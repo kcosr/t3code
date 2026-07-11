@@ -3,6 +3,7 @@ package expo.modules.t3voice
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.MediaRecorder
+import android.util.Log
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
@@ -144,6 +145,7 @@ internal class T3VoiceWebRtcSession(
     try {
       audioRouter.start()
       onStateChanged(sessionId, STATE_PREPARING, false)
+      Log.i(LOG_TAG, "offer-requested")
       peerConnection.createOffer(OfferObserver(sessionId), offerConstraints())
     } catch (cause: Throwable) {
       fail(
@@ -318,6 +320,7 @@ internal class T3VoiceWebRtcSession(
         }
       }
     if (result != null) {
+      Log.i(LOG_TAG, "offer-ready")
       onStateChanged(sessionId, STATE_OFFER_READY, result.third)
       result.first?.onSuccess(result.second)
     }
@@ -343,10 +346,8 @@ internal class T3VoiceWebRtcSession(
       )
       return
     }
-    synchronized(lock) {
-      val session = active?.takeIf { it.sessionId == sessionId } ?: return
-      onStateChanged(sessionId, normalized, session.muted)
-    }
+    val muted = synchronized(lock) { active?.takeIf { it.sessionId == sessionId }?.muted } ?: return
+    onStateChanged(sessionId, normalized, muted)
   }
 
   private fun fail(
@@ -410,6 +411,7 @@ internal class T3VoiceWebRtcSession(
 
   private inner class OfferObserver(private val sessionId: String) : BaseSdpObserver() {
     override fun onCreateSuccess(description: SessionDescription?) {
+      Log.i(LOG_TAG, "offer-created")
       if (description == null || description.description.isBlank()) {
         fail(sessionId, ERROR_OFFER_FAILED, "WebRTC created an empty SDP offer.", null, false)
         return
@@ -419,6 +421,7 @@ internal class T3VoiceWebRtcSession(
       peer.setLocalDescription(
         object : BaseSdpObserver() {
           override fun onSetSuccess() {
+            Log.i(LOG_TAG, "local-description-set")
             synchronized(lock) {
               active?.takeIf { it.sessionId == sessionId }?.localDescriptionSet = true
             }
@@ -426,6 +429,7 @@ internal class T3VoiceWebRtcSession(
           }
 
           override fun onSetFailure(message: String?) {
+            Log.w(LOG_TAG, "local-description-rejected")
             fail(
               sessionId,
               ERROR_OFFER_FAILED,
@@ -440,6 +444,7 @@ internal class T3VoiceWebRtcSession(
     }
 
     override fun onCreateFailure(message: String?) {
+      Log.w(LOG_TAG, "offer-create-failed")
       fail(
         sessionId,
         ERROR_OFFER_FAILED,
@@ -458,6 +463,7 @@ internal class T3VoiceWebRtcSession(
     override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
 
     override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
+      Log.i(LOG_TAG, "ice-gathering-${state?.name?.lowercase() ?: "unknown"}")
       if (state != PeerConnection.IceGatheringState.COMPLETE) return
       synchronized(lock) {
         active?.takeIf { it.sessionId == sessionId }?.iceGatheringComplete = true
@@ -581,6 +587,7 @@ internal class T3VoiceWebRtcSession(
   }
 
   companion object {
+    private const val LOG_TAG = "T3VoiceWebRtc"
     private const val LOCAL_AUDIO_TRACK_ID = "t3-audio"
     private const val LOCAL_MEDIA_STREAM_ID = "t3-media"
     private const val DATA_CHANNEL_LABEL = "oai-events"
