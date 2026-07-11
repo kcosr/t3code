@@ -12,7 +12,13 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import * as Sse from "effect/unstable/encoding/Sse";
-import { HttpBody, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
+import {
+  HttpBody,
+  HttpClient,
+  HttpClientError,
+  HttpClientRequest,
+  HttpClientResponse,
+} from "effect/unstable/http";
 
 import { VoiceError } from "../../Errors.ts";
 import { VoiceCredentialStore } from "../../Services/VoiceCredentialStore.ts";
@@ -308,6 +314,15 @@ const providerError = (operation: string) => (cause: unknown) =>
     detail: "OpenAI voice request failed",
     retryable: true,
     cause,
+  });
+
+const logHttpFailure = (operation: string, cause: unknown) =>
+  Effect.logWarning("OpenAI voice HTTP request failed", {
+    operation,
+    failureType: HttpClientError.isHttpClientError(cause) ? cause.reason._tag : "unknown",
+    ...(HttpClientError.isHttpClientError(cause) && cause.response !== undefined
+      ? { status: cause.response.status }
+      : {}),
   });
 
 const safeOperationalValue = (value: unknown): string | undefined =>
@@ -755,6 +770,7 @@ const make = Effect.gen(function* () {
         )
         .pipe(
           Effect.flatMap(HttpClientResponse.filterStatusOk),
+          Effect.tapError((cause) => logHttpFailure("openai.realtime.negotiate", cause)),
           Effect.mapError(providerError("openai.realtime.negotiate")),
         );
       const providerRealtimeCallId = response.headers.location?.split("/").at(-1);
