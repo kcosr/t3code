@@ -64,6 +64,8 @@ import {
   VoicePublicErrorReason,
   VoiceSessionCloseResult,
   VoiceSessionCreateInput,
+  VoiceSessionFocusInput,
+  VoiceSessionFocusResult,
   VoiceSessionCreateResult,
   VoiceSessionEventsQuery,
   VoiceSessionEventsResult,
@@ -566,6 +568,15 @@ export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
       params: Schema.Struct({ sessionId: VoiceSessionId }),
       payload: VoiceSessionLeaseInput,
       success: VoiceSessionState,
+      error: [...EnvironmentScopedOperationErrors, EnvironmentVoiceOperationError],
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("updateSessionFocus", "/api/voice/sessions/:sessionId/focus", {
+      headers: OptionalBearerHeaders,
+      params: Schema.Struct({ sessionId: VoiceSessionId }),
+      payload: VoiceSessionFocusInput,
+      success: VoiceSessionFocusResult,
       error: [...EnvironmentScopedOperationErrors, EnvironmentVoiceOperationError],
     }).middleware(EnvironmentAuthenticatedAuth),
   )

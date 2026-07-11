@@ -2,6 +2,8 @@ import { VoiceToolCallId } from "@t3tools/contracts";
 import type {
   AuthEnvironmentScope,
   AuthSessionId,
+  ProjectId,
+  ThreadId,
   VoiceCapability,
   VoiceConfirmationId,
   VoiceSessionCreateInput,
@@ -24,7 +26,9 @@ import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import { VoiceError } from "../Errors.ts";
+import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import { voiceFocusContextItem } from "./VoiceContextCompiler.ts";
 import { VoiceContextCompiler } from "../Services/VoiceContextCompiler.ts";
 import { VoiceConversationService } from "../Services/VoiceConversationService.ts";
 import type { RealtimeProviderEvent, RealtimeProviderSession } from "../Services/VoiceProvider.ts";
@@ -73,6 +77,11 @@ interface RuntimeState {
   readonly nextTerminalOrder: number;
 }
 
+interface VoiceSessionFocus {
+  readonly projectId?: ProjectId;
+  readonly threadId?: ThreadId;
+}
+
 const sessionError = (
   reason: VoiceError["reason"],
   operation: string,
@@ -92,6 +101,7 @@ const make = Effect.gen(function* () {
   const tools = yield* VoiceToolExecutor;
   const settingsService = yield* ServerSettingsService;
   const tickets = yield* VoiceMediaTicketRegistry;
+  const projection = yield* ProjectionSnapshotQuery;
   const serviceScope = yield* Scope.make("sequential");
   const lifecycleMutex = yield* Semaphore.make(1);
   const runtime = yield* SynchronizedRef.make<RuntimeState>({
@@ -101,6 +111,59 @@ const make = Effect.gen(function* () {
   });
 
   const nowIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
+
+  const validateFocus = Effect.fn("VoiceSessionService.validateFocus")(function* (
+    focus: VoiceSessionFocus,
+  ) {
+    if (focus.threadId !== undefined && focus.projectId === undefined) {
+      return yield* sessionError(
+        "invalid-context",
+        "session.focus",
+        "A focused thread requires its owning project",
+      );
+    }
+    if (focus.projectId === undefined) return {} satisfies VoiceSessionFocus;
+    const project = yield* projection.getProjectShellById(focus.projectId).pipe(
+      Effect.mapError(
+        (cause) =>
+          new VoiceError({
+            reason: "provider-unavailable",
+            operation: "session.focus.project",
+            detail: "The focused project could not be resolved",
+            retryable: true,
+            cause,
+          }),
+      ),
+    );
+    if (Option.isNone(project)) {
+      return yield* sessionError(
+        "invalid-context",
+        "session.focus",
+        "The focused project does not exist",
+      );
+    }
+    if (focus.threadId === undefined) return { projectId: focus.projectId };
+    const thread = yield* projection.getThreadShellById(focus.threadId).pipe(
+      Effect.mapError(
+        (cause) =>
+          new VoiceError({
+            reason: "provider-unavailable",
+            operation: "session.focus.thread",
+            detail: "The focused thread could not be resolved",
+            retryable: true,
+            cause,
+          }),
+      ),
+    );
+    if (Option.isNone(thread) || thread.value.projectId !== focus.projectId) {
+      return yield* sessionError(
+        "invalid-context",
+        "session.focus",
+        "The focused thread does not belong to the focused project",
+      );
+    }
+    return { projectId: focus.projectId, threadId: focus.threadId };
+  });
 
   const mutateSession = <A>(
     sessionId: VoiceSessionId,
@@ -468,6 +531,10 @@ const make = Effect.gen(function* () {
         heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
       };
     }
+    const initialFocus = yield* validateFocus({
+      ...(input.projectId === undefined ? {} : { projectId: input.projectId }),
+      ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+    });
     const voiceSettings = yield* settingsService.getSettings.pipe(
       Effect.map((settings) => settings.voice),
       Effect.mapError(
@@ -601,7 +668,7 @@ const make = Effect.gen(function* () {
       const sessions = new Map(current.sessions);
       sessions.set(acquired.lease.sessionId, {
         lease: acquired.lease,
-        input,
+        input: { ...input, ...initialFocus },
         state,
         events: [],
         expiresAt,
@@ -689,6 +756,75 @@ const make = Effect.gen(function* () {
     return Option.getOrThrow(updated);
   });
 
+  const updateFocusUnlocked: VoiceSessionServiceShape["updateFocus"] = Effect.fn(
+    "VoiceSessionService.updateFocusUnlocked",
+  )(function* (owner, sessionId, input) {
+    const session = yield* requireOwned(owner, sessionId, input.leaseGeneration);
+    if (
+      session.providerSession === undefined ||
+      session.terminalAt !== undefined ||
+      session.terminating ||
+      session.state.phase === "ended" ||
+      session.state.phase === "error"
+    ) {
+      return yield* sessionError(
+        "invalid-phase",
+        "session.focus",
+        "Voice session has no active provider call",
+      );
+    }
+    const focus = yield* validateFocus({
+      ...(input.projectId === undefined ? {} : { projectId: input.projectId }),
+      ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+    });
+    if (session.input.projectId === focus.projectId && session.input.threadId === focus.threadId) {
+      return { state: session.state, ...focus };
+    }
+    const item =
+      voiceFocusContextItem(focus) ??
+      ({ role: "system", text: "There is no active T3 project or thread context." } as const);
+    yield* session.providerSession.updateContext(item);
+    if (!(yield* registry.isCurrent(session.lease))) {
+      return yield* sessionError(
+        "lease-conflict",
+        "session.focus",
+        "Voice session was replaced during the context update",
+      );
+    }
+    const acknowledgedSession = (yield* SynchronizedRef.get(runtime)).sessions.get(sessionId);
+    if (
+      acknowledgedSession === undefined ||
+      acknowledgedSession.terminalAt !== undefined ||
+      acknowledgedSession.terminating ||
+      acknowledgedSession.state.phase === "ended" ||
+      acknowledgedSession.state.phase === "error"
+    ) {
+      return yield* sessionError(
+        "invalid-phase",
+        "session.focus",
+        "Voice session ended during the context update",
+      );
+    }
+    yield* conversations
+      .appendContext({
+        conversationId: session.lease.conversationId,
+        kind: "context-change",
+        payload: focus,
+      })
+      .pipe(
+        Effect.tapError(() => endRuntimeSession(acknowledgedSession, "error").pipe(Effect.ignore)),
+      );
+    const updated = yield* mutateSession(sessionId, (current) => {
+      const { projectId: _projectId, threadId: _threadId, ...rest } = current.input;
+      const next = { ...current, input: { ...rest, ...focus } };
+      return [{ state: next.state, ...focus }, next] as const;
+    });
+    return Option.getOrThrow(updated);
+  });
+
+  const updateFocus: VoiceSessionServiceShape["updateFocus"] = (owner, sessionId, input) =>
+    lifecycleMutex.withPermits(1)(updateFocusUnlocked(owner, sessionId, input));
+
   const closeUnlocked: VoiceSessionServiceShape["close"] = Effect.fn(
     "VoiceSessionService.closeUnlocked",
   )(function* (owner, sessionId, generation) {
@@ -748,13 +884,19 @@ const make = Effect.gen(function* () {
         ),
       );
       const context = yield* compiler.compile({ entries, tokenBudget: contextTokenBudget });
+      const initialFocus: VoiceSessionFocus = {
+        ...(session.input.projectId === undefined ? {} : { projectId: session.input.projectId }),
+        ...(session.input.threadId === undefined ? {} : { threadId: session.input.threadId }),
+      };
+      const initialFocusItem = voiceFocusContextItem(initialFocus);
       const providerSession = yield* adapter.realtime
         .negotiate({
           sessionId,
           leaseGeneration: session.lease.generation,
           offer,
           instructions: INSTRUCTIONS,
-          continuationContext: context.items,
+          continuationContext:
+            initialFocusItem === undefined ? context.items : [...context.items, initialFocusItem],
         })
         .pipe(Effect.tapError(() => endRuntimeSession(session, "error")));
       const providerAttached = yield* mutateSession(sessionId, (current) => {
@@ -777,6 +919,26 @@ const make = Effect.gen(function* () {
           "session.offer",
           "Voice session was replaced during signaling",
         );
+      }
+      if (initialFocusItem !== undefined) {
+        yield* conversations
+          .appendContext({
+            conversationId: session.lease.conversationId,
+            kind: "context-change",
+            payload: initialFocus,
+          })
+          .pipe(
+            Effect.tapError(() =>
+              SynchronizedRef.get(runtime).pipe(
+                Effect.flatMap((state) => {
+                  const current = state.sessions.get(sessionId);
+                  return current === undefined
+                    ? providerSession.terminate.pipe(Effect.ignore)
+                    : endRuntimeSession(current, "error");
+                }),
+              ),
+            ),
+          );
       }
       const eventFiber = yield* providerSession.events.pipe(
         Stream.runForEach((event) => handleProviderEvent(session.lease, providerSession, event)),
@@ -942,6 +1104,7 @@ const make = Effect.gen(function* () {
     create,
     get,
     heartbeat,
+    updateFocus,
     close,
     offer,
     events,

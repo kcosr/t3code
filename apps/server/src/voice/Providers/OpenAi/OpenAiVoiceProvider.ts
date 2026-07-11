@@ -1,5 +1,6 @@
 import type { VoiceTranscriptionStreamEvent } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -8,6 +9,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as SynchronizedRef from "effect/SynchronizedRef";
 import * as Sse from "effect/unstable/encoding/Sse";
 import { HttpBody, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 
@@ -31,12 +33,24 @@ const TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
 const SPEECH_MODEL = "gpt-4o-mini-tts";
 const REALTIME_MODEL = "gpt-realtime-2.1";
 const CONTEXT_REPLAY_TIMEOUT = "30 seconds";
+const CONTEXT_UPDATE_TIMEOUT = "10 seconds";
 const VOICE_PRESETS: Readonly<Record<string, string>> = {
   default: "marin",
   warm: "cedar",
 };
 const decodeRealtimeEventJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
 const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+
+const decodeRealtimeRecord = (data: string): Record<string, unknown> | undefined => {
+  try {
+    const value = decodeRealtimeEventJson(data);
+    return typeof value === "object" && value !== null && "type" in value
+      ? (value as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
 
 export class OpenAiVoiceProvider extends Context.Service<
   OpenAiVoiceProvider,
@@ -262,6 +276,18 @@ const replayError = (
   new VoiceError({
     reason: "provider-unavailable",
     operation: "openai.realtime.context-replay",
+    detail,
+    retryable: options?.retryable ?? true,
+    ...(options?.cause === undefined ? {} : { cause: options.cause }),
+  });
+
+const contextUpdateError = (
+  detail: string,
+  options?: { readonly cause?: unknown; readonly retryable?: boolean },
+) =>
+  new VoiceError({
+    reason: "provider-unavailable",
+    operation: "openai.realtime.context-update",
     detail,
     retryable: options?.retryable ?? true,
     ...(options?.cause === undefined ? {} : { cause: options.cause }),
@@ -572,6 +598,90 @@ const make = Effect.gen(function* () {
       });
 
       const submittedToolOutputs = yield* Ref.make(new Set<string>());
+      const contextUpdateSequence = yield* Ref.make(0);
+      const pendingContextUpdates = yield* SynchronizedRef.make(
+        new Map<
+          string,
+          {
+            readonly eventId: string;
+            readonly completion: Deferred.Deferred<void, VoiceError>;
+          }
+        >(),
+      );
+      const failPendingContextUpdates = Effect.fn("OpenAiVoiceProvider.failPendingContextUpdates")(
+        function* (error: VoiceError) {
+          const pending = yield* SynchronizedRef.modify(pendingContextUpdates, (current) => [
+            [...current.values()],
+            new Map(),
+          ]);
+          yield* Effect.forEach(pending, ({ completion }) => Deferred.fail(completion, error), {
+            discard: true,
+          });
+        },
+      );
+      const observeContextUpdate = Effect.fn("OpenAiVoiceProvider.observeContextUpdate")(function* (
+        event: OpenAiRealtimeSocketEvent,
+      ) {
+        if (event.type === "closed") {
+          yield* failPendingContextUpdates(
+            contextUpdateError("OpenAI Realtime closed before a context update completed"),
+          );
+          return;
+        }
+        if (event.type === "error") {
+          yield* failPendingContextUpdates(
+            contextUpdateError("OpenAI Realtime failed during a context update", {
+              cause: event.cause,
+            }),
+          );
+          return;
+        }
+        const record = decodeRealtimeRecord(event.data);
+        if (record === undefined) return;
+        if (record.type === "conversation.item.done") {
+          const item = record.item;
+          const itemId =
+            typeof item === "object" &&
+            item !== null &&
+            typeof (item as Record<string, unknown>).id === "string"
+              ? ((item as Record<string, unknown>).id as string)
+              : undefined;
+          if (itemId === undefined) return;
+          const pending = yield* SynchronizedRef.modify(pendingContextUpdates, (current) => {
+            const match = current.get(itemId);
+            if (match === undefined) return [undefined, current] as const;
+            const next = new Map(current);
+            next.delete(itemId);
+            return [match, next] as const;
+          });
+          if (pending !== undefined) yield* Deferred.succeed(pending.completion, undefined);
+          return;
+        }
+        if (record.type !== "error") return;
+        const error = record.error;
+        const rejectedEventId =
+          typeof error === "object" &&
+          error !== null &&
+          typeof (error as Record<string, unknown>).event_id === "string"
+            ? ((error as Record<string, unknown>).event_id as string)
+            : undefined;
+        if (rejectedEventId === undefined) return;
+        const pending = yield* SynchronizedRef.modify(pendingContextUpdates, (current) => {
+          const entry = [...current.entries()].find(
+            ([, candidate]) => candidate.eventId === rejectedEventId,
+          );
+          if (entry === undefined) return [undefined, current] as const;
+          const next = new Map(current);
+          next.delete(entry[0]);
+          return [entry[1], next] as const;
+        });
+        if (pending !== undefined) {
+          yield* Deferred.fail(
+            pending.completion,
+            contextUpdateError("OpenAI rejected a context update", { retryable: false }),
+          );
+        }
+      });
       const terminated = yield* Ref.make(false);
       const terminate = Effect.gen(function* () {
         const shouldTerminate = yield* Ref.modify(
@@ -593,8 +703,50 @@ const make = Effect.gen(function* () {
           sdp: answerSdp,
         },
         events: sideband.events.pipe(
+          Stream.tap(observeContextUpdate),
           Stream.flatMap((event) => Stream.fromIterable(parseRealtimeEvent(event))),
         ),
+        updateContext: (item) =>
+          Effect.gen(function* () {
+            const sequence = yield* Ref.getAndUpdate(contextUpdateSequence, (value) => value + 1);
+            const identity = {
+              eventId: `t3fe_${input.leaseGeneration.toString(36)}_${sequence.toString(36)}`,
+              itemId: `t3focus_${input.leaseGeneration.toString(36)}_${sequence.toString(36)}`,
+            };
+            const completion = yield* Deferred.make<void, VoiceError>();
+            yield* SynchronizedRef.update(pendingContextUpdates, (current) => {
+              const next = new Map(current);
+              next.set(identity.itemId, { eventId: identity.eventId, completion });
+              return next;
+            });
+            yield* sideband.send(encodeJson(continuationEvent(item, identity))).pipe(
+              Effect.mapError((cause) =>
+                contextUpdateError("OpenAI failed to send a context update", { cause }),
+              ),
+              Effect.andThen(
+                Deferred.await(completion).pipe(
+                  Effect.timeoutOption(CONTEXT_UPDATE_TIMEOUT),
+                  Effect.flatMap(
+                    Option.match({
+                      onNone: () =>
+                        Effect.fail(
+                          contextUpdateError("OpenAI did not acknowledge the context update"),
+                        ),
+                      onSome: Effect.succeed,
+                    }),
+                  ),
+                ),
+              ),
+              Effect.ensuring(
+                SynchronizedRef.update(pendingContextUpdates, (current) => {
+                  if (!current.has(identity.itemId)) return current;
+                  const next = new Map(current);
+                  next.delete(identity.itemId);
+                  return next;
+                }),
+              ),
+            );
+          }),
         submitToolOutput: (output) =>
           Effect.gen(function* () {
             const firstSubmission = yield* Ref.modify(submittedToolOutputs, (submitted) => {

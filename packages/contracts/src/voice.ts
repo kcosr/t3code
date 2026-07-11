@@ -185,6 +185,34 @@ export const VoiceSessionLeaseInput = Schema.Struct({
 });
 export type VoiceSessionLeaseInput = typeof VoiceSessionLeaseInput.Type;
 
+export const VoiceSessionFocusInput = Schema.Union([
+  Schema.Struct({
+    leaseGeneration: PositiveInt,
+    projectId: ProjectId,
+    threadId: Schema.optionalKey(ThreadId),
+  }),
+  Schema.Struct({
+    leaseGeneration: PositiveInt,
+    projectId: Schema.optionalKey(Schema.Never),
+    threadId: Schema.optionalKey(Schema.Never),
+  }),
+]);
+export type VoiceSessionFocusInput = typeof VoiceSessionFocusInput.Type;
+
+export const VoiceSessionFocusResult = Schema.Union([
+  Schema.Struct({
+    state: VoiceSessionState,
+    projectId: ProjectId,
+    threadId: Schema.optionalKey(ThreadId),
+  }),
+  Schema.Struct({
+    state: VoiceSessionState,
+    projectId: Schema.optionalKey(Schema.Never),
+    threadId: Schema.optionalKey(Schema.Never),
+  }),
+]);
+export type VoiceSessionFocusResult = typeof VoiceSessionFocusResult.Type;
+
 export const VoiceSessionCloseResult = Schema.Struct({
   state: VoiceSessionState,
   closed: Schema.Boolean,
@@ -384,6 +412,7 @@ export const VoicePublicErrorReason = Schema.Literals([
   "session-not-found",
   "takeover-required",
   "lease-conflict",
+  "invalid-context",
   "invalid-phase",
   "provider-unavailable",
   "confirmation-expired",

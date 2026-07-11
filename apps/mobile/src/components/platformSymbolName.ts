@@ -1,7 +1,9 @@
 import type { AndroidSymbol, SFSymbol, SymbolViewProps } from "expo-symbols";
 
 const ANDROID_SYMBOL_BY_SF_SYMBOL = {
+  airplayaudio: "speaker",
   "arrow.up": "arrow_upward",
+  checkmark: "check",
   "chevron.down": "keyboard_arrow_down",
   desktopcomputer: "computer",
   "mic.fill": "mic",
@@ -9,6 +11,7 @@ const ANDROID_SYMBOL_BY_SF_SYMBOL = {
   "microphone.fill": "mic",
   "phone.down.fill": "call_end",
   plus: "add",
+  "plus.circle.fill": "add_circle",
   "point.topleft.down.curvedto.point.bottomright.up": "account_tree",
   "slider.horizontal.3": "tune",
   "speaker.slash.fill": "volume_off",
@@ -16,6 +19,7 @@ const ANDROID_SYMBOL_BY_SF_SYMBOL = {
   "stop.fill": "stop",
   "tray.and.arrow.up": "upload",
   "waveform.circle.fill": "graphic_eq",
+  xmark: "close",
 } satisfies Partial<Record<SFSymbol, AndroidSymbol>>;
 
 export function platformSymbolName(name: SymbolViewProps["name"]): SymbolViewProps["name"] {

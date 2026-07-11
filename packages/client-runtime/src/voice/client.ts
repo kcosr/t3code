@@ -2,6 +2,8 @@ import {
   VoiceTranscriptionStreamEvent,
   VoiceSpeechRequest,
   VoiceTranscriptionMetadata,
+  type ProjectId,
+  type ThreadId,
   type VoiceConfirmationDecision,
   type VoiceConfirmationId,
   type VoiceConfirmationResult,
@@ -16,6 +18,7 @@ import {
   type VoiceSessionCloseResult,
   type VoiceSessionCreateInput,
   type VoiceSessionCreateResult,
+  type VoiceSessionFocusResult,
   type VoiceSessionEventsResult,
   type VoiceSessionId,
   type VoiceSessionState,
@@ -161,6 +164,13 @@ export interface VoiceHttpClient {
     sessionId: VoiceSessionId,
     leaseGeneration: number,
   ) => Effect.Effect<VoiceSessionState, RemoteEnvironmentRequestError>;
+  readonly updateSessionFocus: (
+    sessionId: VoiceSessionId,
+    leaseGeneration: number,
+    focus:
+      | { readonly projectId: ProjectId; readonly threadId?: ThreadId }
+      | { readonly projectId?: never; readonly threadId?: never },
+  ) => Effect.Effect<VoiceSessionFocusResult, RemoteEnvironmentRequestError>;
   readonly closeSession: (
     sessionId: VoiceSessionId,
     leaseGeneration: number,
@@ -420,6 +430,27 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
             params: { sessionId },
             payload: { leaseGeneration },
           }),
+      }),
+    updateSessionFocus: (sessionId, leaseGeneration, focus) =>
+      control({
+        method: "POST",
+        pathname: `/api/voice/sessions/${sessionId}/focus`,
+        run: (client, headers) =>
+          focus.projectId === undefined
+            ? client.voice.updateSessionFocus({
+                headers,
+                params: { sessionId },
+                payload: { leaseGeneration },
+              })
+            : client.voice.updateSessionFocus({
+                headers,
+                params: { sessionId },
+                payload: {
+                  leaseGeneration,
+                  projectId: focus.projectId,
+                  ...(focus.threadId === undefined ? {} : { threadId: focus.threadId }),
+                },
+              }),
       }),
     closeSession: (sessionId, leaseGeneration) =>
       control({

@@ -10,6 +10,10 @@ describe("platformSymbolName", () => {
     ["stop.fill", "stop"],
     ["arrow.up", "arrow_upward"],
     ["chevron.down", "keyboard_arrow_down"],
+    ["airplayaudio", "speaker"],
+    ["checkmark", "check"],
+    ["plus.circle.fill", "add_circle"],
+    ["xmark", "close"],
   ] as const)("maps %s to its Android Material symbol", (ios, android) => {
     expect(platformSymbolName(ios)).toEqual({ ios, android });
   });

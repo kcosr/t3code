@@ -22,6 +22,7 @@ import { useConnectOnboardingNavigation } from "./features/cloud/connectOnboardi
 import { ThreadFilesTreeScreen, ThreadFileScreen } from "./features/files/ThreadFilesRouteScreen";
 import { AdaptiveWorkspaceLayout } from "./features/layout/AdaptiveWorkspaceLayout";
 import { HardwareKeyboardCommandProvider } from "./features/keyboard/HardwareKeyboardCommandProvider";
+import { parseActiveThreadPath } from "./features/keyboard/hardwareKeyboardCommands";
 import { ReviewCommentComposerSheet } from "./features/review/ReviewCommentComposerSheet";
 import { ReviewSheet } from "./features/review/ReviewSheet";
 import { ThreadTerminalRouteScreen } from "./features/terminal/ThreadTerminalRouteScreen";
@@ -46,7 +47,9 @@ import { SettingsAuthRouteScreen } from "./features/settings/SettingsAuthRouteSc
 import { SettingsEnvironmentsRouteScreen } from "./features/settings/SettingsEnvironmentsRouteScreen";
 import { SettingsRouteScreen } from "./features/settings/SettingsRouteScreen";
 import { SettingsWaitlistRouteScreen } from "./features/settings/SettingsWaitlistRouteScreen";
+import { MasterVoiceProvider } from "./features/voice/MasterVoiceProvider";
 import { nativeHeaderScrollEdgeEffects } from "./native/StackHeader";
+import { useThreadShell } from "./state/entities";
 import { useThreadOutboxDrain } from "./state/use-thread-outbox-drain";
 
 const HEADER_SCROLL_EDGE_EFFECTS = nativeHeaderScrollEdgeEffects(Platform.OS, Platform.Version);
@@ -269,13 +272,26 @@ function RootStackLayout(props: {
   const path = getPathFromState(props.state, navigationPathConfig);
   const pathname = path.startsWith("/") ? path : `/${path}`;
   const workspacePathname = workspacePathFromState(props.state);
+  const focusedThreadRef = parseActiveThreadPath(workspacePathname);
+  const focusedThread = useThreadShell(focusedThreadRef);
+  const voiceFocus =
+    focusedThread === null
+      ? null
+      : {
+          environmentId: focusedThread.environmentId,
+          projectId: focusedThread.projectId,
+          threadId: focusedThread.id,
+          threadTitle: focusedThread.title,
+        };
 
   return (
     <HardwareKeyboardCommandProvider pathname={pathname}>
       <ClerkSettingsSheetDetentProvider initiallyExpanded={false}>
-        <AdaptiveWorkspaceLayout pathname={workspacePathname}>
-          {props.children}
-        </AdaptiveWorkspaceLayout>
+        <MasterVoiceProvider focus={voiceFocus}>
+          <AdaptiveWorkspaceLayout pathname={workspacePathname}>
+            {props.children}
+          </AdaptiveWorkspaceLayout>
+        </MasterVoiceProvider>
       </ClerkSettingsSheetDetentProvider>
     </HardwareKeyboardCommandProvider>
   );

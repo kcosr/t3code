@@ -123,6 +123,16 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
         }),
       )
       .handle(
+        "updateSessionFocus",
+        Effect.fn("environment.voice.updateSessionFocus")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          const principal = yield* requireEnvironmentScope(AuthVoiceUseScope);
+          return yield* sessions
+            .updateFocus(principal.sessionId, args.params.sessionId, args.payload)
+            .pipe(Effect.catch(failVoiceOperation));
+        }),
+      )
+      .handle(
         "closeSession",
         Effect.fn("environment.voice.closeSession")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);

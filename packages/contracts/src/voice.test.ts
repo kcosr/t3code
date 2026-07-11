@@ -5,6 +5,7 @@ import {
   VoiceConversationSelection,
   VoiceSpeechRequest,
   VoiceSessionCreateInput,
+  VoiceSessionFocusInput,
   VoiceSessionEvent,
   VoiceWebRtcOffer,
   VoiceTranscriptionStreamEvent,
@@ -70,6 +71,25 @@ describe("voice contracts", () => {
       decodeUnknownSync(VoiceConversationSelection)({
         type: "continue",
         conversationId: "voice-conversation-1",
+      }),
+    ).toThrow();
+  });
+
+  it("defines clear, project, and project-thread focus without accepting a thread alone", () => {
+    expect(decodeUnknownSync(VoiceSessionFocusInput)({ leaseGeneration: 1 })).toEqual({
+      leaseGeneration: 1,
+    });
+    expect(
+      decodeUnknownSync(VoiceSessionFocusInput)({
+        leaseGeneration: 1,
+        projectId: "project-1",
+        threadId: "thread-1",
+      }),
+    ).toMatchObject({ projectId: "project-1", threadId: "thread-1" });
+    expect(() =>
+      decodeUnknownSync(VoiceSessionFocusInput)({
+        leaseGeneration: 1,
+        threadId: "thread-1",
       }),
     ).toThrow();
   });

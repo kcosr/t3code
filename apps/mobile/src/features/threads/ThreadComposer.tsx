@@ -64,7 +64,7 @@ import {
 import { useComposerPathSearch } from "../../state/use-composer-path-search";
 import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerCommandPopover";
 import { useComposerDictation } from "../voice/useComposerDictation";
-import { useRealtimeVoice } from "../voice/useRealtimeVoice";
+import { useMasterVoice } from "../voice/MasterVoiceProvider";
 
 /**
  * Height of the collapsed composer (pill + vertical padding, excluding safe-area inset).
@@ -274,18 +274,14 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     draftMessage: props.draftMessage,
     onChangeDraftMessage: props.onChangeDraftMessage,
   });
-  const realtimeVoice = useRealtimeVoice({
-    environmentId: props.environmentId,
-    projectId: props.selectedThread.projectId,
-    threadId: props.selectedThread.id,
-  });
+  const realtimeVoice = useMasterVoice();
   const realtimeInUse =
     realtimeVoice.phase === "active" ||
     realtimeVoice.phase === "starting" ||
     realtimeVoice.phase === "stopping";
   const handleRealtimeToggle = useCallback(() => {
     if (realtimeInUse) {
-      realtimeVoice.onToggle();
+      realtimeVoice.onOpenDetails();
       return;
     }
     if (props.speechPlayback.enabled) props.speechPlayback.onToggle();
@@ -304,12 +300,6 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       Alert.alert("Voice input failed", dictation.error);
     }
   }, [dictation.error]);
-  useEffect(() => {
-    if (realtimeVoice.error !== null) {
-      Alert.alert("Voice conversation failed", realtimeVoice.error);
-    }
-  }, [realtimeVoice.error]);
-
   const onPressImage = useCallback(
     (uri: string) => {
       wasExpandedBeforePreviewRef.current = isFocused;
@@ -864,8 +854,8 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                 <ControlPill icon="stop.fill" variant="danger" onPress={props.onStopThread} />
               ) : realtimeInUse ? (
                 <ControlPill
-                  icon="phone.down.fill"
-                  variant="danger"
+                  accessibilityLabel="Open voice conversation"
+                  icon="waveform.circle.fill"
                   onPress={handleRealtimeToggle}
                 />
               ) : dictation.phase === "recording" ? (
@@ -935,10 +925,10 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                 {realtimeVoice.available ? (
                   <ComposerToolbarButton
                     accessibilityLabel={
-                      realtimeInUse ? "End voice conversation" : "Start voice conversation"
+                      realtimeInUse ? "Open voice conversation" : "Start voice conversation"
                     }
-                    icon={realtimeInUse ? "phone.down.fill" : "waveform.circle.fill"}
-                    variant={realtimeInUse ? "danger" : "default"}
+                    icon="waveform.circle.fill"
+                    variant="default"
                     active={realtimeVoice.phase === "active"}
                     disabled={realtimeVoice.phase === "stopping"}
                     onPress={handleRealtimeToggle}

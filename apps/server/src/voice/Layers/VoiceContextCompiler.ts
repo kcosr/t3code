@@ -27,6 +27,19 @@ const decodeSummary = Schema.decodeUnknownExit(SummaryPayload);
 const decodeToolResult = Schema.decodeUnknownExit(ToolResultPayload);
 const decodeContextChange = Schema.decodeUnknownExit(ContextChangePayload);
 
+export const voiceFocusContextItem = (focus: {
+  readonly projectId?: string;
+  readonly threadId?: string;
+}): RealtimeContextItem | undefined => {
+  const targets = [
+    focus.projectId === undefined ? undefined : `project ${focus.projectId}`,
+    focus.threadId === undefined ? undefined : `thread ${focus.threadId}`,
+  ].filter((target): target is string => target !== undefined);
+  return targets.length === 0
+    ? undefined
+    : { role: "system", text: `Active T3 context: ${targets.join(", ")}` };
+};
+
 const entryToItem = (entry: VoiceConversationJournalEntry): RealtimeContextItem | undefined => {
   switch (entry.kind) {
     case "transcript.user":
@@ -59,14 +72,7 @@ const entryToItem = (entry: VoiceConversationJournalEntry): RealtimeContextItem 
     case "context-change": {
       const decoded = decodeContextChange(entry.payload);
       if (decoded._tag === "Failure") return undefined;
-      const payload = decoded.value;
-      const targets = [
-        payload.projectId === undefined ? undefined : `project ${payload.projectId}`,
-        payload.threadId === undefined ? undefined : `thread ${payload.threadId}`,
-      ].filter((target): target is string => target !== undefined);
-      return targets.length === 0
-        ? undefined
-        : { role: "system", text: `Active T3 context: ${targets.join(", ")}` };
+      return voiceFocusContextItem(decoded.value);
     }
     case "call-boundary":
     case "device-handoff":

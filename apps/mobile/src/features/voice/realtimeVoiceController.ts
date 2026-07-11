@@ -1,4 +1,6 @@
 import type {
+  ProjectId,
+  ThreadId,
   VoiceConfirmationDecision,
   VoiceConfirmationId,
   VoiceConfirmationResult,
@@ -172,6 +174,20 @@ export class RealtimeVoiceController {
       nativeSessionId: active.nativeSessionId,
       muted,
     });
+  }
+
+  async updateFocus(projectId: ProjectId, threadId: ThreadId): Promise<void> {
+    const active = this.requireActive();
+    const result = await Effect.runPromise(
+      this.client.updateSessionFocus(active.sessionId, active.leaseGeneration, {
+        projectId,
+        threadId,
+      }),
+    );
+    if (this.active !== active)
+      throw new Error("Realtime voice session changed during focus update");
+    active.serverState = result.state;
+    this.setSnapshot({ session: result.state });
   }
 
   getAudioRoutes(): Promise<ReadonlyArray<T3VoiceAudioRoute>> {

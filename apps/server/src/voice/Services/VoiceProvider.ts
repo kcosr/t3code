@@ -83,6 +83,7 @@ export type RealtimeProviderEvent =
 export interface RealtimeProviderSession {
   readonly answer: VoiceWebRtcAnswer;
   readonly events: Stream.Stream<RealtimeProviderEvent, VoiceError>;
+  readonly updateContext: (item: RealtimeContextItem) => Effect.Effect<void, VoiceError>;
   readonly submitToolOutput: (output: RealtimeToolOutput) => Effect.Effect<void, VoiceError>;
   readonly terminate: Effect.Effect<void, VoiceError>;
 }

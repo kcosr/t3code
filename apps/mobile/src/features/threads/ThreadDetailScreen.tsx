@@ -270,16 +270,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     scopeKey: selectedThreadKey,
     latestAssistant,
   });
-  const handleSpeechPlaybackToggle = useCallback(() => {
-    if (speechPlayback.enabled) {
-      speechPlayback.onToggle();
-      return;
-    }
-    Alert.alert("AI-generated voice", "Spoken responses use an AI-generated voice.", [
-      { text: "Cancel", style: "cancel" },
-      { text: "Enable", onPress: speechPlayback.onToggle },
-    ]);
-  }, [speechPlayback.enabled, speechPlayback.onToggle]);
+  const handleSpeechPlaybackToggle = speechPlayback.onToggle;
   const composerChrome = composerExpanded ? COMPOSER_EXPANDED_CHROME : COMPOSER_COLLAPSED_CHROME;
   const composerOverlapHeight = composerChrome + composerBottomInset;
   const activeWorkIndicatorHeight = props.activeWorkStartedAt ? WORKING_INDICATOR_HEIGHT : 0;

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  ProjectId,
+  ThreadId,
   VoiceConfirmationId,
   VoiceConversationId,
   VoiceMediaTicketId,
@@ -25,6 +27,8 @@ const REQUEST_ID = VoiceRequestId.make("request-1");
 const PLAYBACK_ID = VoicePlaybackId.make("playback-1");
 const SESSION_ID = VoiceSessionId.make("voice-session-1");
 const CONFIRMATION_ID = VoiceConfirmationId.make("confirmation-1");
+const PROJECT_ID = ProjectId.make("project-1");
+const THREAD_ID = ThreadId.make("thread-1");
 
 const preparedConnection = (
   httpAuthorization: PreparedHttpAuthorization | null,
@@ -157,7 +161,11 @@ describe("makeVoiceHttpClient", () => {
 
   it.effect("exposes the complete realtime session lifecycle", () =>
     Effect.gen(function* () {
-      const requests: Array<{ readonly url: string; readonly method: string }> = [];
+      const requests: Array<{
+        readonly url: string;
+        readonly method: string;
+        readonly body: BodyInit | null | undefined;
+      }> = [];
       const sessionState = {
         sessionId: SESSION_ID,
         conversationId: CONVERSATION_ID,
@@ -169,7 +177,7 @@ describe("makeVoiceHttpClient", () => {
       const fetch: typeof globalThis.fetch = async (resource, init) => {
         const url = String(resource);
         const method = init?.method ?? "GET";
-        requests.push({ url, method });
+        requests.push({ url, method, body: init?.body });
         if (url.endsWith("/webrtc-offer")) {
           return jsonResponse({
             sessionId: SESSION_ID,
@@ -186,6 +194,9 @@ describe("makeVoiceHttpClient", () => {
             toolCallId: "tool-call-1",
             outcome: "approved",
           });
+        }
+        if (url.endsWith("/focus")) {
+          return jsonResponse({ state: sessionState, projectId: PROJECT_ID, threadId: THREAD_ID });
         }
         if (method === "DELETE") {
           return jsonResponse({
@@ -224,6 +235,10 @@ describe("makeVoiceHttpClient", () => {
       });
       yield* client.getSession(SESSION_ID);
       yield* client.heartbeatSession(SESSION_ID, 1);
+      yield* client.updateSessionFocus(SESSION_ID, 1, {
+        projectId: PROJECT_ID,
+        threadId: THREAD_ID,
+      });
       const answer = yield* client.offerSession({
         sessionId: SESSION_ID,
         leaseGeneration: 1,
@@ -242,11 +257,16 @@ describe("makeVoiceHttpClient", () => {
         "POST https://environment.example.test/api/voice/sessions",
         `GET https://environment.example.test/api/voice/sessions/${SESSION_ID}`,
         `POST https://environment.example.test/api/voice/sessions/${SESSION_ID}/heartbeat`,
+        `POST https://environment.example.test/api/voice/sessions/${SESSION_ID}/focus`,
         `POST https://environment.example.test/api/voice/sessions/${SESSION_ID}/webrtc-offer`,
         `GET https://environment.example.test/api/voice/sessions/${SESSION_ID}/events?afterSequence=4&waitMilliseconds=20000`,
         `POST https://environment.example.test/api/voice/sessions/${SESSION_ID}/confirmations/${CONFIRMATION_ID}`,
         `DELETE https://environment.example.test/api/voice/sessions/${SESSION_ID}`,
       ]);
+      const focusBody = requests[3]?.body;
+      expect(
+        focusBody instanceof Uint8Array ? new TextDecoder().decode(focusBody) : focusBody,
+      ).toBe('{"leaseGeneration":1,"projectId":"project-1","threadId":"thread-1"}');
     }),
   );
 

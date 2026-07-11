@@ -10,6 +10,8 @@ import type {
   VoiceSessionCreateInput,
   VoiceSessionCreateResult,
   VoiceSessionEventsResult,
+  VoiceSessionFocusInput,
+  VoiceSessionFocusResult,
   VoiceSessionId,
   VoiceSessionState,
   VoiceWebRtcAnswer,
@@ -39,6 +41,11 @@ export interface VoiceSessionServiceShape {
     sessionId: VoiceSessionId,
     leaseGeneration: number,
   ) => Effect.Effect<VoiceSessionState, VoiceError>;
+  readonly updateFocus: (
+    ownerAuthSessionId: AuthSessionId,
+    sessionId: VoiceSessionId,
+    input: VoiceSessionFocusInput,
+  ) => Effect.Effect<VoiceSessionFocusResult, VoiceError>;
   readonly close: (
     ownerAuthSessionId: AuthSessionId,
     sessionId: VoiceSessionId,

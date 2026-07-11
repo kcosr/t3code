@@ -5,7 +5,11 @@ import {
   AuthOrchestrationReadScope,
   AuthSessionId,
   AuthVoiceUseScope,
+  ProjectId,
+  ThreadId,
   type AuthEnvironmentScope,
+  type OrchestrationProjectShell,
+  type OrchestrationThreadShell,
   VoiceConfirmationId,
   VoiceConversationId,
   VoiceRequestId,
@@ -24,6 +28,7 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import { layerTest as serverSettingsLayerTest } from "../../serverSettings.ts";
+import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import type { VoiceConversationJournalEntry } from "../../persistence/Services/VoiceConversations.ts";
 import { VoiceConversationService } from "../Services/VoiceConversationService.ts";
 import type { RealtimeProviderSession, VoiceProviderAdapter } from "../Services/VoiceProvider.ts";
@@ -81,6 +86,7 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
     enabled: true,
     maxConcurrentSessions: 16,
   },
+  projection: Partial<ProjectionSnapshotQuery["Service"]> = {},
 ) {
   const appended = yield* Ref.make<Array<VoiceConversationJournalEntry>>([]);
   const append = (
@@ -128,6 +134,7 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
     VoiceMediaTicketRegistryLive.pipe(Layer.provide(NodeServices.layer)),
     serverSettingsLayerTest({ voice: voiceSettings }),
     Layer.succeed(VoiceToolExecutor, toolExecutor),
+    Layer.mock(ProjectionSnapshotQuery)(projection),
   );
   return {
     appended,
@@ -157,6 +164,7 @@ it.effect(
                   { type: "activity", activity: "listening" } as const,
                   { type: "transcript", role: "user", text: "show threads", final: true } as const,
                 ]),
+                updateContext: () => Effect.void,
                 submitToolOutput: () => Effect.void,
                 terminate: Ref.update(terminated, (count) => count + 1),
               }),
@@ -201,6 +209,148 @@ it.effect(
         expect(yield* Ref.get(terminated)).toBe(1);
       }).pipe(Effect.provide(test.layer));
     }),
+);
+
+it.effect("validates, acknowledges, and journals realtime focus changes in order", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project-focus");
+    const initialThreadId = ThreadId.make("thread-initial");
+    const nextThreadId = ThreadId.make("thread-next");
+    const focusUpdateStarted = yield* Deferred.make<void>();
+    const acknowledgeFocusUpdate = yield* Deferred.make<void>();
+    const updatedItems = yield* Ref.make<Array<string>>([]);
+    const negotiatedContext = yield* Ref.make<ReadonlyArray<string>>([]);
+    const project = { id: projectId } as OrchestrationProjectShell;
+    const thread = (id: ThreadId) => ({ id, projectId }) as OrchestrationThreadShell;
+    const provider: VoiceProviderAdapter = {
+      id: "focus-provider",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Ref.set(
+            negotiatedContext,
+            request.continuationContext.map((item) => item.text),
+          ).pipe(
+            Effect.as({
+              answer: {
+                sessionId: request.sessionId,
+                leaseGeneration: request.leaseGeneration,
+                sdp: "focus-answer",
+              },
+              events: Stream.empty,
+              updateContext: (item) =>
+                Ref.update(updatedItems, (items) => [...items, item.text]).pipe(
+                  Effect.andThen(Deferred.succeed(focusUpdateStarted, undefined)),
+                  Effect.andThen(Deferred.await(acknowledgeFocusUpdate)),
+                ),
+              submitToolOutput: () => Effect.void,
+              terminate: Effect.void,
+            }),
+          ),
+      },
+    };
+    const test = yield* makeLayer(provider, undefined, undefined, {
+      getProjectShellById: (id) =>
+        Effect.succeed(id === projectId ? Option.some(project) : Option.none()),
+      getThreadShellById: (id) =>
+        Effect.succeed(
+          id === initialThreadId || id === nextThreadId ? Option.some(thread(id)) : Option.none(),
+        ),
+    });
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("focus-owner");
+      const created = yield* sessions.create(principal(owner), {
+        ...input(false, "focus-session"),
+        projectId,
+        threadId: initialThreadId,
+      });
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "focus-offer",
+      });
+      expect(yield* Ref.get(negotiatedContext)).toContain(
+        `Active T3 context: project ${projectId}, thread ${initialThreadId}`,
+      );
+      expect((yield* Ref.get(test.appended)).map((entry) => entry.payload)).toEqual([
+        { projectId, threadId: initialThreadId },
+      ]);
+
+      const updating = yield* sessions
+        .updateFocus(owner, created.state.sessionId, {
+          leaseGeneration: created.state.leaseGeneration,
+          projectId,
+          threadId: nextThreadId,
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(focusUpdateStarted);
+      expect(yield* Ref.get(updatedItems)).toEqual([
+        `Active T3 context: project ${projectId}, thread ${nextThreadId}`,
+      ]);
+      expect(yield* Ref.get(test.appended)).toHaveLength(1);
+      yield* Deferred.succeed(acknowledgeFocusUpdate, undefined);
+      const result = yield* Fiber.join(updating);
+      expect(result).toMatchObject({ projectId, threadId: nextThreadId });
+      expect((yield* Ref.get(test.appended)).map((entry) => entry.payload)).toEqual([
+        { projectId, threadId: initialThreadId },
+        { projectId, threadId: nextThreadId },
+      ]);
+
+      const stale = yield* sessions
+        .updateFocus(owner, created.state.sessionId, {
+          leaseGeneration: created.state.leaseGeneration + 1,
+          projectId,
+          threadId: initialThreadId,
+        })
+        .pipe(Effect.flip);
+      expect(stale.reason).toBe("lease-conflict");
+      expect(yield* Ref.get(updatedItems)).toHaveLength(1);
+
+      yield* sessions.close(owner, created.state.sessionId, created.state.leaseGeneration);
+      const ended = yield* sessions
+        .updateFocus(owner, created.state.sessionId, {
+          leaseGeneration: created.state.leaseGeneration,
+          projectId,
+          threadId: initialThreadId,
+        })
+        .pipe(Effect.flip);
+      expect(ended.reason).toBe("invalid-phase");
+      expect(yield* Ref.get(updatedItems)).toHaveLength(1);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("rejects a session focus whose thread belongs to another project", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project-requested");
+    const otherProjectId = ProjectId.make("project-other");
+    const threadId = ThreadId.make("thread-other-project");
+    const provider: VoiceProviderAdapter = {
+      id: "unused-focus-provider",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: { negotiate: () => Effect.die("unused") },
+    };
+    const test = yield* makeLayer(provider, undefined, undefined, {
+      getProjectShellById: () =>
+        Effect.succeed(Option.some({ id: projectId } as OrchestrationProjectShell)),
+      getThreadShellById: () =>
+        Effect.succeed(
+          Option.some({ id: threadId, projectId: otherProjectId } as OrchestrationThreadShell),
+        ),
+    });
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const result = yield* sessions
+        .create(principal(AuthSessionId.make("invalid-focus-owner")), {
+          ...input(false, "invalid-focus"),
+          projectId,
+          threadId,
+        })
+        .pipe(Effect.flip);
+      expect(result.reason).toBe("invalid-context");
+    }).pipe(Effect.provide(test.layer));
+  }),
 );
 
 it.effect("continues a stopped conversation with facts from the prior call", () =>
@@ -254,6 +404,7 @@ it.effect("continues a stopped conversation with facts from the prior call", () 
                           final: true,
                         } as const,
                       ]),
+                updateContext: () => Effect.void,
                 submitToolOutput: () => Effect.void,
                 terminate: Effect.void,
               } satisfies RealtimeProviderSession;
@@ -339,6 +490,7 @@ it.effect("takeover fences an in-flight negotiation and terminates its late prov
           sdp: "late-answer",
         },
         events: Stream.empty,
+        updateContext: () => Effect.void,
         submitToolOutput: () => Effect.void,
         terminate: Ref.update(terminated, (count) => count + 1),
       });
@@ -399,6 +551,7 @@ it.effect("publishes confirmations and submits decided tool output to the provid
               name: "archive_thread",
               argumentsJson: '{"threadId":"thread-one"}',
             }),
+            updateContext: () => Effect.void,
             submitToolOutput: (output) => Ref.update(outputs, (all) => [...all, output]),
             terminate: Effect.void,
           }),
@@ -552,6 +705,7 @@ it.effect("revokes provider sessions and media tickets with their auth session",
               sdp: "answer",
             },
             events: Stream.empty,
+            updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
             terminate: Ref.update(terminated, (count) => count + 1),
           }),
@@ -597,6 +751,7 @@ it.effect("terminates an active call before clearing or deleting its conversatio
               sdp: "answer",
             },
             events: Stream.empty,
+            updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
             terminate: Ref.update(terminated, (count) => count + 1),
           }),

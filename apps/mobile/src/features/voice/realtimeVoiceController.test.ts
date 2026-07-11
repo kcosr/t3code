@@ -1,5 +1,7 @@
 import type { VoiceHttpClient } from "@t3tools/client-runtime/voice";
 import {
+  ProjectId,
+  ThreadId,
   VoiceConversationId,
   VoiceSessionId,
   type VoiceSessionCreateInput,
@@ -72,6 +74,13 @@ const makeHarness = () => {
       Effect.succeed({ state: { ...serverSession.state, phase: "ended" as const }, closed: true }),
     ),
     heartbeatSession: vi.fn(() => Effect.succeed(serverSession.state)),
+    updateSessionFocus: vi.fn(() =>
+      Effect.succeed({
+        state: { ...serverSession.state, sequence: 1 },
+        projectId: ProjectId.make("project-2"),
+        threadId: ThreadId.make("thread-2"),
+      }),
+    ),
     sessionEvents: vi.fn(() => Effect.succeed({ state: serverSession.state, events: [] })),
   } as unknown as VoiceHttpClient;
   const snapshots: Array<string> = [];
@@ -133,6 +142,22 @@ describe("RealtimeVoiceController", () => {
     });
     expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1);
     expect(controller.getSnapshot()).toMatchObject({ phase: "idle", session: null });
+  });
+
+  it("updates focus through the active lease without replacing native media", async () => {
+    const { client, controller, native } = makeHarness();
+    await controller.start(createInput);
+    const projectId = ProjectId.make("project-2");
+    const threadId = ThreadId.make("thread-2");
+
+    await controller.updateFocus(projectId, threadId);
+
+    expect(client.updateSessionFocus).toHaveBeenCalledWith(SESSION_ID, 1, {
+      projectId,
+      threadId,
+    });
+    expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
+    expect(controller.getSnapshot().session?.sequence).toBe(1);
   });
 
   it("closes both sides after repeated control failures", async () => {

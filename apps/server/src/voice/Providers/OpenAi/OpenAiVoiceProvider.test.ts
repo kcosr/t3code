@@ -1,5 +1,7 @@
 import { expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
@@ -392,6 +394,82 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       },
     ]);
     expect(closed).toBe(1);
+  }),
+);
+
+it.effect("waits for an acknowledged live context update on the sideband event stream", () =>
+  Effect.gen(function* () {
+    const queueReady = yield* Deferred.make<Queue.Queue<OpenAiRealtimeSocketEvent>>();
+    const updateSent = yield* Deferred.make<void>();
+    const sent: Array<string> = [];
+    const httpClient = HttpClient.make((request) =>
+      Effect.succeed(
+        HttpClientResponse.fromWeb(
+          request,
+          request.url.endsWith("/hangup")
+            ? new Response(null, { status: 200 })
+            : new Response("answer-sdp", {
+                status: 201,
+                headers: { location: "/v1/realtime/calls/rtc_focus_update" },
+              }),
+        ),
+      ),
+    );
+    const socket = OpenAiRealtimeSocket.of({
+      connect: () =>
+        Effect.gen(function* () {
+          const queue = yield* Queue.unbounded<OpenAiRealtimeSocketEvent>();
+          yield* Deferred.succeed(queueReady, queue);
+          return {
+            events: Stream.fromQueue(queue),
+            receive: Queue.take(queue),
+            send: (data: string) =>
+              Effect.sync(() => sent.push(data)).pipe(
+                Effect.andThen(Deferred.succeed(updateSent, undefined)),
+                Effect.asVoid,
+              ),
+            close: Effect.void,
+          } satisfies OpenAiRealtimeSocketConnection;
+        }),
+    });
+    const provider = yield* __testing.make.pipe(
+      Effect.provideService(HttpClient.HttpClient, httpClient),
+      Effect.provideService(VoiceCredentialStore, credentialStore(Option.some("sk-test"))),
+      Effect.provideService(OpenAiRealtimeSocket, socket),
+    );
+    const session = yield* provider.realtime!.negotiate({
+      sessionId: "voice-session-focus" as never,
+      leaseGeneration: 4,
+      offer: {
+        sessionId: "voice-session-focus" as never,
+        leaseGeneration: 4,
+        sdp: "offer-sdp",
+      },
+      instructions: "test",
+      continuationContext: [],
+    });
+    const eventFiber = yield* session.events.pipe(Stream.runDrain, Effect.forkScoped);
+    const updating = yield* session
+      .updateContext({ role: "system", text: "Active T3 context: project p, thread t" })
+      .pipe(Effect.forkScoped);
+    yield* Deferred.await(updateSent);
+    const updateEvent = decodeJson(sent[0]!) as {
+      readonly event_id: string;
+      readonly item: { readonly id: string };
+    };
+    expect(updateEvent.event_id.length).toBeLessThanOrEqual(32);
+    expect(updateEvent.item.id.length).toBeLessThanOrEqual(32);
+    const queue = yield* Deferred.await(queueReady);
+    yield* Queue.offer(queue, {
+      type: "message",
+      data: encodeJson({
+        type: "conversation.item.done",
+        item: { id: updateEvent.item.id },
+      }),
+    });
+    yield* Fiber.join(updating);
+    yield* Fiber.interrupt(eventFiber);
+    yield* session.terminate;
   }),
 );
 
