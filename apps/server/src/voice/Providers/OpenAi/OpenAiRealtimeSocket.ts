@@ -15,6 +15,7 @@ export type OpenAiRealtimeSocketEvent =
 
 export interface OpenAiRealtimeSocketConnection {
   readonly events: Stream.Stream<OpenAiRealtimeSocketEvent>;
+  readonly receive: Effect.Effect<OpenAiRealtimeSocketEvent, VoiceError>;
   readonly send: (data: string) => Effect.Effect<void, VoiceError>;
   readonly close: Effect.Effect<void>;
 }
@@ -91,6 +92,7 @@ const connect: OpenAiRealtimeSocketShape["connect"] = Effect.fn("OpenAiRealtimeS
 
     return {
       events: Stream.fromQueue(events).pipe(Stream.takeUntil((event) => event.type === "closed")),
+      receive: Queue.take(events),
       send: (data) =>
         Effect.try({
           try: () => socket.send(data),

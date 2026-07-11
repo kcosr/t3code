@@ -1,6 +1,7 @@
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
@@ -34,8 +35,13 @@ const realtimeSocket = (
     connect: () =>
       Effect.gen(function* () {
         yield* Effect.addFinalizer(() => Effect.sync(onClose));
+        const eventQueue = yield* Queue.unbounded<OpenAiRealtimeSocketEvent>();
+        yield* Effect.forEach(events, (event) => Queue.offer(eventQueue, event));
         return {
-          events: Stream.fromIterable(events),
+          events: Stream.fromQueue(eventQueue).pipe(
+            Stream.takeUntil((event) => event.type === "closed"),
+          ),
+          receive: Queue.take(eventQueue),
           send: (data) => Effect.sync(() => sent.push(data)).pipe(Effect.asVoid),
           close: Effect.sync(onClose),
         } satisfies OpenAiRealtimeSocketConnection;
@@ -203,8 +209,25 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
         Effect.gen(function* () {
           socketConnections.push(input);
           yield* Effect.addFinalizer(() => Effect.sync(() => closed++));
-          return {
-            events: Stream.fromIterable([
+          const eventQueue = yield* Queue.unbounded<OpenAiRealtimeSocketEvent>();
+          yield* Effect.forEach(
+            [
+              {
+                type: "message",
+                data: encodeJson({
+                  event_id: "server-replay-1",
+                  type: "conversation.item.created",
+                  item: { id: "t3_replay_item_voice-session-1_3_0" },
+                }),
+              },
+              {
+                type: "message",
+                data: encodeJson({
+                  event_id: "server-replay-2",
+                  type: "conversation.item.created",
+                  item: { id: "t3_replay_item_voice-session-1_3_1" },
+                }),
+              },
               {
                 type: "message",
                 data: encodeJson({
@@ -230,7 +253,14 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
                 }),
               },
               { type: "closed", code: 1000, reason: "done" },
-            ] satisfies ReadonlyArray<OpenAiRealtimeSocketEvent>),
+            ] satisfies ReadonlyArray<OpenAiRealtimeSocketEvent>,
+            (event) => Queue.offer(eventQueue, event),
+          );
+          return {
+            events: Stream.fromQueue(eventQueue).pipe(
+              Stream.takeUntil((event) => event.type === "closed"),
+            ),
+            receive: Queue.take(eventQueue),
             send: (data: string) => Effect.sync(() => sent.push(data)).pipe(Effect.asVoid),
             close: Effect.void,
           } satisfies OpenAiRealtimeSocketConnection;
@@ -283,7 +313,9 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
     expect(sent.map((message) => decodeJson(message))).toEqual([
       {
         type: "conversation.item.create",
+        event_id: "t3_replay_event_voice-session-1_3_0",
         item: {
+          id: "t3_replay_item_voice-session-1_3_0",
           type: "message",
           role: "system",
           status: "completed",
@@ -292,7 +324,9 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       },
       {
         type: "conversation.item.create",
+        event_id: "t3_replay_event_voice-session-1_3_1",
         item: {
+          id: "t3_replay_item_voice-session-1_3_1",
           type: "message",
           role: "assistant",
           status: "completed",
@@ -398,6 +432,139 @@ it.effect("hangs up the provider call when sideband attachment fails", () =>
     expect(requests).toEqual([
       "https://api.openai.com/v1/realtime/calls",
       "https://api.openai.com/v1/realtime/calls/rtc_failed/hangup",
+    ]);
+  }),
+);
+
+it.effect("rejects startup and hangs up when OpenAI rejects a replay item", () =>
+  Effect.gen(function* () {
+    const requests: Array<string> = [];
+    const httpClient = HttpClient.make((request) => {
+      requests.push(request.url);
+      return Effect.succeed(
+        HttpClientResponse.fromWeb(
+          request,
+          request.url.endsWith("/hangup")
+            ? new Response(null, { status: 200 })
+            : new Response("answer-sdp", {
+                status: 201,
+                headers: { location: "/v1/realtime/calls/rtc_replay_rejected" },
+              }),
+        ),
+      );
+    });
+    const sent: Array<string> = [];
+    let closed = 0;
+    const provider = yield* __testing.make.pipe(
+      Effect.provideService(HttpClient.HttpClient, httpClient),
+      Effect.provideService(VoiceCredentialStore, credentialStore(Option.some("sk-test"))),
+      Effect.provideService(
+        OpenAiRealtimeSocket,
+        realtimeSocket(
+          [
+            {
+              type: "message",
+              data: encodeJson({
+                type: "error",
+                error: {
+                  event_id: "t3_replay_event_voice-session-rejected_1_0",
+                  message: "item rejected",
+                },
+              }),
+            },
+          ],
+          sent,
+          () => closed++,
+        ),
+      ),
+    );
+    const error = yield* provider
+      .realtime!.negotiate({
+        sessionId: "voice-session-rejected" as never,
+        leaseGeneration: 1,
+        offer: {
+          sessionId: "voice-session-rejected" as never,
+          leaseGeneration: 1,
+          sdp: "offer-sdp",
+        },
+        instructions: "test",
+        continuationContext: [{ role: "user", text: "My code word is heliotrope." }],
+      })
+      .pipe(Effect.flip);
+
+    expect(error.operation).toBe("openai.realtime.context-replay");
+    expect(error.detail).toBe("OpenAI rejected a context replay item");
+    expect(sent.map((message) => decodeJson(message))).toMatchObject([
+      {
+        type: "conversation.item.create",
+        event_id: "t3_replay_event_voice-session-rejected_1_0",
+        item: { id: "t3_replay_item_voice-session-rejected_1_0" },
+      },
+    ]);
+    expect(requests).toEqual([
+      "https://api.openai.com/v1/realtime/calls",
+      "https://api.openai.com/v1/realtime/calls/rtc_replay_rejected/hangup",
+    ]);
+    expect(closed).toBe(1);
+  }),
+);
+
+it.effect("rejects startup when the sideband closes before every replay item is acknowledged", () =>
+  Effect.gen(function* () {
+    const requests: Array<string> = [];
+    const httpClient = HttpClient.make((request) => {
+      requests.push(request.url);
+      return Effect.succeed(
+        HttpClientResponse.fromWeb(
+          request,
+          request.url.endsWith("/hangup")
+            ? new Response(null, { status: 200 })
+            : new Response("answer-sdp", {
+                status: 201,
+                headers: { location: "/v1/realtime/calls/rtc_replay_incomplete" },
+              }),
+        ),
+      );
+    });
+    const provider = yield* __testing.make.pipe(
+      Effect.provideService(HttpClient.HttpClient, httpClient),
+      Effect.provideService(VoiceCredentialStore, credentialStore(Option.some("sk-test"))),
+      Effect.provideService(
+        OpenAiRealtimeSocket,
+        realtimeSocket([
+          {
+            type: "message",
+            data: encodeJson({
+              type: "conversation.item.created",
+              item: { id: "t3_replay_item_voice-session-incomplete_1_0" },
+            }),
+          },
+          { type: "closed", code: 1006, reason: "connection lost" },
+        ]),
+      ),
+    );
+    const error = yield* provider
+      .realtime!.negotiate({
+        sessionId: "voice-session-incomplete" as never,
+        leaseGeneration: 1,
+        offer: {
+          sessionId: "voice-session-incomplete" as never,
+          leaseGeneration: 1,
+          sdp: "offer-sdp",
+        },
+        instructions: "test",
+        continuationContext: [
+          { role: "user", text: "My code word is heliotrope." },
+          { role: "assistant", text: "I will remember that." },
+        ],
+      })
+      .pipe(Effect.flip);
+
+    expect(error.operation).toBe("openai.realtime.context-replay");
+    expect(error.detail).toBe("OpenAI Realtime closed before context replay completed");
+    expect(requests).toEqual([
+      "https://api.openai.com/v1/realtime/calls",
+      "https://api.openai.com/v1/realtime/calls/rtc_replay_incomplete/hangup",
     ]);
   }),
 );

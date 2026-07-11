@@ -30,6 +30,7 @@ const OPENAI_API_ORIGIN = "https://api.openai.com";
 const TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
 const SPEECH_MODEL = "gpt-4o-mini-tts";
 const REALTIME_MODEL = "gpt-realtime-2.1";
+const CONTEXT_REPLAY_TIMEOUT = "30 seconds";
 const VOICE_PRESETS: Readonly<Record<string, string>> = {
   default: "marin",
   warm: "cedar",
@@ -231,18 +232,89 @@ const providerSessionConfig = (instructions: string) => ({
   tool_choice: "auto",
 });
 
-const continuationEvent = (item: {
-  readonly role: "system" | "user" | "assistant";
-  readonly text: string;
-}) => ({
-  type: "conversation.item.create",
+const continuationEvent = (
   item: {
+    readonly role: "system" | "user" | "assistant";
+    readonly text: string;
+  },
+  identity: { readonly eventId: string; readonly itemId: string },
+) => ({
+  type: "conversation.item.create",
+  event_id: identity.eventId,
+  item: {
+    id: identity.itemId,
     type: "message",
     role: item.role,
     status: "completed",
     content: [{ type: item.role === "assistant" ? "output_text" : "input_text", text: item.text }],
   },
 });
+
+const continuationIdentity = (sessionId: string, leaseGeneration: number, index: number) => ({
+  eventId: `t3_replay_event_${sessionId}_${leaseGeneration}_${index}`,
+  itemId: `t3_replay_item_${sessionId}_${leaseGeneration}_${index}`,
+});
+
+const replayError = (
+  detail: string,
+  options?: { readonly cause?: unknown; readonly retryable?: boolean },
+) =>
+  new VoiceError({
+    reason: "provider-unavailable",
+    operation: "openai.realtime.context-replay",
+    detail,
+    retryable: options?.retryable ?? true,
+    ...(options?.cause === undefined ? {} : { cause: options.cause }),
+  });
+
+type ReplayServerEvent =
+  | { readonly type: "acknowledged"; readonly itemId: string }
+  | { readonly type: "rejected"; readonly clientEventId: string | undefined }
+  | { readonly type: "ignored" };
+
+const parseReplayServerEvent = (
+  event: OpenAiRealtimeSocketEvent,
+): Effect.Effect<ReplayServerEvent, VoiceError> => {
+  if (event.type === "closed") {
+    return Effect.fail(replayError("OpenAI Realtime closed before context replay completed"));
+  }
+  if (event.type === "error") {
+    return Effect.fail(
+      replayError("OpenAI Realtime failed during context replay", { cause: event.cause }),
+    );
+  }
+  let value: unknown;
+  try {
+    value = decodeRealtimeEventJson(event.data);
+  } catch {
+    return Effect.fail(replayError("OpenAI sent an invalid context replay event"));
+  }
+  if (typeof value !== "object" || value === null || !("type" in value)) {
+    return Effect.succeed({ type: "ignored" });
+  }
+  const record = value as Record<string, unknown>;
+  if (record.type === "conversation.item.created") {
+    const item = record.item;
+    return Effect.succeed(
+      typeof item === "object" &&
+        item !== null &&
+        typeof (item as Record<string, unknown>).id === "string"
+        ? { type: "acknowledged", itemId: (item as { readonly id: string }).id }
+        : { type: "ignored" },
+    );
+  }
+  if (record.type === "error") {
+    const error = record.error;
+    const clientEventId =
+      typeof error === "object" &&
+      error !== null &&
+      typeof (error as Record<string, unknown>).event_id === "string"
+        ? ((error as Record<string, unknown>).event_id as string)
+        : undefined;
+    return Effect.succeed({ type: "rejected", clientEventId });
+  }
+  return Effect.succeed({ type: "ignored" });
+};
 
 const requireApiKey = (credentials: VoiceCredentialStore["Service"]) =>
   credentials.getOpenAiApiKey.pipe(
@@ -425,19 +497,79 @@ const make = Effect.gen(function* () {
             ),
           ),
         );
-      for (const item of input.continuationContext) {
-        yield* sideband
-          .send(encodeJson(continuationEvent(item)))
-          .pipe(
-            Effect.catch((cause) =>
-              hangup.pipe(
-                Effect.ignore,
-                Effect.andThen(Scope.close(sessionScope, Exit.void)),
-                Effect.andThen(Effect.fail(cause)),
-              ),
+      const abortStartup = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        effect.pipe(
+          Effect.catch((cause) =>
+            hangup.pipe(
+              Effect.ignore,
+              Effect.andThen(Scope.close(sessionScope, Exit.void)),
+              Effect.andThen(Effect.fail(cause)),
             ),
-          );
-      }
+          ),
+        );
+      const replayItems = input.continuationContext.map((item, index) => ({
+        item,
+        identity: continuationIdentity(input.sessionId, input.leaseGeneration, index),
+      }));
+      yield* Effect.logInfo("OpenAI Realtime context replay starting", {
+        requestedItemCount: replayItems.length,
+      });
+      const acknowledgedReplayItems = yield* Ref.make(0);
+      const acknowledgedItemCount = yield* Effect.gen(function* () {
+        const pendingByItemId = new Map(
+          replayItems.map(({ identity }) => [identity.itemId, identity.eventId] as const),
+        );
+        const pendingEventIds = new Set(replayItems.map(({ identity }) => identity.eventId));
+        for (const { item, identity } of replayItems) {
+          yield* sideband.send(encodeJson(continuationEvent(item, identity)));
+        }
+        while (pendingByItemId.size > 0) {
+          const replayEvent = yield* sideband.receive.pipe(Effect.flatMap(parseReplayServerEvent));
+          if (replayEvent.type === "acknowledged") {
+            const clientEventId = pendingByItemId.get(replayEvent.itemId);
+            if (clientEventId !== undefined) {
+              pendingByItemId.delete(replayEvent.itemId);
+              pendingEventIds.delete(clientEventId);
+              yield* Ref.update(acknowledgedReplayItems, (count) => count + 1);
+            }
+            continue;
+          }
+          if (
+            replayEvent.type === "rejected" &&
+            (replayEvent.clientEventId === undefined ||
+              pendingEventIds.has(replayEvent.clientEventId))
+          ) {
+            return yield* replayError("OpenAI rejected a context replay item", {
+              retryable: false,
+            });
+          }
+        }
+        return yield* Ref.get(acknowledgedReplayItems);
+      }).pipe(
+        Effect.timeoutOption(CONTEXT_REPLAY_TIMEOUT),
+        Effect.flatMap(
+          Option.match({
+            onNone: () =>
+              Effect.fail(replayError("OpenAI context replay did not acknowledge every item")),
+            onSome: Effect.succeed,
+          }),
+        ),
+        Effect.tapError(() =>
+          Ref.get(acknowledgedReplayItems).pipe(
+            Effect.flatMap((acknowledgedItemCount) =>
+              Effect.logWarning("OpenAI Realtime context replay failed", {
+                requestedItemCount: replayItems.length,
+                acknowledgedItemCount,
+              }),
+            ),
+          ),
+        ),
+        abortStartup,
+      );
+      yield* Effect.logInfo("OpenAI Realtime context replay completed", {
+        requestedItemCount: replayItems.length,
+        acknowledgedItemCount,
+      });
 
       const submittedToolOutputs = yield* Ref.make(new Set<string>());
       const terminated = yield* Ref.make(false);

@@ -46,7 +46,7 @@ const SESSION_DURATION_SECONDS = 55 * 60;
 const MAX_BUFFERED_EVENTS = 512;
 const MAX_RETAINED_TERMINAL_SESSIONS = 128;
 const INSTRUCTIONS =
-  "You are the T3 voice agent. Be concise, state what you are about to do before using a tool, and use only the supplied T3 tools.";
+  "You are the T3 voice agent. Be concise, state what you are about to do before using a tool, and use only the supplied T3 tools. Prior conversation items are the user's actual history from this same ongoing conversation: use them as memory, preserve continuity across calls and devices, and never claim that you cannot remember information present in that history.";
 
 interface RuntimeSession {
   readonly lease: VoiceSessionLease;

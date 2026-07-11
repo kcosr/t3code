@@ -24,7 +24,7 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import { layerTest as serverSettingsLayerTest } from "../../serverSettings.ts";
-import { VoiceContextCompiler } from "../Services/VoiceContextCompiler.ts";
+import type { VoiceConversationJournalEntry } from "../../persistence/Services/VoiceConversations.ts";
 import { VoiceConversationService } from "../Services/VoiceConversationService.ts";
 import type { RealtimeProviderSession, VoiceProviderAdapter } from "../Services/VoiceProvider.ts";
 import { voiceProviderRegistryLayer } from "../Services/VoiceProviderRegistry.ts";
@@ -35,6 +35,7 @@ import {
 } from "../Services/VoiceMediaTicketRegistry.ts";
 import { VoiceSessionService } from "../Services/VoiceSessionService.ts";
 import { VoiceToolExecutor } from "../Services/VoiceToolExecutor.ts";
+import { VoiceContextCompilerLive } from "./VoiceContextCompiler.ts";
 import { VoiceSessionServiceLive } from "./VoiceSessionService.ts";
 
 const conversationId = VoiceConversationId.make("conversation-test");
@@ -81,7 +82,29 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
     maxConcurrentSessions: 16,
   },
 ) {
-  const appended = yield* Ref.make<Array<{ readonly kind: string; readonly payload: unknown }>>([]);
+  const appended = yield* Ref.make<Array<VoiceConversationJournalEntry>>([]);
+  const append = (
+    entryId: string | undefined,
+    kind: VoiceConversationJournalEntry["kind"],
+    payload: unknown,
+  ) =>
+    Effect.gen(function* () {
+      const entries = yield* Ref.get(appended);
+      const resolvedEntryId = entryId ?? `entry-${entries.length + 1}`;
+      const existing = entries.find((entry) => entry.entryId === resolvedEntryId);
+      if (existing !== undefined) return existing;
+      const entry: VoiceConversationJournalEntry = {
+        entryId: resolvedEntryId,
+        conversationId,
+        epoch: 1,
+        sequence: entries.length + 1,
+        kind,
+        payload,
+        occurredAt: "2026-07-10T12:00:00.000Z",
+      };
+      yield* Ref.update(appended, (current) => [...current, entry]);
+      return entry;
+    });
   const conversations = VoiceConversationService.of({
     create: () => Effect.succeed(summary),
     listDurable: Effect.succeed([]),
@@ -93,37 +116,13 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
         activeEpoch: 2,
         clearedAt: "2026-07-10T12:01:00.000Z",
       }),
-    listContext: () => Effect.succeed([]),
-    appendContext: (entry) =>
-      Ref.update(appended, (entries) => [...entries, entry]).pipe(
-        Effect.as({
-          entryId: "entry-test",
-          conversationId,
-          epoch: 1,
-          sequence: 1,
-          kind: entry.kind,
-          payload: entry.payload,
-          occurredAt: "2026-07-10T12:00:00.000Z",
-        }),
-      ),
-    appendContextIdempotent: (entry) =>
-      Ref.update(appended, (entries) => [...entries, entry]).pipe(
-        Effect.as({
-          entryId: entry.entryId,
-          conversationId,
-          epoch: 1,
-          sequence: 1,
-          kind: entry.kind,
-          payload: entry.payload,
-          occurredAt: "2026-07-10T12:00:00.000Z",
-        }),
-      ),
+    listContext: () => Ref.get(appended),
+    appendContext: (entry) => append(undefined, entry.kind, entry.payload),
+    appendContextIdempotent: (entry) => append(entry.entryId, entry.kind, entry.payload),
   });
   const dependencies = Layer.mergeAll(
     Layer.succeed(VoiceConversationService, conversations),
-    Layer.succeed(VoiceContextCompiler, {
-      compile: () => Effect.succeed({ items: [], includedThroughSequence: 0, estimatedTokens: 0 }),
-    }),
+    VoiceContextCompilerLive,
     voiceProviderRegistryLayer([provider], new Map([["agent.realtime", provider.id]])),
     VoiceSessionRegistryLive.pipe(Layer.provide(NodeServices.layer)),
     VoiceMediaTicketRegistryLive.pipe(Layer.provide(NodeServices.layer)),
@@ -141,24 +140,27 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const terminated = yield* Ref.make(0);
+      const negotiatedInstructions = yield* Ref.make("");
       const provider: VoiceProviderAdapter = {
         id: "fake",
         capabilities: new Set(["agent.realtime"]),
         realtime: {
           negotiate: (request) =>
-            Effect.succeed({
-              answer: {
-                sessionId: request.sessionId,
-                leaseGeneration: request.leaseGeneration,
-                sdp: "fake-answer",
-              },
-              events: Stream.fromIterable([
-                { type: "activity", activity: "listening" } as const,
-                { type: "transcript", role: "user", text: "show threads", final: true } as const,
-              ]),
-              submitToolOutput: () => Effect.void,
-              terminate: Ref.update(terminated, (count) => count + 1),
-            }),
+            Ref.set(negotiatedInstructions, request.instructions).pipe(
+              Effect.as({
+                answer: {
+                  sessionId: request.sessionId,
+                  leaseGeneration: request.leaseGeneration,
+                  sdp: "fake-answer",
+                },
+                events: Stream.fromIterable([
+                  { type: "activity", activity: "listening" } as const,
+                  { type: "transcript", role: "user", text: "show threads", final: true } as const,
+                ]),
+                submitToolOutput: () => Effect.void,
+                terminate: Ref.update(terminated, (count) => count + 1),
+              }),
+            ),
         },
       };
       const test = yield* makeLayer(provider);
@@ -174,6 +176,9 @@ it.effect(
           sdp: "fake-offer",
         });
         expect(answer.sdp).toBe("fake-answer");
+        expect(yield* Ref.get(negotiatedInstructions)).toContain(
+          "Prior conversation items are the user's actual history from this same ongoing conversation",
+        );
         yield* Effect.yieldNow;
         const snapshot = yield* sessions.events(owner, created.state.sessionId, 0, 0);
         expect(snapshot.events.some((event) => event.type === "transcript" && event.final)).toBe(
@@ -196,6 +201,104 @@ it.effect(
         expect(yield* Ref.get(terminated)).toBe(1);
       }).pipe(Effect.provide(test.layer));
     }),
+);
+
+it.effect("continues a stopped conversation with facts from the prior call", () =>
+  Effect.gen(function* () {
+    const negotiationCount = yield* Ref.make(0);
+    const provider: VoiceProviderAdapter = {
+      id: "continuity-model",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Ref.getAndUpdate(negotiationCount, (count) => count + 1).pipe(
+            Effect.map((callIndex) => {
+              const remembered = request.continuationContext.some(
+                (item) => item.role === "user" && item.text.includes("heliotrope"),
+              );
+              return {
+                answer: {
+                  sessionId: request.sessionId,
+                  leaseGeneration: request.leaseGeneration,
+                  sdp: `fake-answer-${callIndex + 1}`,
+                },
+                events:
+                  callIndex === 0
+                    ? Stream.fromIterable([
+                        {
+                          type: "transcript",
+                          role: "user",
+                          text: "My code word is heliotrope.",
+                          final: true,
+                        } as const,
+                        {
+                          type: "transcript",
+                          role: "assistant",
+                          text: "I will remember that.",
+                          final: true,
+                        } as const,
+                      ])
+                    : Stream.fromIterable([
+                        {
+                          type: "transcript",
+                          role: "user",
+                          text: "What was my code word?",
+                          final: true,
+                        } as const,
+                        {
+                          type: "transcript",
+                          role: "assistant",
+                          text: remembered
+                            ? "Your code word was heliotrope."
+                            : "I do not remember it.",
+                          final: true,
+                        } as const,
+                      ]),
+                submitToolOutput: () => Effect.void,
+                terminate: Effect.void,
+              } satisfies RealtimeProviderSession;
+            }),
+          ),
+      },
+    };
+    const test = yield* makeLayer(provider);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("continuity-phone");
+      const first = yield* sessions.create(principal(owner), input(false, "continuity-first"));
+      yield* sessions.offer(owner, first.state.sessionId, {
+        sessionId: first.state.sessionId,
+        leaseGeneration: first.state.leaseGeneration,
+        sdp: "first-offer",
+      });
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      expect((yield* Ref.get(test.appended)).map((entry) => entry.payload)).toEqual([
+        { text: "My code word is heliotrope." },
+        { text: "I will remember that." },
+      ]);
+      yield* sessions.close(owner, first.state.sessionId, first.state.leaseGeneration);
+
+      const resumed = yield* sessions.create(principal(owner), input(false, "continuity-resumed"));
+      yield* sessions.offer(owner, resumed.state.sessionId, {
+        sessionId: resumed.state.sessionId,
+        leaseGeneration: resumed.state.leaseGeneration,
+        sdp: "resumed-offer",
+      });
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      const snapshot = yield* sessions.events(owner, resumed.state.sessionId, 0, 0);
+      expect(
+        snapshot.events.some(
+          (event) =>
+            event.type === "transcript" &&
+            event.role === "assistant" &&
+            event.final &&
+            event.text === "Your code word was heliotrope.",
+        ),
+      ).toBe(true);
+    }).pipe(Effect.provide(test.layer));
+  }),
 );
 
 it.effect("takeover fences an in-flight negotiation and terminates its late provider call", () =>
