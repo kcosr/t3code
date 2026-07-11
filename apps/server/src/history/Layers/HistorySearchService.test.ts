@@ -12,11 +12,14 @@ import {
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { ServerSecretStore } from "../../auth/ServerSecretStore.ts";
 import { HistorySearchRepositoryLive } from "../../persistence/Layers/HistorySearch.ts";
+import { HistorySearchRepository } from "../../persistence/Services/HistorySearch.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import { HistoryAuthorizationPolicy } from "../Services/HistoryAuthorizationPolicy.ts";
 import { HistorySearchService } from "../Services/HistorySearchService.ts";
 import { HistoryAuthorizationPolicyLive } from "./HistoryAuthorizationPolicy.ts";
 import { HistorySearchServiceLive } from "./HistorySearchService.ts";
@@ -83,6 +86,58 @@ const seedThreadHistory = Effect.fn("seedThreadHistory")(function* () {
         '2026-07-11T10:03:00.000Z', '2026-07-11T10:03:00.000Z')
   `;
 });
+
+it.effect("retries a first page until its index generation is stable", () =>
+  Effect.gen(function* () {
+    const generationReads = yield* Ref.make(0);
+    const searches = yield* Ref.make(0);
+    const repository = HistorySearchRepository.of({
+      getGenerations: () =>
+        Ref.getAndUpdate(generationReads, (count) => count + 1).pipe(
+          Effect.map((count) => ({ threadMessage: count === 0 ? 0 : 1, voiceEntry: 0 })),
+        ),
+      searchThread: () =>
+        Ref.update(searches, (count) => count + 1).pipe(
+          Effect.as([
+            {
+              source: "thread-message" as const,
+              projectId: ProjectId.make("project-retry"),
+              threadId: ThreadId.make("thread-retry"),
+              messageId: MessageId.make("message-retry"),
+              containerTitle: "Retry",
+              roleOrKind: "user",
+              text: "portable retry",
+              occurredAt: "2026-07-11T10:00:00.000Z" as never,
+              rawRank: -1,
+            },
+          ]),
+        ),
+      searchVoice: () => Effect.succeed([]),
+      readThread: () => Effect.succeed(Option.none()),
+      readVoice: () => Effect.succeed(Option.none()),
+    });
+    const result = yield* Effect.gen(function* () {
+      const service = yield* HistorySearchService;
+      return yield* service.search(principal, {
+        query: "portable",
+        sources: ["thread-message"],
+        limit: 5,
+      });
+    }).pipe(
+      Effect.provide(HistorySearchServiceLive),
+      Effect.provideService(HistorySearchRepository, repository),
+      Effect.provideService(HistoryAuthorizationPolicy, {
+        authorizeSearch: () => Effect.succeed(true),
+        authorizeRead: () => Effect.succeed(true),
+      }),
+      Effect.provide(SecretStoreTest),
+    );
+
+    assert.equal(result.matches.length, 1);
+    assert.equal(yield* Ref.get(searches), 2);
+    assert.equal(yield* Ref.get(generationReads), 4);
+  }),
+);
 
 const seedVoiceHistory = Effect.fn("seedVoiceHistory")(function* () {
   const sql = yield* SqlClient.SqlClient;

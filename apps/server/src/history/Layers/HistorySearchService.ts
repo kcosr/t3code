@@ -45,6 +45,7 @@ const CURSOR_VERSION = 1;
 const HISTORY_RESPONSE_MAX_BYTES = 28 * 1024;
 const HISTORY_RECORD_MAX_BYTES = 1_000;
 const HISTORY_EXCERPT_MAX_BYTES = 900;
+const FIRST_PAGE_STABLE_SNAPSHOT_ATTEMPTS = 3;
 
 const SearchFrontier = Schema.Struct({
   rawRank: Schema.Number,
@@ -276,77 +277,98 @@ const make = Effect.gen(function* () {
       }
 
       const fingerprint = requestFingerprint(input);
-      const generationsBefore = yield* repository
-        .getGenerations()
-        .pipe(Effect.mapError((cause) => unavailable("search", cause)));
       const cursor =
         input.cursor === undefined ? undefined : Option.getOrUndefined(decodeCursor(input.cursor));
       if (
         input.cursor !== undefined &&
-        (cursor === undefined ||
-          cursor.fingerprint !== fingerprint ||
-          !generationsMatch(input, cursor.generations, generationsBefore))
+        (cursor === undefined || cursor.fingerprint !== fingerprint)
       ) {
         return yield* invalid("invalid_cursor");
       }
 
       const query = normalizedQuery(input.query);
       const fetchLimit = input.limit + 1;
-      const [threadRows, voiceRows] = yield* Effect.all(
-        [
-          input.sources.includes("thread-message")
-            ? repository.searchThread({
-                query,
-                limit: fetchLimit,
-                ...(input.projectId === undefined ? {} : { projectId: input.projectId }),
-                ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
-                ...(input.roles === undefined ? {} : { roles: input.roles }),
-                ...(input.occurredAfter === undefined
-                  ? {}
-                  : { occurredAfter: input.occurredAfter }),
-                ...(input.occurredBefore === undefined
-                  ? {}
-                  : { occurredBefore: input.occurredBefore }),
-                ...(cursor?.threadAfter === undefined
-                  ? {}
-                  : { after: cursor.threadAfter as HistoryRepositorySearchCursor }),
-              })
-            : Effect.succeed([] as ReadonlyArray<ThreadHistorySearchRow>),
-          input.sources.includes("voice-entry")
-            ? repository.searchVoice({
-                query,
-                limit: fetchLimit,
-                ...(input.voiceScope?.type === "conversation"
-                  ? { conversationId: input.voiceScope.conversationId }
-                  : {}),
-                ...(input.roles === undefined ? {} : { roles: input.roles }),
-                ...(input.occurredAfter === undefined
-                  ? {}
-                  : { occurredAfter: input.occurredAfter }),
-                ...(input.occurredBefore === undefined
-                  ? {}
-                  : { occurredBefore: input.occurredBefore }),
-                ...(cursor?.voiceAfter === undefined
-                  ? {}
-                  : { after: cursor.voiceAfter as HistoryRepositorySearchCursor }),
-              })
-            : Effect.succeed([] as ReadonlyArray<VoiceHistorySearchRow>),
-        ] as const,
-        { concurrency: 2 },
-      ).pipe(
-        Effect.catchTag("HistorySearchQueryError", () => Effect.fail(invalid("invalid_query"))),
-        Effect.mapError((cause) =>
-          cause._tag === "HistoryInvalidRequestError" ? cause : unavailable("search", cause),
-        ),
-      );
-      const generationsAfter = yield* repository
-        .getGenerations()
-        .pipe(Effect.mapError((cause) => unavailable("search", cause)));
-      if (!generationsMatch(input, generationsBefore, generationsAfter)) {
-        return yield* input.cursor === undefined
-          ? unavailable("search", new Error("history index changed during search"))
-          : invalid("invalid_cursor");
+      let stablePage:
+        | {
+            readonly threadRows: ReadonlyArray<ThreadHistorySearchRow>;
+            readonly voiceRows: ReadonlyArray<VoiceHistorySearchRow>;
+            readonly generations: HistoryIndexGenerations;
+          }
+        | undefined;
+      const maxAttempts = input.cursor === undefined ? FIRST_PAGE_STABLE_SNAPSHOT_ATTEMPTS : 1;
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        const generationsBefore = yield* repository
+          .getGenerations()
+          .pipe(Effect.mapError((cause) => unavailable("search", cause)));
+        if (
+          cursor !== undefined &&
+          !generationsMatch(input, cursor.generations, generationsBefore)
+        ) {
+          return yield* invalid("invalid_cursor");
+        }
+        const [threadRows, voiceRows] = yield* Effect.all(
+          [
+            input.sources.includes("thread-message")
+              ? repository.searchThread({
+                  query,
+                  limit: fetchLimit,
+                  ...(input.projectId === undefined ? {} : { projectId: input.projectId }),
+                  ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+                  ...(input.roles === undefined ? {} : { roles: input.roles }),
+                  ...(input.occurredAfter === undefined
+                    ? {}
+                    : { occurredAfter: input.occurredAfter }),
+                  ...(input.occurredBefore === undefined
+                    ? {}
+                    : { occurredBefore: input.occurredBefore }),
+                  ...(cursor?.threadAfter === undefined
+                    ? {}
+                    : { after: cursor.threadAfter as HistoryRepositorySearchCursor }),
+                })
+              : Effect.succeed([] as ReadonlyArray<ThreadHistorySearchRow>),
+            input.sources.includes("voice-entry")
+              ? repository.searchVoice({
+                  query,
+                  limit: fetchLimit,
+                  ...(input.voiceScope?.type === "conversation"
+                    ? { conversationId: input.voiceScope.conversationId }
+                    : {}),
+                  ...(input.roles === undefined ? {} : { roles: input.roles }),
+                  ...(input.occurredAfter === undefined
+                    ? {}
+                    : { occurredAfter: input.occurredAfter }),
+                  ...(input.occurredBefore === undefined
+                    ? {}
+                    : { occurredBefore: input.occurredBefore }),
+                  ...(cursor?.voiceAfter === undefined
+                    ? {}
+                    : { after: cursor.voiceAfter as HistoryRepositorySearchCursor }),
+                })
+              : Effect.succeed([] as ReadonlyArray<VoiceHistorySearchRow>),
+          ] as const,
+          { concurrency: 2 },
+        ).pipe(
+          Effect.catchTag("HistorySearchQueryError", () => Effect.fail(invalid("invalid_query"))),
+          Effect.mapError((cause) =>
+            cause._tag === "HistoryInvalidRequestError" ? cause : unavailable("search", cause),
+          ),
+        );
+        const generationsAfter = yield* repository
+          .getGenerations()
+          .pipe(Effect.mapError((cause) => unavailable("search", cause)));
+        if (generationsMatch(input, generationsBefore, generationsAfter)) {
+          stablePage = { threadRows, voiceRows, generations: generationsAfter };
+          break;
+        }
+        if (input.cursor !== undefined) return yield* invalid("invalid_cursor");
       }
+      if (stablePage === undefined) {
+        return yield* unavailable(
+          "search",
+          new Error("history index remained unstable during search"),
+        );
+      }
+      const { threadRows, voiceRows, generations: stableGenerations } = stablePage;
 
       const threadOffset = cursor?.threadOffset ?? 0;
       const voiceOffset = cursor?.voiceOffset ?? 0;
@@ -391,7 +413,7 @@ const make = Effect.gen(function* () {
           ? encodeCursor({
               version: CURSOR_VERSION,
               fingerprint,
-              generations: generationsAfter,
+              generations: stableGenerations,
               threadOffset: threadOffset + consumedThreads,
               voiceOffset: voiceOffset + consumedVoice,
               ...(threadAfter === undefined ? {} : { threadAfter }),

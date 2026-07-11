@@ -370,6 +370,26 @@ const realtimeDiagnostic = (
   };
 };
 
+const completedFunctionCall = (
+  value: unknown,
+):
+  | {
+      readonly callId: string;
+      readonly name: string;
+      readonly argumentsJson: string;
+    }
+  | undefined => {
+  if (typeof value !== "object" || value === null) return undefined;
+  const call = value as Record<string, unknown>;
+  return call.type === "function_call" &&
+    call.status === "completed" &&
+    typeof call.call_id === "string" &&
+    typeof call.name === "string" &&
+    typeof call.arguments === "string"
+    ? { callId: call.call_id, name: call.name, argumentsJson: call.arguments }
+    : undefined;
+};
+
 const parseRealtimeEvent = (
   event: OpenAiRealtimeSocketEvent,
 ): ReadonlyArray<RealtimeProviderEvent> => {
@@ -401,22 +421,17 @@ const parseRealtimeEvent = (
       const responseRecord = response as Record<string, unknown>;
       const calls = Array.isArray(responseRecord.output)
         ? responseRecord.output.flatMap((item): ReadonlyArray<RealtimeProviderEvent> => {
-            if (typeof item !== "object" || item === null) return [];
-            const call = item as Record<string, unknown>;
-            return call.type === "function_call" &&
-              call.status === "completed" &&
-              typeof call.call_id === "string" &&
-              typeof call.name === "string" &&
-              typeof call.arguments === "string"
-              ? [
+            const call = completedFunctionCall(item);
+            return call === undefined
+              ? []
+              : [
                   {
                     type: "function-call",
-                    providerFunctionCallId: call.call_id,
+                    providerFunctionCallId: call.callId,
                     name: call.name,
-                    argumentsJson: call.arguments,
+                    argumentsJson: call.argumentsJson,
                   },
-                ]
-              : [];
+                ];
           })
         : [];
       return [...calls, { type: "activity", activity: "idle" }];
@@ -902,15 +917,8 @@ const make = Effect.gen(function* () {
                 const pendingFunctionCalls = new Set(state.pendingFunctionCalls);
                 if (Array.isArray(functionCallIds)) {
                   for (const item of functionCallIds) {
-                    if (typeof item !== "object" || item === null) continue;
-                    const call = item as Record<string, unknown>;
-                    if (
-                      call.type === "function_call" &&
-                      call.status === "completed" &&
-                      typeof call.call_id === "string"
-                    ) {
-                      pendingFunctionCalls.add(call.call_id);
-                    }
+                    const call = completedFunctionCall(item);
+                    if (call !== undefined) pendingFunctionCalls.add(call.callId);
                   }
                 }
                 return { ...state, activeResponse: false, pendingFunctionCalls };

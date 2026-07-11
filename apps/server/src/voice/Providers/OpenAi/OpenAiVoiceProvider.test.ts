@@ -645,6 +645,83 @@ it.effect("coalesces parallel tool outputs into one continuation in either compl
   }),
 );
 
+it.effect("does not track malformed completed function calls as pending continuations", () =>
+  Effect.gen(function* () {
+    const sent: Array<string> = [];
+    const httpClient = HttpClient.make((request) =>
+      Effect.succeed(
+        HttpClientResponse.fromWeb(
+          request,
+          request.url.endsWith("/hangup")
+            ? new Response(null, { status: 200 })
+            : new Response("answer-sdp", {
+                status: 201,
+                headers: { location: "/v1/realtime/calls/rtc_malformed_tool" },
+              }),
+        ),
+      ),
+    );
+    const responseDone = (output: ReadonlyArray<unknown>): OpenAiRealtimeSocketEvent => ({
+      type: "message",
+      data: encodeJson({ type: "response.done", response: { output } }),
+    });
+    const provider = yield* __testing.make.pipe(
+      Effect.provideService(HttpClient.HttpClient, httpClient),
+      Effect.provideService(VoiceCredentialStore, credentialStore(Option.some("sk-test"))),
+      Effect.provideService(
+        OpenAiRealtimeSocket,
+        realtimeSocket(
+          [
+            responseDone([
+              {
+                type: "function_call",
+                status: "completed",
+                call_id: "call_malformed",
+              },
+            ]),
+            responseDone([
+              {
+                type: "function_call",
+                status: "completed",
+                call_id: "call_valid",
+                name: "search_history",
+                arguments: "{}",
+              },
+            ]),
+            { type: "closed", code: 1000, reason: "done" },
+          ],
+          sent,
+        ),
+      ),
+    );
+    const session = yield* provider.realtime!.negotiate({
+      sessionId: "voice-session-malformed-tool" as never,
+      leaseGeneration: 1,
+      offer: {
+        sessionId: "voice-session-malformed-tool" as never,
+        leaseGeneration: 1,
+        sdp: "offer-sdp",
+      },
+      instructions: "test",
+      continuationContext: [],
+    });
+    yield* session.events.pipe(Stream.runDrain);
+    yield* session.submitToolOutput({
+      providerFunctionCallId: "call_valid",
+      output: "{}",
+    });
+
+    expect(sent.map((message) => decodeJson(message))).toEqual([
+      {
+        type: "conversation.item.create",
+        item: { type: "function_call_output", call_id: "call_valid", output: "{}" },
+      },
+      { type: "response.create" },
+    ]);
+    yield* session.terminate;
+  }),
+);
+
 it.effect("waits for an acknowledged live context update on the sideband event stream", () =>
   Effect.gen(function* () {
     const queueReady = yield* Deferred.make<Queue.Queue<OpenAiRealtimeSocketEvent>>();
