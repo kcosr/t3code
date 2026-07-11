@@ -463,12 +463,21 @@ const make = Effect.gen(function* () {
         }
         return yield* setPhase(lease, event.activity);
       case "transcript":
-        yield* emit(lease, {
-          type: "transcript",
-          role: event.role,
-          text: event.text,
-          final: event.final,
-        });
+        if (event.final) {
+          yield* emit(lease, {
+            type: "transcript",
+            role: event.role,
+            text: event.text,
+            final: true,
+          });
+        } else {
+          yield* emit(lease, {
+            type: "transcript",
+            role: event.role,
+            text: event.text,
+            final: false,
+          });
+        }
         if (event.final) {
           yield* conversations.appendContextIdempotent({
             entryId: transcriptEntryId(lease, event.role, event.sourceId),

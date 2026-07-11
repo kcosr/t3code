@@ -478,7 +478,9 @@ const parseRealtimeEvent = (
         ? [{ type: "transcript", role: "user", text: record.delta, final: false }]
         : [];
     case "conversation.item.input_audio_transcription.completed":
-      if (typeof record.transcript !== "string" || record.transcript.length === 0) return [];
+      if (typeof record.transcript !== "string") return [];
+      const inputTranscript = record.transcript.trim();
+      if (inputTranscript.length === 0) return [];
       if (
         typeof record.item_id !== "string" ||
         !Number.isInteger(record.content_index) ||
@@ -496,7 +498,7 @@ const parseRealtimeEvent = (
         {
           type: "transcript",
           role: "user",
-          text: record.transcript,
+          text: inputTranscript,
           final: true,
           sourceId: `input:${record.item_id}:${record.content_index}`,
         },
@@ -506,7 +508,9 @@ const parseRealtimeEvent = (
         ? [{ type: "transcript", role: "assistant", text: record.delta, final: false }]
         : [];
     case "response.output_audio_transcript.done":
-      if (typeof record.transcript !== "string" || record.transcript.length === 0) return [];
+      if (typeof record.transcript !== "string") return [];
+      const outputTranscript = record.transcript.trim();
+      if (outputTranscript.length === 0) return [];
       if (
         typeof record.item_id !== "string" ||
         !Number.isInteger(record.content_index) ||
@@ -524,7 +528,7 @@ const parseRealtimeEvent = (
         {
           type: "transcript",
           role: "assistant",
-          text: record.transcript,
+          text: outputTranscript,
           final: true,
           sourceId: `output:${record.item_id}:${record.content_index}`,
         },

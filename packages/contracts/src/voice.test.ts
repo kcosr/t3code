@@ -10,11 +10,13 @@ import {
   VoiceSessionCreateInput,
   VoiceSessionFocusInput,
   VoiceSessionEvent,
+  VoiceSessionEventsResult,
   VoiceWebRtcOffer,
   VoiceTranscriptionStreamEvent,
 } from "./voice.ts";
 
 const decodeUnknownSync = Schema.decodeUnknownSync;
+const encodeSync = Schema.encodeSync;
 
 describe("voice contracts", () => {
   it("decodes a provider-neutral realtime session request", () => {
@@ -142,6 +144,53 @@ describe("voice contracts", () => {
 
     expect(decoded.type).toBe("confirmation-required");
     expect(decoded).not.toHaveProperty("providerCallId");
+  });
+
+  it("preserves partial transcript boundaries and normalizes final transcripts", () => {
+    const eventBase = {
+      type: "transcript" as const,
+      sessionId: "voice-session-1",
+      leaseGeneration: 1,
+      sequence: 8,
+      occurredAt: "2026-07-10T20:00:00.000Z",
+      role: "assistant" as const,
+    };
+
+    expect(decodeUnknownSync(VoiceSessionEvent)({ ...eventBase, text: " ", final: false })).toEqual(
+      { ...eventBase, text: " ", final: false },
+    );
+    expect(
+      decodeUnknownSync(VoiceSessionEvent)({ ...eventBase, text: " next ", final: false }),
+    ).toEqual({ ...eventBase, text: " next ", final: false });
+    const partial = decodeUnknownSync(VoiceSessionEvent)({
+      ...eventBase,
+      text: " next ",
+      final: false,
+    });
+    expect(encodeSync(VoiceSessionEvent)(partial)).toEqual({
+      ...eventBase,
+      text: " next ",
+      final: false,
+    });
+    expect(
+      decodeUnknownSync(VoiceSessionEvent)({ ...eventBase, text: "  Finished.  ", final: true }),
+    ).toEqual({ ...eventBase, text: "Finished.", final: true });
+    expect(() =>
+      decodeUnknownSync(VoiceSessionEvent)({ ...eventBase, text: " ", final: true }),
+    ).toThrow();
+
+    const result = decodeUnknownSync(VoiceSessionEventsResult)({
+      state: {
+        sessionId: "voice-session-1",
+        conversationId: "voice-conversation-1",
+        mode: "realtime-agent",
+        phase: "speaking",
+        leaseGeneration: 1,
+        sequence: 8,
+      },
+      events: [{ ...eventBase, text: " ", final: false }],
+    });
+    expect(result.events[0]).toMatchObject({ text: " ", final: false, sequence: 8 });
   });
 
   it("defines streaming recognition deltas and an authoritative final event", () => {

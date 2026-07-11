@@ -367,8 +367,15 @@ export const VoiceSessionEvent = Schema.Union([
     ...VoiceEventBase,
     type: Schema.Literal("transcript"),
     role: VoiceTranscriptRole,
+    text: Schema.String.check(Schema.isNonEmpty()),
+    final: Schema.Literal(false),
+  }),
+  Schema.Struct({
+    ...VoiceEventBase,
+    type: Schema.Literal("transcript"),
+    role: VoiceTranscriptRole,
     text: TrimmedNonEmptyString,
-    final: Schema.Boolean,
+    final: Schema.Literal(true),
   }),
   Schema.Struct({
     ...VoiceEventBase,

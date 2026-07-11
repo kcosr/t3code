@@ -59,6 +59,48 @@ it("normalizes stable semantic transcript identities and rejects unidentified fi
     parse({ type: "conversation.item.input_audio_transcription.completed", transcript: "" }),
   ).toEqual([]);
   expect(parse({ type: "response.output_audio_transcript.done", transcript: "" })).toEqual([]);
+  expect(parse({ ...assistant, transcript: "  Done.  " })).toEqual([
+    {
+      type: "transcript",
+      role: "assistant",
+      text: "Done.",
+      final: true,
+      sourceId: "output:assistant-item-one:1",
+    },
+  ]);
+  expect(parse({ ...assistant, transcript: "   " })).toEqual([]);
+  const user = {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "user-item-one",
+    content_index: 0,
+    transcript: "  Question?  ",
+  };
+  expect(parse(user)).toEqual([
+    {
+      type: "transcript",
+      role: "user",
+      text: "Question?",
+      final: true,
+      sourceId: "input:user-item-one:0",
+    },
+  ]);
+  expect(parse({ ...user, transcript: "\t\n" })).toEqual([]);
+  expect(
+    parse({ type: "conversation.item.input_audio_transcription.completed", transcript: " " }),
+  ).toEqual([]);
+  expect(parse({ type: "response.output_audio_transcript.done", transcript: " " })).toEqual([]);
+});
+
+it("preserves whitespace in partial Realtime transcript deltas", () => {
+  const parse = (value: unknown) =>
+    __testing.parseRealtimeEvent({ type: "message", data: encodeJson(value) });
+
+  expect(parse({ type: "response.output_audio_transcript.delta", delta: " " })).toEqual([
+    { type: "transcript", role: "assistant", text: " ", final: false },
+  ]);
+  expect(
+    parse({ type: "conversation.item.input_audio_transcription.delta", delta: " next" }),
+  ).toEqual([{ type: "transcript", role: "user", text: " next", final: false }]);
 });
 
 it("reports provider failures without logging provider messages or transcript content", () => {

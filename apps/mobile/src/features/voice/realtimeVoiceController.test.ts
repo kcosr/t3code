@@ -220,6 +220,23 @@ describe("RealtimeVoiceController", () => {
     expect(controller.getSnapshot()).toMatchObject({ phase: "error", error: expect.any(String) });
   });
 
+  it("identifies invalid event payloads separately from connectivity failures", async () => {
+    const { client, controller } = makeHarness();
+    await controller.start(createInput);
+    const invalidResponse = Object.assign(new Error("invalid response"), {
+      _tag: "RemoteEnvironmentAuthInvalidJsonError",
+    });
+    vi.mocked(client.sessionEvents).mockReturnValue(Effect.fail(invalidResponse as never));
+
+    await controller.refreshEvents();
+    await controller.refreshEvents();
+    await controller.refreshEvents();
+
+    expect(controller.getSnapshot().error).toContain(
+      "Realtime event stream returned an invalid response",
+    );
+  });
+
   it("ignores aggregate and stale native terminal events that do not own the active session", async () => {
     const { client, controller, emitNative, native } = makeHarness();
     await controller.start(createInput);

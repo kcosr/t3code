@@ -205,7 +205,21 @@ describe("makeVoiceHttpClient", () => {
           });
         }
         if (url.includes("/events")) {
-          return jsonResponse({ state: sessionState, events: [] });
+          return jsonResponse({
+            state: { ...sessionState, phase: "speaking", sequence: 5 },
+            events: [
+              {
+                type: "transcript",
+                sessionId: SESSION_ID,
+                leaseGeneration: 1,
+                sequence: 5,
+                occurredAt: "2026-07-10T20:00:05.000Z",
+                role: "assistant",
+                text: " ",
+                final: false,
+              },
+            ],
+          });
         }
         if (url.includes("/confirmations/")) {
           return jsonResponse({
@@ -269,7 +283,8 @@ describe("makeVoiceHttpClient", () => {
 
       expect(created.state.phase).toBe("signaling");
       expect(answer.sdp).toBe("answer-sdp");
-      expect(events.state.sequence).toBe(4);
+      expect(events.state.sequence).toBe(5);
+      expect(events.events).toMatchObject([{ sequence: 5, text: " ", final: false }]);
       expect(confirmation.outcome).toBe("approved");
       expect(closed.closed).toBe(true);
       expect(requests.map(({ url, method }) => `${method} ${url}`)).toEqual([

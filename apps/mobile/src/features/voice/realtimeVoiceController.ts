@@ -61,6 +61,18 @@ const defaultScheduler: TimerScheduler = {
 const messageFor = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
 
+const errorTag = (cause: unknown): string | null =>
+  typeof cause === "object" && cause !== null && "_tag" in cause
+    ? String((cause as { readonly _tag: unknown })._tag)
+    : null;
+
+const controlFailureMessage = (operation: "events" | "heartbeat", cause: unknown): string => {
+  if (operation === "events" && errorTag(cause) === "RemoteEnvironmentAuthInvalidJsonError") {
+    return `Realtime event stream returned an invalid response: ${messageFor(cause)}`;
+  }
+  return `Realtime control connection failed during ${operation}: ${messageFor(cause)}`;
+};
+
 const nativeTerminationMessage = (code: string): string => {
   switch (code) {
     case "realtime-connection-failed":
@@ -296,7 +308,7 @@ export class RealtimeVoiceController {
         );
       }
     } catch (cause) {
-      this.handleControlFailure(cause);
+      this.handleControlFailure("events", cause);
     } finally {
       this.refreshInFlight = false;
     }
@@ -328,14 +340,14 @@ export class RealtimeVoiceController {
       this.consecutiveControlFailures = 0;
       this.setSnapshot({ session: state });
     } catch (cause) {
-      this.handleControlFailure(cause);
+      this.handleControlFailure("heartbeat", cause);
     }
   }
 
-  private handleControlFailure(cause: unknown) {
+  private handleControlFailure(operation: "events" | "heartbeat", cause: unknown) {
     this.consecutiveControlFailures += 1;
     if (this.consecutiveControlFailures < 3 || this.active === null) return;
-    const message = `Realtime control connection failed: ${messageFor(cause)}`;
+    const message = controlFailureMessage(operation, cause);
     const active = this.active;
     this.active = null;
     this.clearControlTimers();
