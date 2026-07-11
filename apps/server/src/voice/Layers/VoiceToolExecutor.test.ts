@@ -710,6 +710,22 @@ it.effect("enforces the selected voice scope for exact history reads", () =>
       });
       expect(yield* Ref.get(test.historyReads)).toHaveLength(0);
 
+      const defaultReferencedConversation = yield* tools.invoke(
+        call(
+          "read_history",
+          encodeJson({ ref, before: 2, after: 2 }),
+          "history-read-default-reference",
+          new Set([AuthVoiceUseScope]),
+        ),
+      );
+      expect(
+        defaultReferencedConversation.type === "completed" && defaultReferencedConversation.outcome,
+      ).toBe("succeeded");
+      expect((yield* Ref.get(test.historyReads))[0]?.input).toMatchObject({
+        ref,
+        voiceScope: { type: "conversation", conversationId },
+      });
+
       const current = yield* tools.invoke(
         call(
           "read_history",
@@ -727,9 +743,37 @@ it.effect("enforces the selected voice scope for exact history reads", () =>
       expect(
         current.type === "completed" ? decodeJson(current.output).contentTrust : undefined,
       ).toBe("untrusted-history");
-      expect((yield* Ref.get(test.historyReads))[0]?.input).toMatchObject({
+      expect((yield* Ref.get(test.historyReads))[1]?.input).toMatchObject({
         ref,
         voiceScope: { type: "conversation", conversationId },
+      });
+
+      const threadRef = {
+        type: "thread-message" as const,
+        projectId,
+        threadId,
+        messageId: MessageId.make("history-thread-message"),
+      };
+      const threadWithIgnoredVoiceScope = yield* tools.invoke(
+        call(
+          "read_history",
+          encodeJson({
+            ref: threadRef,
+            voiceScope: { type: "current-conversation" },
+            before: 2,
+            after: 2,
+          }),
+          "history-read-thread-with-scope",
+          new Set([AuthOrchestrationReadScope]),
+        ),
+      );
+      expect(
+        threadWithIgnoredVoiceScope.type === "completed" && threadWithIgnoredVoiceScope.outcome,
+      ).toBe("succeeded");
+      expect((yield* Ref.get(test.historyReads))[2]?.input).toEqual({
+        ref: threadRef,
+        before: 2,
+        after: 2,
       });
     }).pipe(Effect.provide(test.layer));
   }),

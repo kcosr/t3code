@@ -244,7 +244,8 @@ const REALTIME_TOOLS = [
           ],
         },
         voiceScope: {
-          description: "Required when ref.type is voice-entry; omit for thread-message.",
+          description:
+            "Optional scope for voice-entry refs; defaults to the referenced conversation and is ignored for thread-message refs.",
           oneOf: [
             {
               type: "object",
@@ -413,11 +414,14 @@ const completedFunctionCall = (
     : undefined;
 };
 
+const isBenignRealtimeClose = (event: OpenAiRealtimeSocketEvent): boolean =>
+  event.type === "closed" && (event.code === 1000 || event.code === 1001 || event.code === 1005);
+
 const parseRealtimeEvent = (
   event: OpenAiRealtimeSocketEvent,
 ): ReadonlyArray<RealtimeProviderEvent> => {
   if (event.type === "closed") {
-    return event.code === 1000
+    return isBenignRealtimeClose(event)
       ? [{ type: "closed" }]
       : [
           {
@@ -971,7 +975,7 @@ const make = Effect.gen(function* () {
             leaseGeneration: input.leaseGeneration,
           });
           if (diagnostic === undefined) return;
-          yield* event.type === "closed" && event.code === 1000
+          yield* isBenignRealtimeClose(event)
             ? Effect.logInfo(diagnostic.message, diagnostic.annotations)
             : Effect.logWarning(diagnostic.message, diagnostic.annotations);
         },

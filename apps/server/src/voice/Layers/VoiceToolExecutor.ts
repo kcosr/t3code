@@ -110,19 +110,12 @@ const SearchHistoryArguments = Schema.Struct({
 const HistoryContextRadius = Schema.Int.check(
   Schema.isBetween({ minimum: 0, maximum: HISTORY_READ_CONTEXT_MAX_RECORDS }),
 );
-const ReadHistoryArguments = Schema.Union([
-  Schema.Struct({
-    ref: HistoryThreadMessageRef,
-    before: HistoryContextRadius,
-    after: HistoryContextRadius,
-  }),
-  Schema.Struct({
-    ref: HistoryVoiceEntryRef,
-    voiceScope: VoiceToolHistoryVoiceScope,
-    before: HistoryContextRadius,
-    after: HistoryContextRadius,
-  }),
-]);
+const ReadHistoryArguments = Schema.Struct({
+  ref: Schema.Union([HistoryThreadMessageRef, HistoryVoiceEntryRef]),
+  voiceScope: Schema.optionalKey(VoiceToolHistoryVoiceScope),
+  before: HistoryContextRadius,
+  after: HistoryContextRadius,
+});
 type SearchHistoryArguments = typeof SearchHistoryArguments.Type;
 type ReadHistoryArguments = typeof ReadHistoryArguments.Type;
 
@@ -161,20 +154,19 @@ const resolveReadHistoryArguments = (
         before: args.before,
         after: args.after,
       }
-    : "voiceScope" in args
-      ? {
-          ref: {
-            type: "voice-entry",
-            conversationId: args.ref.conversationId,
-            entryId: args.ref.entryId,
-          },
-          voiceScope: resolveHistoryVoiceScope(args.voiceScope, conversationId),
-          before: args.before,
-          after: args.after,
-        }
-      : (() => {
-          throw new Error("Voice history arguments require a voice scope");
-        })();
+    : {
+        ref: {
+          type: "voice-entry",
+          conversationId: args.ref.conversationId,
+          entryId: args.ref.entryId,
+        },
+        voiceScope:
+          args.voiceScope === undefined
+            ? { type: "conversation", conversationId: args.ref.conversationId }
+            : resolveHistoryVoiceScope(args.voiceScope, conversationId),
+        before: args.before,
+        after: args.after,
+      };
 const decodeVoiceToolName = Schema.decodeUnknownEffect(VoiceToolName);
 const isVoiceToolName = Schema.is(VoiceToolName);
 const decodeThreadMessagesCursor = Schema.decodeUnknownEffect(

@@ -129,9 +129,11 @@ it("reports provider failures without logging provider messages or transcript co
 });
 
 it("distinguishes normal and abnormal Realtime sideband closes", () => {
-  expect(__testing.parseRealtimeEvent({ type: "closed", code: 1000, reason: "done" })).toEqual([
-    { type: "closed" },
-  ]);
+  for (const code of [1000, 1001, 1005]) {
+    expect(__testing.parseRealtimeEvent({ type: "closed", code, reason: "done" })).toEqual([
+      { type: "closed" },
+    ]);
+  }
   expect(
     __testing.parseRealtimeEvent({
       type: "closed",
