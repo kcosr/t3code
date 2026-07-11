@@ -99,6 +99,7 @@ export class RealtimeVoiceController {
   private heartbeatTimer: unknown | null = null;
   private eventTimer: unknown | null = null;
   private startGeneration = 0;
+  private startingNativeSessionId: string | null = null;
   private refreshInFlight = false;
   private consecutiveControlFailures = 0;
   private snapshot: RealtimeVoiceControllerSnapshot = {
@@ -147,6 +148,7 @@ export class RealtimeVoiceController {
       serverSession = await Effect.runPromise(this.client.createSession(input));
       this.ensureCurrentStart(generation);
       nativeSessionId = serverSession.state.sessionId;
+      this.startingNativeSessionId = nativeSessionId;
       const nativeOffer = await this.native.prepareRealtimeSessionAsync({ nativeSessionId });
       this.ensureCurrentStart(generation);
       const answer = await Effect.runPromise(
@@ -181,21 +183,29 @@ export class RealtimeVoiceController {
         afterSequence: serverSession.state.sequence,
         lastServerError: null,
       };
+      this.startingNativeSessionId = null;
       this.active = active;
       this.consecutiveControlFailures = 0;
-      this.setSnapshot({ phase: "active", session: active.serverState, error: null });
+      this.setSnapshot({
+        phase: "active",
+        session: active.serverState,
+        native: nativeState,
+        error: null,
+      });
       this.startControlTimers(active);
       return this.snapshot;
     } catch (cause) {
       await this.cleanupPartialSession(serverSession?.state ?? null, nativeSessionId);
       if (generation !== this.startGeneration) return this.snapshot;
+      this.startingNativeSessionId = null;
       this.setSnapshot({ phase: "error", session: null, error: messageFor(cause) });
       throw cause;
     }
   }
 
   async stop(): Promise<void> {
-    ++this.startGeneration;
+    const generation = ++this.startGeneration;
+    this.startingNativeSessionId = null;
     this.clearControlTimers();
     const active = this.active;
     this.active = null;
@@ -208,6 +218,7 @@ export class RealtimeVoiceController {
       this.native.stopRealtimeSessionAsync({ nativeSessionId: active.nativeSessionId }),
       Effect.runPromise(this.client.closeSession(active.sessionId, active.leaseGeneration)),
     ]);
+    if (generation !== this.startGeneration) return;
     this.setSnapshot({ phase: "idle", session: null, error: null });
   }
 
@@ -336,6 +347,12 @@ export class RealtimeVoiceController {
   }
 
   private handleNativeState(state: T3VoiceRuntimeState) {
+    const currentSequence = this.snapshot.native?.sequence ?? -1;
+    if (state.sequence < currentSequence) return;
+    const expectedSessionId = this.active?.nativeSessionId ?? this.startingNativeSessionId;
+    if (expectedSessionId !== null && state.activeRealtimeSessionId !== expectedSessionId) {
+      return;
+    }
     this.setSnapshot({ native: state });
   }
 
@@ -356,25 +373,29 @@ export class RealtimeVoiceController {
 
   private async closeServerAfterNativeTermination(active: ActiveSession, error: string | null) {
     if (this.active !== active) return;
+    const generation = ++this.startGeneration;
     this.active = null;
     this.clearControlTimers();
-    await Effect.runPromise(
-      this.client.closeSession(active.sessionId, active.leaseGeneration),
-    ).catch(() => undefined);
     this.setSnapshot({
       phase: error === null ? "idle" : "error",
       session: null,
       error,
     });
+    await Effect.runPromise(
+      this.client.closeSession(active.sessionId, active.leaseGeneration),
+    ).catch(() => undefined);
+    if (generation !== this.startGeneration) return;
   }
 
   private async cleanupAfterServerTermination(active: ActiveSession, error: string | null) {
     if (this.active !== active) return;
+    const generation = ++this.startGeneration;
     this.active = null;
     this.clearControlTimers();
     await this.native
       .stopRealtimeSessionAsync({ nativeSessionId: active.nativeSessionId })
       .catch(() => undefined);
+    if (generation !== this.startGeneration) return;
     this.setSnapshot({
       phase: error === null ? "idle" : "error",
       session: error === null ? null : active.serverState,

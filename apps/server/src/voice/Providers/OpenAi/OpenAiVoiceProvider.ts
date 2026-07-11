@@ -346,7 +346,7 @@ const realtimeDiagnostic = (
       message: "OpenAI Realtime sideband transport error",
       annotations: {
         ...correlation,
-        causeType: event.cause instanceof Error ? event.cause.name : typeof event.cause,
+        causeType: event.cause instanceof Error ? "error-object" : typeof event.cause,
       },
     };
   }

@@ -129,6 +129,10 @@ describe("RealtimeVoiceController", () => {
       sdp: "remote-answer",
     });
     expect(controller.getSnapshot().phase).toBe("active");
+    expect(controller.getSnapshot().native).toMatchObject({
+      activeRealtimeSessionId: SESSION_ID,
+      sequence: 1,
+    });
     expect(snapshots).toContain("starting");
     expect(snapshots).toContain("active");
   });
@@ -243,6 +247,39 @@ describe("RealtimeVoiceController", () => {
     expect(client.closeSession).not.toHaveBeenCalled();
   });
 
+  it("rejects stale or foreign native state after startup reconciliation", async () => {
+    const { controller, emitNative } = makeHarness();
+    await controller.start(createInput);
+
+    emitNative("stateChanged", {
+      phase: "realtime",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected",
+      realtimeMuted: true,
+      sequence: 0,
+    });
+    emitNative("stateChanged", {
+      phase: "realtime",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: "an-older-session",
+      realtimeConnectionState: "connected",
+      realtimeMuted: true,
+      sequence: 3,
+    });
+
+    expect(controller.getSnapshot().native).toMatchObject({
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connecting",
+      realtimeMuted: false,
+      sequence: 1,
+    });
+  });
+
   it("preserves a safe native failure reason and closes the server lease once", async () => {
     const { client, controller, emitNative } = makeHarness();
     await controller.start(createInput);
@@ -352,6 +389,38 @@ describe("RealtimeVoiceController", () => {
 
     await vi.waitFor(() => expect(controller.getSnapshot().phase).toBe("error"));
     expect(client.closeSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not let an old native-terminal cleanup overwrite a restarted call", async () => {
+    const { client, controller, emitNative } = makeHarness();
+    let resolveClose!: () => void;
+    const pendingClose = new Promise<void>((resolve) => {
+      resolveClose = resolve;
+    });
+    vi.mocked(client.closeSession).mockReturnValue(
+      Effect.promise(async () => {
+        await pendingClose;
+        return {
+          state: { ...serverSession.state, phase: "ended" as const },
+          closed: true,
+        };
+      }),
+    );
+    await controller.start(createInput);
+
+    emitNative("realtimeTerminated", {
+      nativeSessionId: SESSION_ID,
+      outcome: "failed",
+      code: "realtime-connection-failed",
+      retryable: true,
+    });
+    expect(controller.getSnapshot().phase).toBe("error");
+
+    await controller.start(createInput);
+    resolveClose();
+    await Promise.resolve();
+
+    expect(controller.getSnapshot().phase).toBe("active");
   });
 
   it("lets one terminal owner win when native and server termination race", async () => {

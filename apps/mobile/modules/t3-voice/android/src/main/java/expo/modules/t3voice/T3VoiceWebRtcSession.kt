@@ -89,62 +89,60 @@ internal class T3VoiceWebRtcSession(
 
   fun prepare(sessionId: String, callback: T3VoiceWebRtcResultCallback<String>) {
     require(sessionId.isNotBlank()) { "nativeSessionId must be a non-empty string." }
-    synchronized(lock) {
-      check(active == null) { "A Realtime voice session is already active." }
-    }
-
-    val audioSource = peerConnectionFactory.createAudioSource(audioConstraints())
-    val audioTrack = peerConnectionFactory.createAudioTrack(LOCAL_AUDIO_TRACK_ID, audioSource)
-    audioTrack.setEnabled(true)
-    val peerConnection =
-      peerConnectionFactory.createPeerConnection(
-        rtcConfiguration(),
-        PeerObserver(sessionId),
-      )
-        ?: run {
+    val session =
+      synchronized(lock) {
+        check(active == null) { "A Realtime voice session is already active." }
+        val audioSource = peerConnectionFactory.createAudioSource(audioConstraints())
+        val audioTrack = peerConnectionFactory.createAudioTrack(LOCAL_AUDIO_TRACK_ID, audioSource)
+        audioTrack.setEnabled(true)
+        val peerConnection =
+          peerConnectionFactory.createPeerConnection(
+            rtcConfiguration(),
+            PeerObserver(sessionId),
+          )
+            ?: run {
+              audioTrack.dispose()
+              audioSource.dispose()
+              error("WebRTC could not create a peer connection.")
+            }
+        val sender = peerConnection.addTrack(audioTrack, listOf(LOCAL_MEDIA_STREAM_ID))
+        if (sender == null) {
+          peerConnection.dispose()
           audioTrack.dispose()
           audioSource.dispose()
-          error("WebRTC could not create a peer connection.")
+          error("WebRTC could not attach the microphone track.")
         }
-    val sender = peerConnection.addTrack(audioTrack, listOf(LOCAL_MEDIA_STREAM_ID))
-    if (sender == null) {
-      peerConnection.dispose()
-      audioTrack.dispose()
-      audioSource.dispose()
-      error("WebRTC could not attach the microphone track.")
-    }
-    peerConnection.setAudioPlayout(true)
-    peerConnection.setAudioRecording(true)
-    val dataChannel =
-      peerConnection.createDataChannel(
-        DATA_CHANNEL_LABEL,
-        DataChannel.Init().apply { ordered = true },
-      )
-    dataChannel.registerObserver(DataChannelObserver(sessionId, dataChannel))
-    val session =
-      ActiveSession(
-        sessionId = sessionId,
-        peerConnection = peerConnection,
-        audioSource = audioSource,
-        audioTrack = audioTrack,
-        dataChannel = dataChannel,
-        offerCallback = callback,
-      )
-    synchronized(lock) {
-      check(active == null) { "A Realtime voice session started concurrently." }
-      active = session
-      terminalLatch.activate(sessionId)
-      session.offerTimeout =
-        scheduler.schedule(
-          { fail(sessionId, ERROR_ICE_TIMEOUT, "WebRTC ICE gathering timed out.", null, true) },
-          ICE_GATHERING_TIMEOUT_SECONDS,
-          TimeUnit.SECONDS,
-        )
-    }
+        peerConnection.setAudioPlayout(true)
+        peerConnection.setAudioRecording(true)
+        val dataChannel =
+          peerConnection.createDataChannel(
+            DATA_CHANNEL_LABEL,
+            DataChannel.Init().apply { ordered = true },
+          )
+        dataChannel.registerObserver(DataChannelObserver(sessionId, dataChannel))
+        val created =
+          ActiveSession(
+            sessionId = sessionId,
+            peerConnection = peerConnection,
+            audioSource = audioSource,
+            audioTrack = audioTrack,
+            dataChannel = dataChannel,
+            offerCallback = callback,
+          )
+        active = created
+        terminalLatch.activate(sessionId)
+        created.offerTimeout =
+          scheduler.schedule(
+            { fail(sessionId, ERROR_ICE_TIMEOUT, "WebRTC ICE gathering timed out.", null, true) },
+            ICE_GATHERING_TIMEOUT_SECONDS,
+            TimeUnit.SECONDS,
+          )
+        created
+      }
     try {
       audioRouter.start()
       onStateChanged(sessionId, STATE_PREPARING, false)
-      peerConnection.createOffer(OfferObserver(sessionId), offerConstraints())
+      session.peerConnection.createOffer(OfferObserver(sessionId), offerConstraints())
     } catch (cause: Throwable) {
       fail(
         sessionId,
@@ -293,33 +291,25 @@ internal class T3VoiceWebRtcSession(
   }
 
   private fun maybeDeliverOffer(sessionId: String) {
-    val result =
-      synchronized(lock) {
-        val session = active
-        if (
-          session?.sessionId != sessionId ||
-            !session.localDescriptionSet ||
-            !session.iceGatheringComplete ||
-            session.offerDelivered
-        ) {
-          null
-        } else {
-          val description = session.peerConnection.localDescription?.description
-          if (description.isNullOrBlank()) {
-            null
-          } else {
-            session.offerDelivered = true
-            session.offerTimeout?.cancel(false)
-            session.offerTimeout = null
-            val callback = session.offerCallback
-            session.offerCallback = null
-            callback to description
-          }
-        }
+    synchronized(lock) {
+      val session = active
+      if (
+        session?.sessionId != sessionId ||
+          !session.localDescriptionSet ||
+          !session.iceGatheringComplete ||
+          session.offerDelivered
+      ) {
+        return
       }
-    if (result != null) {
-      onStateChanged(sessionId, STATE_OFFER_READY, isMuted(sessionId))
-      result.first?.onSuccess(result.second)
+      val description = session.peerConnection.localDescription?.description
+      if (description.isNullOrBlank()) return
+      session.offerDelivered = true
+      session.offerTimeout?.cancel(false)
+      session.offerTimeout = null
+      val callback = session.offerCallback
+      session.offerCallback = null
+      onStateChanged(sessionId, STATE_OFFER_READY, session.muted)
+      callback?.onSuccess(description)
     }
   }
 
@@ -333,7 +323,6 @@ internal class T3VoiceWebRtcSession(
         PeerConnection.PeerConnectionState.FAILED -> STATE_FAILED
         PeerConnection.PeerConnectionState.CLOSED -> STATE_CLOSED
     }
-    val muted = synchronized(lock) { active?.takeIf { it.sessionId == sessionId }?.muted } ?: return
     if (state == PeerConnection.PeerConnectionState.FAILED) {
       fail(
         sessionId,
@@ -344,7 +333,10 @@ internal class T3VoiceWebRtcSession(
       )
       return
     }
-    onStateChanged(sessionId, normalized, muted)
+    synchronized(lock) {
+      val session = active?.takeIf { it.sessionId == sessionId } ?: return
+      onStateChanged(sessionId, normalized, session.muted)
+    }
   }
 
   private fun fail(

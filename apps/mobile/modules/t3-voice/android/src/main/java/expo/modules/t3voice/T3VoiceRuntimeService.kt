@@ -22,6 +22,9 @@ class T3VoiceRuntimeService : Service() {
     val events: SharedFlow<T3VoiceRuntimeEvent>
       get() = T3VoiceStateStore.events
 
+    val realtimeTermination: StateFlow<T3VoiceRuntimeEvent.RealtimeTerminated?>
+      get() = T3VoiceStateStore.realtimeTermination
+
     fun startRecording(recordingId: String) {
       check(T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
         "The voice runtime is already in use."
@@ -83,12 +86,13 @@ class T3VoiceRuntimeService : Service() {
       nativeSessionId: String,
       callback: T3VoiceWebRtcResultCallback<String>,
     ) {
-      check(T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
+      check(T3VoiceStateStore.claimRealtime(nativeSessionId)) {
         "The voice runtime is already in use."
       }
       try {
         realtime.prepare(nativeSessionId, callback)
       } catch (cause: Throwable) {
+        T3VoiceStateStore.releaseRealtimeClaim(nativeSessionId)
         stopRuntimeForeground()
         throw cause
       }
@@ -122,13 +126,11 @@ class T3VoiceRuntimeService : Service() {
       T3VoiceWebRtcSession(
         context = applicationContext,
         onStateChanged = { sessionId, connectionState, muted ->
-          val ended = connectionState == "closed" || connectionState == "failed"
           T3VoiceStateStore.setRealtime(
-            sessionId = if (ended) null else sessionId,
+            sessionId = sessionId,
             connectionState = connectionState,
             muted = muted,
           )
-          if (ended) stopRuntimeForeground()
         },
         onError = { sessionId, code, message, recoverable ->
           T3VoiceStateStore.emit(
@@ -141,7 +143,7 @@ class T3VoiceRuntimeService : Service() {
           )
         },
         onTerminated = { sessionId, outcome, code, retryable ->
-          T3VoiceStateStore.emit(
+          T3VoiceStateStore.terminateRealtime(
             T3VoiceRuntimeEvent.RealtimeTerminated(
               nativeSessionId = sessionId,
               outcome = outcome,
@@ -149,6 +151,7 @@ class T3VoiceRuntimeService : Service() {
               retryable = retryable,
             ),
           )
+          stopRuntimeForeground()
         },
       )
     }
@@ -235,8 +238,8 @@ class T3VoiceRuntimeService : Service() {
       T3VoiceStateStore.setPlayback(null)
     }
     state.activeRealtimeSessionId?.let {
-      runCatching { realtime.stop(it) }
-      T3VoiceStateStore.setRealtime(null, "closed", state.realtimeMuted)
+      val stopped = runCatching { realtime.stop(it) }.getOrDefault(false)
+      if (!stopped) T3VoiceStateStore.releaseRealtimeClaim(it)
     }
     stopRuntimeForeground()
   }

@@ -26,6 +26,7 @@ class T3VoiceModule : Module() {
   private val pendingBinderOperations = mutableListOf<PendingBinderOperation>()
   private var stateCollection: Job? = null
   private var eventCollection: Job? = null
+  private var realtimeTerminationCollection: Job? = null
 
   private class PendingBinderOperation(
     val promise: Promise,
@@ -69,6 +70,13 @@ class T3VoiceModule : Module() {
                 is T3VoiceRuntimeEvent.RealtimeTerminated ->
                   sendEvent(REALTIME_TERMINATED_EVENT, event.toEventBody())
               }
+            }
+          }
+        realtimeTerminationCollection?.cancel()
+        realtimeTerminationCollection =
+          appContext.mainQueue.launch {
+            connectedBinder.realtimeTermination.collectLatest { event ->
+              if (event != null) sendEvent(REALTIME_TERMINATED_EVENT, event.toEventBody())
             }
           }
       }
@@ -249,14 +257,22 @@ class T3VoiceModule : Module() {
                   )
                 }
 
-                override fun onFailure(code: String, message: String, cause: Throwable?) {
-                  promise.reject(code, message, cause)
+                override fun onFailure(
+                  code: String,
+                  @Suppress("UNUSED_PARAMETER") message: String,
+                  @Suppress("UNUSED_PARAMETER") cause: Throwable?,
+                ) {
+                  promise.reject(code, publicRealtimeFailureMessage(code), null)
                 }
               },
             )
           }
-        } catch (cause: Throwable) {
-          promise.reject("realtime-prepare-failed", cause.message, cause)
+        } catch (_: Throwable) {
+          promise.reject(
+            "realtime-prepare-failed",
+            publicRealtimeFailureMessage("realtime-prepare-failed"),
+            null,
+          )
         }
       }
 
@@ -273,14 +289,22 @@ class T3VoiceModule : Module() {
                   promise.resolve()
                 }
 
-                override fun onFailure(code: String, message: String, cause: Throwable?) {
-                  promise.reject(code, message, cause)
+                override fun onFailure(
+                  code: String,
+                  @Suppress("UNUSED_PARAMETER") message: String,
+                  @Suppress("UNUSED_PARAMETER") cause: Throwable?,
+                ) {
+                  promise.reject(code, publicRealtimeFailureMessage(code), null)
                 }
               },
             )
           }
-        } catch (cause: Throwable) {
-          promise.reject("realtime-answer-rejected", cause.message, cause)
+        } catch (_: Throwable) {
+          promise.reject(
+            "realtime-answer-rejected",
+            publicRealtimeFailureMessage("realtime-answer-rejected"),
+            null,
+          )
         }
       }
 
@@ -404,7 +428,17 @@ class T3VoiceModule : Module() {
     stateCollection = null
     eventCollection?.cancel()
     eventCollection = null
+    realtimeTerminationCollection?.cancel()
+    realtimeTerminationCollection = null
   }
+
+  private fun publicRealtimeFailureMessage(code: String): String =
+    when (code) {
+      "realtime-answer-rejected" -> "The Realtime answer was rejected."
+      "realtime-ice-timeout" -> "The Realtime connection timed out."
+      "realtime-offer-failed" -> "The Realtime offer could not be created."
+      else -> "The Realtime media session could not be prepared."
+    }
 
   companion object {
     private const val MODULE_NAME = "T3Voice"

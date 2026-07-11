@@ -99,9 +99,45 @@ internal object T3VoiceStateStore {
       ),
     )
   private val mutableEvents = MutableSharedFlow<T3VoiceRuntimeEvent>(extraBufferCapacity = 64)
+  private val mutableRealtimeTermination =
+    MutableStateFlow<T3VoiceRuntimeEvent.RealtimeTerminated?>(null)
 
   val state: StateFlow<T3VoiceRuntimeState> = mutableState.asStateFlow()
   val events: SharedFlow<T3VoiceRuntimeEvent> = mutableEvents.asSharedFlow()
+  val realtimeTermination: StateFlow<T3VoiceRuntimeEvent.RealtimeTerminated?> =
+    mutableRealtimeTermination.asStateFlow()
+
+  fun claimRealtime(sessionId: String): Boolean {
+    while (true) {
+      val current = mutableState.value
+      if (current.phase != T3VoiceRuntimePhase.IDLE) return false
+      val next =
+        current.copy(
+          phase = T3VoiceRuntimePhase.REALTIME,
+          activeRecordingId = null,
+          activePlaybackId = null,
+          activeRealtimeSessionId = sessionId,
+          realtimeConnectionState = "preparing",
+          realtimeMuted = false,
+          sequence = current.sequence + 1,
+        )
+      if (mutableState.compareAndSet(current, next)) {
+        mutableRealtimeTermination.value = null
+        return true
+      }
+    }
+  }
+
+  fun releaseRealtimeClaim(sessionId: String) {
+    updateIfRealtimeOwner(sessionId) {
+      it.copy(
+        phase = T3VoiceRuntimePhase.IDLE,
+        activeRealtimeSessionId = null,
+        realtimeConnectionState = null,
+        realtimeMuted = false,
+      )
+    }
+  }
 
   fun setServiceReady() {
     update { it.copy(phase = T3VoiceRuntimePhase.IDLE) }
@@ -137,10 +173,10 @@ internal object T3VoiceStateStore {
     }
   }
 
-  fun setRealtime(sessionId: String?, connectionState: String?, muted: Boolean) {
-    update {
+  fun setRealtime(sessionId: String, connectionState: String, muted: Boolean) {
+    updateIfRealtimeOwner(sessionId) {
       it.copy(
-        phase = if (sessionId == null) T3VoiceRuntimePhase.IDLE else T3VoiceRuntimePhase.REALTIME,
+        phase = T3VoiceRuntimePhase.REALTIME,
         activeRecordingId = null,
         activePlaybackId = null,
         activeRealtimeSessionId = sessionId,
@@ -148,6 +184,20 @@ internal object T3VoiceStateStore {
         realtimeMuted = muted,
       )
     }
+  }
+
+  fun terminateRealtime(event: T3VoiceRuntimeEvent.RealtimeTerminated) {
+    val connectionState = if (event.outcome == "ended") "closed" else "failed"
+    val terminated =
+      updateIfRealtimeOwner(event.nativeSessionId) {
+        it.copy(
+          phase = T3VoiceRuntimePhase.IDLE,
+          activeRealtimeSessionId = null,
+          realtimeConnectionState = connectionState,
+          realtimeMuted = false,
+        )
+      }
+    if (terminated) mutableRealtimeTermination.value = event
   }
 
   fun setInactive() {
@@ -172,6 +222,20 @@ internal object T3VoiceStateStore {
     mutableState.update { current ->
       val next = transform(current)
       if (next == current) current else next.copy(sequence = current.sequence + 1)
+    }
+  }
+
+  private fun updateIfRealtimeOwner(
+    sessionId: String,
+    transform: (T3VoiceRuntimeState) -> T3VoiceRuntimeState,
+  ): Boolean {
+    while (true) {
+      val current = mutableState.value
+      if (current.activeRealtimeSessionId != sessionId) return false
+      val transformed = transform(current)
+      val next =
+        if (transformed == current) current else transformed.copy(sequence = current.sequence + 1)
+      if (next == current || mutableState.compareAndSet(current, next)) return true
     }
   }
 }

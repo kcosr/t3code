@@ -116,6 +116,16 @@ it("reports provider failures without logging provider messages or transcript co
       ),
     ),
   ).not.toContain(privateMessage);
+  const privateName = new Error("safe message");
+  privateName.name = privateMessage;
+  const transportDiagnostic = __testing.realtimeDiagnostic(
+    { type: "error", cause: privateName },
+    { sessionId: "voice-session-sensitive", leaseGeneration: 7 },
+  );
+  expect(transportDiagnostic).toMatchObject({
+    annotations: { causeType: "error-object" },
+  });
+  expect(JSON.stringify(transportDiagnostic)).not.toContain(privateMessage);
 });
 
 it("distinguishes normal and abnormal Realtime sideband closes", () => {
