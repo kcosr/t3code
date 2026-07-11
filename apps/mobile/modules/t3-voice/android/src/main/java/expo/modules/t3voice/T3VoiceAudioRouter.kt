@@ -24,6 +24,11 @@ internal data class T3VoiceAudioRoute(
     )
 }
 
+internal data class T3VoiceAudioRouterStartResult(
+  val transition: T3VoiceAudioFocusTransition,
+  val ownerGeneration: Long,
+)
+
 internal class T3VoiceAudioRouter(
   context: Context,
   private val onFocusActions: (List<T3VoiceAudioFocusAction>) -> Unit = {},
@@ -41,8 +46,13 @@ internal class T3VoiceAudioRouter(
   private var deviceCallback: AudioDeviceCallback? = null
 
   @Synchronized
-  fun start(): T3VoiceAudioFocusTransition {
-    if (active) return T3VoiceAudioFocusTransition(focusState, emptyList())
+  fun start(): T3VoiceAudioRouterStartResult {
+    if (active) {
+      return T3VoiceAudioRouterStartResult(
+        transition = T3VoiceAudioFocusTransition(focusState, emptyList()),
+        ownerGeneration = checkNotNull(activeGeneration),
+      )
+    }
     val ownerGeneration = T3VoiceDiagnostics.nextGeneration()
     generation = ownerGeneration
     activeGeneration = ownerGeneration
@@ -67,9 +77,15 @@ internal class T3VoiceAudioRouter(
     if (requestFocus()) {
       recordDiagnostic(T3VoiceDiagnosticCategory.FOCUS, T3VoiceDiagnosticCode.REQUEST_GRANTED)
       registerDeviceCallback()
-      return T3VoiceAudioFocusTransition(focusState, emptyList())
+      return T3VoiceAudioRouterStartResult(
+        transition = T3VoiceAudioFocusTransition(focusState, emptyList()),
+        ownerGeneration = ownerGeneration,
+      )
     }
-    return applyFocusEvent(T3VoiceAudioFocusEvent.REQUEST_DENIED)
+    return T3VoiceAudioRouterStartResult(
+      transition = applyFocusEvent(T3VoiceAudioFocusEvent.REQUEST_DENIED),
+      ownerGeneration = ownerGeneration,
+    )
   }
 
   @Synchronized
@@ -144,9 +160,6 @@ internal class T3VoiceAudioRouter(
       ),
     )
   }
-
-  @Synchronized
-  fun ownerGeneration(): Long? = activeGeneration
 
   @Suppress("DEPRECATION")
   private fun clearSelectedRoute() {

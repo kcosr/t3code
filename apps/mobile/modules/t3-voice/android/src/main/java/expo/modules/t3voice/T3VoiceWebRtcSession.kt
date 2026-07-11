@@ -216,12 +216,12 @@ internal class T3VoiceWebRtcSession(
         throw cause
       }
     try {
-      check(audioRouter.start().state != T3VoiceAudioFocusState.TERMINATED) {
+      val routerStart = audioRouter.start()
+      check(routerStart.transition.state != T3VoiceAudioFocusState.TERMINATED) {
         "Android denied Realtime audio focus."
       }
-      val routerGeneration = checkNotNull(audioRouter.ownerGeneration())
       synchronized(lock) {
-        active?.takeIf { it === session }?.audioRouterGeneration = routerGeneration
+        active?.takeIf { it === session }?.audioRouterGeneration = routerStart.ownerGeneration
       }
       onStateChanged(sessionId, STATE_PREPARING, false)
       peerConnection.createOffer(OfferObserver(sessionId), offerConstraints())
