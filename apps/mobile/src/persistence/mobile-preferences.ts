@@ -15,6 +15,8 @@ const PREFERENCES_FALLBACK_KEY = "t3code.preferences.fallback";
 
 export interface Preferences {
   readonly liveActivitiesEnabled?: boolean;
+  readonly threadSpeechEnabled?: boolean;
+  readonly voiceAudioRouteId?: string;
   readonly baseFontSize?: number;
   readonly terminalFontSize?: number | null;
   readonly markdownFontSize?: number;
@@ -64,6 +66,8 @@ export class MobilePreferencesStore extends Context.Service<
 function sanitizePreferences(parsed: Preferences): Preferences {
   const preferences: {
     liveActivitiesEnabled?: boolean;
+    threadSpeechEnabled?: boolean;
+    voiceAudioRouteId?: string;
     baseFontSize?: number;
     terminalFontSize?: number | null;
     markdownFontSize?: number;
@@ -75,6 +79,12 @@ function sanitizePreferences(parsed: Preferences): Preferences {
 
   if (typeof parsed.liveActivitiesEnabled === "boolean") {
     preferences.liveActivitiesEnabled = parsed.liveActivitiesEnabled;
+  }
+  if (typeof parsed.threadSpeechEnabled === "boolean") {
+    preferences.threadSpeechEnabled = parsed.threadSpeechEnabled;
+  }
+  if (typeof parsed.voiceAudioRouteId === "string" && parsed.voiceAudioRouteId.length > 0) {
+    preferences.voiceAudioRouteId = parsed.voiceAudioRouteId;
   }
   if (typeof parsed.baseFontSize === "number") preferences.baseFontSize = parsed.baseFontSize;
   if (typeof parsed.terminalFontSize === "number" || parsed.terminalFontSize === null) {
@@ -177,7 +187,10 @@ export const make = Effect.fn("MobilePreferencesStore.make")(function* () {
       yield* Effect.logWarning("Database unavailable; saving preferences to secure storage.").pipe(
         Effect.annotateLogs({ cause: databaseResult.failure }),
       );
-      const fallback = yield* encode(PREFERENCES_FALLBACK_KEY, { payload, updatedAt: timestamp });
+      const fallback = yield* encode(PREFERENCES_FALLBACK_KEY, {
+        payload,
+        updatedAt: timestamp,
+      });
       yield* secureStorage.setItem(PREFERENCES_FALLBACK_KEY, fallback);
       return;
     }

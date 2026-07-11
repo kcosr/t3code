@@ -173,7 +173,9 @@ const REALTIME_TOOLS = [
           oneOf: [
             {
               type: "object",
-              properties: { type: { type: "string", const: "current-conversation" } },
+              properties: {
+                type: { type: "string", const: "current-conversation" },
+              },
               required: ["type"],
               additionalProperties: false,
             },
@@ -249,7 +251,9 @@ const REALTIME_TOOLS = [
           oneOf: [
             {
               type: "object",
-              properties: { type: { type: "string", const: "current-conversation" } },
+              properties: {
+                type: { type: "string", const: "current-conversation" },
+              },
               required: ["type"],
               additionalProperties: false,
             },
@@ -274,6 +278,18 @@ const REALTIME_TOOLS = [
         after: { type: "integer", minimum: 0, maximum: 10 },
       },
       required: ["ref", "before", "after"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "activate_thread",
+    description:
+      "Open a T3 thread on the connected client and make it the active focus for subsequent voice operations.",
+    parameters: {
+      type: "object",
+      properties: { threadId: { type: "string" } },
+      required: ["threadId"],
       additionalProperties: false,
     },
   },
@@ -432,13 +448,25 @@ const parseRealtimeEvent = (
         ];
   }
   if (event.type === "error") {
-    return [{ type: "error", detail: "OpenAI Realtime sideband failed", recoverable: true }];
+    return [
+      {
+        type: "error",
+        detail: "OpenAI Realtime sideband failed",
+        recoverable: true,
+      },
+    ];
   }
   let value: unknown;
   try {
     value = decodeRealtimeEventJson(event.data);
   } catch {
-    return [{ type: "error", detail: "OpenAI sent an invalid Realtime event", recoverable: false }];
+    return [
+      {
+        type: "error",
+        detail: "OpenAI sent an invalid Realtime event",
+        recoverable: false,
+      },
+    ];
   }
   if (typeof value !== "object" || value === null || !("type" in value)) return [];
   const record = value as Record<string, unknown>;
@@ -475,7 +503,14 @@ const parseRealtimeEvent = (
     }
     case "conversation.item.input_audio_transcription.delta":
       return typeof record.delta === "string" && record.delta.length > 0
-        ? [{ type: "transcript", role: "user", text: record.delta, final: false }]
+        ? [
+            {
+              type: "transcript",
+              role: "user",
+              text: record.delta,
+              final: false,
+            },
+          ]
         : [];
     case "conversation.item.input_audio_transcription.completed":
       if (typeof record.transcript !== "string") return [];
@@ -505,7 +540,14 @@ const parseRealtimeEvent = (
       ];
     case "response.output_audio_transcript.delta":
       return typeof record.delta === "string" && record.delta.length > 0
-        ? [{ type: "transcript", role: "assistant", text: record.delta, final: false }]
+        ? [
+            {
+              type: "transcript",
+              role: "assistant",
+              text: record.delta,
+              final: false,
+            },
+          ]
         : [];
     case "response.output_audio_transcript.done":
       if (typeof record.transcript !== "string") return [];
@@ -534,7 +576,13 @@ const parseRealtimeEvent = (
         },
       ];
     case "error": {
-      return [{ type: "error", detail: "OpenAI Realtime reported an error", recoverable: false }];
+      return [
+        {
+          type: "error",
+          detail: "OpenAI Realtime reported an error",
+          recoverable: false,
+        },
+      ];
     }
     default:
       return [];
@@ -573,7 +621,12 @@ const continuationEvent = (
     type: "message",
     role: item.role,
     status: "completed",
-    content: [{ type: item.role === "assistant" ? "output_text" : "input_text", text: item.text }],
+    content: [
+      {
+        type: item.role === "assistant" ? "output_text" : "input_text",
+        text: item.text,
+      },
+    ],
   },
 });
 
@@ -619,7 +672,9 @@ const parseReplayServerEvent = (
   }
   if (event.type === "error") {
     return Effect.fail(
-      replayError("OpenAI Realtime failed during context replay", { cause: event.cause }),
+      replayError("OpenAI Realtime failed during context replay", {
+        cause: event.cause,
+      }),
     );
   }
   let value: unknown;
@@ -709,7 +764,11 @@ const make = Effect.gen(function* () {
             Stream.map(
               (data): VoiceTranscriptionStreamEvent =>
                 data.type === "transcript.text.delta"
-                  ? { type: "delta", requestId: input.requestId, text: data.delta }
+                  ? {
+                      type: "delta",
+                      requestId: input.requestId,
+                      text: data.delta,
+                    }
                   : {
                       type: "final",
                       result: {
@@ -945,7 +1004,10 @@ const make = Effect.gen(function* () {
           if (record === undefined) return;
           if (record.type === "response.created") {
             yield* continuationMutex.withPermits(1)(
-              Ref.update(continuationState, (state) => ({ ...state, activeResponse: true })),
+              Ref.update(continuationState, (state) => ({
+                ...state,
+                activeResponse: true,
+              })),
             );
             return;
           }
@@ -965,7 +1027,11 @@ const make = Effect.gen(function* () {
                     if (call !== undefined) pendingFunctionCalls.add(call.callId);
                   }
                 }
-                return { ...state, activeResponse: false, pendingFunctionCalls };
+                return {
+                  ...state,
+                  activeResponse: false,
+                  pendingFunctionCalls,
+                };
               });
               yield* requestContinuationIfReady();
             }),
@@ -1064,7 +1130,9 @@ const make = Effect.gen(function* () {
         if (pending !== undefined) {
           yield* Deferred.fail(
             pending.completion,
-            contextUpdateError("OpenAI rejected a context update", { retryable: false }),
+            contextUpdateError("OpenAI rejected a context update", {
+              retryable: false,
+            }),
           );
         }
       });
@@ -1107,7 +1175,10 @@ const make = Effect.gen(function* () {
             const completion = yield* Deferred.make<void, VoiceError>();
             yield* SynchronizedRef.update(pendingContextUpdates, (current) => {
               const next = new Map(current);
-              next.set(identity.itemId, { eventId: identity.eventId, completion });
+              next.set(identity.itemId, {
+                eventId: identity.eventId,
+                completion,
+              });
               return next;
             });
             yield* sideband.send(encodeJson(continuationEvent(item, identity))).pipe(
@@ -1164,7 +1235,11 @@ const make = Effect.gen(function* () {
               yield* Ref.update(continuationState, (state) => {
                 const pendingFunctionCalls = new Set(state.pendingFunctionCalls);
                 pendingFunctionCalls.delete(output.providerFunctionCallId);
-                return { ...state, pendingFunctionCalls, continuationNeeded: true };
+                return {
+                  ...state,
+                  pendingFunctionCalls,
+                  continuationNeeded: true,
+                };
               });
               yield* requestContinuationIfReady();
             }),

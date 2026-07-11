@@ -14,11 +14,13 @@ import {
   masterVoiceEnvironmentId,
   reconcileMasterVoiceFocus,
   newVoiceConversationSelection,
+  newVoiceConversationTitle,
   resumeVoiceConversationSelection,
   type MasterVoiceFocus,
 } from "./masterVoiceState";
 
 const environmentId = EnvironmentId.make("environment-one");
+const localDateTime = new Date(2026, 6, 11, 14, 5);
 const focus: MasterVoiceFocus = {
   environmentId,
   projectId: ProjectId.make("project-one"),
@@ -85,17 +87,22 @@ describe("master voice state", () => {
 
   it("creates the first durable conversation when there is nothing to resume", () => {
     expect(
-      resumeVoiceConversationSelection([
-        conversation("temporary", "ephemeral", "2026-07-12T00:00:00.000Z"),
-      ]),
-    ).toEqual({ type: "new", retention: "durable", title: "T3 Voice" });
+      resumeVoiceConversationSelection(
+        [conversation("temporary", "ephemeral", "2026-07-12T00:00:00.000Z")],
+        localDateTime,
+      ),
+    ).toEqual({
+      type: "new",
+      retention: "durable",
+      title: "Voice · 2026-07-11 14:05",
+    });
   });
 
   it("keeps explicit new and resume selections distinct", () => {
-    expect(newVoiceConversationSelection()).toEqual({
+    expect(newVoiceConversationSelection(localDateTime)).toEqual({
       type: "new",
       retention: "durable",
-      title: "T3 Voice",
+      title: "Voice · 2026-07-11 14:05",
     });
     expect(continueVoiceConversationSelection(VoiceConversationId.make("selected"))).toEqual({
       type: "continue",
@@ -104,14 +111,21 @@ describe("master voice state", () => {
     });
   });
 
-  it("compares focus by environment, project, and thread identity", () => {
-    expect(isSameMasterVoiceFocus(focus, { ...focus, threadTitle: "Renamed" })).toBe(true);
-    expect(isSameMasterVoiceFocus(focus, { ...focus, threadId: ThreadId.make("thread-two") })).toBe(
-      false,
-    );
+  it("formats new conversation titles from the local date and time", () => {
+    expect(newVoiceConversationTitle(new Date(2026, 0, 2, 3, 4))).toBe("Voice · 2026-01-02 03:04");
   });
 
-  it("preserves an active call while navigating away from thread routes", () => {
+  it("compares focus by environment, project, and thread identity", () => {
+    expect(isSameMasterVoiceFocus(focus, { ...focus, threadTitle: "Renamed" })).toBe(true);
+    expect(
+      isSameMasterVoiceFocus(focus, {
+        ...focus,
+        threadId: ThreadId.make("thread-two"),
+      }),
+    ).toBe(false);
+  });
+
+  it("preserves an active voice session while navigating away from thread routes", () => {
     expect(reconcileMasterVoiceFocus({ environmentId, focus }, null)).toEqual({
       type: "preserve",
     });
@@ -130,7 +144,7 @@ describe("master voice state", () => {
     });
   });
 
-  it("stops instead of carrying an active call into another environment", () => {
+  it("stops instead of carrying an active voice session into another environment", () => {
     const nextFocus = {
       ...focus,
       environmentId: EnvironmentId.make("environment-two"),

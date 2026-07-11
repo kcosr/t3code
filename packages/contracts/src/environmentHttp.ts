@@ -30,6 +30,7 @@ import {
   TrimmedNonEmptyString,
   VoiceConversationId,
   VoiceConfirmationId,
+  VoiceClientActionId,
   VoiceSessionId,
 } from "./baseSchemas.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
@@ -53,6 +54,8 @@ import {
   VoiceCapabilities,
   VoiceConfirmationInput,
   VoiceConfirmationResult,
+  VoiceClientActionAckInput,
+  VoiceClientActionAckResult,
   VoiceCredentialSetInput,
   VoiceCredentialStatus,
   VoiceConversationClearContextResult,
@@ -146,7 +149,9 @@ export class EnvironmentRequestInvalidError extends Schema.TaggedErrorClass<Envi
   { httpApiStatus: 400 },
 ) {
   [HttpServerRespondable.symbol]() {
-    return HttpServerResponse.schemaJson(EnvironmentRequestInvalidError)(this, { status: 400 });
+    return HttpServerResponse.schemaJson(EnvironmentRequestInvalidError)(this, {
+      status: 400,
+    });
   }
 }
 
@@ -162,7 +167,9 @@ export class EnvironmentVoiceOperationError extends Schema.TaggedErrorClass<Envi
   { httpApiStatus: 409 },
 ) {
   [HttpServerRespondable.symbol]() {
-    return HttpServerResponse.schemaJson(EnvironmentVoiceOperationError)(this, { status: 409 });
+    return HttpServerResponse.schemaJson(EnvironmentVoiceOperationError)(this, {
+      status: 409,
+    });
   }
 }
 
@@ -176,7 +183,9 @@ export class EnvironmentHistoryRequestError extends Schema.TaggedErrorClass<Envi
   { httpApiStatus: 400 },
 ) {
   [HttpServerRespondable.symbol]() {
-    return HttpServerResponse.schemaJson(EnvironmentHistoryRequestError)(this, { status: 400 });
+    return HttpServerResponse.schemaJson(EnvironmentHistoryRequestError)(this, {
+      status: 400,
+    });
   }
 }
 
@@ -190,7 +199,9 @@ export class EnvironmentAuthInvalidError extends Schema.TaggedErrorClass<Environ
   { httpApiStatus: 401 },
 ) {
   [HttpServerRespondable.symbol]() {
-    return HttpServerResponse.schemaJson(EnvironmentAuthInvalidError)(this, { status: 401 });
+    return HttpServerResponse.schemaJson(EnvironmentAuthInvalidError)(this, {
+      status: 401,
+    });
   }
 }
 
@@ -204,7 +215,9 @@ export class EnvironmentScopeRequiredError extends Schema.TaggedErrorClass<Envir
   { httpApiStatus: 403 },
 ) {
   [HttpServerRespondable.symbol]() {
-    return HttpServerResponse.schemaJson(EnvironmentScopeRequiredError)(this, { status: 403 });
+    return HttpServerResponse.schemaJson(EnvironmentScopeRequiredError)(this, {
+      status: 403,
+    });
   }
 }
 
@@ -232,7 +245,9 @@ export class EnvironmentInternalError extends Schema.TaggedErrorClass<Environmen
   { httpApiStatus: 500 },
 ) {
   [HttpServerRespondable.symbol]() {
-    return HttpServerResponse.schemaJson(EnvironmentInternalError)(this, { status: 500 });
+    return HttpServerResponse.schemaJson(EnvironmentInternalError)(this, {
+      status: 500,
+    });
   }
 }
 
@@ -281,7 +296,9 @@ export class EnvironmentHttpBadRequestError extends Schema.TaggedErrorClass<Envi
   { httpApiStatus: 400 },
 ) {
   [HttpServerRespondable.symbol]() {
-    return HttpServerResponse.schemaJson(EnvironmentHttpBadRequestError)(this, { status: 400 });
+    return HttpServerResponse.schemaJson(EnvironmentHttpBadRequestError)(this, {
+      status: 400,
+    });
   }
 }
 
@@ -305,7 +322,9 @@ export class EnvironmentHttpForbiddenError extends Schema.TaggedErrorClass<Envir
   { httpApiStatus: 403 },
 ) {
   [HttpServerRespondable.symbol]() {
-    return HttpServerResponse.schemaJson(EnvironmentHttpForbiddenError)(this, { status: 403 });
+    return HttpServerResponse.schemaJson(EnvironmentHttpForbiddenError)(this, {
+      status: 403,
+    });
   }
 }
 
@@ -329,7 +348,9 @@ export class EnvironmentHttpConflictError extends Schema.TaggedErrorClass<Enviro
   { httpApiStatus: 409 },
 ) {
   [HttpServerRespondable.symbol]() {
-    return HttpServerResponse.schemaJson(EnvironmentHttpConflictError)(this, { status: 409 });
+    return HttpServerResponse.schemaJson(EnvironmentHttpConflictError)(this, {
+      status: 409,
+    });
   }
 }
 
@@ -670,6 +691,22 @@ export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
       success: VoiceSessionEventsResult,
       error: [...EnvironmentScopedOperationErrors, EnvironmentVoiceOperationError],
     }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "acknowledgeVoiceClientAction",
+      "/api/voice/sessions/:sessionId/client-actions/:actionId/ack",
+      {
+        headers: OptionalBearerHeaders,
+        params: Schema.Struct({
+          sessionId: VoiceSessionId,
+          actionId: VoiceClientActionId,
+        }),
+        payload: VoiceClientActionAckInput,
+        success: VoiceClientActionAckResult,
+        error: [...EnvironmentScopedOperationErrors, EnvironmentVoiceOperationError],
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
     HttpApiEndpoint.post(

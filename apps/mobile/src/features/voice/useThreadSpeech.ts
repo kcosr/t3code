@@ -1,16 +1,20 @@
 import { VoicePlaybackId, VoiceRequestId } from "@t3tools/contracts";
+import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
+import { AsyncResult } from "effect/unstable/reactivity";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import { uuidv4 } from "../../lib/uuid";
+import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import { usePreparedConnection } from "../../state/session";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
 import {
   initialThreadSpeechPlannerState,
   planThreadSpeechToggle,
+  restoreThreadSpeechPreference,
   setThreadSpeechEnabled,
   updateThreadSpeech,
   type AssistantSpeechSnapshot,
@@ -36,12 +40,18 @@ const MAX_UNCONSUMED_CHUNKS = 4;
 export function useThreadSpeech(input: {
   readonly environmentId: Parameters<typeof usePreparedConnection>[0];
   readonly scopeKey: string;
+  readonly historyReady: boolean;
   readonly latestAssistant: AssistantSpeechSnapshot | null;
 }) {
   const prepared = Option.getOrNull(usePreparedConnection(input.environmentId));
   const native = getT3VoiceNativeModule();
   const capabilityAvailable = useVoiceCapabilityAvailability(prepared, "speech.streaming");
+  const preferencesResult = useAtomValue(mobilePreferencesAtom);
+  const savePreferences = useAtomSet(updateMobilePreferencesAtom);
   const plannerRef = useRef<ThreadSpeechPlannerState>(initialThreadSpeechPlannerState());
+  const preferenceHydratedRef = useRef(false);
+  const toggledBeforePreferenceHydrationRef = useRef(false);
+  const earlyToggleNeedsBaselineRef = useRef(false);
   const latestRef = useRef(input.latestAssistant);
   latestRef.current = input.latestAssistant;
   const actionChainRef = useRef(Promise.resolve());
@@ -267,8 +277,37 @@ export function useThreadSpeech(input: {
     };
   }, [native]);
 
+  useEffect(() => {
+    if (
+      preferenceHydratedRef.current ||
+      !input.historyReady ||
+      !AsyncResult.isSuccess(preferencesResult)
+    ) {
+      return;
+    }
+    preferenceHydratedRef.current = true;
+    if (toggledBeforePreferenceHydrationRef.current && !earlyToggleNeedsBaselineRef.current) {
+      return;
+    }
+
+    const restored = restoreThreadSpeechPreference(
+      plannerRef.current,
+      toggledBeforePreferenceHydrationRef.current
+        ? plannerRef.current.enabled
+        : preferencesResult.value.threadSpeechEnabled === true,
+      latestRef.current,
+    );
+    plannerRef.current = restored.state;
+    setEnabled(restored.state.enabled);
+    enqueueActions(restored.actions);
+  }, [enqueueActions, input.historyReady, preferencesResult]);
+
   const toggle = useCallback(() => {
     if (!capabilityAvailable) return;
+    if (!preferenceHydratedRef.current) {
+      toggledBeforePreferenceHydrationRef.current = true;
+      earlyToggleNeedsBaselineRef.current ||= !input.historyReady;
+    }
     const result = planThreadSpeechToggle(plannerRef.current, latestRef.current, uuidv4);
     if (!result.enabled) {
       ++operationGenerationRef.current;
@@ -283,9 +322,10 @@ export function useThreadSpeech(input: {
     }
     plannerRef.current = result.state;
     setEnabled(result.enabled);
+    savePreferences({ threadSpeechEnabled: result.enabled });
     setError(null);
     enqueueActions(result.actions);
-  }, [capabilityAvailable, enqueueActions, native]);
+  }, [capabilityAvailable, enqueueActions, input.historyReady, native, savePreferences]);
 
   useEffect(
     () => () => {

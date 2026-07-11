@@ -209,7 +209,10 @@ function composerConnectionStatus(input: {
           : `Failed to connect to ${environmentLabel}`,
       };
     case "available":
-      return { kind: "unavailable", label: `${environmentLabel} is not connected` };
+      return {
+        kind: "unavailable",
+        label: `${environmentLabel} is not connected`,
+      };
     case "connected":
       break;
   }
@@ -279,6 +282,20 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     realtimeVoice.phase === "active" ||
     realtimeVoice.phase === "starting" ||
     realtimeVoice.phase === "stopping";
+
+  useEffect(
+    () => realtimeVoice.registerDictationCancellation(dictation.cancel),
+    [dictation.cancel, realtimeVoice],
+  );
+
+  const toggleDictation = useCallback(async () => {
+    if (dictation.phase === "recording") {
+      await dictation.stop();
+      return;
+    }
+    await realtimeVoice.stop();
+    await dictation.start();
+  }, [dictation, realtimeVoice]);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
   const canSend = hasContent;
@@ -648,7 +665,10 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
               : "Full access",
         subactions: [
           { id: "options:runtime:approval-required", title: "Approve actions" },
-          { id: "options:runtime:auto-accept-edits", title: "Auto-accept edits" },
+          {
+            id: "options:runtime:auto-accept-edits",
+            title: "Auto-accept edits",
+          },
           { id: "options:runtime:full-access", title: "Full access" },
         ].map((option) => {
           const value = option.id.replace("options:runtime:", "");
@@ -840,24 +860,17 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
             <Animated.View entering={FadeIn.duration(180)} exiting={FadeOut.duration(100)}>
               {showStopAction ? (
                 <ControlPill icon="stop.fill" variant="danger" onPress={props.onStopThread} />
-              ) : realtimeInUse ? (
-                <ControlPill
-                  icon="arrow.up"
-                  variant="primary"
-                  disabled={!canSend}
-                  onPress={handleSend}
-                />
               ) : dictation.phase === "recording" ? (
                 <ControlPill
                   icon="stop.fill"
                   variant="danger"
-                  onPress={() => void dictation.stop()}
+                  onPress={() => void toggleDictation()}
                 />
               ) : !canSend && dictation.available ? (
                 <ControlPill
                   icon="microphone.fill"
                   disabled={dictation.phase === "transcribing"}
-                  onPress={() => void dictation.start()}
+                  onPress={() => void toggleDictation()}
                 />
               ) : (
                 <ControlPill
@@ -884,7 +897,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                   onPress={() => void props.onPickDraftImages()}
                   showChevron={false}
                 />
-                {dictation.available && !realtimeInUse ? (
+                {dictation.available ? (
                   <ComposerToolbarButton
                     accessibilityLabel={
                       dictation.phase === "recording" ? "Stop dictation" : "Start dictation"
@@ -892,9 +905,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                     icon={dictation.phase === "recording" ? "stop.fill" : "microphone.fill"}
                     variant={dictation.phase === "recording" ? "danger" : "default"}
                     disabled={dictation.phase === "transcribing"}
-                    onPress={() =>
-                      void (dictation.phase === "recording" ? dictation.stop() : dictation.start())
-                    }
+                    onPress={() => void toggleDictation()}
                     showChevron={false}
                   />
                 ) : null}
@@ -958,8 +969,8 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
         {props.queueCount > 0 ? (
           <Animated.View entering={FadeIn.duration(180)} exiting={FadeOut.duration(120)}>
             <Text className="pt-2 text-xs text-foreground-muted">
-              {props.queueCount} queued message{props.queueCount === 1 ? "" : "s"} will send
-              automatically.
+              {props.queueCount} queued message
+              {props.queueCount === 1 ? "" : "s"} will send automatically.
             </Text>
           </Animated.View>
         ) : null}

@@ -4,6 +4,9 @@ import type {
   VoiceConfirmationId,
   VoiceConfirmationInput,
   VoiceConfirmationResult,
+  VoiceClientActionAckInput,
+  VoiceClientActionAckResult,
+  VoiceClientActionId,
   VoiceConversationClearContextResult,
   VoiceConversationId,
   VoiceSessionCloseResult,
@@ -77,6 +80,12 @@ export interface VoiceSessionServiceShape {
     confirmationId: VoiceConfirmationId,
     input: VoiceConfirmationInput,
   ) => Effect.Effect<VoiceConfirmationResult, VoiceError>;
+  readonly acknowledgeClientAction: (
+    ownerAuthSessionId: AuthSessionId,
+    sessionId: VoiceSessionId,
+    actionId: VoiceClientActionId,
+    input: VoiceClientActionAckInput,
+  ) => Effect.Effect<VoiceClientActionAckResult, VoiceError>;
 }
 
 export class VoiceSessionService extends Context.Service<

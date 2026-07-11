@@ -52,7 +52,12 @@ const CONVERSATION_PAGE_SIZE = 40;
 const CONVERSATION_ACTIONS: MenuAction[] = [
   { id: "rename", title: "Rename", image: "pencil" },
   { id: "clear", title: "Clear Model Context", image: "eraser" },
-  { id: "delete", title: "Delete", image: "trash", attributes: { destructive: true } },
+  {
+    id: "delete",
+    title: "Delete",
+    image: "trash",
+    attributes: { destructive: true },
+  },
 ];
 
 const messageFromCause = (cause: unknown): string =>
@@ -182,7 +187,10 @@ export function VoiceConversationBrowser(props: {
     setListError(null);
     try {
       const result = await Effect.runPromise(
-        props.client.listConversations({ cursor, limit: CONVERSATION_PAGE_SIZE }),
+        props.client.listConversations({
+          cursor,
+          limit: CONVERSATION_PAGE_SIZE,
+        }),
       );
       if (generation !== listGeneration.current) return;
       setConversations((current) => mergeVoiceConversations(current, result.conversations));
@@ -360,7 +368,11 @@ export function VoiceConversationBrowser(props: {
         }),
       );
       if (generation !== detailGeneration.current) return;
-      const updated = { ...selected, activeEpoch: result.activeEpoch, updatedAt: result.clearedAt };
+      const updated = {
+        ...selected,
+        activeEpoch: result.activeEpoch,
+        updatedAt: result.clearedAt,
+      };
       setSelected(updated);
       setActiveContextEpoch(result.activeEpoch);
       setConversations((current) => replaceVoiceConversation(current, updated));
@@ -416,19 +428,27 @@ export function VoiceConversationBrowser(props: {
       } else if (nativeEvent.event === "clear") {
         Alert.alert(
           "Clear model context?",
-          "Earlier transcript will remain visible, but it will not be included when this conversation is resumed. Any active call will end.",
+          "Earlier transcript will remain visible, but it will not be included when this conversation is resumed. Any active voice session will end.",
           [
             { text: "Cancel", style: "cancel" },
-            { text: "Clear", style: "destructive", onPress: () => void clearContext() },
+            {
+              text: "Clear",
+              style: "destructive",
+              onPress: () => void clearContext(),
+            },
           ],
         );
       } else if (nativeEvent.event === "delete") {
         Alert.alert(
           "Delete voice conversation?",
-          `“${selected.title ?? "Voice conversation"}” and its transcript will be permanently deleted. Any active call will end.`,
+          `“${selected.title ?? "Voice conversation"}” and its transcript will be permanently deleted. Any active voice session will end.`,
           [
             { text: "Cancel", style: "cancel" },
-            { text: "Delete", style: "destructive", onPress: () => void deleteConversation() },
+            {
+              text: "Delete",
+              style: "destructive",
+              onPress: () => void deleteConversation(),
+            },
           ],
         );
       }
@@ -455,7 +475,10 @@ export function VoiceConversationBrowser(props: {
     >
       <View
         className="flex-1 bg-screen"
-        style={{ paddingTop: Math.max(insets.top, 20), paddingBottom: Math.max(insets.bottom, 12) }}
+        style={{
+          paddingTop: Math.max(insets.top, 20),
+          paddingBottom: Math.max(insets.bottom, 12),
+        }}
       >
         {selected === null ? (
           <>
@@ -496,7 +519,11 @@ export function VoiceConversationBrowser(props: {
               <FlatList
                 data={conversations}
                 keyExtractor={(conversation) => conversation.conversationId}
-                contentContainerStyle={{ flexGrow: 1, paddingHorizontal: 16, paddingBottom: 24 }}
+                contentContainerStyle={{
+                  flexGrow: 1,
+                  paddingHorizontal: 16,
+                  paddingBottom: 24,
+                }}
                 refreshControl={
                   <RefreshControl
                     refreshing={listRefreshing}
@@ -621,7 +648,11 @@ export function VoiceConversationBrowser(props: {
                 data={rows}
                 keyExtractor={(row) => row.id}
                 maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
-                contentContainerStyle={{ flexGrow: 1, paddingHorizontal: 20, paddingBottom: 20 }}
+                contentContainerStyle={{
+                  flexGrow: 1,
+                  paddingHorizontal: 20,
+                  paddingBottom: 20,
+                }}
                 ListHeaderComponent={
                   <View className="gap-3 py-4">
                     {!activeEpochHasEntries && entries.length > 0 ? (
@@ -664,7 +695,7 @@ export function VoiceConversationBrowser(props: {
                 ListEmptyComponent={
                   <EmptyState
                     title="No transcript yet"
-                    detail="Resume this conversation to begin a new call."
+                    detail="Resume this conversation to begin a new voice session."
                     variant="plain"
                   />
                 }

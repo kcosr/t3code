@@ -38,7 +38,6 @@ import {
   parseActiveThreadPath,
   useHardwareKeyboardCommand,
 } from "../keyboard/hardwareKeyboardCommands";
-import { HomeListOptionsProvider } from "../home/home-list-options";
 import { ThreadNavigationSidebar } from "../threads/ThreadNavigationSidebar";
 import { WORKSPACE_PANE_TIMING } from "./workspace-pane-animation";
 import { WorkspaceInspectorPane } from "./workspace-inspector-pane";
@@ -474,53 +473,49 @@ export function AdaptiveWorkspaceLayout(props: {
   );
 
   return (
-    <HomeListOptionsProvider>
-      <AdaptiveWorkspaceContext.Provider value={contextValue}>
-        <View testID="adaptive-workspace-layout" className="flex-1 flex-row">
-          {shouldRenderPrimarySidebar && layout.listPaneWidth !== null ? (
-            <Animated.View
-              className="self-stretch overflow-hidden"
-              accessibilityElementsHidden={!panes.primarySidebarVisible}
-              collapsable={false}
-              importantForAccessibility={
-                panes.primarySidebarVisible ? "auto" : "no-hide-descendants"
-              }
-              pointerEvents={panes.primarySidebarVisible ? "auto" : "none"}
-              style={sidebarAnimatedStyle}
-            >
-              <ThreadNavigationSidebar
-                width={layout.listPaneWidth}
-                visible={panes.primarySidebarVisible}
-                onRequestVisibility={revealPrimarySidebar}
-                selectedThreadKey={selectedThreadKey}
-                onOpenSettings={handleOpenSettings}
-                onOpenEnvironmentSettings={handleOpenEnvironmentSettings}
-                onNewThreadInProject={handleNewThreadInProject}
-                onSelectThread={handleSelectThread}
-                onSearchQueryChange={setPrimarySidebarSearchQuery}
-                searchQuery={primarySidebarSearchQuery}
-              />
-            </Animated.View>
-          ) : null}
-          <View className="flex-1 overflow-hidden bg-screen" collapsable={false}>
-            <View
-              collapsable={false}
-              style={
-                contentSettledWidth !== null ? { flex: 1, width: contentSettledWidth } : { flex: 1 }
-              }
-            >
-              {props.children}
-            </View>
+    <AdaptiveWorkspaceContext.Provider value={contextValue}>
+      <View testID="adaptive-workspace-layout" className="flex-1 flex-row">
+        {shouldRenderPrimarySidebar && layout.listPaneWidth !== null ? (
+          <Animated.View
+            className="self-stretch overflow-hidden"
+            accessibilityElementsHidden={!panes.primarySidebarVisible}
+            collapsable={false}
+            importantForAccessibility={panes.primarySidebarVisible ? "auto" : "no-hide-descendants"}
+            pointerEvents={panes.primarySidebarVisible ? "auto" : "none"}
+            style={sidebarAnimatedStyle}
+          >
+            <ThreadNavigationSidebar
+              width={layout.listPaneWidth}
+              visible={panes.primarySidebarVisible}
+              onRequestVisibility={revealPrimarySidebar}
+              selectedThreadKey={selectedThreadKey}
+              onOpenSettings={handleOpenSettings}
+              onOpenEnvironmentSettings={handleOpenEnvironmentSettings}
+              onNewThreadInProject={handleNewThreadInProject}
+              onSelectThread={handleSelectThread}
+              onSearchQueryChange={setPrimarySidebarSearchQuery}
+              searchQuery={primarySidebarSearchQuery}
+            />
+          </Animated.View>
+        ) : null}
+        <View className="flex-1 overflow-hidden bg-screen" collapsable={false}>
+          <View
+            collapsable={false}
+            style={
+              contentSettledWidth !== null ? { flex: 1, width: contentSettledWidth } : { flex: 1 }
+            }
+          >
+            {props.children}
           </View>
-          <WorkspaceInspectorPane
-            active={workspaceInspector?.active ?? false}
-            panes={panes}
-            renderInspector={workspaceInspector?.render}
-            setAuxiliaryPaneWidth={setAuxiliaryPaneWidth}
-            onClosed={handleWorkspaceInspectorClosed}
-          />
         </View>
-      </AdaptiveWorkspaceContext.Provider>
-    </HomeListOptionsProvider>
+        <WorkspaceInspectorPane
+          active={workspaceInspector?.active ?? false}
+          panes={panes}
+          renderInspector={workspaceInspector?.render}
+          setAuxiliaryPaneWidth={setAuxiliaryPaneWidth}
+          onClosed={handleWorkspaceInspectorClosed}
+        />
+      </View>
+    </AdaptiveWorkspaceContext.Provider>
   );
 }

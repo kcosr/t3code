@@ -59,6 +59,8 @@ export const VoiceToolCallId = makeEntityId("VoiceToolCallId");
 export type VoiceToolCallId = typeof VoiceToolCallId.Type;
 export const VoiceConfirmationId = makeEntityId("VoiceConfirmationId");
 export type VoiceConfirmationId = typeof VoiceConfirmationId.Type;
+export const VoiceClientActionId = makeEntityId("VoiceClientActionId");
+export type VoiceClientActionId = typeof VoiceClientActionId.Type;
 export const VoiceMediaTicketId = makeEntityId("VoiceMediaTicketId");
 export type VoiceMediaTicketId = typeof VoiceMediaTicketId.Type;
 

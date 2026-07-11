@@ -122,9 +122,11 @@ function latestStreamingAssistantMessage(
   return null;
 }
 
-function latestAssistantSpeechSnapshot(
-  feed: ReadonlyArray<ThreadFeedEntry>,
-): { readonly id: string; readonly text: string; readonly streaming: boolean } | null {
+function latestAssistantSpeechSnapshot(feed: ReadonlyArray<ThreadFeedEntry>): {
+  readonly id: string;
+  readonly text: string;
+  readonly streaming: boolean;
+} | null {
   for (let index = feed.length - 1; index >= 0; index -= 1) {
     const entry = feed[index];
     if (entry?.type === "message" && entry.message.role === "assistant") {
@@ -268,6 +270,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
   const speechPlayback = useThreadSpeech({
     environmentId: props.environmentId,
     scopeKey: selectedThreadKey,
+    historyReady: contentPresentationKind === "ready",
     latestAssistant,
   });
   const handleSpeechPlaybackToggle = speechPlayback.onToggle;

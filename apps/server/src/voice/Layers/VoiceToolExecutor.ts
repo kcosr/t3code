@@ -22,6 +22,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
   VoiceConfirmationId,
+  VoiceClientActionId,
   VoiceConversationEntryId,
   VoiceToolCallId,
   VoiceToolName,
@@ -185,6 +186,7 @@ type ReadVoiceTool = Extract<
   | "wait_for_thread_turn"
   | "search_history"
   | "read_history"
+  | "activate_thread"
 >;
 type MutationVoiceTool = Exclude<VoiceToolName, ReadVoiceTool>;
 type HistoryVoiceTool = Extract<VoiceToolName, "search_history" | "read_history">;
@@ -197,6 +199,7 @@ const VOICE_TOOL_ACCESS = {
   wait_for_thread_turn: "orchestration-read",
   search_history: "history-read",
   read_history: "history-read",
+  activate_thread: "orchestration-read",
   create_thread: "orchestration-operate",
   send_thread_message: "orchestration-operate",
   interrupt_thread: "orchestration-operate",
@@ -308,11 +311,17 @@ const historyErrorOutput = (error: HistorySearchServiceError | VoiceError) => {
     case "HistoryInvalidRequestError":
       return jsonOutput({ error: { code: error.reason, retryable: false } });
     case "HistoryItemNotFoundError":
-      return jsonOutput({ error: { code: "item_not_found", retryable: false } });
+      return jsonOutput({
+        error: { code: "item_not_found", retryable: false },
+      });
     case "HistorySearchUnavailableError":
-      return jsonOutput({ error: { code: "search_unavailable", retryable: true } });
+      return jsonOutput({
+        error: { code: "search_unavailable", retryable: true },
+      });
     case "VoiceError":
-      return jsonOutput({ error: { code: "invalid_arguments", retryable: false } });
+      return jsonOutput({
+        error: { code: "invalid_arguments", retryable: false },
+      });
   }
 };
 
@@ -370,7 +379,11 @@ const mutationOutput = (command: ClientOrchestrationCommand, sequence: number) =
     case "thread.create":
     case "thread.turn.interrupt":
     case "thread.archive":
-      return jsonOutput({ sequence, threadId: command.threadId, commandId: command.commandId });
+      return jsonOutput({
+        sequence,
+        threadId: command.threadId,
+        commandId: command.commandId,
+      });
     default:
       return jsonOutput({ sequence });
   }
@@ -598,7 +611,9 @@ const make = Effect.gen(function* () {
       case "list_projects": {
         const args = yield* parseArguments(ListProjectsArguments, input);
         const snapshot = yield* query.getShellSnapshot();
-        return jsonOutput({ projects: snapshot.projects.slice(0, args.limit).map(projectOutput) });
+        return jsonOutput({
+          projects: snapshot.projects.slice(0, args.limit).map(projectOutput),
+        });
       }
       case "list_threads": {
         const args = yield* parseArguments(ListThreadsArguments, input);
@@ -612,7 +627,27 @@ const make = Effect.gen(function* () {
       }
       case "get_thread_status": {
         const args = yield* parseArguments(ThreadArguments, input);
-        return jsonOutput({ thread: threadOutput(yield* requireThread(args.threadId)) });
+        return jsonOutput({
+          thread: threadOutput(yield* requireThread(args.threadId)),
+        });
+      }
+      case "activate_thread": {
+        const args = yield* parseArguments(ThreadArguments, input);
+        const thread = yield* requireThread(args.threadId);
+        const resolution = yield* input.requestClientAction({
+          actionId: VoiceClientActionId.make(deterministicId("voice-client-action", input)),
+          action: "activate-thread",
+          projectId: thread.projectId,
+          threadId: thread.id,
+        });
+        return resolution.outcome === "succeeded"
+          ? jsonOutput({ status: "thread-activated", threadId: thread.id })
+          : jsonOutput({
+              error: {
+                code: resolution.reason ?? "client_action_failed",
+                retryable: true,
+              },
+            });
       }
       case "get_thread_messages": {
         const args = yield* parseArguments(GetThreadMessagesArguments, input);
@@ -663,7 +698,9 @@ const make = Effect.gen(function* () {
       case "wait_for_thread_turn": {
         const args = yield* parseArguments(WaitForThreadTurnArguments, input);
         yield* requireThread(args.threadId);
-        const dispatchedMessage = yield* messages.getByMessageId({ messageId: args.messageId });
+        const dispatchedMessage = yield* messages.getByMessageId({
+          messageId: args.messageId,
+        });
         if (
           Option.isNone(dispatchedMessage) ||
           dispatchedMessage.value.threadId !== args.threadId ||
@@ -699,13 +736,18 @@ const make = Effect.gen(function* () {
           }
           const value = outcome.value.turn;
           if (value === null) {
-            return { state: "running", turnId: outcome.value.start.turnId } as const;
+            return {
+              state: "running",
+              turnId: outcome.value.start.turnId,
+            } as const;
           }
           if (value.state !== "running") {
             const assistantMessage =
               value.assistantMessageId === null
                 ? Option.none()
-                : yield* messages.getByMessageId({ messageId: value.assistantMessageId });
+                : yield* messages.getByMessageId({
+                    messageId: value.assistantMessageId,
+                  });
             const assistant = Option.filter(
               assistantMessage,
               (message) => message.threadId === args.threadId && message.role === "assistant",
@@ -733,10 +775,16 @@ const make = Effect.gen(function* () {
           }
           const isActiveTurn = value.turnId !== null && shell.latestTurn?.turnId === value.turnId;
           if (isActiveTurn && shell.hasPendingApprovals) {
-            return { state: "approval-required", turnId: value.turnId } as const;
+            return {
+              state: "approval-required",
+              turnId: value.turnId,
+            } as const;
           }
           if (isActiveTurn && shell.hasPendingUserInput) {
-            return { state: "user-input-required", turnId: value.turnId } as const;
+            return {
+              state: "user-input-required",
+              turnId: value.turnId,
+            } as const;
           }
           return { state: value.state, turnId: value.turnId } as const;
         });
@@ -959,7 +1007,9 @@ const make = Effect.gen(function* () {
               input,
               requestedTool,
               "failed",
-              jsonOutput({ error: { code: "invalid_arguments", retryable: false } }),
+              jsonOutput({
+                error: { code: "invalid_arguments", retryable: false },
+              }),
             );
           }
           requiredScopes = decodedScopes.value;
@@ -977,7 +1027,9 @@ const make = Effect.gen(function* () {
             requestedTool,
             "failed",
             access === "history-read"
-              ? jsonOutput({ error: { code: "scope_required", retryable: false } })
+              ? jsonOutput({
+                  error: { code: "scope_required", retryable: false },
+                })
               : jsonOutput({ error: `Voice tool requires ${missingScope}` }),
           );
         }
@@ -1083,7 +1135,10 @@ const make = Effect.gen(function* () {
         }
         if (existing?.type === "executing-read") {
           return Effect.succeed([
-            { action: "await-read", completion: existing.completion } satisfies InvokeAction,
+            {
+              action: "await-read",
+              completion: existing.completion,
+            } satisfies InvokeAction,
             current,
           ] as const);
         }
@@ -1169,7 +1224,12 @@ const make = Effect.gen(function* () {
           if (readTool) {
             const completion = yield* Deferred.make<VoiceToolCompletedResult, VoiceError>();
             return [
-              { action: "execute-read", key, tool, completion } satisfies InvokeAction,
+              {
+                action: "execute-read",
+                key,
+                tool,
+                completion,
+              } satisfies InvokeAction,
               {
                 ...current,
                 calls: new Map(current.calls).set(key, {
@@ -1208,7 +1268,7 @@ const make = Effect.gen(function* () {
               },
             ] as const;
           }
-          if (tool === "send_thread_message") {
+          if (tool === "create_thread" || tool === "send_thread_message") {
             const result = yield* dispatcher.dispatch(prepared.value.command).pipe(
               Effect.match({
                 onFailure: (cause) =>
@@ -1402,6 +1462,8 @@ const make = Effect.gen(function* () {
             name: pending.tool,
             argumentsJson: "{}",
             grantedScopes: pending.grantedScopes,
+            requestClientAction: () =>
+              Effect.die("Confirmed mutations cannot request client actions"),
           };
           const result =
             input.decision === "reject"
@@ -1471,6 +1533,7 @@ const make = Effect.gen(function* () {
           name: pending.tool,
           argumentsJson: "{}",
           grantedScopes: pending.grantedScopes,
+          requestClientAction: () => Effect.die("Expired mutations cannot request client actions"),
         };
         const result = completed(
           toolInput,
@@ -1506,7 +1569,9 @@ const make = Effect.gen(function* () {
       yield* toolCalls
         .terminalizeSession({
           sessionId,
-          resultOutput: jsonOutput({ error: "Voice session ended before the tool completed" }),
+          resultOutput: jsonOutput({
+            error: "Voice session ended before the tool completed",
+          }),
           updatedAt,
         })
         .pipe(

@@ -104,7 +104,10 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
           const principal = yield* requireEnvironmentScope(AuthVoiceUseScope);
           return yield* sessions
             .create(
-              { sessionId: principal.sessionId, scopes: new Set(principal.scopes) },
+              {
+                sessionId: principal.sessionId,
+                scopes: new Set(principal.scopes),
+              },
               args.payload,
             )
             .pipe(Effect.catch(failVoiceOperation));
@@ -171,6 +174,21 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
               args.params.sessionId,
               args.query.afterSequence ?? 0,
               args.query.waitMilliseconds ?? 0,
+            )
+            .pipe(Effect.catch(failVoiceOperation));
+        }),
+      )
+      .handle(
+        "acknowledgeVoiceClientAction",
+        Effect.fn("environment.voice.acknowledgeVoiceClientAction")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          const principal = yield* requireEnvironmentScope(AuthVoiceUseScope);
+          return yield* sessions
+            .acknowledgeClientAction(
+              principal.sessionId,
+              args.params.sessionId,
+              args.params.actionId,
+              args.payload,
             )
             .pipe(Effect.catch(failVoiceOperation));
         }),

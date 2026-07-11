@@ -15,12 +15,15 @@ export interface MasterVoiceFocus {
 
 export interface ActiveMasterVoiceAttachment {
   readonly environmentId: EnvironmentId;
-  readonly focus: MasterVoiceFocus;
+  readonly focus: MasterVoiceFocus | null;
 }
 
 export type MasterVoiceFocusReconciliation =
   | { readonly type: "preserve" }
-  | { readonly type: "update"; readonly attachment: ActiveMasterVoiceAttachment }
+  | {
+      readonly type: "update";
+      readonly attachment: ActiveMasterVoiceAttachment;
+    }
   | { readonly type: "stop" };
 
 export function durableVoiceConversations(
@@ -35,17 +38,38 @@ export function durableVoiceConversations(
     );
 }
 
+const padDatePart = (value: number): string => String(value).padStart(2, "0");
+
+export function newVoiceConversationTitle(now: Date = new Date()): string {
+  const date = `${now.getFullYear()}-${padDatePart(now.getMonth() + 1)}-${padDatePart(now.getDate())}`;
+  const time = `${padDatePart(now.getHours())}:${padDatePart(now.getMinutes())}`;
+  return `Voice · ${date} ${time}`;
+}
+
 export function resumeVoiceConversationSelection(
   conversations: ReadonlyArray<VoiceConversationSummary>,
+  now: Date = new Date(),
 ): VoiceConversationSelection {
   const latest = durableVoiceConversations(conversations)[0];
   return latest === undefined
-    ? { type: "new", retention: "durable", title: "T3 Voice" }
-    : { type: "continue", conversationId: latest.conversationId, takeover: false };
+    ? {
+        type: "new",
+        retention: "durable",
+        title: newVoiceConversationTitle(now),
+      }
+    : {
+        type: "continue",
+        conversationId: latest.conversationId,
+        takeover: false,
+      };
 }
 
-export function newVoiceConversationSelection(): VoiceConversationSelection {
-  return { type: "new", retention: "durable", title: "T3 Voice" };
+export function newVoiceConversationSelection(now: Date = new Date()): VoiceConversationSelection {
+  return {
+    type: "new",
+    retention: "durable",
+    title: newVoiceConversationTitle(now),
+  };
 }
 
 export function continueVoiceConversationSelection(
@@ -57,8 +81,9 @@ export function continueVoiceConversationSelection(
 export function masterVoiceEnvironmentId(
   activeEnvironmentId: EnvironmentId | null,
   focus: MasterVoiceFocus | null,
+  fallbackEnvironmentId: EnvironmentId | null = null,
 ): EnvironmentId | null {
-  return activeEnvironmentId ?? focus?.environmentId ?? null;
+  return activeEnvironmentId ?? focus?.environmentId ?? fallbackEnvironmentId;
 }
 
 export function isSameMasterVoiceFocus(

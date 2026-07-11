@@ -11,6 +11,7 @@ import {
   VoiceSessionFocusInput,
   VoiceSessionEvent,
   VoiceSessionEventsResult,
+  VoiceClientActionAckInput,
   VoiceWebRtcOffer,
   VoiceTranscriptionStreamEvent,
 } from "./voice.ts";
@@ -105,7 +106,9 @@ describe("voice contracts", () => {
       }),
     ).toThrow();
     expect(() =>
-      decodeUnknownSync(VoiceConversationUpdateInput)({ title: "x".repeat(257) }),
+      decodeUnknownSync(VoiceConversationUpdateInput)({
+        title: "x".repeat(257),
+      }),
     ).toThrow();
   });
 
@@ -146,6 +149,30 @@ describe("voice contracts", () => {
     expect(decoded).not.toHaveProperty("providerCallId");
   });
 
+  it("decodes acknowledged client navigation actions", () => {
+    expect(
+      decodeUnknownSync(VoiceSessionEvent)({
+        type: "client-action",
+        sessionId: "voice-session-1",
+        leaseGeneration: 2,
+        sequence: 8,
+        occurredAt: "2026-07-10T20:00:00.000Z",
+        action: "activate-thread",
+        actionId: "voice-client-action-1",
+        projectId: "project-1",
+        threadId: "thread-1",
+        expiresAt: "2026-07-10T20:00:10.000Z",
+      }),
+    ).toMatchObject({ action: "activate-thread", threadId: "thread-1" });
+    expect(
+      decodeUnknownSync(VoiceClientActionAckInput)({
+        leaseGeneration: 2,
+        outcome: "failed",
+        message: "Navigation was unavailable",
+      }),
+    ).toMatchObject({ outcome: "failed" });
+  });
+
   it("preserves partial transcript boundaries and normalizes final transcripts", () => {
     const eventBase = {
       type: "transcript" as const,
@@ -156,11 +183,19 @@ describe("voice contracts", () => {
       role: "assistant" as const,
     };
 
-    expect(decodeUnknownSync(VoiceSessionEvent)({ ...eventBase, text: " ", final: false })).toEqual(
-      { ...eventBase, text: " ", final: false },
-    );
     expect(
-      decodeUnknownSync(VoiceSessionEvent)({ ...eventBase, text: " next ", final: false }),
+      decodeUnknownSync(VoiceSessionEvent)({
+        ...eventBase,
+        text: " ",
+        final: false,
+      }),
+    ).toEqual({ ...eventBase, text: " ", final: false });
+    expect(
+      decodeUnknownSync(VoiceSessionEvent)({
+        ...eventBase,
+        text: " next ",
+        final: false,
+      }),
     ).toEqual({ ...eventBase, text: " next ", final: false });
     const partial = decodeUnknownSync(VoiceSessionEvent)({
       ...eventBase,
@@ -173,10 +208,18 @@ describe("voice contracts", () => {
       final: false,
     });
     expect(
-      decodeUnknownSync(VoiceSessionEvent)({ ...eventBase, text: "  Finished.  ", final: true }),
+      decodeUnknownSync(VoiceSessionEvent)({
+        ...eventBase,
+        text: "  Finished.  ",
+        final: true,
+      }),
     ).toEqual({ ...eventBase, text: "Finished.", final: true });
     expect(() =>
-      decodeUnknownSync(VoiceSessionEvent)({ ...eventBase, text: " ", final: true }),
+      decodeUnknownSync(VoiceSessionEvent)({
+        ...eventBase,
+        text: " ",
+        final: true,
+      }),
     ).toThrow();
 
     const result = decodeUnknownSync(VoiceSessionEventsResult)({
@@ -190,7 +233,11 @@ describe("voice contracts", () => {
       },
       events: [{ ...eventBase, text: " ", final: false }],
     });
-    expect(result.events[0]).toMatchObject({ text: " ", final: false, sequence: 8 });
+    expect(result.events[0]).toMatchObject({
+      text: " ",
+      final: false,
+      sequence: 8,
+    });
   });
 
   it("defines streaming recognition deltas and an authoritative final event", () => {

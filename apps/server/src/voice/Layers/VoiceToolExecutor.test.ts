@@ -184,7 +184,11 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
     Array<{ readonly principal: HistoryPrincipal; readonly input: unknown }>
   >([]);
   const journal = yield* Ref.make<
-    Array<{ readonly entryId?: string; readonly kind: string; readonly payload: unknown }>
+    Array<{
+      readonly entryId?: string;
+      readonly kind: string;
+      readonly payload: unknown;
+    }>
   >([]);
   const durableCalls = yield* Ref.make(new Map<string, DurableVoiceToolCall>());
   const projectionMessages = yield* Ref.make([...(projection?.messages ?? [])]);
@@ -262,7 +266,10 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
     listPageByThreadId: (input: {
       readonly threadId: ThreadId;
       readonly limit: number;
-      readonly before?: { readonly createdAt: string; readonly messageId: MessageId };
+      readonly before?: {
+        readonly createdAt: string;
+        readonly messageId: MessageId;
+      };
       readonly includeStreaming?: boolean;
     }) =>
       (projection?.blockMessagePage === true
@@ -521,6 +528,7 @@ const call = (
   name,
   argumentsJson,
   grantedScopes,
+  requestClientAction: () => Effect.succeed({ outcome: "succeeded" as const }),
 });
 
 it.effect("executes read tools, strictly decodes arguments, and deduplicates provider calls", () =>
@@ -561,6 +569,45 @@ it.effect("executes read tools, strictly decodes arguments, and deduplicates pro
       );
       expect(invalid.type === "completed" && invalid.outcome).toBe("failed");
       expect(yield* Ref.get(test.commands)).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("waits for acknowledged thread activation and deduplicates the client action", () =>
+  Effect.gen(function* () {
+    const test = yield* makeTest();
+    const requests: Array<{
+      readonly projectId: ProjectId;
+      readonly threadId: ThreadId;
+    }> = [];
+    yield* Effect.gen(function* () {
+      const tools = yield* VoiceToolExecutor;
+      const input = {
+        ...call("activate_thread", encodeJson({ threadId }), "activate-one"),
+        requestClientAction: (request: {
+          readonly projectId: ProjectId;
+          readonly threadId: ThreadId;
+        }) =>
+          Effect.sync(() => {
+            requests.push({
+              projectId: request.projectId,
+              threadId: request.threadId,
+            });
+            return { outcome: "succeeded" as const };
+          }),
+      };
+
+      const result = yield* tools.invoke(input);
+      expect(result.type === "completed" && result.outcome).toBe("succeeded");
+      expect(result.type === "completed" ? decodeJson(result.output) : null).toEqual({
+        status: "thread-activated",
+        threadId,
+      });
+      expect(requests).toEqual([{ projectId, threadId }]);
+
+      const duplicate = yield* tools.invoke(input);
+      expect(duplicate.type === "completed" && duplicate.submitOutput).toBe(false);
+      expect(requests).toHaveLength(1);
     }).pipe(Effect.provide(test.layer));
   }),
 );
@@ -883,7 +930,10 @@ it.effect("reads bounded message pages with opaque cursors and excludes streamin
       );
       const secondOutput = second.type === "completed" ? decodeJson(second.output) : {};
       expect(secondOutput.messages).toEqual([
-        expect.objectContaining({ messageId: oldestMessageId, text: "older question" }),
+        expect.objectContaining({
+          messageId: oldestMessageId,
+          text: "older question",
+        }),
       ]);
       expect(secondOutput.nextCursor).toBeNull();
 
@@ -984,7 +1034,11 @@ it.effect("waits for the exact dispatched message and returns its terminal assis
       const result = yield* (yield* VoiceToolExecutor).invoke(
         call(
           "wait_for_thread_turn",
-          encodeJson({ threadId, messageId: userMessageId, waitMilliseconds: 1_000 }),
+          encodeJson({
+            threadId,
+            messageId: userMessageId,
+            waitMilliseconds: 1_000,
+          }),
           "wait-completed",
           new Set([AuthOrchestrationReadScope]),
         ),
@@ -1032,7 +1086,11 @@ it.effect("waits for the canonical assistant message to finish projecting", () =
         .invoke(
           call(
             "wait_for_thread_turn",
-            encodeJson({ threadId, messageId: userMessageId, waitMilliseconds: 1_000 }),
+            encodeJson({
+              threadId,
+              messageId: userMessageId,
+              waitMilliseconds: 1_000,
+            }),
             "wait-finalizing-assistant",
             new Set([AuthOrchestrationReadScope]),
           ),
@@ -1100,7 +1158,11 @@ it.effect("rejects a wait for a message owned by another thread", () =>
       const result = yield* (yield* VoiceToolExecutor).invoke(
         call(
           "wait_for_thread_turn",
-          encodeJson({ threadId, messageId: userMessageId, waitMilliseconds: 1_000 }),
+          encodeJson({
+            threadId,
+            messageId: userMessageId,
+            waitMilliseconds: 1_000,
+          }),
           "wait-wrong-thread",
           new Set([AuthOrchestrationReadScope]),
         ),
@@ -1131,7 +1193,11 @@ it.effect("rejects a wait for a non-user message in the requested thread", () =>
       const result = yield* (yield* VoiceToolExecutor).invoke(
         call(
           "wait_for_thread_turn",
-          encodeJson({ threadId, messageId: assistantMessageId, waitMilliseconds: 1_000 }),
+          encodeJson({
+            threadId,
+            messageId: assistantMessageId,
+            waitMilliseconds: 1_000,
+          }),
           "wait-non-user-message",
           new Set([AuthOrchestrationReadScope]),
         ),
@@ -1189,14 +1255,22 @@ it.effect(
             turnId: interruptedTurnId,
           }),
         ],
-        thread: { ...thread, hasPendingApprovals: true, hasPendingUserInput: true },
+        thread: {
+          ...thread,
+          hasPendingApprovals: true,
+          hasPendingUserInput: true,
+        },
       });
       yield* Effect.gen(function* () {
         const tools = yield* VoiceToolExecutor;
         const failed = yield* tools.invoke(
           call(
             "wait_for_thread_turn",
-            encodeJson({ threadId, messageId: failedMessageId, waitMilliseconds: 1_000 }),
+            encodeJson({
+              threadId,
+              messageId: failedMessageId,
+              waitMilliseconds: 1_000,
+            }),
             "wait-failed",
             new Set([AuthOrchestrationReadScope]),
           ),
@@ -1206,7 +1280,10 @@ it.effect(
         expect(failedOutput).toMatchObject({
           state: "failed",
           turnId: failedTurnId,
-          assistantMessage: { messageId: failedAssistantMessageId, truncated: true },
+          assistantMessage: {
+            messageId: failedAssistantMessageId,
+            truncated: true,
+          },
         });
         expect(
           ((failedOutput.assistantMessage as { readonly text: string }).text as string).length,
@@ -1215,7 +1292,11 @@ it.effect(
         const interrupted = yield* tools.invoke(
           call(
             "wait_for_thread_turn",
-            encodeJson({ threadId, messageId: interruptedMessageId, waitMilliseconds: 1_000 }),
+            encodeJson({
+              threadId,
+              messageId: interruptedMessageId,
+              waitMilliseconds: 1_000,
+            }),
             "wait-interrupted",
             new Set([AuthOrchestrationReadScope]),
           ),
@@ -1283,7 +1364,11 @@ it.effect("preserves terminal state when assistant output is partial or missing"
       const failed = yield* tools.invoke(
         call(
           "wait_for_thread_turn",
-          encodeJson({ threadId, messageId: failedMessageId, waitMilliseconds: 1_000 }),
+          encodeJson({
+            threadId,
+            messageId: failedMessageId,
+            waitMilliseconds: 1_000,
+          }),
           "wait-failed-partial",
           new Set([AuthOrchestrationReadScope]),
         ),
@@ -1297,7 +1382,11 @@ it.effect("preserves terminal state when assistant output is partial or missing"
       const interrupted = yield* tools.invoke(
         call(
           "wait_for_thread_turn",
-          encodeJson({ threadId, messageId: interruptedMessageId, waitMilliseconds: 1_000 }),
+          encodeJson({
+            threadId,
+            messageId: interruptedMessageId,
+            waitMilliseconds: 1_000,
+          }),
           "wait-interrupted-missing",
           new Set([AuthOrchestrationReadScope]),
         ),
@@ -1340,7 +1429,12 @@ it.effect("reports pending, accepted-without-lifecycle, failed, and ambiguous st
     const test = yield* makeTest("durable", {
       messages: [pendingMessageId, acceptedMessageId, failedMessageId, ambiguousMessageId].map(
         (messageId) =>
-          projectionMessage({ messageId, role: "user", text: "Run it", createdAt: now }),
+          projectionMessage({
+            messageId,
+            role: "user",
+            text: "Run it",
+            createdAt: now,
+          }),
       ),
       turns: [
         start(pendingMessageId, "pending", null),
@@ -1405,7 +1499,10 @@ it.effect("reports pending, accepted-without-lifecycle, failed, and ambiguous st
 it.effect("returns interaction-required state and bounds a still-running wait", () =>
   Effect.gen(function* () {
     const userMessageId = MessageId.make("message-user-running");
-    const runningTurn = projectionTurn({ pendingMessageId: userMessageId, state: "running" });
+    const runningTurn = projectionTurn({
+      pendingMessageId: userMessageId,
+      state: "running",
+    });
     const test = yield* makeTest("durable", {
       messages: [
         projectionMessage({
@@ -1427,7 +1524,11 @@ it.effect("returns interaction-required state and bounds a still-running wait", 
       const approval = yield* tools.invoke(
         call(
           "wait_for_thread_turn",
-          encodeJson({ threadId, messageId: userMessageId, waitMilliseconds: 1_000 }),
+          encodeJson({
+            threadId,
+            messageId: userMessageId,
+            waitMilliseconds: 1_000,
+          }),
           "wait-approval",
           new Set([AuthOrchestrationReadScope]),
         ),
@@ -1446,7 +1547,11 @@ it.effect("returns interaction-required state and bounds a still-running wait", 
       const userInput = yield* tools.invoke(
         call(
           "wait_for_thread_turn",
-          encodeJson({ threadId, messageId: userMessageId, waitMilliseconds: 1_000 }),
+          encodeJson({
+            threadId,
+            messageId: userMessageId,
+            waitMilliseconds: 1_000,
+          }),
           "wait-user-input",
           new Set([AuthOrchestrationReadScope]),
         ),
@@ -1466,7 +1571,11 @@ it.effect("returns interaction-required state and bounds a still-running wait", 
         tools.invoke(
           call(
             "wait_for_thread_turn",
-            encodeJson({ threadId, messageId: userMessageId, waitMilliseconds: 500 }),
+            encodeJson({
+              threadId,
+              messageId: userMessageId,
+              waitMilliseconds: 500,
+            }),
             "wait-timeout",
             new Set([AuthOrchestrationReadScope]),
           ),
@@ -1503,7 +1612,11 @@ it.effect("returns the last observed state when a later lookup remains blocked a
         .invoke(
           call(
             "wait_for_thread_turn",
-            encodeJson({ threadId, messageId: userMessageId, waitMilliseconds: 500 }),
+            encodeJson({
+              threadId,
+              messageId: userMessageId,
+              waitMilliseconds: 500,
+            }),
             "wait-blocked-final-read",
             new Set([AuthOrchestrationReadScope]),
           ),
@@ -1547,7 +1660,11 @@ it.effect("does not serialize other tools behind a blocked turn wait", () =>
       const tools = yield* VoiceToolExecutor;
       const waitingInput = call(
         "wait_for_thread_turn",
-        encodeJson({ threadId, messageId: userMessageId, waitMilliseconds: 500 }),
+        encodeJson({
+          threadId,
+          messageId: userMessageId,
+          waitMilliseconds: 500,
+        }),
         "wait-concurrent",
         new Set([AuthOrchestrationReadScope]),
       );
@@ -1760,11 +1877,10 @@ it.effect("requires confirmation for gated mutations and dispatches them canonic
     yield* Effect.gen(function* () {
       const tools = yield* VoiceToolExecutor;
       const mutations = [
-        call("create_thread", encodeJson({ projectId, title: "From voice" })),
         call("interrupt_thread", encodeJson({ threadId })),
         call("archive_thread", encodeJson({ threadId })),
       ];
-      const expectedTypes = ["thread.create", "thread.turn.interrupt", "thread.archive"];
+      const expectedTypes = ["thread.turn.interrupt", "thread.archive"];
       for (const mutation of mutations) {
         const pending = yield* tools.invoke(mutation);
         expect(pending.type).toBe("confirmation-required");
@@ -1791,6 +1907,35 @@ it.effect("requires confirmation for gated mutations and dispatches them canonic
         expect(repeated.reason).toBe("confirmation-expired");
       }
       expect((yield* Ref.get(test.commands)).map((command) => command.type)).toEqual(expectedTypes);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("dispatches create_thread immediately and durably deduplicates it", () =>
+  Effect.gen(function* () {
+    const test = yield* makeTest();
+    yield* Effect.gen(function* () {
+      const tools = yield* VoiceToolExecutor;
+      const mutation = call(
+        "create_thread",
+        encodeJson({ projectId, title: "From voice" }),
+        "immediate-create",
+      );
+      const result = yield* tools.invoke(mutation);
+      expect(result.type).toBe("completed");
+      expect(result.type === "completed" ? result.outcome : undefined).toBe("succeeded");
+      expect(result.type === "completed" ? decodeJson(result.output) : undefined).toMatchObject({
+        sequence: 42,
+        threadId: `voice-thread:${conversationId}:immediate-create`,
+        commandId: `voice:${conversationId}:immediate-create`,
+      });
+
+      const duplicate = yield* tools.invoke(mutation);
+      expect(duplicate.type === "completed" ? duplicate.submitOutput : undefined).toBe(false);
+      expect(yield* Ref.get(test.commands)).toHaveLength(1);
+      expect(
+        (yield* Ref.get(test.durableCalls)).get(`${conversationId}:immediate-create`),
+      ).toMatchObject({ status: "succeeded" });
     }).pipe(Effect.provide(test.layer));
   }),
 );
@@ -1854,7 +1999,10 @@ it.effect("rejects without dispatch and expires pending calls exactly once", () 
       });
       expect(expired?.outcome).toBe("expired");
       expect(
-        yield* tools.expire({ sessionId, confirmationId: expiring.confirmationId }),
+        yield* tools.expire({
+          sessionId,
+          confirmationId: expiring.confirmationId,
+        }),
       ).toBeUndefined();
       const decision = yield* tools
         .decide({

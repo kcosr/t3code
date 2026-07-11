@@ -1,4 +1,4 @@
-import { VoiceConversationEntryId, VoiceToolCallId } from "@t3tools/contracts";
+import { VoiceClientActionId, VoiceConversationEntryId, VoiceToolCallId } from "@t3tools/contracts";
 import * as NodeCrypto from "node:crypto";
 import type {
   AuthEnvironmentScope,
@@ -50,6 +50,7 @@ const HEARTBEAT_INTERVAL_SECONDS = 10;
 const SESSION_DURATION_SECONDS = 55 * 60;
 const MAX_BUFFERED_EVENTS = 512;
 const MAX_RETAINED_TERMINAL_SESSIONS = 128;
+const CLIENT_ACTION_TIMEOUT_MILLIS = 10_000;
 const INSTRUCTIONS = [
   "You are the T3 voice agent. Be concise, state what you are about to do before using a tool, and use only the supplied T3 tools.",
   "Prior conversation items are the user's actual history from this same ongoing conversation: use them as memory, preserve continuity across calls and devices, and never claim that you cannot remember information present in that history.",
@@ -57,7 +58,43 @@ const INSTRUCTIONS = [
   "send_thread_message dispatches immediately and returns a messageId. Never claim the coding turn completed from that receipt. When the user needs the result, call wait_for_thread_turn with that exact messageId; a pending or running timeout is not completion and may be waited on again.",
 ].join(" ");
 
-const BACKGROUND_VOICE_TOOLS = new Set(["wait_for_thread_turn", "search_history", "read_history"]);
+const BACKGROUND_VOICE_TOOLS = new Set([
+  "wait_for_thread_turn",
+  "search_history",
+  "read_history",
+  "activate_thread",
+]);
+
+interface ClientActionResolution {
+  readonly outcome: "succeeded" | "failed";
+  readonly reason?: string;
+}
+
+interface ClientActionSelection {
+  readonly existing: RuntimeClientAction;
+  readonly created: boolean;
+}
+
+interface ClientActionAckSelection {
+  readonly completion: Deferred.Deferred<ClientActionResolution> | null;
+  readonly expired: boolean;
+}
+
+type RuntimeClientAction =
+  | {
+      readonly status: "pending";
+      readonly action: "activate-thread";
+      readonly projectId: ProjectId;
+      readonly threadId: ThreadId;
+      readonly expiresAt: string;
+      readonly expiresAtMillis: number;
+      readonly completion: Deferred.Deferred<ClientActionResolution>;
+    }
+  | {
+      readonly status: "settled";
+      readonly resolution: ClientActionResolution;
+    }
+  | { readonly status: "expired" };
 
 const transcriptEntryId = (
   lease: VoiceSessionLease,
@@ -83,6 +120,7 @@ interface RuntimeSession {
   readonly idempotencyId: string;
   readonly lastHeartbeatAt: number;
   readonly pendingConfirmations: ReadonlySet<VoiceConfirmationId>;
+  readonly clientActions: ReadonlyMap<VoiceClientActionId, RuntimeClientAction>;
   readonly grantedScopes: ReadonlySet<AuthEnvironmentScope>;
   readonly eventSignal: Deferred.Deferred<void>;
   readonly terminationSignal: Deferred.Deferred<void>;
@@ -233,6 +271,89 @@ const make = Effect.gen(function* () {
     }
   });
 
+  const requestClientAction = Effect.fn("VoiceSessionService.requestClientAction")(function* (
+    lease: VoiceSessionLease,
+    request: {
+      readonly actionId: VoiceClientActionId;
+      readonly action: "activate-thread";
+      readonly projectId: ProjectId;
+      readonly threadId: ThreadId;
+    },
+  ): Effect.fn.Return<ClientActionResolution> {
+    const now = yield* Clock.currentTimeMillis;
+    const expiresAtMillis = now + CLIENT_ACTION_TIMEOUT_MILLIS;
+    const expiresAt = DateTime.formatIso(DateTime.makeUnsafe(expiresAtMillis));
+    const completion = yield* Deferred.make<ClientActionResolution>();
+    const selected = yield* mutateSession<ClientActionSelection>(lease.sessionId, (session) => {
+      const existing = session.clientActions.get(request.actionId);
+      if (existing !== undefined) return [{ existing, created: false }, session] as const;
+      const pending: RuntimeClientAction = {
+        status: "pending",
+        action: request.action,
+        projectId: request.projectId,
+        threadId: request.threadId,
+        expiresAt,
+        expiresAtMillis,
+        completion,
+      };
+      return [
+        { existing: pending, created: true },
+        {
+          ...session,
+          clientActions: new Map(session.clientActions).set(request.actionId, pending),
+        },
+      ] as const;
+    });
+    if (Option.isNone(selected)) {
+      return {
+        outcome: "failed",
+        reason: "client_action_session_ended",
+      } as const;
+    }
+    const action = selected.value.existing;
+    if (action.status === "settled") return action.resolution;
+    if (action.status === "expired") {
+      return { outcome: "failed", reason: "client_action_timeout" } as const;
+    }
+    if (selected.value.created) {
+      yield* emit(lease, {
+        type: "client-action",
+        action: action.action,
+        actionId: request.actionId,
+        projectId: action.projectId,
+        threadId: action.threadId,
+        expiresAt: action.expiresAt,
+      });
+    }
+    const acknowledged = yield* Deferred.await(action.completion).pipe(
+      Effect.timeoutOption(`${Math.max(0, action.expiresAtMillis - now)} millis`),
+    );
+    if (Option.isSome(acknowledged)) return acknowledged.value;
+    const timedOut = yield* mutateSession(lease.sessionId, (session) => {
+      const current = session.clientActions.get(request.actionId);
+      if (current?.status === "settled") return [current.resolution, session] as const;
+      if (current !== action) {
+        return [
+          { outcome: "failed", reason: "client_action_session_ended" } as const,
+          session,
+        ] as const;
+      }
+      return [
+        { outcome: "failed", reason: "client_action_timeout" } as const,
+        {
+          ...session,
+          clientActions: new Map(session.clientActions).set(request.actionId, {
+            status: "expired",
+          }),
+        },
+      ] as const;
+    });
+    return Option.getOrElse(timedOut, () => ({
+      outcome: "failed" as const,
+      reason: "client_action_session_ended",
+    }));
+  });
+
   const terminateProvider = (
     session: RuntimeSession,
     options: {
@@ -273,7 +394,11 @@ const make = Effect.gen(function* () {
       for (const expired of retained.slice(MAX_RETAINED_TERMINAL_SESSIONS)) {
         sessions.delete(expired.lease.sessionId);
       }
-      return { ...current, sessions, nextTerminalOrder: current.nextTerminalOrder + 1 };
+      return {
+        ...current,
+        sessions,
+        nextTerminalOrder: current.nextTerminalOrder + 1,
+      };
     });
   });
 
@@ -499,6 +624,7 @@ const make = Effect.gen(function* () {
           name: event.name,
           argumentsJson: event.argumentsJson,
           grantedScopes,
+          requestClientAction: (request) => requestClientAction(lease, request),
         });
         if (BACKGROUND_VOICE_TOOLS.has(event.name)) {
           const session = (yield* SynchronizedRef.get(runtime)).sessions.get(lease.sessionId);
@@ -549,25 +675,37 @@ const make = Effect.gen(function* () {
           });
           yield* scheduleConfirmationExpiry(lease, providerSession, result).pipe(
             Effect.catch((error) =>
-              emit(lease, { type: "error", reason: error.detail, recoverable: error.retryable }),
+              emit(lease, {
+                type: "error",
+                reason: error.detail,
+                recoverable: error.retryable,
+              }),
             ),
             Effect.forkIn(serviceScope),
           );
         }
         return;
       case "error":
-        yield* emit(lease, { type: "error", reason: event.detail, recoverable: event.recoverable });
+        yield* emit(lease, {
+          type: "error",
+          reason: event.detail,
+          recoverable: event.recoverable,
+        });
         if (!event.recoverable) {
           const session = (yield* SynchronizedRef.get(runtime)).sessions.get(lease.sessionId);
           if (session !== undefined) {
-            yield* endRuntimeSession(session, "error", { interruptEventFiber: false });
+            yield* endRuntimeSession(session, "error", {
+              interruptEventFiber: false,
+            });
           }
         }
         return;
       case "closed": {
         const session = (yield* SynchronizedRef.get(runtime)).sessions.get(lease.sessionId);
         if (session !== undefined) {
-          yield* endRuntimeSession(session, "ended", { interruptEventFiber: false });
+          yield* endRuntimeSession(session, "ended", {
+            interruptEventFiber: false,
+          });
         }
         return;
       }
@@ -750,6 +888,7 @@ const make = Effect.gen(function* () {
         idempotencyId,
         lastHeartbeatAt: createdAtMillis,
         pendingConfirmations: new Set(),
+        clientActions: new Map(),
         grantedScopes: new Set(principal.scopes),
         eventSignal,
         terminationSignal,
@@ -790,7 +929,9 @@ const make = Effect.gen(function* () {
             : "Voice session heartbeat timed out",
           recoverable: false,
         });
-        yield* endRuntimeSession(current, "ended", { interruptHeartbeatFiber: false });
+        yield* endRuntimeSession(current, "ended", {
+          interruptHeartbeatFiber: false,
+        });
         return;
       }
     }).pipe(Effect.forkIn(serviceScope));
@@ -860,7 +1001,10 @@ const make = Effect.gen(function* () {
     }
     const item =
       voiceFocusContextItem(focus) ??
-      ({ role: "system", text: "There is no active T3 project or thread context." } as const);
+      ({
+        role: "system",
+        text: "There is no active T3 project or thread context.",
+      } as const);
     yield* session.providerSession.updateContext(item);
     if (!(yield* registry.isCurrent(session.lease))) {
       return yield* sessionError(
@@ -986,7 +1130,10 @@ const make = Effect.gen(function* () {
             }),
         ),
       );
-      const context = yield* compiler.compile({ entries, tokenBudget: contextTokenBudget });
+      const context = yield* compiler.compile({
+        entries,
+        tokenBudget: contextTokenBudget,
+      });
       const initialFocus: VoiceSessionFocus = {
         ...(session.input.projectId === undefined ? {} : { projectId: session.input.projectId }),
         ...(session.input.threadId === undefined ? {} : { threadId: session.input.threadId }),
@@ -1055,7 +1202,9 @@ const make = Effect.gen(function* () {
             });
             const current = (yield* SynchronizedRef.get(runtime)).sessions.get(sessionId);
             if (current !== undefined) {
-              yield* endRuntimeSession(current, "error", { interruptEventFiber: false });
+              yield* endRuntimeSession(current, "error", {
+                interruptEventFiber: false,
+              });
             }
           }),
         ),
@@ -1249,6 +1398,123 @@ const make = Effect.gen(function* () {
       );
     });
 
+  const acknowledgeClientAction: VoiceSessionServiceShape["acknowledgeClientAction"] = Effect.fn(
+    "VoiceSessionService.acknowledgeClientAction",
+  )(function* (owner, sessionId, actionId, input) {
+    const owned = yield* requireOwned(owner, sessionId, input.leaseGeneration);
+    if (
+      owned.state.phase === "ending" ||
+      owned.state.phase === "ended" ||
+      owned.state.phase === "error"
+    ) {
+      return yield* sessionError(
+        "invalid-phase",
+        "session.client-action",
+        "Voice session is no longer accepting client actions",
+      );
+    }
+    return yield* owned.operationMutex.withPermits(1)(
+      Effect.gen(function* () {
+        yield* requireOwned(owner, sessionId, input.leaseGeneration);
+        const now = yield* Clock.currentTimeMillis;
+        const resolution: ClientActionResolution = {
+          outcome: input.outcome,
+          ...(input.message === undefined ? {} : { reason: input.message }),
+        };
+        const selected = yield* SynchronizedRef.modifyEffect<
+          RuntimeState,
+          ClientActionAckSelection,
+          VoiceError,
+          never
+        >(runtime, (current) => {
+          const session = current.sessions.get(sessionId);
+          const action = session?.clientActions.get(actionId);
+          if (session === undefined || action === undefined) {
+            return Effect.fail(
+              sessionError(
+                "invalid-phase",
+                "session.client-action",
+                "Voice client action was not found",
+              ),
+            );
+          }
+          if (action.status === "expired") {
+            return Effect.fail(
+              sessionError(
+                "invalid-phase",
+                "session.client-action",
+                "Voice client action has expired",
+              ),
+            );
+          }
+          if (action.status === "settled") {
+            if (
+              action.resolution.outcome !== resolution.outcome ||
+              action.resolution.reason !== resolution.reason
+            ) {
+              return Effect.fail(
+                sessionError(
+                  "invalid-phase",
+                  "session.client-action",
+                  "Voice client action was already acknowledged differently",
+                ),
+              );
+            }
+            return Effect.succeed([
+              {
+                completion: null,
+                expired: false,
+              } satisfies ClientActionAckSelection,
+              current,
+            ] as const);
+          }
+          if (now >= action.expiresAtMillis) {
+            const sessions = new Map(current.sessions);
+            sessions.set(sessionId, {
+              ...session,
+              clientActions: new Map(session.clientActions).set(actionId, {
+                status: "expired",
+              }),
+            });
+            return Effect.succeed([
+              {
+                completion: null,
+                expired: true,
+              } satisfies ClientActionAckSelection,
+              { ...current, sessions },
+            ] as const);
+          }
+          const sessions = new Map(current.sessions);
+          sessions.set(sessionId, {
+            ...session,
+            clientActions: new Map(session.clientActions).set(actionId, {
+              status: "settled",
+              resolution,
+            }),
+          });
+          return Effect.succeed([
+            {
+              completion: action.completion,
+              expired: false,
+            } satisfies ClientActionAckSelection,
+            { ...current, sessions },
+          ] as const);
+        });
+        if (selected.expired) {
+          return yield* sessionError(
+            "invalid-phase",
+            "session.client-action",
+            "Voice client action has expired",
+          );
+        }
+        if (selected.completion !== null) {
+          yield* Deferred.succeed(selected.completion, resolution).pipe(Effect.ignore);
+        }
+        return { actionId, outcome: resolution.outcome };
+      }),
+    );
+  });
+
   return VoiceSessionService.of({
     create,
     get,
@@ -1258,6 +1524,7 @@ const make = Effect.gen(function* () {
     offer,
     events,
     confirm,
+    acknowledgeClientAction,
     revokeAuthSession,
     deleteConversation,
     clearConversationContext,

@@ -3,6 +3,7 @@ import {
   EnvironmentId,
   ProjectId,
   ThreadId,
+  VoiceClientActionId,
   VoiceConfirmationId,
   VoiceConversationId,
   VoiceMediaTicketId,
@@ -27,6 +28,7 @@ const REQUEST_ID = VoiceRequestId.make("request-1");
 const PLAYBACK_ID = VoicePlaybackId.make("playback-1");
 const SESSION_ID = VoiceSessionId.make("voice-session-1");
 const CONFIRMATION_ID = VoiceConfirmationId.make("confirmation-1");
+const CLIENT_ACTION_ID = VoiceClientActionId.make("client-action-1");
 const PROJECT_ID = ProjectId.make("project-1");
 const THREAD_ID = ThreadId.make("thread-1");
 
@@ -129,7 +131,10 @@ describe("makeVoiceHttpClient", () => {
           return jsonResponse({ deleted: true });
         }
         if (method === "GET" && url.endsWith("/conversations")) {
-          return jsonResponse({ conversations: [conversation], nextCursor: null });
+          return jsonResponse({
+            conversations: [conversation],
+            nextCursor: null,
+          });
         }
         return jsonResponse(conversation);
       };
@@ -149,7 +154,10 @@ describe("makeVoiceHttpClient", () => {
         client.listConversations(),
         client.getConversation(CONVERSATION_ID),
         client.updateConversation(CONVERSATION_ID, { title: "Renamed" }),
-        client.getConversationTranscript(CONVERSATION_ID, { cursor: "next-page", limit: 20 }),
+        client.getConversationTranscript(CONVERSATION_ID, {
+          cursor: "next-page",
+          limit: 20,
+        }),
         client.clearConversationContext(CONVERSATION_ID, {
           expectedEpoch: 1,
           idempotencyKey: "clear-one",
@@ -162,7 +170,10 @@ describe("makeVoiceHttpClient", () => {
       ]);
 
       expect(results[0]).toEqual(conversation);
-      expect(results[1]).toEqual({ conversations: [conversation], nextCursor: null });
+      expect(results[1]).toEqual({
+        conversations: [conversation],
+        nextCursor: null,
+      });
       expect(results[4].activeContextEpoch).toBe(2);
       expect(results[5].activeEpoch).toBe(2);
       expect(results[6].deleted).toBe(true);
@@ -228,8 +239,18 @@ describe("makeVoiceHttpClient", () => {
             outcome: "approved",
           });
         }
+        if (url.includes("/client-actions/")) {
+          return jsonResponse({
+            actionId: CLIENT_ACTION_ID,
+            outcome: "succeeded",
+          });
+        }
         if (url.endsWith("/focus")) {
-          return jsonResponse({ state: sessionState, projectId: PROJECT_ID, threadId: THREAD_ID });
+          return jsonResponse({
+            state: sessionState,
+            projectId: PROJECT_ID,
+            threadId: THREAD_ID,
+          });
         }
         if (method === "DELETE") {
           return jsonResponse({
@@ -278,6 +299,10 @@ describe("makeVoiceHttpClient", () => {
         sdp: "offer-sdp",
       });
       const events = yield* client.sessionEvents(SESSION_ID, 4);
+      const clientAction = yield* client.acknowledgeClientAction(SESSION_ID, CLIENT_ACTION_ID, {
+        leaseGeneration: 1,
+        outcome: "succeeded",
+      });
       const confirmation = yield* client.decideConfirmation(SESSION_ID, CONFIRMATION_ID, "approve");
       const closed = yield* client.closeSession(SESSION_ID, 1);
 
@@ -285,6 +310,7 @@ describe("makeVoiceHttpClient", () => {
       expect(answer.sdp).toBe("answer-sdp");
       expect(events.state.sequence).toBe(5);
       expect(events.events).toMatchObject([{ sequence: 5, text: " ", final: false }]);
+      expect(clientAction.outcome).toBe("succeeded");
       expect(confirmation.outcome).toBe("approved");
       expect(closed.closed).toBe(true);
       expect(requests.map(({ url, method }) => `${method} ${url}`)).toEqual([
@@ -294,6 +320,7 @@ describe("makeVoiceHttpClient", () => {
         `POST https://environment.example.test/api/voice/sessions/${SESSION_ID}/focus`,
         `POST https://environment.example.test/api/voice/sessions/${SESSION_ID}/webrtc-offer`,
         `GET https://environment.example.test/api/voice/sessions/${SESSION_ID}/events?afterSequence=4&waitMilliseconds=20000`,
+        `POST https://environment.example.test/api/voice/sessions/${SESSION_ID}/client-actions/${CLIENT_ACTION_ID}/ack`,
         `POST https://environment.example.test/api/voice/sessions/${SESSION_ID}/confirmations/${CONFIRMATION_ID}`,
         `DELETE https://environment.example.test/api/voice/sessions/${SESSION_ID}`,
       ]);
@@ -301,6 +328,12 @@ describe("makeVoiceHttpClient", () => {
       expect(
         focusBody instanceof Uint8Array ? new TextDecoder().decode(focusBody) : focusBody,
       ).toBe('{"leaseGeneration":1,"projectId":"project-1","threadId":"thread-1"}');
+      const clientActionBody = requests[6]?.body;
+      expect(
+        clientActionBody instanceof Uint8Array
+          ? new TextDecoder().decode(clientActionBody)
+          : clientActionBody,
+      ).toBe('{"leaseGeneration":1,"outcome":"succeeded"}');
     }),
   );
 
@@ -499,7 +532,10 @@ describe("makeVoiceHttpClient", () => {
         },
       });
       const client = makeVoiceHttpClient({
-        prepared: preparedConnection({ _tag: "Dpop", accessToken: "dpop-token" }),
+        prepared: preparedConnection({
+          _tag: "Dpop",
+          accessToken: "dpop-token",
+        }),
         signer,
         fetch: async () => jsonResponse({ conversations: [], nextCursor: null }),
       });

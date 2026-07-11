@@ -8,6 +8,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
   VoiceConfirmationId,
+  VoiceClientActionId,
   VoiceConversationEntryId,
   VoiceConversationId,
   VoiceMediaTicketId,
@@ -104,7 +105,10 @@ export const VoiceConversationListQuery = Schema.Struct({
   ),
   limit: Schema.optionalKey(
     Schema.Int.check(
-      Schema.isBetween({ minimum: 1, maximum: VOICE_CONVERSATION_LIST_PAGE_MAX_ENTRIES }),
+      Schema.isBetween({
+        minimum: 1,
+        maximum: VOICE_CONVERSATION_LIST_PAGE_MAX_ENTRIES,
+      }),
     ),
   ),
 });
@@ -137,7 +141,10 @@ export const VoiceConversationTranscriptQuery = Schema.Struct({
   ),
   limit: Schema.optionalKey(
     Schema.Int.check(
-      Schema.isBetween({ minimum: 1, maximum: VOICE_CONVERSATION_TRANSCRIPT_PAGE_MAX_ENTRIES }),
+      Schema.isBetween({
+        minimum: 1,
+        maximum: VOICE_CONVERSATION_TRANSCRIPT_PAGE_MAX_ENTRIES,
+      }),
     ),
   ),
 });
@@ -333,6 +340,7 @@ export const VoiceToolName = Schema.Literals([
   "wait_for_thread_turn",
   "search_history",
   "read_history",
+  "activate_thread",
   "create_thread",
   "send_thread_message",
   "interrupt_thread",
@@ -395,6 +403,15 @@ export const VoiceSessionEvent = Schema.Union([
   }),
   Schema.Struct({
     ...VoiceEventBase,
+    type: Schema.Literal("client-action"),
+    action: Schema.Literal("activate-thread"),
+    actionId: VoiceClientActionId,
+    projectId: ProjectId,
+    threadId: ThreadId,
+    expiresAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    ...VoiceEventBase,
     type: Schema.Literal("lease-fenced"),
     replacementGeneration: PositiveInt,
   }),
@@ -417,6 +434,22 @@ export const VoiceSessionEventsResult = Schema.Struct({
   events: Schema.Array(VoiceSessionEvent),
 });
 export type VoiceSessionEventsResult = typeof VoiceSessionEventsResult.Type;
+
+export const VoiceClientActionOutcome = Schema.Literals(["succeeded", "failed"]);
+export type VoiceClientActionOutcome = typeof VoiceClientActionOutcome.Type;
+
+export const VoiceClientActionAckInput = Schema.Struct({
+  leaseGeneration: PositiveInt,
+  outcome: VoiceClientActionOutcome,
+  message: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(512))),
+});
+export type VoiceClientActionAckInput = typeof VoiceClientActionAckInput.Type;
+
+export const VoiceClientActionAckResult = Schema.Struct({
+  actionId: VoiceClientActionId,
+  outcome: VoiceClientActionOutcome,
+});
+export type VoiceClientActionAckResult = typeof VoiceClientActionAckResult.Type;
 
 export const VoiceConfirmationDecision = Schema.Literals(["approve", "reject"]);
 export type VoiceConfirmationDecision = typeof VoiceConfirmationDecision.Type;

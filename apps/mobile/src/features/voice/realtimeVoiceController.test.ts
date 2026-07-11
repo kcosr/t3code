@@ -81,7 +81,10 @@ const makeHarness = () => {
       }),
     ),
     closeSession: vi.fn(() =>
-      Effect.succeed({ state: { ...serverSession.state, phase: "ended" as const }, closed: true }),
+      Effect.succeed({
+        state: { ...serverSession.state, phase: "ended" as const },
+        closed: true,
+      }),
     ),
     heartbeatSession: vi.fn(() => Effect.succeed(serverSession.state)),
     updateSessionFocus: vi.fn(() =>
@@ -92,6 +95,9 @@ const makeHarness = () => {
       }),
     ),
     sessionEvents: vi.fn(() => Effect.succeed({ state: serverSession.state, events: [] })),
+    acknowledgeClientAction: vi.fn((_sessionId, actionId) =>
+      Effect.succeed({ actionId, outcome: "succeeded" as const }),
+    ),
   } as unknown as VoiceHttpClient;
   const snapshots: Array<string> = [];
   const scheduledCallbacks = new Map<number, () => void>();
@@ -120,7 +126,15 @@ const makeHarness = () => {
     await Promise.resolve();
     await Promise.resolve();
   };
-  return { client, controller, emitNative, native, runScheduled, scheduler, snapshots };
+  return {
+    client,
+    controller,
+    emitNative,
+    native,
+    runScheduled,
+    scheduler,
+    snapshots,
+  };
 };
 
 describe("RealtimeVoiceController", () => {
@@ -198,7 +212,10 @@ describe("RealtimeVoiceController", () => {
       nativeSessionId: SESSION_ID,
     });
     expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1);
-    expect(controller.getSnapshot()).toMatchObject({ phase: "idle", session: null });
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "idle",
+      session: null,
+    });
   });
 
   it("updates focus through the active lease without replacing native media", async () => {
@@ -231,7 +248,10 @@ describe("RealtimeVoiceController", () => {
       nativeSessionId: SESSION_ID,
     });
     expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1);
-    expect(controller.getSnapshot()).toMatchObject({ phase: "error", error: expect.any(String) });
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "error",
+      error: expect.any(String),
+    });
   });
 
   it("identifies invalid event payloads separately from connectivity failures", async () => {
@@ -378,7 +398,11 @@ describe("RealtimeVoiceController", () => {
     await controller.start(createInput);
     vi.mocked(client.sessionEvents).mockReturnValueOnce(
       Effect.succeed({
-        state: { ...serverSession.state, phase: "listening" as const, sequence: 2 },
+        state: {
+          ...serverSession.state,
+          phase: "listening" as const,
+          sequence: 2,
+        },
         events: [
           {
             sessionId: SESSION_ID,
@@ -425,7 +449,11 @@ describe("RealtimeVoiceController", () => {
 
     await controller.refreshEvents();
 
-    expect(controller.getSnapshot()).toMatchObject({ phase: "idle", session: null, error: null });
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "idle",
+      session: null,
+      error: null,
+    });
     expect(native.stopRealtimeSessionAsync).toHaveBeenCalledTimes(1);
     expect(client.closeSession).not.toHaveBeenCalled();
   });

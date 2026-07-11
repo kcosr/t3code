@@ -177,9 +177,32 @@ describe("mobile connection storage", () => {
     await expect(loadPreferences()).resolves.toEqual({ baseFontSize: 17 });
   });
 
+  it("loads only valid persisted voice preferences", async () => {
+    mocks.setPreferencesJson(
+      JSON.stringify({
+        threadSpeechEnabled: true,
+        voiceAudioRouteId: "speaker",
+        unsupportedSpeechSetting: "ignored",
+      }),
+      10,
+    );
+    await expect(loadPreferences()).resolves.toEqual({
+      threadSpeechEnabled: true,
+      voiceAudioRouteId: "speaker",
+    });
+
+    mocks.setPreferencesJson(
+      JSON.stringify({ threadSpeechEnabled: "yes", voiceAudioRouteId: "" }),
+      20,
+    );
+    await expect(loadPreferences()).resolves.toEqual({});
+  });
+
   it("falls back to secure storage when SQLite cannot save preferences", async () => {
     mocks.setDatabaseFailures(true, true);
-    await expect(savePreferencesPatch({ baseFontSize: 19 })).resolves.toEqual({ baseFontSize: 19 });
+    await expect(savePreferencesPatch({ baseFontSize: 19 })).resolves.toEqual({
+      baseFontSize: 19,
+    });
     const fallback = JSON.parse(mocks.getStoredValue("t3code.preferences.fallback") ?? "") as {
       readonly payload: string;
       readonly updatedAt: number;
@@ -199,7 +222,9 @@ describe("mobile connection storage", () => {
     );
 
     await expect(loadPreferences()).resolves.toEqual({ baseFontSize: 19 });
-    expect(JSON.parse(mocks.getPreferencesJson() ?? "")).toEqual({ baseFontSize: 19 });
+    expect(JSON.parse(mocks.getPreferencesJson() ?? "")).toEqual({
+      baseFontSize: 19,
+    });
     expect(mocks.getStoredValue("t3code.preferences.fallback")).toBeNull();
   });
 
@@ -214,7 +239,9 @@ describe("mobile connection storage", () => {
     );
 
     await expect(loadPreferences()).resolves.toEqual({ baseFontSize: 21 });
-    expect(JSON.parse(mocks.getPreferencesJson() ?? "")).toEqual({ baseFontSize: 21 });
+    expect(JSON.parse(mocks.getPreferencesJson() ?? "")).toEqual({
+      baseFontSize: 21,
+    });
     expect(mocks.getStoredValue("t3code.preferences.fallback")).toBeNull();
   });
 
@@ -227,7 +254,9 @@ describe("mobile connection storage", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     await expect(loadPreferences()).resolves.toEqual({ baseFontSize: 21 });
-    expect(JSON.parse(mocks.getPreferencesJson() ?? "")).toEqual({ baseFontSize: 21 });
+    expect(JSON.parse(mocks.getPreferencesJson() ?? "")).toEqual({
+      baseFontSize: 21,
+    });
     expect(mocks.getStoredValue("t3code.preferences.fallback")).toBeNull();
 
     warn.mockRestore();
@@ -238,6 +267,8 @@ describe("mobile connection storage", () => {
     await mocks.setItemAsync("t3code.preferences", JSON.stringify({ baseFontSize: 19 }));
 
     await expect(loadPreferences()).resolves.toEqual({ baseFontSize: 21 });
-    expect(JSON.parse(mocks.getPreferencesJson() ?? "")).toEqual({ baseFontSize: 21 });
+    expect(JSON.parse(mocks.getPreferencesJson() ?? "")).toEqual({
+      baseFontSize: 21,
+    });
   });
 });

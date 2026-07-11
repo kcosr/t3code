@@ -56,7 +56,10 @@ it("normalizes stable semantic transcript identities and rejects unidentified fi
     },
   ]);
   expect(
-    parse({ type: "conversation.item.input_audio_transcription.completed", transcript: "" }),
+    parse({
+      type: "conversation.item.input_audio_transcription.completed",
+      transcript: "",
+    }),
   ).toEqual([]);
   expect(parse({ type: "response.output_audio_transcript.done", transcript: "" })).toEqual([]);
   expect(parse({ ...assistant, transcript: "  Done.  " })).toEqual([
@@ -86,7 +89,10 @@ it("normalizes stable semantic transcript identities and rejects unidentified fi
   ]);
   expect(parse({ ...user, transcript: "\t\n" })).toEqual([]);
   expect(
-    parse({ type: "conversation.item.input_audio_transcription.completed", transcript: " " }),
+    parse({
+      type: "conversation.item.input_audio_transcription.completed",
+      transcript: " ",
+    }),
   ).toEqual([]);
   expect(parse({ type: "response.output_audio_transcript.done", transcript: " " })).toEqual([]);
 });
@@ -99,7 +105,10 @@ it("preserves whitespace in partial Realtime transcript deltas", () => {
     { type: "transcript", role: "assistant", text: " ", final: false },
   ]);
   expect(
-    parse({ type: "conversation.item.input_audio_transcription.delta", delta: " next" }),
+    parse({
+      type: "conversation.item.input_audio_transcription.delta",
+      delta: " next",
+    }),
   ).toEqual([{ type: "transcript", role: "user", text: " next", final: false }]);
 });
 
@@ -134,7 +143,13 @@ it("reports provider failures without logging provider messages or transcript co
       type: "message",
       data: encodeJson({ type: "error", error: { message: privateMessage } }),
     }),
-  ).toEqual([{ type: "error", detail: "OpenAI Realtime reported an error", recoverable: false }]);
+  ).toEqual([
+    {
+      type: "error",
+      detail: "OpenAI Realtime reported an error",
+      recoverable: false,
+    },
+  ]);
   expect(
     __testing.realtimeDiagnostic(
       { type: "closed", code: 1009, reason: privateMessage },
@@ -223,7 +238,10 @@ const realtimeSocket = (
 
 it.effect("normalizes OpenAI transcription SSE without exposing provider events", () =>
   Effect.gen(function* () {
-    const requests: Array<{ readonly url: string; readonly authorization?: string }> = [];
+    const requests: Array<{
+      readonly url: string;
+      readonly authorization?: string;
+    }> = [];
     const httpClient = HttpClient.make((request) => {
       requests.push({
         url: request.url,
@@ -239,7 +257,10 @@ it.effect("normalizes OpenAI transcription SSE without exposing provider events"
       return Effect.succeed(
         HttpClientResponse.fromWeb(
           request,
-          new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } }),
+          new Response(body, {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          }),
         ),
       );
     });
@@ -345,7 +366,10 @@ it.effect("fails before HTTP when the server credential is absent", () =>
 
 it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime events", () =>
   Effect.gen(function* () {
-    const httpRequests: Array<{ readonly url: string; readonly authorization?: string }> = [];
+    const httpRequests: Array<{
+      readonly url: string;
+      readonly authorization?: string;
+    }> = [];
     let sessionConfig: unknown;
     let offerSdp = "";
     let negotiationAttempts = 0;
@@ -381,7 +405,10 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
     );
     const sent: Array<string> = [];
     let closed = 0;
-    const socketConnections: Array<{ readonly url: string; readonly apiKey: string }> = [];
+    const socketConnections: Array<{
+      readonly url: string;
+      readonly apiKey: string;
+    }> = [];
     const socket = OpenAiRealtimeSocket.of({
       connect: (input) =>
         Effect.gen(function* () {
@@ -518,6 +545,7 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       "wait_for_thread_turn",
       "search_history",
       "read_history",
+      "activate_thread",
       "create_thread",
       "send_thread_message",
     ]);
@@ -538,8 +566,12 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       readonly required: ReadonlyArray<string>;
       readonly additionalProperties: boolean;
       readonly properties: {
-        readonly ref: { readonly oneOf: ReadonlyArray<Record<string, unknown>> };
-        readonly voiceScope: { readonly oneOf: ReadonlyArray<Record<string, unknown>> };
+        readonly ref: {
+          readonly oneOf: ReadonlyArray<Record<string, unknown>>;
+        };
+        readonly voiceScope: {
+          readonly oneOf: ReadonlyArray<Record<string, unknown>>;
+        };
         readonly before: Record<string, unknown>;
         readonly after: Record<string, unknown>;
       };
@@ -552,8 +584,12 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
     expect(readHistoryParameters).not.toHaveProperty("anyOf");
     expect(readHistoryParameters.properties.ref.oneOf).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ required: ["type", "projectId", "threadId", "messageId"] }),
-        expect.objectContaining({ required: ["type", "conversationId", "entryId"] }),
+        expect.objectContaining({
+          required: ["type", "projectId", "threadId", "messageId"],
+        }),
+        expect.objectContaining({
+          required: ["type", "conversationId", "entryId"],
+        }),
       ]),
     );
     expect(readHistoryParameters.properties.voiceScope.oneOf).toEqual(
@@ -637,8 +673,14 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
     yield* session.terminate;
     yield* session.terminate;
     expect(httpRequests).toEqual([
-      { url: "https://api.openai.com/v1/realtime/calls", authorization: "Bearer sk-test" },
-      { url: "https://api.openai.com/v1/realtime/calls", authorization: "Bearer sk-test" },
+      {
+        url: "https://api.openai.com/v1/realtime/calls",
+        authorization: "Bearer sk-test",
+      },
+      {
+        url: "https://api.openai.com/v1/realtime/calls",
+        authorization: "Bearer sk-test",
+      },
       {
         url: "https://api.openai.com/v1/realtime/calls/rtc_test/hangup",
         authorization: "Bearer sk-test",
@@ -663,7 +705,9 @@ it.effect("coalesces parallel tool outputs into one continuation in either compl
               ? new Response(null, { status: 200 })
               : new Response("answer-sdp", {
                   status: 201,
-                  headers: { location: "/v1/realtime/calls/rtc_parallel_tools" },
+                  headers: {
+                    location: "/v1/realtime/calls/rtc_parallel_tools",
+                  },
                 }),
           ),
         ),
@@ -752,7 +796,9 @@ it.effect("does not track malformed completed function calls as pending continua
             ? new Response(null, { status: 200 })
             : new Response("answer-sdp", {
                 status: 201,
-                headers: { location: "/v1/realtime/calls/rtc_malformed_tool" },
+                headers: {
+                  location: "/v1/realtime/calls/rtc_malformed_tool",
+                },
               }),
         ),
       ),
@@ -810,7 +856,11 @@ it.effect("does not track malformed completed function calls as pending continua
     expect(sent.map((message) => decodeJson(message))).toEqual([
       {
         type: "conversation.item.create",
-        item: { type: "function_call_output", call_id: "call_valid", output: "{}" },
+        item: {
+          type: "function_call_output",
+          call_id: "call_valid",
+          output: "{}",
+        },
       },
       { type: "response.create" },
     ]);
@@ -871,7 +921,10 @@ it.effect("waits for an acknowledged live context update on the sideband event s
     });
     const eventFiber = yield* session.events.pipe(Stream.runDrain, Effect.forkScoped);
     const updating = yield* session
-      .updateContext({ role: "system", text: "Active T3 context: project p, thread t" })
+      .updateContext({
+        role: "system",
+        text: "Active T3 context: project p, thread t",
+      })
       .pipe(Effect.forkScoped);
     yield* Deferred.await(updateSent);
     const updateEvent = decodeJson(sent[0]!) as {
@@ -963,7 +1016,9 @@ it.effect("rejects startup and hangs up when OpenAI rejects a replay item", () =
             ? new Response(null, { status: 200 })
             : new Response("answer-sdp", {
                 status: 201,
-                headers: { location: "/v1/realtime/calls/rtc_replay_rejected" },
+                headers: {
+                  location: "/v1/realtime/calls/rtc_replay_rejected",
+                },
               }),
         ),
       );
@@ -1036,7 +1091,9 @@ it.effect("rejects startup when the sideband closes before every replay item is 
             ? new Response(null, { status: 200 })
             : new Response("answer-sdp", {
                 status: 201,
-                headers: { location: "/v1/realtime/calls/rtc_replay_incomplete" },
+                headers: {
+                  location: "/v1/realtime/calls/rtc_replay_incomplete",
+                },
               }),
         ),
       );

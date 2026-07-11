@@ -1,6 +1,9 @@
 import type {
   AuthEnvironmentScope,
   AuthSessionId,
+  ProjectId,
+  ThreadId,
+  VoiceClientActionId,
   VoiceConfirmationDecision,
   VoiceConfirmationId,
   VoiceConversationId,
@@ -23,6 +26,15 @@ export interface VoiceToolCallInput {
   readonly name: string;
   readonly argumentsJson: string;
   readonly grantedScopes: ReadonlySet<AuthEnvironmentScope>;
+  readonly requestClientAction: (request: {
+    readonly actionId: VoiceClientActionId;
+    readonly action: "activate-thread";
+    readonly projectId: ProjectId;
+    readonly threadId: ThreadId;
+  }) => Effect.Effect<{
+    readonly outcome: "succeeded" | "failed";
+    readonly reason?: string;
+  }>;
 }
 
 export interface VoiceToolCompletedResult {

@@ -3,11 +3,47 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   initialThreadSpeechPlannerState,
   planThreadSpeechToggle,
+  restoreThreadSpeechPreference,
   setThreadSpeechEnabled,
   updateThreadSpeech,
 } from "./threadSpeechPlanner";
 
 describe("threadSpeechPlanner", () => {
+  it("restores speech without replaying the current streaming response", () => {
+    const latest = {
+      id: "existing",
+      text: "This part of the response was already rendered.",
+      streaming: true,
+    };
+    const restored = restoreThreadSpeechPreference(initialThreadSpeechPlannerState(), true, latest);
+
+    expect(restored.state).toEqual({
+      enabled: true,
+      baselineMessageId: "existing",
+      active: null,
+    });
+    expect(updateThreadSpeech(restored.state, latest, () => "playback-1").actions).toEqual([]);
+    expect(
+      updateThreadSpeech(
+        restored.state,
+        { id: "next", text: "This response is new.", streaming: false },
+        () => "playback-2",
+      ).actions,
+    ).toEqual([
+      { type: "start", playbackId: "playback-2" },
+      {
+        type: "segment",
+        playbackId: "playback-2",
+        segment: {
+          index: 0,
+          text: "This response is new.",
+          finalSegment: true,
+        },
+      },
+      { type: "finish", playbackId: "playback-2" },
+    ]);
+  });
+
   it("ignores the assistant message already visible when speech is enabled", () => {
     const enabled = setThreadSpeechEnabled(initialThreadSpeechPlannerState(), true, {
       id: "old",
@@ -76,7 +112,10 @@ describe("threadSpeechPlanner", () => {
     const enabled = setThreadSpeechEnabled(initialThreadSpeechPlannerState(), true, latest).state;
     const result = updateThreadSpeech(enabled, latest, () => "playback-1");
 
-    expect(result.actions[0]).toEqual({ type: "start", playbackId: "playback-1" });
+    expect(result.actions[0]).toEqual({
+      type: "start",
+      playbackId: "playback-1",
+    });
     expect(result.actions[1]).toMatchObject({
       type: "segment",
       segment: { text: latest.text },
@@ -115,7 +154,11 @@ describe("threadSpeechPlanner", () => {
     const enabled = setThreadSpeechEnabled(initialThreadSpeechPlannerState(), true, null).state;
     const active = updateThreadSpeech(
       enabled,
-      { id: "first", text: "First response is still streaming", streaming: true },
+      {
+        id: "first",
+        text: "First response is still streaming",
+        streaming: true,
+      },
       () => "playback-1",
     ).state;
 
@@ -131,7 +174,11 @@ describe("threadSpeechPlanner", () => {
       {
         type: "segment",
         playbackId: "playback-2",
-        segment: { index: 0, text: "Replacement response.", finalSegment: true },
+        segment: {
+          index: 0,
+          text: "Replacement response.",
+          finalSegment: true,
+        },
       },
       { type: "finish", playbackId: "playback-2" },
     ]);

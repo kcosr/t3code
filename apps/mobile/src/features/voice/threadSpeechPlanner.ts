@@ -40,6 +40,22 @@ export const initialThreadSpeechPlannerState = (): ThreadSpeechPlannerState => (
   active: null,
 });
 
+export const restoreThreadSpeechPreference = (
+  state: ThreadSpeechPlannerState,
+  enabled: boolean,
+  latest: AssistantSpeechSnapshot | null,
+): {
+  readonly state: ThreadSpeechPlannerState;
+  readonly actions: ReadonlyArray<ThreadSpeechAction>;
+} => ({
+  state: {
+    enabled,
+    baselineMessageId: latest?.id ?? null,
+    active: null,
+  },
+  actions: state.active ? [{ type: "cancel", playbackId: state.active.playbackId }] : [],
+});
+
 export const setThreadSpeechEnabled = (
   state: ThreadSpeechPlannerState,
   enabled: boolean,
@@ -51,7 +67,11 @@ export const setThreadSpeechEnabled = (
   if (state.enabled === enabled) return { state, actions: [] };
   if (!enabled) {
     return {
-      state: { enabled: false, baselineMessageId: latest?.id ?? null, active: null },
+      state: {
+        enabled: false,
+        baselineMessageId: latest?.id ?? null,
+        active: null,
+      },
       actions: state.active ? [{ type: "cancel", playbackId: state.active.playbackId }] : [],
     };
   }
@@ -159,7 +179,10 @@ export const updateThreadSpeech = (
   if (!state.enabled) return { state, actions: [] };
   if (state.active !== null) {
     if (latest === null || latest.id !== state.active.messageId) {
-      const cancelled = { type: "cancel" as const, playbackId: state.active.playbackId };
+      const cancelled = {
+        type: "cancel" as const,
+        playbackId: state.active.playbackId,
+      };
       if (latest === null) {
         return {
           state: { ...state, baselineMessageId: null, active: null },

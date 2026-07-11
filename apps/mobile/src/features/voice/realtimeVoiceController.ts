@@ -4,6 +4,9 @@ import type {
   VoiceConfirmationDecision,
   VoiceConfirmationId,
   VoiceConfirmationResult,
+  VoiceClientActionAckInput,
+  VoiceClientActionAckResult,
+  VoiceClientActionId,
   VoiceSessionCreateInput,
   VoiceSessionCreateResult,
   VoiceSessionEvent,
@@ -108,14 +111,19 @@ const nativeRuntimeErrorMessage = (code: string): string => {
 export class RealtimeVoiceController {
   private readonly scheduler: TimerScheduler;
   private readonly eventPollIntervalMs: number;
-  private readonly subscriptions: ReadonlyArray<{ readonly remove: () => void }>;
+  private readonly subscriptions: ReadonlyArray<{
+    readonly remove: () => void;
+  }>;
   private active: ActiveSession | null = null;
   private heartbeatTimer: unknown | null = null;
   private eventTimer: unknown | null = null;
   private startGeneration = 0;
   private startingNativeSessionId: string | null = null;
   private refreshInFlight = false;
-  private controlFailures: Record<ControlOperation, number> = { events: 0, heartbeat: 0 };
+  private controlFailures: Record<ControlOperation, number> = {
+    events: 0,
+    heartbeat: 0,
+  };
   private snapshot: RealtimeVoiceControllerSnapshot = {
     phase: "idle",
     session: null,
@@ -163,7 +171,9 @@ export class RealtimeVoiceController {
       this.ensureCurrentStart(generation);
       nativeSessionId = serverSession.state.sessionId;
       this.startingNativeSessionId = nativeSessionId;
-      const nativeOffer = await this.native.prepareRealtimeSessionAsync({ nativeSessionId });
+      const nativeOffer = await this.native.prepareRealtimeSessionAsync({
+        nativeSessionId,
+      });
       this.ensureCurrentStart(generation);
       const answer = await Effect.runPromise(
         this.client.offerSession({
@@ -212,7 +222,11 @@ export class RealtimeVoiceController {
       await this.cleanupPartialSession(serverSession?.state ?? null, nativeSessionId);
       if (generation !== this.startGeneration) return this.snapshot;
       this.startingNativeSessionId = null;
-      this.setSnapshot({ phase: "error", session: null, error: messageFor(cause) });
+      this.setSnapshot({
+        phase: "error",
+        session: null,
+        error: messageFor(cause),
+      });
       throw cause;
     }
   }
@@ -227,9 +241,15 @@ export class RealtimeVoiceController {
       this.setSnapshot({ phase: "idle", session: null, error: null });
       return;
     }
-    this.setSnapshot({ phase: "stopping", session: active.serverState, error: null });
+    this.setSnapshot({
+      phase: "stopping",
+      session: active.serverState,
+      error: null,
+    });
     await Promise.allSettled([
-      this.native.stopRealtimeSessionAsync({ nativeSessionId: active.nativeSessionId }),
+      this.native.stopRealtimeSessionAsync({
+        nativeSessionId: active.nativeSessionId,
+      }),
       Effect.runPromise(this.client.closeSession(active.sessionId, active.leaseGeneration)),
     ]);
     if (generation !== this.startGeneration) return;
@@ -278,6 +298,19 @@ export class RealtimeVoiceController {
     const active = this.requireActive();
     return Effect.runPromise(
       this.client.decideConfirmation(active.sessionId, confirmationId, decision),
+    );
+  }
+
+  acknowledgeClientAction(
+    actionId: VoiceClientActionId,
+    input: Omit<VoiceClientActionAckInput, "leaseGeneration">,
+  ): Promise<VoiceClientActionAckResult> {
+    const active = this.requireActive();
+    return Effect.runPromise(
+      this.client.acknowledgeClientAction(active.sessionId, actionId, {
+        ...input,
+        leaseGeneration: active.leaseGeneration,
+      }),
     );
   }
 
@@ -354,10 +387,16 @@ export class RealtimeVoiceController {
     this.active = null;
     this.clearControlTimers();
     void Promise.allSettled([
-      this.native.stopRealtimeSessionAsync({ nativeSessionId: active.nativeSessionId }),
+      this.native.stopRealtimeSessionAsync({
+        nativeSessionId: active.nativeSessionId,
+      }),
       Effect.runPromise(this.client.closeSession(active.sessionId, active.leaseGeneration)),
     ]);
-    this.setSnapshot({ phase: "error", session: active.serverState, error: message });
+    this.setSnapshot({
+      phase: "error",
+      session: active.serverState,
+      error: message,
+    });
   }
 
   private handleNativeState(state: T3VoiceRuntimeState) {

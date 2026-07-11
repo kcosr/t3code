@@ -8,6 +8,9 @@ import {
   type VoiceConfirmationId,
   type VoiceConfirmationResult,
   type VoiceCapabilities,
+  type VoiceClientActionAckInput,
+  type VoiceClientActionAckResult,
+  type VoiceClientActionId,
   type VoiceConversationClearContextResult,
   type VoiceConversationClearContextInput,
   type VoiceConversationCreateInput,
@@ -193,6 +196,11 @@ export interface VoiceHttpClient {
     confirmationId: VoiceConfirmationId,
     decision: VoiceConfirmationDecision,
   ) => Effect.Effect<VoiceConfirmationResult, RemoteEnvironmentRequestError>;
+  readonly acknowledgeClientAction: (
+    sessionId: VoiceSessionId,
+    actionId: VoiceClientActionId,
+    input: VoiceClientActionAckInput,
+  ) => Effect.Effect<VoiceClientActionAckResult, RemoteEnvironmentRequestError>;
   readonly capabilities: () => Effect.Effect<VoiceCapabilities, RemoteEnvironmentRequestError>;
   readonly createConversation: (
     input: VoiceConversationCreateInput,
@@ -504,6 +512,17 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
             query: afterSequence === undefined ? {} : { afterSequence, waitMilliseconds: 20_000 },
           }),
       }),
+    acknowledgeClientAction: (sessionId, actionId, payload) =>
+      control({
+        method: "POST",
+        pathname: `/api/voice/sessions/${sessionId}/client-actions/${actionId}/ack`,
+        run: (client, headers) =>
+          client.voice.acknowledgeVoiceClientAction({
+            headers,
+            params: { sessionId, actionId },
+            payload,
+          }),
+      }),
     decideConfirmation: (sessionId, confirmationId, decision) =>
       control({
         method: "POST",
@@ -550,7 +569,11 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
         method: "PATCH",
         pathname: `/api/voice/conversations/${conversationId}`,
         run: (client, headers) =>
-          client.voice.updateConversation({ headers, params: { conversationId }, payload }),
+          client.voice.updateConversation({
+            headers,
+            params: { conversationId },
+            payload,
+          }),
       }),
     getConversationTranscript: (conversationId, query = {}) => {
       const search = new URLSearchParams();

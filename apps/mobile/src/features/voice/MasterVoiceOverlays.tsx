@@ -51,10 +51,13 @@ export function VoiceTranscriptModal(props: {
     >
       <View
         className="flex-1 bg-screen"
-        style={{ paddingTop: Math.max(insets.top, 20), paddingBottom: Math.max(insets.bottom, 16) }}
+        style={{
+          paddingTop: Math.max(insets.top, 20),
+          paddingBottom: Math.max(insets.bottom, 16),
+        }}
       >
         <VoiceSheetHeader
-          title="Current call"
+          title="Current voice session"
           closeLabel="Close transcript"
           onClose={props.onClose}
         />
@@ -102,7 +105,10 @@ export function VoiceAudioRoutePicker(props: {
     >
       <View
         className="flex-1 bg-screen"
-        style={{ paddingTop: Math.max(insets.top, 20), paddingBottom: Math.max(insets.bottom, 16) }}
+        style={{
+          paddingTop: Math.max(insets.top, 20),
+          paddingBottom: Math.max(insets.bottom, 16),
+        }}
       >
         <VoiceSheetHeader
           title="Audio route"
@@ -139,7 +145,10 @@ export function VoiceAudioRoutePicker(props: {
               return (
                 <Pressable
                   accessibilityRole="radio"
-                  accessibilityState={{ checked: item.selected, disabled: selectionInFlight }}
+                  accessibilityState={{
+                    checked: item.selected,
+                    disabled: selectionInFlight,
+                  }}
                   accessibilityLabel={item.label}
                   className="flex-row items-center border-b border-border px-2 py-4"
                   disabled={selectionInFlight}
@@ -173,11 +182,11 @@ export function VoiceAudioRoutePicker(props: {
 
 function phaseLabel(snapshot: RealtimeVoiceControllerSnapshot): string {
   if (snapshot.phase === "starting") return "Connecting";
-  if (snapshot.phase === "stopping") return "Ending call";
-  if (snapshot.phase === "error") return "Voice call failed";
+  if (snapshot.phase === "stopping") return "Ending voice session";
+  if (snapshot.phase === "error") return "Voice session failed";
   if (snapshot.native?.realtimeConnectionState === "connecting") return "Connecting media";
-  if (snapshot.native?.realtimeConnectionState === "connected") return "Voice call active";
-  return "Voice call";
+  if (snapshot.native?.realtimeConnectionState === "connected") return "Voice active";
+  return "Voice";
 }
 
 export function MasterVoiceCallBar(props: {
@@ -251,10 +260,12 @@ export function MasterVoiceCallBar(props: {
       >
         <Text className="text-sm font-t3-bold text-foreground" numberOfLines={1}>
           {phaseLabel(props.snapshot)}
-          {props.attachment === null ? "" : ` · ${props.attachment.focus.threadTitle}`}
+          {props.attachment?.focus === null || props.attachment === null
+            ? ""
+            : ` · ${props.attachment.focus.threadTitle}`}
         </Text>
         <Text className="text-xs text-foreground-muted" numberOfLines={1}>
-          {lastTurn?.text ?? "Tap to view the call transcript"}
+          {lastTurn?.text ?? "Tap to view the voice transcript"}
         </Text>
       </Pressable>
       {props.snapshot.phase === "active" ? (
@@ -277,7 +288,7 @@ export function MasterVoiceCallBar(props: {
       <ControlPill
         icon={props.snapshot.phase === "error" ? "xmark" : "phone.down.fill"}
         accessibilityLabel={
-          props.snapshot.phase === "error" ? "Dismiss voice error" : "End voice call"
+          props.snapshot.phase === "error" ? "Dismiss voice error" : "End voice session"
         }
         variant="danger"
         onPress={props.onStop}

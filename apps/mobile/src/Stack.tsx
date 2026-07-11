@@ -34,6 +34,7 @@ import { ThreadRouteScreen } from "./features/threads/ThreadRouteScreen";
 import { ConnectionsRouteScreen } from "./features/connection/ConnectionsRouteScreen";
 import { ConnectionsNewRouteScreen } from "./features/connection/ConnectionsNewRouteScreen";
 import { HomeRouteScreen } from "./features/home/HomeRouteScreen";
+import { HomeListOptionsProvider, useHomeListOptions } from "./features/home/home-list-options";
 import { AddProjectDestinationRoute } from "./features/projects/AddProjectDestinationRoute";
 import { AddProjectLocalRoute } from "./features/projects/AddProjectLocalRoute";
 import { AddProjectRepositoryRoute } from "./features/projects/AddProjectRepositoryRoute";
@@ -50,6 +51,7 @@ import { SettingsWaitlistRouteScreen } from "./features/settings/SettingsWaitlis
 import { MasterVoiceProvider } from "./features/voice/MasterVoiceProvider";
 import { nativeHeaderScrollEdgeEffects } from "./native/StackHeader";
 import { useThreadShell } from "./state/entities";
+import { useSavedRemoteConnections } from "./state/use-remote-environment-registry";
 import { useThreadOutboxDrain } from "./state/use-thread-outbox-drain";
 
 const HEADER_SCROLL_EDGE_EFFECTS = nativeHeaderScrollEdgeEffects(Platform.OS, Platform.Version);
@@ -58,7 +60,10 @@ const HEADER_SCROLL_EDGE_EFFECTS = nativeHeaderScrollEdgeEffects(Platform.OS, Pl
 // background stay STATIC config while still adapting to appearance changes.
 const SHEET_BACKGROUND_COLOR =
   Platform.OS === "ios"
-    ? DynamicColorIOS({ light: "rgba(242, 242, 247, 0.98)", dark: "rgba(14, 14, 14, 0.98)" })
+    ? DynamicColorIOS({
+        light: "rgba(242, 242, 247, 0.98)",
+        dark: "rgba(14, 14, 14, 0.98)",
+      })
     : undefined;
 
 type AppScreenOptions = NativeStackNavigationOptions & {
@@ -259,7 +264,7 @@ function workspacePathFromState(state: NavigationState): string {
   return path.startsWith("/") ? path : `/${path}`;
 }
 
-function RootStackLayout(props: {
+function RootStackLayoutContent(props: {
   readonly children: React.ReactNode;
   readonly state: NavigationState;
 }) {
@@ -274,6 +279,11 @@ function RootStackLayout(props: {
   const workspacePathname = workspacePathFromState(props.state);
   const focusedThreadRef = parseActiveThreadPath(workspacePathname);
   const focusedThread = useThreadShell(focusedThreadRef);
+  const { savedConnectionsById } = useSavedRemoteConnections();
+  const availableEnvironmentIds = new Set(
+    Object.keys(savedConnectionsById) as Array<keyof typeof savedConnectionsById>,
+  );
+  const { options: homeListOptions } = useHomeListOptions(availableEnvironmentIds);
   const voiceFocus =
     focusedThread === null
       ? null
@@ -283,17 +293,33 @@ function RootStackLayout(props: {
           threadId: focusedThread.id,
           threadTitle: focusedThread.title,
         };
+  const voiceEnvironmentId =
+    voiceFocus?.environmentId ??
+    homeListOptions.selectedEnvironmentId ??
+    [...availableEnvironmentIds].sort()[0] ??
+    null;
 
   return (
     <HardwareKeyboardCommandProvider pathname={pathname}>
       <ClerkSettingsSheetDetentProvider initiallyExpanded={false}>
-        <MasterVoiceProvider focus={voiceFocus}>
+        <MasterVoiceProvider environmentId={voiceEnvironmentId} focus={voiceFocus}>
           <AdaptiveWorkspaceLayout pathname={workspacePathname}>
             {props.children}
           </AdaptiveWorkspaceLayout>
         </MasterVoiceProvider>
       </ClerkSettingsSheetDetentProvider>
     </HardwareKeyboardCommandProvider>
+  );
+}
+
+function RootStackLayout(props: {
+  readonly children: React.ReactNode;
+  readonly state: NavigationState;
+}) {
+  return (
+    <HomeListOptionsProvider>
+      <RootStackLayoutContent {...props} />
+    </HomeListOptionsProvider>
   );
 }
 
