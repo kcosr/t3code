@@ -20,18 +20,6 @@ import { __testing } from "./OpenAiVoiceProvider.ts";
 const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
 
-it("keeps Realtime function parameters rooted in an object schema", () => {
-  const config = __testing.providerSessionConfig("test");
-  const readHistory = config.tools.find((tool) => tool.name === "read_history");
-  const parameters = readHistory?.parameters as Record<string, unknown> | undefined;
-
-  expect(parameters).toMatchObject({
-    type: "object",
-    required: ["ref", "before", "after"],
-  });
-  expect(parameters).not.toHaveProperty("anyOf");
-});
-
 it("normalizes stable semantic transcript identities and rejects unidentified finals", () => {
   const parse = (value: unknown) =>
     __testing.parseRealtimeEvent({ type: "message", data: encodeJson(value) });
@@ -502,33 +490,37 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
     });
     const readHistoryParameters = configuredTools.find((tool) => tool.name === "read_history")
       ?.parameters as {
-      readonly anyOf: ReadonlyArray<{
-        readonly required: ReadonlyArray<string>;
-        readonly additionalProperties: boolean;
-        readonly properties: Record<string, unknown>;
-      }>;
+      readonly type: string;
+      readonly required: ReadonlyArray<string>;
+      readonly additionalProperties: boolean;
+      readonly properties: {
+        readonly ref: { readonly oneOf: ReadonlyArray<Record<string, unknown>> };
+        readonly voiceScope: { readonly oneOf: ReadonlyArray<Record<string, unknown>> };
+        readonly before: Record<string, unknown>;
+        readonly after: Record<string, unknown>;
+      };
     };
-    expect(readHistoryParameters.anyOf).toHaveLength(2);
-    expect(readHistoryParameters.anyOf[0]).toMatchObject({
+    expect(readHistoryParameters).toMatchObject({
+      type: "object",
       required: ["ref", "before", "after"],
       additionalProperties: false,
-      properties: {
-        ref: { required: ["type", "projectId", "threadId", "messageId"] },
-        before: { maximum: 10 },
-        after: { maximum: 10 },
-      },
     });
-    expect(readHistoryParameters.anyOf[1]).toMatchObject({
-      required: ["ref", "voiceScope", "before", "after"],
-      additionalProperties: false,
-      properties: {
-        ref: { required: ["type", "conversationId", "entryId"] },
-        voiceScope: {
-          oneOf: expect.arrayContaining([
-            expect.objectContaining({ required: ["type", "conversationId"] }),
-          ]),
-        },
-      },
+    expect(readHistoryParameters).not.toHaveProperty("anyOf");
+    expect(readHistoryParameters.properties.ref.oneOf).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ required: ["type", "projectId", "threadId", "messageId"] }),
+        expect.objectContaining({ required: ["type", "conversationId", "entryId"] }),
+      ]),
+    );
+    expect(readHistoryParameters.properties.voiceScope.oneOf).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ required: ["type"] }),
+        expect.objectContaining({ required: ["type", "conversationId"] }),
+      ]),
+    );
+    expect(readHistoryParameters.properties).toMatchObject({
+      before: { maximum: 10 },
+      after: { maximum: 10 },
     });
     expect(socketConnections).toEqual([
       {
