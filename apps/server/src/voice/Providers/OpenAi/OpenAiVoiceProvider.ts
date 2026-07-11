@@ -1,4 +1,5 @@
 import type { VoiceTranscriptionStreamEvent } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -326,9 +327,12 @@ const logHttpFailure = (operation: string, cause: unknown) =>
   });
 
 const isTransientNegotiationFailure = (cause: unknown): boolean =>
-  HttpClientError.isHttpClientError(cause) &&
-  cause.response !== undefined &&
-  (cause.response.status === 502 || cause.response.status === 503 || cause.response.status === 504);
+  Cause.isTimeoutError(cause) ||
+  (HttpClientError.isHttpClientError(cause) &&
+    cause.response !== undefined &&
+    (cause.response.status === 502 ||
+      cause.response.status === 503 ||
+      cause.response.status === 504));
 
 const safeOperationalValue = (value: unknown): string | undefined =>
   typeof value === "string" && /^[A-Za-z0-9._:/[\]-]{1,128}$/.test(value) ? value : undefined;
@@ -775,8 +779,9 @@ const make = Effect.gen(function* () {
         )
         .pipe(
           Effect.flatMap(HttpClientResponse.filterStatusOk),
+          Effect.timeout("7 seconds"),
           Effect.tapError((cause) => logHttpFailure("openai.realtime.negotiate", cause)),
-          Effect.retry({ times: 2, while: isTransientNegotiationFailure }),
+          Effect.retry({ times: 1, while: isTransientNegotiationFailure }),
           Effect.mapError(providerError("openai.realtime.negotiate")),
         );
       const providerRealtimeCallId = response.headers.location?.split("/").at(-1);
