@@ -94,7 +94,14 @@ const makeHarness = () => {
     sessionEvents: vi.fn(() => Effect.succeed({ state: serverSession.state, events: [] })),
   } as unknown as VoiceHttpClient;
   const snapshots: Array<string> = [];
-  const scheduler = { setInterval: vi.fn(() => Symbol()), clearInterval: vi.fn() };
+  const scheduledCallbacks = new Map<number, () => void>();
+  const scheduler = {
+    setInterval: vi.fn((callback: () => void, delayMs: number) => {
+      scheduledCallbacks.set(delayMs, callback);
+      return Symbol();
+    }),
+    clearInterval: vi.fn(),
+  };
   const controller = new RealtimeVoiceController(
     native,
     client,
@@ -106,7 +113,14 @@ const makeHarness = () => {
     if (listener === undefined) throw new Error(`Missing native listener: ${name}`);
     listener(event);
   };
-  return { client, controller, emitNative, native, scheduler, snapshots };
+  const runScheduled = async (delayMs: number) => {
+    const callback = scheduledCallbacks.get(delayMs);
+    if (callback === undefined) throw new Error(`Missing scheduled callback for ${delayMs}ms`);
+    callback();
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+  return { client, controller, emitNative, native, runScheduled, scheduler, snapshots };
 };
 
 describe("RealtimeVoiceController", () => {
@@ -235,6 +249,31 @@ describe("RealtimeVoiceController", () => {
     expect(controller.getSnapshot().error).toContain(
       "Realtime event stream returned an invalid response",
     );
+  });
+
+  it("tracks heartbeat and event failures independently", async () => {
+    const { client, controller, native, runScheduled } = makeHarness();
+    await controller.start(createInput);
+    const invalidResponse = Object.assign(new Error("invalid response"), {
+      _tag: "RemoteEnvironmentAuthInvalidJsonError",
+    });
+    vi.mocked(client.sessionEvents).mockReturnValue(Effect.fail(invalidResponse as never));
+    vi.mocked(client.heartbeatSession).mockReturnValue(Effect.die(new Error("offline")));
+
+    await controller.refreshEvents();
+    await runScheduled(10_000);
+    await controller.refreshEvents();
+    await runScheduled(10_000);
+
+    expect(controller.getSnapshot().phase).toBe("active");
+    expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
+
+    await controller.refreshEvents();
+
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "error",
+      error: expect.stringContaining("Realtime event stream returned an invalid response"),
+    });
   });
 
   it("ignores aggregate and stale native terminal events that do not own the active session", async () => {

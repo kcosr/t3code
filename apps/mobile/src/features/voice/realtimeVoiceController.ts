@@ -48,6 +48,8 @@ interface TimerScheduler {
   readonly clearInterval: (handle: unknown) => void;
 }
 
+type ControlOperation = "events" | "heartbeat";
+
 export interface RealtimeVoiceControllerOptions {
   readonly scheduler?: TimerScheduler;
   readonly eventPollIntervalMs?: number;
@@ -66,7 +68,7 @@ const errorTag = (cause: unknown): string | null =>
     ? String((cause as { readonly _tag: unknown })._tag)
     : null;
 
-const controlFailureMessage = (operation: "events" | "heartbeat", cause: unknown): string => {
+const controlFailureMessage = (operation: ControlOperation, cause: unknown): string => {
   if (operation === "events" && errorTag(cause) === "RemoteEnvironmentAuthInvalidJsonError") {
     return `Realtime event stream returned an invalid response: ${messageFor(cause)}`;
   }
@@ -113,7 +115,7 @@ export class RealtimeVoiceController {
   private startGeneration = 0;
   private startingNativeSessionId: string | null = null;
   private refreshInFlight = false;
-  private consecutiveControlFailures = 0;
+  private controlFailures: Record<ControlOperation, number> = { events: 0, heartbeat: 0 };
   private snapshot: RealtimeVoiceControllerSnapshot = {
     phase: "idle",
     session: null,
@@ -197,7 +199,7 @@ export class RealtimeVoiceController {
       };
       this.startingNativeSessionId = null;
       this.active = active;
-      this.consecutiveControlFailures = 0;
+      this.resetControlFailures();
       this.setSnapshot({
         phase: "active",
         session: active.serverState,
@@ -293,7 +295,7 @@ export class RealtimeVoiceController {
         (sequence, event) => Math.max(sequence, event.sequence),
         active.afterSequence,
       );
-      this.consecutiveControlFailures = 0;
+      this.controlFailures.events = 0;
       this.setSnapshot({ session: result.state });
       if (result.events.length > 0) this.listener.onSessionEvents?.(result.events);
       const serverError = result.events.toReversed().find((event) => event.type === "error");
@@ -337,16 +339,16 @@ export class RealtimeVoiceController {
       );
       if (this.active !== active) return;
       active.serverState = state;
-      this.consecutiveControlFailures = 0;
+      this.controlFailures.heartbeat = 0;
       this.setSnapshot({ session: state });
     } catch (cause) {
       this.handleControlFailure("heartbeat", cause);
     }
   }
 
-  private handleControlFailure(operation: "events" | "heartbeat", cause: unknown) {
-    this.consecutiveControlFailures += 1;
-    if (this.consecutiveControlFailures < 3 || this.active === null) return;
+  private handleControlFailure(operation: ControlOperation, cause: unknown) {
+    this.controlFailures[operation] += 1;
+    if (this.controlFailures[operation] < 3 || this.active === null) return;
     const message = controlFailureMessage(operation, cause);
     const active = this.active;
     this.active = null;
@@ -438,6 +440,11 @@ export class RealtimeVoiceController {
     if (this.eventTimer !== null) this.scheduler.clearInterval(this.eventTimer);
     this.heartbeatTimer = null;
     this.eventTimer = null;
+  }
+
+  private resetControlFailures() {
+    this.controlFailures.events = 0;
+    this.controlFailures.heartbeat = 0;
   }
 
   private requireActive(): ActiveSession {
