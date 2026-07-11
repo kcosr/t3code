@@ -812,6 +812,177 @@ it.effect("takeover fences an in-flight negotiation and terminates its late prov
   }),
 );
 
+it.effect("takeover terminates a provider that negotiates while displaced cleanup is blocked", () =>
+  Effect.gen(function* () {
+    const negotiationGate = yield* Deferred.make<RealtimeProviderSession>();
+    const negotiationStarted = yield* Deferred.make<void>();
+    const cleanupStarted = yield* Deferred.make<void>();
+    const cleanupRelease = yield* Deferred.make<void>();
+    const terminated = yield* Ref.make(0);
+    const provider: VoiceProviderAdapter = {
+      id: "fake-takeover-cleanup-race",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: () =>
+          Deferred.succeed(negotiationStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(negotiationGate)),
+          ),
+      },
+    };
+    const executor = VoiceToolExecutor.of({
+      invoke: () => Effect.die("unused"),
+      decide: () => Effect.die("unused"),
+      expire: () => Effect.succeed(undefined),
+      discardSession: () =>
+        Deferred.succeed(cleanupStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(cleanupRelease)),
+        ),
+    });
+    const test = yield* makeLayer(provider, executor);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const firstOwner = AuthSessionId.make("cleanup-race-phone");
+      const secondOwner = AuthSessionId.make("cleanup-race-desktop");
+      const first = yield* sessions.create(
+        principal(firstOwner),
+        input(false, "cleanup-race-first"),
+      );
+      const offering = yield* sessions
+        .offer(firstOwner, first.state.sessionId, {
+          sessionId: first.state.sessionId,
+          leaseGeneration: first.state.leaseGeneration,
+          sdp: "offer",
+        })
+        .pipe(Effect.flip, Effect.forkScoped);
+      yield* Deferred.await(negotiationStarted);
+
+      const replacing = yield* sessions
+        .create(principal(secondOwner), input(true, "cleanup-race-second"))
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(cleanupStarted);
+      yield* Deferred.succeed(negotiationGate, {
+        answer: {
+          sessionId: VoiceSessionId.make("provider-cleanup-race"),
+          leaseGeneration: first.state.leaseGeneration,
+          sdp: "late-answer",
+        },
+        events: Stream.empty,
+        updateContext: () => Effect.void,
+        submitToolOutput: () => Effect.void,
+        terminate: Ref.update(terminated, (count) => count + 1),
+      });
+
+      const offerError = yield* Fiber.join(offering);
+      expect(offerError.reason).toBe("lease-conflict");
+      expect(yield* Ref.get(terminated)).toBe(1);
+      yield* Deferred.succeed(cleanupRelease, undefined);
+      const replacement = yield* Fiber.join(replacing);
+      expect(replacement.state.leaseGeneration).toBe(2);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("does not let an old-owner heartbeat race past takeover fencing", () =>
+  Effect.gen(function* () {
+    const cleanupStarted = yield* Deferred.make<void>();
+    const cleanupRelease = yield* Deferred.make<void>();
+    const provider: VoiceProviderAdapter = {
+      id: "fake-heartbeat-takeover-race",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: { negotiate: () => Effect.die("unused") },
+    };
+    const executor = VoiceToolExecutor.of({
+      invoke: () => Effect.die("unused"),
+      decide: () => Effect.die("unused"),
+      expire: () => Effect.succeed(undefined),
+      discardSession: () =>
+        Deferred.succeed(cleanupStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(cleanupRelease)),
+        ),
+    });
+    const test = yield* makeLayer(provider, executor);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const oldOwner = AuthSessionId.make("heartbeat-race-old");
+      const newOwner = AuthSessionId.make("heartbeat-race-new");
+      const first = yield* sessions.create(principal(oldOwner), input(false, "heartbeat-race-1"));
+      const takeover = yield* sessions
+        .create(principal(newOwner), input(true, "heartbeat-race-2"))
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(cleanupStarted);
+      const heartbeatCompleted = yield* Deferred.make<void>();
+      const heartbeat = yield* sessions
+        .heartbeat(oldOwner, first.state.sessionId, first.state.leaseGeneration)
+        .pipe(
+          Effect.flip,
+          Effect.ensuring(Deferred.succeed(heartbeatCompleted, undefined)),
+          Effect.forkScoped,
+        );
+      yield* Effect.yieldNow;
+      expect(Option.isSome(yield* Deferred.poll(heartbeatCompleted))).toBe(true);
+      const error = yield* Fiber.join(heartbeat);
+      expect(error.reason).toBe("lease-conflict");
+
+      yield* Deferred.succeed(cleanupRelease, undefined);
+      const replacement = yield* Fiber.join(takeover);
+      expect(replacement.state.leaseGeneration).toBe(2);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("rejects a heartbeat while session termination is in progress", () =>
+  Effect.gen(function* () {
+    const terminationStarted = yield* Deferred.make<void>();
+    const terminationRelease = yield* Deferred.make<void>();
+    const provider: VoiceProviderAdapter = {
+      id: "fake-heartbeat-close-race",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Effect.succeed({
+            answer: {
+              sessionId: request.sessionId,
+              leaseGeneration: request.leaseGeneration,
+              sdp: "answer",
+            },
+            events: Stream.empty,
+            updateContext: () => Effect.void,
+            submitToolOutput: () => Effect.void,
+            terminate: Deferred.succeed(terminationStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(terminationRelease)),
+            ),
+          }),
+      },
+    };
+    const test = yield* makeLayer(provider);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("heartbeat-close-race");
+      const created = yield* sessions.create(
+        principal(owner),
+        input(false, "heartbeat-close-race"),
+      );
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      const closing = yield* sessions
+        .close(owner, created.state.sessionId, created.state.leaseGeneration)
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(terminationStarted);
+
+      const error = yield* sessions
+        .heartbeat(owner, created.state.sessionId, created.state.leaseGeneration)
+        .pipe(Effect.flip);
+      expect(error.reason).toBe("invalid-phase");
+
+      yield* Deferred.succeed(terminationRelease, undefined);
+      expect((yield* Fiber.join(closing)).state.phase).toBe("ended");
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
 it.effect("expires a session after three missed heartbeat intervals", () =>
   Effect.gen(function* () {
     const provider: VoiceProviderAdapter = {
@@ -833,6 +1004,140 @@ it.effect("expires a session after three missed heartbeat intervals", () =>
         .heartbeat(owner, created.state.sessionId, created.state.leaseGeneration)
         .pipe(Effect.flip);
       expect(heartbeatError.reason).toBe("invalid-phase");
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect.each(["listening", "speaking"] as const)(
+  "keeps a provider-owned %s session active without client heartbeats",
+  (activity) =>
+    Effect.gen(function* () {
+      const provider: VoiceProviderAdapter = {
+        id: `fake-active-${activity}`,
+        capabilities: new Set(["agent.realtime"]),
+        realtime: {
+          negotiate: (request) =>
+            Effect.succeed({
+              answer: {
+                sessionId: request.sessionId,
+                leaseGeneration: request.leaseGeneration,
+                sdp: "answer",
+              },
+              events: Stream.make({ type: "activity" as const, activity }),
+              updateContext: () => Effect.void,
+              submitToolOutput: () => Effect.void,
+              terminate: Effect.void,
+            }),
+        },
+      };
+      const test = yield* makeLayer(provider);
+      yield* Effect.gen(function* () {
+        const sessions = yield* VoiceSessionService;
+        const owner = AuthSessionId.make(`phone-active-${activity}`);
+        const created = yield* sessions.create(
+          principal(owner),
+          input(false, `active-${activity}`),
+        );
+        yield* sessions.offer(owner, created.state.sessionId, {
+          sessionId: created.state.sessionId,
+          leaseGeneration: created.state.leaseGeneration,
+          sdp: "offer",
+        });
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("31 seconds");
+        yield* Effect.yieldNow;
+
+        const snapshot = yield* sessions.events(owner, created.state.sessionId, 0, 0);
+        expect(snapshot.state.phase).toBe(activity);
+        expect(snapshot.events.some((event) => event.type === "error")).toBe(false);
+      }).pipe(Effect.provide(test.layer));
+    }),
+);
+
+it.effect("ends an active provider session at the absolute duration limit", () =>
+  Effect.gen(function* () {
+    const provider: VoiceProviderAdapter = {
+      id: "fake-active-duration-limit",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Effect.succeed({
+            answer: {
+              sessionId: request.sessionId,
+              leaseGeneration: request.leaseGeneration,
+              sdp: "answer",
+            },
+            events: Stream.make({ type: "activity" as const, activity: "listening" as const }),
+            updateContext: () => Effect.void,
+            submitToolOutput: () => Effect.void,
+            terminate: Effect.void,
+          }),
+      },
+    };
+    const test = yield* makeLayer(provider);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("phone-active-duration-limit");
+      const created = yield* sessions.create(principal(owner), input(false, "duration-limit"));
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("56 minutes");
+      yield* Effect.yieldNow;
+
+      const snapshot = yield* sessions.events(owner, created.state.sessionId, 0, 0);
+      expect(snapshot.state.phase).toBe("ended");
+      expect(snapshot.events.some((event) => event.type === "rotation-required")).toBe(true);
+      expect(
+        snapshot.events.some(
+          (event) => event.type === "error" && event.reason.includes("duration limit"),
+        ),
+      ).toBe(true);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("ends an active session when the provider transport closes", () =>
+  Effect.gen(function* () {
+    const provider: VoiceProviderAdapter = {
+      id: "fake-active-provider-close",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Effect.succeed({
+            answer: {
+              sessionId: request.sessionId,
+              leaseGeneration: request.leaseGeneration,
+              sdp: "answer",
+            },
+            events: Stream.fromIterable([
+              { type: "activity" as const, activity: "speaking" as const },
+              { type: "closed" as const },
+            ]),
+            updateContext: () => Effect.void,
+            submitToolOutput: () => Effect.void,
+            terminate: Effect.void,
+          }),
+      },
+    };
+    const test = yield* makeLayer(provider);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("phone-provider-close");
+      const created = yield* sessions.create(principal(owner), input(false, "provider-close"));
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      const snapshot = yield* sessions.events(owner, created.state.sessionId, 0, 0);
+      expect(snapshot.state.phase).toBe("ended");
     }).pipe(Effect.provide(test.layer));
   }),
 );

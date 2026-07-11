@@ -12,9 +12,11 @@ import type {
   VoiceSessionEvent,
   VoiceSessionState,
 } from "@t3tools/contracts";
+import { VoiceSessionId } from "@t3tools/contracts";
 import type { VoiceHttpClient } from "@t3tools/client-runtime/voice";
 import type {
   T3VoiceAudioRoute,
+  T3VoiceAudioRouteChangedEvent,
   T3VoiceNativeModule,
   T3VoiceRealtimeTerminatedEvent,
   T3VoiceRuntimeErrorEvent,
@@ -34,6 +36,7 @@ export interface RealtimeVoiceControllerSnapshot {
 export interface RealtimeVoiceControllerListener {
   readonly onSnapshot: (snapshot: RealtimeVoiceControllerSnapshot) => void;
   readonly onSessionEvents?: (events: ReadonlyArray<VoiceSessionEvent>) => void;
+  readonly onAudioRouteChanged?: (event: T3VoiceAudioRouteChangedEvent) => void;
 }
 
 interface ActiveSession {
@@ -120,6 +123,8 @@ export class RealtimeVoiceController {
   private startGeneration = 0;
   private startingNativeSessionId: string | null = null;
   private refreshInFlight = false;
+  private heartbeatInFlight = false;
+  private nativeRuntimeReconciliation: Promise<void> | null = null;
   private controlFailures: Record<ControlOperation, number> = {
     events: 0,
     heartbeat: 0,
@@ -142,6 +147,11 @@ export class RealtimeVoiceController {
     this.subscriptions = [
       native.addListener("stateChanged", (state) => this.handleNativeState(state)),
       native.addListener("runtimeError", (event) => this.handleNativeError(event)),
+      native.addListener("audioRouteChanged", (event) => {
+        if (event.nativeSessionId === this.active?.nativeSessionId) {
+          listener.onAudioRouteChanged?.(event);
+        }
+      }),
       native.addListener("realtimeTerminated", (event) => this.handleNativeTermination(event)),
     ];
   }
@@ -150,7 +160,27 @@ export class RealtimeVoiceController {
     return this.snapshot;
   }
 
+  reconcileNativeRuntime(): Promise<void> {
+    if (this.active !== null || this.snapshot.phase === "starting") {
+      return Promise.reject(new Error("Cannot reconcile native media during an active session"));
+    }
+    if (this.nativeRuntimeReconciliation === null) {
+      const reconciliation = this.reconcileNativeRuntimeOnce();
+      this.nativeRuntimeReconciliation = reconciliation.then(
+        () => {
+          if (this.nativeRuntimeReconciliation !== null) this.nativeRuntimeReconciliation = null;
+        },
+        (cause) => {
+          if (this.nativeRuntimeReconciliation !== null) this.nativeRuntimeReconciliation = null;
+          throw cause;
+        },
+      );
+    }
+    return this.nativeRuntimeReconciliation;
+  }
+
   async start(input: VoiceSessionCreateInput): Promise<RealtimeVoiceControllerSnapshot> {
+    await this.reconcileNativeRuntime();
     if (this.snapshot.phase !== "idle" && this.snapshot.phase !== "error") {
       throw new Error("A Realtime voice session is already starting or active");
     }
@@ -253,6 +283,17 @@ export class RealtimeVoiceController {
       Effect.runPromise(this.client.closeSession(active.sessionId, active.leaseGeneration)),
     ]);
     if (generation !== this.startGeneration) return;
+    const nativeState = await this.native.getStateAsync();
+    if (generation !== this.startGeneration) return;
+    this.setSnapshot({ native: nativeState });
+    if (nativeState.activeRealtimeSessionId !== null) {
+      this.setSnapshot({
+        phase: "error",
+        session: active.serverState,
+        error: "The Realtime media session could not be stopped",
+      });
+      return;
+    }
     this.setSnapshot({ phase: "idle", session: null, error: null });
   }
 
@@ -343,7 +384,7 @@ export class RealtimeVoiceController {
         );
       }
     } catch (cause) {
-      this.handleControlFailure("events", cause);
+      if (this.active === active) this.handleControlFailure("events", cause);
     } finally {
       this.refreshInFlight = false;
     }
@@ -365,7 +406,8 @@ export class RealtimeVoiceController {
   }
 
   private async heartbeat(active: ActiveSession) {
-    if (this.active !== active) return;
+    if (this.active !== active || this.heartbeatInFlight) return;
+    this.heartbeatInFlight = true;
     try {
       const state = await Effect.runPromise(
         this.client.heartbeatSession(active.sessionId, active.leaseGeneration),
@@ -375,7 +417,9 @@ export class RealtimeVoiceController {
       this.controlFailures.heartbeat = 0;
       this.setSnapshot({ session: state });
     } catch (cause) {
-      this.handleControlFailure("heartbeat", cause);
+      if (this.active === active) this.handleControlFailure("heartbeat", cause);
+    } finally {
+      this.heartbeatInFlight = false;
     }
   }
 
@@ -449,6 +493,17 @@ export class RealtimeVoiceController {
       .stopRealtimeSessionAsync({ nativeSessionId: active.nativeSessionId })
       .catch(() => undefined);
     if (generation !== this.startGeneration) return;
+    const nativeState = await this.native.getStateAsync();
+    if (generation !== this.startGeneration) return;
+    this.setSnapshot({ native: nativeState });
+    if (nativeState.activeRealtimeSessionId !== null) {
+      this.setSnapshot({
+        phase: "error",
+        session: active.serverState,
+        error: "The Realtime media session could not be stopped",
+      });
+      return;
+    }
     this.setSnapshot({
       phase: error === null ? "idle" : "error",
       session: error === null ? null : active.serverState,
@@ -479,6 +534,37 @@ export class RealtimeVoiceController {
     if (this.eventTimer !== null) this.scheduler.clearInterval(this.eventTimer);
     this.heartbeatTimer = null;
     this.eventTimer = null;
+  }
+
+  private async reconcileNativeRuntimeOnce(): Promise<void> {
+    const before = await this.native.getStateAsync();
+    this.setSnapshot({ native: before });
+    const nativeSessionId = before.activeRealtimeSessionId;
+    if (nativeSessionId === null) return;
+
+    const sessionId = VoiceSessionId.make(nativeSessionId);
+    const closeServer = async () => {
+      try {
+        const state = await Effect.runPromise(this.client.getSession(sessionId));
+        await Effect.runPromise(this.client.closeSession(sessionId, state.leaseGeneration));
+      } catch {
+        // The native peer must still be stopped when its original environment or auth is unavailable.
+      }
+    };
+
+    let stopFailure: unknown = null;
+    try {
+      await this.native.stopRealtimeSessionAsync({ nativeSessionId });
+    } catch (cause) {
+      stopFailure = cause;
+    }
+    await closeServer();
+
+    const after = await this.native.getStateAsync();
+    this.setSnapshot({ native: after });
+    if (after.activeRealtimeSessionId !== null) {
+      throw stopFailure ?? new Error("The orphaned Realtime media session could not be stopped");
+    }
   }
 
   private resetControlFailures() {

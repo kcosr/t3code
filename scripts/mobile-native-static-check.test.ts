@@ -10,7 +10,11 @@ import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
-import { collectSources, runCommand } from "./mobile-native-static-check.ts";
+import {
+  collectSources,
+  findAndroidVoiceLogViolations,
+  runCommand,
+} from "./mobile-native-static-check.ts";
 
 const processHandle = (
   exitCode: Effect.Effect<ChildProcessSpawner.ExitCode, PlatformError.PlatformError>,
@@ -35,6 +39,21 @@ const provideSpawner = (spawn: ChildProcessSpawner.ChildProcessSpawner["Service"
 const runSwiftLint = runCommand("swiftlint", ["lint", "--strict"], "/repo/apps/mobile").pipe(
   Effect.provideService(HostProcess.HostProcessPlatform, "linux"),
 );
+
+it("rejects every Android Log surface from native voice sources", () => {
+  assert.deepEqual(
+    findAndroidVoiceLogViolations([
+      { path: "direct.kt", content: 'Log.i("voice", "sessionId=$sessionId")' },
+      {
+        path: "qualified.kt",
+        content: 'android.util.Log.w("voice", "provider payload")',
+      },
+      { path: "imported.kt", content: "import android.util.Log\nclass SafeLooking" },
+      { path: "ring.kt", content: "T3VoiceDiagnostics.record(generation, category, code)" },
+    ]),
+    ["direct.kt", "qualified.kt", "imported.kt"],
+  );
+});
 
 it.layer(NodeServices.layer)("mobile native source discovery", (it) => {
   it.effect("preserves the failed discovery operation, path, and exact cause", () =>

@@ -855,10 +855,11 @@ All clients use the same server signaling, capability, confirmation, and bounded
 
 - `VoiceSessionRegistry` owns one Effect scope per provider session.
 - Ending a T3 session interrupts sideband readers, tool fibers, timers, and provider connections.
-- Loss of the native voice heartbeat or server sideband starts a short grace timer; ordinary React
-  event-subscription disconnect does not close healthy native media.
-- Grace expiry fences the generation, explicitly terminates the provider call, and tells the native
-  peer to close. The native peer independently closes on control-heartbeat loss.
+- Client heartbeat expiry fences only pre-media setup in `creating`, `signaling`, and `connecting`.
+  After provider media attaches, provider closure and the absolute session-duration limit own
+  liveness so React timer suspension cannot end healthy background media.
+- Ordinary React event-subscription disconnect does not close healthy native media. A recreated
+  controller explicitly stops and reconciles an orphaned native peer before starting another call.
 - Provider errors are normalized into recoverable, terminal, or policy failures.
 - Tool execution survives duplicate provider events through idempotency records.
 - Session duration is capped below the provider maximum and exposed to the client.

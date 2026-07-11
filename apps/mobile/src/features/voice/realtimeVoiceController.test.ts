@@ -6,7 +6,7 @@ import {
   VoiceSessionId,
   type VoiceSessionCreateInput,
 } from "@t3tools/contracts";
-import type { T3VoiceNativeModule } from "@t3tools/mobile-voice-native";
+import type { T3VoiceNativeModule, T3VoiceRuntimeState } from "@t3tools/mobile-voice-native";
 import * as Effect from "effect/Effect";
 import { describe, expect, it, vi } from "vite-plus/test";
 
@@ -44,25 +44,49 @@ const serverSession = {
 
 const makeHarness = () => {
   const listeners = new Map<string, (event: unknown) => void>();
+  let nativeState: T3VoiceRuntimeState = {
+    phase: "idle" as const,
+    isForeground: false,
+    activeRecordingId: null,
+    activePlaybackId: null,
+    activeRealtimeSessionId: null,
+    realtimeConnectionState: null,
+    realtimeMuted: false,
+    sequence: 0,
+  };
   const native = {
     getMicrophonePermissionAsync: vi.fn(async () => ({ granted: true })),
     requestMicrophonePermissionAsync: vi.fn(),
-    getStateAsync: vi.fn(async () => ({
-      phase: "realtime" as const,
-      isForeground: true,
-      activeRecordingId: null,
-      activePlaybackId: null,
-      activeRealtimeSessionId: SESSION_ID,
-      realtimeConnectionState: "connecting" as const,
-      realtimeMuted: false,
-      sequence: 1,
-    })),
-    prepareRealtimeSessionAsync: vi.fn(async () => ({
-      nativeSessionId: SESSION_ID,
-      sdp: "local-offer",
-    })),
-    applyRealtimeAnswerAsync: vi.fn(async () => undefined),
-    stopRealtimeSessionAsync: vi.fn(async () => true),
+    getStateAsync: vi.fn(async () => nativeState),
+    prepareRealtimeSessionAsync: vi.fn(async () => {
+      nativeState = {
+        ...nativeState,
+        phase: "realtime" as const,
+        isForeground: true,
+        activeRealtimeSessionId: SESSION_ID,
+        realtimeConnectionState: "offer-ready" as const,
+        sequence: nativeState.sequence + 1,
+      };
+      return { nativeSessionId: SESSION_ID, sdp: "local-offer" };
+    }),
+    applyRealtimeAnswerAsync: vi.fn(async () => {
+      nativeState = {
+        ...nativeState,
+        realtimeConnectionState: "connecting" as const,
+        sequence: nativeState.sequence + 1,
+      };
+    }),
+    stopRealtimeSessionAsync: vi.fn(async () => {
+      nativeState = {
+        ...nativeState,
+        phase: "idle" as const,
+        isForeground: false,
+        activeRealtimeSessionId: null,
+        realtimeConnectionState: "closed" as const,
+        sequence: nativeState.sequence + 1,
+      };
+      return true;
+    }),
     setRealtimeMutedAsync: vi.fn(async () => undefined),
     getAudioRoutesAsync: vi.fn(async () => []),
     setAudioRouteAsync: vi.fn(async () => []),
@@ -73,6 +97,7 @@ const makeHarness = () => {
   } as unknown as T3VoiceNativeModule;
   const client = {
     createSession: vi.fn(() => Effect.succeed(serverSession)),
+    getSession: vi.fn(() => Effect.succeed(serverSession.state)),
     offerSession: vi.fn(() =>
       Effect.succeed({
         sessionId: SESSION_ID,
@@ -100,6 +125,7 @@ const makeHarness = () => {
     ),
   } as unknown as VoiceHttpClient;
   const snapshots: Array<string> = [];
+  const routeChanges: Array<string> = [];
   const scheduledCallbacks = new Map<number, () => void>();
   const scheduler = {
     setInterval: vi.fn((callback: () => void, delayMs: number) => {
@@ -111,10 +137,24 @@ const makeHarness = () => {
   const controller = new RealtimeVoiceController(
     native,
     client,
-    { onSnapshot: (snapshot) => snapshots.push(snapshot.phase) },
+    {
+      onSnapshot: (snapshot) => snapshots.push(snapshot.phase),
+      onAudioRouteChanged: (event) => routeChanges.push(`${event.reason}:${event.routeId}`),
+    },
     { scheduler },
   );
   const emitNative = (name: string, event: unknown) => {
+    if (name === "stateChanged") nativeState = event as typeof nativeState;
+    if (name === "realtimeTerminated") {
+      nativeState = {
+        ...nativeState,
+        phase: "idle" as const,
+        isForeground: false,
+        activeRealtimeSessionId: null,
+        realtimeConnectionState: "closed" as const,
+        sequence: nativeState.sequence + 1,
+      };
+    }
     const listener = listeners.get(name);
     if (listener === undefined) throw new Error(`Missing native listener: ${name}`);
     listener(event);
@@ -132,12 +172,117 @@ const makeHarness = () => {
     emitNative,
     native,
     runScheduled,
+    routeChanges,
     scheduler,
     snapshots,
   };
 };
 
 describe("RealtimeVoiceController", () => {
+  it("forwards sanitized native route fallback events for the active owner", async () => {
+    const { controller, emitNative, routeChanges } = makeHarness();
+    await controller.start(createInput);
+
+    emitNative("audioRouteChanged", {
+      nativeSessionId: SESSION_ID,
+      routeId: "system",
+      routeType: "system",
+      reason: "selected-route-unavailable",
+    });
+    emitNative("audioRouteChanged", {
+      nativeSessionId: "stale-session",
+      routeId: "system",
+      routeType: "system",
+      reason: "selected-route-unavailable",
+    });
+
+    expect(routeChanges).toEqual(["selected-route-unavailable:system"]);
+  });
+
+  it("stops an orphaned native session and closes its authenticated server lease", async () => {
+    const { client, controller, native } = makeHarness();
+    vi.mocked(native.getStateAsync).mockResolvedValueOnce({
+      phase: "realtime",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected",
+      realtimeMuted: false,
+      sequence: 8,
+    });
+
+    await Promise.all([controller.reconcileNativeRuntime(), controller.reconcileNativeRuntime()]);
+
+    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledTimes(1);
+    expect(client.getSession).toHaveBeenCalledWith(SESSION_ID);
+    expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1);
+    expect(controller.getSnapshot().native?.activeRealtimeSessionId).toBeNull();
+  });
+
+  it("still stops an orphan when its original server lease is unavailable", async () => {
+    const { client, controller, native } = makeHarness();
+    vi.mocked(native.getStateAsync).mockResolvedValueOnce({
+      phase: "realtime",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected",
+      realtimeMuted: false,
+      sequence: 4,
+    });
+    vi.mocked(client.getSession).mockReturnValue(Effect.die(new Error("server unavailable")));
+
+    await controller.reconcileNativeRuntime();
+
+    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledTimes(1);
+    expect(client.closeSession).not.toHaveBeenCalled();
+    expect(controller.getSnapshot().native?.activeRealtimeSessionId).toBeNull();
+  });
+
+  it("blocks startup when native state confirms an orphan survived the stop request", async () => {
+    const { client, controller, native } = makeHarness();
+    const orphan: T3VoiceRuntimeState = {
+      phase: "realtime",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected",
+      realtimeMuted: false,
+      sequence: 3,
+    };
+    vi.mocked(native.getStateAsync).mockResolvedValueOnce(orphan).mockResolvedValueOnce(orphan);
+    vi.mocked(native.stopRealtimeSessionAsync).mockRejectedValueOnce(new Error("binder failed"));
+
+    await expect(controller.start(createInput)).rejects.toThrow("binder failed");
+
+    expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1);
+    expect(client.createSession).not.toHaveBeenCalled();
+  });
+
+  it("blocks startup when orphan cleanup leaves a different realtime peer active", async () => {
+    const { controller, native } = makeHarness();
+    const orphan: T3VoiceRuntimeState = {
+      phase: "realtime",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected",
+      realtimeMuted: false,
+      sequence: 3,
+    };
+    vi.mocked(native.getStateAsync)
+      .mockResolvedValueOnce(orphan)
+      .mockResolvedValueOnce({ ...orphan, activeRealtimeSessionId: "replacement", sequence: 4 });
+
+    await expect(controller.start(createInput)).rejects.toThrow(
+      "The orphaned Realtime media session could not be stopped",
+    );
+  });
+
   it("signals an ICE-complete native offer through the authenticated server", async () => {
     const { client, controller, native, snapshots } = makeHarness();
 
@@ -159,7 +304,7 @@ describe("RealtimeVoiceController", () => {
     expect(controller.getSnapshot().phase).toBe("active");
     expect(controller.getSnapshot().native).toMatchObject({
       activeRealtimeSessionId: SESSION_ID,
-      sequence: 1,
+      sequence: 2,
     });
     expect(snapshots).toContain("starting");
     expect(snapshots).toContain("active");
@@ -180,16 +325,27 @@ describe("RealtimeVoiceController", () => {
 
   it("rejects startup when native media terminates after accepting the answer", async () => {
     const { client, controller, native } = makeHarness();
-    vi.mocked(native.getStateAsync).mockResolvedValueOnce({
-      phase: "idle",
-      isForeground: true,
-      activeRecordingId: null,
-      activePlaybackId: null,
-      activeRealtimeSessionId: null,
-      realtimeConnectionState: "failed",
-      realtimeMuted: false,
-      sequence: 2,
-    });
+    vi.mocked(native.getStateAsync)
+      .mockResolvedValueOnce({
+        phase: "idle",
+        isForeground: false,
+        activeRecordingId: null,
+        activePlaybackId: null,
+        activeRealtimeSessionId: null,
+        realtimeConnectionState: null,
+        realtimeMuted: false,
+        sequence: 0,
+      })
+      .mockResolvedValueOnce({
+        phase: "idle",
+        isForeground: true,
+        activeRecordingId: null,
+        activePlaybackId: null,
+        activeRealtimeSessionId: null,
+        realtimeConnectionState: "failed",
+        realtimeMuted: false,
+        sequence: 2,
+      });
 
     await expect(controller.start(createInput)).rejects.toThrow(
       "The Realtime media session ended during startup",
@@ -215,6 +371,38 @@ describe("RealtimeVoiceController", () => {
     expect(controller.getSnapshot()).toMatchObject({
       phase: "idle",
       session: null,
+    });
+  });
+
+  it("does not report idle when explicit stop leaves native media active", async () => {
+    const { controller, native } = makeHarness();
+    await controller.start(createInput);
+    vi.mocked(native.stopRealtimeSessionAsync).mockResolvedValueOnce(false);
+
+    await controller.stop();
+
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "error",
+      error: "The Realtime media session could not be stopped",
+    });
+  });
+
+  it("does not report idle when server termination cleanup leaves native media active", async () => {
+    const { client, controller, native } = makeHarness();
+    await controller.start(createInput);
+    vi.mocked(native.stopRealtimeSessionAsync).mockResolvedValueOnce(false);
+    vi.mocked(client.sessionEvents).mockReturnValue(
+      Effect.succeed({
+        state: { ...serverSession.state, phase: "ended" as const },
+        events: [],
+      }),
+    );
+
+    await controller.refreshEvents();
+
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "error",
+      error: "The Realtime media session could not be stopped",
     });
   });
 
@@ -296,6 +484,51 @@ describe("RealtimeVoiceController", () => {
     });
   });
 
+  it("keeps heartbeat requests single-flight", async () => {
+    const { client, controller, runScheduled } = makeHarness();
+    await controller.start(createInput);
+    let resolveHeartbeat!: (state: typeof serverSession.state) => void;
+    const pendingHeartbeat = new Promise<typeof serverSession.state>((resolve) => {
+      resolveHeartbeat = resolve;
+    });
+    vi.mocked(client.heartbeatSession).mockReturnValue(Effect.promise(() => pendingHeartbeat));
+
+    await runScheduled(10_000);
+    await runScheduled(10_000);
+
+    expect(client.heartbeatSession).toHaveBeenCalledTimes(1);
+    resolveHeartbeat(serverSession.state);
+    await vi.waitFor(async () => {
+      await runScheduled(10_000);
+      expect(client.heartbeatSession).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("keeps event polling single-flight", async () => {
+    const { client, controller } = makeHarness();
+    await controller.start(createInput);
+    let resolveEvents!: (value: {
+      state: typeof serverSession.state;
+      events: ReadonlyArray<never>;
+    }) => void;
+    const pendingEvents = new Promise<{
+      state: typeof serverSession.state;
+      events: ReadonlyArray<never>;
+    }>((resolve) => {
+      resolveEvents = resolve;
+    });
+    vi.mocked(client.sessionEvents).mockReturnValue(Effect.promise(() => pendingEvents));
+
+    const first = controller.refreshEvents();
+    await controller.refreshEvents();
+
+    expect(client.sessionEvents).toHaveBeenCalledTimes(1);
+    resolveEvents({ state: serverSession.state, events: [] });
+    await first;
+    await controller.refreshEvents();
+    expect(client.sessionEvents).toHaveBeenCalledTimes(2);
+  });
+
   it("ignores aggregate and stale native terminal events that do not own the active session", async () => {
     const { client, controller, emitNative, native } = makeHarness();
     await controller.start(createInput);
@@ -352,7 +585,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: SESSION_ID,
       realtimeConnectionState: "connecting",
       realtimeMuted: false,
-      sequence: 1,
+      sequence: 2,
     });
   });
 

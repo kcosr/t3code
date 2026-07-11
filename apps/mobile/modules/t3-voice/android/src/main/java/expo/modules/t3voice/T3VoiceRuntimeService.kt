@@ -14,6 +14,19 @@ import android.os.IBinder
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 
+internal class T3VoiceForegroundReleaseCoordinator(
+  private val isIdle: () -> Boolean,
+  private val releaseForeground: () -> Unit,
+) {
+  val lock = Any()
+
+  fun releaseWhileLocked() {
+    check(Thread.holdsLock(lock)) { "Foreground release must hold the operation lock." }
+    check(isIdle()) { "Cannot release foreground ownership while voice is active." }
+    releaseForeground()
+  }
+}
+
 class T3VoiceRuntimeService : Service() {
   internal inner class VoiceBinder : Binder() {
     val state: StateFlow<T3VoiceRuntimeState>
@@ -26,29 +39,41 @@ class T3VoiceRuntimeService : Service() {
       get() = T3VoiceStateStore.realtimeTermination
 
     fun startRecording(recordingId: String) {
-      check(T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
-        "The voice runtime is already in use."
-      }
-      try {
-        recorder.start(recordingId)
-        T3VoiceStateStore.setRecording(recordingId)
-      } catch (cause: Throwable) {
-        stopRuntimeForeground()
-        throw cause
+      synchronized(operationLock) {
+        val owner =
+          checkNotNull(T3VoiceStateStore.claimRecording(recordingId)) {
+            "The voice runtime is already in use."
+          }
+        recordingOwner = owner
+        try {
+          ensureRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+          recorder.start(recordingId)
+        } catch (cause: Throwable) {
+          releaseRecordingLocked(owner)
+          throw cause
+        }
       }
     }
 
-    fun stopRecording(recordingId: String): Map<String, Any> {
-      val result = recorder.stop(recordingId)
-      T3VoiceStateStore.setRecording(null)
-      stopRuntimeForeground()
-      return result.toResultBody()
-    }
+    fun stopRecording(recordingId: String): Map<String, Any> =
+      synchronized(operationLock) {
+        val owner = requireRecordingOwner(recordingId)
+        try {
+          recorder.stop(recordingId).toResultBody()
+        } finally {
+          releaseRecordingLocked(owner)
+        }
+      }
 
     fun cancelRecording(recordingId: String) {
-      recorder.cancel(recordingId)
-      T3VoiceStateStore.setRecording(null)
-      stopRuntimeForeground()
+      synchronized(operationLock) {
+        val owner = requireRecordingOwner(recordingId)
+        try {
+          recorder.cancel(recordingId)
+        } finally {
+          releaseRecordingLocked(owner)
+        }
+      }
     }
 
     fun deleteRecording(recordingId: String, uri: String) {
@@ -56,15 +81,19 @@ class T3VoiceRuntimeService : Service() {
     }
 
     fun startPlayback(playbackId: String, sampleRate: Int, channelCount: Int) {
-      check(T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
-        "The voice runtime is already in use."
-      }
-      try {
-        player.start(playbackId, sampleRate, channelCount)
-        T3VoiceStateStore.setPlayback(playbackId)
-      } catch (cause: Throwable) {
-        stopRuntimeForeground()
-        throw cause
+      synchronized(operationLock) {
+        val owner =
+          checkNotNull(T3VoiceStateStore.claimPlayback(playbackId)) {
+            "The voice runtime is already in use."
+          }
+        playbackOwner = owner
+        try {
+          ensureRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+          player.start(playbackId, sampleRate, channelCount)
+        } catch (cause: Throwable) {
+          releasePlaybackLocked(owner)
+          throw cause
+        }
       }
     }
 
@@ -77,24 +106,35 @@ class T3VoiceRuntimeService : Service() {
     }
 
     fun cancelPlayback(playbackId: String) {
-      player.cancel(playbackId)
-      T3VoiceStateStore.setPlayback(null)
-      stopRuntimeForeground()
+      synchronized(operationLock) {
+        val owner = requirePlaybackOwner(playbackId)
+        try {
+          player.cancel(playbackId)
+        } finally {
+          releasePlaybackLocked(owner)
+        }
+      }
     }
 
     fun prepareRealtimeSession(
       nativeSessionId: String,
       callback: T3VoiceWebRtcResultCallback<String>,
     ) {
-      check(T3VoiceStateStore.claimRealtime(nativeSessionId)) {
-        "The voice runtime is already in use."
-      }
-      try {
-        realtime.prepare(nativeSessionId, callback)
-      } catch (cause: Throwable) {
-        T3VoiceStateStore.releaseRealtimeClaim(nativeSessionId)
-        stopRuntimeForeground()
-        throw cause
+      synchronized(operationLock) {
+        check(T3VoiceStateStore.claimRealtime(nativeSessionId)) {
+          "The voice runtime is already in use."
+        }
+        try {
+          ensureRuntimeForeground(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+              ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+          )
+          realtime.prepare(nativeSessionId, callback)
+        } catch (cause: Throwable) {
+          T3VoiceStateStore.releaseRealtimeClaim(nativeSessionId)
+          stopRuntimeForegroundLocked()
+          throw cause
+        }
       }
     }
 
@@ -119,6 +159,14 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private val binder = VoiceBinder()
+  private val foregroundReleaseCoordinator =
+    T3VoiceForegroundReleaseCoordinator(
+      isIdle = { T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE },
+      releaseForeground = ::stopRuntimeForeground,
+    )
+  private val operationLock = foregroundReleaseCoordinator.lock
+  private var recordingOwner: T3VoiceOperationOwner? = null
+  private var playbackOwner: T3VoiceOperationOwner? = null
   private lateinit var recorder: T3VoiceRecorder
   private lateinit var player: T3VoicePcmPlayer
   private val realtimeDelegate =
@@ -132,6 +180,16 @@ class T3VoiceRuntimeService : Service() {
             muted = muted,
           )
         },
+        onRouteChanged = { sessionId, change ->
+          T3VoiceStateStore.emit(
+            T3VoiceRuntimeEvent.AudioRouteChanged(
+              nativeSessionId = sessionId,
+              routeId = change.routeId,
+              routeType = change.routeType,
+              reason = change.reason.name.lowercase().replace('_', '-'),
+            ),
+          )
+        },
         onError = { sessionId, code, message, recoverable ->
           T3VoiceStateStore.emit(
             T3VoiceRuntimeEvent.RuntimeError(
@@ -143,15 +201,18 @@ class T3VoiceRuntimeService : Service() {
           )
         },
         onTerminated = { sessionId, outcome, code, retryable ->
-          T3VoiceStateStore.terminateRealtime(
-            T3VoiceRuntimeEvent.RealtimeTerminated(
-              nativeSessionId = sessionId,
-              outcome = outcome,
-              code = code,
-              retryable = retryable,
-            ),
-          )
-          stopRuntimeForeground()
+          synchronized(operationLock) {
+            val terminated =
+              T3VoiceStateStore.terminateRealtime(
+                T3VoiceRuntimeEvent.RealtimeTerminated(
+                  nativeSessionId = sessionId,
+                  outcome = outcome,
+                  code = code,
+                  retryable = retryable,
+                ),
+              )
+            if (terminated) stopRuntimeForegroundLocked()
+          }
         },
       )
     }
@@ -161,6 +222,7 @@ class T3VoiceRuntimeService : Service() {
   override fun onCreate() {
     super.onCreate()
     recorder = T3VoiceRecorder(applicationContext)
+    recorder.sweepStaleCache()
     player =
       T3VoicePcmPlayer(
         onChunkConsumed = { playbackId, chunkIndex ->
@@ -169,9 +231,8 @@ class T3VoiceRuntimeService : Service() {
           )
         },
         onFinished = { playbackId ->
-          if (T3VoiceStateStore.state.value.activePlaybackId == playbackId) {
-            T3VoiceStateStore.setPlayback(null)
-            stopRuntimeForeground()
+          synchronized(operationLock) {
+            playbackOwner?.takeIf { it.id == playbackId }?.let(::releasePlaybackLocked)
           }
         },
         onError = { playbackId, cause ->
@@ -183,8 +244,9 @@ class T3VoiceRuntimeService : Service() {
               recoverable = true,
             ),
           )
-          T3VoiceStateStore.setPlayback(null)
-          stopRuntimeForeground()
+          synchronized(operationLock) {
+            playbackOwner?.takeIf { it.id == playbackId }?.let(::releasePlaybackLocked)
+          }
         },
       )
     createNotificationChannel()
@@ -194,17 +256,34 @@ class T3VoiceRuntimeService : Service() {
   override fun onBind(intent: Intent?): IBinder = binder
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-    when (intent?.action) {
-      ACTION_STOP -> stopActiveOperation()
-      ACTION_START_RECORDING -> startRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-      ACTION_START_PLAYBACK ->
-        startRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
-      ACTION_START_REALTIME ->
-        startRuntimeForeground(
-          ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
-        )
-      else -> stopSelf(startId)
+    synchronized(operationLock) {
+      when (intent?.action) {
+        ACTION_STOP -> stopActiveOperationLocked()
+        ACTION_START_RECORDING ->
+          reconcileStartCommand(
+            expectedOwnerId = intent.getStringExtra(EXTRA_OPERATION_ID),
+            activeOwnerId = T3VoiceStateStore.state.value.activeRecordingId,
+            foregroundServiceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+            startId = startId,
+          )
+        ACTION_START_PLAYBACK ->
+          reconcileStartCommand(
+            expectedOwnerId = intent.getStringExtra(EXTRA_OPERATION_ID),
+            activeOwnerId = T3VoiceStateStore.state.value.activePlaybackId,
+            foregroundServiceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+            startId = startId,
+          )
+        ACTION_START_REALTIME ->
+          reconcileStartCommand(
+            expectedOwnerId = intent.getStringExtra(EXTRA_OPERATION_ID),
+            activeOwnerId = T3VoiceStateStore.state.value.activeRealtimeSessionId,
+            foregroundServiceType =
+              ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+            startId = startId,
+          )
+        else -> stopSelf(startId)
+      }
     }
     return START_NOT_STICKY
   }
@@ -227,21 +306,78 @@ class T3VoiceRuntimeService : Service() {
     T3VoiceStateStore.setForeground(true)
   }
 
-  private fun stopActiveOperation() {
-    val state = T3VoiceStateStore.state.value
-    state.activeRecordingId?.let {
-      runCatching { recorder.cancel(it) }
-      T3VoiceStateStore.setRecording(null)
+  private fun reconcileStartCommand(
+    expectedOwnerId: String?,
+    activeOwnerId: String?,
+    foregroundServiceType: Int,
+    startId: Int,
+  ) {
+    when (T3VoiceStartCommandPolicy.decide(expectedOwnerId, activeOwnerId)) {
+      T3VoiceStartCommandDecision.PROMOTE_ACTIVE_OWNER ->
+        ensureRuntimeForeground(foregroundServiceType)
+      T3VoiceStartCommandDecision.STOP_STALE_START -> stopSelf(startId)
     }
-    state.activePlaybackId?.let {
-      runCatching { player.cancel(it) }
-      T3VoiceStateStore.setPlayback(null)
+  }
+
+  private fun ensureRuntimeForeground(foregroundServiceType: Int) {
+    check(Thread.holdsLock(operationLock)) {
+      "Foreground acquisition must hold the operation lock."
+    }
+    if (!T3VoiceStateStore.state.value.isForeground) {
+      startRuntimeForeground(foregroundServiceType)
+    }
+    check(T3VoiceStateStore.state.value.isForeground) {
+      "Android could not acquire foreground voice ownership."
+    }
+  }
+
+  private fun stopActiveOperationLocked() {
+    val state = T3VoiceStateStore.state.value
+    recordingOwner?.takeIf { it.id == state.activeRecordingId }?.let { owner ->
+      runCatching { recorder.cancel(owner.id) }
+      releaseRecordingLocked(owner, stopForeground = false)
+    }
+    playbackOwner?.takeIf { it.id == state.activePlaybackId }?.let { owner ->
+      runCatching { player.cancel(owner.id) }
+      releasePlaybackLocked(owner, stopForeground = false)
     }
     state.activeRealtimeSessionId?.let {
       val stopped = runCatching { realtime.stop(it) }.getOrDefault(false)
       if (!stopped) T3VoiceStateStore.releaseRealtimeClaim(it)
     }
-    stopRuntimeForeground()
+    stopRuntimeForegroundLocked()
+  }
+
+  private fun requireRecordingOwner(recordingId: String): T3VoiceOperationOwner =
+    checkNotNull(recordingOwner?.takeIf { it.id == recordingId }) {
+      "Recording $recordingId does not own the active recorder."
+    }
+
+  private fun requirePlaybackOwner(playbackId: String): T3VoiceOperationOwner =
+    checkNotNull(playbackOwner?.takeIf { it.id == playbackId }) {
+      "Playback $playbackId does not own the active player."
+    }
+
+  private fun releaseRecordingLocked(
+    owner: T3VoiceOperationOwner,
+    stopForeground: Boolean = true,
+  ) {
+    if (!T3VoiceStateStore.releaseRecording(owner)) return
+    if (recordingOwner == owner) recordingOwner = null
+    if (stopForeground) stopRuntimeForegroundLocked()
+  }
+
+  private fun releasePlaybackLocked(
+    owner: T3VoiceOperationOwner,
+    stopForeground: Boolean = true,
+  ) {
+    if (!T3VoiceStateStore.releasePlayback(owner)) return
+    if (playbackOwner == owner) playbackOwner = null
+    if (stopForeground) stopRuntimeForegroundLocked()
+  }
+
+  private fun stopRuntimeForegroundLocked() {
+    foregroundReleaseCoordinator.releaseWhileLocked()
   }
 
   private fun stopRuntimeForeground() {
@@ -320,25 +456,30 @@ class T3VoiceRuntimeService : Service() {
     private const val ACTION_START_RECORDING = "expo.modules.t3voice.action.START_RECORDING"
     private const val ACTION_START_PLAYBACK = "expo.modules.t3voice.action.START_PLAYBACK"
     private const val ACTION_START_REALTIME = "expo.modules.t3voice.action.START_REALTIME"
+    private const val EXTRA_OPERATION_ID = "operationId"
 
-    fun startForRecording(context: Context) {
-      start(context, ACTION_START_RECORDING)
+    fun startForRecording(context: Context, recordingId: String) {
+      start(context, ACTION_START_RECORDING, recordingId)
     }
 
-    fun startForPlayback(context: Context) {
-      start(context, ACTION_START_PLAYBACK)
+    fun startForPlayback(context: Context, playbackId: String) {
+      start(context, ACTION_START_PLAYBACK, playbackId)
     }
 
-    fun startForRealtime(context: Context) {
-      start(context, ACTION_START_REALTIME)
+    fun startForRealtime(context: Context, nativeSessionId: String) {
+      start(context, ACTION_START_REALTIME, nativeSessionId)
     }
 
     fun requestStop(context: Context) {
-      start(context, ACTION_STOP)
+      start(context, ACTION_STOP, null)
     }
 
-    private fun start(context: Context, action: String) {
-      val intent = Intent(context, T3VoiceRuntimeService::class.java).setAction(action)
+    private fun start(context: Context, action: String, operationId: String?) {
+      val intent =
+        Intent(context, T3VoiceRuntimeService::class.java).apply {
+          this.action = action
+          if (operationId != null) putExtra(EXTRA_OPERATION_ID, operationId)
+        }
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         context.startForegroundService(intent)
       } else {

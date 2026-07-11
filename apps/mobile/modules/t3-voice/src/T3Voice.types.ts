@@ -80,6 +80,13 @@ export interface T3VoiceRuntimeErrorEvent {
   readonly recoverable: boolean;
 }
 
+export interface T3VoiceAudioRouteChangedEvent {
+  readonly nativeSessionId: string;
+  readonly routeId: T3VoiceAudioRoute["id"];
+  readonly routeType: T3VoiceAudioRoute["type"];
+  readonly reason: "selected" | "selected-route-unavailable";
+}
+
 export interface T3VoiceRealtimeTerminatedEvent {
   readonly nativeSessionId: string;
   readonly outcome: "ended" | "failed";
@@ -121,6 +128,10 @@ export interface T3VoiceNativeModule {
     (
       eventName: "runtimeError",
       listener: (event: T3VoiceRuntimeErrorEvent) => void,
+    ): T3VoiceEventSubscription;
+    (
+      eventName: "audioRouteChanged",
+      listener: (event: T3VoiceAudioRouteChangedEvent) => void,
     ): T3VoiceEventSubscription;
     (
       eventName: "realtimeTerminated",

@@ -6,6 +6,73 @@ import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
 import java.io.File
+import java.util.UUID
+
+internal class T3VoiceRecordingCache(
+  cacheRoot: File,
+  private val nowMillis: () -> Long = System::currentTimeMillis,
+  private val maximumAgeMillis: Long = DEFAULT_MAXIMUM_AGE_MILLIS,
+  private val maximumRetainedFiles: Int = DEFAULT_MAXIMUM_RETAINED_FILES,
+) {
+  val directory = File(cacheRoot, DIRECTORY_NAME)
+
+  init {
+    require(maximumAgeMillis > 0) { "Recording cache maximum age must be positive." }
+    require(maximumRetainedFiles >= 0) { "Recording cache file limit must be non-negative." }
+  }
+
+  fun createTempFile(): File {
+    ensureDirectory()
+    repeat(MAXIMUM_CREATE_ATTEMPTS) {
+      val candidate = File(directory, "$FILE_PREFIX${UUID.randomUUID()}$FILE_SUFFIX")
+      if (candidate.createNewFile()) return candidate
+    }
+    error("A unique T3 voice recording cache file could not be created.")
+  }
+
+  fun sweep(): Int {
+    ensureDirectory()
+    val now = nowMillis()
+    val owned =
+      directory.listFiles().orEmpty()
+        .filter(::isOwnedFile)
+        .sortedWith(compareByDescending<File> { it.lastModified() }.thenByDescending(File::getName))
+    var deleted = 0
+    owned.forEachIndexed { index, file ->
+      val ageMillis = (now - file.lastModified()).coerceAtLeast(0)
+      if (ageMillis >= maximumAgeMillis || index >= maximumRetainedFiles) {
+        if (file.delete()) deleted += 1
+      }
+    }
+    return deleted
+  }
+
+  fun owns(file: File): Boolean {
+    val canonicalDirectory = directory.canonicalFile
+    val canonicalFile = file.canonicalFile
+    return canonicalFile.parentFile == canonicalDirectory && isOwnedFile(canonicalFile)
+  }
+
+  private fun ensureDirectory() {
+    check(directory.isDirectory || directory.mkdirs()) {
+      "The T3 voice recording cache directory could not be created."
+    }
+  }
+
+  private fun isOwnedFile(file: File): Boolean =
+    file.isFile && OWNED_FILENAME.matches(file.name)
+
+  companion object {
+    private const val DIRECTORY_NAME = "t3-voice-recordings"
+    private const val FILE_PREFIX = "recording-"
+    private const val FILE_SUFFIX = ".m4a"
+    private const val MAXIMUM_CREATE_ATTEMPTS = 4
+    private const val DEFAULT_MAXIMUM_AGE_MILLIS = 24L * 60L * 60L * 1_000L
+    private const val DEFAULT_MAXIMUM_RETAINED_FILES = 64
+    private val OWNED_FILENAME =
+      Regex("^recording-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.m4a$")
+  }
+}
 
 internal data class T3VoiceRecordingResult(
   val recordingId: String,
@@ -37,11 +104,14 @@ internal class T3VoiceRecorder(private val context: Context) {
 
   private var active: ActiveRecording? = null
   private val completed = mutableMapOf<String, File>()
+  private val recordingCache = T3VoiceRecordingCache(context.cacheDir)
+
+  fun sweepStaleCache(): Int = recordingCache.sweep()
 
   @Synchronized
   fun start(recordingId: String) {
     check(active == null) { "A voice recording is already active." }
-    val outputFile = File.createTempFile(FILE_PREFIX, FILE_SUFFIX, context.cacheDir)
+    val outputFile = recordingCache.createTempFile()
     val recorder = createMediaRecorder()
     try {
       recorder.setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
@@ -108,12 +178,8 @@ internal class T3VoiceRecorder(private val context: Context) {
     val requestedFile = Uri.parse(uri).path?.let(::File) ?: error("Recording URI is invalid.")
     val canonicalOwned = ownedFile.canonicalFile
     val canonicalRequested = requestedFile.canonicalFile
-    val canonicalCacheDirectory = context.cacheDir.canonicalFile
     check(canonicalOwned == canonicalRequested) { "Recording URI does not match $recordingId." }
-    check(canonicalOwned.parentFile == canonicalCacheDirectory) {
-      "Recording file is outside the T3 voice cache directory."
-    }
-    check(canonicalOwned.name.startsWith(FILE_PREFIX) && canonicalOwned.name.endsWith(FILE_SUFFIX)) {
+    check(recordingCache.owns(canonicalOwned)) {
       "Recording file is not a T3 voice cache file."
     }
     check(!canonicalOwned.exists() || canonicalOwned.delete()) { "Recording file could not be deleted." }
@@ -151,7 +217,5 @@ internal class T3VoiceRecorder(private val context: Context) {
   companion object {
     private const val RECORDING_SAMPLE_RATE = 24_000
     private const val RECORDING_BIT_RATE = 64_000
-    private const val FILE_PREFIX = "t3-voice-"
-    private const val FILE_SUFFIX = ".m4a"
   }
 }

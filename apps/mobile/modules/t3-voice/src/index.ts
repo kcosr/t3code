@@ -14,6 +14,7 @@ export type {
   T3VoiceRecordingDeleteInput,
   T3VoiceRecordingResult,
   T3VoiceAudioRoute,
+  T3VoiceAudioRouteChangedEvent,
   T3VoiceRealtimeAnswerInput,
   T3VoiceRealtimeConnectionState,
   T3VoiceRealtimeOffer,

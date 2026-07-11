@@ -23,38 +23,67 @@ class T3VoiceModule : Module() {
   @Volatile private var destroyed = false
   private val binderLock = Any()
   private val mainHandler = Handler(Looper.getMainLooper())
-  private val pendingBinderOperations = mutableListOf<PendingBinderOperation>()
+  private val pendingBinderOperations = T3VoiceBinderOperationRegistry<PendingBinderOperation>()
+  private val bindingRealtimeOwner = T3VoiceBindingRealtimeOwnerPolicy()
   private var stateCollection: Job? = null
   private var eventCollection: Job? = null
   private var realtimeTerminationCollection: Job? = null
+  private var rebindScheduled = false
+  private var rebindAttemptedSinceConnection = false
 
   private class PendingBinderOperation(
     val promise: Promise,
     val errorCode: String,
-    val stopServiceOnFailure: Boolean,
-    val operation: (T3VoiceRuntimeService.VoiceBinder) -> Unit,
+    val operation: (T3VoiceRuntimeService.VoiceBinder, BinderSettlement) -> Unit,
   ) {
-    lateinit var timeout: Runnable
+    lateinit var ticket: T3VoiceBinderOperationRegistry.Ticket
+    var timeout: Runnable? = null
+  }
+
+  private inner class BinderSettlement(
+    private val pending: PendingBinderOperation,
+    private val binderGeneration: Long,
+  ) {
+    fun resolve(value: Any? = null) {
+      if (completePending(pending, binderGeneration)) pending.promise.resolve(value)
+    }
+
+    fun reject(code: String, message: String, cause: Throwable? = null) {
+      if (!completePending(pending, binderGeneration)) return
+      pending.promise.reject(code, message, cause)
+    }
   }
 
   private val serviceConnection =
     object : ServiceConnection {
       override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
         val connectedBinder = service as? T3VoiceRuntimeService.VoiceBinder ?: return
-        val pending =
+        val (bindingGeneration, dispatches) =
           synchronized(binderLock) {
             if (destroyed) return
+            val generation = bindingRealtimeOwner.connected()
             binder = connectedBinder
-            pendingBinderOperations.toList().also { pendingBinderOperations.clear() }
+            bindingRealtimeOwner.observe(
+              generation,
+              connectedBinder.state.value.activeRealtimeSessionId,
+            )
+            rebindScheduled = false
+            rebindAttemptedSinceConnection = false
+            generation to pendingBinderOperations.connected()
           }
-        pending.forEach { operation ->
-          mainHandler.removeCallbacks(operation.timeout)
-          executeBinderOperation(connectedBinder, operation)
+        dispatches.forEach { dispatch ->
+          cancelBinderTimeout(dispatch.value)
+          executeBinderOperation(connectedBinder, dispatch)
         }
         stateCollection?.cancel()
         stateCollection =
           appContext.mainQueue.launch {
             connectedBinder.state.collectLatest { state ->
+              synchronized(binderLock) {
+                if (binder === connectedBinder) {
+                  bindingRealtimeOwner.observe(bindingGeneration, state.activeRealtimeSessionId)
+                }
+              }
               sendEvent(STATE_CHANGED_EVENT, state.toEventBody())
             }
           }
@@ -67,6 +96,8 @@ class T3VoiceModule : Module() {
                   sendEvent(PLAYBACK_CHUNK_CONSUMED_EVENT, event.toEventBody())
                 is T3VoiceRuntimeEvent.RuntimeError ->
                   sendEvent(RUNTIME_ERROR_EVENT, event.toEventBody())
+                is T3VoiceRuntimeEvent.AudioRouteChanged ->
+                  sendEvent(AUDIO_ROUTE_CHANGED_EVENT, event.toEventBody())
                 is T3VoiceRuntimeEvent.RealtimeTerminated ->
                   sendEvent(REALTIME_TERMINATED_EVENT, event.toEventBody())
               }
@@ -82,8 +113,24 @@ class T3VoiceModule : Module() {
       }
 
       override fun onServiceDisconnected(name: ComponentName?) {
-        synchronized(binderLock) { binder = null }
-        cancelCollections()
+        handleBindingLoss(
+          "The T3 voice runtime service disconnected during the operation.",
+          rebind = false,
+        )
+      }
+
+      override fun onBindingDied(name: ComponentName?) {
+        handleBindingLoss(
+          "The T3 voice runtime service binding died during the operation.",
+          rebind = true,
+        )
+      }
+
+      override fun onNullBinding(name: ComponentName?) {
+        handleBindingLoss(
+          "The T3 voice runtime service returned an invalid binding.",
+          rebind = true,
+        )
       }
     }
 
@@ -94,15 +141,20 @@ class T3VoiceModule : Module() {
         STATE_CHANGED_EVENT,
         PLAYBACK_CHUNK_CONSUMED_EVENT,
         RUNTIME_ERROR_EVENT,
+        AUDIO_ROUTE_CHANGED_EVENT,
         REALTIME_TERMINATED_EVENT,
       )
 
       Constants(
-        "nativeRevision" to 3,
+        "nativeRevision" to 4,
       )
 
       OnCreate {
-        destroyed = false
+        synchronized(binderLock) {
+          destroyed = false
+          rebindScheduled = false
+          rebindAttemptedSinceConnection = false
+        }
         val context = appContext.reactContext ?: return@OnCreate
         val intent = Intent(context, T3VoiceRuntimeService::class.java)
         serviceBound = context.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
@@ -112,9 +164,15 @@ class T3VoiceModule : Module() {
         destroyed = true
         cancelCollections()
         val context = appContext.reactContext
-        rejectPendingBinderOperations(context)
+        val pending = synchronized(binderLock) { pendingBinderOperations.destroy() }
+        pending.forEach { entry ->
+          rejectPendingOperation(
+            entry.value,
+            "The T3 voice module was destroyed before the operation completed.",
+          )
+        }
         if (serviceBound && context != null) {
-          context.unbindService(serviceConnection)
+          runCatching { context.unbindService(serviceConnection) }
         }
         synchronized(binderLock) { binder = null }
         serviceBound = false
@@ -169,33 +227,33 @@ class T3VoiceModule : Module() {
       AsyncFunction("startRecordingAsync") { input: Map<String, String>, promise: Promise ->
         val recordingId = requireIdentifier(input, "recordingId")
         val context = requireNotNull(appContext.reactContext) { "React context is unavailable." }
-        T3VoiceRuntimeService.startForRecording(context)
-        withBinder(promise, "recording-start-failed", stopServiceOnFailure = true) { voice ->
+        T3VoiceRuntimeService.startForRecording(context, recordingId)
+        withBinder(promise, "recording-start-failed") { voice, result ->
           voice.startRecording(recordingId)
-          promise.resolve()
+          result.resolve()
         }
       }
 
       AsyncFunction("stopRecordingAsync") { input: Map<String, String>, promise: Promise ->
-        withBinder(promise, "recording-stop-failed") { voice ->
-          promise.resolve(voice.stopRecording(requireIdentifier(input, "recordingId")))
+        withBinder(promise, "recording-stop-failed") { voice, result ->
+          result.resolve(voice.stopRecording(requireIdentifier(input, "recordingId")))
         }
       }
 
       AsyncFunction("cancelRecordingAsync") { input: Map<String, String>, promise: Promise ->
-        withBinder(promise, "recording-cancel-failed") { voice ->
+        withBinder(promise, "recording-cancel-failed") { voice, result ->
           voice.cancelRecording(requireIdentifier(input, "recordingId"))
-          promise.resolve()
+          result.resolve()
         }
       }
 
       AsyncFunction("deleteRecordingAsync") { input: Map<String, String>, promise: Promise ->
-        withBinder(promise, "recording-delete-failed") { voice ->
+        withBinder(promise, "recording-delete-failed") { voice, result ->
           voice.deleteRecording(
             recordingId = requireIdentifier(input, "recordingId"),
             uri = requireIdentifier(input, "uri"),
           )
-          promise.resolve()
+          result.resolve()
         }
       }
 
@@ -204,38 +262,38 @@ class T3VoiceModule : Module() {
         val sampleRate = requireInt(input, "sampleRate")
         val channelCount = requireInt(input, "channelCount")
         val context = requireNotNull(appContext.reactContext) { "React context is unavailable." }
-        T3VoiceRuntimeService.startForPlayback(context)
-        withBinder(promise, "playback-start-failed", stopServiceOnFailure = true) { voice ->
+        T3VoiceRuntimeService.startForPlayback(context, playbackId)
+        withBinder(promise, "playback-start-failed") { voice, result ->
           voice.startPlayback(playbackId, sampleRate, channelCount)
-          promise.resolve()
+          result.resolve()
         }
       }
 
       AsyncFunction("enqueuePlaybackChunkAsync") { input: Map<String, Any>, promise: Promise ->
-        withBinder(promise, "playback-enqueue-failed") { voice ->
+        withBinder(promise, "playback-enqueue-failed") { voice, result ->
           voice.enqueuePlaybackChunk(
             playbackId = requireIdentifier(input, "playbackId"),
             chunkIndex = requireInt(input, "chunkIndex"),
             pcmBase64 = requireIdentifier(input, "pcmBase64"),
           )
-          promise.resolve()
+          result.resolve()
         }
       }
 
       AsyncFunction("finishPlaybackAsync") { input: Map<String, Any>, promise: Promise ->
-        withBinder(promise, "playback-finish-failed") { voice ->
+        withBinder(promise, "playback-finish-failed") { voice, result ->
           voice.finishPlayback(
             playbackId = requireIdentifier(input, "playbackId"),
             finalChunkIndex = requireInt(input, "finalChunkIndex"),
           )
-          promise.resolve()
+          result.resolve()
         }
       }
 
       AsyncFunction("cancelPlaybackAsync") { input: Map<String, String>, promise: Promise ->
-        withBinder(promise, "playback-cancel-failed") { voice ->
+        withBinder(promise, "playback-cancel-failed") { voice, result ->
           voice.cancelPlayback(requireIdentifier(input, "playbackId"))
-          promise.resolve()
+          result.resolve()
         }
       }
 
@@ -243,13 +301,16 @@ class T3VoiceModule : Module() {
         val nativeSessionId = requireIdentifier(input, "nativeSessionId")
         val context = requireNotNull(appContext.reactContext) { "React context is unavailable." }
         try {
-          T3VoiceRuntimeService.startForRealtime(context)
-          withBinder(promise, "realtime-prepare-failed", stopServiceOnFailure = true) { voice ->
+          T3VoiceRuntimeService.startForRealtime(context, nativeSessionId)
+          withBinder(
+            promise,
+            "realtime-prepare-failed",
+          ) { voice, settlement ->
             voice.prepareRealtimeSession(
               nativeSessionId,
               object : T3VoiceWebRtcResultCallback<String> {
                 override fun onSuccess(result: String) {
-                  promise.resolve(
+                  settlement.resolve(
                     mapOf(
                       "nativeSessionId" to nativeSessionId,
                       "sdp" to result,
@@ -262,7 +323,7 @@ class T3VoiceModule : Module() {
                   @Suppress("UNUSED_PARAMETER") message: String,
                   @Suppress("UNUSED_PARAMETER") cause: Throwable?,
                 ) {
-                  promise.reject(code, publicRealtimeFailureMessage(code), null)
+                  settlement.reject(code, publicRealtimeFailureMessage(code))
                 }
               },
             )
@@ -280,13 +341,13 @@ class T3VoiceModule : Module() {
         val nativeSessionId = requireIdentifier(input, "nativeSessionId")
         val sdp = requireIdentifier(input, "sdp")
         try {
-          withBinder(promise, "realtime-answer-rejected") { voice ->
+          withBinder(promise, "realtime-answer-rejected") { voice, settlement ->
             voice.applyRealtimeAnswer(
               nativeSessionId,
               sdp,
               object : T3VoiceWebRtcResultCallback<Unit> {
                 override fun onSuccess(result: Unit) {
-                  promise.resolve()
+                  settlement.resolve()
                 }
 
                 override fun onFailure(
@@ -294,7 +355,7 @@ class T3VoiceModule : Module() {
                   @Suppress("UNUSED_PARAMETER") message: String,
                   @Suppress("UNUSED_PARAMETER") cause: Throwable?,
                 ) {
-                  promise.reject(code, publicRealtimeFailureMessage(code), null)
+                  settlement.reject(code, publicRealtimeFailureMessage(code))
                 }
               },
             )
@@ -309,31 +370,31 @@ class T3VoiceModule : Module() {
       }
 
       AsyncFunction("stopRealtimeSessionAsync") { input: Map<String, String>, promise: Promise ->
-        withBinder(promise, "realtime-stop-failed") { voice ->
-          promise.resolve(voice.stopRealtimeSession(requireIdentifier(input, "nativeSessionId")))
+        withBinder(promise, "realtime-stop-failed") { voice, result ->
+          result.resolve(voice.stopRealtimeSession(requireIdentifier(input, "nativeSessionId")))
         }
       }
 
       AsyncFunction("setRealtimeMutedAsync") { input: Map<String, Any>, promise: Promise ->
         val muted = input["muted"] as? Boolean ?: error("muted must be a boolean.")
-        withBinder(promise, "realtime-mute-failed") { voice ->
+        withBinder(promise, "realtime-mute-failed") { voice, result ->
           voice.setRealtimeMuted(
             nativeSessionId = requireIdentifier(input, "nativeSessionId"),
             muted = muted,
           )
-          promise.resolve()
+          result.resolve()
         }
       }
 
       AsyncFunction("getAudioRoutesAsync") { promise: Promise ->
-        withBinder(promise, "audio-routes-failed") { voice ->
-          promise.resolve(voice.getAudioRoutes())
+        withBinder(promise, "audio-routes-failed") { voice, result ->
+          result.resolve(voice.getAudioRoutes())
         }
       }
 
       AsyncFunction("setAudioRouteAsync") { input: Map<String, String>, promise: Promise ->
-        withBinder(promise, "audio-route-selection-failed") { voice ->
-          promise.resolve(
+        withBinder(promise, "audio-route-selection-failed") { voice, result ->
+          result.resolve(
             voice.setAudioRoute(
               nativeSessionId = requireIdentifier(input, "nativeSessionId"),
               routeId = requireIdentifier(input, "routeId"),
@@ -343,73 +404,164 @@ class T3VoiceModule : Module() {
       }
     }
 
-  private fun withBinder(
-    promise: Promise,
-    errorCode: String,
-    stopServiceOnFailure: Boolean = false,
-    operation: (T3VoiceRuntimeService.VoiceBinder) -> Unit,
-  ) {
-    val pending = PendingBinderOperation(promise, errorCode, stopServiceOnFailure, operation)
-    val connected =
+  private fun handleBindingLoss(message: String, rebind: Boolean) {
+    val (disconnected, realtimeOwner) =
       synchronized(binderLock) {
-        val current = binder
-        if (current == null && !destroyed && serviceBound) {
-          pending.timeout = Runnable { timeoutBinderOperation(pending) }
-          pendingBinderOperations += pending
-          mainHandler.postDelayed(pending.timeout, BINDER_CONNECTION_TIMEOUT_MS)
-        }
-        current
+        val owner = bindingRealtimeOwner.disconnected()
+        binder = null
+        pendingBinderOperations.disconnected() to owner
       }
-    when {
-      connected != null -> executeBinderOperation(connected, pending)
-      destroyed -> promise.reject(errorCode, "The T3 voice module was destroyed.", null)
-      !serviceBound -> promise.reject(errorCode, "The T3 voice runtime service could not be bound.", null)
+    cancelCollections()
+    if (realtimeOwner != null) {
+      sendEvent(
+        REALTIME_TERMINATED_EVENT,
+        T3VoiceRuntimeEvent.RealtimeTerminated(
+          nativeSessionId = realtimeOwner.sessionId,
+          outcome = "failed",
+          code = "realtime-service-disconnected",
+          retryable = true,
+        ).toEventBody(),
+      )
+    }
+    disconnected.forEach { entry -> rejectPendingOperation(entry.value, message) }
+    if (rebind) scheduleServiceRebind()
+  }
+
+  private fun scheduleServiceRebind() {
+    val shouldSchedule =
+      synchronized(binderLock) {
+        if (destroyed || rebindScheduled) {
+          false
+        } else {
+          rebindScheduled = true
+          true
+        }
+      }
+    if (!shouldSchedule) return
+
+    mainHandler.post {
+      val context = appContext.reactContext
+      val shouldRebind =
+        synchronized(binderLock) {
+          if (!rebindScheduled) return@post
+          rebindScheduled = false
+          if (destroyed || context == null) {
+            false
+          } else if (rebindAttemptedSinceConnection) {
+            false
+          } else {
+            rebindAttemptedSinceConnection = true
+            true
+          }
+        }
+      if (serviceBound && context != null) {
+        runCatching { context.unbindService(serviceConnection) }
+        serviceBound = false
+      }
+      if (!shouldRebind || context == null) return@post
+
+      synchronized(binderLock) {
+        if (destroyed) return@post
+        serviceBound =
+          runCatching {
+            context.bindService(
+              Intent(context, T3VoiceRuntimeService::class.java),
+              serviceConnection,
+              Context.BIND_AUTO_CREATE,
+            )
+          }.getOrDefault(false)
+      }
     }
   }
 
-  private fun timeoutBinderOperation(pending: PendingBinderOperation) {
-    val removed = synchronized(binderLock) { pendingBinderOperations.remove(pending) }
-    if (!removed) return
-    if (pending.stopServiceOnFailure) {
-      appContext.reactContext?.let(T3VoiceRuntimeService::requestStop)
+  private fun withBinder(
+    promise: Promise,
+    errorCode: String,
+    operation: (T3VoiceRuntimeService.VoiceBinder, BinderSettlement) -> Unit,
+  ) {
+    val pending = PendingBinderOperation(promise, errorCode, operation)
+    var dispatch: T3VoiceBinderOperationRegistry.Dispatch<PendingBinderOperation>? = null
+    var connectedBinder: T3VoiceRuntimeService.VoiceBinder? = null
+    var unavailableMessage: String? = null
+    synchronized(binderLock) {
+      when {
+        destroyed -> unavailableMessage = "The T3 voice module was destroyed."
+        !serviceBound ->
+          unavailableMessage = "The T3 voice runtime service could not be bound."
+        else -> {
+          val registration = pendingBinderOperations.register(pending)
+          pending.ticket = registration.first
+          dispatch = registration.second
+          connectedBinder = binder
+          if (dispatch == null) {
+            val timeout = Runnable { timeoutBinderOperation(pending.ticket) }
+            pending.timeout = timeout
+            mainHandler.postDelayed(timeout, BINDER_CONNECTION_TIMEOUT_MS)
+          }
+        }
+      }
     }
-    pending.promise.reject(
-      pending.errorCode,
+    when {
+      unavailableMessage != null -> promise.reject(errorCode, unavailableMessage, null)
+      dispatch != null && connectedBinder != null ->
+        executeBinderOperation(requireNotNull(connectedBinder), requireNotNull(dispatch))
+      dispatch != null -> {
+        val failed =
+          synchronized(binderLock) {
+            pendingBinderOperations.complete(
+              pending.ticket,
+              requireNotNull(dispatch).binderGeneration,
+            )
+          }
+        if (failed != null) {
+          rejectPendingOperation(failed.value, "The T3 voice runtime service disconnected.")
+        }
+      }
+    }
+  }
+
+  private fun timeoutBinderOperation(ticket: T3VoiceBinderOperationRegistry.Ticket) {
+    val timedOut = synchronized(binderLock) { pendingBinderOperations.timeout(ticket) } ?: return
+    rejectPendingOperation(
+      timedOut.value,
       "The T3 voice runtime service did not connect in time.",
-      null,
     )
   }
 
   private fun executeBinderOperation(
     connectedBinder: T3VoiceRuntimeService.VoiceBinder,
-    pending: PendingBinderOperation,
+    dispatch: T3VoiceBinderOperationRegistry.Dispatch<PendingBinderOperation>,
   ) {
+    val pending = dispatch.value
+    val settlement = BinderSettlement(pending, dispatch.binderGeneration)
     try {
-      pending.operation(connectedBinder)
+      pending.operation(connectedBinder, settlement)
     } catch (cause: Throwable) {
-      if (pending.stopServiceOnFailure) {
-        appContext.reactContext?.let(T3VoiceRuntimeService::requestStop)
-      }
-      pending.promise.reject(pending.errorCode, cause.message, cause)
+      settlement.reject(pending.errorCode, cause.message ?: "The voice operation failed.", cause)
     }
   }
 
-  private fun rejectPendingBinderOperations(context: Context?) {
-    val pending =
-      synchronized(binderLock) {
-        pendingBinderOperations.toList().also { pendingBinderOperations.clear() }
-      }
-    pending.forEach { operation ->
-      mainHandler.removeCallbacks(operation.timeout)
-      if (operation.stopServiceOnFailure && context != null) {
-        T3VoiceRuntimeService.requestStop(context)
-      }
-      operation.promise.reject(
-        operation.errorCode,
-        "The T3 voice module was destroyed before the service connected.",
-        null,
-      )
+  private fun completePending(
+    pending: PendingBinderOperation,
+    binderGeneration: Long,
+  ): Boolean =
+    synchronized(binderLock) {
+      pendingBinderOperations.complete(pending.ticket, binderGeneration) != null
+    }.also { completed ->
+      if (completed) cancelBinderTimeout(pending)
     }
+
+  private fun rejectPendingOperation(
+    pending: PendingBinderOperation,
+    message: String,
+  ) {
+    cancelBinderTimeout(pending)
+    pending.promise.reject(pending.errorCode, message, null)
+  }
+
+  private fun cancelBinderTimeout(pending: PendingBinderOperation) {
+    pending.timeout?.let(mainHandler::removeCallbacks)
+    pending.timeout = null
   }
 
   private fun requireIdentifier(input: Map<String, *>, key: String): String {
@@ -445,6 +597,7 @@ class T3VoiceModule : Module() {
     private const val STATE_CHANGED_EVENT = "stateChanged"
     private const val PLAYBACK_CHUNK_CONSUMED_EVENT = "playbackChunkConsumed"
     private const val RUNTIME_ERROR_EVENT = "runtimeError"
+    private const val AUDIO_ROUTE_CHANGED_EVENT = "audioRouteChanged"
     private const val REALTIME_TERMINATED_EVENT = "realtimeTerminated"
     private const val BINDER_CONNECTION_TIMEOUT_MS = 5_000L
   }

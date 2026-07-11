@@ -323,7 +323,30 @@ export function MasterVoiceProvider(props: {
           if (next.phase !== "active") setAudioRoutePicker(null);
         },
         onSessionEvents: handleSessionEvents,
+        onAudioRouteChanged: (event) => {
+          if (event.reason !== "selected-route-unavailable") return;
+          savePreferences({ voiceAudioRouteId: event.routeId });
+          void controller
+            .getAudioRoutes()
+            .then((routes) => {
+              if (disposed) return;
+              setAudioRoutePicker((current) =>
+                current === null ? null : { routes, selectingRouteId: null, error: null },
+              );
+            })
+            .catch(() => undefined);
+        },
       });
+      try {
+        await controller.reconcileNativeRuntime();
+      } catch (cause) {
+        await controller.dispose();
+        throw cause;
+      }
+      if (disposed) {
+        await controller.dispose();
+        return;
+      }
       const runtime = {
         environmentId: controllerEnvironmentId,
         client,
@@ -343,7 +366,13 @@ export function MasterVoiceProvider(props: {
       runtimeRef.current = null;
       void runtime.controller.dispose();
     };
-  }, [controllerEnvironmentId, conversationConnection, handleSessionEvents, native]);
+  }, [
+    controllerEnvironmentId,
+    conversationConnection,
+    handleSessionEvents,
+    native,
+    savePreferences,
+  ]);
 
   useEffect(() => {
     const current = attachmentRef.current;

@@ -51,6 +51,20 @@ const SESSION_DURATION_SECONDS = 55 * 60;
 const MAX_BUFFERED_EVENTS = 512;
 const MAX_RETAINED_TERMINAL_SESSIONS = 128;
 const CLIENT_ACTION_TIMEOUT_MILLIS = 10_000;
+const CLIENT_HEARTBEAT_EXPIRY_BY_PHASE = {
+  creating: true,
+  signaling: true,
+  connecting: true,
+  idle: false,
+  listening: false,
+  thinking: false,
+  speaking: false,
+  confirming: false,
+  reconnecting: false,
+  ending: false,
+  ended: false,
+  error: false,
+} satisfies Record<VoiceSessionPhase, boolean>;
 const INSTRUCTIONS = [
   "You are the T3 voice agent. Be concise, state what you are about to do before using a tool, and use only the supplied T3 tools.",
   "Prior conversation items are the user's actual history from this same ongoing conversation: use them as memory, preserve continuity across calls and devices, and never claim that you cannot remember information present in that history.",
@@ -817,6 +831,11 @@ const make = Effect.gen(function* () {
         acquired.replacedSessionId.value,
       );
       if (displaced !== undefined) {
+        yield* mutateSession(displaced.lease.sessionId, (current) => [
+          undefined,
+          { ...current, terminating: true },
+        ]);
+        yield* Deferred.succeed(displaced.terminationSignal, undefined).pipe(Effect.ignore);
         yield* emit(displaced.lease, {
           type: "lease-fenced",
           replacementGeneration: acquired.lease.generation,
@@ -914,6 +933,7 @@ const make = Effect.gen(function* () {
           return;
         const now = yield* Clock.currentTimeMillis;
         const heartbeatExpired =
+          CLIENT_HEARTBEAT_EXPIRY_BY_PHASE[current.state.phase] &&
           now - current.lastHeartbeatAt >= HEARTBEAT_INTERVAL_SECONDS * 3 * 1_000;
         const durationExpired = now >= Date.parse(current.expiresAt);
         if (!heartbeatExpired && !durationExpired) continue;
@@ -957,11 +977,17 @@ const make = Effect.gen(function* () {
   const get: VoiceSessionServiceShape["get"] = (owner, sessionId) =>
     requireOwned(owner, sessionId).pipe(Effect.map((session) => session.state));
 
-  const heartbeat: VoiceSessionServiceShape["heartbeat"] = Effect.fn(
-    "VoiceSessionService.heartbeat",
+  const heartbeatUnlocked: VoiceSessionServiceShape["heartbeat"] = Effect.fn(
+    "VoiceSessionService.heartbeatUnlocked",
   )(function* (owner, sessionId, generation) {
     const session = yield* requireOwned(owner, sessionId, generation);
-    if (session.state.phase === "ended" || session.state.phase === "error") {
+    if (
+      session.terminating ||
+      session.terminalAt !== undefined ||
+      session.state.phase === "ending" ||
+      session.state.phase === "ended" ||
+      session.state.phase === "error"
+    ) {
       return yield* sessionError(
         "invalid-phase",
         "session.heartbeat",
@@ -969,12 +995,45 @@ const make = Effect.gen(function* () {
       );
     }
     const heartbeatAt = yield* Clock.currentTimeMillis;
-    const updated = yield* mutateSession(sessionId, (current) => {
-      const next = { ...current, lastHeartbeatAt: heartbeatAt };
-      return [next.state, next] as const;
-    });
-    return Option.getOrThrow(updated);
+    const updated = yield* SynchronizedRef.modifyEffect(runtime, (state) =>
+      Effect.gen(function* () {
+        const current = state.sessions.get(sessionId);
+        if (
+          current === undefined ||
+          current.lease.ownerAuthSessionId !== owner ||
+          current.lease.generation !== generation ||
+          !(yield* registry.isCurrent(current.lease))
+        ) {
+          return yield* sessionError(
+            "lease-conflict",
+            "session.heartbeat",
+            "Voice session lease changed during heartbeat",
+          );
+        }
+        if (
+          current.terminating ||
+          current.terminalAt !== undefined ||
+          current.state.phase === "ending" ||
+          current.state.phase === "ended" ||
+          current.state.phase === "error"
+        ) {
+          return yield* sessionError(
+            "invalid-phase",
+            "session.heartbeat",
+            "Voice session is no longer active",
+          );
+        }
+        const next = { ...current, lastHeartbeatAt: heartbeatAt };
+        const sessions = new Map(state.sessions);
+        sessions.set(sessionId, next);
+        return [next.state, { ...state, sessions }] as const;
+      }),
+    );
+    return updated;
   });
+
+  const heartbeat: VoiceSessionServiceShape["heartbeat"] = (owner, sessionId, generation) =>
+    heartbeatUnlocked(owner, sessionId, generation);
 
   const updateFocusUnlocked: VoiceSessionServiceShape["updateFocus"] = Effect.fn(
     "VoiceSessionService.updateFocusUnlocked",
@@ -1165,6 +1224,7 @@ const make = Effect.gen(function* () {
         );
       }
       if (!(yield* registry.isCurrent(session.lease))) {
+        yield* providerSession.terminate.pipe(Effect.ignore);
         return yield* sessionError(
           "lease-conflict",
           "session.offer",
