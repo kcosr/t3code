@@ -1,5 +1,6 @@
 import type {
   AuthEnvironmentScope,
+  AuthSessionId,
   VoiceConfirmationDecision,
   VoiceConfirmationId,
   VoiceConversationId,
@@ -13,6 +14,7 @@ import type * as Effect from "effect/Effect";
 import type { VoiceError } from "../Errors.ts";
 
 export interface VoiceToolCallInput {
+  readonly authSessionId: AuthSessionId;
   readonly sessionId: VoiceSessionId;
   readonly conversationId: VoiceConversationId;
   readonly contextEpoch: number;
@@ -49,6 +51,7 @@ export type VoiceToolInvokeResult = VoiceToolCompletedResult | VoiceToolConfirma
 export interface VoiceToolExecutorShape {
   readonly invoke: (input: VoiceToolCallInput) => Effect.Effect<VoiceToolInvokeResult, VoiceError>;
   readonly decide: (input: {
+    readonly authSessionId: AuthSessionId;
     readonly sessionId: VoiceSessionId;
     readonly confirmationId: VoiceConfirmationId;
     readonly decision: VoiceConfirmationDecision;

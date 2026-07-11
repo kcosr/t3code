@@ -1,6 +1,7 @@
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
+import { HistoryRuntimeLive } from "../history/runtimeLayer.ts";
 import { VoiceCredentialStoreLive } from "./Layers/VoiceCredentialStore.ts";
 import { VoiceConversationServiceLive } from "./Layers/VoiceConversationService.ts";
 import { VoiceConversationRepositoryLive } from "../persistence/Layers/VoiceConversations.ts";
@@ -69,6 +70,7 @@ const VoiceToolExecutorConfiguredLive = VoiceToolExecutorLive.pipe(
       ProjectionThreadMessageRepositoryLive,
       ProjectionTurnRepositoryLive,
       ProjectionTurnStartRepositoryLive.pipe(Layer.provide(ProjectionTurnRepositoryLive)),
+      HistoryRuntimeLive,
     ),
   ),
 );
@@ -79,6 +81,7 @@ const VoiceToolInfrastructureLive = Layer.mergeAll(
   ProjectionThreadMessageRepositoryLive,
   ProjectionTurnRepositoryLive,
   ProjectionTurnStartRepositoryLive.pipe(Layer.provide(ProjectionTurnRepositoryLive)),
+  HistoryRuntimeLive,
   VoiceToolExecutorConfiguredLive,
 );
 

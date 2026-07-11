@@ -2,6 +2,7 @@ import {
   EnvironmentHttpApi,
   EnvironmentHttpCommonError,
   type EnvironmentAuthInvalidError,
+  type EnvironmentHistoryRequestError,
   type EnvironmentInternalError,
   type EnvironmentOperationForbiddenError,
   type EnvironmentRequestInvalidError,
@@ -68,6 +69,7 @@ export class RemoteEnvironmentAuthTimeoutError extends Data.TaggedError(
 
 export type RemoteEnvironmentRequestError =
   | EnvironmentRequestInvalidError
+  | EnvironmentHistoryRequestError
   | EnvironmentAuthInvalidError
   | EnvironmentScopeRequiredError
   | EnvironmentOperationForbiddenError

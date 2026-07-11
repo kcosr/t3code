@@ -365,11 +365,15 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
         },
       },
     });
-    expect(
-      (sessionConfig as { readonly tools: ReadonlyArray<{ readonly name: string }> }).tools.map(
-        (tool) => tool.name,
-      ),
-    ).toEqual([
+    const configuredTools = (
+      sessionConfig as {
+        readonly tools: ReadonlyArray<{
+          readonly name: string;
+          readonly parameters: Record<string, unknown>;
+        }>;
+      }
+    ).tools;
+    expect(configuredTools.map((tool) => tool.name)).toEqual([
       "list_projects",
       "list_threads",
       "get_thread_status",
@@ -377,9 +381,37 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       "archive_thread",
       "get_thread_messages",
       "wait_for_thread_turn",
+      "search_history",
+      "read_history",
       "create_thread",
       "send_thread_message",
     ]);
+    expect(
+      configuredTools.find((tool) => tool.name === "search_history")?.parameters,
+    ).toMatchObject({
+      required: ["query", "sources", "limit"],
+      additionalProperties: false,
+      properties: {
+        query: { maxLength: 512 },
+        sources: { maxItems: 2, uniqueItems: true },
+        limit: { maximum: 20 },
+      },
+    });
+    expect(configuredTools.find((tool) => tool.name === "read_history")?.parameters).toMatchObject({
+      required: ["ref", "before", "after"],
+      additionalProperties: false,
+      properties: {
+        ref: {
+          oneOf: expect.arrayContaining([
+            expect.objectContaining({
+              required: ["type", "projectId", "threadId", "messageId"],
+            }),
+          ]),
+        },
+        before: { maximum: 10 },
+        after: { maximum: 10 },
+      },
+    });
     expect(socketConnections).toEqual([
       {
         url: "wss://api.openai.com/v1/realtime?call_id=rtc_test",

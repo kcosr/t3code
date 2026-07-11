@@ -331,6 +331,8 @@ export const VoiceToolName = Schema.Literals([
   "get_thread_status",
   "get_thread_messages",
   "wait_for_thread_turn",
+  "search_history",
+  "read_history",
   "create_thread",
   "send_thread_message",
   "interrupt_thread",

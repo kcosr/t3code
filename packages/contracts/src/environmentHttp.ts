@@ -80,6 +80,13 @@ import {
   VoiceWebRtcAnswer,
   VoiceWebRtcOffer,
 } from "./voice.ts";
+import {
+  HistoryReadInput,
+  HistoryReadResult,
+  HistoryRequestInvalidReason,
+  HistorySearchInput,
+  HistorySearchPage,
+} from "./history.ts";
 
 const OptionalBearerHeaders = Schema.Struct({
   authorization: Schema.optionalKey(Schema.String),
@@ -123,6 +130,8 @@ export const EnvironmentInternalErrorReason = Schema.Literals([
   "orchestration_snapshot_failed",
   "orchestration_thread_snapshot_failed",
   "orchestration_dispatch_failed",
+  "history_search_failed",
+  "history_read_failed",
   "internal_error",
 ]);
 export type EnvironmentInternalErrorReason = typeof EnvironmentInternalErrorReason.Type;
@@ -154,6 +163,20 @@ export class EnvironmentVoiceOperationError extends Schema.TaggedErrorClass<Envi
 ) {
   [HttpServerRespondable.symbol]() {
     return HttpServerResponse.schemaJson(EnvironmentVoiceOperationError)(this, { status: 409 });
+  }
+}
+
+export class EnvironmentHistoryRequestError extends Schema.TaggedErrorClass<EnvironmentHistoryRequestError>()(
+  "EnvironmentHistoryRequestError",
+  {
+    code: Schema.Literal("history_request_invalid"),
+    reason: HistoryRequestInvalidReason,
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 400 },
+) {
+  [HttpServerRespondable.symbol]() {
+    return HttpServerResponse.schemaJson(EnvironmentHistoryRequestError)(this, { status: 400 });
   }
 }
 
@@ -216,6 +239,7 @@ export class EnvironmentInternalError extends Schema.TaggedErrorClass<Environmen
 export const EnvironmentResourceNotFoundReason = Schema.Literals([
   "thread_not_found",
   "voice_conversation_not_found",
+  "history_item_not_found",
 ]);
 export type EnvironmentResourceNotFoundReason = typeof EnvironmentResourceNotFoundReason.Type;
 
@@ -235,6 +259,7 @@ export class EnvironmentResourceNotFoundError extends Schema.TaggedErrorClass<En
 
 export const EnvironmentHttpCommonError = Schema.Union([
   EnvironmentRequestInvalidError,
+  EnvironmentHistoryRequestError,
   EnvironmentAuthInvalidError,
   EnvironmentScopeRequiredError,
   EnvironmentOperationForbiddenError,
@@ -551,6 +576,31 @@ export class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestr
     }).middleware(EnvironmentAuthenticatedAuth),
   ) {}
 
+const EnvironmentHistoryOperationErrors = [
+  EnvironmentHistoryRequestError,
+  EnvironmentScopeRequiredError,
+  EnvironmentResourceNotFoundError,
+  EnvironmentInternalError,
+] as const;
+
+export class EnvironmentHistoryHttpApi extends HttpApiGroup.make("history")
+  .add(
+    HttpApiEndpoint.post("search", "/api/history/search", {
+      headers: OptionalBearerHeaders,
+      payload: HistorySearchInput,
+      success: HistorySearchPage,
+      error: EnvironmentHistoryOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("readHistory", "/api/history/read", {
+      headers: OptionalBearerHeaders,
+      payload: HistoryReadInput,
+      success: HistoryReadResult,
+      error: EnvironmentHistoryOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  ) {}
+
 export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
   .add(
     HttpApiEndpoint.post("createSession", "/api/voice/sessions", {
@@ -817,5 +867,6 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentMetadataHttpApi)
   .add(EnvironmentAuthHttpApi)
   .add(EnvironmentOrchestrationHttpApi)
+  .add(EnvironmentHistoryHttpApi)
   .add(EnvironmentVoiceHttpApi)
   .add(EnvironmentConnectHttpApi) {}

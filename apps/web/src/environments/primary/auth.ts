@@ -215,6 +215,7 @@ function readHttpApiStatus(error: unknown): number | null {
 function readEnvironmentHttpErrorStatus(error: EnvironmentHttpCommonErrorType): number {
   switch (error._tag) {
     case "EnvironmentRequestInvalidError":
+    case "EnvironmentHistoryRequestError":
       return 400;
     case "EnvironmentAuthInvalidError":
       return 401;

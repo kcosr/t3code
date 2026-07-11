@@ -1,12 +1,22 @@
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
+  AuthVoiceUseScope,
+  type AuthEnvironmentScope,
   ClientOrchestrationCommand,
   CommandId,
   DEFAULT_MODEL,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
   MessageId,
+  HISTORY_READ_CONTEXT_MAX_RECORDS,
+  HistorySearchInput,
+  HistoryThreadMessageRef,
+  HistoryVoiceEntryRef,
+  HistoryVoiceScope,
+  type HistoryReadInput as HistoryReadInputType,
+  type HistorySearchInput as HistorySearchInputType,
+  type HistoryVoiceScope as HistoryVoiceScopeType,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -31,6 +41,10 @@ import * as Schema from "effect/Schema";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import { ClientCommandDispatcher } from "../../orchestration/Services/ClientCommandDispatcher.ts";
+import {
+  HistorySearchService,
+  type HistorySearchServiceError,
+} from "../../history/Services/HistorySearchService.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import {
   ProjectionThreadMessageCursor,
@@ -56,6 +70,7 @@ const MAX_RETAINED_CALLS = 512;
 const MAX_TOOL_MESSAGE_CHARS = 4_000;
 const MAX_TOOL_PAGE_CHARS = 16_000;
 const MAX_WAIT_MESSAGE_CHARS = 8_000;
+const MAX_HISTORY_TOOL_OUTPUT_BYTES = 32_000;
 const TURN_WAIT_POLL_INTERVAL = "250 millis";
 
 const ListProjectsArguments = Schema.Struct({
@@ -84,6 +99,82 @@ const SendThreadMessageArguments = Schema.Struct({
   threadId: ThreadId,
   message: TrimmedNonEmptyString,
 });
+const CurrentConversationVoiceScope = Schema.Struct({
+  type: Schema.Literal("current-conversation"),
+});
+const VoiceToolHistoryVoiceScope = Schema.Union([CurrentConversationVoiceScope, HistoryVoiceScope]);
+const SearchHistoryArguments = Schema.Struct({
+  ...HistorySearchInput.fields,
+  voiceScope: Schema.optionalKey(VoiceToolHistoryVoiceScope),
+});
+const HistoryContextRadius = Schema.Int.check(
+  Schema.isBetween({ minimum: 0, maximum: HISTORY_READ_CONTEXT_MAX_RECORDS }),
+);
+const ReadHistoryArguments = Schema.Union([
+  Schema.Struct({
+    ref: HistoryThreadMessageRef,
+    before: HistoryContextRadius,
+    after: HistoryContextRadius,
+  }),
+  Schema.Struct({
+    ref: HistoryVoiceEntryRef,
+    voiceScope: VoiceToolHistoryVoiceScope,
+    before: HistoryContextRadius,
+    after: HistoryContextRadius,
+  }),
+]);
+type SearchHistoryArguments = typeof SearchHistoryArguments.Type;
+type ReadHistoryArguments = typeof ReadHistoryArguments.Type;
+
+const resolveHistoryVoiceScope = (
+  scope: typeof VoiceToolHistoryVoiceScope.Type,
+  conversationId: VoiceConversationId,
+): HistoryVoiceScopeType =>
+  scope.type === "current-conversation" ? { type: "conversation", conversationId } : scope;
+
+const resolveSearchHistoryArguments = (
+  args: SearchHistoryArguments,
+  conversationId: VoiceConversationId,
+): HistorySearchInputType => {
+  const { voiceScope: requestedVoiceScope, ...rest } = args;
+  const voiceScope =
+    requestedVoiceScope === undefined
+      ? args.sources.includes("voice-entry")
+        ? ({ type: "conversation", conversationId } as const)
+        : undefined
+      : resolveHistoryVoiceScope(requestedVoiceScope, conversationId);
+  return voiceScope === undefined ? rest : { ...rest, voiceScope };
+};
+
+const resolveReadHistoryArguments = (
+  args: ReadHistoryArguments,
+  conversationId: VoiceConversationId,
+): HistoryReadInputType =>
+  args.ref.type === "thread-message"
+    ? {
+        ref: {
+          type: "thread-message",
+          projectId: args.ref.projectId,
+          threadId: args.ref.threadId,
+          messageId: args.ref.messageId,
+        },
+        before: args.before,
+        after: args.after,
+      }
+    : "voiceScope" in args
+      ? {
+          ref: {
+            type: "voice-entry",
+            conversationId: args.ref.conversationId,
+            entryId: args.ref.entryId,
+          },
+          voiceScope: resolveHistoryVoiceScope(args.voiceScope, conversationId),
+          before: args.before,
+          after: args.after,
+        }
+      : (() => {
+          throw new Error("Voice history arguments require a voice scope");
+        })();
 const decodeVoiceToolName = Schema.decodeUnknownEffect(VoiceToolName);
 const isVoiceToolName = Schema.is(VoiceToolName);
 const decodeThreadMessagesCursor = Schema.decodeUnknownEffect(
@@ -100,23 +191,34 @@ type ReadVoiceTool = Extract<
   | "get_thread_status"
   | "get_thread_messages"
   | "wait_for_thread_turn"
+  | "search_history"
+  | "read_history"
 >;
 type MutationVoiceTool = Exclude<VoiceToolName, ReadVoiceTool>;
+type HistoryVoiceTool = Extract<VoiceToolName, "search_history" | "read_history">;
 
 const VOICE_TOOL_ACCESS = {
-  list_projects: "read",
-  list_threads: "read",
-  get_thread_status: "read",
-  get_thread_messages: "read",
-  wait_for_thread_turn: "read",
-  create_thread: "operate",
-  send_thread_message: "operate",
-  interrupt_thread: "operate",
-  archive_thread: "operate",
-} as const satisfies Record<VoiceToolName, "read" | "operate">;
+  list_projects: "orchestration-read",
+  list_threads: "orchestration-read",
+  get_thread_status: "orchestration-read",
+  get_thread_messages: "orchestration-read",
+  wait_for_thread_turn: "orchestration-read",
+  search_history: "history-read",
+  read_history: "history-read",
+  create_thread: "orchestration-operate",
+  send_thread_message: "orchestration-operate",
+  interrupt_thread: "orchestration-operate",
+  archive_thread: "orchestration-operate",
+} as const satisfies Record<
+  VoiceToolName,
+  "orchestration-read" | "history-read" | "orchestration-operate"
+>;
 
 const isReadTool = (tool: VoiceToolName): tool is ReadVoiceTool =>
-  VOICE_TOOL_ACCESS[tool] === "read";
+  VOICE_TOOL_ACCESS[tool] !== "orchestration-operate";
+
+const isHistoryTool = (tool: VoiceToolName): tool is HistoryVoiceTool =>
+  tool === "search_history" || tool === "read_history";
 
 type PreparedMutation = {
   readonly tool: MutationVoiceTool;
@@ -126,6 +228,7 @@ type PreparedMutation = {
 
 interface PendingCall {
   readonly type: "pending";
+  readonly authSessionId: VoiceToolCallInput["authSessionId"];
   readonly sessionId: VoiceSessionId;
   readonly conversationId: VoiceConversationId;
   readonly contextEpoch: number;
@@ -208,6 +311,26 @@ const boundedText = (text: string, limit: number) => ({
   truncated: text.length > limit,
 });
 
+const historyErrorOutput = (error: HistorySearchServiceError | VoiceError) => {
+  switch (error._tag) {
+    case "HistoryInvalidRequestError":
+      return jsonOutput({ error: { code: error.reason, retryable: false } });
+    case "HistoryItemNotFoundError":
+      return jsonOutput({ error: { code: "item_not_found", retryable: false } });
+    case "HistorySearchUnavailableError":
+      return jsonOutput({ error: { code: "search_unavailable", retryable: true } });
+    case "VoiceError":
+      return jsonOutput({ error: { code: "invalid_arguments", retryable: false } });
+  }
+};
+
+const boundedHistoryOutput = (value: Record<string, unknown>) => {
+  const output = jsonOutput({ contentTrust: "untrusted-history", ...value });
+  return Buffer.byteLength(output, "utf8") <= MAX_HISTORY_TOOL_OUTPUT_BYTES
+    ? output
+    : jsonOutput({ error: { code: "result_too_large", retryable: false } });
+};
+
 const deterministicId = (prefix: string, input: VoiceToolCallInput) =>
   `${prefix}:${input.conversationId}:${input.toolCallId}`;
 
@@ -266,6 +389,7 @@ const make = Effect.gen(function* () {
   const messages = yield* ProjectionThreadMessageRepository;
   const turnStarts = yield* ProjectionTurnStartRepository;
   const dispatcher = yield* ClientCommandDispatcher;
+  const history = yield* HistorySearchService;
   const conversations = yield* VoiceConversationService;
   const toolCalls = yield* VoiceToolCallRepository;
   const state = yield* SynchronizedRef.make<ExecutorState>({
@@ -274,6 +398,29 @@ const make = Effect.gen(function* () {
   });
 
   const nowIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
+
+  const historyPrincipal = (input: VoiceToolCallInput) => ({
+    sessionId: input.authSessionId,
+    scopes: input.grantedScopes,
+  });
+
+  const requiredHistoryScopes = Effect.fn("VoiceToolExecutor.requiredHistoryScopes")(function* (
+    input: VoiceToolCallInput,
+    tool: HistoryVoiceTool,
+  ) {
+    if (tool === "search_history") {
+      const args = yield* parseArguments(SearchHistoryArguments, input);
+      return new Set<AuthEnvironmentScope>(
+        args.sources.map((source) =>
+          source === "thread-message" ? AuthOrchestrationReadScope : AuthVoiceUseScope,
+        ),
+      );
+    }
+    const args = yield* parseArguments(ReadHistoryArguments, input);
+    return new Set<AuthEnvironmentScope>([
+      args.ref.type === "thread-message" ? AuthOrchestrationReadScope : AuthVoiceUseScope,
+    ]);
+  });
 
   const appendJournal = Effect.fn("VoiceToolExecutor.appendJournal")(function* (
     input: VoiceToolCallInput,
@@ -602,6 +749,34 @@ const make = Effect.gen(function* () {
         );
         return jsonOutput(Option.isSome(waited) ? waited.value : lastObserved);
       }
+      case "search_history": {
+        return yield* Effect.gen(function* () {
+          const args = yield* parseArguments(SearchHistoryArguments, input);
+          const result = yield* history.search(
+            historyPrincipal(input),
+            resolveSearchHistoryArguments(args, input.conversationId),
+          );
+          return boundedHistoryOutput(result);
+        }).pipe(Effect.catch((error) => Effect.succeed(historyErrorOutput(error))));
+      }
+      case "read_history": {
+        return yield* Effect.gen(function* () {
+          const args = yield* parseArguments(ReadHistoryArguments, input);
+          const resolved = resolveReadHistoryArguments(args, input.conversationId);
+          if (resolved.ref.type === "voice-entry" && "voiceScope" in resolved) {
+            if (
+              resolved.voiceScope.type === "conversation" &&
+              resolved.voiceScope.conversationId !== resolved.ref.conversationId
+            ) {
+              return jsonOutput({
+                error: { code: "invalid_reference", retryable: false },
+              });
+            }
+          }
+          const result = yield* history.read(historyPrincipal(input), resolved);
+          return boundedHistoryOutput(result);
+        }).pipe(Effect.catch((error) => Effect.succeed(historyErrorOutput(error))));
+      }
     }
   });
 
@@ -677,6 +852,7 @@ const make = Effect.gen(function* () {
 
   const pendingFromDurable = (
     call: DurableVoiceToolCall,
+    authSessionId: VoiceToolCallInput["authSessionId"],
     grantedScopes: VoiceToolCallInput["grantedScopes"],
   ) =>
     Effect.gen(function* () {
@@ -708,6 +884,7 @@ const make = Effect.gen(function* () {
       );
       return {
         type: "pending",
+        authSessionId,
         sessionId: call.sessionId,
         conversationId: call.conversationId,
         contextEpoch: call.contextEpoch,
@@ -764,15 +941,37 @@ const make = Effect.gen(function* () {
       const decodedRequestedTool = yield* decodeVoiceToolName(input.name).pipe(Effect.option);
       if (Option.isSome(decodedRequestedTool)) {
         const requestedTool = decodedRequestedTool.value;
-        const requiredScope = isReadTool(requestedTool)
-          ? AuthOrchestrationReadScope
-          : AuthOrchestrationOperateScope;
-        if (!input.grantedScopes.has(requiredScope)) {
+        const access = VOICE_TOOL_ACCESS[requestedTool];
+        let requiredScopes: ReadonlySet<AuthEnvironmentScope>;
+        if (isHistoryTool(requestedTool)) {
+          const decodedScopes = yield* requiredHistoryScopes(input, requestedTool).pipe(
+            Effect.option,
+          );
+          if (Option.isNone(decodedScopes)) {
+            return completed(
+              input,
+              requestedTool,
+              "failed",
+              jsonOutput({ error: { code: "invalid_arguments", retryable: false } }),
+            );
+          }
+          requiredScopes = decodedScopes.value;
+        } else {
+          requiredScopes = new Set<AuthEnvironmentScope>([
+            access === "orchestration-read"
+              ? AuthOrchestrationReadScope
+              : AuthOrchestrationOperateScope,
+          ]);
+        }
+        const missingScope = [...requiredScopes].find((scope) => !input.grantedScopes.has(scope));
+        if (missingScope !== undefined) {
           return completed(
             input,
             requestedTool,
             "failed",
-            jsonOutput({ error: `Voice tool requires ${requiredScope}` }),
+            access === "history-read"
+              ? jsonOutput({ error: { code: "scope_required", retryable: false } })
+              : jsonOutput({ error: `Voice tool requires ${missingScope}` }),
           );
         }
       }
@@ -909,7 +1108,11 @@ const make = Effect.gen(function* () {
                 ),
               );
             }
-            const pending = yield* pendingFromDurable(claimed.call, input.grantedScopes);
+            const pending = yield* pendingFromDurable(
+              claimed.call,
+              input.authSessionId,
+              input.grantedScopes,
+            );
             yield* appendJournal(input, "pending-confirmation");
             return [
               {
@@ -1003,6 +1206,7 @@ const make = Effect.gen(function* () {
           const expiresAt = DateTime.formatIso(DateTime.makeUnsafe(expiresAtMillis));
           const pending: PendingCall = {
             type: "pending",
+            authSessionId: input.authSessionId,
             sessionId: input.sessionId,
             conversationId: input.conversationId,
             contextEpoch: input.contextEpoch,
@@ -1117,7 +1321,11 @@ const make = Effect.gen(function* () {
               .getByConfirmationId(input.confirmationId)
               .pipe(persistenceFailure("tool.load-confirmation"));
             if (Option.isSome(durable) && durable.value.status === "pending-confirmation") {
-              const hydrated = yield* pendingFromDurable(durable.value, new Set());
+              const hydrated = yield* pendingFromDurable(
+                durable.value,
+                input.authSessionId,
+                new Set(),
+              );
               key = callKey(hydrated.conversationId, hydrated.toolCallId);
               pending = hydrated;
               working = {
@@ -1142,6 +1350,7 @@ const make = Effect.gen(function* () {
             );
           }
           const toolInput: VoiceToolCallInput = {
+            authSessionId: pending.authSessionId,
             sessionId: pending.sessionId,
             conversationId: pending.conversationId,
             contextEpoch: pending.contextEpoch,
@@ -1210,6 +1419,7 @@ const make = Effect.gen(function* () {
           return Effect.succeed([undefined, prune(current, now)] as const);
         }
         const toolInput: VoiceToolCallInput = {
+          authSessionId: pending.authSessionId,
           sessionId: pending.sessionId,
           conversationId: pending.conversationId,
           contextEpoch: pending.contextEpoch,
