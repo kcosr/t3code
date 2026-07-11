@@ -20,6 +20,18 @@ import { __testing } from "./OpenAiVoiceProvider.ts";
 const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
 
+it("keeps Realtime function parameters rooted in an object schema", () => {
+  const config = __testing.providerSessionConfig("test");
+  const readHistory = config.tools.find((tool) => tool.name === "read_history");
+  const parameters = readHistory?.parameters as Record<string, unknown> | undefined;
+
+  expect(parameters).toMatchObject({
+    type: "object",
+    required: ["ref", "before", "after"],
+  });
+  expect(parameters).not.toHaveProperty("anyOf");
+});
+
 it("normalizes stable semantic transcript identities and rejects unidentified finals", () => {
   const parse = (value: unknown) =>
     __testing.parseRealtimeEvent({ type: "message", data: encodeJson(value) });
