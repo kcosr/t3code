@@ -252,7 +252,7 @@ const continuationEvent = (
 
 const continuationIdentity = (sessionId: string, leaseGeneration: number, index: number) => ({
   eventId: `t3_replay_event_${sessionId}_${leaseGeneration}_${index}`,
-  itemId: `t3_replay_item_${sessionId}_${leaseGeneration}_${index}`,
+  itemId: `t3ctx_${leaseGeneration.toString(36)}_${index.toString(36)}`,
 });
 
 const replayError = (
@@ -293,7 +293,7 @@ const parseReplayServerEvent = (
     return Effect.succeed({ type: "ignored" });
   }
   const record = value as Record<string, unknown>;
-  if (record.type === "conversation.item.created") {
+  if (record.type === "conversation.item.done") {
     const item = record.item;
     return Effect.succeed(
       typeof item === "object" &&

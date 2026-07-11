@@ -216,16 +216,32 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
                 type: "message",
                 data: encodeJson({
                   event_id: "server-replay-1",
-                  type: "conversation.item.created",
-                  item: { id: "t3_replay_item_voice-session-1_3_0" },
+                  type: "conversation.item.added",
+                  item: { id: "t3ctx_3_0" },
                 }),
               },
               {
                 type: "message",
                 data: encodeJson({
                   event_id: "server-replay-2",
-                  type: "conversation.item.created",
-                  item: { id: "t3_replay_item_voice-session-1_3_1" },
+                  type: "conversation.item.done",
+                  item: { id: "t3ctx_3_0" },
+                }),
+              },
+              {
+                type: "message",
+                data: encodeJson({
+                  event_id: "server-replay-3",
+                  type: "conversation.item.added",
+                  item: { id: "t3ctx_3_1" },
+                }),
+              },
+              {
+                type: "message",
+                data: encodeJson({
+                  event_id: "server-replay-4",
+                  type: "conversation.item.done",
+                  item: { id: "t3ctx_3_1" },
                 }),
               },
               {
@@ -315,7 +331,7 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
         type: "conversation.item.create",
         event_id: "t3_replay_event_voice-session-1_3_0",
         item: {
-          id: "t3_replay_item_voice-session-1_3_0",
+          id: "t3ctx_3_0",
           type: "message",
           role: "system",
           status: "completed",
@@ -326,7 +342,7 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
         type: "conversation.item.create",
         event_id: "t3_replay_event_voice-session-1_3_1",
         item: {
-          id: "t3_replay_item_voice-session-1_3_1",
+          id: "t3ctx_3_1",
           type: "message",
           role: "assistant",
           status: "completed",
@@ -498,7 +514,7 @@ it.effect("rejects startup and hangs up when OpenAI rejects a replay item", () =
       {
         type: "conversation.item.create",
         event_id: "t3_replay_event_voice-session-rejected_1_0",
-        item: { id: "t3_replay_item_voice-session-rejected_1_0" },
+        item: { id: "t3ctx_1_0" },
       },
     ]);
     expect(requests).toEqual([
@@ -535,8 +551,8 @@ it.effect("rejects startup when the sideband closes before every replay item is 
           {
             type: "message",
             data: encodeJson({
-              type: "conversation.item.created",
-              item: { id: "t3_replay_item_voice-session-incomplete_1_0" },
+              type: "conversation.item.done",
+              item: { id: "t3ctx_1_0" },
             }),
           },
           { type: "closed", code: 1006, reason: "connection lost" },
