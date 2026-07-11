@@ -27,6 +27,8 @@ const decodeSummary = Schema.decodeUnknownExit(SummaryPayload);
 const decodeToolResult = Schema.decodeUnknownExit(ToolResultPayload);
 const decodeContextChange = Schema.decodeUnknownExit(ContextChangePayload);
 
+const UNTRUSTED_HISTORY_TOOLS = new Set(["search_history", "read_history"]);
+
 export const voiceFocusContextItem = (focus: {
   readonly projectId?: string;
   readonly threadId?: string;
@@ -63,7 +65,10 @@ const entryToItem = (entry: VoiceConversationJournalEntry): RealtimeContextItem 
       const decoded = decodeToolResult(entry.payload);
       if (decoded._tag === "Failure") return undefined;
       const payload = decoded.value;
-      const suffix = payload.result === undefined ? "" : `: ${payload.result}`;
+      // History results contain user-authored transcript text. Older journals may still have
+      // captured that text, so never elevate it to a system item during context replay.
+      const safeResult = UNTRUSTED_HISTORY_TOOLS.has(payload.tool) ? undefined : payload.result;
+      const suffix = safeResult === undefined ? "" : `: ${safeResult}`;
       return {
         role: "system",
         text: `T3 tool ${payload.tool} ${payload.outcome}${suffix}`,

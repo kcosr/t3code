@@ -1,6 +1,7 @@
 import {
   AuthOrchestrationReadScope,
   AuthVoiceUseScope,
+  EnvironmentHistoryPrivacyBoundary,
   EnvironmentHistoryRequestError,
   EnvironmentHttpApi,
   type EnvironmentInternalError,
@@ -11,9 +12,11 @@ import {
 } from "@t3tools/contracts";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as HttpEffect from "effect/unstable/http/HttpEffect";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
+import { HttpApiSchemaError } from "effect/unstable/httpapi/HttpApiError";
 
 import {
   currentEnvironmentTraceId,
@@ -36,6 +39,32 @@ const appendPrivateHistoryResponseHeaders = HttpEffect.appendPreResponseHandler(
     ),
 );
 
+export const historyPrivacyBoundaryLayer = Layer.succeed(
+  EnvironmentHistoryPrivacyBoundary,
+  (httpEffect, { endpoint }) =>
+    Effect.gen(function* () {
+      yield* appendPrivateHistoryResponseHeaders;
+      const traceId = yield* currentEnvironmentTraceId;
+      yield* Effect.addFinalizer((exit) =>
+        exit._tag === "Failure"
+          ? Effect.logWarning("history api request failed", {
+              endpoint: endpoint.name,
+              traceId,
+              errorTag: causeErrorTag(exit.cause),
+            })
+          : Effect.void,
+      );
+      yield* Effect.annotateLogsScoped({
+        "history.endpoint": endpoint.name,
+        traceId,
+      });
+      yield* Effect.annotateCurrentSpan({ "history.endpoint": endpoint.name });
+      return yield* httpEffect.pipe(
+        Effect.catchIf(HttpApiSchemaError.is, () => failHistoryInvalid("invalid_filters")),
+      );
+    }),
+);
+
 const annotateHistoryRequest = (input: {
   readonly endpoint: string;
   readonly sources: ReadonlyArray<"thread-message" | "voice-entry">;
@@ -45,16 +74,6 @@ const annotateHistoryRequest = (input: {
   readonly hasCursor: boolean;
 }) =>
   Effect.gen(function* () {
-    const traceId = yield* currentEnvironmentTraceId;
-    yield* Effect.addFinalizer((exit) =>
-      exit._tag === "Failure"
-        ? Effect.logWarning("history api request failed", {
-            endpoint: input.endpoint,
-            traceId,
-            errorTag: causeErrorTag(exit.cause),
-          })
-        : Effect.void,
-    );
     yield* Effect.annotateLogsScoped({
       "history.endpoint": input.endpoint,
       "history.sourceCount": input.sources.length,
@@ -62,7 +81,6 @@ const annotateHistoryRequest = (input: {
       "history.hasThreadFilter": input.hasThreadFilter,
       "history.hasVoiceScope": input.hasVoiceScope,
       "history.hasCursor": input.hasCursor,
-      traceId,
     });
     yield* Effect.annotateCurrentSpan({
       "history.endpoint": input.endpoint,
@@ -138,7 +156,6 @@ export const historyHttpApiLayer = HttpApiBuilder.group(
       .handle(
         "search",
         Effect.fn("environment.history.search")(function* (args) {
-          yield* appendPrivateHistoryResponseHeaders;
           yield* annotateHistoryRequest({
             endpoint: args.endpoint.name,
             sources: args.payload.sources,
@@ -170,13 +187,12 @@ export const historyHttpApiLayer = HttpApiBuilder.group(
       .handle(
         "readHistory",
         Effect.fn("environment.history.read")(function* (args) {
-          yield* appendPrivateHistoryResponseHeaders;
           yield* annotateHistoryRequest({
             endpoint: args.endpoint.name,
             sources: [args.payload.ref.type],
             hasProjectFilter: args.payload.ref.type === "thread-message",
             hasThreadFilter: args.payload.ref.type === "thread-message",
-            hasVoiceScope: args.payload.ref.type === "voice-entry",
+            hasVoiceScope: args.payload.voiceScope !== undefined,
             hasCursor: false,
           });
           const principal = yield* requireReadScope(args.payload);

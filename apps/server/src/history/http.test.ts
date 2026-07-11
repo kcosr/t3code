@@ -9,6 +9,8 @@ import {
   EnvironmentAuthenticatedAuth,
   EnvironmentAuthenticatedPrincipal,
   EnvironmentHistoryHttpApi,
+  VoiceConversationEntryId,
+  VoiceConversationId,
   type AuthEnvironmentScope,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -20,7 +22,7 @@ import * as HttpServer from "effect/unstable/http/HttpServer";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
-import { historyHttpApiLayer } from "./http.ts";
+import { historyHttpApiLayer, historyPrivacyBoundaryLayer } from "./http.ts";
 import { HistorySearchService } from "./Services/HistorySearchService.ts";
 
 class HistoryTestApi extends HttpApi.make("environment").add(EnvironmentHistoryHttpApi) {}
@@ -41,6 +43,7 @@ const runWithServer = <A>(input: {
   const serverLayer = HttpRouter.serve(
     HttpApiBuilder.layer(HistoryTestApi).pipe(
       Layer.provide(historyHttpApiLayer),
+      Layer.provide(historyPrivacyBoundaryLayer),
       Layer.provide(
         Layer.succeed(
           EnvironmentAuthenticatedAuth,
@@ -82,7 +85,7 @@ const runWithServer = <A>(input: {
         throw new Error("Expected a TCP test server address");
       }
       return yield* Effect.promise(() => input.run(`http://127.0.0.1:${address.port}`));
-    }).pipe(Effect.provide(Layer.mergeAll(serverLayer, captureLoggerLayer))),
+    }).pipe(Effect.provide(serverLayer.pipe(Layer.provide(captureLoggerLayer)))),
   );
 };
 
@@ -145,6 +148,85 @@ describe("history HTTP API", () => {
         expect(response.status).toBe(200);
         expect(response.headers.get("cache-control")).toBe("no-store");
         expect(searchCalls).toBe(1);
+      },
+    });
+  });
+
+  it.effect("sanitizes malformed authenticated history payloads", () => {
+    let searchCalls = 0;
+    const capturedLogs: Array<string> = [];
+    const sentinel = "private-malformed-sentinel-81ad";
+    return runWithServer({
+      scopes: ["orchestration:read"],
+      capturedLogs,
+      service: HistorySearchService.of({
+        search: () => {
+          searchCalls += 1;
+          return Effect.succeed({ matches: [], nextCursor: null });
+        },
+        read: () => Effect.die("read should not be called"),
+      }),
+      run: async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/history/search`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            query: sentinel,
+            sources: ["not-a-history-source"],
+            limit: 5,
+          }),
+        });
+        expect(response.status).toBe(400);
+        expect(response.headers.get("cache-control")).toBe("no-store");
+        expect(response.headers.get("pragma")).toBe("no-cache");
+        expect(searchCalls).toBe(0);
+        expect(capturedLogs.join("\n")).not.toContain(sentinel);
+      },
+    });
+  });
+
+  it.effect("annotates voice reads from the explicit voice scope", () => {
+    const capturedLogs: Array<string> = [];
+    return runWithServer({
+      scopes: ["voice:use"],
+      capturedLogs,
+      service: HistorySearchService.of({
+        search: () => Effect.die("search should not be called"),
+        read: () =>
+          Effect.logInfo("history read annotation probe").pipe(
+            Effect.as({
+              target: {
+                ref: {
+                  type: "voice-entry" as const,
+                  conversationId: VoiceConversationId.make("conversation-1"),
+                  entryId: VoiceConversationEntryId.make("entry-1"),
+                },
+                roleOrKind: "user",
+                occurredAt: "2026-07-11T00:00:00.000Z",
+                content: "bounded content",
+                truncated: false,
+              },
+              context: [],
+            }),
+          ),
+      }),
+      run: async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/history/read`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            ref: {
+              type: "voice-entry",
+              conversationId: "conversation-1",
+              entryId: "entry-1",
+            },
+            voiceScope: { type: "conversation", conversationId: "conversation-1" },
+            before: 0,
+            after: 0,
+          }),
+        });
+        expect(response.status).toBe(200);
+        expect(capturedLogs.join("\n")).toContain("history.hasVoiceScope:true");
       },
     });
   });

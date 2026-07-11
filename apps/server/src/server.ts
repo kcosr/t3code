@@ -90,7 +90,7 @@ import {
   persistServerRuntimeState,
 } from "./serverRuntimeState.ts";
 import { orchestrationHttpApiLayer } from "./orchestration/http.ts";
-import { historyHttpApiLayer } from "./history/http.ts";
+import { historyHttpApiLayer, historyPrivacyBoundaryLayer } from "./history/http.ts";
 import { HistoryRuntimeLive } from "./history/runtimeLayer.ts";
 import { voiceControlHttpApiLayer } from "./voice/controlHttp.ts";
 import { voiceMediaRoutesLayer } from "./voice/http.ts";
@@ -364,6 +364,7 @@ const makeRoutesLayerBase = Layer.mergeAll(
       Layer.provide(connectHttpApiLayer),
       Layer.provide(orchestrationHttpApiLayer),
       Layer.provide(historyHttpApiLayer),
+      Layer.provide(historyPrivacyBoundaryLayer),
       Layer.provide(voiceControlHttpApiLayer),
       Layer.provide(serverEnvironmentHttpApiLayer),
       Layer.provide(environmentAuthenticatedAuthLayer),

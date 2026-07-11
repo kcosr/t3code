@@ -49,6 +49,7 @@ const principal = {
 
 const seedThreadHistory = Effect.fn("seedThreadHistory")(function* () {
   const sql = yield* SqlClient.SqlClient;
+  yield* sql`DELETE FROM projection_thread_messages WHERE thread_id = 'thread-service-search'`;
   yield* sql`
     INSERT OR IGNORE INTO projection_projects (
       project_id, title, workspace_root, default_model_selection_json, scripts_json,
@@ -85,6 +86,7 @@ const seedThreadHistory = Effect.fn("seedThreadHistory")(function* () {
 
 const seedVoiceHistory = Effect.fn("seedVoiceHistory")(function* () {
   const sql = yield* SqlClient.SqlClient;
+  yield* sql`DELETE FROM voice_conversation_entries WHERE conversation_id = 'conversation-service-search'`;
   yield* sql`
     INSERT OR IGNORE INTO voice_conversations (
       conversation_id, retention, title, active_epoch, next_entry_sequence,
@@ -241,11 +243,11 @@ layer("HistorySearchService", (it) => {
         cursor = page.nextCursor ?? undefined;
       } while (cursor !== undefined);
 
-      assert.equal(keys.length, 6);
-      assert.equal(new Set(keys).size, 6);
+      assert.equal(keys.length, 5);
+      assert.equal(new Set(keys).size, 5);
       assert.deepStrictEqual(
         keys.map((key) => key.split(":")[0]),
-        ["thread", "voice", "thread", "voice", "thread", "thread"],
+        ["thread", "voice", "thread", "voice", "thread"],
       );
     }),
   );

@@ -409,6 +409,13 @@ export class EnvironmentAuthenticatedAuth extends HttpApiMiddleware.Service<
   error: EnvironmentAuthenticationErrors,
 }) {}
 
+export class EnvironmentHistoryPrivacyBoundary extends HttpApiMiddleware.Service<EnvironmentHistoryPrivacyBoundary>()(
+  "EnvironmentHistoryPrivacyBoundary",
+  {
+    error: EnvironmentHistoryRequestError,
+  },
+) {}
+
 const EnvironmentHttpCloudErrors = [
   EnvironmentHttpBadRequestError,
   EnvironmentHttpUnauthorizedError,
@@ -599,7 +606,8 @@ export class EnvironmentHistoryHttpApi extends HttpApiGroup.make("history")
       success: HistoryReadResult,
       error: EnvironmentHistoryOperationErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
-  ) {}
+  )
+  .middleware(EnvironmentHistoryPrivacyBoundary) {}
 
 export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
   .add(

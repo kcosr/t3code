@@ -217,7 +217,7 @@ const VOICE_TOOL_ACCESS = {
 const isReadTool = (tool: VoiceToolName): tool is ReadVoiceTool =>
   VOICE_TOOL_ACCESS[tool] !== "orchestration-operate";
 
-const isHistoryTool = (tool: VoiceToolName): tool is HistoryVoiceTool =>
+const isHistoryToolName = (tool: string): tool is HistoryVoiceTool =>
   tool === "search_history" || tool === "read_history";
 
 type PreparedMutation = {
@@ -449,10 +449,25 @@ const make = Effect.gen(function* () {
               providerFunctionCallId: input.providerFunctionCallId,
               tool: input.name,
               outcome,
-              ...(result === undefined ? {} : { result }),
+              ...(result === undefined || isHistoryToolName(input.name) ? {} : { result }),
             },
     });
   });
+
+  const durableResultOutput = (
+    input: VoiceToolCallInput,
+    result: VoiceToolCompletedResult,
+  ): string =>
+    isHistoryToolName(input.name)
+      ? jsonOutput({
+          contentTrust: "untrusted-history",
+          result: {
+            persisted: false,
+            tool: input.name,
+            outcome: result.outcome,
+          },
+        })
+      : result.output;
 
   const completed = (
     input: VoiceToolCallInput,
@@ -925,7 +940,7 @@ const make = Effect.gen(function* () {
                     contextEpoch: input.contextEpoch,
                     toolCallId: input.toolCallId,
                     status: result.outcome,
-                    resultOutput: result.output,
+                    resultOutput: durableResultOutput(input, result),
                     updatedAt,
                   })
                   .pipe(persistenceFailure("tool.persist-terminal")),
@@ -943,7 +958,7 @@ const make = Effect.gen(function* () {
         const requestedTool = decodedRequestedTool.value;
         const access = VOICE_TOOL_ACCESS[requestedTool];
         let requiredScopes: ReadonlySet<AuthEnvironmentScope>;
-        if (isHistoryTool(requestedTool)) {
+        if (isHistoryToolName(requestedTool)) {
           const decodedScopes = yield* requiredHistoryScopes(input, requestedTool).pipe(
             Effect.option,
           );
@@ -1186,6 +1201,42 @@ const make = Effect.gen(function* () {
           );
           if ("error" in prepared) {
             const result = completed(input, tool, "failed", jsonOutput({ error: prepared.error }));
+            yield* appendJournal(input, result.outcome, result.output);
+            yield* persistCompleted(input, result, requestedAt);
+            return [
+              result,
+              {
+                ...current,
+                calls: new Map(current.calls).set(key, {
+                  type: "completed",
+                  sessionId: input.sessionId,
+                  result,
+                  completedAtMillis: now,
+                }),
+              },
+            ] as const;
+          }
+          if (tool === "send_thread_message") {
+            const result = yield* dispatcher.dispatch(prepared.value.command).pipe(
+              Effect.match({
+                onFailure: (cause) =>
+                  completed(
+                    input,
+                    tool,
+                    "failed",
+                    jsonOutput({
+                      error: cause instanceof Error ? cause.message : "T3 command dispatch failed",
+                    }),
+                  ),
+                onSuccess: (receipt) =>
+                  completed(
+                    input,
+                    tool,
+                    "succeeded",
+                    mutationOutput(prepared.value.command, receipt.sequence),
+                  ),
+              }),
+            );
             yield* appendJournal(input, result.outcome, result.output);
             yield* persistCompleted(input, result, requestedAt);
             return [

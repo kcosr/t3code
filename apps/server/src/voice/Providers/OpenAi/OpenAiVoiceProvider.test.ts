@@ -61,6 +61,50 @@ it("normalizes stable semantic transcript identities and rejects unidentified fi
   expect(parse({ type: "response.output_audio_transcript.done", transcript: "" })).toEqual([]);
 });
 
+it("reports provider failures without logging provider messages or transcript content", () => {
+  const privateMessage = "context overflow after private transcript content";
+  const providerErrorDiagnostic = __testing.realtimeDiagnostic({
+    type: "message",
+    data: encodeJson({
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        code: "context_length_exceeded",
+        param: "session.truncation",
+        event_id: "event_123",
+        message: privateMessage,
+      },
+    }),
+  });
+  expect(providerErrorDiagnostic).toEqual({
+    message: "OpenAI Realtime provider error",
+    annotations: {
+      providerErrorType: "invalid_request_error",
+      providerErrorCode: "context_length_exceeded",
+      providerErrorParam: "session.truncation",
+      providerEventId: "event_123",
+      providerMessagePresent: true,
+    },
+  });
+  expect(JSON.stringify(providerErrorDiagnostic)).not.toContain(privateMessage);
+  expect(
+    __testing.parseRealtimeEvent({
+      type: "message",
+      data: encodeJson({ type: "error", error: { message: privateMessage } }),
+    }),
+  ).toEqual([{ type: "error", detail: "OpenAI Realtime reported an error", recoverable: false }]);
+  expect(
+    __testing.realtimeDiagnostic({ type: "closed", code: 1009, reason: privateMessage }),
+  ).toEqual({
+    message: "OpenAI Realtime sideband closed",
+    annotations: {
+      closeCode: 1009,
+      closeReason: "provider-supplied",
+      closeReasonLength: privateMessage.length,
+    },
+  });
+});
+
 const credentialStore = (key: Option.Option<string>) =>
   VoiceCredentialStore.of({
     status: Effect.succeed({ configured: Option.isSome(key), updatedAt: null }),
@@ -397,19 +441,34 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
         limit: { maximum: 20 },
       },
     });
-    expect(configuredTools.find((tool) => tool.name === "read_history")?.parameters).toMatchObject({
+    const readHistoryParameters = configuredTools.find((tool) => tool.name === "read_history")
+      ?.parameters as {
+      readonly anyOf: ReadonlyArray<{
+        readonly required: ReadonlyArray<string>;
+        readonly additionalProperties: boolean;
+        readonly properties: Record<string, unknown>;
+      }>;
+    };
+    expect(readHistoryParameters.anyOf).toHaveLength(2);
+    expect(readHistoryParameters.anyOf[0]).toMatchObject({
       required: ["ref", "before", "after"],
       additionalProperties: false,
       properties: {
-        ref: {
-          oneOf: expect.arrayContaining([
-            expect.objectContaining({
-              required: ["type", "projectId", "threadId", "messageId"],
-            }),
-          ]),
-        },
+        ref: { required: ["type", "projectId", "threadId", "messageId"] },
         before: { maximum: 10 },
         after: { maximum: 10 },
+      },
+    });
+    expect(readHistoryParameters.anyOf[1]).toMatchObject({
+      required: ["ref", "voiceScope", "before", "after"],
+      additionalProperties: false,
+      properties: {
+        ref: { required: ["type", "conversationId", "entryId"] },
+        voiceScope: {
+          oneOf: expect.arrayContaining([
+            expect.objectContaining({ required: ["type", "conversationId"] }),
+          ]),
+        },
       },
     });
     expect(socketConnections).toEqual([
@@ -490,6 +549,99 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       },
     ]);
     expect(closed).toBe(1);
+  }),
+);
+
+it.effect("coalesces parallel tool outputs into one continuation in either completion order", () =>
+  Effect.gen(function* () {
+    for (const completionOrder of [
+      ["call_tools_1", "call_tools_2"],
+      ["call_tools_2", "call_tools_1"],
+    ] as const) {
+      const sent: Array<string> = [];
+      const httpClient = HttpClient.make((request) =>
+        Effect.succeed(
+          HttpClientResponse.fromWeb(
+            request,
+            request.url.endsWith("/hangup")
+              ? new Response(null, { status: 200 })
+              : new Response("answer-sdp", {
+                  status: 201,
+                  headers: { location: "/v1/realtime/calls/rtc_parallel_tools" },
+                }),
+          ),
+        ),
+      );
+      const provider = yield* __testing.make.pipe(
+        Effect.provideService(HttpClient.HttpClient, httpClient),
+        Effect.provideService(VoiceCredentialStore, credentialStore(Option.some("sk-test"))),
+        Effect.provideService(
+          OpenAiRealtimeSocket,
+          realtimeSocket(
+            [
+              {
+                type: "message",
+                data: encodeJson({
+                  type: "response.done",
+                  response: {
+                    output: [
+                      {
+                        type: "function_call",
+                        status: "completed",
+                        call_id: "call_tools_1",
+                        name: "search_history",
+                        arguments: "{}",
+                      },
+                      {
+                        type: "function_call",
+                        status: "completed",
+                        call_id: "call_tools_2",
+                        name: "wait_for_thread_turn",
+                        arguments: "{}",
+                      },
+                    ],
+                  },
+                }),
+              },
+              { type: "closed", code: 1000, reason: "done" },
+            ],
+            sent,
+          ),
+        ),
+      );
+      const session = yield* provider.realtime!.negotiate({
+        sessionId: "voice-session-parallel-tools" as never,
+        leaseGeneration: 1,
+        offer: {
+          sessionId: "voice-session-parallel-tools" as never,
+          leaseGeneration: 1,
+          sdp: "offer-sdp",
+        },
+        instructions: "test",
+        continuationContext: [],
+      });
+      yield* session.events.pipe(Stream.runDrain);
+
+      for (const providerFunctionCallId of completionOrder) {
+        yield* session.submitToolOutput({
+          providerFunctionCallId,
+          output: `{"callId":"${providerFunctionCallId}"}`,
+        });
+      }
+
+      expect(sent.map((message) => decodeJson(message))).toEqual([
+        ...completionOrder.map((providerFunctionCallId) => ({
+          type: "conversation.item.create",
+          item: {
+            type: "function_call_output",
+            call_id: providerFunctionCallId,
+            output: `{"callId":"${providerFunctionCallId}"}`,
+          },
+        })),
+        { type: "response.create" },
+      ]);
+      yield* session.terminate;
+    }
   }),
 );
 
