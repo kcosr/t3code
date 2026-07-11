@@ -134,6 +134,7 @@ interface RuntimeSession {
   readonly expiresAt: string;
   readonly idempotencyId: string;
   readonly lastHeartbeatAt: number;
+  readonly providerActivityObserved: boolean;
   readonly pendingConfirmations: ReadonlySet<VoiceConfirmationId>;
   readonly clientActions: ReadonlyMap<VoiceClientActionId, RuntimeClientAction>;
   readonly grantedScopes: ReadonlySet<AuthEnvironmentScope>;
@@ -589,6 +590,12 @@ const make = Effect.gen(function* () {
     event: RealtimeProviderEvent,
   ) {
     if (!(yield* registry.isCurrent(lease))) return;
+    if (event.type !== "activity" || event.activity !== "idle") {
+      yield* mutateSession(lease.sessionId, (current) => [
+        undefined,
+        { ...current, providerActivityObserved: true },
+      ]);
+    }
     const grantedScopes = (yield* SynchronizedRef.get(runtime)).sessions.get(
       lease.sessionId,
     )?.grantedScopes;
@@ -907,6 +914,7 @@ const make = Effect.gen(function* () {
         expiresAt,
         idempotencyId,
         lastHeartbeatAt: createdAtMillis,
+        providerActivityObserved: false,
         pendingConfirmations: new Set(),
         clientActions: new Map(),
         grantedScopes: new Set(principal.scopes),
@@ -933,7 +941,8 @@ const make = Effect.gen(function* () {
           return;
         const now = yield* Clock.currentTimeMillis;
         const heartbeatExpired =
-          CLIENT_HEARTBEAT_EXPIRY_BY_PHASE[current.state.phase] &&
+          (CLIENT_HEARTBEAT_EXPIRY_BY_PHASE[current.state.phase] ||
+            !current.providerActivityObserved) &&
           now - current.lastHeartbeatAt >= HEARTBEAT_INTERVAL_SECONDS * 3 * 1_000;
         const durationExpired = now >= Date.parse(current.expiresAt);
         if (!heartbeatExpired && !durationExpired) continue;
@@ -1144,155 +1153,161 @@ const make = Effect.gen(function* () {
   const close: VoiceSessionServiceShape["close"] = (owner, sessionId, generation) =>
     lifecycleMutex.withPermits(1)(closeUnlocked(owner, sessionId, generation));
 
-  const offer: VoiceSessionServiceShape["offer"] = Effect.fn("VoiceSessionService.offer")(
-    function* (owner, sessionId, offer) {
-      if (offer.sessionId !== sessionId) {
-        return yield* sessionError(
-          "lease-conflict",
-          "session.offer",
-          "SDP offer session ID does not match the route",
-        );
-      }
-      const session = yield* requireOwned(owner, sessionId, offer.leaseGeneration);
-      if (session.state.phase !== "signaling") {
-        return yield* sessionError(
-          "invalid-phase",
-          "session.offer",
-          "Voice session is not awaiting an SDP offer",
-        );
-      }
-      const capability: VoiceCapability =
-        session.input.mode === "realtime-agent" ? "agent.realtime" : "transcription.realtime";
-      const adapter = yield* providers.resolve(capability);
-      if (adapter.realtime === undefined) {
-        return yield* sessionError(
-          "provider-unavailable",
-          "session.offer",
-          "Configured provider has no realtime implementation",
-          true,
-        );
-      }
-      yield* setPhase(session.lease, "connecting");
-      const entries = yield* conversations.listContext(
-        session.lease.conversationId,
-        session.lease.contextEpoch,
+  const offerUnlocked: VoiceSessionServiceShape["offer"] = Effect.fn(
+    "VoiceSessionService.offerUnlocked",
+  )(function* (owner, sessionId, offer) {
+    if (offer.sessionId !== sessionId) {
+      return yield* sessionError(
+        "lease-conflict",
+        "session.offer",
+        "SDP offer session ID does not match the route",
       );
-      const contextTokenBudget = yield* settingsService.getSettings.pipe(
-        Effect.map((settings) => settings.voice.contextTokenBudget),
-        Effect.mapError(
-          (cause) =>
-            new VoiceError({
-              reason: "provider-unavailable",
-              operation: "session.offer.settings",
-              detail: "Voice settings are unavailable",
-              retryable: true,
-              cause,
-            }),
-        ),
+    }
+    const session = yield* requireOwned(owner, sessionId, offer.leaseGeneration);
+    if (session.state.phase !== "signaling") {
+      return yield* sessionError(
+        "invalid-phase",
+        "session.offer",
+        "Voice session is not awaiting an SDP offer",
       );
-      const context = yield* compiler.compile({
-        entries,
-        tokenBudget: contextTokenBudget,
-      });
-      const initialFocus: VoiceSessionFocus = {
-        ...(session.input.projectId === undefined ? {} : { projectId: session.input.projectId }),
-        ...(session.input.threadId === undefined ? {} : { threadId: session.input.threadId }),
-      };
-      const initialFocusItem = voiceFocusContextItem(initialFocus);
-      const providerSession = yield* adapter.realtime
-        .negotiate({
-          sessionId,
-          leaseGeneration: session.lease.generation,
-          offer,
-          instructions: INSTRUCTIONS,
-          continuationContext:
-            initialFocusItem === undefined ? context.items : [...context.items, initialFocusItem],
-        })
-        .pipe(Effect.tapError(() => endRuntimeSession(session, "error")));
-      const providerAttached = yield* mutateSession(sessionId, (current) => {
-        if (current.terminating || current.terminalAt !== undefined) {
-          return [false, current] as const;
-        }
-        return [true, { ...current, providerSession }] as const;
-      });
-      if (Option.isNone(providerAttached) || !providerAttached.value) {
-        yield* providerSession.terminate.pipe(Effect.ignore);
-        return yield* sessionError(
-          "lease-conflict",
-          "session.offer",
-          "Voice session was replaced during signaling",
-        );
-      }
-      if (!(yield* registry.isCurrent(session.lease))) {
-        yield* providerSession.terminate.pipe(Effect.ignore);
-        return yield* sessionError(
-          "lease-conflict",
-          "session.offer",
-          "Voice session was replaced during signaling",
-        );
-      }
-      if (initialFocusItem !== undefined) {
-        yield* conversations
-          .appendContext({
-            conversationId: session.lease.conversationId,
-            expectedEpoch: session.lease.contextEpoch,
-            kind: "context-change",
-            payload: initialFocus,
-          })
-          .pipe(
-            Effect.tapError(() =>
-              SynchronizedRef.get(runtime).pipe(
-                Effect.flatMap((state) => {
-                  const current = state.sessions.get(sessionId);
-                  return current === undefined
-                    ? providerSession.terminate.pipe(Effect.ignore)
-                    : endRuntimeSession(current, "error");
-                }),
-              ),
-            ),
-          );
-      }
-      const eventFiber = yield* providerSession.events.pipe(
-        Stream.runForEach((event) => handleProviderEvent(session.lease, providerSession, event)),
-        Effect.catch((error) =>
-          Effect.gen(function* () {
-            yield* emit(session.lease, {
-              type: "error",
-              reason: error.detail,
-              recoverable: error.retryable,
-            });
-            const current = (yield* SynchronizedRef.get(runtime)).sessions.get(sessionId);
-            if (current !== undefined) {
-              yield* endRuntimeSession(current, "error", {
-                interruptEventFiber: false,
-              });
-            }
+    }
+    const capability: VoiceCapability =
+      session.input.mode === "realtime-agent" ? "agent.realtime" : "transcription.realtime";
+    const adapter = yield* providers.resolve(capability);
+    if (adapter.realtime === undefined) {
+      return yield* sessionError(
+        "provider-unavailable",
+        "session.offer",
+        "Configured provider has no realtime implementation",
+        true,
+      );
+    }
+    yield* setPhase(session.lease, "connecting");
+    const entries = yield* conversations.listContext(
+      session.lease.conversationId,
+      session.lease.contextEpoch,
+    );
+    const contextTokenBudget = yield* settingsService.getSettings.pipe(
+      Effect.map((settings) => settings.voice.contextTokenBudget),
+      Effect.mapError(
+        (cause) =>
+          new VoiceError({
+            reason: "provider-unavailable",
+            operation: "session.offer.settings",
+            detail: "Voice settings are unavailable",
+            retryable: true,
+            cause,
           }),
-        ),
-        Effect.forkIn(serviceScope),
-      );
-      const eventFiberAttached = yield* mutateSession(sessionId, (current) => {
-        if (current.terminating || current.terminalAt !== undefined) {
-          return [false, current] as const;
-        }
-        return [true, { ...current, eventFiber }] as const;
-      });
-      if (
-        Option.isNone(eventFiberAttached) ||
-        !eventFiberAttached.value ||
-        !(yield* registry.isCurrent(session.lease))
-      ) {
-        yield* Fiber.interrupt(eventFiber);
-        return yield* sessionError(
-          "lease-conflict",
-          "session.offer",
-          "Voice session ended while signaling",
-        );
+      ),
+    );
+    const context = yield* compiler.compile({
+      entries,
+      tokenBudget: contextTokenBudget,
+    });
+    const initialFocus: VoiceSessionFocus = {
+      ...(session.input.projectId === undefined ? {} : { projectId: session.input.projectId }),
+      ...(session.input.threadId === undefined ? {} : { threadId: session.input.threadId }),
+    };
+    const initialFocusItem = voiceFocusContextItem(initialFocus);
+    const providerSession = yield* adapter.realtime
+      .negotiate({
+        sessionId,
+        leaseGeneration: session.lease.generation,
+        offer,
+        instructions: INSTRUCTIONS,
+        continuationContext:
+          initialFocusItem === undefined ? context.items : [...context.items, initialFocusItem],
+      })
+      .pipe(Effect.tapError(() => endRuntimeSession(session, "error")));
+    const providerAttached = yield* mutateSession(sessionId, (current) => {
+      if (current.terminating || current.terminalAt !== undefined) {
+        return [false, current] as const;
       }
-      yield* setPhase(session.lease, "idle");
-      return providerSession.answer;
-    },
-  );
+      return [true, { ...current, providerSession }] as const;
+    });
+    if (Option.isNone(providerAttached) || !providerAttached.value) {
+      yield* providerSession.terminate.pipe(Effect.ignore);
+      return yield* sessionError(
+        "lease-conflict",
+        "session.offer",
+        "Voice session was replaced during signaling",
+      );
+    }
+    if (!(yield* registry.isCurrent(session.lease))) {
+      yield* providerSession.terminate.pipe(Effect.ignore);
+      return yield* sessionError(
+        "lease-conflict",
+        "session.offer",
+        "Voice session was replaced during signaling",
+      );
+    }
+    if (initialFocusItem !== undefined) {
+      yield* conversations
+        .appendContext({
+          conversationId: session.lease.conversationId,
+          expectedEpoch: session.lease.contextEpoch,
+          kind: "context-change",
+          payload: initialFocus,
+        })
+        .pipe(
+          Effect.tapError(() =>
+            SynchronizedRef.get(runtime).pipe(
+              Effect.flatMap((state) => {
+                const current = state.sessions.get(sessionId);
+                return current === undefined
+                  ? providerSession.terminate.pipe(Effect.ignore)
+                  : endRuntimeSession(current, "error");
+              }),
+            ),
+          ),
+        );
+    }
+    const eventFiber = yield* providerSession.events.pipe(
+      Stream.runForEach((event) => handleProviderEvent(session.lease, providerSession, event)),
+      Effect.catch((error) =>
+        Effect.gen(function* () {
+          yield* emit(session.lease, {
+            type: "error",
+            reason: error.detail,
+            recoverable: error.retryable,
+          });
+          const current = (yield* SynchronizedRef.get(runtime)).sessions.get(sessionId);
+          if (current !== undefined) {
+            yield* endRuntimeSession(current, "error", {
+              interruptEventFiber: false,
+            });
+          }
+        }),
+      ),
+      Effect.forkIn(serviceScope),
+    );
+    const eventFiberAttached = yield* mutateSession(sessionId, (current) => {
+      if (current.terminating || current.terminalAt !== undefined) {
+        return [false, current] as const;
+      }
+      return [true, { ...current, eventFiber }] as const;
+    });
+    if (
+      Option.isNone(eventFiberAttached) ||
+      !eventFiberAttached.value ||
+      !(yield* registry.isCurrent(session.lease))
+    ) {
+      yield* Fiber.interrupt(eventFiber);
+      return yield* sessionError(
+        "lease-conflict",
+        "session.offer",
+        "Voice session ended while signaling",
+      );
+    }
+    yield* setPhase(session.lease, "idle");
+    return providerSession.answer;
+  });
+
+  const offer: VoiceSessionServiceShape["offer"] = (owner, sessionId, input) =>
+    Effect.gen(function* () {
+      const session = yield* requireOwned(owner, sessionId, input.leaseGeneration);
+      return yield* session.operationMutex.withPermits(1)(offerUnlocked(owner, sessionId, input));
+    });
 
   const events: VoiceSessionServiceShape["events"] = Effect.fn("VoiceSessionService.events")(
     function* (owner, sessionId, afterSequence, waitMilliseconds) {

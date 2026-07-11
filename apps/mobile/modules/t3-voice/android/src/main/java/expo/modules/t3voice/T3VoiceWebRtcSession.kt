@@ -83,7 +83,7 @@ internal class T3VoiceWebRtcSession(
   private val audioOwners = T3VoiceRealtimeAudioOwnerPolicy()
   private val connectionTimeouts = T3VoiceRealtimeConnectionTimeoutPolicy()
   private var active: ActiveSession? = null
-  private val usedSessionIds = mutableSetOf<String>()
+  private val usedSessionIds = T3VoiceSessionIdTombstones(SESSION_ID_TOMBSTONE_CAPACITY)
 
   init {
     initializeWebRtc(applicationContext)
@@ -932,6 +932,7 @@ internal class T3VoiceWebRtcSession(
     private const val ICE_GATHERING_TIMEOUT_SECONDS = 15L
     private const val CONNECTION_TIMEOUT_SECONDS = 20L
     private const val DISCONNECTED_GRACE_SECONDS = 10L
+    private const val SESSION_ID_TOMBSTONE_CAPACITY = 256
     private const val STATE_PREPARING = "preparing"
     private const val STATE_OFFER_READY = "offer-ready"
     private const val STATE_CONNECTING = "connecting"

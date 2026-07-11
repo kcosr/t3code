@@ -430,13 +430,32 @@ export class RealtimeVoiceController {
     const active = this.active;
     this.active = null;
     this.clearControlTimers();
-    void Promise.allSettled([
-      this.native.stopRealtimeSessionAsync({
-        nativeSessionId: active.nativeSessionId,
-      }),
+    void this.cleanupAfterControlFailure(active, message);
+  }
+
+  private async cleanupAfterControlFailure(active: ActiveSession, message: string) {
+    const generation = ++this.startGeneration;
+    await Promise.allSettled([
+      this.native.stopRealtimeSessionAsync({ nativeSessionId: active.nativeSessionId }),
       Effect.runPromise(this.client.closeSession(active.sessionId, active.leaseGeneration)),
     ]);
+    if (generation !== this.startGeneration) return;
+    const nativeState = await this.native.getStateAsync().catch(() => null);
+    if (generation !== this.startGeneration) return;
+    if (nativeState === null || nativeState.activeRealtimeSessionId !== null) {
+      this.setSnapshot({
+        ...(nativeState === null ? {} : { native: nativeState }),
+        phase: "error",
+        session: active.serverState,
+        error:
+          nativeState === null
+            ? `${message}. Native media shutdown could not be verified`
+            : `${message}. The Realtime media session could not be stopped`,
+      });
+      return;
+    }
     this.setSnapshot({
+      native: nativeState,
       phase: "error",
       session: active.serverState,
       error: message,

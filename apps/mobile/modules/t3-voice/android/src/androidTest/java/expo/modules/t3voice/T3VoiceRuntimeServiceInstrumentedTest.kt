@@ -12,9 +12,11 @@ import android.os.IBinder
 import android.os.SystemClock
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import java.util.UUID
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -67,6 +69,42 @@ class T3VoiceRuntimeServiceInstrumentedTest {
     val second = bindService()
     try {
       assertNotNull(second.binder.get())
+      assertEquals(T3VoiceRuntimePhase.IDLE, second.binder.get()!!.state.value.phase)
+    } finally {
+      context.unbindService(second.connection)
+    }
+    waitUntil { T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.INACTIVE }
+  }
+
+  @Test
+  fun recordingOwnsForegroundUntilCancelledAndServiceCanRebind() {
+    InstrumentationRegistry.getInstrumentation().uiAutomation.grantRuntimePermission(
+      context.packageName,
+      Manifest.permission.RECORD_AUDIO,
+    )
+    val recordingId = UUID.randomUUID().toString()
+    val first = bindService()
+    try {
+      val binder = checkNotNull(first.binder.get())
+      binder.startRecording(recordingId)
+      waitUntil {
+        binder.state.value.phase == T3VoiceRuntimePhase.RECORDING &&
+          binder.state.value.isForeground &&
+          binder.state.value.activeRecordingId == recordingId
+      }
+      binder.cancelRecording(recordingId)
+      waitUntil {
+        binder.state.value.phase == T3VoiceRuntimePhase.IDLE &&
+          !binder.state.value.isForeground &&
+          binder.state.value.activeRecordingId == null
+      }
+    } finally {
+      context.unbindService(first.connection)
+    }
+    waitUntil { T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.INACTIVE }
+
+    val second = bindService()
+    try {
       assertEquals(T3VoiceRuntimePhase.IDLE, second.binder.get()!!.state.value.phase)
     } finally {
       context.unbindService(second.connection)

@@ -100,14 +100,27 @@ const excludedDirectories = new Set([
   "Vendor",
 ]);
 const generatedNativeProjectDirectories = new Set(["android", "ios"]);
-const androidLogPattern = /(?:import\s+android\.util\.Log\b|\b(?:android\.util\.)?Log\s*\.)/;
+const prohibitedAndroidVoiceOutputPatterns = [
+  /(?:import\s+android\.util\.Log\b|\b(?:android\.util\.)?Log\s*\.)/,
+  /\b(?:kotlin\.io\.)?print(?:ln)?\s*\(/,
+  /\b(?:java\.lang\.)?System\s*\.\s*(?:out|err)\b/,
+  /\.\s*printStackTrace\s*\(/,
+  /(?:import\s+timber\.log\.Timber\b|\bTimber\s*\.)/,
+  /(?:import\s+java\.util\.logging\b|\b(?:java\.util\.logging\.)?Logger\s*\.\s*getLogger\s*\()/,
+] as const;
 
 export function findAndroidVoiceLogViolations(
   sources: ReadonlyArray<{ readonly path: string; readonly content: string }>,
 ): ReadonlyArray<string> {
   return sources
-    .filter((source) => androidLogPattern.test(source.content))
+    .filter((source) =>
+      prohibitedAndroidVoiceOutputPatterns.some((pattern) => pattern.test(source.content)),
+    )
     .map((source) => source.path);
+}
+
+export function isAndroidVoiceSourcePath(source: string): boolean {
+  return source.replaceAll("\\", "/").includes("/modules/t3-voice/android/src/");
 }
 
 const mobileAppRootUrl = new URL("../apps/mobile", import.meta.url);
@@ -256,13 +269,14 @@ const runNativeStaticChecks = Effect.fn("runNativeStaticChecks")(function* () {
     const extension = path.extname(source);
     return extension === ".kt" || extension === ".kts";
   });
-  const androidVoiceSources = kotlinSources.filter((source) =>
-    source.replaceAll("\\", "/").includes("/modules/t3-voice/android/src/main/"),
-  );
+  const androidVoiceSources = kotlinSources.filter(isAndroidVoiceSourcePath);
   const fs = yield* FileSystem.FileSystem;
   const androidVoiceSourceContents = yield* Effect.forEach(androidVoiceSources, (source) =>
     fs.readFileString(source).pipe(
-      Effect.map((content) => ({ path: path.relative(root, source), content })),
+      Effect.map((content) => ({
+        path: path.relative(root, source),
+        content,
+      })),
       Effect.mapError(
         (cause) =>
           new NativeStaticCheckSourceDiscoveryError({
@@ -275,7 +289,9 @@ const runNativeStaticChecks = Effect.fn("runNativeStaticChecks")(function* () {
   );
   const privacyViolations = findAndroidVoiceLogViolations(androidVoiceSourceContents);
   if (privacyViolations.length > 0) {
-    return yield* new NativeStaticCheckPrivacyError({ paths: privacyViolations });
+    return yield* new NativeStaticCheckPrivacyError({
+      paths: privacyViolations,
+    });
   }
   const availableTools = new Map<string, boolean>();
 

@@ -430,15 +430,35 @@ describe("RealtimeVoiceController", () => {
     await controller.refreshEvents();
     await controller.refreshEvents();
     await controller.refreshEvents();
-    await Promise.resolve();
 
-    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledWith({
-      nativeSessionId: SESSION_ID,
+    await vi.waitFor(() => {
+      expect(native.stopRealtimeSessionAsync).toHaveBeenCalledWith({
+        nativeSessionId: SESSION_ID,
+      });
+      expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1);
+      expect(controller.getSnapshot()).toMatchObject({
+        phase: "error",
+        error: expect.any(String),
+      });
     });
-    expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1);
-    expect(controller.getSnapshot()).toMatchObject({
-      phase: "error",
-      error: expect.any(String),
+  });
+
+  it("reports retained native media after repeated control failures", async () => {
+    const { client, controller, native } = makeHarness();
+    await controller.start(createInput);
+    vi.mocked(client.sessionEvents).mockReturnValue(Effect.die(new Error("offline")));
+    vi.mocked(native.stopRealtimeSessionAsync).mockResolvedValueOnce(false);
+
+    await controller.refreshEvents();
+    await controller.refreshEvents();
+    await controller.refreshEvents();
+
+    await vi.waitFor(() => {
+      expect(controller.getSnapshot()).toMatchObject({
+        phase: "error",
+        error: expect.stringContaining("could not be stopped"),
+        native: { activeRealtimeSessionId: SESSION_ID },
+      });
     });
   });
 
@@ -454,9 +474,11 @@ describe("RealtimeVoiceController", () => {
     await controller.refreshEvents();
     await controller.refreshEvents();
 
-    expect(controller.getSnapshot().error).toContain(
-      "Realtime event stream returned an invalid response",
-    );
+    await vi.waitFor(() => {
+      expect(controller.getSnapshot().error).toContain(
+        "Realtime event stream returned an invalid response",
+      );
+    });
   });
 
   it("tracks heartbeat and event failures independently", async () => {
@@ -478,9 +500,11 @@ describe("RealtimeVoiceController", () => {
 
     await controller.refreshEvents();
 
-    expect(controller.getSnapshot()).toMatchObject({
-      phase: "error",
-      error: expect.stringContaining("Realtime event stream returned an invalid response"),
+    await vi.waitFor(() => {
+      expect(controller.getSnapshot()).toMatchObject({
+        phase: "error",
+        error: expect.stringContaining("Realtime event stream returned an invalid response"),
+      });
     });
   });
 

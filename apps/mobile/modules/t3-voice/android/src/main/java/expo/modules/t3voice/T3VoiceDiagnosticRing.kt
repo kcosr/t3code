@@ -38,7 +38,17 @@ internal data class T3VoiceDiagnosticEntry(
   val code: T3VoiceDiagnosticCode,
   val primaryCount: Int,
   val secondaryCount: Int,
-)
+) {
+  fun toResultBody(): Map<String, Any> =
+    mapOf(
+      "elapsedRealtimeMillis" to elapsedRealtimeMillis,
+      "generation" to generation,
+      "category" to category.name.lowercase(),
+      "code" to code.name.lowercase().replace('_', '-'),
+      "primaryCount" to primaryCount,
+      "secondaryCount" to secondaryCount,
+    )
+}
 
 internal class T3VoiceDiagnosticRing(
   private val capacity: Int = DEFAULT_CAPACITY,
@@ -109,4 +119,6 @@ internal object T3VoiceDiagnostics {
     primaryCount: Int = 0,
     secondaryCount: Int = 0,
   ) = ring.record(generation, category, code, primaryCount, secondaryCount)
+
+  fun snapshot(): List<Map<String, Any>> = ring.snapshot().map(T3VoiceDiagnosticEntry::toResultBody)
 }

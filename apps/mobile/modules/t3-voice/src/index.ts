@@ -4,6 +4,9 @@ import type { T3VoiceNativeModule } from "./T3Voice.types";
 
 export type {
   T3VoiceEventSubscription,
+  T3VoiceDiagnosticCategory,
+  T3VoiceDiagnosticCode,
+  T3VoiceDiagnosticEntry,
   T3VoiceMediaCapabilities,
   T3VoiceNativeModule,
   T3VoicePlaybackFinishInput,

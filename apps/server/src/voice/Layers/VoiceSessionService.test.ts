@@ -812,6 +812,63 @@ it.effect("takeover fences an in-flight negotiation and terminates its late prov
   }),
 );
 
+it.effect("serializes duplicate offers so only one provider session is negotiated", () =>
+  Effect.gen(function* () {
+    const negotiationStarted = yield* Deferred.make<void>();
+    const releaseNegotiation = yield* Deferred.make<void>();
+    const negotiations = yield* Ref.make(0);
+    const provider: VoiceProviderAdapter = {
+      id: "fake-duplicate-offer",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Ref.update(negotiations, (count) => count + 1).pipe(
+            Effect.andThen(Deferred.succeed(negotiationStarted, undefined)),
+            Effect.andThen(Deferred.await(releaseNegotiation)),
+            Effect.as({
+              answer: {
+                sessionId: request.sessionId,
+                leaseGeneration: request.leaseGeneration,
+                sdp: "answer",
+              },
+              events: Stream.empty,
+              updateContext: () => Effect.void,
+              submitToolOutput: () => Effect.void,
+              terminate: Effect.void,
+            } satisfies RealtimeProviderSession),
+          ),
+      },
+    };
+    const test = yield* makeLayer(provider);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("duplicate-offer-phone");
+      const created = yield* sessions.create(principal(owner), input(false, "duplicate-offer"));
+      const offer = {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      } as const;
+
+      const first = yield* sessions
+        .offer(owner, created.state.sessionId, offer)
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(negotiationStarted);
+      const duplicate = yield* sessions
+        .offer(owner, created.state.sessionId, offer)
+        .pipe(Effect.flip, Effect.forkScoped);
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(negotiations)).toBe(1);
+
+      yield* Deferred.succeed(releaseNegotiation, undefined);
+      expect((yield* Fiber.join(first)).sdp).toBe("answer");
+      const duplicateError = yield* Fiber.join(duplicate);
+      expect(duplicateError.reason).toBe("invalid-phase");
+      expect(yield* Ref.get(negotiations)).toBe(1);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
 it.effect("takeover terminates a provider that negotiates while displaced cleanup is blocked", () =>
   Effect.gen(function* () {
     const negotiationGate = yield* Deferred.make<RealtimeProviderSession>();
@@ -1052,6 +1109,49 @@ it.effect.each(["listening", "speaking"] as const)(
         expect(snapshot.events.some((event) => event.type === "error")).toBe(false);
       }).pipe(Effect.provide(test.layer));
     }),
+);
+
+it.effect("expires a negotiated session until provider media activity is observed", () =>
+  Effect.gen(function* () {
+    const provider: VoiceProviderAdapter = {
+      id: "fake-negotiated-without-media",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Effect.succeed({
+            answer: {
+              sessionId: request.sessionId,
+              leaseGeneration: request.leaseGeneration,
+              sdp: "answer",
+            },
+            events: Stream.never,
+            updateContext: () => Effect.void,
+            submitToolOutput: () => Effect.void,
+            terminate: Effect.void,
+          }),
+      },
+    };
+    const test = yield* makeLayer(provider);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("phone-negotiated-without-media");
+      const created = yield* sessions.create(
+        principal(owner),
+        input(false, "negotiated-without-media"),
+      );
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      yield* TestClock.adjust("31 seconds");
+      yield* Effect.yieldNow;
+
+      const snapshot = yield* sessions.events(owner, created.state.sessionId, 0, 0);
+      expect(snapshot.state.phase).toBe("ended");
+      expect(snapshot.events.some((event) => event.type === "error")).toBe(true);
+    }).pipe(Effect.provide(test.layer));
+  }),
 );
 
 it.effect("ends an active provider session at the absolute duration limit", () =>

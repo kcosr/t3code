@@ -392,6 +392,12 @@ class T3VoiceModule : Module() {
         }
       }
 
+      AsyncFunction("getDiagnosticsAsync") { promise: Promise ->
+        withBinder(promise, "diagnostics-read-failed") { voice, result ->
+          result.resolve(voice.getDiagnostics())
+        }
+      }
+
       AsyncFunction("setAudioRouteAsync") { input: Map<String, String>, promise: Promise ->
         withBinder(promise, "audio-route-selection-failed") { voice, result ->
           result.resolve(

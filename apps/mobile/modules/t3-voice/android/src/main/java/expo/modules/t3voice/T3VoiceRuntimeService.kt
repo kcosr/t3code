@@ -154,6 +154,8 @@ class T3VoiceRuntimeService : Service() {
 
     fun getAudioRoutes(): List<Map<String, Any>> = realtime.routes()
 
+    fun getDiagnostics(): List<Map<String, Any>> = T3VoiceDiagnostics.snapshot()
+
     fun setAudioRoute(nativeSessionId: String, routeId: String): List<Map<String, Any>> =
       realtime.selectRoute(nativeSessionId, routeId)
   }

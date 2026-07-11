@@ -114,6 +114,37 @@ export interface T3VoiceAudioRoute {
   readonly selected: boolean;
 }
 
+export type T3VoiceDiagnosticCategory = "lifecycle" | "state" | "route" | "focus" | "terminal";
+
+export type T3VoiceDiagnosticCode =
+  | "started"
+  | "stopped"
+  | "active"
+  | "idle"
+  | "request-granted"
+  | "request-denied"
+  | "gained"
+  | "lost-transiently"
+  | "duck-requested"
+  | "lost-permanently"
+  | "route-selected"
+  | "route-fallback"
+  | "route-scan-unavailable"
+  | "device-callback-registered"
+  | "device-callback-unavailable"
+  | "device-callback-unregistered"
+  | "ended"
+  | "failed";
+
+export interface T3VoiceDiagnosticEntry {
+  readonly elapsedRealtimeMillis: number;
+  readonly generation: number;
+  readonly category: T3VoiceDiagnosticCategory;
+  readonly code: T3VoiceDiagnosticCode;
+  readonly primaryCount: number;
+  readonly secondaryCount: number;
+}
+
 export interface T3VoiceNativeModule {
   readonly nativeRevision: number;
   readonly addListener: {
@@ -161,7 +192,10 @@ export interface T3VoiceNativeModule {
     input: T3VoiceRealtimePrepareInput & { readonly muted: boolean },
   ) => Promise<void>;
   readonly getAudioRoutesAsync: () => Promise<ReadonlyArray<T3VoiceAudioRoute>>;
+  readonly getDiagnosticsAsync: () => Promise<ReadonlyArray<T3VoiceDiagnosticEntry>>;
   readonly setAudioRouteAsync: (
-    input: T3VoiceRealtimePrepareInput & { readonly routeId: T3VoiceAudioRoute["id"] },
+    input: T3VoiceRealtimePrepareInput & {
+      readonly routeId: T3VoiceAudioRoute["id"];
+    },
   ) => Promise<ReadonlyArray<T3VoiceAudioRoute>>;
 }

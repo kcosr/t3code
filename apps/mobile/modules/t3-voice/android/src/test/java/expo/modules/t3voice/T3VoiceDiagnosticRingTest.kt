@@ -87,6 +87,30 @@ class T3VoiceDiagnosticRingTest {
   }
 
   @Test
+  fun supportSnapshotContainsOnlyDocumentedRedactedFields() {
+    val ring = T3VoiceDiagnosticRing(capacity = 1, clock = { 42L })
+    ring.record(
+      generation = 7,
+      category = T3VoiceDiagnosticCategory.ROUTE,
+      code = T3VoiceDiagnosticCode.ROUTE_SCAN_UNAVAILABLE,
+      primaryCount = 2,
+      secondaryCount = 3,
+    )
+
+    assertEquals(
+      mapOf(
+        "elapsedRealtimeMillis" to 42L,
+        "generation" to 7L,
+        "category" to "route",
+        "code" to "route-scan-unavailable",
+        "primaryCount" to 2,
+        "secondaryCount" to 3,
+      ),
+      ring.snapshot().single().toResultBody(),
+    )
+  }
+
+  @Test
   fun capacityItselfHasAHardUpperBound() {
     val failure = runCatching { T3VoiceDiagnosticRing(capacity = 257) }
     assertTrue(failure.isFailure)
