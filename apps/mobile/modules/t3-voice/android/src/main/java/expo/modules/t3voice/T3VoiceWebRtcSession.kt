@@ -145,7 +145,7 @@ internal class T3VoiceWebRtcSession(
     try {
       audioRouter.start()
       onStateChanged(sessionId, STATE_PREPARING, false)
-      Log.i(LOG_TAG, "offer-requested")
+      Log.i(LOG_TAG, "offer-requested sessionId=$sessionId")
       peerConnection.createOffer(OfferObserver(sessionId), offerConstraints())
     } catch (cause: Throwable) {
       fail(
@@ -189,6 +189,7 @@ internal class T3VoiceWebRtcSession(
                 }
               }
             acceptedCallback?.onSuccess(Unit)
+            Log.i(LOG_TAG, "answer-applied sessionId=$sessionId")
           }
 
           override fun onSetFailure(message: String?) {
@@ -247,6 +248,7 @@ internal class T3VoiceWebRtcSession(
   }
 
   fun stop(sessionId: String): Boolean {
+    Log.i(LOG_TAG, "stop-requested sessionId=$sessionId")
     val session =
       synchronized(lock) {
         val current = active ?: return false
@@ -269,6 +271,7 @@ internal class T3VoiceWebRtcSession(
     releaseSession(session)
     audioRouter.stop()
     if (terminalLatch.claim(sessionId)) {
+      Log.i(LOG_TAG, "terminal sessionId=$sessionId outcome=$OUTCOME_ENDED code=$ERROR_SESSION_STOPPED")
       onTerminated(sessionId, OUTCOME_ENDED, ERROR_SESSION_STOPPED, false)
     }
     onStateChanged(sessionId, STATE_CLOSED, session.muted)
@@ -320,13 +323,14 @@ internal class T3VoiceWebRtcSession(
         }
       }
     if (result != null) {
-      Log.i(LOG_TAG, "offer-ready")
+      Log.i(LOG_TAG, "offer-ready sessionId=$sessionId")
       onStateChanged(sessionId, STATE_OFFER_READY, result.third)
       result.first?.onSuccess(result.second)
     }
   }
 
   private fun updateConnectionState(sessionId: String, state: PeerConnection.PeerConnectionState) {
+    Log.i(LOG_TAG, "peer-connection-state sessionId=$sessionId state=${state.name.lowercase()}")
     val normalized =
       when (state) {
         PeerConnection.PeerConnectionState.NEW -> STATE_PREPARING
@@ -371,6 +375,7 @@ internal class T3VoiceWebRtcSession(
     releaseSession(session)
     audioRouter.stop()
     if (terminalLatch.claim(sessionId)) {
+      Log.w(LOG_TAG, "terminal sessionId=$sessionId outcome=$OUTCOME_FAILED code=$code")
       onTerminated(sessionId, OUTCOME_FAILED, code, recoverable)
     }
     onStateChanged(sessionId, STATE_FAILED, session.muted)
@@ -411,7 +416,7 @@ internal class T3VoiceWebRtcSession(
 
   private inner class OfferObserver(private val sessionId: String) : BaseSdpObserver() {
     override fun onCreateSuccess(description: SessionDescription?) {
-      Log.i(LOG_TAG, "offer-created")
+      Log.i(LOG_TAG, "offer-created sessionId=$sessionId")
       if (description == null || description.description.isBlank()) {
         fail(sessionId, ERROR_OFFER_FAILED, "WebRTC created an empty SDP offer.", null, false)
         return
@@ -421,7 +426,7 @@ internal class T3VoiceWebRtcSession(
       peer.setLocalDescription(
         object : BaseSdpObserver() {
           override fun onSetSuccess() {
-            Log.i(LOG_TAG, "local-description-set")
+            Log.i(LOG_TAG, "local-description-set sessionId=$sessionId")
             synchronized(lock) {
               active?.takeIf { it.sessionId == sessionId }?.localDescriptionSet = true
             }
@@ -429,7 +434,7 @@ internal class T3VoiceWebRtcSession(
           }
 
           override fun onSetFailure(message: String?) {
-            Log.w(LOG_TAG, "local-description-rejected")
+            Log.w(LOG_TAG, "local-description-rejected sessionId=$sessionId")
             fail(
               sessionId,
               ERROR_OFFER_FAILED,
@@ -444,7 +449,7 @@ internal class T3VoiceWebRtcSession(
     }
 
     override fun onCreateFailure(message: String?) {
-      Log.w(LOG_TAG, "offer-create-failed")
+      Log.w(LOG_TAG, "offer-create-failed sessionId=$sessionId")
       fail(
         sessionId,
         ERROR_OFFER_FAILED,
@@ -456,14 +461,29 @@ internal class T3VoiceWebRtcSession(
   }
 
   private inner class PeerObserver(private val sessionId: String) : PeerConnection.Observer {
-    override fun onSignalingChange(state: PeerConnection.SignalingState?) = Unit
+    override fun onSignalingChange(state: PeerConnection.SignalingState?) {
+      Log.i(
+        LOG_TAG,
+        "signaling-state sessionId=$sessionId state=${state?.name?.lowercase() ?: "unknown"}",
+      )
+    }
 
-    override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) = Unit
+    override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
+      Log.i(
+        LOG_TAG,
+        "ice-connection-state sessionId=$sessionId state=${state?.name?.lowercase() ?: "unknown"}",
+      )
+    }
 
-    override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
+    override fun onIceConnectionReceivingChange(receiving: Boolean) {
+      Log.i(LOG_TAG, "ice-receiving sessionId=$sessionId receiving=$receiving")
+    }
 
     override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
-      Log.i(LOG_TAG, "ice-gathering-${state?.name?.lowercase() ?: "unknown"}")
+      Log.i(
+        LOG_TAG,
+        "ice-gathering-state sessionId=$sessionId state=${state?.name?.lowercase() ?: "unknown"}",
+      )
       if (state != PeerConnection.IceGatheringState.COMPLETE) return
       synchronized(lock) {
         active?.takeIf { it.sessionId == sessionId }?.iceGatheringComplete = true
@@ -509,7 +529,9 @@ internal class T3VoiceWebRtcSession(
     override fun onBufferedAmountChange(previousAmount: Long) = Unit
 
     override fun onStateChange() {
-      if (channel.state() == DataChannel.State.CLOSED) {
+      val state = channel.state()
+      Log.i(LOG_TAG, "data-channel-state sessionId=$sessionId state=${state.name.lowercase()}")
+      if (state == DataChannel.State.CLOSED) {
         val connected =
           synchronized(lock) {
             active?.takeIf { it.sessionId == sessionId }?.peerConnection?.connectionState() ==
@@ -532,6 +554,7 @@ internal class T3VoiceWebRtcSession(
       val isProviderError =
         runCatching { JSONObject(text).optString("type") == "error" }.getOrDefault(false)
       if (isProviderError) {
+        Log.w(LOG_TAG, "provider-error-event sessionId=$sessionId")
         onError(
           sessionId,
           ERROR_PROVIDER_EVENT,
@@ -573,6 +596,7 @@ internal class T3VoiceWebRtcSession(
     @Suppress("UNUSED_PARAMETER") providerMessage: String?,
   ) {
     val sessionId = synchronized(lock) { active?.sessionId } ?: return
+    Log.w(LOG_TAG, "audio-error sessionId=$sessionId code=$code")
     onError(sessionId, code, "Realtime audio failed.", true)
   }
 
