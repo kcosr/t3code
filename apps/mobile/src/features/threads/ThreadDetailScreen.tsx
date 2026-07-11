@@ -17,7 +17,7 @@ import type {
 import { formatElapsed } from "@t3tools/shared/orchestrationTiming";
 import * as Haptics from "expo-haptics";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Platform, View, type GestureResponderEvent } from "react-native";
+import { Alert, Platform, View, type GestureResponderEvent } from "react-native";
 import { KeyboardController, KeyboardStickyView } from "react-native-keyboard-controller";
 import Animated, { FadeInDown, FadeOut, LinearTransition } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -43,6 +43,7 @@ import {
 } from "./ThreadComposer";
 import { ThreadFeed } from "./ThreadFeed";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
+import { useThreadSpeech } from "../voice/useThreadSpeech";
 
 export interface ThreadDetailScreenProps {
   readonly selectedThread: OrchestrationThreadShell;
@@ -118,6 +119,22 @@ function latestStreamingAssistantMessage(
     };
   }
 
+  return null;
+}
+
+function latestAssistantSpeechSnapshot(
+  feed: ReadonlyArray<ThreadFeedEntry>,
+): { readonly id: string; readonly text: string; readonly streaming: boolean } | null {
+  for (let index = feed.length - 1; index >= 0; index -= 1) {
+    const entry = feed[index];
+    if (entry?.type === "message" && entry.message.role === "assistant") {
+      return {
+        id: entry.message.id,
+        text: entry.message.text,
+        streaming: entry.message.streaming,
+      };
+    }
+  }
   return null;
 }
 
@@ -244,6 +261,25 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     }
   })();
   const selectedThreadFeed = props.selectedThreadFeed;
+  const latestAssistant = useMemo(
+    () => latestAssistantSpeechSnapshot(selectedThreadFeed),
+    [selectedThreadFeed],
+  );
+  const speechPlayback = useThreadSpeech({
+    environmentId: props.environmentId,
+    scopeKey: selectedThreadKey,
+    latestAssistant,
+  });
+  const handleSpeechPlaybackToggle = useCallback(() => {
+    if (speechPlayback.enabled) {
+      speechPlayback.onToggle();
+      return;
+    }
+    Alert.alert("AI-generated voice", "Spoken responses use an AI-generated voice.", [
+      { text: "Cancel", style: "cancel" },
+      { text: "Enable", onPress: speechPlayback.onToggle },
+    ]);
+  }, [speechPlayback.enabled, speechPlayback.onToggle]);
   const composerChrome = composerExpanded ? COMPOSER_EXPANDED_CHROME : COMPOSER_COLLAPSED_CHROME;
   const composerOverlapHeight = composerChrome + composerBottomInset;
   const activeWorkIndicatorHeight = props.activeWorkStartedAt ? WORKING_INDICATOR_HEIGHT : 0;
@@ -270,6 +306,11 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
   const contentMaxWidth = isSplitLayout ? CHAT_CONTENT_MAX_WIDTH : undefined;
   const selectedInstanceId = props.selectedThread.modelSelection.instanceId;
   useStreamingHaptics(props.selectedThread.id, props.selectedThreadFeed);
+  useEffect(() => {
+    if (speechPlayback.error !== null) {
+      Alert.alert("Spoken response failed", speechPlayback.error);
+    }
+  }, [speechPlayback.error]);
   const selectedProviderSkills = useMemo(
     () =>
       props.serverConfig?.providers.find((provider) => provider.instanceId === selectedInstanceId)
@@ -496,6 +537,12 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               onUpdateRuntimeMode={props.onUpdateThreadRuntimeMode}
               onUpdateInteractionMode={props.onUpdateThreadInteractionMode}
               onExpandedChange={setComposerExpanded}
+              speechPlayback={{
+                available: speechPlayback.available,
+                enabled: speechPlayback.enabled,
+                playing: speechPlayback.playing,
+                onToggle: handleSpeechPlaybackToggle,
+              }}
             />
           </View>
         </KeyboardStickyView>

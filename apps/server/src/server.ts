@@ -83,12 +83,16 @@ import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
+import { ClientCommandDispatcherLive } from "./orchestration/Layers/ClientCommandDispatcher.ts";
 import {
   clearPersistedServerRuntimeState,
   makePersistedServerRuntimeState,
   persistServerRuntimeState,
 } from "./serverRuntimeState.ts";
 import { orchestrationHttpApiLayer } from "./orchestration/http.ts";
+import { voiceControlHttpApiLayer } from "./voice/controlHttp.ts";
+import { voiceMediaRoutesLayer } from "./voice/http.ts";
+import { VoiceRuntimeLive } from "./voice/runtimeLayer.ts";
 import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
 import { disableTailscaleServe, ensureTailscaleServe } from "@t3tools/tailscale";
@@ -343,12 +347,20 @@ const RuntimeServicesLive = ServerRuntimeStartup.layer.pipe(
   Layer.provideMerge(RuntimeDependenciesLive),
 );
 
-export const makeRoutesLayer = Layer.mergeAll(
+const CompleteVoiceRuntimeLive = VoiceRuntimeLive.pipe(Layer.provide(ClientCommandDispatcherLive));
+
+const RouteFeatureDependenciesLive = Layer.mergeAll(
+  ClientCommandDispatcherLive,
+  CompleteVoiceRuntimeLive,
+);
+
+const makeRoutesLayerBase = Layer.mergeAll(
   Layer.mergeAll(
     HttpApiBuilder.layer(EnvironmentHttpApi).pipe(
       Layer.provide(authHttpApiLayer),
       Layer.provide(connectHttpApiLayer),
       Layer.provide(orchestrationHttpApiLayer),
+      Layer.provide(voiceControlHttpApiLayer),
       Layer.provide(serverEnvironmentHttpApiLayer),
       Layer.provide(environmentAuthenticatedAuthLayer),
     ),
@@ -356,9 +368,19 @@ export const makeRoutesLayer = Layer.mergeAll(
     assetRouteLayer,
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,
+    voiceMediaRoutesLayer,
   ),
   McpHttpServer.layer.pipe(Layer.provide(McpSessionRegistry.layer)),
 ).pipe(Layer.provide(PreviewAutomationBroker.layer), Layer.provide(browserApiCorsLayer));
+
+export const makeRoutesLayer = makeRoutesLayerBase.pipe(
+  Layer.provide(RouteFeatureDependenciesLive),
+);
+
+export const makeServedRoutesLayer = (options?: {
+  readonly disableListenLog?: boolean;
+  readonly disableLogger?: boolean;
+}) => HttpRouter.serve(makeRoutesLayer, options).pipe(Layer.provide(CompleteVoiceRuntimeLive));
 
 export const makeServerLayer = Layer.unwrap(
   Effect.gen(function* () {
@@ -468,7 +490,7 @@ export const makeServerLayer = Layer.unwrap(
     );
 
     const serverApplicationLayer = Layer.mergeAll(
-      HttpRouter.serve(makeRoutesLayer, {
+      makeServedRoutesLayer({
         disableLogger: !config.logWebSocketEvents,
       }),
       httpListeningLayer,

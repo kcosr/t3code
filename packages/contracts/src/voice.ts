@@ -1,0 +1,401 @@
+import * as Schema from "effect/Schema";
+
+import {
+  IsoDateTime,
+  NonNegativeInt,
+  PositiveInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+  VoiceConfirmationId,
+  VoiceConversationId,
+  VoiceMediaTicketId,
+  VoicePlaybackId,
+  VoiceRequestId,
+  VoiceSessionId,
+  VoiceToolCallId,
+} from "./baseSchemas.ts";
+
+export const VoiceCapability = Schema.Literals([
+  "transcription.request",
+  "transcription.realtime",
+  "speech.streaming",
+  "agent.realtime",
+]);
+export type VoiceCapability = typeof VoiceCapability.Type;
+
+export const VoiceCapabilityState = Schema.Literals([
+  "ready",
+  "disabled",
+  "not-configured",
+  "unavailable",
+]);
+export type VoiceCapabilityState = typeof VoiceCapabilityState.Type;
+
+export const VoiceAudioFormat = Schema.Literals([
+  "audio/mpeg",
+  "audio/mp4",
+  "audio/m4a",
+  "audio/ogg",
+  "audio/wav",
+  "audio/webm",
+  "audio/pcm;rate=24000;encoding=s16le;channels=1",
+]);
+export type VoiceAudioFormat = typeof VoiceAudioFormat.Type;
+
+export const VoiceCapabilityDescriptor = Schema.Struct({
+  capability: VoiceCapability,
+  state: VoiceCapabilityState,
+  inputFormats: Schema.Array(VoiceAudioFormat),
+  outputFormats: Schema.Array(VoiceAudioFormat),
+  maxInputBytes: Schema.optionalKey(PositiveInt),
+  maxInputDurationSeconds: Schema.optionalKey(PositiveInt),
+  maxSessionDurationSeconds: Schema.optionalKey(PositiveInt),
+});
+export type VoiceCapabilityDescriptor = typeof VoiceCapabilityDescriptor.Type;
+
+export const VoiceCapabilities = Schema.Struct({
+  version: Schema.Literal(1),
+  capabilities: Schema.Array(VoiceCapabilityDescriptor),
+  conversationRetention: Schema.Array(Schema.Literals(["ephemeral", "durable"])),
+});
+export type VoiceCapabilities = typeof VoiceCapabilities.Type;
+
+export const VoiceCredentialStatus = Schema.Struct({
+  configured: Schema.Boolean,
+  updatedAt: Schema.NullOr(IsoDateTime),
+});
+export type VoiceCredentialStatus = typeof VoiceCredentialStatus.Type;
+
+export const VoiceCredentialSetInput = Schema.Struct({
+  apiKey: TrimmedNonEmptyString,
+});
+export type VoiceCredentialSetInput = typeof VoiceCredentialSetInput.Type;
+
+export const VoiceConversationRetention = Schema.Literals(["ephemeral", "durable"]);
+export type VoiceConversationRetention = typeof VoiceConversationRetention.Type;
+
+export const VoiceConversationSummary = Schema.Struct({
+  conversationId: VoiceConversationId,
+  retention: VoiceConversationRetention,
+  title: Schema.NullOr(TrimmedNonEmptyString),
+  activeEpoch: PositiveInt,
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type VoiceConversationSummary = typeof VoiceConversationSummary.Type;
+
+export const VoiceConversationCreateInput = Schema.Struct({
+  retention: VoiceConversationRetention,
+  title: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type VoiceConversationCreateInput = typeof VoiceConversationCreateInput.Type;
+
+export const VoiceConversationClearContextResult = Schema.Struct({
+  conversationId: VoiceConversationId,
+  activeEpoch: PositiveInt,
+  clearedAt: IsoDateTime,
+});
+export type VoiceConversationClearContextResult = typeof VoiceConversationClearContextResult.Type;
+
+export const VoiceConversationDeleteResult = Schema.Struct({
+  deleted: Schema.Boolean,
+});
+export type VoiceConversationDeleteResult = typeof VoiceConversationDeleteResult.Type;
+
+export const VoiceSessionMode = Schema.Literals(["realtime-transcription", "realtime-agent"]);
+export type VoiceSessionMode = typeof VoiceSessionMode.Type;
+
+const VoiceSdp = Schema.String.check(Schema.isPattern(/\S/));
+
+export const VoiceSessionPhase = Schema.Literals([
+  "creating",
+  "signaling",
+  "connecting",
+  "idle",
+  "listening",
+  "thinking",
+  "speaking",
+  "confirming",
+  "reconnecting",
+  "ending",
+  "ended",
+  "error",
+]);
+export type VoiceSessionPhase = typeof VoiceSessionPhase.Type;
+
+export const VoiceConversationSelection = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("new"),
+    retention: VoiceConversationRetention,
+    title: Schema.optionalKey(TrimmedNonEmptyString),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("continue"),
+    conversationId: VoiceConversationId,
+    takeover: Schema.Boolean,
+  }),
+]);
+export type VoiceConversationSelection = typeof VoiceConversationSelection.Type;
+
+export const VoiceClientMediaCapabilities = Schema.Struct({
+  transports: Schema.Array(Schema.Literal("webrtc-sdp-v1")),
+  audioFormats: Schema.Array(VoiceAudioFormat),
+  supportsInputRouteSelection: Schema.Boolean,
+  supportsOutputRouteSelection: Schema.Boolean,
+});
+export type VoiceClientMediaCapabilities = typeof VoiceClientMediaCapabilities.Type;
+
+export const VoiceSessionCreateInput = Schema.Struct({
+  mode: VoiceSessionMode,
+  conversation: VoiceConversationSelection,
+  projectId: Schema.optionalKey(ProjectId),
+  threadId: Schema.optionalKey(ThreadId),
+  media: VoiceClientMediaCapabilities,
+  idempotencyKey: TrimmedNonEmptyString,
+});
+export type VoiceSessionCreateInput = typeof VoiceSessionCreateInput.Type;
+
+export const VoiceMediaTransport = Schema.Struct({
+  kind: Schema.Literal("webrtc-sdp-v1"),
+  signalingPath: TrimmedNonEmptyString,
+});
+export type VoiceMediaTransport = typeof VoiceMediaTransport.Type;
+
+export const VoiceSessionState = Schema.Struct({
+  sessionId: VoiceSessionId,
+  conversationId: VoiceConversationId,
+  mode: VoiceSessionMode,
+  phase: VoiceSessionPhase,
+  leaseGeneration: PositiveInt,
+  sequence: NonNegativeInt,
+});
+export type VoiceSessionState = typeof VoiceSessionState.Type;
+
+export const VoiceSessionCreateResult = Schema.Struct({
+  state: VoiceSessionState,
+  transport: VoiceMediaTransport,
+  expiresAt: IsoDateTime,
+  heartbeatIntervalSeconds: PositiveInt,
+});
+export type VoiceSessionCreateResult = typeof VoiceSessionCreateResult.Type;
+
+export const VoiceSessionLeaseInput = Schema.Struct({
+  leaseGeneration: PositiveInt,
+});
+export type VoiceSessionLeaseInput = typeof VoiceSessionLeaseInput.Type;
+
+export const VoiceSessionCloseResult = Schema.Struct({
+  state: VoiceSessionState,
+  closed: Schema.Boolean,
+});
+export type VoiceSessionCloseResult = typeof VoiceSessionCloseResult.Type;
+
+export const VoiceSessionEventsQuery = Schema.Struct({
+  afterSequence: Schema.optionalKey(NonNegativeInt),
+  waitMilliseconds: Schema.optionalKey(
+    Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 25_000 })),
+  ),
+});
+export type VoiceSessionEventsQuery = typeof VoiceSessionEventsQuery.Type;
+
+export const VoiceWebRtcOffer = Schema.Struct({
+  sessionId: VoiceSessionId,
+  leaseGeneration: PositiveInt,
+  sdp: VoiceSdp,
+});
+export type VoiceWebRtcOffer = typeof VoiceWebRtcOffer.Type;
+
+export const VoiceWebRtcAnswer = Schema.Struct({
+  sessionId: VoiceSessionId,
+  leaseGeneration: PositiveInt,
+  sdp: VoiceSdp,
+});
+export type VoiceWebRtcAnswer = typeof VoiceWebRtcAnswer.Type;
+
+export const VoiceTranscriptRole = Schema.Literals(["user", "assistant"]);
+export type VoiceTranscriptRole = typeof VoiceTranscriptRole.Type;
+
+export const VoiceToolName = Schema.Literals([
+  "list_projects",
+  "list_threads",
+  "get_thread_status",
+  "create_thread",
+  "send_thread_message",
+  "interrupt_thread",
+  "archive_thread",
+]);
+export type VoiceToolName = typeof VoiceToolName.Type;
+
+export const VoiceToolOutcome = Schema.Literals([
+  "pending-confirmation",
+  "approved",
+  "rejected",
+  "expired",
+  "succeeded",
+  "failed",
+]);
+export type VoiceToolOutcome = typeof VoiceToolOutcome.Type;
+
+const VoiceEventBase = {
+  sessionId: VoiceSessionId,
+  leaseGeneration: PositiveInt,
+  sequence: NonNegativeInt,
+  occurredAt: IsoDateTime,
+};
+
+export const VoiceSessionEvent = Schema.Union([
+  Schema.Struct({
+    ...VoiceEventBase,
+    type: Schema.Literal("state"),
+    phase: VoiceSessionPhase,
+  }),
+  Schema.Struct({
+    ...VoiceEventBase,
+    type: Schema.Literal("transcript"),
+    role: VoiceTranscriptRole,
+    text: TrimmedNonEmptyString,
+    final: Schema.Boolean,
+  }),
+  Schema.Struct({
+    ...VoiceEventBase,
+    type: Schema.Literal("tool"),
+    toolCallId: VoiceToolCallId,
+    tool: VoiceToolName,
+    outcome: VoiceToolOutcome,
+  }),
+  Schema.Struct({
+    ...VoiceEventBase,
+    type: Schema.Literal("confirmation-required"),
+    confirmationId: VoiceConfirmationId,
+    toolCallId: VoiceToolCallId,
+    tool: VoiceToolName,
+    summary: TrimmedNonEmptyString,
+    expiresAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    ...VoiceEventBase,
+    type: Schema.Literal("lease-fenced"),
+    replacementGeneration: PositiveInt,
+  }),
+  Schema.Struct({
+    ...VoiceEventBase,
+    type: Schema.Literal("rotation-required"),
+    reason: Schema.Literals(["duration-limit", "context-limit", "configuration-changed"]),
+  }),
+  Schema.Struct({
+    ...VoiceEventBase,
+    type: Schema.Literal("error"),
+    reason: TrimmedNonEmptyString,
+    recoverable: Schema.Boolean,
+  }),
+]);
+export type VoiceSessionEvent = typeof VoiceSessionEvent.Type;
+
+export const VoiceSessionEventsResult = Schema.Struct({
+  state: VoiceSessionState,
+  events: Schema.Array(VoiceSessionEvent),
+});
+export type VoiceSessionEventsResult = typeof VoiceSessionEventsResult.Type;
+
+export const VoiceConfirmationDecision = Schema.Literals(["approve", "reject"]);
+export type VoiceConfirmationDecision = typeof VoiceConfirmationDecision.Type;
+
+export const VoiceConfirmationInput = Schema.Struct({
+  decision: VoiceConfirmationDecision,
+});
+export type VoiceConfirmationInput = typeof VoiceConfirmationInput.Type;
+
+export const VoiceConfirmationResult = Schema.Struct({
+  confirmationId: VoiceConfirmationId,
+  toolCallId: VoiceToolCallId,
+  outcome: Schema.Literals(["approved", "rejected"]),
+});
+export type VoiceConfirmationResult = typeof VoiceConfirmationResult.Type;
+
+export const VoiceTranscriptionMetadata = Schema.Struct({
+  requestId: VoiceRequestId,
+  format: VoiceAudioFormat,
+  language: Schema.optionalKey(TrimmedNonEmptyString),
+  vocabulary: Schema.optionalKey(Schema.Array(TrimmedNonEmptyString)),
+});
+export type VoiceTranscriptionMetadata = typeof VoiceTranscriptionMetadata.Type;
+
+export const VoiceTranscriptionResult = Schema.Struct({
+  requestId: VoiceRequestId,
+  text: TrimmedNonEmptyString,
+  language: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type VoiceTranscriptionResult = typeof VoiceTranscriptionResult.Type;
+
+export const VoiceTranscriptionStreamEvent = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("delta"),
+    requestId: VoiceRequestId,
+    text: TrimmedNonEmptyString,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("final"),
+    result: VoiceTranscriptionResult,
+  }),
+]);
+export type VoiceTranscriptionStreamEvent = typeof VoiceTranscriptionStreamEvent.Type;
+
+export const VoiceSpeechRequest = Schema.Struct({
+  requestId: VoiceRequestId,
+  playbackId: VoicePlaybackId,
+  segmentIndex: NonNegativeInt,
+  finalSegment: Schema.Boolean,
+  text: TrimmedNonEmptyString,
+  preset: TrimmedNonEmptyString,
+});
+export type VoiceSpeechRequest = typeof VoiceSpeechRequest.Type;
+
+export const VoiceMediaTicketOperation = Schema.Literals([
+  "transcription-upload",
+  "speech-stream",
+  "voice-heartbeat",
+]);
+export type VoiceMediaTicketOperation = typeof VoiceMediaTicketOperation.Type;
+
+export const VoiceMediaTicketRequest = Schema.Struct({
+  operation: VoiceMediaTicketOperation,
+  requestId: Schema.optionalKey(VoiceRequestId),
+  sessionId: Schema.optionalKey(VoiceSessionId),
+});
+export type VoiceMediaTicketRequest = typeof VoiceMediaTicketRequest.Type;
+
+export const VoiceMediaTicket = Schema.Struct({
+  ticketId: VoiceMediaTicketId,
+  token: TrimmedNonEmptyString,
+  operation: VoiceMediaTicketOperation,
+  expiresAt: IsoDateTime,
+});
+export type VoiceMediaTicket = typeof VoiceMediaTicket.Type;
+
+export const VoicePublicErrorReason = Schema.Literals([
+  "disabled",
+  "not-configured",
+  "unsupported-media",
+  "payload-too-large",
+  "duration-limit",
+  "quota-exceeded",
+  "conversation-not-found",
+  "session-not-found",
+  "takeover-required",
+  "lease-conflict",
+  "invalid-phase",
+  "provider-unavailable",
+  "confirmation-expired",
+  "authorization-revoked",
+]);
+export type VoicePublicErrorReason = typeof VoicePublicErrorReason.Type;
+
+export const VoicePublicError = Schema.Struct({
+  reason: VoicePublicErrorReason,
+  message: TrimmedNonEmptyString,
+  requestId: Schema.optionalKey(VoiceRequestId),
+  sessionId: Schema.optionalKey(VoiceSessionId),
+  retryable: Schema.Boolean,
+});
+export type VoicePublicError = typeof VoicePublicError.Type;

@@ -60,7 +60,6 @@ import {
   HttpClient,
   HttpClientRequest,
   HttpClientResponse,
-  HttpRouter,
   HttpServer,
 } from "effect/unstable/http";
 import { OtlpSerialization, OtlpTracer } from "effect/unstable/observability";
@@ -71,7 +70,7 @@ import { vi } from "vite-plus/test";
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
 
 import * as ServerConfig from "./config.ts";
-import { makeRoutesLayer } from "./server.ts";
+import { makeServedRoutesLayer } from "./server.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -520,7 +519,7 @@ const buildAppUnderTest = (options?: {
         })
       : VcsStatusBroadcaster.layer.pipe(Layer.provide(gitWorkflowLayer));
 
-    const servedRoutesLayer = HttpRouter.serve(makeRoutesLayer, {
+    const servedRoutesLayer = makeServedRoutesLayer({
       disableListenLog: true,
       disableLogger: true,
     }).pipe(
@@ -803,6 +802,7 @@ const buildAppUnderTest = (options?: {
       Layer.provideMerge(ServerSecretStore.layer),
       Layer.provide(workspaceAndProjectServicesLayer),
       Layer.provideMerge(FetchHttpClient.layer),
+      Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provide(layerConfig),
     );
 
@@ -922,7 +922,7 @@ const exchangeAccessToken = (
         requested_token_type: AuthAccessTokenType,
         scope:
           options?.scope ??
-          "orchestration:read orchestration:operate terminal:operate review:write relay:read access:read access:write relay:write",
+          "orchestration:read orchestration:operate terminal:operate review:write relay:read voice:use access:read access:write relay:write voice:manage",
         ...(options?.clientMetadata?.label ? { client_label: options.clientMetadata.label } : {}),
         ...(options?.clientMetadata?.deviceType
           ? { client_device_type: options.clientMetadata.deviceType }
@@ -1200,9 +1200,11 @@ const assertBrowserApiCorsPreflightHeaders = (
 ) => {
   assertBrowserApiCorsResponseHeaders(headers, options);
   assert.deepEqual(splitHeaderTokens(headers["access-control-allow-methods"] ?? null), [
+    "DELETE",
     "GET",
     "OPTIONS",
     "POST",
+    "PUT",
   ]);
   assert.deepEqual(splitHeaderTokens(headers["access-control-allow-headers"]), [
     "authorization",
@@ -1210,6 +1212,7 @@ const assertBrowserApiCorsPreflightHeaders = (
     "content-type",
     "dpop",
     "traceparent",
+    "x-t3-voice-ticket",
   ]);
 };
 const crossOriginClientOrigin = "http://remote-client.test:3773";
@@ -1366,7 +1369,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(tokenBody.token_type, "Bearer");
       assert.equal(
         tokenBody.scope,
-        "orchestration:read orchestration:operate terminal:operate review:write relay:read access:read access:write relay:write",
+        "orchestration:read orchestration:operate terminal:operate review:write relay:read voice:use access:read access:write relay:write voice:manage",
       );
       assert.equal(typeof tokenBody.access_token, "string");
 
@@ -1391,10 +1394,101 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         "terminal:operate",
         "review:write",
         "relay:read",
+        "voice:use",
         "access:read",
         "access:write",
         "relay:write",
+        "voice:manage",
       ]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rejects a voice media ticket used for a different request", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({
+        layers: {
+          serverSettings: {
+            getSettings: Effect.succeed({
+              ...DEFAULT_SERVER_SETTINGS,
+              voice: { ...DEFAULT_SERVER_SETTINGS.voice, enabled: true },
+            }),
+          },
+        },
+      });
+      const cookie = yield* getAuthenticatedSessionCookieHeader();
+      const ticketResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/voice/media-tickets"),
+        {
+          method: "POST",
+          headers: { cookie, "content-type": "application/json" },
+          body: jsonRequestBody({ operation: "speech-stream", requestId: "voice-request-a" }),
+        },
+      );
+      const ticket = yield* responseJsonEffect<{ readonly token: string }>(ticketResponse);
+      assert.equal(ticketResponse.status, 200);
+
+      const speechResponse = yield* fetchEffect(yield* getHttpServerUrl("/api/voice/speech"), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-t3-voice-ticket": ticket.token,
+        },
+        body: jsonRequestBody({
+          requestId: "voice-request-b",
+          playbackId: "voice-playback-1",
+          segmentIndex: 0,
+          finalSegment: true,
+          text: "This request must not be authorized.",
+          preset: "default",
+        }),
+      });
+
+      assert.equal(speechResponse.status, 401);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("consumes a voice media ticket before rejecting an invalid request body", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({
+        layers: {
+          serverSettings: {
+            getSettings: Effect.succeed({
+              ...DEFAULT_SERVER_SETTINGS,
+              voice: { ...DEFAULT_SERVER_SETTINGS.voice, enabled: true },
+            }),
+          },
+        },
+      });
+      const cookie = yield* getAuthenticatedSessionCookieHeader();
+      const ticketResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/voice/media-tickets"),
+        {
+          method: "POST",
+          headers: { cookie, "content-type": "application/json" },
+          body: jsonRequestBody({ operation: "speech-stream", requestId: "voice-request-replay" }),
+        },
+      );
+      const ticket = yield* responseJsonEffect<{ readonly token: string }>(ticketResponse);
+      assert.equal(ticketResponse.status, 200);
+
+      const speechUrl = yield* getHttpServerUrl("/api/voice/speech");
+      const headers = {
+        "content-type": "application/json",
+        "x-t3-voice-ticket": ticket.token,
+      };
+      const first = yield* fetchEffect(speechUrl, {
+        method: "POST",
+        headers,
+        body: jsonRequestBody({}),
+      });
+      const replay = yield* fetchEffect(speechUrl, {
+        method: "POST",
+        headers,
+        body: jsonRequestBody({}),
+      });
+
+      assert.equal(first.status, 400);
+      assert.equal(replay.status, 401);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -3970,9 +4064,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(response.status, 204);
       assert.equal(response.headers["access-control-allow-origin"], "*");
       assert.deepEqual(splitHeaderTokens(response.headers["access-control-allow-methods"]), [
+        "DELETE",
         "GET",
         "OPTIONS",
         "POST",
+        "PUT",
       ]);
       assert.deepEqual(splitHeaderTokens(response.headers["access-control-allow-headers"]), [
         "authorization",
@@ -3980,6 +4076,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         "content-type",
         "dpop",
         "traceparent",
+        "x-t3-voice-ticket",
       ]);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );

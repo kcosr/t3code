@@ -16,6 +16,7 @@ import {
 import { useThemeColor } from "../lib/useThemeColor";
 import { cn } from "../lib/cn";
 import { AppText as Text } from "./AppText";
+import { platformSymbolName } from "./platformSymbolName";
 
 export const COMPOSER_TOOLBAR_CONTROL_HEIGHT = 44;
 export const COMPOSER_TOOLBAR_GAP = 8;
@@ -216,7 +217,12 @@ export function ComposerToolbarButton(props: {
       {props.iconNode ? (
         <View className="h-4 w-4 items-center justify-center">{props.iconNode}</View>
       ) : props.icon ? (
-        <SymbolView name={props.icon} size={16} tintColor={iconTintColor} type="monochrome" />
+        <SymbolView
+          name={platformSymbolName(props.icon)}
+          size={16}
+          tintColor={iconTintColor}
+          type="monochrome"
+        />
       ) : null}
       {props.label ? (
         <Text
@@ -236,7 +242,12 @@ export function ComposerToolbarButton(props: {
         </Text>
       ) : null}
       {props.showChevron === false ? null : (
-        <SymbolView name="chevron.down" size={11} tintColor={iconTintColor} type="monochrome" />
+        <SymbolView
+          name={platformSymbolName("chevron.down")}
+          size={11}
+          tintColor={iconTintColor}
+          type="monochrome"
+        />
       )}
     </Pressable>
   );

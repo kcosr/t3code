@@ -8,6 +8,8 @@ import {
   AuthRelayWriteScope,
   AuthReviewWriteScope,
   AuthTerminalOperateScope,
+  AuthVoiceManageScope,
+  AuthVoiceUseScope,
   EnvironmentAuthInvalidError,
   type EnvironmentAuthInvalidReason,
   EnvironmentHttpApi,
@@ -171,6 +173,25 @@ export const requireEnvironmentScope = Effect.fn("environment.auth.requireScope"
   return session;
 });
 
+export const authenticateRawRouteWithScope = Effect.fn(
+  "environment.auth.authenticateRawRouteWithScope",
+)(function* (scope: AuthEnvironmentScope) {
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+  const session = yield* serverAuth.authenticateHttpRequest(request).pipe(
+    Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, (error) =>
+      failEnvironmentAuthInvalid(EnvironmentAuth.serverAuthCredentialReason(error)),
+    ),
+    Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+      failEnvironmentInternal("internal_error", error),
+    ),
+  );
+  if (!session.scopes.includes(scope)) {
+    return yield* failEnvironmentScopeRequired(scope);
+  }
+  return session;
+});
+
 export const environmentAuthenticatedAuthLayer = Layer.effect(
   EnvironmentAuthenticatedAuth,
   Effect.gen(function* () {
@@ -271,6 +292,8 @@ export const authHttpApiLayer = HttpApiBuilder.group(
                       AuthAccessWriteScope,
                       AuthRelayReadScope,
                       AuthRelayWriteScope,
+                      AuthVoiceUseScope,
+                      AuthVoiceManageScope,
                     ]),
                   });
             if (requestedScopes === null) {

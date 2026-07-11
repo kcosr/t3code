@@ -1,7 +1,8 @@
 # Documentation
 
 - [Getting started](./getting-started/quick-start.md)
-- [Architecture](./architecture/overview.md)
+- [Architecture](./architecture/overview.md), including [voice](./architecture/voice.md) and the
+  [Pi provider design](./architecture/pi-provider.md)
 - [T3 Connect](./cloud/t3-connect-clerk.md)
 - [Integrations](./integrations/source-control-providers.md)
 - [Mobile](./mobile/app.md)

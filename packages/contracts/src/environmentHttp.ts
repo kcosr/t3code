@@ -24,7 +24,14 @@ import {
   AuthWebSocketTicketResult,
   ServerAuthSessionMethod,
 } from "./auth.ts";
-import { AuthSessionId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  AuthSessionId,
+  ThreadId,
+  TrimmedNonEmptyString,
+  VoiceConversationId,
+  VoiceConfirmationId,
+  VoiceSessionId,
+} from "./baseSchemas.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import {
   ClientOrchestrationCommand,
@@ -42,6 +49,29 @@ import {
   RelayEnvironmentMintResponse,
   RelayLinkProofRequest,
 } from "./relay.ts";
+import {
+  VoiceCapabilities,
+  VoiceConfirmationInput,
+  VoiceConfirmationResult,
+  VoiceCredentialSetInput,
+  VoiceCredentialStatus,
+  VoiceConversationClearContextResult,
+  VoiceConversationCreateInput,
+  VoiceConversationDeleteResult,
+  VoiceConversationSummary,
+  VoiceMediaTicket,
+  VoiceMediaTicketRequest,
+  VoicePublicErrorReason,
+  VoiceSessionCloseResult,
+  VoiceSessionCreateInput,
+  VoiceSessionCreateResult,
+  VoiceSessionEventsQuery,
+  VoiceSessionEventsResult,
+  VoiceSessionLeaseInput,
+  VoiceSessionState,
+  VoiceWebRtcAnswer,
+  VoiceWebRtcOffer,
+} from "./voice.ts";
 
 const OptionalBearerHeaders = Schema.Struct({
   authorization: Schema.optionalKey(Schema.String),
@@ -56,6 +86,7 @@ export const EnvironmentRequestInvalidReason = Schema.Literals([
   "invalid_scope",
   "scope_not_granted",
   "invalid_command",
+  "invalid_voice_media_binding",
 ]);
 export type EnvironmentRequestInvalidReason = typeof EnvironmentRequestInvalidReason.Type;
 
@@ -99,6 +130,22 @@ export class EnvironmentRequestInvalidError extends Schema.TaggedErrorClass<Envi
 ) {
   [HttpServerRespondable.symbol]() {
     return HttpServerResponse.schemaJson(EnvironmentRequestInvalidError)(this, { status: 400 });
+  }
+}
+
+export class EnvironmentVoiceOperationError extends Schema.TaggedErrorClass<EnvironmentVoiceOperationError>()(
+  "EnvironmentVoiceOperationError",
+  {
+    code: Schema.Literal("voice_operation_failed"),
+    reason: VoicePublicErrorReason,
+    message: TrimmedNonEmptyString,
+    retryable: Schema.Boolean,
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 409 },
+) {
+  [HttpServerRespondable.symbol]() {
+    return HttpServerResponse.schemaJson(EnvironmentVoiceOperationError)(this, { status: 409 });
   }
 }
 
@@ -158,7 +205,10 @@ export class EnvironmentInternalError extends Schema.TaggedErrorClass<Environmen
   }
 }
 
-export const EnvironmentResourceNotFoundReason = Schema.Literals(["thread_not_found"]);
+export const EnvironmentResourceNotFoundReason = Schema.Literals([
+  "thread_not_found",
+  "voice_conversation_not_found",
+]);
 export type EnvironmentResourceNotFoundReason = typeof EnvironmentResourceNotFoundReason.Type;
 
 export class EnvironmentResourceNotFoundError extends Schema.TaggedErrorClass<EnvironmentResourceNotFoundError>()(
@@ -276,6 +326,10 @@ const EnvironmentTokenExchangeErrors = [
 const EnvironmentScopedOperationErrors = [
   EnvironmentScopeRequiredError,
   EnvironmentInternalError,
+] as const;
+const EnvironmentVoiceMediaTicketErrors = [
+  EnvironmentRequestInvalidError,
+  ...EnvironmentScopedOperationErrors,
 ] as const;
 const EnvironmentPairingCredentialErrors = [
   EnvironmentRequestInvalidError,
@@ -489,6 +543,164 @@ export class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestr
     }).middleware(EnvironmentAuthenticatedAuth),
   ) {}
 
+export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
+  .add(
+    HttpApiEndpoint.post("createSession", "/api/voice/sessions", {
+      headers: OptionalBearerHeaders,
+      payload: VoiceSessionCreateInput,
+      success: VoiceSessionCreateResult,
+      error: [...EnvironmentScopedOperationErrors, EnvironmentVoiceOperationError],
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("getSession", "/api/voice/sessions/:sessionId", {
+      headers: OptionalBearerHeaders,
+      params: Schema.Struct({ sessionId: VoiceSessionId }),
+      success: VoiceSessionState,
+      error: [...EnvironmentScopedOperationErrors, EnvironmentVoiceOperationError],
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("heartbeatSession", "/api/voice/sessions/:sessionId/heartbeat", {
+      headers: OptionalBearerHeaders,
+      params: Schema.Struct({ sessionId: VoiceSessionId }),
+      payload: VoiceSessionLeaseInput,
+      success: VoiceSessionState,
+      error: [...EnvironmentScopedOperationErrors, EnvironmentVoiceOperationError],
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.delete("closeSession", "/api/voice/sessions/:sessionId", {
+      headers: OptionalBearerHeaders,
+      params: Schema.Struct({ sessionId: VoiceSessionId }),
+      payload: VoiceSessionLeaseInput,
+      success: VoiceSessionCloseResult,
+      error: [...EnvironmentScopedOperationErrors, EnvironmentVoiceOperationError],
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("offerSession", "/api/voice/sessions/:sessionId/webrtc-offer", {
+      headers: OptionalBearerHeaders,
+      params: Schema.Struct({ sessionId: VoiceSessionId }),
+      payload: VoiceWebRtcOffer,
+      success: VoiceWebRtcAnswer,
+      error: [...EnvironmentScopedOperationErrors, EnvironmentVoiceOperationError],
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("sessionEvents", "/api/voice/sessions/:sessionId/events", {
+      headers: OptionalBearerHeaders,
+      params: Schema.Struct({ sessionId: VoiceSessionId }),
+      query: VoiceSessionEventsQuery,
+      success: VoiceSessionEventsResult,
+      error: [...EnvironmentScopedOperationErrors, EnvironmentVoiceOperationError],
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "decideVoiceConfirmation",
+      "/api/voice/sessions/:sessionId/confirmations/:confirmationId",
+      {
+        headers: OptionalBearerHeaders,
+        params: Schema.Struct({
+          sessionId: VoiceSessionId,
+          confirmationId: VoiceConfirmationId,
+        }),
+        payload: VoiceConfirmationInput,
+        success: VoiceConfirmationResult,
+        error: [...EnvironmentScopedOperationErrors, EnvironmentVoiceOperationError],
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("createConversation", "/api/voice/conversations", {
+      headers: OptionalBearerHeaders,
+      payload: VoiceConversationCreateInput,
+      success: VoiceConversationSummary,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("listConversations", "/api/voice/conversations", {
+      headers: OptionalBearerHeaders,
+      success: Schema.Array(VoiceConversationSummary),
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("getConversation", "/api/voice/conversations/:conversationId", {
+      headers: OptionalBearerHeaders,
+      params: Schema.Struct({ conversationId: VoiceConversationId }),
+      success: VoiceConversationSummary,
+      error: [
+        EnvironmentScopeRequiredError,
+        EnvironmentResourceNotFoundError,
+        EnvironmentInternalError,
+      ],
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.delete("deleteConversation", "/api/voice/conversations/:conversationId", {
+      headers: OptionalBearerHeaders,
+      params: Schema.Struct({ conversationId: VoiceConversationId }),
+      success: VoiceConversationDeleteResult,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "clearConversationContext",
+      "/api/voice/conversations/:conversationId/clear-context",
+      {
+        headers: OptionalBearerHeaders,
+        params: Schema.Struct({ conversationId: VoiceConversationId }),
+        success: VoiceConversationClearContextResult,
+        error: [
+          EnvironmentScopeRequiredError,
+          EnvironmentResourceNotFoundError,
+          EnvironmentInternalError,
+        ],
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("capabilities", "/api/voice/capabilities", {
+      headers: OptionalBearerHeaders,
+      success: VoiceCapabilities,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("mediaTicket", "/api/voice/media-tickets", {
+      headers: OptionalBearerHeaders,
+      payload: VoiceMediaTicketRequest,
+      success: VoiceMediaTicket,
+      error: EnvironmentVoiceMediaTicketErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("credentialStatus", "/api/voice/credentials", {
+      headers: OptionalBearerHeaders,
+      success: VoiceCredentialStatus,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.put("setCredential", "/api/voice/credentials", {
+      headers: OptionalBearerHeaders,
+      payload: VoiceCredentialSetInput,
+      success: VoiceCredentialStatus,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.delete("clearCredential", "/api/voice/credentials", {
+      headers: OptionalBearerHeaders,
+      success: VoiceCredentialStatus,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  ) {}
+
 export class EnvironmentConnectHttpApi extends HttpApiGroup.make("connect")
   .add(
     HttpApiEndpoint.post("linkProof", "/api/connect/link-proof", {
@@ -554,4 +766,5 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentMetadataHttpApi)
   .add(EnvironmentAuthHttpApi)
   .add(EnvironmentOrchestrationHttpApi)
+  .add(EnvironmentVoiceHttpApi)
   .add(EnvironmentConnectHttpApi) {}

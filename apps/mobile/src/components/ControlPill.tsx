@@ -6,6 +6,7 @@ import { useThemeColor } from "../lib/useThemeColor";
 
 import { cn } from "../lib/cn";
 import { AppText as Text } from "./AppText";
+import { platformSymbolName } from "./platformSymbolName";
 
 export function ControlPill(props: {
   readonly icon?: ComponentProps<typeof SymbolView>["name"];
@@ -67,7 +68,12 @@ export function ControlPill(props: {
       {props.iconNode ? (
         <View className="h-4 w-4 items-center justify-center">{props.iconNode}</View>
       ) : props.icon ? (
-        <SymbolView name={props.icon} size={16} tintColor={iconTintColor} type="monochrome" />
+        <SymbolView
+          name={platformSymbolName(props.icon)}
+          size={16}
+          tintColor={iconTintColor}
+          type="monochrome"
+        />
       ) : null}
       {props.label ? <Text className={labelClassName}>{props.label}</Text> : null}
     </Pressable>

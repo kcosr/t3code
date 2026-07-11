@@ -7,7 +7,7 @@ import * as Layer from "effect/Layer";
 import { createDpopProof, loadOrCreateDpopProofKeyPair } from "./dpop";
 import { managedRelayAccessTokenStore } from "./managedRelayTokenStore";
 
-const relayDpopSignerLayer = Layer.effect(
+export const relayDpopSignerLayer = Layer.effect(
   ManagedRelay.ManagedRelayDpopSigner,
   Effect.gen(function* () {
     const crypto = yield* Crypto.Crypto;

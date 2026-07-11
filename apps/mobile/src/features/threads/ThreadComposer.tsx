@@ -18,6 +18,7 @@ import type { ReactNode } from "react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
   ActivityIndicator,
+  Alert,
   Image,
   Pressable,
   useColorScheme,
@@ -62,6 +63,8 @@ import {
 } from "../../lib/providerOptions";
 import { useComposerPathSearch } from "../../state/use-composer-path-search";
 import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerCommandPopover";
+import { useComposerDictation } from "../voice/useComposerDictation";
+import { useRealtimeVoice } from "../voice/useRealtimeVoice";
 
 /**
  * Height of the collapsed composer (pill + vertical padding, excluding safe-area inset).
@@ -108,6 +111,12 @@ export interface ThreadComposerProps {
   readonly onUpdateInteractionMode: (interactionMode: ProviderInteractionMode) => void;
   readonly onReconnectEnvironment: () => void;
   readonly onExpandedChange?: (expanded: boolean) => void;
+  readonly speechPlayback: {
+    readonly available: boolean;
+    readonly enabled: boolean;
+    readonly playing: boolean;
+    readonly onToggle: () => void;
+  };
 }
 
 /**
@@ -259,9 +268,47 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const { onExpandedChange } = props;
 
   const [previewImageUri, setPreviewImageUri] = useState<string | null>(null);
+  const dictation = useComposerDictation({
+    environmentId: props.environmentId,
+    scopeKey: props.selectedThread.id,
+    draftMessage: props.draftMessage,
+    onChangeDraftMessage: props.onChangeDraftMessage,
+  });
+  const realtimeVoice = useRealtimeVoice({
+    environmentId: props.environmentId,
+    projectId: props.selectedThread.projectId,
+    threadId: props.selectedThread.id,
+  });
+  const realtimeInUse =
+    realtimeVoice.phase === "active" ||
+    realtimeVoice.phase === "starting" ||
+    realtimeVoice.phase === "stopping";
+  const handleRealtimeToggle = useCallback(() => {
+    if (realtimeInUse) {
+      realtimeVoice.onToggle();
+      return;
+    }
+    if (props.speechPlayback.enabled) props.speechPlayback.onToggle();
+    if (dictation.phase === "recording") {
+      void dictation.cancel().finally(realtimeVoice.onToggle);
+      return;
+    }
+    realtimeVoice.onToggle();
+  }, [dictation, props.speechPlayback, realtimeInUse, realtimeVoice]);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
   const canSend = hasContent;
+
+  useEffect(() => {
+    if (dictation.error !== null) {
+      Alert.alert("Voice input failed", dictation.error);
+    }
+  }, [dictation.error]);
+  useEffect(() => {
+    if (realtimeVoice.error !== null) {
+      Alert.alert("Voice conversation failed", realtimeVoice.error);
+    }
+  }, [realtimeVoice.error]);
 
   const onPressImage = useCallback(
     (uri: string) => {
@@ -815,6 +862,24 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
             <Animated.View entering={FadeIn.duration(180)} exiting={FadeOut.duration(100)}>
               {showStopAction ? (
                 <ControlPill icon="stop.fill" variant="danger" onPress={props.onStopThread} />
+              ) : realtimeInUse ? (
+                <ControlPill
+                  icon="phone.down.fill"
+                  variant="danger"
+                  onPress={handleRealtimeToggle}
+                />
+              ) : dictation.phase === "recording" ? (
+                <ControlPill
+                  icon="stop.fill"
+                  variant="danger"
+                  onPress={() => void dictation.stop()}
+                />
+              ) : !canSend && dictation.available ? (
+                <ControlPill
+                  icon="microphone.fill"
+                  disabled={dictation.phase === "transcribing"}
+                  onPress={() => void dictation.start()}
+                />
               ) : (
                 <ControlPill
                   icon="arrow.up"
@@ -840,6 +905,57 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                   onPress={() => void props.onPickDraftImages()}
                   showChevron={false}
                 />
+                {dictation.available && !realtimeInUse ? (
+                  <ComposerToolbarButton
+                    accessibilityLabel={
+                      dictation.phase === "recording" ? "Stop dictation" : "Start dictation"
+                    }
+                    icon={dictation.phase === "recording" ? "stop.fill" : "microphone.fill"}
+                    variant={dictation.phase === "recording" ? "danger" : "default"}
+                    disabled={dictation.phase === "transcribing"}
+                    onPress={() =>
+                      void (dictation.phase === "recording" ? dictation.stop() : dictation.start())
+                    }
+                    showChevron={false}
+                  />
+                ) : null}
+                {props.speechPlayback.available && !realtimeInUse ? (
+                  <ComposerToolbarButton
+                    accessibilityLabel={
+                      props.speechPlayback.enabled ? "Disable spoken responses" : "Speak responses"
+                    }
+                    icon={
+                      props.speechPlayback.enabled ? "speaker.wave.2.fill" : "speaker.slash.fill"
+                    }
+                    active={props.speechPlayback.enabled}
+                    onPress={props.speechPlayback.onToggle}
+                    showChevron={false}
+                  />
+                ) : null}
+                {realtimeVoice.available ? (
+                  <ComposerToolbarButton
+                    accessibilityLabel={
+                      realtimeInUse ? "End voice conversation" : "Start voice conversation"
+                    }
+                    icon={realtimeInUse ? "phone.down.fill" : "waveform.circle.fill"}
+                    variant={realtimeInUse ? "danger" : "default"}
+                    active={realtimeVoice.phase === "active"}
+                    disabled={realtimeVoice.phase === "stopping"}
+                    onPress={handleRealtimeToggle}
+                    showChevron={false}
+                  />
+                ) : null}
+                {realtimeVoice.phase === "active" ? (
+                  <ComposerToolbarButton
+                    accessibilityLabel={
+                      realtimeVoice.muted ? "Unmute microphone" : "Mute microphone"
+                    }
+                    icon={realtimeVoice.muted ? "mic.slash.fill" : "mic.fill"}
+                    active={realtimeVoice.muted}
+                    onPress={realtimeVoice.onToggleMuted}
+                    showChevron={false}
+                  />
+                ) : null}
                 <ControlPillMenu
                   actions={modelMenuActions}
                   onPressAction={({ nativeEvent }) => handleModelMenuAction(nativeEvent.event)}

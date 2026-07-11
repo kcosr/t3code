@@ -219,7 +219,7 @@ const config: ExpoConfig = {
       },
     ],
     "./plugins/withIosSceneLifecycle.cjs",
-    "./plugins/withAndroidCleartextTraffic.cjs",
+    "./plugins/withAndroidNetworkSecurity.cjs",
   ],
   extra: {
     appVariant: APP_VARIANT,
