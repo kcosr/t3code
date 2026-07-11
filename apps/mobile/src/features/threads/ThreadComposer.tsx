@@ -857,7 +857,19 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
             </View>
           ) : null}
           {!isExpanded ? (
-            <Animated.View entering={FadeIn.duration(180)} exiting={FadeOut.duration(100)}>
+            <Animated.View
+              className="flex-row gap-2"
+              entering={FadeIn.duration(180)}
+              exiting={FadeOut.duration(100)}
+            >
+              {realtimeInUse && dictation.available ? (
+                <ControlPill
+                  icon="microphone.fill"
+                  accessibilityLabel="Switch from realtime voice to dictation"
+                  disabled={dictation.phase === "transcribing"}
+                  onPress={() => void toggleDictation()}
+                />
+              ) : null}
               {showStopAction ? (
                 <ControlPill icon="stop.fill" variant="danger" onPress={props.onStopThread} />
               ) : dictation.phase === "recording" ? (
@@ -866,7 +878,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                   variant="danger"
                   onPress={() => void toggleDictation()}
                 />
-              ) : !canSend && dictation.available ? (
+              ) : !realtimeInUse && !canSend && dictation.available ? (
                 <ControlPill
                   icon="microphone.fill"
                   disabled={dictation.phase === "transcribing"}

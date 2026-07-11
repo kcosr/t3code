@@ -531,6 +531,7 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       sessionConfig as {
         readonly tools: ReadonlyArray<{
           readonly name: string;
+          readonly description: string;
           readonly parameters: Record<string, unknown>;
         }>;
       }
@@ -549,6 +550,9 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       "create_thread",
       "send_thread_message",
     ]);
+    expect(configuredTools.find((tool) => tool.name === "create_thread")?.description).toContain(
+      "does not mean downstream initialization is complete",
+    );
     expect(
       configuredTools.find((tool) => tool.name === "search_history")?.parameters,
     ).toMatchObject({

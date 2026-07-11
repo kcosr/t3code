@@ -31,7 +31,8 @@ provider control events.
 - Realtime tools execute only on the T3 server against the existing orchestration services.
 - Voice tools are a narrow allowlist. No shell, terminal, filesystem, git, or arbitrary MCP tool is
   exposed in the initial implementation.
-- Mutating voice tools require a server-enforced confirmation handshake.
+- Mutating voice tools use a server-enforced interaction policy: create/send dispatch immediately
+  with durable idempotency, while interrupt/archive require confirmation.
 - No standard provider API credential is delivered to a client.
 - Raw audio is not persisted by default.
 - Voice sessions are not provider coding sessions. They are short-lived control sessions that can
@@ -286,8 +287,8 @@ Tool execution also checks the scope required by the underlying operation on eve
 
 - read tools require `orchestration:read`;
 - mutating tools require `orchestration:operate`;
-- voice confirmation does not add authority; it only satisfies the interaction policy for an
-  already-authorized operation.
+- voice confirmation does not add authority; for confirmation-gated operations it only satisfies
+  the interaction policy for an already-authorized operation.
 
 The authenticated session ID and immutable granted scopes are captured in the T3 voice session.
 They are not accepted from a client payload or provider tool arguments. `VoiceSessionRegistry`
@@ -626,8 +627,8 @@ is a convenience, not a permanently blocking HTTP request.
 ### Confirmation policy
 
 - Read tools execute immediately.
-- `create_thread` and `send_thread_message` require confirmation unless the user explicitly enabled
-  a future trusted voice-write policy.
+- `create_thread` and `send_thread_message` dispatch immediately with deterministic command IDs and
+  durable idempotency. Their receipts report accepted dispatch metadata, not downstream completion.
 - `interrupt_thread` and `archive_thread` always require confirmation in the initial release.
 - Confirmation enforcement is server code, not prompt text.
 - T3 holds the completed provider function call without submitting output while confirmation is
@@ -1059,7 +1060,8 @@ Acceptance criteria:
 
 Acceptance criteria:
 
-- No mutating tool executes without valid server-side confirmation.
+- Create and send execute immediately with deterministic durable deduplication; interrupt and
+  archive require valid server-side confirmation.
 - Duplicate provider calls and confirmation replays do not duplicate orchestration commands.
 
 ### 7. Hardening and cross-platform readiness

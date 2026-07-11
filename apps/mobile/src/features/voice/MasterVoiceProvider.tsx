@@ -32,6 +32,10 @@ import { uuidv4 } from "../../lib/uuid";
 import { usePreparedConnection } from "../../state/session";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import {
+  acknowledgeClientActionWithRetry,
+  clientActionAcknowledgementInput,
+} from "./clientActionAcknowledgement";
+import {
   MasterVoiceCallBar,
   VoiceAudioRoutePicker,
   VoiceTranscriptModal,
@@ -187,28 +191,15 @@ export function MasterVoiceProvider(props: {
       const runtime = runtimeRef.current;
       if (runtime === null) return;
       const expiresAtMillis = Date.parse(event.expiresAt);
-      let retryDelayMillis = 250;
-      while (
-        runtimeRef.current === runtime &&
-        pendingClientActionsRef.current.has(event.actionId) &&
-        Date.now() < expiresAtMillis
-      ) {
-        try {
-          await runtime.controller.acknowledgeClientAction(event.actionId, {
-            outcome,
-            ...(message === undefined ? {} : { message: message.slice(0, 240) }),
-          });
-          pendingClientActionsRef.current.delete(event.actionId);
-          return;
-        } catch {
-          const remainingMillis = expiresAtMillis - Date.now();
-          if (remainingMillis <= 0) break;
-          await new Promise((resolve) =>
-            setTimeout(resolve, Math.min(retryDelayMillis, remainingMillis)),
-          );
-          retryDelayMillis = Math.min(retryDelayMillis * 2, 1_000);
-        }
-      }
+      await acknowledgeClientActionWithRetry({
+        expiresAtMillis,
+        acknowledge: async (input) => {
+          await runtime.controller.acknowledgeClientAction(event.actionId, input);
+        },
+        input: clientActionAcknowledgementInput(outcome, message),
+        shouldContinue: () =>
+          runtimeRef.current === runtime && pendingClientActionsRef.current.has(event.actionId),
+      });
       pendingClientActionsRef.current.delete(event.actionId);
     },
     [],
@@ -399,13 +390,11 @@ export function MasterVoiceProvider(props: {
         await Promise.all(
           actions.map((action) => acknowledgeClientAction(action, "failed", errorMessage(cause))),
         );
-        if (actions.length === 0) {
-          await runtime.controller.stop();
-          Alert.alert(
-            "Voice conversation ended",
-            `Could not update thread focus. ${errorMessage(cause)}`,
-          );
-        }
+        await runtime.controller.stop();
+        Alert.alert(
+          "Voice conversation ended",
+          `Could not update thread focus. ${errorMessage(cause)}`,
+        );
       });
   }, [acknowledgeClientAction, props.focus]);
 

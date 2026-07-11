@@ -286,7 +286,7 @@ export function MasterVoiceCallBar(props: {
         </>
       ) : null}
       <ControlPill
-        icon={props.snapshot.phase === "error" ? "xmark" : "phone.down.fill"}
+        icon={props.snapshot.phase === "error" ? "xmark" : "stop.fill"}
         accessibilityLabel={
           props.snapshot.phase === "error" ? "Dismiss voice error" : "End voice session"
         }

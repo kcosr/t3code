@@ -296,7 +296,8 @@ const REALTIME_TOOLS = [
   {
     type: "function",
     name: "create_thread",
-    description: "Create a thread in a T3 project.",
+    description:
+      "Dispatch creation of a T3 thread immediately and return accepted command metadata. The receipt does not mean downstream initialization is complete.",
     parameters: {
       type: "object",
       properties: { projectId: { type: "string" }, title: { type: "string" } },
