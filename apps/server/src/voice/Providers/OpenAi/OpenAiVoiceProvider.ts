@@ -325,6 +325,11 @@ const logHttpFailure = (operation: string, cause: unknown) =>
       : {}),
   });
 
+const isTransientNegotiationFailure = (cause: unknown): boolean =>
+  HttpClientError.isHttpClientError(cause) &&
+  cause.response !== undefined &&
+  (cause.response.status === 502 || cause.response.status === 503 || cause.response.status === 504);
+
 const safeOperationalValue = (value: unknown): string | undefined =>
   typeof value === "string" && /^[A-Za-z0-9._:/[\]-]{1,128}$/.test(value) ? value : undefined;
 
@@ -771,6 +776,7 @@ const make = Effect.gen(function* () {
         .pipe(
           Effect.flatMap(HttpClientResponse.filterStatusOk),
           Effect.tapError((cause) => logHttpFailure("openai.realtime.negotiate", cause)),
+          Effect.retry({ times: 2, while: isTransientNegotiationFailure }),
           Effect.mapError(providerError("openai.realtime.negotiate")),
         );
       const providerRealtimeCallId = response.headers.location?.split("/").at(-1);

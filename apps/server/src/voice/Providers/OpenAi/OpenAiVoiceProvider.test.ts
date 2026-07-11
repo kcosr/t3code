@@ -304,6 +304,7 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
     const httpRequests: Array<{ readonly url: string; readonly authorization?: string }> = [];
     let sessionConfig: unknown;
     let offerSdp = "";
+    let negotiationAttempts = 0;
     const httpClient = HttpClient.make((request) =>
       Effect.sync(() => {
         httpRequests.push({
@@ -313,6 +314,10 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
             : { authorization: request.headers.authorization }),
         });
         if (request.url.endsWith("/v1/realtime/calls")) {
+          negotiationAttempts += 1;
+          if (negotiationAttempts === 1) {
+            return HttpClientResponse.fromWeb(request, new Response(null, { status: 504 }));
+          }
           expect(request.body._tag).toBe("FormData");
           if (request.body._tag === "FormData") {
             const formData = request.body.formData;
@@ -584,6 +589,7 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
     yield* session.terminate;
     yield* session.terminate;
     expect(httpRequests).toEqual([
+      { url: "https://api.openai.com/v1/realtime/calls", authorization: "Bearer sk-test" },
       { url: "https://api.openai.com/v1/realtime/calls", authorization: "Bearer sk-test" },
       {
         url: "https://api.openai.com/v1/realtime/calls/rtc_test/hangup",
