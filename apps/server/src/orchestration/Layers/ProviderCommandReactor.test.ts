@@ -36,6 +36,7 @@ import { TextGenerationError } from "@t3tools/contracts";
 import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
+import { PersistenceSqlError } from "../../persistence/Errors.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import {
   ProviderService,
@@ -145,6 +146,8 @@ describe("ProviderCommandReactor", () => {
     readonly threadModelSelection?: ModelSelection;
     readonly sessionModelSwitch?: "unsupported" | "in-session";
     readonly requiresNewThreadForModelChange?: boolean;
+    readonly startReactor?: boolean;
+    readonly correlateDispatchFailures?: number;
   }) {
     const now = "2026-01-01T00:00:00.000Z";
     const baseDir =
@@ -346,6 +349,7 @@ describe("ProviderCommandReactor", () => {
     const layer = ProviderCommandReactorLive.pipe(
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
+      Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provideMerge(Layer.succeed(ProviderService, service)),
       Layer.provideMerge(makeProviderRegistryLayer(providerSnapshots as never)),
       Layer.provideMerge(
@@ -375,10 +379,38 @@ describe("ProviderCommandReactor", () => {
     runtime = ManagedRuntime.make(layer);
 
     const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
+    const dispatch = engine.dispatch;
+    let correlateDispatchAttempts = 0;
+    if ((input?.correlateDispatchFailures ?? 0) > 0) {
+      Object.defineProperty(engine, "dispatch", {
+        value: (command: Parameters<typeof engine.dispatch>[0]) =>
+          Effect.suspend(() => {
+            if (command.type === "thread.turn.correlate") {
+              correlateDispatchAttempts += 1;
+              if (correlateDispatchAttempts <= (input?.correlateDispatchFailures ?? 0)) {
+                return Effect.fail(
+                  new PersistenceSqlError({
+                    operation: "ProviderCommandReactor.test:correlate",
+                    detail: "simulated transient correlation failure",
+                    correlation: { threadId: command.threadId },
+                  }),
+                );
+              }
+            }
+            return dispatch(command);
+          }),
+      });
+    }
     const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
     const reactor = await runtime.runPromise(Effect.service(ProviderCommandReactor));
     scope = await Effect.runPromise(Scope.make("sequential"));
-    await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
+    let reactorStarted = false;
+    const startReactor = async () => {
+      if (reactorStarted) return;
+      reactorStarted = true;
+      await Effect.runPromise(reactor.start().pipe(Scope.provide(scope!)));
+    };
+    if (input?.startReactor !== false) await startReactor();
     const drain = () => Effect.runPromise(reactor.drain);
 
     await Effect.runPromise(
@@ -410,6 +442,8 @@ describe("ProviderCommandReactor", () => {
 
     return {
       engine,
+      dispatch: (command: Parameters<typeof engine.dispatch>[0]) =>
+        runtime!.runPromise(engine.dispatch(command)),
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
       startSession,
       sendTurn,
@@ -424,6 +458,10 @@ describe("ProviderCommandReactor", () => {
       runtimeSessions,
       stateDir,
       drain,
+      startReactor,
+      get correlateDispatchAttempts() {
+        return correlateDispatchAttempts;
+      },
     };
   }
 
@@ -464,6 +502,146 @@ describe("ProviderCommandReactor", () => {
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread?.session?.threadId).toBe("thread-1");
     expect(thread?.session?.runtimeMode).toBe("approval-required");
+  });
+
+  it("replays an undispatched pending start after reactor restart", async () => {
+    const harness = await createHarness({ startReactor: false });
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-recover-pending"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-recover-pending"),
+          role: "user",
+          text: "recover this pending request",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+
+    await harness.startReactor();
+    await harness.drain();
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries exact turn correlation without sending the provider turn twice", async () => {
+    const harness = await createHarness({ correlateDispatchFailures: 1 });
+    const threadId = ThreadId.make("thread-1");
+    const messageId = asMessageId("user-message-correlate-retry");
+
+    await harness.dispatch({
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-turn-start-correlate-retry"),
+      threadId,
+      message: {
+        messageId,
+        role: "user",
+        text: "persist the exact provider turn",
+        attachments: [],
+      },
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      runtimeMode: "approval-required",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    await harness.drain();
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    expect(harness.correlateDispatchAttempts).toBe(2);
+    const events = Array.from(
+      await Effect.runPromise(Stream.runCollect(harness.engine.readEvents(0))),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "thread.turn-correlated",
+        payload: expect.objectContaining({ threadId, messageId, turnId: "turn-1" }),
+      }),
+    );
+    expect(events.some((event) => event.type === "thread.turn-start-failed")).toBe(false);
+  });
+
+  it("marks exhausted live correlation persistence ambiguous without resending", async () => {
+    const harness = await createHarness({ correlateDispatchFailures: 10 });
+    const threadId = ThreadId.make("thread-1");
+    const messageId = asMessageId("user-message-correlate-exhausted");
+
+    await harness.dispatch({
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-turn-start-correlate-exhausted"),
+      threadId,
+      message: {
+        messageId,
+        role: "user",
+        text: "do not resend this provider turn",
+        attachments: [],
+      },
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      runtimeMode: "approval-required",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    await harness.drain();
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    expect(harness.correlateDispatchAttempts).toBe(5);
+    const events = Array.from(
+      await Effect.runPromise(Stream.runCollect(harness.engine.readEvents(0))),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "thread.turn-start-failed",
+        payload: expect.objectContaining({ messageId, ambiguous: true }),
+      }),
+    );
+    expect(events.some((event) => event.type === "thread.turn-correlated")).toBe(false);
+  });
+
+  it("marks a stale submitting start ambiguous without resending", async () => {
+    const harness = await createHarness({ startReactor: false });
+    const threadId = ThreadId.make("thread-1");
+    const messageId = asMessageId("user-message-recover-submitting");
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-recover-submitting"),
+        threadId,
+        message: {
+          messageId,
+          role: "user",
+          text: "do not duplicate this request",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start.submit",
+        commandId: CommandId.make(`server:provider-turn-submit:${messageId}`),
+        threadId,
+        messageId,
+        submittedAt: "2026-01-01T00:00:01.000Z",
+        createdAt: "2026-01-01T00:00:01.000Z",
+      }),
+    );
+
+    await harness.startReactor();
+    await harness.drain();
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    const events = Array.from(
+      await Effect.runPromise(Stream.runCollect(harness.engine.readEvents(0))),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "thread.turn-start-failed",
+        payload: expect.objectContaining({ messageId, ambiguous: true }),
+      }),
+    );
   });
 
   it("generates a thread title on the first turn", async () => {
@@ -1862,55 +2040,49 @@ describe("ProviderCommandReactor", () => {
       ),
     );
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-for-approval-error"),
+    await harness.dispatch({
+      type: "thread.session.set",
+      commandId: CommandId.make("cmd-session-set-for-approval-error"),
+      threadId: ThreadId.make("thread-1"),
+      session: {
         threadId: ThreadId.make("thread-1"),
-        session: {
-          threadId: ThreadId.make("thread-1"),
-          status: "running",
-          providerName: "codex",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: now,
-        },
-        createdAt: now,
-      }),
-    );
+        status: "running",
+        providerName: "codex",
+        runtimeMode: "approval-required",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: now,
+      },
+      createdAt: now,
+    });
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.activity.append",
-        commandId: CommandId.make("cmd-approval-requested"),
-        threadId: ThreadId.make("thread-1"),
-        activity: {
-          id: EventId.make("activity-approval-requested"),
-          tone: "approval",
-          kind: "approval.requested",
-          summary: "Command approval requested",
-          payload: {
-            requestId: "approval-request-1",
-            requestKind: "command",
-          },
-          turnId: null,
-          createdAt: now,
+    await harness.dispatch({
+      type: "thread.activity.append",
+      commandId: CommandId.make("cmd-approval-requested"),
+      threadId: ThreadId.make("thread-1"),
+      activity: {
+        id: EventId.make("activity-approval-requested"),
+        tone: "approval",
+        kind: "approval.requested",
+        summary: "Command approval requested",
+        payload: {
+          requestId: "approval-request-1",
+          requestKind: "command",
         },
+        turnId: null,
         createdAt: now,
-      }),
-    );
+      },
+      createdAt: now,
+    });
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.approval.respond",
-        commandId: CommandId.make("cmd-approval-respond-stale"),
-        threadId: ThreadId.make("thread-1"),
-        requestId: asApprovalRequestId("approval-request-1"),
-        decision: "acceptForSession",
-        createdAt: now,
-      }),
-    );
+    await harness.dispatch({
+      type: "thread.approval.respond",
+      commandId: CommandId.make("cmd-approval-respond-stale"),
+      threadId: ThreadId.make("thread-1"),
+      requestId: asApprovalRequestId("approval-request-1"),
+      decision: "acceptForSession",
+      createdAt: now,
+    });
 
     await waitFor(async () => {
       const readModel = await harness.readModel();
@@ -1957,69 +2129,63 @@ describe("ProviderCommandReactor", () => {
       ),
     );
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-for-user-input-error"),
+    await harness.dispatch({
+      type: "thread.session.set",
+      commandId: CommandId.make("cmd-session-set-for-user-input-error"),
+      threadId: ThreadId.make("thread-1"),
+      session: {
         threadId: ThreadId.make("thread-1"),
-        session: {
-          threadId: ThreadId.make("thread-1"),
-          status: "running",
-          providerName: "claudeAgent",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: now,
-        },
-        createdAt: now,
-      }),
-    );
+        status: "running",
+        providerName: "claudeAgent",
+        runtimeMode: "approval-required",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: now,
+      },
+      createdAt: now,
+    });
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.activity.append",
-        commandId: CommandId.make("cmd-user-input-requested"),
-        threadId: ThreadId.make("thread-1"),
-        activity: {
-          id: EventId.make("activity-user-input-requested"),
-          tone: "info",
-          kind: "user-input.requested",
-          summary: "User input requested",
-          payload: {
-            requestId: "user-input-request-1",
-            questions: [
-              {
-                id: "sandbox_mode",
-                header: "Sandbox",
-                question: "Which mode should be used?",
-                options: [
-                  {
-                    label: "workspace-write",
-                    description: "Allow workspace writes only",
-                  },
-                ],
-              },
-            ],
-          },
-          turnId: null,
-          createdAt: now,
+    await harness.dispatch({
+      type: "thread.activity.append",
+      commandId: CommandId.make("cmd-user-input-requested"),
+      threadId: ThreadId.make("thread-1"),
+      activity: {
+        id: EventId.make("activity-user-input-requested"),
+        tone: "info",
+        kind: "user-input.requested",
+        summary: "User input requested",
+        payload: {
+          requestId: "user-input-request-1",
+          questions: [
+            {
+              id: "sandbox_mode",
+              header: "Sandbox",
+              question: "Which mode should be used?",
+              options: [
+                {
+                  label: "workspace-write",
+                  description: "Allow workspace writes only",
+                },
+              ],
+            },
+          ],
         },
+        turnId: null,
         createdAt: now,
-      }),
-    );
+      },
+      createdAt: now,
+    });
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.user-input.respond",
-        commandId: CommandId.make("cmd-user-input-respond-stale"),
-        threadId: ThreadId.make("thread-1"),
-        requestId: asApprovalRequestId("user-input-request-1"),
-        answers: {
-          sandbox_mode: "workspace-write",
-        },
-        createdAt: now,
-      }),
-    );
+    await harness.dispatch({
+      type: "thread.user-input.respond",
+      commandId: CommandId.make("cmd-user-input-respond-stale"),
+      threadId: ThreadId.make("thread-1"),
+      requestId: asApprovalRequestId("user-input-request-1"),
+      answers: {
+        sandbox_mode: "workspace-write",
+      },
+      createdAt: now,
+    });
 
     await waitFor(async () => {
       const readModel = await harness.readModel();
@@ -2057,33 +2223,29 @@ describe("ProviderCommandReactor", () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-for-stop"),
+    await harness.dispatch({
+      type: "thread.session.set",
+      commandId: CommandId.make("cmd-session-set-for-stop"),
+      threadId: ThreadId.make("thread-1"),
+      session: {
         threadId: ThreadId.make("thread-1"),
-        session: {
-          threadId: ThreadId.make("thread-1"),
-          status: "ready",
-          providerName: "codex",
-          providerInstanceId: ProviderInstanceId.make("codex_work"),
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: now,
-        },
-        createdAt: now,
-      }),
-    );
+        status: "ready",
+        providerName: "codex",
+        providerInstanceId: ProviderInstanceId.make("codex_work"),
+        runtimeMode: "approval-required",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: now,
+      },
+      createdAt: now,
+    });
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.stop",
-        commandId: CommandId.make("cmd-session-stop"),
-        threadId: ThreadId.make("thread-1"),
-        createdAt: now,
-      }),
-    );
+    await harness.dispatch({
+      type: "thread.session.stop",
+      commandId: CommandId.make("cmd-session-stop"),
+      threadId: ThreadId.make("thread-1"),
+      createdAt: now,
+    });
 
     await waitFor(() => harness.stopSession.mock.calls.length === 1);
     const readModel = await harness.readModel();

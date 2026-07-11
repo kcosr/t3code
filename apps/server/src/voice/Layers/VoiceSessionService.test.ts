@@ -623,6 +623,149 @@ it.effect("publishes confirmations and submits decided tool output to the provid
   }),
 );
 
+it.effect("continues handling provider events while a thread-turn wait is blocked", () =>
+  Effect.gen(function* () {
+    const waitStarted = yield* Deferred.make<void>();
+    const releaseWait = yield* Deferred.make<void>();
+    const outputs = yield* Ref.make<ReadonlyArray<string>>([]);
+    const provider: VoiceProviderAdapter = {
+      id: "fake-wait-tool",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Effect.succeed({
+            answer: {
+              sessionId: request.sessionId,
+              leaseGeneration: request.leaseGeneration,
+              sdp: "fake-answer",
+            },
+            events: Stream.fromIterable([
+              {
+                type: "function-call" as const,
+                providerFunctionCallId: "wait-call-one",
+                name: "wait_for_thread_turn",
+                argumentsJson: '{"threadId":"thread-one","messageId":"message-one"}',
+              },
+              { type: "activity" as const, activity: "speaking" as const },
+            ]),
+            updateContext: () => Effect.void,
+            submitToolOutput: ({ output }) => Ref.update(outputs, (all) => [...all, output]),
+            terminate: Effect.void,
+          }),
+      },
+    };
+    const executor = VoiceToolExecutor.of({
+      invoke: (toolCall) =>
+        Deferred.succeed(waitStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseWait)),
+          Effect.as({
+            type: "completed" as const,
+            toolCallId: VoiceToolCallId.make(toolCall.providerFunctionCallId),
+            providerFunctionCallId: toolCall.providerFunctionCallId,
+            tool: "wait_for_thread_turn" as const,
+            outcome: "succeeded" as const,
+            output: '{"state":"completed"}',
+            submitOutput: true,
+          }),
+        ),
+      decide: () => Effect.die("unused"),
+      expire: () => Effect.sync(() => undefined),
+      discardSession: () => Effect.void,
+    });
+    const test = yield* makeLayer(provider, executor);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("phone-wait-tool");
+      const created = yield* sessions.create(principal(owner), input(false, "wait-tool"));
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      yield* Deferred.await(waitStarted);
+      yield* Effect.yieldNow;
+      const whileWaiting = yield* sessions.events(owner, created.state.sessionId, 0, 0);
+      expect(whileWaiting.state.phase).toBe("speaking");
+      expect(yield* Ref.get(outputs)).toEqual([]);
+
+      yield* Deferred.succeed(releaseWait, undefined);
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(outputs)).toEqual(['{"state":"completed"}']);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("interrupts a blocked thread-turn wait and fences its output when the session ends", () =>
+  Effect.gen(function* () {
+    const waitStarted = yield* Deferred.make<void>();
+    const waitInterrupted = yield* Deferred.make<void>();
+    const releaseWait = yield* Deferred.make<void>();
+    const outputs = yield* Ref.make<ReadonlyArray<string>>([]);
+    const provider: VoiceProviderAdapter = {
+      id: "fake-terminated-wait-tool",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Effect.succeed({
+            answer: {
+              sessionId: request.sessionId,
+              leaseGeneration: request.leaseGeneration,
+              sdp: "fake-answer",
+            },
+            events: Stream.make({
+              type: "function-call" as const,
+              providerFunctionCallId: "terminated-wait-call",
+              name: "wait_for_thread_turn",
+              argumentsJson: '{"threadId":"thread-one","messageId":"message-one"}',
+            }),
+            updateContext: () => Effect.void,
+            submitToolOutput: ({ output }) => Ref.update(outputs, (all) => [...all, output]),
+            terminate: Effect.void,
+          }),
+      },
+    };
+    const executor = VoiceToolExecutor.of({
+      invoke: (toolCall) =>
+        Deferred.succeed(waitStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseWait)),
+          Effect.as({
+            type: "completed" as const,
+            toolCallId: VoiceToolCallId.make(toolCall.providerFunctionCallId),
+            providerFunctionCallId: toolCall.providerFunctionCallId,
+            tool: "wait_for_thread_turn" as const,
+            outcome: "succeeded" as const,
+            output: '{"state":"completed"}',
+            submitOutput: true,
+          }),
+          Effect.onInterrupt(() => Deferred.succeed(waitInterrupted, undefined)),
+        ),
+      decide: () => Effect.die("unused"),
+      expire: () => Effect.sync(() => undefined),
+      discardSession: () => Effect.void,
+    });
+    const test = yield* makeLayer(provider, executor);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("phone-terminated-wait-tool");
+      const created = yield* sessions.create(
+        principal(owner),
+        input(false, "terminated-wait-tool"),
+      );
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      yield* Deferred.await(waitStarted);
+      yield* sessions.close(owner, created.state.sessionId, created.state.leaseGeneration);
+      yield* Deferred.await(waitInterrupted);
+      yield* Deferred.succeed(releaseWait, undefined);
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(outputs)).toEqual([]);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
 const unusedProvider: VoiceProviderAdapter = {
   id: "fake-unused",
   capabilities: new Set(["agent.realtime"]),

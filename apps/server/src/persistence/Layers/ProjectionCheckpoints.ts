@@ -55,7 +55,6 @@ const makeProjectionCheckpointRepository = Effect.gen(function* () {
         INSERT INTO projection_turns (
           thread_id,
           turn_id,
-          pending_message_id,
           assistant_message_id,
           state,
           requested_at,
@@ -69,7 +68,6 @@ const makeProjectionCheckpointRepository = Effect.gen(function* () {
         VALUES (
           ${row.threadId},
           ${row.turnId},
-          NULL,
           ${row.assistantMessageId},
           ${row.status === "error" ? "error" : "completed"},
           ${row.completedAt},

@@ -5,7 +5,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Struct from "effect/Struct";
-import { ChatAttachment } from "@t3tools/contracts";
+import { ChatAttachment, ThreadId } from "@t3tools/contracts";
 
 import { toPersistenceSqlError } from "../Errors.ts";
 import {
@@ -15,6 +15,7 @@ import {
   DeleteProjectionThreadMessagesInput,
   ListProjectionThreadMessagesInput,
   ProjectionThreadMessage,
+  ProjectionThreadMessageCursor,
 } from "../Services/ProjectionThreadMessages.ts";
 
 const ProjectionThreadMessageDbRowSchema = ProjectionThreadMessage.mapFields(
@@ -23,6 +24,14 @@ const ProjectionThreadMessageDbRowSchema = ProjectionThreadMessage.mapFields(
     attachments: Schema.NullOr(Schema.fromJsonString(Schema.Array(ChatAttachment))),
   }),
 );
+const PageQueryInput = Schema.Struct({
+  threadId: ThreadId,
+  limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 })),
+});
+const PageBeforeQueryInput = Schema.Struct({
+  ...PageQueryInput.fields,
+  before: ProjectionThreadMessageCursor,
+});
 
 function toProjectionThreadMessage(
   row: Schema.Schema.Type<typeof ProjectionThreadMessageDbRowSchema>,
@@ -137,6 +146,102 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
       `,
   });
 
+  const listCompletedProjectionThreadMessagePageRows = SqlSchema.findAll({
+    Request: PageQueryInput,
+    Result: ProjectionThreadMessageDbRowSchema,
+    execute: ({ threadId, limit }) =>
+      sql`
+        SELECT
+          message_id AS "messageId",
+          thread_id AS "threadId",
+          turn_id AS "turnId",
+          role,
+          text,
+          attachments_json AS "attachments",
+          is_streaming AS "isStreaming",
+          created_at AS "createdAt",
+          updated_at AS "updatedAt"
+        FROM projection_thread_messages
+        WHERE thread_id = ${threadId}
+          AND is_streaming = 0
+          AND role IN ('user', 'assistant')
+        ORDER BY created_at DESC, message_id DESC
+        LIMIT ${limit + 1}
+      `,
+  });
+
+  const listCompletedProjectionThreadMessagePageBeforeRows = SqlSchema.findAll({
+    Request: PageBeforeQueryInput,
+    Result: ProjectionThreadMessageDbRowSchema,
+    execute: ({ threadId, limit, before }) =>
+      sql`
+        SELECT
+          message_id AS "messageId",
+          thread_id AS "threadId",
+          turn_id AS "turnId",
+          role,
+          text,
+          attachments_json AS "attachments",
+          is_streaming AS "isStreaming",
+          created_at AS "createdAt",
+          updated_at AS "updatedAt"
+        FROM projection_thread_messages
+        WHERE thread_id = ${threadId}
+          AND is_streaming = 0
+          AND role IN ('user', 'assistant')
+          AND (created_at, message_id) < (${before.createdAt}, ${before.messageId})
+        ORDER BY created_at DESC, message_id DESC
+        LIMIT ${limit + 1}
+      `,
+  });
+
+  const listAllProjectionThreadMessagePageRows = SqlSchema.findAll({
+    Request: PageQueryInput,
+    Result: ProjectionThreadMessageDbRowSchema,
+    execute: ({ threadId, limit }) =>
+      sql`
+        SELECT
+          message_id AS "messageId",
+          thread_id AS "threadId",
+          turn_id AS "turnId",
+          role,
+          text,
+          attachments_json AS "attachments",
+          is_streaming AS "isStreaming",
+          created_at AS "createdAt",
+          updated_at AS "updatedAt"
+        FROM projection_thread_messages
+        WHERE thread_id = ${threadId}
+          AND role IN ('user', 'assistant')
+        ORDER BY created_at DESC, message_id DESC
+        LIMIT ${limit + 1}
+      `,
+  });
+
+  const listAllProjectionThreadMessagePageBeforeRows = SqlSchema.findAll({
+    Request: PageBeforeQueryInput,
+    Result: ProjectionThreadMessageDbRowSchema,
+    execute: ({ threadId, limit, before }) =>
+      sql`
+        SELECT
+          message_id AS "messageId",
+          thread_id AS "threadId",
+          turn_id AS "turnId",
+          role,
+          text,
+          attachments_json AS "attachments",
+          is_streaming AS "isStreaming",
+          created_at AS "createdAt",
+          updated_at AS "updatedAt"
+        FROM projection_thread_messages
+        WHERE thread_id = ${threadId}
+          AND role IN ('user', 'assistant')
+          AND (created_at, message_id) < (${before.createdAt}, ${before.messageId})
+        ORDER BY created_at DESC, message_id DESC
+        LIMIT ${limit + 1}
+      `,
+  });
+
   const deleteProjectionThreadMessageRows = SqlSchema.void({
     Request: DeleteProjectionThreadMessagesInput,
     execute: ({ threadId }) =>
@@ -167,6 +272,36 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
       Effect.map((rows) => rows.map(toProjectionThreadMessage)),
     );
 
+  const listPageByThreadId: ProjectionThreadMessageRepositoryShape["listPageByThreadId"] = (
+    input,
+  ) => {
+    const query =
+      input.includeStreaming === true
+        ? input.before === undefined
+          ? listAllProjectionThreadMessagePageRows(input)
+          : listAllProjectionThreadMessagePageBeforeRows({ ...input, before: input.before })
+        : input.before === undefined
+          ? listCompletedProjectionThreadMessagePageRows(input)
+          : listCompletedProjectionThreadMessagePageBeforeRows({ ...input, before: input.before });
+    return query.pipe(
+      Effect.mapError(
+        toPersistenceSqlError("ProjectionThreadMessageRepository.listPageByThreadId:query"),
+      ),
+      Effect.map((rows) => {
+        const hasMore = rows.length > input.limit;
+        const pageRows = rows.slice(0, input.limit);
+        const oldest = pageRows.at(-1);
+        return {
+          messages: pageRows.map(toProjectionThreadMessage).toReversed(),
+          nextCursor:
+            hasMore && oldest !== undefined
+              ? { createdAt: oldest.createdAt, messageId: oldest.messageId }
+              : null,
+        };
+      }),
+    );
+  };
+
   const deleteByThreadId: ProjectionThreadMessageRepositoryShape["deleteByThreadId"] = (input) =>
     deleteProjectionThreadMessageRows(input).pipe(
       Effect.mapError(
@@ -178,6 +313,7 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
     upsert,
     getByMessageId,
     listByThreadId,
+    listPageByThreadId,
     deleteByThreadId,
   } satisfies ProjectionThreadMessageRepositoryShape;
 });

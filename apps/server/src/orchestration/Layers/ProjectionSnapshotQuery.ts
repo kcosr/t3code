@@ -571,8 +571,20 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           turns.started_at AS "startedAt",
           turns.completed_at AS "completedAt",
           turns.assistant_message_id AS "assistantMessageId",
-          turns.source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
-          turns.source_proposed_plan_id AS "sourceProposedPlanId"
+          (SELECT starts.source_proposed_plan_thread_id
+           FROM projection_turn_starts starts
+           WHERE starts.thread_id = turns.thread_id AND starts.turn_id = turns.turn_id
+             AND starts.source_proposed_plan_thread_id IS NOT NULL
+             AND starts.source_proposed_plan_id IS NOT NULL
+           ORDER BY starts.requested_at ASC, starts.message_id ASC LIMIT 1)
+            AS "sourceProposedPlanThreadId",
+          (SELECT starts.source_proposed_plan_id
+           FROM projection_turn_starts starts
+           WHERE starts.thread_id = turns.thread_id AND starts.turn_id = turns.turn_id
+             AND starts.source_proposed_plan_thread_id IS NOT NULL
+             AND starts.source_proposed_plan_id IS NOT NULL
+           ORDER BY starts.requested_at ASC, starts.message_id ASC LIMIT 1)
+            AS "sourceProposedPlanId"
         FROM projection_threads threads
         JOIN projection_turns turns
           ON turns.thread_id = threads.thread_id
@@ -595,8 +607,18 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           turns.started_at AS "startedAt",
           turns.completed_at AS "completedAt",
           turns.assistant_message_id AS "assistantMessageId",
-          turns.source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
-          turns.source_proposed_plan_id AS "sourceProposedPlanId"
+          (SELECT starts.source_proposed_plan_thread_id FROM projection_turn_starts starts
+           WHERE starts.thread_id = turns.thread_id AND starts.turn_id = turns.turn_id
+             AND starts.source_proposed_plan_thread_id IS NOT NULL
+             AND starts.source_proposed_plan_id IS NOT NULL
+           ORDER BY starts.requested_at ASC, starts.message_id ASC LIMIT 1)
+            AS "sourceProposedPlanThreadId",
+          (SELECT starts.source_proposed_plan_id FROM projection_turn_starts starts
+           WHERE starts.thread_id = turns.thread_id AND starts.turn_id = turns.turn_id
+             AND starts.source_proposed_plan_thread_id IS NOT NULL
+             AND starts.source_proposed_plan_id IS NOT NULL
+           ORDER BY starts.requested_at ASC, starts.message_id ASC LIMIT 1)
+            AS "sourceProposedPlanId"
         FROM projection_threads threads
         JOIN projection_turns turns
           ON turns.thread_id = threads.thread_id
@@ -621,8 +643,18 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           turns.started_at AS "startedAt",
           turns.completed_at AS "completedAt",
           turns.assistant_message_id AS "assistantMessageId",
-          turns.source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
-          turns.source_proposed_plan_id AS "sourceProposedPlanId"
+          (SELECT starts.source_proposed_plan_thread_id FROM projection_turn_starts starts
+           WHERE starts.thread_id = turns.thread_id AND starts.turn_id = turns.turn_id
+             AND starts.source_proposed_plan_thread_id IS NOT NULL
+             AND starts.source_proposed_plan_id IS NOT NULL
+           ORDER BY starts.requested_at ASC, starts.message_id ASC LIMIT 1)
+            AS "sourceProposedPlanThreadId",
+          (SELECT starts.source_proposed_plan_id FROM projection_turn_starts starts
+           WHERE starts.thread_id = turns.thread_id AND starts.turn_id = turns.turn_id
+             AND starts.source_proposed_plan_thread_id IS NOT NULL
+             AND starts.source_proposed_plan_id IS NOT NULL
+           ORDER BY starts.requested_at ASC, starts.message_id ASC LIMIT 1)
+            AS "sourceProposedPlanId"
         FROM projection_threads threads
         JOIN projection_turns turns
           ON turns.thread_id = threads.thread_id
@@ -865,8 +897,18 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           turns.started_at AS "startedAt",
           turns.completed_at AS "completedAt",
           turns.assistant_message_id AS "assistantMessageId",
-          turns.source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
-          turns.source_proposed_plan_id AS "sourceProposedPlanId"
+          (SELECT starts.source_proposed_plan_thread_id FROM projection_turn_starts starts
+           WHERE starts.thread_id = turns.thread_id AND starts.turn_id = turns.turn_id
+             AND starts.source_proposed_plan_thread_id IS NOT NULL
+             AND starts.source_proposed_plan_id IS NOT NULL
+           ORDER BY starts.requested_at ASC, starts.message_id ASC LIMIT 1)
+            AS "sourceProposedPlanThreadId",
+          (SELECT starts.source_proposed_plan_id FROM projection_turn_starts starts
+           WHERE starts.thread_id = turns.thread_id AND starts.turn_id = turns.turn_id
+             AND starts.source_proposed_plan_thread_id IS NOT NULL
+             AND starts.source_proposed_plan_id IS NOT NULL
+           ORDER BY starts.requested_at ASC, starts.message_id ASC LIMIT 1)
+            AS "sourceProposedPlanId"
         FROM projection_threads threads
         JOIN projection_turns turns
           ON turns.thread_id = threads.thread_id

@@ -204,9 +204,6 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         INSERT INTO projection_turns (
           thread_id,
           turn_id,
-          pending_message_id,
-          source_proposed_plan_thread_id,
-          source_proposed_plan_id,
           assistant_message_id,
           state,
           requested_at,
@@ -220,9 +217,6 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         VALUES (
           'thread-1',
           'turn-1',
-          NULL,
-          'thread-1',
-          'plan-1',
           'message-1',
           'completed',
           '2026-02-24T00:00:08.000Z',
@@ -232,6 +226,18 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           'checkpoint-1',
           'ready',
           '[{"path":"README.md","kind":"modified","additions":2,"deletions":1}]'
+        )
+      `;
+
+      yield* sql`
+        INSERT INTO projection_turn_starts (
+          thread_id, message_id, turn_id, state,
+          source_proposed_plan_thread_id, source_proposed_plan_id,
+          requested_at, resolved_at
+        ) VALUES (
+          'thread-1', 'message-user-1', 'turn-1', 'accepted',
+          'thread-1', 'plan-1',
+          '2026-02-24T00:00:08.000Z', '2026-02-24T00:00:08.000Z'
         )
       `;
 
@@ -765,9 +771,6 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         INSERT INTO projection_turns (
           thread_id,
           turn_id,
-          pending_message_id,
-          source_proposed_plan_thread_id,
-          source_proposed_plan_id,
           assistant_message_id,
           state,
           requested_at,
@@ -783,9 +786,6 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             'thread-context',
             'turn-1',
             NULL,
-            NULL,
-            NULL,
-            NULL,
             'completed',
             '2026-03-02T00:00:04.000Z',
             '2026-03-02T00:00:04.000Z',
@@ -798,9 +798,6 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           (
             'thread-context',
             'turn-2',
-            NULL,
-            NULL,
-            NULL,
             NULL,
             'completed',
             '2026-03-02T00:00:05.000Z',
@@ -1087,9 +1084,6 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         INSERT INTO projection_turns (
           thread_id,
           turn_id,
-          pending_message_id,
-          source_proposed_plan_thread_id,
-          source_proposed_plan_id,
           assistant_message_id,
           state,
           requested_at,
@@ -1104,9 +1098,6 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           (
             'thread-1',
             'turn-completed',
-            'message-user-1',
-            NULL,
-            NULL,
             'message-assistant-1',
             'completed',
             '2026-04-02T00:00:05.000Z',
@@ -1120,9 +1111,6 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           (
             'thread-1',
             'turn-running',
-            'message-user-2',
-            NULL,
-            NULL,
             NULL,
             'running',
             '2026-04-02T00:00:30.000Z',
@@ -1231,9 +1219,6 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         INSERT INTO projection_turns (
           thread_id,
           turn_id,
-          pending_message_id,
-          source_proposed_plan_thread_id,
-          source_proposed_plan_id,
           assistant_message_id,
           state,
           requested_at,
@@ -1248,9 +1233,6 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           (
             'thread-1',
             'turn-running',
-            'message-user-2',
-            NULL,
-            NULL,
             NULL,
             'running',
             '2026-04-03T00:00:30.000Z',
@@ -1264,9 +1246,6 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           (
             'thread-1',
             'turn-completed',
-            'message-user-1',
-            NULL,
-            NULL,
             'message-assistant-1',
             'completed',
             '2026-04-03T00:00:05.000Z',
@@ -1383,9 +1362,6 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         INSERT INTO projection_turns (
           thread_id,
           turn_id,
-          pending_message_id,
-          source_proposed_plan_thread_id,
-          source_proposed_plan_id,
           assistant_message_id,
           state,
           requested_at,
@@ -1399,9 +1375,6 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         VALUES (
           'thread-deleted',
           'turn-deleted',
-          'message-deleted-user',
-          NULL,
-          NULL,
           'message-deleted-assistant',
           'completed',
           '2026-04-05T00:00:04.100Z',

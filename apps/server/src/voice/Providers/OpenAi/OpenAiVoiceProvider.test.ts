@@ -322,6 +322,21 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
         },
       },
     });
+    expect(
+      (sessionConfig as { readonly tools: ReadonlyArray<{ readonly name: string }> }).tools.map(
+        (tool) => tool.name,
+      ),
+    ).toEqual([
+      "list_projects",
+      "list_threads",
+      "get_thread_status",
+      "interrupt_thread",
+      "archive_thread",
+      "get_thread_messages",
+      "wait_for_thread_turn",
+      "create_thread",
+      "send_thread_message",
+    ]);
     expect(socketConnections).toEqual([
       {
         url: "wss://api.openai.com/v1/realtime?call_id=rtc_test",

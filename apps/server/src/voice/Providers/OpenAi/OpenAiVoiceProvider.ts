@@ -114,6 +114,37 @@ const REALTIME_TOOLS = [
   })),
   {
     type: "function",
+    name: "get_thread_messages",
+    description: "Read a bounded page of normalized user and assistant messages from a T3 thread.",
+    parameters: {
+      type: "object",
+      properties: {
+        threadId: { type: "string" },
+        limit: { type: "integer", minimum: 1, maximum: 50 },
+        cursor: { type: "string" },
+      },
+      required: ["threadId", "limit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "wait_for_thread_turn",
+    description:
+      "Wait for the exact T3 thread turn started by send_thread_message, up to a bounded timeout.",
+    parameters: {
+      type: "object",
+      properties: {
+        threadId: { type: "string" },
+        messageId: { type: "string" },
+        waitMilliseconds: { type: "integer", minimum: 250, maximum: 25_000 },
+      },
+      required: ["threadId", "messageId", "waitMilliseconds"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
     name: "create_thread",
     description: "Create a thread in a T3 project.",
     parameters: {

@@ -49,8 +49,11 @@ const HEARTBEAT_INTERVAL_SECONDS = 10;
 const SESSION_DURATION_SECONDS = 55 * 60;
 const MAX_BUFFERED_EVENTS = 512;
 const MAX_RETAINED_TERMINAL_SESSIONS = 128;
-const INSTRUCTIONS =
-  "You are the T3 voice agent. Be concise, state what you are about to do before using a tool, and use only the supplied T3 tools. Prior conversation items are the user's actual history from this same ongoing conversation: use them as memory, preserve continuity across calls and devices, and never claim that you cannot remember information present in that history.";
+const INSTRUCTIONS = [
+  "You are the T3 voice agent. Be concise, state what you are about to do before using a tool, and use only the supplied T3 tools.",
+  "Prior conversation items are the user's actual history from this same ongoing conversation: use them as memory, preserve continuity across calls and devices, and never claim that you cannot remember information present in that history.",
+  "send_thread_message confirms dispatch only and returns a messageId. Never claim the coding turn completed from that receipt. When the user needs the result, call wait_for_thread_turn with that exact messageId; a pending or running timeout is not completion and may be waited on again.",
+].join(" ");
 
 interface RuntimeSession {
   readonly lease: VoiceSessionLease;
@@ -63,6 +66,7 @@ interface RuntimeSession {
   readonly pendingConfirmations: ReadonlySet<VoiceConfirmationId>;
   readonly grantedScopes: ReadonlySet<AuthEnvironmentScope>;
   readonly eventSignal: Deferred.Deferred<void>;
+  readonly toolScope: Scope.Closeable;
   readonly terminalAt?: number;
   readonly terminalOrder?: number;
   readonly terminating?: boolean;
@@ -222,6 +226,7 @@ const make = Effect.gen(function* () {
       if (options.interruptEventFiber !== false && session.eventFiber !== undefined) {
         yield* Fiber.interrupt(session.eventFiber);
       }
+      yield* Scope.close(session.toolScope, Exit.void);
       if (session.providerSession !== undefined)
         yield* session.providerSession.terminate.pipe(Effect.ignore);
       yield* tools.discardSession(session.lease.sessionId);
@@ -281,9 +286,10 @@ const make = Effect.gen(function* () {
   yield* Effect.addFinalizer(() =>
     SynchronizedRef.get(runtime).pipe(
       Effect.flatMap((state) =>
-        Effect.forEach(
-          state.sessions.values(),
-          (session) => session.providerSession?.terminate.pipe(Effect.ignore) ?? Effect.void,
+        Effect.forEach(state.sessions.values(), (session) =>
+          Scope.close(session.toolScope, Exit.void).pipe(
+            Effect.andThen(session.providerSession?.terminate.pipe(Effect.ignore) ?? Effect.void),
+          ),
         ),
       ),
       Effect.andThen(Scope.close(serviceScope, Exit.void)),
@@ -450,7 +456,7 @@ const make = Effect.gen(function* () {
         }
         return;
       case "function-call":
-        const result = yield* tools.invoke({
+        const invocation = tools.invoke({
           sessionId: lease.sessionId,
           conversationId: lease.conversationId,
           toolCallId: VoiceToolCallId.make(event.providerFunctionCallId),
@@ -459,6 +465,33 @@ const make = Effect.gen(function* () {
           argumentsJson: event.argumentsJson,
           grantedScopes,
         });
+        if (event.name === "wait_for_thread_turn") {
+          const session = (yield* SynchronizedRef.get(runtime)).sessions.get(lease.sessionId);
+          if (session === undefined) return;
+          yield* invocation.pipe(
+            Effect.flatMap((result) =>
+              result.type === "completed"
+                ? submitCompletedTool(lease, providerSession, result)
+                : Effect.void,
+            ),
+            Effect.catch((error) =>
+              Effect.gen(function* () {
+                yield* emit(lease, {
+                  type: "error",
+                  reason: error.detail,
+                  recoverable: error.retryable,
+                });
+                const current = (yield* SynchronizedRef.get(runtime)).sessions.get(lease.sessionId);
+                if (current !== undefined) {
+                  yield* endRuntimeSession(current, "error").pipe(Effect.forkIn(serviceScope));
+                }
+              }),
+            ),
+            Effect.forkIn(session.toolScope),
+          );
+          return;
+        }
+        const result = yield* invocation;
         if (result.type === "completed") {
           yield* submitCompletedTool(lease, providerSession, result);
           return;
@@ -664,6 +697,7 @@ const make = Effect.gen(function* () {
       sequence: 0,
     };
     const eventSignal = yield* Deferred.make<void>();
+    const toolScope = yield* Scope.make("sequential");
     yield* SynchronizedRef.update(runtime, (current) => {
       const sessions = new Map(current.sessions);
       sessions.set(acquired.lease.sessionId, {
@@ -677,6 +711,7 @@ const make = Effect.gen(function* () {
         pendingConfirmations: new Set(),
         grantedScopes: new Set(principal.scopes),
         eventSignal,
+        toolScope,
       });
       const idempotency = new Map(current.idempotency);
       idempotency.set(idempotencyId, acquired.lease.sessionId);

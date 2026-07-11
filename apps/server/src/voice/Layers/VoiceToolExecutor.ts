@@ -21,7 +21,9 @@ import {
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -29,6 +31,11 @@ import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import { ClientCommandDispatcher } from "../../orchestration/Services/ClientCommandDispatcher.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import {
+  ProjectionThreadMessageCursor,
+  ProjectionThreadMessageRepository,
+} from "../../persistence/Services/ProjectionThreadMessages.ts";
+import { ProjectionTurnStartRepository } from "../../persistence/Services/ProjectionTurnStarts.ts";
 import {
   type DurableVoiceToolCall,
   VoiceToolCallRepository,
@@ -45,6 +52,10 @@ import {
 
 const CONFIRMATION_TTL_MILLIS = 30_000;
 const MAX_RETAINED_CALLS = 512;
+const MAX_TOOL_MESSAGE_CHARS = 4_000;
+const MAX_TOOL_PAGE_CHARS = 16_000;
+const MAX_WAIT_MESSAGE_CHARS = 8_000;
+const TURN_WAIT_POLL_INTERVAL = "250 millis";
 
 const ListProjectsArguments = Schema.Struct({
   limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
@@ -54,6 +65,16 @@ const ListThreadsArguments = Schema.Struct({
   limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
 });
 const ThreadArguments = Schema.Struct({ threadId: ThreadId });
+const GetThreadMessagesArguments = Schema.Struct({
+  threadId: ThreadId,
+  limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
+  cursor: Schema.optionalKey(TrimmedNonEmptyString),
+});
+const WaitForThreadTurnArguments = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  waitMilliseconds: Schema.Int.check(Schema.isBetween({ minimum: 250, maximum: 25_000 })),
+});
 const CreateThreadArguments = Schema.Struct({
   projectId: ProjectId,
   title: Schema.optionalKey(TrimmedNonEmptyString),
@@ -63,12 +84,41 @@ const SendThreadMessageArguments = Schema.Struct({
   message: TrimmedNonEmptyString,
 });
 const decodeVoiceToolName = Schema.decodeUnknownEffect(VoiceToolName);
+const isVoiceToolName = Schema.is(VoiceToolName);
+const decodeThreadMessagesCursor = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectionThreadMessageCursor),
+);
+const encodeThreadMessagesCursor = Schema.encodeSync(
+  Schema.fromJsonString(ProjectionThreadMessageCursor),
+);
+
+type ReadVoiceTool = Extract<
+  VoiceToolName,
+  | "list_projects"
+  | "list_threads"
+  | "get_thread_status"
+  | "get_thread_messages"
+  | "wait_for_thread_turn"
+>;
+type MutationVoiceTool = Exclude<VoiceToolName, ReadVoiceTool>;
+
+const VOICE_TOOL_ACCESS = {
+  list_projects: "read",
+  list_threads: "read",
+  get_thread_status: "read",
+  get_thread_messages: "read",
+  wait_for_thread_turn: "read",
+  create_thread: "operate",
+  send_thread_message: "operate",
+  interrupt_thread: "operate",
+  archive_thread: "operate",
+} as const satisfies Record<VoiceToolName, "read" | "operate">;
+
+const isReadTool = (tool: VoiceToolName): tool is ReadVoiceTool =>
+  VOICE_TOOL_ACCESS[tool] === "read";
 
 type PreparedMutation = {
-  readonly tool: Extract<
-    VoiceToolName,
-    "create_thread" | "send_thread_message" | "interrupt_thread" | "archive_thread"
-  >;
+  readonly tool: MutationVoiceTool;
   readonly summary: string;
   readonly command: ClientOrchestrationCommand;
 };
@@ -95,7 +145,13 @@ interface CompletedCall {
   readonly completedAtMillis: number;
 }
 
-type CallState = PendingCall | CompletedCall;
+interface ExecutingReadCall {
+  readonly type: "executing-read";
+  readonly sessionId: VoiceSessionId;
+  readonly completion: Deferred.Deferred<VoiceToolCompletedResult, VoiceError>;
+}
+
+type CallState = PendingCall | CompletedCall | ExecutingReadCall;
 interface ExecutorState {
   readonly calls: ReadonlyMap<string, CallState>;
   readonly confirmations: ReadonlyMap<VoiceConfirmationId, string>;
@@ -128,6 +184,27 @@ const canonicalizeArguments = (argumentsJson: string) =>
     catch: () =>
       voiceError("invalid-phase", "tool.arguments", "Voice tool arguments were not valid JSON"),
   });
+
+const decodeCursor = (cursor: string | undefined) => {
+  if (cursor === undefined) return Effect.succeed(undefined);
+  return Effect.try({
+    try: () => Buffer.from(cursor, "base64url").toString("utf8"),
+    catch: () => voiceError("invalid-phase", "tool.cursor", "Thread message cursor was invalid"),
+  }).pipe(
+    Effect.flatMap(decodeThreadMessagesCursor),
+    Effect.mapError(() =>
+      voiceError("invalid-phase", "tool.cursor", "Thread message cursor was invalid"),
+    ),
+  );
+};
+
+const encodeCursor = (cursor: ProjectionThreadMessageCursor) =>
+  Buffer.from(encodeThreadMessagesCursor(cursor), "utf8").toString("base64url");
+
+const boundedText = (text: string, limit: number) => ({
+  text: text.slice(0, limit),
+  truncated: text.length > limit,
+});
 
 const deterministicId = (prefix: string, input: VoiceToolCallInput) =>
   `${prefix}:${input.conversationId}:${input.toolCallId}`;
@@ -166,11 +243,17 @@ const threadOutput = (thread: OrchestrationThreadShell) => ({
 
 const mutationOutput = (command: ClientOrchestrationCommand, sequence: number) => {
   switch (command.type) {
-    case "thread.create":
     case "thread.turn.start":
+      return jsonOutput({
+        sequence,
+        threadId: command.threadId,
+        commandId: command.commandId,
+        messageId: command.message.messageId,
+      });
+    case "thread.create":
     case "thread.turn.interrupt":
     case "thread.archive":
-      return jsonOutput({ sequence, threadId: command.threadId });
+      return jsonOutput({ sequence, threadId: command.threadId, commandId: command.commandId });
     default:
       return jsonOutput({ sequence });
   }
@@ -178,6 +261,8 @@ const mutationOutput = (command: ClientOrchestrationCommand, sequence: number) =
 
 const make = Effect.gen(function* () {
   const query = yield* ProjectionSnapshotQuery;
+  const messages = yield* ProjectionThreadMessageRepository;
+  const turnStarts = yield* ProjectionTurnStartRepository;
   const dispatcher = yield* ClientCommandDispatcher;
   const conversations = yield* VoiceConversationService;
   const toolCalls = yield* VoiceToolCallRepository;
@@ -348,7 +433,7 @@ const make = Effect.gen(function* () {
 
   const executeRead = Effect.fn("VoiceToolExecutor.executeRead")(function* (
     input: VoiceToolCallInput,
-    tool: Extract<VoiceToolName, "list_projects" | "list_threads" | "get_thread_status">,
+    tool: ReadVoiceTool,
   ) {
     switch (tool) {
       case "list_projects": {
@@ -370,18 +455,167 @@ const make = Effect.gen(function* () {
         const args = yield* parseArguments(ThreadArguments, input);
         return jsonOutput({ thread: threadOutput(yield* requireThread(args.threadId)) });
       }
+      case "get_thread_messages": {
+        const args = yield* parseArguments(GetThreadMessagesArguments, input);
+        yield* requireThread(args.threadId);
+        const before = yield* decodeCursor(args.cursor);
+        const page = yield* messages.listPageByThreadId({
+          threadId: args.threadId,
+          limit: args.limit,
+          ...(before === undefined ? {} : { before }),
+        });
+        let remainingChars = MAX_TOOL_PAGE_CHARS;
+        const outputNewestFirst = [];
+        let budgetExcludedMessages = false;
+        for (const message of page.messages.toReversed()) {
+          if (remainingChars === 0) {
+            budgetExcludedMessages = true;
+            break;
+          }
+          const allowed = Math.min(MAX_TOOL_MESSAGE_CHARS, remainingChars);
+          const content = boundedText(message.text, allowed);
+          remainingChars -= content.text.length;
+          outputNewestFirst.push({
+            messageId: message.messageId,
+            turnId: message.turnId,
+            role: message.role,
+            ...content,
+            createdAt: message.createdAt,
+            updatedAt: message.updatedAt,
+          });
+        }
+        const outputMessages = outputNewestFirst.toReversed();
+        const oldestEmitted = outputMessages.at(0);
+        const nextCursor = budgetExcludedMessages
+          ? oldestEmitted === undefined
+            ? null
+            : encodeCursor({
+                createdAt: oldestEmitted.createdAt,
+                messageId: oldestEmitted.messageId,
+              })
+          : page.nextCursor === null
+            ? null
+            : encodeCursor(page.nextCursor);
+        return jsonOutput({
+          messages: outputMessages,
+          nextCursor,
+        });
+      }
+      case "wait_for_thread_turn": {
+        const args = yield* parseArguments(WaitForThreadTurnArguments, input);
+        yield* requireThread(args.threadId);
+        const dispatchedMessage = yield* messages.getByMessageId({ messageId: args.messageId });
+        if (
+          Option.isNone(dispatchedMessage) ||
+          dispatchedMessage.value.threadId !== args.threadId ||
+          dispatchedMessage.value.role !== "user"
+        ) {
+          return yield* Effect.fail(
+            voiceError(
+              "invalid-phase",
+              "tool.wait-for-thread-turn",
+              "The dispatched thread message was not found",
+            ),
+          );
+        }
+
+        const readState = Effect.fn("VoiceToolExecutor.readWaitedTurn")(function* () {
+          const [outcome, shell] = yield* Effect.all([
+            turnStarts.getOutcomeByMessageId({
+              threadId: args.threadId,
+              messageId: args.messageId,
+            }),
+            requireThread(args.threadId),
+          ]);
+          if (Option.isNone(outcome) || outcome.value.start.state === "pending") {
+            return { state: "pending", turnId: null } as const;
+          }
+          if (outcome.value.start.state === "failed" || outcome.value.start.state === "ambiguous") {
+            return {
+              state: "failed",
+              turnId: null,
+              assistantMessage: null,
+              ambiguous: outcome.value.start.state === "ambiguous",
+            } as const;
+          }
+          const value = outcome.value.turn;
+          if (value === null) {
+            return { state: "running", turnId: outcome.value.start.turnId } as const;
+          }
+          if (value.state !== "running") {
+            const assistantMessage =
+              value.assistantMessageId === null
+                ? Option.none()
+                : yield* messages.getByMessageId({ messageId: value.assistantMessageId });
+            const assistant = Option.filter(
+              assistantMessage,
+              (message) => message.threadId === args.threadId && message.role === "assistant",
+            );
+            if (
+              value.state === "completed" &&
+              value.assistantMessageId !== null &&
+              (Option.isNone(assistant) || assistant.value.isStreaming)
+            ) {
+              return { state: "running", turnId: value.turnId } as const;
+            }
+            const finalAssistant = Option.filter(assistant, (message) => !message.isStreaming);
+            return {
+              state: value.state === "error" ? "failed" : value.state,
+              turnId: value.turnId,
+              assistantMessage: Option.isNone(finalAssistant)
+                ? null
+                : {
+                    messageId: finalAssistant.value.messageId,
+                    ...boundedText(finalAssistant.value.text, MAX_WAIT_MESSAGE_CHARS),
+                    createdAt: finalAssistant.value.createdAt,
+                    updatedAt: finalAssistant.value.updatedAt,
+                  },
+            } as const;
+          }
+          const isActiveTurn = value.turnId !== null && shell.latestTurn?.turnId === value.turnId;
+          if (isActiveTurn && shell.hasPendingApprovals) {
+            return { state: "approval-required", turnId: value.turnId } as const;
+          }
+          if (isActiveTurn && shell.hasPendingUserInput) {
+            return { state: "user-input-required", turnId: value.turnId } as const;
+          }
+          return { state: value.state, turnId: value.turnId } as const;
+        });
+
+        type WaitedTurnState = Effect.Success<ReturnType<typeof readState>>;
+        let lastObserved: WaitedTurnState = { state: "pending", turnId: null };
+        const waitUntilSettled = Effect.gen(function* () {
+          while (true) {
+            const current = yield* readState();
+            lastObserved = current;
+            if (current.state !== "pending" && current.state !== "running") return current;
+            yield* Effect.sleep(TURN_WAIT_POLL_INTERVAL);
+          }
+        });
+        const waited = yield* waitUntilSettled.pipe(
+          Effect.timeoutOption(`${args.waitMilliseconds} millis`),
+        );
+        return jsonOutput(Option.isSome(waited) ? waited.value : lastObserved);
+      }
     }
   });
 
   const prune = (current: ExecutorState, now: number): ExecutorState => {
-    const retained = [...current.calls.entries()]
-      .filter(([, call]) =>
-        call.type === "pending"
-          ? call.expiresAtMillis > now
-          : now - call.completedAtMillis < 10 * 60_000,
-      )
+    const retained = [...current.calls.entries()].filter(([, call]) => {
+      switch (call.type) {
+        case "pending":
+          return call.expiresAtMillis > now;
+        case "completed":
+          return now - call.completedAtMillis < 10 * 60_000;
+        case "executing-read":
+          return true;
+      }
+    });
+    const executing = retained.filter(([, call]) => call.type === "executing-read");
+    const settled = retained
+      .filter(([, call]) => call.type !== "executing-read")
       .slice(-MAX_RETAINED_CALLS);
-    const calls = new Map(retained);
+    const calls = new Map([...settled, ...executing]);
     const confirmations = new Map(
       [...current.confirmations.entries()].filter(([, key]) => calls.get(key)?.type === "pending"),
     );
@@ -425,7 +659,7 @@ const make = Effect.gen(function* () {
     type: "completed",
     toolCallId: call.toolCallId,
     providerFunctionCallId: call.providerFunctionCallId,
-    tool: Schema.is(VoiceToolName)(call.toolName) ? call.toolName : "unknown",
+    tool: isVoiceToolName(call.toolName) ? call.toolName : "unknown",
     outcome:
       call.status === "requested" || call.status === "pending-confirmation"
         ? "failed"
@@ -455,7 +689,7 @@ const make = Effect.gen(function* () {
           voiceError("invalid-phase", "tool.name", "Persisted voice tool name was invalid"),
         ),
       );
-      if (tool === "list_projects" || tool === "list_threads" || tool === "get_thread_status") {
+      if (isReadTool(tool)) {
         return yield* Effect.fail(
           voiceError("invalid-phase", "tool.state", "Read tool cannot await confirmation"),
         );
@@ -518,6 +752,21 @@ const make = Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
       const requestedAt = yield* nowIso;
       const canonicalArgumentsJson = yield* canonicalizeArguments(input.argumentsJson);
+      const decodedRequestedTool = yield* decodeVoiceToolName(input.name).pipe(Effect.option);
+      if (Option.isSome(decodedRequestedTool)) {
+        const requestedTool = decodedRequestedTool.value;
+        const requiredScope = isReadTool(requestedTool)
+          ? AuthOrchestrationReadScope
+          : AuthOrchestrationOperateScope;
+        if (!input.grantedScopes.has(requiredScope)) {
+          return completed(
+            input,
+            requestedTool,
+            "failed",
+            jsonOutput({ error: `Voice tool requires ${requiredScope}` }),
+          );
+        }
+      }
       const conversation = yield* conversations.get(input.conversationId).pipe(
         Effect.flatMap(
           Option.match({
@@ -567,9 +816,21 @@ const make = Effect.gen(function* () {
               } satisfies DurableVoiceToolCall,
             };
       yield* validateDurableIdentity(input, claimed.call);
-      return yield* SynchronizedRef.modifyEffect<
+      type InvokeAction =
+        | {
+            readonly action: "execute-read";
+            readonly key: string;
+            readonly tool: ReadVoiceTool;
+            readonly completion: Deferred.Deferred<VoiceToolCompletedResult, VoiceError>;
+          }
+        | {
+            readonly action: "await-read";
+            readonly completion: Deferred.Deferred<VoiceToolCompletedResult, VoiceError>;
+          };
+
+      const resolution = yield* SynchronizedRef.modifyEffect<
         ExecutorState,
-        VoiceToolInvokeResult,
+        VoiceToolInvokeResult | InvokeAction,
         VoiceError,
         never
       >(state, (unpruned) => {
@@ -591,6 +852,12 @@ const make = Effect.gen(function* () {
               expiresAt: existing.expiresAt,
               newlyCreated: false,
             } satisfies VoiceToolInvokeResult,
+            current,
+          ] as const);
+        }
+        if (existing?.type === "executing-read") {
+          return Effect.succeed([
+            { action: "await-read", completion: existing.completion } satisfies InvokeAction,
             current,
           ] as const);
         }
@@ -644,9 +911,8 @@ const make = Effect.gen(function* () {
         }
 
         return Effect.gen(function* () {
-          yield* appendJournal(input, "requested");
-          const decodedTool = yield* decodeVoiceToolName(input.name).pipe(Effect.option);
-          if (Option.isNone(decodedTool)) {
+          if (Option.isNone(decodedRequestedTool)) {
+            yield* appendJournal(input, "requested");
             const result = completed(
               input,
               "unknown",
@@ -668,65 +934,24 @@ const make = Effect.gen(function* () {
               },
             ] as const;
           }
-          const tool = decodedTool.value;
-          const isReadTool =
-            tool === "list_projects" || tool === "list_threads" || tool === "get_thread_status";
-          const requiredScope = isReadTool
-            ? AuthOrchestrationReadScope
-            : AuthOrchestrationOperateScope;
-          if (!input.grantedScopes.has(requiredScope)) {
-            const result = completed(
-              input,
-              tool,
-              "failed",
-              jsonOutput({ error: `Voice tool requires ${requiredScope}` }),
-            );
-            yield* appendJournal(input, result.outcome, result.output);
-            yield* persistCompleted(input, result, requestedAt);
+          const tool = decodedRequestedTool.value;
+          const readTool = isReadTool(tool);
+          if (readTool) {
+            const completion = yield* Deferred.make<VoiceToolCompletedResult, VoiceError>();
             return [
-              result,
+              { action: "execute-read", key, tool, completion } satisfies InvokeAction,
               {
                 ...current,
                 calls: new Map(current.calls).set(key, {
-                  type: "completed",
+                  type: "executing-read",
                   sessionId: input.sessionId,
-                  result,
-                  completedAtMillis: now,
-                }),
-              },
-            ] as const;
-          }
-          if (isReadTool) {
-            const output = yield* executeRead(input, tool).pipe(
-              Effect.mapError((cause) => cause),
-              Effect.match({
-                onFailure: (cause) =>
-                  jsonOutput({
-                    error: cause instanceof Error ? cause.message : "Invalid tool arguments",
-                  }),
-                onSuccess: (value) => value,
-              }),
-            );
-            const outcome = output.startsWith('{"error"')
-              ? ("failed" as const)
-              : ("succeeded" as const);
-            const result = completed(input, tool, outcome, output);
-            yield* appendJournal(input, outcome, output);
-            yield* persistCompleted(input, result, requestedAt);
-            return [
-              result,
-              {
-                ...current,
-                calls: new Map(current.calls).set(key, {
-                  type: "completed",
-                  sessionId: input.sessionId,
-                  result,
-                  completedAtMillis: now,
+                  completion,
                 }),
               },
             ] as const;
           }
 
+          yield* appendJournal(input, "requested");
           const prepared = yield* prepareMutation(input, tool).pipe(
             Effect.match({
               onFailure: (cause) =>
@@ -804,6 +1029,56 @@ const make = Effect.gen(function* () {
           ] as const;
         });
       });
+
+      if (!("action" in resolution)) return resolution;
+      if (resolution.action === "await-read") {
+        return yield* Deferred.await(resolution.completion).pipe(
+          Effect.map((result) => ({ ...result, submitOutput: false })),
+        );
+      }
+
+      const execution = Effect.gen(function* () {
+        yield* appendJournal(input, "requested");
+        const output = yield* executeRead(input, resolution.tool).pipe(
+          Effect.match({
+            onFailure: (cause) =>
+              jsonOutput({
+                error: cause instanceof Error ? cause.message : "Invalid tool arguments",
+              }),
+            onSuccess: (value) => value,
+          }),
+        );
+        const outcome = output.startsWith('{"error"')
+          ? ("failed" as const)
+          : ("succeeded" as const);
+        const result = completed(input, resolution.tool, outcome, output);
+        yield* appendJournal(input, outcome, output);
+        yield* persistCompleted(input, result, requestedAt);
+        return result;
+      });
+
+      return yield* execution.pipe(
+        Effect.onExit((exit) =>
+          SynchronizedRef.update(state, (current) => {
+            const active = current.calls.get(resolution.key);
+            if (active?.type !== "executing-read" || active.completion !== resolution.completion) {
+              return current;
+            }
+            const calls = new Map(current.calls);
+            if (Exit.isSuccess(exit)) {
+              calls.set(resolution.key, {
+                type: "completed",
+                sessionId: input.sessionId,
+                result: exit.value,
+                completedAtMillis: now,
+              });
+            } else {
+              calls.delete(resolution.key);
+            }
+            return { ...current, calls };
+          }).pipe(Effect.andThen(Deferred.done(resolution.completion, exit))),
+        ),
+      );
     },
   );
 

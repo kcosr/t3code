@@ -728,6 +728,36 @@ const ThreadSessionSetCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+const ThreadTurnCorrelateCommand = Schema.Struct({
+  type: Schema.Literal("thread.turn.correlate"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  messageId: MessageId,
+  turnId: TurnId,
+  sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  resolvedAt: IsoDateTime,
+  createdAt: IsoDateTime,
+});
+
+const ThreadTurnStartSubmitCommand = Schema.Struct({
+  type: Schema.Literal("thread.turn.start.submit"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  messageId: MessageId,
+  submittedAt: IsoDateTime,
+  createdAt: IsoDateTime,
+});
+
+const ThreadTurnStartFailCommand = Schema.Struct({
+  type: Schema.Literal("thread.turn.start.fail"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  messageId: MessageId,
+  failedAt: IsoDateTime,
+  ambiguous: Schema.optional(Schema.Boolean),
+  createdAt: IsoDateTime,
+});
+
 const ThreadMessageAssistantDeltaCommand = Schema.Struct({
   type: Schema.Literal("thread.message.assistant.delta"),
   commandId: CommandId,
@@ -787,6 +817,9 @@ const ThreadRevertCompleteCommand = Schema.Struct({
 
 const InternalOrchestrationCommand = Schema.Union([
   ThreadSessionSetCommand,
+  ThreadTurnStartSubmitCommand,
+  ThreadTurnCorrelateCommand,
+  ThreadTurnStartFailCommand,
   ThreadMessageAssistantDeltaCommand,
   ThreadMessageAssistantCompleteCommand,
   ThreadProposedPlanUpsertCommand,
@@ -815,6 +848,9 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.interaction-mode-set",
   "thread.message-sent",
   "thread.turn-start-requested",
+  "thread.turn-start-submitted",
+  "thread.turn-correlated",
+  "thread.turn-start-failed",
   "thread.turn-interrupt-requested",
   "thread.approval-response-requested",
   "thread.user-input-response-requested",
@@ -978,6 +1014,26 @@ export const ThreadSessionSetPayload = Schema.Struct({
   session: OrchestrationSession,
 });
 
+export const ThreadTurnCorrelatedPayload = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  turnId: TurnId,
+  resolvedAt: IsoDateTime,
+});
+
+export const ThreadTurnStartSubmittedPayload = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  submittedAt: IsoDateTime,
+});
+
+export const ThreadTurnStartFailedPayload = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+  failedAt: IsoDateTime,
+  ambiguous: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+});
+
 export const ThreadProposedPlanUpsertedPayload = Schema.Struct({
   threadId: ThreadId,
   proposedPlan: OrchestrationProposedPlan,
@@ -1080,6 +1136,21 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.turn-start-requested"),
     payload: ThreadTurnStartRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.turn-start-submitted"),
+    payload: ThreadTurnStartSubmittedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.turn-correlated"),
+    payload: ThreadTurnCorrelatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.turn-start-failed"),
+    payload: ThreadTurnStartFailedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,
