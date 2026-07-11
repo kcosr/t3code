@@ -18,6 +18,7 @@ export type {
   T3VoiceRealtimeConnectionState,
   T3VoiceRealtimeOffer,
   T3VoiceRealtimePrepareInput,
+  T3VoiceRealtimeTerminatedEvent,
   T3VoiceRuntimeErrorEvent,
   T3VoiceRuntimePhase,
   T3VoiceRuntimeState,

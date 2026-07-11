@@ -315,6 +315,10 @@ const safeOperationalValue = (value: unknown): string | undefined =>
 
 const realtimeDiagnostic = (
   event: OpenAiRealtimeSocketEvent,
+  correlation?: {
+    readonly sessionId: string;
+    readonly leaseGeneration: number;
+  },
 ):
   | {
       readonly message: string;
@@ -325,6 +329,7 @@ const realtimeDiagnostic = (
     return {
       message: "OpenAI Realtime sideband closed",
       annotations: {
+        ...correlation,
         closeCode: event.code,
         closeReason:
           event.reason.length === 0
@@ -340,6 +345,7 @@ const realtimeDiagnostic = (
     return {
       message: "OpenAI Realtime sideband transport error",
       annotations: {
+        ...correlation,
         causeType: event.cause instanceof Error ? event.cause.name : typeof event.cause,
       },
     };
@@ -353,6 +359,7 @@ const realtimeDiagnostic = (
   return {
     message: "OpenAI Realtime provider error",
     annotations: {
+      ...correlation,
       ...(safeOperationalValue(error.type) === undefined
         ? {}
         : { providerErrorType: safeOperationalValue(error.type)! }),
@@ -393,7 +400,17 @@ const completedFunctionCall = (
 const parseRealtimeEvent = (
   event: OpenAiRealtimeSocketEvent,
 ): ReadonlyArray<RealtimeProviderEvent> => {
-  if (event.type === "closed") return [{ type: "closed" }];
+  if (event.type === "closed") {
+    return event.code === 1000
+      ? [{ type: "closed" }]
+      : [
+          {
+            type: "error",
+            detail: "OpenAI Realtime sideband closed unexpectedly",
+            recoverable: false,
+          },
+        ];
+  }
   if (event.type === "error") {
     return [{ type: "error", detail: "OpenAI Realtime sideband failed", recoverable: true }];
   }
@@ -930,7 +947,10 @@ const make = Effect.gen(function* () {
       );
       const observeProviderDiagnostic = Effect.fn("OpenAiVoiceProvider.observeProviderDiagnostic")(
         function* (event: OpenAiRealtimeSocketEvent) {
-          const diagnostic = realtimeDiagnostic(event);
+          const diagnostic = realtimeDiagnostic(event, {
+            sessionId: input.sessionId,
+            leaseGeneration: input.leaseGeneration,
+          });
           if (diagnostic === undefined) return;
           yield* event.type === "closed" && event.code === 1000
             ? Effect.logInfo(diagnostic.message, diagnostic.annotations)

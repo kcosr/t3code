@@ -6,6 +6,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 
 internal enum class T3VoiceRuntimePhase {
   INACTIVE,
@@ -66,6 +67,21 @@ internal sealed interface T3VoiceRuntimeEvent {
         "recoverable" to recoverable,
       )
   }
+
+  data class RealtimeTerminated(
+    val nativeSessionId: String,
+    val outcome: String,
+    val code: String,
+    val retryable: Boolean,
+  ) : T3VoiceRuntimeEvent {
+    override fun toEventBody(): Map<String, Any> =
+      mapOf(
+        "nativeSessionId" to nativeSessionId,
+        "outcome" to outcome,
+        "code" to code,
+        "retryable" to retryable,
+      )
+  }
 }
 
 internal object T3VoiceStateStore {
@@ -88,93 +104,74 @@ internal object T3VoiceStateStore {
   val events: SharedFlow<T3VoiceRuntimeEvent> = mutableEvents.asSharedFlow()
 
   fun setServiceReady() {
-    update(phase = T3VoiceRuntimePhase.IDLE)
+    update { it.copy(phase = T3VoiceRuntimePhase.IDLE) }
   }
 
   fun setForeground(isForeground: Boolean) {
-    update(isForeground = isForeground)
+    update { it.copy(isForeground = isForeground) }
   }
 
   fun setRecording(recordingId: String?) {
-    update(
-      phase = if (recordingId == null) T3VoiceRuntimePhase.IDLE else T3VoiceRuntimePhase.RECORDING,
-      activeRecordingId = recordingId,
-      activePlaybackId = null,
-      activeRealtimeSessionId = null,
-      realtimeConnectionState = null,
-      realtimeMuted = false,
-    )
+    update {
+      it.copy(
+        phase = if (recordingId == null) T3VoiceRuntimePhase.IDLE else T3VoiceRuntimePhase.RECORDING,
+        activeRecordingId = recordingId,
+        activePlaybackId = null,
+        activeRealtimeSessionId = null,
+        realtimeConnectionState = null,
+        realtimeMuted = false,
+      )
+    }
   }
 
   fun setPlayback(playbackId: String?) {
-    update(
-      phase = if (playbackId == null) T3VoiceRuntimePhase.IDLE else T3VoiceRuntimePhase.PLAYING,
-      activeRecordingId = null,
-      activePlaybackId = playbackId,
-      activeRealtimeSessionId = null,
-      realtimeConnectionState = null,
-      realtimeMuted = false,
-    )
+    update {
+      it.copy(
+        phase = if (playbackId == null) T3VoiceRuntimePhase.IDLE else T3VoiceRuntimePhase.PLAYING,
+        activeRecordingId = null,
+        activePlaybackId = playbackId,
+        activeRealtimeSessionId = null,
+        realtimeConnectionState = null,
+        realtimeMuted = false,
+      )
+    }
   }
 
   fun setRealtime(sessionId: String?, connectionState: String?, muted: Boolean) {
-    update(
-      phase = if (sessionId == null) T3VoiceRuntimePhase.IDLE else T3VoiceRuntimePhase.REALTIME,
-      activeRecordingId = null,
-      activePlaybackId = null,
-      activeRealtimeSessionId = sessionId,
-      realtimeConnectionState = connectionState,
-      realtimeMuted = muted,
-    )
+    update {
+      it.copy(
+        phase = if (sessionId == null) T3VoiceRuntimePhase.IDLE else T3VoiceRuntimePhase.REALTIME,
+        activeRecordingId = null,
+        activePlaybackId = null,
+        activeRealtimeSessionId = sessionId,
+        realtimeConnectionState = connectionState,
+        realtimeMuted = muted,
+      )
+    }
   }
 
   fun setInactive() {
-    update(
-      phase = T3VoiceRuntimePhase.INACTIVE,
-      isForeground = false,
-      activeRecordingId = null,
-      activePlaybackId = null,
-      activeRealtimeSessionId = null,
-      realtimeConnectionState = null,
-      realtimeMuted = false,
-    )
+    update {
+      it.copy(
+        phase = T3VoiceRuntimePhase.INACTIVE,
+        isForeground = false,
+        activeRecordingId = null,
+        activePlaybackId = null,
+        activeRealtimeSessionId = null,
+        realtimeConnectionState = null,
+        realtimeMuted = false,
+      )
+    }
   }
 
   fun emit(event: T3VoiceRuntimeEvent) {
     mutableEvents.tryEmit(event)
   }
 
-  private fun update(
-    phase: T3VoiceRuntimePhase = mutableState.value.phase,
-    isForeground: Boolean = mutableState.value.isForeground,
-    activeRecordingId: String? = mutableState.value.activeRecordingId,
-    activePlaybackId: String? = mutableState.value.activePlaybackId,
-    activeRealtimeSessionId: String? = mutableState.value.activeRealtimeSessionId,
-    realtimeConnectionState: String? = mutableState.value.realtimeConnectionState,
-    realtimeMuted: Boolean = mutableState.value.realtimeMuted,
-  ) {
-    val current = mutableState.value
-    if (
-      current.phase == phase &&
-        current.isForeground == isForeground &&
-        current.activeRecordingId == activeRecordingId &&
-        current.activePlaybackId == activePlaybackId &&
-        current.activeRealtimeSessionId == activeRealtimeSessionId &&
-        current.realtimeConnectionState == realtimeConnectionState &&
-        current.realtimeMuted == realtimeMuted
-    ) {
-      return
+  private fun update(transform: (T3VoiceRuntimeState) -> T3VoiceRuntimeState) {
+    mutableState.update { current ->
+      val next = transform(current)
+      if (next == current) current else next.copy(sequence = current.sequence + 1)
     }
-    mutableState.value =
-      T3VoiceRuntimeState(
-        phase = phase,
-        isForeground = isForeground,
-        activeRecordingId = activeRecordingId,
-        activePlaybackId = activePlaybackId,
-        activeRealtimeSessionId = activeRealtimeSessionId,
-        realtimeConnectionState = realtimeConnectionState,
-        realtimeMuted = realtimeMuted,
-        sequence = current.sequence + 1,
-      )
   }
 }

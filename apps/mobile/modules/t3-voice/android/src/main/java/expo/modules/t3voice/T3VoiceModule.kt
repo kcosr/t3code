@@ -66,6 +66,8 @@ class T3VoiceModule : Module() {
                   sendEvent(PLAYBACK_CHUNK_CONSUMED_EVENT, event.toEventBody())
                 is T3VoiceRuntimeEvent.RuntimeError ->
                   sendEvent(RUNTIME_ERROR_EVENT, event.toEventBody())
+                is T3VoiceRuntimeEvent.RealtimeTerminated ->
+                  sendEvent(REALTIME_TERMINATED_EVENT, event.toEventBody())
               }
             }
           }
@@ -80,10 +82,15 @@ class T3VoiceModule : Module() {
   override fun definition() =
     ModuleDefinition {
       Name(MODULE_NAME)
-      Events(STATE_CHANGED_EVENT, PLAYBACK_CHUNK_CONSUMED_EVENT, RUNTIME_ERROR_EVENT)
+      Events(
+        STATE_CHANGED_EVENT,
+        PLAYBACK_CHUNK_CONSUMED_EVENT,
+        RUNTIME_ERROR_EVENT,
+        REALTIME_TERMINATED_EVENT,
+      )
 
       Constants(
-        "nativeRevision" to 2,
+        "nativeRevision" to 3,
       )
 
       OnCreate {
@@ -404,6 +411,7 @@ class T3VoiceModule : Module() {
     private const val STATE_CHANGED_EVENT = "stateChanged"
     private const val PLAYBACK_CHUNK_CONSUMED_EVENT = "playbackChunkConsumed"
     private const val RUNTIME_ERROR_EVENT = "runtimeError"
+    private const val REALTIME_TERMINATED_EVENT = "realtimeTerminated"
     private const val BINDER_CONNECTION_TIMEOUT_MS = 5_000L
   }
 }

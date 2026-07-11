@@ -80,6 +80,13 @@ export interface T3VoiceRuntimeErrorEvent {
   readonly recoverable: boolean;
 }
 
+export interface T3VoiceRealtimeTerminatedEvent {
+  readonly nativeSessionId: string;
+  readonly outcome: "ended" | "failed";
+  readonly code: string;
+  readonly retryable: boolean;
+}
+
 export interface T3VoiceRealtimePrepareInput {
   readonly nativeSessionId: string;
 }
@@ -114,6 +121,10 @@ export interface T3VoiceNativeModule {
     (
       eventName: "runtimeError",
       listener: (event: T3VoiceRuntimeErrorEvent) => void,
+    ): T3VoiceEventSubscription;
+    (
+      eventName: "realtimeTerminated",
+      listener: (event: T3VoiceRealtimeTerminatedEvent) => void,
     ): T3VoiceEventSubscription;
   };
   readonly getMediaCapabilitiesAsync: () => Promise<T3VoiceMediaCapabilities>;

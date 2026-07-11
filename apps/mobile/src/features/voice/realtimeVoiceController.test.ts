@@ -43,10 +43,20 @@ const serverSession = {
 };
 
 const makeHarness = () => {
-  const listeners = new Map<string, (event: never) => void>();
+  const listeners = new Map<string, (event: unknown) => void>();
   const native = {
     getMicrophonePermissionAsync: vi.fn(async () => ({ granted: true })),
     requestMicrophonePermissionAsync: vi.fn(),
+    getStateAsync: vi.fn(async () => ({
+      phase: "realtime" as const,
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connecting" as const,
+      realtimeMuted: false,
+      sequence: 1,
+    })),
     prepareRealtimeSessionAsync: vi.fn(async () => ({
       nativeSessionId: SESSION_ID,
       sdp: "local-offer",
@@ -57,7 +67,7 @@ const makeHarness = () => {
     getAudioRoutesAsync: vi.fn(async () => []),
     setAudioRouteAsync: vi.fn(async () => []),
     addListener: vi.fn((name: string, listener: (event: never) => void) => {
-      listeners.set(name, listener);
+      listeners.set(name, (event) => listener(event as never));
       return { remove: vi.fn() };
     }),
   } as unknown as T3VoiceNativeModule;
@@ -91,7 +101,12 @@ const makeHarness = () => {
     { onSnapshot: (snapshot) => snapshots.push(snapshot.phase) },
     { scheduler },
   );
-  return { client, controller, native, scheduler, snapshots };
+  const emitNative = (name: string, event: unknown) => {
+    const listener = listeners.get(name);
+    if (listener === undefined) throw new Error(`Missing native listener: ${name}`);
+    listener(event);
+  };
+  return { client, controller, emitNative, native, scheduler, snapshots };
 };
 
 describe("RealtimeVoiceController", () => {
@@ -123,6 +138,30 @@ describe("RealtimeVoiceController", () => {
     vi.mocked(client.offerSession).mockReturnValue(Effect.die(new Error("signaling failed")));
 
     await expect(controller.start(createInput)).rejects.toThrow("signaling failed");
+
+    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledWith({
+      nativeSessionId: SESSION_ID,
+    });
+    expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1);
+    expect(controller.getSnapshot().phase).toBe("error");
+  });
+
+  it("rejects startup when native media terminates after accepting the answer", async () => {
+    const { client, controller, native } = makeHarness();
+    vi.mocked(native.getStateAsync).mockResolvedValueOnce({
+      phase: "idle",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: null,
+      realtimeConnectionState: "failed",
+      realtimeMuted: false,
+      sequence: 2,
+    });
+
+    await expect(controller.start(createInput)).rejects.toThrow(
+      "The Realtime media session ended during startup",
+    );
 
     expect(native.stopRealtimeSessionAsync).toHaveBeenCalledWith({
       nativeSessionId: SESSION_ID,
@@ -175,5 +214,174 @@ describe("RealtimeVoiceController", () => {
     });
     expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1);
     expect(controller.getSnapshot()).toMatchObject({ phase: "error", error: expect.any(String) });
+  });
+
+  it("ignores aggregate and stale native terminal events that do not own the active session", async () => {
+    const { client, controller, emitNative, native } = makeHarness();
+    await controller.start(createInput);
+
+    emitNative("stateChanged", {
+      phase: "idle",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: null,
+      realtimeConnectionState: "failed",
+      realtimeMuted: false,
+      sequence: 2,
+    });
+    emitNative("realtimeTerminated", {
+      nativeSessionId: "an-older-session",
+      outcome: "failed",
+      code: "realtime-connection-failed",
+      retryable: true,
+    });
+    await Promise.resolve();
+
+    expect(controller.getSnapshot().phase).toBe("active");
+    expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
+    expect(client.closeSession).not.toHaveBeenCalled();
+  });
+
+  it("preserves a safe native failure reason and closes the server lease once", async () => {
+    const { client, controller, emitNative } = makeHarness();
+    await controller.start(createInput);
+
+    emitNative("realtimeTerminated", {
+      nativeSessionId: SESSION_ID,
+      outcome: "failed",
+      code: "realtime-ice-timeout",
+      retryable: true,
+    });
+
+    await vi.waitFor(() => {
+      expect(controller.getSnapshot()).toMatchObject({
+        phase: "error",
+        error: "The Realtime connection timed out",
+      });
+    });
+    expect(client.closeSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not surface raw native diagnostic payloads", async () => {
+    const { controller, emitNative } = makeHarness();
+    await controller.start(createInput);
+
+    emitNative("runtimeError", {
+      operation: `realtime:${SESSION_ID}`,
+      code: "data-channel-error",
+      message: "private provider payload",
+      recoverable: true,
+    });
+
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "active",
+      error: "The Realtime media connection reported an error",
+    });
+  });
+
+  it("preserves the latest server error while cleaning native media", async () => {
+    const { client, controller, native } = makeHarness();
+    await controller.start(createInput);
+    vi.mocked(client.sessionEvents).mockReturnValueOnce(
+      Effect.succeed({
+        state: { ...serverSession.state, phase: "listening" as const, sequence: 2 },
+        events: [
+          {
+            sessionId: SESSION_ID,
+            leaseGeneration: 1,
+            sequence: 2,
+            occurredAt: "2026-07-10T22:01:00.000Z" as never,
+            type: "error" as const,
+            reason: "The provider connection was interrupted",
+            recoverable: false,
+          },
+        ],
+      }),
+    );
+    vi.mocked(client.sessionEvents).mockReturnValueOnce(
+      Effect.succeed({
+        state: { ...serverSession.state, phase: "error" as const, sequence: 3 },
+        events: [],
+      }),
+    );
+
+    await controller.refreshEvents();
+    expect(controller.getSnapshot().phase).toBe("active");
+    await controller.refreshEvents();
+
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "error",
+      error: "The provider connection was interrupted",
+    });
+    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledWith({
+      nativeSessionId: SESSION_ID,
+    });
+    expect(client.closeSession).not.toHaveBeenCalled();
+  });
+
+  it("returns to idle on graceful server termination without closing the server twice", async () => {
+    const { client, controller, native } = makeHarness();
+    await controller.start(createInput);
+    vi.mocked(client.sessionEvents).mockReturnValue(
+      Effect.succeed({
+        state: { ...serverSession.state, phase: "ended" as const, sequence: 1 },
+        events: [],
+      }),
+    );
+
+    await controller.refreshEvents();
+
+    expect(controller.getSnapshot()).toMatchObject({ phase: "idle", session: null, error: null });
+    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledTimes(1);
+    expect(client.closeSession).not.toHaveBeenCalled();
+  });
+
+  it("coalesces duplicate native terminal events during asynchronous cleanup", async () => {
+    const { client, controller, emitNative } = makeHarness();
+    await controller.start(createInput);
+    const terminalEvent = {
+      nativeSessionId: SESSION_ID,
+      outcome: "failed",
+      code: "realtime-connection-failed",
+      retryable: true,
+    };
+
+    emitNative("realtimeTerminated", terminalEvent);
+    emitNative("realtimeTerminated", terminalEvent);
+
+    await vi.waitFor(() => expect(controller.getSnapshot().phase).toBe("error"));
+    expect(client.closeSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets one terminal owner win when native and server termination race", async () => {
+    const { client, controller, emitNative, native } = makeHarness();
+    await controller.start(createInput);
+    let resolveEvents!: (value: {
+      state: typeof serverSession.state;
+      events: ReadonlyArray<never>;
+    }) => void;
+    const pendingEvents = new Promise<{
+      state: typeof serverSession.state;
+      events: ReadonlyArray<never>;
+    }>((resolve) => {
+      resolveEvents = resolve;
+    });
+    vi.mocked(client.sessionEvents).mockReturnValue(Effect.promise(() => pendingEvents));
+
+    const refresh = controller.refreshEvents();
+    await Promise.resolve();
+    emitNative("realtimeTerminated", {
+      nativeSessionId: SESSION_ID,
+      outcome: "failed",
+      code: "realtime-connection-failed",
+      retryable: true,
+    });
+    resolveEvents({ state: serverSession.state, events: [] });
+    await refresh;
+    await vi.waitFor(() => expect(controller.getSnapshot().phase).toBe("error"));
+
+    expect(client.closeSession).toHaveBeenCalledTimes(1);
+    expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
   });
 });

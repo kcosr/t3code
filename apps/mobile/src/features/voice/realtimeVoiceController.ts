@@ -13,6 +13,7 @@ import type { VoiceHttpClient } from "@t3tools/client-runtime/voice";
 import type {
   T3VoiceAudioRoute,
   T3VoiceNativeModule,
+  T3VoiceRealtimeTerminatedEvent,
   T3VoiceRuntimeErrorEvent,
   T3VoiceRuntimeState,
 } from "@t3tools/mobile-voice-native";
@@ -39,6 +40,7 @@ interface ActiveSession {
   readonly heartbeatIntervalMs: number;
   serverState: VoiceSessionState;
   afterSequence: number;
+  lastServerError: string | null;
 }
 
 interface TimerScheduler {
@@ -58,6 +60,36 @@ const defaultScheduler: TimerScheduler = {
 
 const messageFor = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
+
+const nativeTerminationMessage = (code: string): string => {
+  switch (code) {
+    case "realtime-connection-failed":
+      return "The Realtime media connection failed";
+    case "realtime-ice-timeout":
+      return "The Realtime connection timed out";
+    case "realtime-answer-rejected":
+      return "The Realtime answer was rejected";
+    case "realtime-offer-failed":
+      return "The Realtime offer could not be created";
+    case "realtime-prepare-failed":
+      return "The Realtime media session could not be prepared";
+    default:
+      return "The Realtime media session ended unexpectedly";
+  }
+};
+
+const nativeRuntimeErrorMessage = (code: string): string => {
+  switch (code) {
+    case "realtime-connection-failed":
+    case "realtime-ice-timeout":
+    case "realtime-answer-rejected":
+    case "realtime-offer-failed":
+    case "realtime-prepare-failed":
+      return nativeTerminationMessage(code);
+    default:
+      return "The Realtime media connection reported an error";
+  }
+};
 
 export class RealtimeVoiceController {
   private readonly scheduler: TimerScheduler;
@@ -87,6 +119,7 @@ export class RealtimeVoiceController {
     this.subscriptions = [
       native.addListener("stateChanged", (state) => this.handleNativeState(state)),
       native.addListener("runtimeError", (event) => this.handleNativeError(event)),
+      native.addListener("realtimeTerminated", (event) => this.handleNativeTermination(event)),
     ];
   }
 
@@ -129,6 +162,15 @@ export class RealtimeVoiceController {
         sdp: answer.sdp,
       });
       this.ensureCurrentStart(generation);
+      const nativeState = await this.native.getStateAsync();
+      this.ensureCurrentStart(generation);
+      if (
+        nativeState.activeRealtimeSessionId !== nativeSessionId ||
+        nativeState.realtimeConnectionState === "failed" ||
+        nativeState.realtimeConnectionState === "closed"
+      ) {
+        throw new Error("The Realtime media session ended during startup");
+      }
 
       const active: ActiveSession = {
         sessionId: serverSession.state.sessionId,
@@ -137,6 +179,7 @@ export class RealtimeVoiceController {
         heartbeatIntervalMs: serverSession.heartbeatIntervalSeconds * 1_000,
         serverState: serverSession.state,
         afterSequence: serverSession.state.sequence,
+        lastServerError: null,
       };
       this.active = active;
       this.consecutiveControlFailures = 0;
@@ -230,9 +273,16 @@ export class RealtimeVoiceController {
       this.consecutiveControlFailures = 0;
       this.setSnapshot({ session: result.state });
       if (result.events.length > 0) this.listener.onSessionEvents?.(result.events);
+      const serverError = result.events.toReversed().find((event) => event.type === "error");
+      if (serverError !== undefined) active.lastServerError = serverError.reason;
       const fenced = result.events.some((event) => event.type === "lease-fenced");
       if (fenced || result.state.phase === "ended" || result.state.phase === "error") {
-        await this.stop();
+        await this.cleanupAfterServerTermination(
+          active,
+          result.state.phase === "error"
+            ? (active.lastServerError ?? "The Realtime voice session ended with an error")
+            : null,
+        );
       }
     } catch (cause) {
       this.handleControlFailure(cause);
@@ -286,32 +336,22 @@ export class RealtimeVoiceController {
   }
 
   private handleNativeState(state: T3VoiceRuntimeState) {
-    const active = this.active;
     this.setSnapshot({ native: state });
-    if (
-      active !== null &&
-      this.snapshot.phase === "active" &&
-      state.activeRealtimeSessionId === null
-    ) {
-      if (state.realtimeConnectionState === "closed") {
-        void this.closeServerAfterNativeTermination(active, null);
-      } else if (state.realtimeConnectionState === "failed") {
-        void this.closeServerAfterNativeTermination(active, "The Realtime media connection failed");
-      }
-    }
   }
 
   private handleNativeError(event: T3VoiceRuntimeErrorEvent) {
     const active = this.active;
-    if (active === null) {
-      if (this.snapshot.phase === "error" && event.operation.startsWith("realtime:")) {
-        this.setSnapshot({ error: event.message });
-      }
-      return;
-    }
-    if (event.operation !== `realtime:${active.nativeSessionId}`) return;
-    this.setSnapshot({ error: event.message });
-    if (!event.recoverable) void this.stop();
+    if (active === null || event.operation !== `realtime:${active.nativeSessionId}`) return;
+    this.setSnapshot({ error: nativeRuntimeErrorMessage(event.code) });
+  }
+
+  private handleNativeTermination(event: T3VoiceRealtimeTerminatedEvent) {
+    const active = this.active;
+    if (active === null || event.nativeSessionId !== active.nativeSessionId) return;
+    void this.closeServerAfterNativeTermination(
+      active,
+      event.outcome === "ended" ? null : nativeTerminationMessage(event.code),
+    );
   }
 
   private async closeServerAfterNativeTermination(active: ActiveSession, error: string | null) {
@@ -324,6 +364,20 @@ export class RealtimeVoiceController {
     this.setSnapshot({
       phase: error === null ? "idle" : "error",
       session: null,
+      error,
+    });
+  }
+
+  private async cleanupAfterServerTermination(active: ActiveSession, error: string | null) {
+    if (this.active !== active) return;
+    this.active = null;
+    this.clearControlTimers();
+    await this.native
+      .stopRealtimeSessionAsync({ nativeSessionId: active.nativeSessionId })
+      .catch(() => undefined);
+    this.setSnapshot({
+      phase: error === null ? "idle" : "error",
+      session: error === null ? null : active.serverState,
       error,
     });
   }

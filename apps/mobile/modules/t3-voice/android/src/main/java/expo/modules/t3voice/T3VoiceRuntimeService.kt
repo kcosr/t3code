@@ -140,6 +140,16 @@ class T3VoiceRuntimeService : Service() {
             ),
           )
         },
+        onTerminated = { sessionId, outcome, code, retryable ->
+          T3VoiceStateStore.emit(
+            T3VoiceRuntimeEvent.RealtimeTerminated(
+              nativeSessionId = sessionId,
+              outcome = outcome,
+              code = code,
+              retryable = retryable,
+            ),
+          )
+        },
       )
     }
   private val realtime: T3VoiceWebRtcSession

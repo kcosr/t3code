@@ -34,6 +34,7 @@ internal class T3VoiceWebRtcSession(
   context: Context,
   private val onStateChanged: (String, String, Boolean) -> Unit,
   private val onError: (String, String, String, Boolean) -> Unit,
+  private val onTerminated: (String, String, String, Boolean) -> Unit,
 ) {
   private data class ActiveSession(
     val sessionId: String,
@@ -55,6 +56,7 @@ internal class T3VoiceWebRtcSession(
   private val lock = Any()
   private val scheduler = Executors.newSingleThreadScheduledExecutor()
   private val audioRouter = T3VoiceAudioRouter(applicationContext)
+  private val terminalLatch = T3VoiceRealtimeTerminalLatch()
   private val audioDeviceModule: JavaAudioDeviceModule
   private val peerConnectionFactory: PeerConnectionFactory
   private var active: ActiveSession? = null
@@ -131,6 +133,7 @@ internal class T3VoiceWebRtcSession(
     synchronized(lock) {
       check(active == null) { "A Realtime voice session started concurrently." }
       active = session
+      terminalLatch.activate(sessionId)
       session.offerTimeout =
         scheduler.schedule(
           { fail(sessionId, ERROR_ICE_TIMEOUT, "WebRTC ICE gathering timed out.", null, true) },
@@ -263,6 +266,9 @@ internal class T3VoiceWebRtcSession(
     session.answerCallback = null
     releaseSession(session)
     audioRouter.stop()
+    if (terminalLatch.claim(sessionId)) {
+      onTerminated(sessionId, OUTCOME_ENDED, ERROR_SESSION_STOPPED, false)
+    }
     onStateChanged(sessionId, STATE_CLOSED, session.muted)
     return true
   }
@@ -326,9 +332,8 @@ internal class T3VoiceWebRtcSession(
         PeerConnection.PeerConnectionState.DISCONNECTED -> STATE_DISCONNECTED
         PeerConnection.PeerConnectionState.FAILED -> STATE_FAILED
         PeerConnection.PeerConnectionState.CLOSED -> STATE_CLOSED
-      }
+    }
     val muted = synchronized(lock) { active?.takeIf { it.sessionId == sessionId }?.muted } ?: return
-    onStateChanged(sessionId, normalized, muted)
     if (state == PeerConnection.PeerConnectionState.FAILED) {
       fail(
         sessionId,
@@ -337,7 +342,9 @@ internal class T3VoiceWebRtcSession(
         null,
         true,
       )
+      return
     }
+    onStateChanged(sessionId, normalized, muted)
   }
 
   private fun fail(
@@ -360,8 +367,10 @@ internal class T3VoiceWebRtcSession(
     session.answerCallback = null
     releaseSession(session)
     audioRouter.stop()
+    if (terminalLatch.claim(sessionId)) {
+      onTerminated(sessionId, OUTCOME_FAILED, code, recoverable)
+    }
     onStateChanged(sessionId, STATE_FAILED, session.muted)
-    onError(sessionId, code, message, recoverable)
   }
 
   private fun releaseSession(session: ActiveSession) {
@@ -551,10 +560,12 @@ internal class T3VoiceWebRtcSession(
       reportAudioError("realtime-playout", message)
   }
 
-  private fun reportAudioError(code: String, providerMessage: String?) {
+  private fun reportAudioError(
+    code: String,
+    @Suppress("UNUSED_PARAMETER") providerMessage: String?,
+  ) {
     val sessionId = synchronized(lock) { active?.sessionId } ?: return
-    val message = if (providerMessage.isNullOrBlank()) "Realtime audio failed." else "Realtime audio failed: $providerMessage"
-    onError(sessionId, code, message, true)
+    onError(sessionId, code, "Realtime audio failed.", true)
   }
 
   private open class BaseSdpObserver : SdpObserver {
@@ -579,6 +590,8 @@ internal class T3VoiceWebRtcSession(
     private const val STATE_DISCONNECTED = "disconnected"
     private const val STATE_FAILED = "failed"
     private const val STATE_CLOSED = "closed"
+    private const val OUTCOME_ENDED = "ended"
+    private const val OUTCOME_FAILED = "failed"
     private const val ERROR_PREPARE_FAILED = "realtime-prepare-failed"
     private const val ERROR_OFFER_FAILED = "realtime-offer-failed"
     private const val ERROR_ICE_TIMEOUT = "realtime-ice-timeout"

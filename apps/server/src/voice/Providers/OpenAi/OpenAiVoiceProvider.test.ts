@@ -94,15 +94,47 @@ it("reports provider failures without logging provider messages or transcript co
     }),
   ).toEqual([{ type: "error", detail: "OpenAI Realtime reported an error", recoverable: false }]);
   expect(
-    __testing.realtimeDiagnostic({ type: "closed", code: 1009, reason: privateMessage }),
+    __testing.realtimeDiagnostic(
+      { type: "closed", code: 1009, reason: privateMessage },
+      { sessionId: "voice-session-sensitive", leaseGeneration: 7 },
+    ),
   ).toEqual({
     message: "OpenAI Realtime sideband closed",
     annotations: {
+      sessionId: "voice-session-sensitive",
+      leaseGeneration: 7,
       closeCode: 1009,
       closeReason: "provider-supplied",
       closeReasonLength: privateMessage.length,
     },
   });
+  expect(
+    JSON.stringify(
+      __testing.realtimeDiagnostic(
+        { type: "closed", code: 1009, reason: privateMessage },
+        { sessionId: "voice-session-sensitive", leaseGeneration: 7 },
+      ),
+    ),
+  ).not.toContain(privateMessage);
+});
+
+it("distinguishes normal and abnormal Realtime sideband closes", () => {
+  expect(__testing.parseRealtimeEvent({ type: "closed", code: 1000, reason: "done" })).toEqual([
+    { type: "closed" },
+  ]);
+  expect(
+    __testing.parseRealtimeEvent({
+      type: "closed",
+      code: 1006,
+      reason: "private provider failure reason",
+    }),
+  ).toEqual([
+    {
+      type: "error",
+      detail: "OpenAI Realtime sideband closed unexpectedly",
+      recoverable: false,
+    },
+  ]);
 });
 
 const credentialStore = (key: Option.Option<string>) =>
