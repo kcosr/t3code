@@ -286,10 +286,10 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     }
     if (props.speechPlayback.enabled) props.speechPlayback.onToggle();
     if (dictation.phase === "recording") {
-      void dictation.cancel().finally(realtimeVoice.onToggle);
+      void dictation.cancel().finally(realtimeVoice.onStartNew);
       return;
     }
-    realtimeVoice.onToggle();
+    realtimeVoice.onStartNew();
   }, [dictation, props.speechPlayback, realtimeInUse, realtimeVoice]);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
@@ -932,6 +932,14 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                     active={realtimeVoice.phase === "active"}
                     disabled={realtimeVoice.phase === "stopping"}
                     onPress={handleRealtimeToggle}
+                    showChevron={false}
+                  />
+                ) : null}
+                {realtimeVoice.available && !realtimeInUse ? (
+                  <ComposerToolbarButton
+                    accessibilityLabel="Browse voice conversations"
+                    icon="clock.arrow.circlepath"
+                    onPress={realtimeVoice.onBrowseHistory}
                     showChevron={false}
                   />
                 ) : null}

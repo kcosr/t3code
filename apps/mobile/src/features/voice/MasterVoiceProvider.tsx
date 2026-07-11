@@ -64,7 +64,8 @@ interface MasterVoiceContextValue {
   readonly phase: RealtimeVoiceControllerSnapshot["phase"];
   readonly muted: boolean;
   readonly activeEnvironmentId: EnvironmentId | null;
-  readonly onToggle: () => void;
+  readonly onStartNew: () => void;
+  readonly onBrowseHistory: () => void;
   readonly onToggleMuted: () => void;
   readonly onOpenDetails: () => void;
 }
@@ -101,6 +102,7 @@ export function MasterVoiceProvider(props: {
   const [transcript, setTranscript] = useState<ReadonlyArray<MasterVoiceTranscriptTurn>>([]);
   const [confirmations, setConfirmations] = useState<ReadonlyArray<PendingVoiceConfirmation>>([]);
   const runtimeRef = useRef<MasterVoiceRuntime | null>(null);
+  const startInFlightRef = useRef(false);
   const focusUpdateGenerationRef = useRef(0);
   const focusUpdateTailRef = useRef(Promise.resolve());
   const attachmentRef = useRef(attachment);
@@ -230,8 +232,14 @@ export function MasterVoiceProvider(props: {
     async (conversation: VoiceConversationSelection, takeover = false) => {
       const focus = props.focus;
       const runtime = runtimeRef.current;
-      if (focus === null || runtime === null || runtime.environmentId !== focus.environmentId)
+      if (
+        startInFlightRef.current ||
+        focus === null ||
+        runtime === null ||
+        runtime.environmentId !== focus.environmentId
+      )
         return;
+      startInFlightRef.current = true;
       setPickerConversations(null);
       setTranscript([]);
       const sessionInput: VoiceSessionCreateInput = {
@@ -273,19 +281,21 @@ export function MasterVoiceProvider(props: {
           return;
         }
         Alert.alert("Voice conversation failed", errorMessage(cause));
+      } finally {
+        startInFlightRef.current = false;
       }
     },
     [props.focus],
   );
 
-  const toggle = useCallback(() => {
+  const startNew = useCallback(() => {
+    if ((snapshot.phase !== "idle" && snapshot.phase !== "error") || props.focus === null) return;
+    void start({ type: "new", retention: "durable", title: "T3 Voice" });
+  }, [props.focus, snapshot.phase, start]);
+
+  const browseHistory = useCallback(() => {
     const runtime = runtimeRef.current;
-    if (runtime === null) return;
-    if (snapshot.phase === "active" || snapshot.phase === "starting") {
-      void runtime.controller.stop();
-      return;
-    }
-    if (snapshot.phase === "stopping" || props.focus === null) return;
+    if (runtime === null || snapshot.phase !== "idle" || props.focus === null) return;
     void Effect.runPromise(runtime.client.listConversations())
       .then((conversations) => setPickerConversations(durableVoiceConversations(conversations)))
       .catch((cause) => Alert.alert("Voice conversations unavailable", errorMessage(cause)));
@@ -404,17 +414,19 @@ export function MasterVoiceProvider(props: {
       phase: snapshot.phase,
       muted: snapshot.native?.realtimeMuted ?? false,
       activeEnvironmentId: attachment?.environmentId ?? null,
-      onToggle: toggle,
+      onStartNew: startNew,
+      onBrowseHistory: browseHistory,
       onToggleMuted: toggleMuted,
       onOpenDetails: () => setTranscriptVisible(true),
     }),
     [
       attachment?.environmentId,
       availableEnvironmentId,
+      browseHistory,
       native,
       props.focus,
       snapshot,
-      toggle,
+      startNew,
       toggleMuted,
     ],
   );
@@ -444,7 +456,6 @@ export function MasterVoiceProvider(props: {
         visible={pickerConversations !== null}
         conversations={pickerConversations ?? []}
         onCancel={() => setPickerConversations(null)}
-        onNew={() => void start({ type: "new", retention: "durable", title: "T3 Voice" })}
         onContinue={(conversation) =>
           void start({
             type: "continue",

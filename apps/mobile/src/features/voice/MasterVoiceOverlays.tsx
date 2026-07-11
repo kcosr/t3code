@@ -41,7 +41,6 @@ export function VoiceConversationPicker(props: {
   readonly visible: boolean;
   readonly conversations: ReadonlyArray<VoiceConversationSummary>;
   readonly onCancel: () => void;
-  readonly onNew: () => void;
   readonly onContinue: (conversation: VoiceConversationSummary) => void;
 }) {
   const insets = useSafeAreaInsets();
@@ -67,20 +66,6 @@ export function VoiceConversationPicker(props: {
             Calls use an AI-generated voice and may request confirmed T3 actions.
           </Text>
         </View>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Start new voice conversation"
-          className="mx-4 mt-4 flex-row items-center gap-3 border-b border-border px-2 py-4"
-          onPress={props.onNew}
-        >
-          <SymbolView
-            name={platformSymbolName("plus.circle.fill")}
-            size={22}
-            tintColor={iconColor}
-            type="monochrome"
-          />
-          <Text className="text-base font-t3-bold text-foreground">New conversation</Text>
-        </Pressable>
         <FlatList
           data={props.conversations}
           keyExtractor={(conversation) => conversation.conversationId}
@@ -272,11 +257,15 @@ export function MasterVoiceCallBar(props: {
   readonly onTranscript: () => void;
   readonly onStop: () => void;
 }) {
+  const insets = useSafeAreaInsets();
   const iconColor = useThemeColor("--color-icon");
   if (props.snapshot.phase === "idle") return null;
   const lastTurn = props.transcript.at(-1);
   return (
-    <View className="flex-row items-center gap-3 border-t border-border bg-screen px-3 py-2">
+    <View
+      className="flex-row items-center gap-3 border-t border-border bg-screen px-3 pt-2"
+      style={{ paddingBottom: Math.max(insets.bottom, 12) }}
+    >
       <SymbolView
         name={platformSymbolName("waveform.circle.fill")}
         size={24}
@@ -304,6 +293,7 @@ export function MasterVoiceCallBar(props: {
             accessibilityLabel={
               props.snapshot.native?.realtimeMuted ? "Unmute microphone" : "Mute microphone"
             }
+            active={props.snapshot.native?.realtimeMuted ?? false}
             onPress={props.onMute}
           />
           <ControlPill
