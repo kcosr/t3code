@@ -249,17 +249,50 @@ function phaseLabel(snapshot: RealtimeVoiceControllerSnapshot): string {
 }
 
 export function MasterVoiceCallBar(props: {
+  readonly available: boolean;
   readonly snapshot: RealtimeVoiceControllerSnapshot;
   readonly attachment: ActiveMasterVoiceAttachment | null;
   readonly transcript: ReadonlyArray<MasterVoiceTranscriptTurn>;
   readonly onMute: () => void;
   readonly onRoute: () => void;
   readonly onTranscript: () => void;
+  readonly onResume: () => void;
+  readonly resumePending: boolean;
+  readonly onHistory: () => void;
   readonly onStop: () => void;
 }) {
   const insets = useSafeAreaInsets();
   const iconColor = useThemeColor("--color-icon");
-  if (props.snapshot.phase === "idle") return null;
+  if (props.snapshot.phase === "idle") {
+    if (!props.available) return null;
+    return (
+      <View
+        className="flex-row items-center gap-3 border-t border-border bg-screen px-3 pt-2"
+        style={{ paddingBottom: Math.max(insets.bottom, 12) }}
+      >
+        <View className="min-w-0 flex-1">
+          <Text className="text-sm font-t3-bold text-foreground" numberOfLines={1}>
+            Voice conversation
+          </Text>
+          <Text className="text-xs text-foreground-muted" numberOfLines={1}>
+            Resume your last conversation
+          </Text>
+        </View>
+        <ControlPill
+          icon="clock.arrow.circlepath"
+          accessibilityLabel="Browse voice conversations"
+          onPress={props.onHistory}
+        />
+        <ControlPill
+          icon="waveform.circle.fill"
+          accessibilityLabel="Resume last voice conversation"
+          variant="primary"
+          disabled={props.resumePending}
+          onPress={props.onResume}
+        />
+      </View>
+    );
+  }
   const lastTurn = props.transcript.at(-1);
   return (
     <View

@@ -12,6 +12,7 @@ import {
   isSameMasterVoiceFocus,
   masterVoiceEnvironmentId,
   reconcileMasterVoiceFocus,
+  resumeVoiceConversationSelection,
   type MasterVoiceFocus,
 } from "./masterVoiceState";
 
@@ -50,6 +51,28 @@ describe("master voice state", () => {
         conversation("newer", "durable", "2026-07-12T00:00:00.000Z"),
       ]).map(({ conversationId }) => conversationId),
     ).toEqual(["newer", "older"]);
+  });
+
+  it("resumes the most recently active durable conversation by default", () => {
+    expect(
+      resumeVoiceConversationSelection([
+        conversation("older", "durable", "2026-07-10T00:00:00.000Z"),
+        conversation("temporary", "ephemeral", "2026-07-12T00:00:00.000Z"),
+        conversation("latest", "durable", "2026-07-11T00:00:00.000Z"),
+      ]),
+    ).toEqual({
+      type: "continue",
+      conversationId: VoiceConversationId.make("latest"),
+      takeover: false,
+    });
+  });
+
+  it("creates the first durable conversation when there is nothing to resume", () => {
+    expect(
+      resumeVoiceConversationSelection([
+        conversation("temporary", "ephemeral", "2026-07-12T00:00:00.000Z"),
+      ]),
+    ).toEqual({ type: "new", retention: "durable", title: "T3 Voice" });
   });
 
   it("compares focus by environment, project, and thread identity", () => {

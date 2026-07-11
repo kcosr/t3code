@@ -279,18 +279,6 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     realtimeVoice.phase === "active" ||
     realtimeVoice.phase === "starting" ||
     realtimeVoice.phase === "stopping";
-  const handleRealtimeToggle = useCallback(() => {
-    if (realtimeInUse) {
-      realtimeVoice.onOpenDetails();
-      return;
-    }
-    if (props.speechPlayback.enabled) props.speechPlayback.onToggle();
-    if (dictation.phase === "recording") {
-      void dictation.cancel().finally(realtimeVoice.onStartNew);
-      return;
-    }
-    realtimeVoice.onStartNew();
-  }, [dictation, props.speechPlayback, realtimeInUse, realtimeVoice]);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
   const canSend = hasContent;
@@ -854,9 +842,10 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                 <ControlPill icon="stop.fill" variant="danger" onPress={props.onStopThread} />
               ) : realtimeInUse ? (
                 <ControlPill
-                  accessibilityLabel="Open voice conversation"
-                  icon="waveform.circle.fill"
-                  onPress={handleRealtimeToggle}
+                  icon="arrow.up"
+                  variant="primary"
+                  disabled={!canSend}
+                  onPress={handleSend}
                 />
               ) : dictation.phase === "recording" ? (
                 <ControlPill
@@ -919,38 +908,6 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                     }
                     active={props.speechPlayback.enabled}
                     onPress={props.speechPlayback.onToggle}
-                    showChevron={false}
-                  />
-                ) : null}
-                {realtimeVoice.available ? (
-                  <ComposerToolbarButton
-                    accessibilityLabel={
-                      realtimeInUse ? "Open voice conversation" : "Start voice conversation"
-                    }
-                    icon="waveform.circle.fill"
-                    variant="default"
-                    active={realtimeVoice.phase === "active"}
-                    disabled={realtimeVoice.phase === "stopping"}
-                    onPress={handleRealtimeToggle}
-                    showChevron={false}
-                  />
-                ) : null}
-                {realtimeVoice.available && !realtimeInUse ? (
-                  <ComposerToolbarButton
-                    accessibilityLabel="Browse voice conversations"
-                    icon="clock.arrow.circlepath"
-                    onPress={realtimeVoice.onBrowseHistory}
-                    showChevron={false}
-                  />
-                ) : null}
-                {realtimeVoice.phase === "active" ? (
-                  <ComposerToolbarButton
-                    accessibilityLabel={
-                      realtimeVoice.muted ? "Unmute microphone" : "Mute microphone"
-                    }
-                    icon={realtimeVoice.muted ? "mic.slash.fill" : "mic.fill"}
-                    active={realtimeVoice.muted}
-                    onPress={realtimeVoice.onToggleMuted}
                     showChevron={false}
                   />
                 ) : null}

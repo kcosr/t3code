@@ -2,6 +2,7 @@ import type {
   EnvironmentId,
   ProjectId,
   ThreadId,
+  VoiceConversationSelection,
   VoiceConversationSummary,
 } from "@t3tools/contracts";
 
@@ -28,6 +29,15 @@ export function durableVoiceConversations(
   return conversations
     .filter((conversation) => conversation.retention === "durable")
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+export function resumeVoiceConversationSelection(
+  conversations: ReadonlyArray<VoiceConversationSummary>,
+): VoiceConversationSelection {
+  const latest = durableVoiceConversations(conversations)[0];
+  return latest === undefined
+    ? { type: "new", retention: "durable", title: "T3 Voice" }
+    : { type: "continue", conversationId: latest.conversationId, takeover: false };
 }
 
 export function masterVoiceEnvironmentId(

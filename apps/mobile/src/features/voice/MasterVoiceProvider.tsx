@@ -38,6 +38,7 @@ import {
   durableVoiceConversations,
   masterVoiceEnvironmentId,
   reconcileMasterVoiceFocus,
+  resumeVoiceConversationSelection,
   type ActiveMasterVoiceAttachment,
   type MasterVoiceFocus,
 } from "./masterVoiceState";
@@ -60,14 +61,7 @@ interface MasterVoiceRuntime {
 }
 
 interface MasterVoiceContextValue {
-  readonly available: boolean;
   readonly phase: RealtimeVoiceControllerSnapshot["phase"];
-  readonly muted: boolean;
-  readonly activeEnvironmentId: EnvironmentId | null;
-  readonly onStartNew: () => void;
-  readonly onBrowseHistory: () => void;
-  readonly onToggleMuted: () => void;
-  readonly onOpenDetails: () => void;
 }
 
 const INITIAL_SNAPSHOT: RealtimeVoiceControllerSnapshot = {
@@ -99,10 +93,12 @@ export function MasterVoiceProvider(props: {
     useState<ReadonlyArray<VoiceConversationSummary> | null>(null);
   const [audioRoutePicker, setAudioRoutePicker] = useState<VoiceAudioRoutePickerState | null>(null);
   const [transcriptVisible, setTranscriptVisible] = useState(false);
+  const [resumePending, setResumePending] = useState(false);
   const [transcript, setTranscript] = useState<ReadonlyArray<MasterVoiceTranscriptTurn>>([]);
   const [confirmations, setConfirmations] = useState<ReadonlyArray<PendingVoiceConfirmation>>([]);
   const runtimeRef = useRef<MasterVoiceRuntime | null>(null);
   const startInFlightRef = useRef(false);
+  const resumeInFlightRef = useRef(false);
   const focusUpdateGenerationRef = useRef(0);
   const focusUpdateTailRef = useRef(Promise.resolve());
   const attachmentRef = useRef(attachment);
@@ -288,9 +284,25 @@ export function MasterVoiceProvider(props: {
     [props.focus],
   );
 
-  const startNew = useCallback(() => {
-    if ((snapshot.phase !== "idle" && snapshot.phase !== "error") || props.focus === null) return;
-    void start({ type: "new", retention: "durable", title: "T3 Voice" });
+  const resume = useCallback(() => {
+    const runtime = runtimeRef.current;
+    if (
+      resumeInFlightRef.current ||
+      startInFlightRef.current ||
+      snapshot.phase !== "idle" ||
+      props.focus === null ||
+      runtime === null
+    )
+      return;
+    resumeInFlightRef.current = true;
+    setResumePending(true);
+    void Effect.runPromise(runtime.client.listConversations())
+      .then((conversations) => start(resumeVoiceConversationSelection(conversations)))
+      .catch((cause) => Alert.alert("Voice conversation unavailable", errorMessage(cause)))
+      .finally(() => {
+        resumeInFlightRef.current = false;
+        setResumePending(false);
+      });
   }, [props.focus, snapshot.phase, start]);
 
   const browseHistory = useCallback(() => {
@@ -406,29 +418,8 @@ export function MasterVoiceProvider(props: {
   }, [decideConfirmation, pendingConfirmation]);
 
   const contextValue = useMemo<MasterVoiceContextValue>(
-    () => ({
-      available:
-        props.focus !== null &&
-        availableEnvironmentId === props.focus.environmentId &&
-        native !== null,
-      phase: snapshot.phase,
-      muted: snapshot.native?.realtimeMuted ?? false,
-      activeEnvironmentId: attachment?.environmentId ?? null,
-      onStartNew: startNew,
-      onBrowseHistory: browseHistory,
-      onToggleMuted: toggleMuted,
-      onOpenDetails: () => setTranscriptVisible(true),
-    }),
-    [
-      attachment?.environmentId,
-      availableEnvironmentId,
-      browseHistory,
-      native,
-      props.focus,
-      snapshot,
-      startNew,
-      toggleMuted,
-    ],
+    () => ({ phase: snapshot.phase }),
+    [snapshot.phase],
   );
 
   return (
@@ -436,12 +427,20 @@ export function MasterVoiceProvider(props: {
       <View className="flex-1">
         {props.children}
         <MasterVoiceCallBar
+          available={
+            props.focus !== null &&
+            availableEnvironmentId === props.focus.environmentId &&
+            native !== null
+          }
           snapshot={snapshot}
           attachment={attachment}
           transcript={transcript}
           onMute={toggleMuted}
           onRoute={chooseAudioRoute}
           onTranscript={() => setTranscriptVisible(true)}
+          onResume={resume}
+          resumePending={resumePending}
+          onHistory={browseHistory}
           onStop={() => {
             if (snapshot.phase === "error") {
               setSnapshot(INITIAL_SNAPSHOT);
