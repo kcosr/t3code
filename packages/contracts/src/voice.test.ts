@@ -3,6 +3,9 @@ import * as Schema from "effect/Schema";
 
 import {
   VoiceConversationSelection,
+  VoiceConversationTranscriptEntry,
+  VoiceConversationTranscriptQuery,
+  VoiceConversationUpdateInput,
   VoiceSpeechRequest,
   VoiceSessionCreateInput,
   VoiceSessionFocusInput,
@@ -72,6 +75,35 @@ describe("voice contracts", () => {
         type: "continue",
         conversationId: "voice-conversation-1",
       }),
+    ).toThrow();
+  });
+
+  it("bounds public transcript and conversation management inputs", () => {
+    expect(
+      decodeUnknownSync(VoiceConversationTranscriptEntry)({
+        entryId: "entry-1",
+        contextEpoch: 2,
+        sequence: 3,
+        role: "assistant",
+        text: "hello",
+        truncated: false,
+        occurredAt: "2026-07-11T00:00:00.000Z",
+      }),
+    ).toMatchObject({ contextEpoch: 2, role: "assistant", text: "hello" });
+    expect(() => decodeUnknownSync(VoiceConversationTranscriptQuery)({ limit: 51 })).toThrow();
+    expect(() =>
+      decodeUnknownSync(VoiceConversationTranscriptEntry)({
+        entryId: "entry-1",
+        contextEpoch: 1,
+        sequence: 1,
+        role: "user",
+        text: "x".repeat(16_001),
+        truncated: false,
+        occurredAt: "2026-07-11T00:00:00.000Z",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeUnknownSync(VoiceConversationUpdateInput)({ title: "x".repeat(257) }),
     ).toThrow();
   });
 

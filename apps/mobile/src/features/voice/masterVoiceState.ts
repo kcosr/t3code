@@ -28,7 +28,11 @@ export function durableVoiceConversations(
 ): ReadonlyArray<VoiceConversationSummary> {
   return conversations
     .filter((conversation) => conversation.retention === "durable")
-    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    .sort(
+      (left, right) =>
+        (right.lastCallAt ?? right.createdAt).localeCompare(left.lastCallAt ?? left.createdAt) ||
+        left.conversationId.localeCompare(right.conversationId),
+    );
 }
 
 export function resumeVoiceConversationSelection(
@@ -38,6 +42,16 @@ export function resumeVoiceConversationSelection(
   return latest === undefined
     ? { type: "new", retention: "durable", title: "T3 Voice" }
     : { type: "continue", conversationId: latest.conversationId, takeover: false };
+}
+
+export function newVoiceConversationSelection(): VoiceConversationSelection {
+  return { type: "new", retention: "durable", title: "T3 Voice" };
+}
+
+export function continueVoiceConversationSelection(
+  conversationId: VoiceConversationSummary["conversationId"],
+): VoiceConversationSelection {
+  return { type: "continue", conversationId, takeover: false };
 }
 
 export function masterVoiceEnvironmentId(

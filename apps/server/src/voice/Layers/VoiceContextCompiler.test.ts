@@ -1,5 +1,5 @@
 import { expect, it } from "@effect/vitest";
-import { VoiceConversationId } from "@t3tools/contracts";
+import { VoiceConversationEntryId, VoiceConversationId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
 import type { VoiceConversationJournalEntry } from "../../persistence/Services/VoiceConversations.ts";
@@ -12,7 +12,7 @@ const entry = (
   kind: VoiceConversationJournalEntry["kind"],
   payload: unknown,
 ): VoiceConversationJournalEntry => ({
-  entryId: `entry-${sequence}`,
+  entryId: VoiceConversationEntryId.make(`entry-${sequence}`),
   conversationId,
   epoch: 1,
   sequence,

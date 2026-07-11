@@ -11,6 +11,7 @@ import {
   type OrchestrationProjectShell,
   type OrchestrationThreadShell,
   VoiceConfirmationId,
+  VoiceConversationEntryId,
   VoiceConversationId,
   VoiceRequestId,
   type VoiceConversationSummary,
@@ -30,6 +31,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { layerTest as serverSettingsLayerTest } from "../../serverSettings.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import type { VoiceConversationJournalEntry } from "../../persistence/Services/VoiceConversations.ts";
+import { VoiceError } from "../Errors.ts";
 import { VoiceConversationService } from "../Services/VoiceConversationService.ts";
 import type { RealtimeProviderSession, VoiceProviderAdapter } from "../Services/VoiceProvider.ts";
 import { voiceProviderRegistryLayer } from "../Services/VoiceProviderRegistry.ts";
@@ -49,6 +51,7 @@ const summary: VoiceConversationSummary = {
   retention: "ephemeral",
   title: null,
   activeEpoch: 1,
+  lastCallAt: null,
   createdAt: "2026-07-10T12:00:00.000Z",
   updatedAt: "2026-07-10T12:00:00.000Z",
 };
@@ -87,22 +90,30 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
     maxConcurrentSessions: 16,
   },
   projection: Partial<ProjectionSnapshotQuery["Service"]> = {},
+  appendContextOverride?: VoiceConversationService["Service"]["appendContext"],
 ) {
   const appended = yield* Ref.make<Array<VoiceConversationJournalEntry>>([]);
+  const conversationEpoch = yield* Ref.make(1);
+  const callStarts = yield* Ref.make(0);
+  const contextClears = yield* Ref.make(
+    new Map<string, { activeEpoch: number; clearedAt: string }>(),
+  );
   const append = (
-    entryId: string | undefined,
+    entryId: VoiceConversationEntryId | undefined,
+    expectedEpoch: number,
     kind: VoiceConversationJournalEntry["kind"],
     payload: unknown,
   ) =>
     Effect.gen(function* () {
       const entries = yield* Ref.get(appended);
-      const resolvedEntryId = entryId ?? `entry-${entries.length + 1}`;
+      const resolvedEntryId =
+        entryId ?? VoiceConversationEntryId.make(`entry-${entries.length + 1}`);
       const existing = entries.find((entry) => entry.entryId === resolvedEntryId);
       if (existing !== undefined) return existing;
       const entry: VoiceConversationJournalEntry = {
         entryId: resolvedEntryId,
         conversationId,
-        epoch: 1,
+        epoch: expectedEpoch,
         sequence: entries.length + 1,
         kind,
         payload,
@@ -112,19 +123,51 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
       return entry;
     });
   const conversations = VoiceConversationService.of({
-    create: () => Effect.succeed(summary),
-    listDurable: Effect.succeed([]),
-    get: () => Effect.succeed(Option.some(summary)),
-    delete: () => Effect.succeed(true),
-    clearContext: () =>
-      Effect.succeed({
-        conversationId,
-        activeEpoch: 2,
-        clearedAt: "2026-07-10T12:01:00.000Z",
+    create: () =>
+      Ref.get(conversationEpoch).pipe(Effect.map((activeEpoch) => ({ ...summary, activeEpoch }))),
+    listDurable: () => Effect.succeed({ conversations: [], nextCursor: null }),
+    get: () =>
+      Ref.get(conversationEpoch).pipe(
+        Effect.map((activeEpoch) => Option.some({ ...summary, activeEpoch })),
+      ),
+    updateTitle: () => Effect.die("unused"),
+    markCallStarted: (_conversationId, expectedEpoch) =>
+      Effect.gen(function* () {
+        const activeEpoch = yield* Ref.get(conversationEpoch);
+        if (activeEpoch !== expectedEpoch) return yield* Effect.die("stale test epoch");
+        yield* Ref.update(callStarts, (count) => count + 1);
+        return {
+          ...summary,
+          activeEpoch,
+          lastCallAt: "2026-07-10T12:00:01.000Z",
+          updatedAt: "2026-07-10T12:00:01.000Z",
+        };
       }),
-    listContext: () => Ref.get(appended),
-    appendContext: (entry) => append(undefined, entry.kind, entry.payload),
-    appendContextIdempotent: (entry) => append(entry.entryId, entry.kind, entry.payload),
+    delete: () => Effect.succeed(true),
+    clearContext: (_conversationId, expectedEpoch, idempotencyKey) =>
+      Effect.gen(function* () {
+        const previous = (yield* Ref.get(contextClears)).get(idempotencyKey);
+        if (previous !== undefined) return { conversationId, ...previous };
+        const activeEpoch = yield* Ref.get(conversationEpoch);
+        if (activeEpoch !== expectedEpoch) return yield* Effect.die("stale test epoch");
+        const result = {
+          activeEpoch: activeEpoch + 1,
+          clearedAt: "2026-07-10T12:01:00.000Z",
+        };
+        yield* Ref.set(conversationEpoch, result.activeEpoch);
+        yield* Ref.update(contextClears, (current) => new Map(current).set(idempotencyKey, result));
+        return { conversationId, ...result };
+      }),
+    listTranscript: () => Effect.die("unused"),
+    listContext: (_conversationId, expectedEpoch) =>
+      Ref.get(appended).pipe(
+        Effect.map((entries) => entries.filter((entry) => entry.epoch === expectedEpoch)),
+      ),
+    appendContext:
+      appendContextOverride ??
+      ((entry) => append(undefined, entry.expectedEpoch, entry.kind, entry.payload)),
+    appendContextIdempotent: (entry) =>
+      append(entry.entryId, entry.expectedEpoch, entry.kind, entry.payload),
   });
   const dependencies = Layer.mergeAll(
     Layer.succeed(VoiceConversationService, conversations),
@@ -138,6 +181,7 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
   );
   return {
     appended,
+    callStarts,
     layer: VoiceSessionServiceLive.pipe(Layer.provideMerge(dependencies)),
   };
 });
@@ -162,7 +206,20 @@ it.effect(
                 },
                 events: Stream.fromIterable([
                   { type: "activity", activity: "listening" } as const,
-                  { type: "transcript", role: "user", text: "show threads", final: true } as const,
+                  {
+                    type: "transcript",
+                    role: "user",
+                    text: "show threads",
+                    final: true,
+                    sourceId: "fake-input:1",
+                  } as const,
+                  {
+                    type: "transcript",
+                    role: "user",
+                    text: "show threads",
+                    final: true,
+                    sourceId: "fake-input:1",
+                  } as const,
                 ]),
                 updateContext: () => Effect.void,
                 submitToolOutput: () => Effect.void,
@@ -178,6 +235,7 @@ it.effect(
         const created = yield* sessions.create(principal(owner), input(false, "create-one"));
         const retried = yield* sessions.create(principal(owner), input(false, "create-one"));
         expect(retried.state.sessionId).toBe(created.state.sessionId);
+        expect(yield* Ref.get(test.callStarts)).toBe(1);
         const answer = yield* sessions.offer(owner, created.state.sessionId, {
           sessionId: created.state.sessionId,
           leaseGeneration: created.state.leaseGeneration,
@@ -193,6 +251,7 @@ it.effect(
           true,
         );
         expect(yield* Ref.get(test.appended)).toHaveLength(1);
+        expect((yield* Ref.get(test.appended))[0]?.entryId).not.toContain("fake-input:1");
         const closed = yield* sessions.close(
           owner,
           created.state.sessionId,
@@ -321,6 +380,178 @@ it.effect("validates, acknowledges, and journals realtime focus changes in order
   }),
 );
 
+it.effect("does not let a blocked focus acknowledgement delay hang-up", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project-blocked-focus");
+    const nextThreadId = ThreadId.make("thread-blocked-focus");
+    const focusUpdateStarted = yield* Deferred.make<void>();
+    const focusUpdateInterrupted = yield* Deferred.make<void>();
+    const providerTerminated = yield* Deferred.make<void>();
+    const project = { id: projectId } as OrchestrationProjectShell;
+    const thread = { id: nextThreadId, projectId } as OrchestrationThreadShell;
+    const provider: VoiceProviderAdapter = {
+      id: "blocked-focus-provider",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Effect.succeed({
+            answer: {
+              sessionId: request.sessionId,
+              leaseGeneration: request.leaseGeneration,
+              sdp: "focus-answer",
+            },
+            events: Stream.empty,
+            updateContext: () =>
+              Deferred.succeed(focusUpdateStarted, undefined).pipe(
+                Effect.andThen(Effect.never),
+                Effect.onInterrupt(() => Deferred.succeed(focusUpdateInterrupted, undefined)),
+              ),
+            submitToolOutput: () => Effect.void,
+            terminate: Deferred.succeed(providerTerminated, undefined),
+          }),
+      },
+    };
+    const test = yield* makeLayer(provider, undefined, undefined, {
+      getProjectShellById: (id) =>
+        Effect.succeed(id === projectId ? Option.some(project) : Option.none()),
+      getThreadShellById: (id) =>
+        Effect.succeed(id === nextThreadId ? Option.some(thread) : Option.none()),
+    });
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("blocked-focus-owner");
+      const created = yield* sessions.create(principal(owner), input(false, "blocked-focus"));
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      const updating = yield* sessions
+        .updateFocus(owner, created.state.sessionId, {
+          leaseGeneration: created.state.leaseGeneration,
+          projectId,
+          threadId: nextThreadId,
+        })
+        .pipe(Effect.result, Effect.forkScoped);
+      yield* Deferred.await(focusUpdateStarted);
+
+      const closed = yield* sessions.close(
+        owner,
+        created.state.sessionId,
+        created.state.leaseGeneration,
+      );
+      expect(closed.closed).toBe(true);
+      expect(closed.state.phase).toBe("ended");
+      yield* Deferred.await(providerTerminated);
+      yield* Deferred.await(focusUpdateInterrupted);
+      const update = yield* Fiber.join(updating);
+      expect(Result.isFailure(update)).toBe(true);
+      if (Result.isFailure(update)) expect(update.failure.reason).toBe("invalid-phase");
+      expect(yield* Ref.get(test.appended)).toHaveLength(0);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("completes focus journal failure cleanup outside the cancelled update", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project-focus-journal-failure");
+    const threadId = ThreadId.make("thread-focus-journal-failure");
+    const terminationStarted = yield* Deferred.make<void>();
+    const releaseTermination = yield* Deferred.make<void>();
+    const terminationCompleted = yield* Deferred.make<void>();
+    const project = { id: projectId } as OrchestrationProjectShell;
+    const thread = { id: threadId, projectId } as OrchestrationThreadShell;
+    const provider: VoiceProviderAdapter = {
+      id: "focus-journal-failure-provider",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Effect.succeed({
+            answer: {
+              sessionId: request.sessionId,
+              leaseGeneration: request.leaseGeneration,
+              sdp: "focus-answer",
+            },
+            events: Stream.empty,
+            updateContext: () => Effect.void,
+            submitToolOutput: () => Effect.void,
+            terminate: Deferred.succeed(terminationStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseTermination)),
+              Effect.ensuring(Deferred.succeed(terminationCompleted, undefined)),
+            ),
+          }),
+      },
+    };
+    const test = yield* makeLayer(
+      provider,
+      undefined,
+      undefined,
+      {
+        getProjectShellById: (id) =>
+          Effect.succeed(id === projectId ? Option.some(project) : Option.none()),
+        getThreadShellById: (id) =>
+          Effect.succeed(id === threadId ? Option.some(thread) : Option.none()),
+      },
+      () =>
+        Effect.fail(
+          new VoiceError({
+            reason: "provider-unavailable",
+            operation: "conversation.append-context",
+            detail: "Injected focus journal failure",
+            retryable: true,
+          }),
+        ),
+    );
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const mediaTickets = yield* VoiceMediaTicketRegistry;
+      const owner = AuthSessionId.make("focus-journal-failure-owner");
+      const created = yield* sessions.create(
+        principal(owner),
+        input(false, "focus-journal-failure"),
+      );
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      const ticket = yield* mediaTickets.issue({
+        authSessionId: owner,
+        operation: "voice-heartbeat",
+        requestId: VoiceRequestId.make("focus-journal-failure-ticket"),
+        voiceSessionId: created.state.sessionId,
+      });
+
+      const updating = yield* sessions
+        .updateFocus(owner, created.state.sessionId, {
+          leaseGeneration: created.state.leaseGeneration,
+          projectId,
+          threadId,
+        })
+        .pipe(Effect.result, Effect.forkScoped);
+      yield* Deferred.await(terminationStarted);
+      const update = yield* Fiber.join(updating);
+      expect(Result.isFailure(update)).toBe(true);
+      if (Result.isFailure(update)) {
+        expect(["invalid-phase", "provider-unavailable"]).toContain(update.failure.reason);
+      }
+
+      yield* Deferred.succeed(releaseTermination, undefined);
+      yield* Deferred.await(terminationCompleted);
+      yield* Effect.yieldNow;
+      expect((yield* sessions.get(owner, created.state.sessionId)).phase).toBe("error");
+      expect(yield* mediaTickets.consume(ticket.token, "voice-heartbeat")).toBeUndefined();
+
+      const continued = yield* sessions.create(
+        principal(owner),
+        input(false, "after-focus-journal-failure"),
+      );
+      expect(continued.state.phase).toBe("signaling");
+      yield* sessions.close(owner, continued.state.sessionId, continued.state.leaseGeneration);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
 it.effect("rejects a session focus whose thread belongs to another project", () =>
   Effect.gen(function* () {
     const projectId = ProjectId.make("project-requested");
@@ -380,12 +611,14 @@ it.effect("continues a stopped conversation with facts from the prior call", () 
                           role: "user",
                           text: "My code word is heliotrope.",
                           final: true,
+                          sourceId: "continuity-user:1",
                         } as const,
                         {
                           type: "transcript",
                           role: "assistant",
                           text: "I will remember that.",
                           final: true,
+                          sourceId: "continuity-assistant:1",
                         } as const,
                       ])
                     : Stream.fromIterable([
@@ -394,6 +627,7 @@ it.effect("continues a stopped conversation with facts from the prior call", () 
                           role: "user",
                           text: "What was my code word?",
                           final: true,
+                          sourceId: "continuity-user:2",
                         } as const,
                         {
                           type: "transcript",
@@ -402,6 +636,7 @@ it.effect("continues a stopped conversation with facts from the prior call", () 
                             ? "Your code word was heliotrope."
                             : "I do not remember it.",
                           final: true,
+                          sourceId: "continuity-assistant:2",
                         } as const,
                       ]),
                 updateContext: () => Effect.void,
@@ -910,9 +1145,15 @@ it.effect("terminates an active call before clearing or deleting its conversatio
         leaseGeneration: clearing.state.leaseGeneration,
         sdp: "offer",
       });
-      const cleared = yield* sessions.clearConversationContext(conversationId);
+      const cleared = yield* sessions.clearConversationContext(conversationId, 1, "clear-test");
       expect(cleared.activeEpoch).toBe(2);
       expect((yield* sessions.get(owner, clearing.state.sessionId)).phase).toBe("ended");
+
+      const afterClear = yield* sessions.create(principal(owner), input(false, "after-clear"));
+      const replayed = yield* sessions.clearConversationContext(conversationId, 1, "clear-test");
+      expect(replayed).toEqual(cleared);
+      expect((yield* sessions.get(owner, afterClear.state.sessionId)).phase).toBe("signaling");
+      yield* sessions.close(owner, afterClear.state.sessionId, afterClear.state.leaseGeneration);
 
       const deleting = yield* sessions.create(
         principal(owner),
@@ -924,9 +1165,251 @@ it.effect("terminates an active call before clearing or deleting its conversatio
         sdp: "offer",
       });
       expect(yield* sessions.deleteConversation(conversationId)).toBe(true);
-      const deletedSession = yield* sessions.get(owner, deleting.state.sessionId).pipe(Effect.flip);
-      expect(deletedSession.reason).toBe("session-not-found");
+      expect((yield* sessions.get(owner, deleting.state.sessionId)).phase).toBe("ended");
       expect(yield* Ref.get(terminated)).toBe(2);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+const resetRaceExecutor = (decisions: Ref.Ref<number>) =>
+  VoiceToolExecutor.of({
+    invoke: () => Effect.die("unused"),
+    decide: () =>
+      Ref.update(decisions, (count) => count + 1).pipe(
+        Effect.as({
+          type: "completed" as const,
+          toolCallId: VoiceToolCallId.make("reset-race-call"),
+          providerFunctionCallId: "reset-race-call",
+          tool: "archive_thread" as const,
+          outcome: "succeeded" as const,
+          output: "{}",
+          submitOutput: true,
+        }),
+      ),
+    expire: () => Effect.sync(() => undefined),
+    discardSession: () => Effect.void,
+  });
+
+const resetRaceProvider = (
+  terminationStarted: Deferred.Deferred<void>,
+  releaseTermination: Deferred.Deferred<void>,
+): VoiceProviderAdapter => ({
+  id: "fake-reset-race",
+  capabilities: new Set(["agent.realtime"]),
+  realtime: {
+    negotiate: (request) =>
+      Effect.succeed({
+        answer: {
+          sessionId: request.sessionId,
+          leaseGeneration: request.leaseGeneration,
+          sdp: "answer",
+        },
+        events: Stream.empty,
+        updateContext: () => Effect.void,
+        submitToolOutput: () => Effect.void,
+        terminate: Deferred.succeed(terminationStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseTermination)),
+        ),
+      }),
+  },
+});
+
+const blockedDecisionExecutor = (
+  decisionStarted: Deferred.Deferred<void>,
+  decisionInterrupted: Deferred.Deferred<void>,
+) =>
+  VoiceToolExecutor.of({
+    invoke: () => Effect.die("unused"),
+    decide: () =>
+      Deferred.succeed(decisionStarted, undefined).pipe(
+        Effect.andThen(Effect.never),
+        Effect.onInterrupt(() => Deferred.succeed(decisionInterrupted, undefined)),
+      ),
+    expire: () => Effect.sync(() => undefined),
+    discardSession: () => Effect.void,
+  });
+
+const immediateResetProvider = (
+  outputs: Ref.Ref<number>,
+  terminations: Ref.Ref<number>,
+): VoiceProviderAdapter => ({
+  id: "fake-immediate-reset",
+  capabilities: new Set(["agent.realtime"]),
+  realtime: {
+    negotiate: (request) =>
+      Effect.succeed({
+        answer: {
+          sessionId: request.sessionId,
+          leaseGeneration: request.leaseGeneration,
+          sdp: "answer",
+        },
+        events: Stream.empty,
+        updateContext: () => Effect.void,
+        submitToolOutput: () => Ref.update(outputs, (count) => count + 1),
+        terminate: Ref.update(terminations, (count) => count + 1),
+      }),
+  },
+});
+
+it.effect("interrupts a blocked approval without delaying conversation clear", () =>
+  Effect.gen(function* () {
+    const decisionStarted = yield* Deferred.make<void>();
+    const decisionInterrupted = yield* Deferred.make<void>();
+    const outputs = yield* Ref.make(0);
+    const terminations = yield* Ref.make(0);
+    const test = yield* makeLayer(
+      immediateResetProvider(outputs, terminations),
+      blockedDecisionExecutor(decisionStarted, decisionInterrupted),
+    );
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("blocked-clear-owner");
+      const created = yield* sessions.create(principal(owner), input(false, "blocked-clear"));
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      const approving = yield* sessions
+        .confirm(
+          owner,
+          created.state.sessionId,
+          VoiceConfirmationId.make("blocked-clear-confirmation"),
+          { decision: "approve" },
+        )
+        .pipe(Effect.result, Effect.forkScoped);
+      yield* Deferred.await(decisionStarted);
+
+      const cleared = yield* sessions.clearConversationContext(conversationId, 1, "blocked-clear");
+      expect(cleared.activeEpoch).toBe(2);
+      expect((yield* sessions.get(owner, created.state.sessionId)).phase).toBe("ended");
+      yield* Deferred.await(decisionInterrupted);
+      const approval = yield* Fiber.join(approving);
+      expect(Result.isFailure(approval)).toBe(true);
+      if (Result.isFailure(approval)) expect(approval.failure.reason).toBe("invalid-phase");
+      expect(yield* Ref.get(outputs)).toBe(0);
+      expect(yield* Ref.get(terminations)).toBe(1);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("interrupts a blocked approval without delaying conversation deletion", () =>
+  Effect.gen(function* () {
+    const decisionStarted = yield* Deferred.make<void>();
+    const decisionInterrupted = yield* Deferred.make<void>();
+    const outputs = yield* Ref.make(0);
+    const terminations = yield* Ref.make(0);
+    const test = yield* makeLayer(
+      immediateResetProvider(outputs, terminations),
+      blockedDecisionExecutor(decisionStarted, decisionInterrupted),
+    );
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("blocked-delete-owner");
+      const created = yield* sessions.create(principal(owner), input(false, "blocked-delete"));
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      const approving = yield* sessions
+        .confirm(
+          owner,
+          created.state.sessionId,
+          VoiceConfirmationId.make("blocked-delete-confirmation"),
+          { decision: "approve" },
+        )
+        .pipe(Effect.result, Effect.forkScoped);
+      yield* Deferred.await(decisionStarted);
+
+      expect(yield* sessions.deleteConversation(conversationId)).toBe(true);
+      expect((yield* sessions.get(owner, created.state.sessionId)).phase).toBe("ended");
+      yield* Deferred.await(decisionInterrupted);
+      const approval = yield* Fiber.join(approving);
+      expect(Result.isFailure(approval)).toBe(true);
+      if (Result.isFailure(approval)) expect(approval.failure.reason).toBe("invalid-phase");
+      expect(yield* Ref.get(outputs)).toBe(0);
+      expect(yield* Ref.get(terminations)).toBe(1);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("fences approval while clearing an active conversation", () =>
+  Effect.gen(function* () {
+    const terminationStarted = yield* Deferred.make<void>();
+    const releaseTermination = yield* Deferred.make<void>();
+    const decisions = yield* Ref.make(0);
+    const test = yield* makeLayer(
+      resetRaceProvider(terminationStarted, releaseTermination),
+      resetRaceExecutor(decisions),
+    );
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("clear-race-owner");
+      const created = yield* sessions.create(principal(owner), input(false, "clear-race"));
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      const clearing = yield* sessions
+        .clearConversationContext(conversationId, 1, "clear-race")
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(terminationStarted);
+      const approving = yield* sessions
+        .confirm(
+          owner,
+          created.state.sessionId,
+          VoiceConfirmationId.make("clear-race-confirmation"),
+          { decision: "approve" },
+        )
+        .pipe(Effect.result, Effect.forkScoped);
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(decisions)).toBe(0);
+      yield* Deferred.succeed(releaseTermination, undefined);
+      yield* Fiber.join(clearing);
+      const approval = yield* Fiber.join(approving);
+      expect(Result.isFailure(approval)).toBe(true);
+      expect(yield* Ref.get(decisions)).toBe(0);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("fences approval while deleting an active conversation", () =>
+  Effect.gen(function* () {
+    const terminationStarted = yield* Deferred.make<void>();
+    const releaseTermination = yield* Deferred.make<void>();
+    const decisions = yield* Ref.make(0);
+    const test = yield* makeLayer(
+      resetRaceProvider(terminationStarted, releaseTermination),
+      resetRaceExecutor(decisions),
+    );
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("delete-race-owner");
+      const created = yield* sessions.create(principal(owner), input(false, "delete-race"));
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      const deleting = yield* sessions.deleteConversation(conversationId).pipe(Effect.forkScoped);
+      yield* Deferred.await(terminationStarted);
+      const approving = yield* sessions
+        .confirm(
+          owner,
+          created.state.sessionId,
+          VoiceConfirmationId.make("delete-race-confirmation"),
+          { decision: "approve" },
+        )
+        .pipe(Effect.result, Effect.forkScoped);
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(decisions)).toBe(0);
+      yield* Deferred.succeed(releaseTermination, undefined);
+      expect(yield* Fiber.join(deleting)).toBe(true);
+      const approval = yield* Fiber.join(approving);
+      expect(Result.isFailure(approval)).toBe(true);
+      expect(yield* Ref.get(decisions)).toBe(0);
     }).pipe(Effect.provide(test.layer));
   }),
 );

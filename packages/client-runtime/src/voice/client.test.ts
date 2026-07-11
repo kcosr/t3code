@@ -51,6 +51,7 @@ const conversation = {
   retention: "durable" as const,
   title: "Planning",
   activeEpoch: 1,
+  lastCallAt: "2026-07-10T20:00:00.000Z",
   createdAt: "2026-07-10T20:00:00.000Z",
   updatedAt: "2026-07-10T20:00:00.000Z",
 };
@@ -116,11 +117,19 @@ describe("makeVoiceHttpClient", () => {
             clearedAt: "2026-07-10T20:00:30.000Z",
           });
         }
+        if (url.includes("/transcript")) {
+          return jsonResponse({
+            conversationId: CONVERSATION_ID,
+            activeContextEpoch: 2,
+            entries: [],
+            nextCursor: null,
+          });
+        }
         if (method === "DELETE") {
           return jsonResponse({ deleted: true });
         }
         if (method === "GET" && url.endsWith("/conversations")) {
-          return jsonResponse([conversation]);
+          return jsonResponse({ conversations: [conversation], nextCursor: null });
         }
         return jsonResponse(conversation);
       };
@@ -139,7 +148,12 @@ describe("makeVoiceHttpClient", () => {
         }),
         client.listConversations(),
         client.getConversation(CONVERSATION_ID),
-        client.clearConversationContext(CONVERSATION_ID),
+        client.updateConversation(CONVERSATION_ID, { title: "Renamed" }),
+        client.getConversationTranscript(CONVERSATION_ID, { cursor: "next-page", limit: 20 }),
+        client.clearConversationContext(CONVERSATION_ID, {
+          expectedEpoch: 1,
+          idempotencyKey: "clear-one",
+        }),
         client.deleteConversation(CONVERSATION_ID),
         client.createMediaTicket({
           operation: "speech-stream",
@@ -148,10 +162,15 @@ describe("makeVoiceHttpClient", () => {
       ]);
 
       expect(results[0]).toEqual(conversation);
-      expect(results[1]).toEqual([conversation]);
-      expect(results[3].activeEpoch).toBe(2);
-      expect(results[4].deleted).toBe(true);
-      expect(results[5].token).toBe("one-use-token");
+      expect(results[1]).toEqual({ conversations: [conversation], nextCursor: null });
+      expect(results[4].activeContextEpoch).toBe(2);
+      expect(results[5].activeEpoch).toBe(2);
+      expect(results[6].deleted).toBe(true);
+      expect(results[7].token).toBe("one-use-token");
+      expect(requests.some(({ init }) => init?.method === "PATCH")).toBe(true);
+      expect(
+        requests.some(({ url }) => url.endsWith("/transcript?cursor=next-page&limit=20")),
+      ).toBe(true);
       for (const request of requests) {
         expect(new Headers(request.init?.headers).get("authorization")).toBe("Bearer voice-token");
         expect(request.init?.credentials).toBeUndefined();
@@ -449,6 +468,33 @@ describe("makeVoiceHttpClient", () => {
         {
           method: "GET",
           url: `https://environment.example.test/api/voice/sessions/${SESSION_ID}/events?afterSequence=4&waitMilliseconds=20000`,
+        },
+      ]);
+    }),
+  );
+
+  it.effect("signs the exact conversation list cursor URL", () =>
+    Effect.gen(function* () {
+      const proofs: Array<{ readonly method: string; readonly url: string }> = [];
+      const signer = ManagedRelayDpopSigner.of({
+        thumbprint: Effect.succeed("thumbprint"),
+        createProof: (input) => {
+          proofs.push({ method: input.method, url: input.url });
+          return Effect.succeed("signed-proof");
+        },
+      });
+      const client = makeVoiceHttpClient({
+        prepared: preparedConnection({ _tag: "Dpop", accessToken: "dpop-token" }),
+        signer,
+        fetch: async () => jsonResponse({ conversations: [], nextCursor: null }),
+      });
+
+      yield* client.listConversations({ cursor: "page_cursor-1", limit: 17 });
+
+      expect(proofs).toEqual([
+        {
+          method: "GET",
+          url: "https://environment.example.test/api/voice/conversations?cursor=page_cursor-1&limit=17",
         },
       ]);
     }),

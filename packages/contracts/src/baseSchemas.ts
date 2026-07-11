@@ -45,6 +45,10 @@ export const AuthSessionId = makeEntityId("AuthSessionId");
 export type AuthSessionId = typeof AuthSessionId.Type;
 export const VoiceConversationId = makeEntityId("VoiceConversationId");
 export type VoiceConversationId = typeof VoiceConversationId.Type;
+export const VoiceConversationEntryId = TrimmedNonEmptyString.check(Schema.isMaxLength(1_024)).pipe(
+  Schema.brand("VoiceConversationEntryId"),
+);
+export type VoiceConversationEntryId = typeof VoiceConversationEntryId.Type;
 export const VoiceSessionId = makeEntityId("VoiceSessionId");
 export type VoiceSessionId = typeof VoiceSessionId.Type;
 export const VoiceRequestId = makeEntityId("VoiceRequestId");

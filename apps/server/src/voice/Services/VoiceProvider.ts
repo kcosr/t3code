@@ -65,7 +65,14 @@ export type RealtimeProviderEvent =
       readonly type: "transcript";
       readonly role: "user" | "assistant";
       readonly text: string;
-      readonly final: boolean;
+      readonly final: false;
+    }
+  | {
+      readonly type: "transcript";
+      readonly role: "user" | "assistant";
+      readonly text: string;
+      readonly final: true;
+      readonly sourceId: string;
     }
   | {
       readonly type: "function-call";

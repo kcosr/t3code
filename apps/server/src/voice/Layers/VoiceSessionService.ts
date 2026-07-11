@@ -1,4 +1,5 @@
-import { VoiceToolCallId } from "@t3tools/contracts";
+import { VoiceConversationEntryId, VoiceToolCallId } from "@t3tools/contracts";
+import * as NodeCrypto from "node:crypto";
 import type {
   AuthEnvironmentScope,
   AuthSessionId,
@@ -55,6 +56,21 @@ const INSTRUCTIONS = [
   "send_thread_message confirms dispatch only and returns a messageId. Never claim the coding turn completed from that receipt. When the user needs the result, call wait_for_thread_turn with that exact messageId; a pending or running timeout is not completion and may be waited on again.",
 ].join(" ");
 
+const transcriptEntryId = (
+  lease: VoiceSessionLease,
+  role: "user" | "assistant",
+  sourceId: string,
+) =>
+  VoiceConversationEntryId.make(
+    `voice-transcript:${NodeCrypto.createHash("sha256")
+      .update(
+        [lease.conversationId, lease.sessionId, String(lease.generation), role, sourceId].join(
+          "\0",
+        ),
+      )
+      .digest("base64url")}`,
+  );
+
 interface RuntimeSession {
   readonly lease: VoiceSessionLease;
   readonly input: VoiceSessionCreateInput;
@@ -66,7 +82,9 @@ interface RuntimeSession {
   readonly pendingConfirmations: ReadonlySet<VoiceConfirmationId>;
   readonly grantedScopes: ReadonlySet<AuthEnvironmentScope>;
   readonly eventSignal: Deferred.Deferred<void>;
+  readonly terminationSignal: Deferred.Deferred<void>;
   readonly toolScope: Scope.Closeable;
+  readonly operationMutex: Semaphore.Semaphore;
   readonly terminalAt?: number;
   readonly terminalOrder?: number;
   readonly terminating?: boolean;
@@ -269,6 +287,7 @@ const make = Effect.gen(function* () {
       return [true, { ...current, terminating: true }] as const;
     });
     if (Option.isNone(claimed) || !claimed.value) return false;
+    yield* Deferred.succeed(session.terminationSignal, undefined).pipe(Effect.ignore);
     yield* emit(session.lease, { type: "state", phase });
     const current = (yield* SynchronizedRef.get(runtime)).sessions.get(session.lease.sessionId);
     yield* terminateProvider(current ?? session, options);
@@ -448,8 +467,10 @@ const make = Effect.gen(function* () {
           final: event.final,
         });
         if (event.final) {
-          yield* conversations.appendContext({
+          yield* conversations.appendContextIdempotent({
+            entryId: transcriptEntryId(lease, event.role, event.sourceId),
             conversationId: lease.conversationId,
+            expectedEpoch: lease.contextEpoch,
             kind: event.role === "user" ? "transcript.user" : "transcript.assistant",
             payload: { text: event.text },
           });
@@ -459,6 +480,7 @@ const make = Effect.gen(function* () {
         const invocation = tools.invoke({
           sessionId: lease.sessionId,
           conversationId: lease.conversationId,
+          contextEpoch: lease.contextEpoch,
           toolCallId: VoiceToolCallId.make(event.providerFunctionCallId),
           providerFunctionCallId: event.providerFunctionCallId,
           name: event.name,
@@ -634,6 +656,7 @@ const make = Effect.gen(function* () {
           );
     const acquired = yield* registry.acquire({
       conversationId: conversation.conversationId,
+      contextEpoch: conversation.activeEpoch,
       ownerAuthSessionId,
       takeover: input.conversation.type === "continue" && input.conversation.takeover,
     });
@@ -683,6 +706,9 @@ const make = Effect.gen(function* () {
         yield* retainTerminalSession(displaced.lease.sessionId);
       }
     }
+    yield* conversations
+      .markCallStarted(conversation.conversationId, conversation.activeEpoch)
+      .pipe(Effect.tapError(() => registry.release(acquired.lease).pipe(Effect.ignore)));
     const createdAt = yield* DateTime.now;
     const createdAtMillis = yield* Clock.currentTimeMillis;
     const expiresAt = DateTime.formatIso(
@@ -697,7 +723,9 @@ const make = Effect.gen(function* () {
       sequence: 0,
     };
     const eventSignal = yield* Deferred.make<void>();
+    const terminationSignal = yield* Deferred.make<void>();
     const toolScope = yield* Scope.make("sequential");
+    const operationMutex = yield* Semaphore.make(1);
     yield* SynchronizedRef.update(runtime, (current) => {
       const sessions = new Map(current.sessions);
       sessions.set(acquired.lease.sessionId, {
@@ -711,7 +739,9 @@ const make = Effect.gen(function* () {
         pendingConfirmations: new Set(),
         grantedScopes: new Set(principal.scopes),
         eventSignal,
+        terminationSignal,
         toolScope,
+        operationMutex,
       });
       const idempotency = new Map(current.idempotency);
       idempotency.set(idempotencyId, acquired.lease.sessionId);
@@ -843,11 +873,17 @@ const make = Effect.gen(function* () {
     yield* conversations
       .appendContext({
         conversationId: session.lease.conversationId,
+        expectedEpoch: session.lease.contextEpoch,
         kind: "context-change",
         payload: focus,
       })
       .pipe(
-        Effect.tapError(() => endRuntimeSession(acknowledgedSession, "error").pipe(Effect.ignore)),
+        Effect.tapError(() =>
+          endRuntimeSession(acknowledgedSession, "error").pipe(
+            Effect.ignore,
+            Effect.forkIn(serviceScope),
+          ),
+        ),
       );
     const updated = yield* mutateSession(sessionId, (current) => {
       const { projectId: _projectId, threadId: _threadId, ...rest } = current.input;
@@ -858,7 +894,23 @@ const make = Effect.gen(function* () {
   });
 
   const updateFocus: VoiceSessionServiceShape["updateFocus"] = (owner, sessionId, input) =>
-    lifecycleMutex.withPermits(1)(updateFocusUnlocked(owner, sessionId, input));
+    Effect.gen(function* () {
+      const session = yield* requireOwned(owner, sessionId, input.leaseGeneration);
+      return yield* Effect.raceFirst(
+        session.operationMutex.withPermits(1)(updateFocusUnlocked(owner, sessionId, input)),
+        Deferred.await(session.terminationSignal).pipe(
+          Effect.andThen(
+            Effect.fail(
+              sessionError(
+                "invalid-phase",
+                "session.focus",
+                "Voice session ended during the context update",
+              ),
+            ),
+          ),
+        ),
+      );
+    });
 
   const closeUnlocked: VoiceSessionServiceShape["close"] = Effect.fn(
     "VoiceSessionService.closeUnlocked",
@@ -904,7 +956,10 @@ const make = Effect.gen(function* () {
         );
       }
       yield* setPhase(session.lease, "connecting");
-      const entries = yield* conversations.listContext(session.lease.conversationId);
+      const entries = yield* conversations.listContext(
+        session.lease.conversationId,
+        session.lease.contextEpoch,
+      );
       const contextTokenBudget = yield* settingsService.getSettings.pipe(
         Effect.map((settings) => settings.voice.contextTokenBudget),
         Effect.mapError(
@@ -959,6 +1014,7 @@ const make = Effect.gen(function* () {
         yield* conversations
           .appendContext({
             conversationId: session.lease.conversationId,
+            expectedEpoch: session.lease.contextEpoch,
             kind: "context-change",
             payload: initialFocus,
           })
@@ -1063,77 +1119,117 @@ const make = Effect.gen(function* () {
           discard: true,
         });
         const deleted = yield* conversations.delete(conversationId);
-        if (deleted) {
-          yield* SynchronizedRef.update(runtime, (current) => {
-            const sessions = new Map(current.sessions);
-            for (const session of sessions.values()) {
-              if (session.lease.conversationId === conversationId) {
-                sessions.delete(session.lease.sessionId);
-              }
-            }
-            return { ...current, sessions };
-          });
-        }
         return deleted;
       }),
     );
 
   const clearConversationContext: VoiceSessionServiceShape["clearConversationContext"] = (
     conversationId,
+    expectedEpoch,
+    idempotencyKey,
   ) =>
     lifecycleMutex.withPermits(1)(
       Effect.gen(function* () {
+        const cleared = yield* conversations.clearContext(
+          conversationId,
+          expectedEpoch,
+          idempotencyKey,
+        );
         const matching = Array.from((yield* SynchronizedRef.get(runtime)).sessions.values()).filter(
           (session) =>
-            session.lease.conversationId === conversationId && session.terminalAt === undefined,
+            session.lease.conversationId === conversationId &&
+            session.lease.contextEpoch < cleared.activeEpoch &&
+            session.terminalAt === undefined,
         );
         yield* Effect.forEach(matching, (session) => endRuntimeSession(session, "ended"), {
           discard: true,
         });
-        return yield* conversations.clearContext(conversationId);
+        return cleared;
       }),
     );
 
-  const confirm: VoiceSessionServiceShape["confirm"] = Effect.fn("VoiceSessionService.confirm")(
-    function* (owner, sessionId, confirmationId, input) {
-      const session = yield* requireOwned(owner, sessionId);
-      if (
-        session.providerSession === undefined ||
-        session.state.phase === "ended" ||
-        session.state.phase === "error"
-      ) {
-        return yield* sessionError(
-          "invalid-phase",
-          "session.confirmation",
-          "Voice session does not have an active provider call",
-        );
-      }
-      const result = yield* tools.decide({ sessionId, confirmationId, decision: input.decision });
-      if (result.tool === "unknown") {
-        return yield* sessionError(
-          "invalid-phase",
-          "session.confirmation",
-          "Voice tool confirmation resolved to an unknown tool",
-        );
-      }
-      if (input.decision === "approve") {
-        yield* emit(session.lease, {
-          type: "tool",
-          toolCallId: result.toolCallId,
-          tool: result.tool,
-          outcome: "approved",
-        });
-      }
-      yield* submitCompletedTool(session.lease, session.providerSession, result).pipe(
-        Effect.ensuring(resolvePendingConfirmation(session.lease, confirmationId)),
+  const confirmUnlocked: VoiceSessionServiceShape["confirm"] = Effect.fn(
+    "VoiceSessionService.confirmUnlocked",
+  )(function* (owner, sessionId, confirmationId, input) {
+    let session = yield* requireOwned(owner, sessionId);
+    if (
+      session.providerSession === undefined ||
+      session.state.phase === "ended" ||
+      session.state.phase === "error"
+    ) {
+      return yield* sessionError(
+        "invalid-phase",
+        "session.confirmation",
+        "Voice session does not have an active provider call",
       );
-      return {
-        confirmationId,
+    }
+    const conversation = yield* conversations.get(session.lease.conversationId);
+    if (
+      Option.isNone(conversation) ||
+      conversation.value.activeEpoch !== session.lease.contextEpoch
+    ) {
+      return yield* sessionError(
+        "lease-conflict",
+        "session.confirmation",
+        "Voice session belongs to an inactive conversation context",
+      );
+    }
+    // Revalidate after the storage read and immediately before executing the approved tool.
+    session = yield* requireOwned(owner, sessionId, session.lease.generation);
+    const providerSession = session.providerSession;
+    if (providerSession === undefined) {
+      return yield* sessionError(
+        "invalid-phase",
+        "session.confirmation",
+        "Voice session does not have an active provider call",
+      );
+    }
+    const result = yield* tools.decide({ sessionId, confirmationId, decision: input.decision });
+    if (result.tool === "unknown") {
+      return yield* sessionError(
+        "invalid-phase",
+        "session.confirmation",
+        "Voice tool confirmation resolved to an unknown tool",
+      );
+    }
+    if (input.decision === "approve") {
+      yield* emit(session.lease, {
+        type: "tool",
         toolCallId: result.toolCallId,
-        outcome: input.decision === "approve" ? "approved" : "rejected",
-      };
-    },
-  );
+        tool: result.tool,
+        outcome: "approved",
+      });
+    }
+    yield* submitCompletedTool(session.lease, providerSession, result).pipe(
+      Effect.ensuring(resolvePendingConfirmation(session.lease, confirmationId)),
+    );
+    return {
+      confirmationId,
+      toolCallId: result.toolCallId,
+      outcome: input.decision === "approve" ? "approved" : "rejected",
+    };
+  });
+
+  const confirm: VoiceSessionServiceShape["confirm"] = (owner, sessionId, confirmationId, input) =>
+    Effect.gen(function* () {
+      const session = yield* requireOwned(owner, sessionId);
+      return yield* Effect.raceFirst(
+        session.operationMutex.withPermits(1)(
+          confirmUnlocked(owner, sessionId, confirmationId, input),
+        ),
+        Deferred.await(session.terminationSignal).pipe(
+          Effect.andThen(
+            Effect.fail(
+              sessionError(
+                "invalid-phase",
+                "session.confirmation",
+                "Voice session ended during confirmation",
+              ),
+            ),
+          ),
+        ),
+      );
+    });
 
   return VoiceSessionService.of({
     create,

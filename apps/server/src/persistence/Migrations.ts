@@ -48,6 +48,9 @@ import Migration0032 from "./Migrations/032_AuthPairingProofKeyThumbprint.ts";
 import Migration0033 from "./Migrations/033_VoiceConversations.ts";
 import Migration0034 from "./Migrations/034_VoiceToolCalls.ts";
 import Migration0035 from "./Migrations/035_VoiceThreadToolQueryIndexes.ts";
+import Migration0036 from "./Migrations/036_VoiceConversationTranscripts.ts";
+import Migration0037 from "./Migrations/037_VoiceToolCallContextEpoch.ts";
+import Migration0038 from "./Migrations/038_VoiceConversationLastCallAt.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -95,6 +98,9 @@ export const migrationEntries = [
   [33, "VoiceConversations", Migration0033],
   [34, "VoiceToolCalls", Migration0034],
   [35, "VoiceThreadToolQueryIndexes", Migration0035],
+  [36, "VoiceConversationTranscripts", Migration0036],
+  [37, "VoiceToolCallContextEpoch", Migration0037],
+  [38, "VoiceConversationLastCallAt", Migration0038],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

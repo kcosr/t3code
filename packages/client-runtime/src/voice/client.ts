@@ -9,10 +9,16 @@ import {
   type VoiceConfirmationResult,
   type VoiceCapabilities,
   type VoiceConversationClearContextResult,
+  type VoiceConversationClearContextInput,
   type VoiceConversationCreateInput,
   type VoiceConversationDeleteResult,
   type VoiceConversationId,
+  type VoiceConversationListPage,
+  type VoiceConversationListQuery,
   type VoiceConversationSummary,
+  type VoiceConversationTranscriptPage,
+  type VoiceConversationTranscriptQuery,
+  type VoiceConversationUpdateInput,
   type VoiceMediaTicket,
   type VoiceMediaTicketRequest,
   type VoiceSessionCloseResult,
@@ -191,18 +197,26 @@ export interface VoiceHttpClient {
   readonly createConversation: (
     input: VoiceConversationCreateInput,
   ) => Effect.Effect<VoiceConversationSummary, RemoteEnvironmentRequestError>;
-  readonly listConversations: () => Effect.Effect<
-    ReadonlyArray<VoiceConversationSummary>,
-    RemoteEnvironmentRequestError
-  >;
+  readonly listConversations: (
+    query?: VoiceConversationListQuery,
+  ) => Effect.Effect<VoiceConversationListPage, RemoteEnvironmentRequestError>;
   readonly getConversation: (
     conversationId: VoiceConversationId,
   ) => Effect.Effect<VoiceConversationSummary, RemoteEnvironmentRequestError>;
+  readonly updateConversation: (
+    conversationId: VoiceConversationId,
+    input: VoiceConversationUpdateInput,
+  ) => Effect.Effect<VoiceConversationSummary, RemoteEnvironmentRequestError>;
+  readonly getConversationTranscript: (
+    conversationId: VoiceConversationId,
+    query?: VoiceConversationTranscriptQuery,
+  ) => Effect.Effect<VoiceConversationTranscriptPage, RemoteEnvironmentRequestError>;
   readonly deleteConversation: (
     conversationId: VoiceConversationId,
   ) => Effect.Effect<VoiceConversationDeleteResult, RemoteEnvironmentRequestError>;
   readonly clearConversationContext: (
     conversationId: VoiceConversationId,
+    input: VoiceConversationClearContextInput,
   ) => Effect.Effect<VoiceConversationClearContextResult, RemoteEnvironmentRequestError>;
   readonly createMediaTicket: (
     input: VoiceMediaTicketRequest,
@@ -229,7 +243,7 @@ const controlRequest = <A, E>(input: {
   readonly prepared: PreparedConnection;
   readonly signer: Option.Option<ManagedRelayDpopSigner["Service"]>;
   readonly fetch: typeof globalThis.fetch;
-  readonly method: "GET" | "POST" | "DELETE";
+  readonly method: "GET" | "POST" | "PATCH" | "DELETE";
   readonly pathname: string;
   readonly search?: string;
   readonly timeoutMs: number;
@@ -391,7 +405,7 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
   const signer = Option.fromNullishOr(input.signer);
   const timeoutMs = input.timeoutMs ?? DEFAULT_VOICE_HTTP_TIMEOUT_MS;
   const control = <A, E>(request: {
-    readonly method: "GET" | "POST" | "DELETE";
+    readonly method: "GET" | "POST" | "PATCH" | "DELETE";
     readonly pathname: string;
     readonly search?: string;
     readonly run: (
@@ -513,12 +527,17 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
         pathname: "/api/voice/conversations",
         run: (client, headers) => client.voice.createConversation({ headers, payload }),
       }),
-    listConversations: () =>
-      control({
+    listConversations: (query = {}) => {
+      const search = new URLSearchParams();
+      if (query.cursor !== undefined) search.set("cursor", query.cursor);
+      if (query.limit !== undefined) search.set("limit", String(query.limit));
+      return control({
         method: "GET",
         pathname: "/api/voice/conversations",
-        run: (client, headers) => client.voice.listConversations({ headers }),
-      }),
+        ...(search.size === 0 ? {} : { search: search.toString() }),
+        run: (client, headers) => client.voice.listConversations({ headers, query }),
+      });
+    },
     getConversation: (conversationId) =>
       control({
         method: "GET",
@@ -526,6 +545,30 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
         run: (client, headers) =>
           client.voice.getConversation({ headers, params: { conversationId } }),
       }),
+    updateConversation: (conversationId, payload) =>
+      control({
+        method: "PATCH",
+        pathname: `/api/voice/conversations/${conversationId}`,
+        run: (client, headers) =>
+          client.voice.updateConversation({ headers, params: { conversationId }, payload }),
+      }),
+    getConversationTranscript: (conversationId, query = {}) => {
+      const search = new URLSearchParams();
+      if (query.cursor !== undefined) search.set("cursor", query.cursor);
+      if (query.limit !== undefined) search.set("limit", String(query.limit));
+      const suffix = search.size === 0 ? "" : `?${search.toString()}`;
+      return control({
+        method: "GET",
+        pathname: `/api/voice/conversations/${conversationId}/transcript`,
+        ...(suffix === "" ? {} : { search: suffix.slice(1) }),
+        run: (client, headers) =>
+          client.voice.getConversationTranscript({
+            headers,
+            params: { conversationId },
+            query,
+          }),
+      });
+    },
     deleteConversation: (conversationId) =>
       control({
         method: "DELETE",
@@ -536,7 +579,7 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
             params: { conversationId },
           }),
       }),
-    clearConversationContext: (conversationId) =>
+    clearConversationContext: (conversationId, payload) =>
       control({
         method: "POST",
         pathname: `/api/voice/conversations/${conversationId}/clear-context`,
@@ -544,6 +587,7 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
           client.voice.clearConversationContext({
             headers,
             params: { conversationId },
+            payload,
           }),
       }),
     createMediaTicket: (payload) =>

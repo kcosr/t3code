@@ -232,17 +232,57 @@ const parseRealtimeEvent = (
         ? [{ type: "transcript", role: "user", text: record.delta, final: false }]
         : [];
     case "conversation.item.input_audio_transcription.completed":
-      return typeof record.transcript === "string" && record.transcript.length > 0
-        ? [{ type: "transcript", role: "user", text: record.transcript, final: true }]
-        : [];
+      if (typeof record.transcript !== "string" || record.transcript.length === 0) return [];
+      if (
+        typeof record.item_id !== "string" ||
+        !Number.isInteger(record.content_index) ||
+        (record.content_index as number) < 0
+      ) {
+        return [
+          {
+            type: "error",
+            detail: "OpenAI sent a final input transcript without a stable identity",
+            recoverable: false,
+          },
+        ];
+      }
+      return [
+        {
+          type: "transcript",
+          role: "user",
+          text: record.transcript,
+          final: true,
+          sourceId: `input:${record.item_id}:${record.content_index}`,
+        },
+      ];
     case "response.output_audio_transcript.delta":
       return typeof record.delta === "string" && record.delta.length > 0
         ? [{ type: "transcript", role: "assistant", text: record.delta, final: false }]
         : [];
     case "response.output_audio_transcript.done":
-      return typeof record.transcript === "string" && record.transcript.length > 0
-        ? [{ type: "transcript", role: "assistant", text: record.transcript, final: true }]
-        : [];
+      if (typeof record.transcript !== "string" || record.transcript.length === 0) return [];
+      if (
+        typeof record.item_id !== "string" ||
+        !Number.isInteger(record.content_index) ||
+        (record.content_index as number) < 0
+      ) {
+        return [
+          {
+            type: "error",
+            detail: "OpenAI sent a final output transcript without a stable identity",
+            recoverable: false,
+          },
+        ];
+      }
+      return [
+        {
+          type: "transcript",
+          role: "assistant",
+          text: record.transcript,
+          final: true,
+          sourceId: `output:${record.item_id}:${record.content_index}`,
+        },
+      ];
     case "error": {
       const error = record.error;
       const detail =

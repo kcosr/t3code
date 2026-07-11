@@ -24,6 +24,7 @@ const make = Effect.gen(function* () {
     execute: (input) => sql`
       SELECT
         conversation_id AS "conversationId",
+        context_epoch AS "contextEpoch",
         tool_call_id AS "toolCallId",
         provider_function_call_id AS "providerFunctionCallId",
         tool_name AS "toolName",
@@ -51,6 +52,7 @@ const make = Effect.gen(function* () {
     execute: ({ confirmationId }) => sql`
       SELECT
         conversation_id AS "conversationId",
+        context_epoch AS "contextEpoch",
         tool_call_id AS "toolCallId",
         provider_function_call_id AS "providerFunctionCallId",
         tool_name AS "toolName",
@@ -85,6 +87,7 @@ const make = Effect.gen(function* () {
   const insertRequested = SqlSchema.findOneOption({
     Request: Schema.Struct({
       conversationId: Schema.String,
+      contextEpoch: Schema.Number,
       toolCallId: Schema.String,
       providerFunctionCallId: Schema.String,
       toolName: Schema.String,
@@ -95,10 +98,10 @@ const make = Effect.gen(function* () {
     Result: Key,
     execute: (input) => sql`
       INSERT INTO voice_tool_calls (
-        conversation_id, tool_call_id, provider_function_call_id, tool_name,
+        conversation_id, context_epoch, tool_call_id, provider_function_call_id, tool_name,
         canonical_arguments_json, status, session_id, created_at, updated_at
       ) VALUES (
-        ${input.conversationId}, ${input.toolCallId}, ${input.providerFunctionCallId},
+        ${input.conversationId}, ${input.contextEpoch}, ${input.toolCallId}, ${input.providerFunctionCallId},
         ${input.toolName}, ${input.canonicalArgumentsJson}, 'requested', ${input.sessionId},
         ${input.createdAt}, ${input.createdAt}
       )
@@ -110,6 +113,7 @@ const make = Effect.gen(function* () {
   const updatePending = SqlSchema.void({
     Request: Schema.Struct({
       conversationId: Schema.String,
+      contextEpoch: Schema.Number,
       toolCallId: Schema.String,
       sessionId: Schema.String,
       confirmationId: Schema.String,
@@ -130,6 +134,7 @@ const make = Effect.gen(function* () {
           updated_at = ${input.updatedAt},
           expires_at = ${input.expiresAt}
       WHERE conversation_id = ${input.conversationId}
+        AND context_epoch = ${input.contextEpoch}
         AND tool_call_id = ${input.toolCallId}
         AND status = 'requested'
     `,
@@ -138,6 +143,7 @@ const make = Effect.gen(function* () {
   const updateTerminal = SqlSchema.void({
     Request: Schema.Struct({
       conversationId: Schema.String,
+      contextEpoch: Schema.Number,
       toolCallId: Schema.String,
       status: Schema.String,
       resultOutput: Schema.String,
@@ -149,7 +155,24 @@ const make = Effect.gen(function* () {
           result_output = ${input.resultOutput},
           updated_at = ${input.updatedAt}
       WHERE conversation_id = ${input.conversationId}
+        AND context_epoch = ${input.contextEpoch}
         AND tool_call_id = ${input.toolCallId}
+        AND status IN ('requested', 'pending-confirmation')
+    `,
+  });
+
+  const terminalizeSessionRows = SqlSchema.void({
+    Request: Schema.Struct({
+      sessionId: Schema.String,
+      resultOutput: Schema.String,
+      updatedAt: Schema.String,
+    }),
+    execute: (input) => sql`
+      UPDATE voice_tool_calls
+      SET status = 'failed',
+          result_output = ${input.resultOutput},
+          updated_at = ${input.updatedAt}
+      WHERE session_id = ${input.sessionId}
         AND status IN ('requested', 'pending-confirmation')
     `,
   });
@@ -179,6 +202,10 @@ const make = Effect.gen(function* () {
       Effect.mapError(toPersistenceSqlError("VoiceToolCallRepository.markTerminal:update")),
       Effect.andThen(getRequired(input)),
     );
+  const terminalizeSession: VoiceToolCallRepositoryShape["terminalizeSession"] = (input) =>
+    terminalizeSessionRows(input).pipe(
+      Effect.mapError(toPersistenceSqlError("VoiceToolCallRepository.terminalizeSession:update")),
+    );
 
   return VoiceToolCallRepository.of({
     createRequested,
@@ -186,6 +213,7 @@ const make = Effect.gen(function* () {
     getByConfirmationId,
     markPending,
     markTerminal,
+    terminalizeSession,
   });
 });
 

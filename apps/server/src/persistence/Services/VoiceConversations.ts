@@ -1,7 +1,9 @@
 import {
   IsoDateTime,
+  NonNegativeInt,
   PositiveInt,
   TrimmedNonEmptyString,
+  VoiceConversationEntryId,
   VoiceConversationId,
   VoiceConversationRetention,
 } from "@t3tools/contracts";
@@ -17,6 +19,7 @@ export const DurableVoiceConversation = Schema.Struct({
   retention: Schema.Literal("durable"),
   title: Schema.NullOr(TrimmedNonEmptyString),
   activeEpoch: PositiveInt,
+  lastCallAt: Schema.NullOr(IsoDateTime),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -36,7 +39,7 @@ export const VoiceConversationJournalEntryKind = Schema.Literals([
 export type VoiceConversationJournalEntryKind = typeof VoiceConversationJournalEntryKind.Type;
 
 export const VoiceConversationJournalEntry = Schema.Struct({
-  entryId: TrimmedNonEmptyString,
+  entryId: VoiceConversationEntryId,
   conversationId: VoiceConversationId,
   epoch: PositiveInt,
   sequence: PositiveInt,
@@ -60,23 +63,52 @@ export const GetVoiceConversationInput = Schema.Struct({
 export type GetVoiceConversationInput = typeof GetVoiceConversationInput.Type;
 
 export const ListVoiceConversationsInput = Schema.Struct({
-  limit: Schema.optionalKey(PositiveInt),
+  beforeUpdatedAt: Schema.optionalKey(IsoDateTime),
+  beforeConversationId: Schema.optionalKey(VoiceConversationId),
+  limit: PositiveInt,
 });
 export type ListVoiceConversationsInput = typeof ListVoiceConversationsInput.Type;
+
+export const VoiceConversationRepositoryPage = Schema.Struct({
+  conversations: Schema.Array(DurableVoiceConversation),
+  hasMore: Schema.Boolean,
+});
+export type VoiceConversationRepositoryPage = typeof VoiceConversationRepositoryPage.Type;
 
 export const DeleteVoiceConversationInput = GetVoiceConversationInput;
 export type DeleteVoiceConversationInput = typeof DeleteVoiceConversationInput.Type;
 
+export const UpdateVoiceConversationTitleInput = Schema.Struct({
+  conversationId: VoiceConversationId,
+  title: Schema.NullOr(TrimmedNonEmptyString),
+  updatedAt: IsoDateTime,
+});
+export type UpdateVoiceConversationTitleInput = typeof UpdateVoiceConversationTitleInput.Type;
+
+export const MarkVoiceConversationCallStartedInput = Schema.Struct({
+  conversationId: VoiceConversationId,
+  expectedEpoch: PositiveInt,
+  startedAt: IsoDateTime,
+});
+export type MarkVoiceConversationCallStartedInput =
+  typeof MarkVoiceConversationCallStartedInput.Type;
+
 export const ClearVoiceConversationContextInput = Schema.Struct({
   conversationId: VoiceConversationId,
-  entryId: TrimmedNonEmptyString,
+  entryId: VoiceConversationEntryId,
   expectedEpoch: PositiveInt,
   clearedAt: IsoDateTime,
 });
 export type ClearVoiceConversationContextInput = typeof ClearVoiceConversationContextInput.Type;
 
+export const ClearedVoiceConversationContext = Schema.Struct({
+  conversation: DurableVoiceConversation,
+  clearedAt: IsoDateTime,
+});
+export type ClearedVoiceConversationContext = typeof ClearedVoiceConversationContext.Type;
+
 export const AppendVoiceConversationJournalEntryInput = Schema.Struct({
-  entryId: TrimmedNonEmptyString,
+  entryId: VoiceConversationEntryId,
   conversationId: VoiceConversationId,
   expectedEpoch: PositiveInt,
   kind: VoiceConversationJournalEntryKind,
@@ -88,9 +120,36 @@ export type AppendVoiceConversationJournalEntryInput =
 
 export const ListVoiceConversationContextInput = Schema.Struct({
   conversationId: VoiceConversationId,
+  expectedEpoch: PositiveInt,
   limit: Schema.optionalKey(PositiveInt),
 });
 export type ListVoiceConversationContextInput = typeof ListVoiceConversationContextInput.Type;
+
+export const VoiceConversationTranscriptRow = Schema.Struct({
+  entryId: VoiceConversationEntryId,
+  conversationId: VoiceConversationId,
+  contextEpoch: PositiveInt,
+  sequence: PositiveInt,
+  role: Schema.Literals(["user", "assistant"]),
+  text: Schema.String,
+  occurredAt: IsoDateTime,
+});
+export type VoiceConversationTranscriptRow = typeof VoiceConversationTranscriptRow.Type;
+
+export const ListVoiceConversationTranscriptInput = Schema.Struct({
+  conversationId: VoiceConversationId,
+  snapshotThroughSequence: NonNegativeInt,
+  beforeSequence: PositiveInt,
+  limit: PositiveInt,
+});
+export type ListVoiceConversationTranscriptInput = typeof ListVoiceConversationTranscriptInput.Type;
+
+export const VoiceConversationTranscriptRepositoryPage = Schema.Struct({
+  entries: Schema.Array(VoiceConversationTranscriptRow),
+  hasMore: Schema.Boolean,
+});
+export type VoiceConversationTranscriptRepositoryPage =
+  typeof VoiceConversationTranscriptRepositoryPage.Type;
 
 export class VoiceConversationAlreadyExistsError extends Schema.TaggedErrorClass<VoiceConversationAlreadyExistsError>()(
   "VoiceConversationAlreadyExistsError",
@@ -115,7 +174,7 @@ export class VoiceConversationEntryConflictError extends Schema.TaggedErrorClass
   "VoiceConversationEntryConflictError",
   {
     conversationId: VoiceConversationId,
-    entryId: TrimmedNonEmptyString,
+    entryId: VoiceConversationEntryId,
   },
 ) {}
 
@@ -144,17 +203,23 @@ export interface VoiceConversationRepositoryShape {
     PersistenceSqlError | PersistenceDecodeError
   >;
   readonly list: (
-    input?: ListVoiceConversationsInput,
+    input: ListVoiceConversationsInput,
+  ) => Effect.Effect<VoiceConversationRepositoryPage, PersistenceSqlError | PersistenceDecodeError>;
+  readonly updateTitle: (
+    input: UpdateVoiceConversationTitleInput,
   ) => Effect.Effect<
-    ReadonlyArray<DurableVoiceConversation>,
+    Option.Option<DurableVoiceConversation>,
     PersistenceSqlError | PersistenceDecodeError
   >;
+  readonly markCallStarted: (
+    input: MarkVoiceConversationCallStartedInput,
+  ) => Effect.Effect<DurableVoiceConversation, VoiceConversationRepositoryError>;
   readonly delete: (
     input: DeleteVoiceConversationInput,
   ) => Effect.Effect<boolean, PersistenceSqlError>;
   readonly clearContext: (
     input: ClearVoiceConversationContextInput,
-  ) => Effect.Effect<DurableVoiceConversation, VoiceConversationRepositoryError>;
+  ) => Effect.Effect<ClearedVoiceConversationContext, VoiceConversationRepositoryError>;
   readonly append: (
     input: AppendVoiceConversationJournalEntryInput,
   ) => Effect.Effect<VoiceConversationJournalEntry, VoiceConversationRepositoryError>;
@@ -164,6 +229,12 @@ export interface VoiceConversationRepositoryShape {
     ReadonlyArray<VoiceConversationJournalEntry>,
     VoiceConversationRepositoryError
   >;
+  readonly listTranscript: (
+    input: ListVoiceConversationTranscriptInput,
+  ) => Effect.Effect<VoiceConversationTranscriptRepositoryPage, VoiceConversationRepositoryError>;
+  readonly getTranscriptSnapshotSequence: (
+    input: GetVoiceConversationInput,
+  ) => Effect.Effect<number, VoiceConversationRepositoryError>;
 }
 
 export class VoiceConversationRepository extends Context.Service<

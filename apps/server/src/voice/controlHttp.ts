@@ -1,6 +1,7 @@
 import {
   AuthVoiceManageScope,
   AuthVoiceUseScope,
+  EnvironmentResourceNotFoundError,
   EnvironmentVoiceOperationError,
   EnvironmentHttpApi,
   type VoiceCapabilityDescriptor,
@@ -38,6 +39,13 @@ const failVoiceOperation = (error: VoiceError) =>
       ),
     ),
   );
+
+const failVoiceConversationOperation = (
+  error: VoiceError,
+): Effect.Effect<never, EnvironmentResourceNotFoundError | EnvironmentVoiceOperationError> =>
+  error.reason === "conversation-not-found"
+    ? failEnvironmentNotFound("voice_conversation_not_found")
+    : failVoiceOperation(error);
 
 const descriptor = (
   capability: VoiceCapabilityDescriptor["capability"],
@@ -197,9 +205,9 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
         Effect.fn("environment.voice.listConversations")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthVoiceUseScope);
-          return yield* conversations.listDurable.pipe(
-            Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)),
-          );
+          return yield* conversations
+            .listDurable(args.query)
+            .pipe(Effect.catch(failVoiceOperation));
         }),
       )
       .handle(
@@ -214,6 +222,26 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
             return yield* failEnvironmentNotFound("voice_conversation_not_found");
           }
           return conversation.value;
+        }),
+      )
+      .handle(
+        "updateConversation",
+        Effect.fn("environment.voice.updateConversation")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireEnvironmentScope(AuthVoiceUseScope);
+          return yield* conversations
+            .updateTitle(args.params.conversationId, args.payload)
+            .pipe(Effect.catch(failVoiceConversationOperation));
+        }),
+      )
+      .handle(
+        "getConversationTranscript",
+        Effect.fn("environment.voice.getConversationTranscript")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireEnvironmentScope(AuthVoiceUseScope);
+          return yield* conversations
+            .listTranscript(args.params.conversationId, args.query)
+            .pipe(Effect.catch(failVoiceConversationOperation));
         }),
       )
       .handle(
@@ -232,13 +260,13 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
         Effect.fn("environment.voice.clearConversationContext")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthVoiceUseScope);
-          return yield* sessions.clearConversationContext(args.params.conversationId).pipe(
-            Effect.catchIf(
-              (error) => error.reason === "conversation-not-found",
-              () => failEnvironmentNotFound("voice_conversation_not_found"),
-            ),
-            Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)),
-          );
+          return yield* sessions
+            .clearConversationContext(
+              args.params.conversationId,
+              args.payload.expectedEpoch,
+              args.payload.idempotencyKey,
+            )
+            .pipe(Effect.catch(failVoiceConversationOperation));
         }),
       )
       .handle(

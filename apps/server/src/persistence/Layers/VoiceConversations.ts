@@ -15,11 +15,13 @@ import {
   VoiceConversationEpochConflictError,
   VoiceConversationJournalEntry,
   VoiceConversationNotFoundError,
+  VoiceConversationRepositoryPage,
   VoiceConversationRepository,
+  VoiceConversationTranscriptRepositoryPage,
+  VoiceConversationTranscriptRow,
   type VoiceConversationRepositoryShape,
 } from "../Services/VoiceConversations.ts";
 
-const DEFAULT_LIST_LIMIT = 100;
 const DEFAULT_CONTEXT_LIMIT = 1_000;
 
 const ConversationRow = DurableVoiceConversation;
@@ -31,8 +33,12 @@ const AllocatedSequence = Schema.Struct({
   sequence: Schema.Number,
 });
 const DeletedConversation = Schema.Struct({ conversationId: Schema.String });
+const TranscriptPayload = Schema.Struct({ text: Schema.String.check(Schema.isPattern(/\S/)) });
+const TranscriptSnapshot = Schema.Struct({ sequence: Schema.Number });
+const TranscriptProjectionRow = VoiceConversationTranscriptRow;
 
 const encodePayload = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeTranscriptPayload = Schema.decodeUnknownExit(TranscriptPayload);
 
 const makeVoiceConversationRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -46,6 +52,7 @@ const makeVoiceConversationRepository = Effect.gen(function* () {
         retention,
         title,
         active_epoch AS "activeEpoch",
+        last_call_at AS "lastCallAt",
         created_at AS "createdAt",
         updated_at AS "updatedAt"
       FROM voice_conversations
@@ -86,6 +93,7 @@ const makeVoiceConversationRepository = Effect.gen(function* () {
         retention,
         title,
         active_epoch AS "activeEpoch",
+        last_call_at AS "lastCallAt",
         created_at AS "createdAt",
         updated_at AS "updatedAt"
     `,
@@ -100,11 +108,86 @@ const makeVoiceConversationRepository = Effect.gen(function* () {
         retention,
         title,
         active_epoch AS "activeEpoch",
+        last_call_at AS "lastCallAt",
         created_at AS "createdAt",
         updated_at AS "updatedAt"
       FROM voice_conversations
       ORDER BY updated_at DESC, conversation_id ASC
       LIMIT ${limit}
+    `,
+  });
+
+  const listConversationsAfter = SqlSchema.findAll({
+    Request: Schema.Struct({
+      beforeUpdatedAt: Schema.String,
+      beforeConversationId: Schema.String,
+      limit: Schema.Number,
+    }),
+    Result: ConversationRow,
+    execute: (input) => sql`
+      SELECT
+        conversation_id AS "conversationId",
+        retention,
+        title,
+        active_epoch AS "activeEpoch",
+        last_call_at AS "lastCallAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM voice_conversations
+      WHERE updated_at < ${input.beforeUpdatedAt}
+        OR (
+          updated_at = ${input.beforeUpdatedAt}
+          AND conversation_id > ${input.beforeConversationId}
+        )
+      ORDER BY updated_at DESC, conversation_id ASC
+      LIMIT ${input.limit}
+    `,
+  });
+
+  const updateConversationTitle = SqlSchema.findOneOption({
+    Request: Schema.Struct({
+      conversationId: Schema.String,
+      title: Schema.NullOr(Schema.String),
+      updatedAt: Schema.String,
+    }),
+    Result: ConversationRow,
+    execute: (input) => sql`
+      UPDATE voice_conversations
+      SET title = ${input.title}, updated_at = ${input.updatedAt}
+      WHERE conversation_id = ${input.conversationId}
+      RETURNING
+        conversation_id AS "conversationId",
+        retention,
+        title,
+        active_epoch AS "activeEpoch",
+        last_call_at AS "lastCallAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+    `,
+  });
+
+  const markConversationCallStarted = SqlSchema.findOneOption({
+    Request: Schema.Struct({
+      conversationId: Schema.String,
+      expectedEpoch: Schema.Number,
+      startedAt: Schema.String,
+    }),
+    Result: ConversationRow,
+    execute: (input) => sql`
+      UPDATE voice_conversations
+      SET
+        last_call_at = MAX(COALESCE(last_call_at, ${input.startedAt}), ${input.startedAt}),
+        updated_at = MAX(updated_at, ${input.startedAt})
+      WHERE conversation_id = ${input.conversationId}
+        AND active_epoch = ${input.expectedEpoch}
+      RETURNING
+        conversation_id AS "conversationId",
+        retention,
+        title,
+        active_epoch AS "activeEpoch",
+        last_call_at AS "lastCallAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
     `,
   });
 
@@ -218,6 +301,78 @@ const makeVoiceConversationRepository = Effect.gen(function* () {
     `,
   });
 
+  const insertTranscriptProjection = SqlSchema.findOne({
+    Request: TranscriptProjectionRow,
+    Result: TranscriptProjectionRow,
+    execute: (input) => sql`
+      INSERT INTO voice_conversation_transcript_entries (
+        entry_id,
+        conversation_id,
+        context_epoch,
+        sequence,
+        role,
+        text,
+        occurred_at
+      )
+      VALUES (
+        ${input.entryId},
+        ${input.conversationId},
+        ${input.contextEpoch},
+        ${input.sequence},
+        ${input.role},
+        ${input.text},
+        ${input.occurredAt}
+      )
+      RETURNING
+        entry_id AS "entryId",
+        conversation_id AS "conversationId",
+        context_epoch AS "contextEpoch",
+        sequence,
+        role,
+        text,
+        occurred_at AS "occurredAt"
+    `,
+  });
+
+  const transcriptSnapshot = SqlSchema.findOne({
+    Request: Schema.Struct({ conversationId: Schema.String }),
+    Result: TranscriptSnapshot,
+    execute: ({ conversationId }) => sql`
+      SELECT next_entry_sequence - 1 AS sequence
+      FROM voice_conversations
+      WHERE conversation_id = ${conversationId}
+    `,
+  });
+
+  const listTranscriptEntries = SqlSchema.findAll({
+    Request: Schema.Struct({
+      conversationId: Schema.String,
+      snapshotThroughSequence: Schema.Number,
+      beforeSequence: Schema.Number,
+      limit: Schema.Number,
+    }),
+    Result: TranscriptProjectionRow,
+    execute: (input) => sql`
+      SELECT * FROM (
+        SELECT
+          entry_id AS "entryId",
+          conversation_id AS "conversationId",
+          context_epoch AS "contextEpoch",
+          sequence,
+          role,
+          text,
+          occurred_at AS "occurredAt"
+        FROM voice_conversation_transcript_entries
+        WHERE conversation_id = ${input.conversationId}
+          AND sequence <= ${input.snapshotThroughSequence}
+          AND sequence < ${input.beforeSequence}
+        ORDER BY sequence DESC
+        LIMIT ${input.limit}
+      )
+      ORDER BY sequence ASC
+    `,
+  });
+
   const listContextEntries = SqlSchema.findAll({
     Request: Schema.Struct({
       conversationId: Schema.String,
@@ -299,10 +454,44 @@ const makeVoiceConversationRepository = Effect.gen(function* () {
       Effect.mapError(toPersistenceSqlError("VoiceConversationRepository.get:query")),
     );
 
-  const list: VoiceConversationRepositoryShape["list"] = (input = {}) =>
-    listConversations({ limit: input.limit ?? DEFAULT_LIST_LIMIT }).pipe(
-      Effect.mapError(toPersistenceSqlError("VoiceConversationRepository.list:query")),
+  const list: VoiceConversationRepositoryShape["list"] = Effect.fn(
+    "VoiceConversationRepository.list",
+  )(function* (input) {
+    const limit = input.limit + 1;
+    const rows = yield* (
+      input.beforeUpdatedAt === undefined || input.beforeConversationId === undefined
+        ? listConversations({ limit })
+        : listConversationsAfter({
+            beforeUpdatedAt: input.beforeUpdatedAt,
+            beforeConversationId: input.beforeConversationId,
+            limit,
+          })
+    ).pipe(Effect.mapError(toPersistenceSqlError("VoiceConversationRepository.list:query")));
+    return {
+      conversations: rows.slice(0, input.limit),
+      hasMore: rows.length > input.limit,
+    } satisfies VoiceConversationRepositoryPage;
+  });
+
+  const updateTitle: VoiceConversationRepositoryShape["updateTitle"] = (input) =>
+    updateConversationTitle(input).pipe(
+      Effect.mapError(toPersistenceSqlError("VoiceConversationRepository.updateTitle:query")),
     );
+
+  const markCallStarted: VoiceConversationRepositoryShape["markCallStarted"] = Effect.fn(
+    "VoiceConversationRepository.markCallStarted",
+  )(function* (input) {
+    const updated = yield* markConversationCallStarted(input).pipe(
+      Effect.mapError(toPersistenceSqlError("VoiceConversationRepository.markCallStarted:update")),
+    );
+    if (Option.isSome(updated)) return updated.value;
+    const conversation = yield* getConversationOrFail(input.conversationId);
+    return yield* new VoiceConversationEpochConflictError({
+      conversationId: input.conversationId,
+      expectedEpoch: input.expectedEpoch,
+      actualEpoch: conversation.activeEpoch,
+    });
+  });
 
   const deleteConversationById: VoiceConversationRepositoryShape["delete"] = (input) =>
     deleteConversation(input).pipe(
@@ -332,7 +521,6 @@ const makeVoiceConversationRepository = Effect.gen(function* () {
               existing.value.conversationId !== input.conversationId ||
               existing.value.epoch !== input.expectedEpoch ||
               existing.value.kind !== input.kind ||
-              existing.value.occurredAt !== input.occurredAt ||
               existingPayloadJson !== payloadJson
             ) {
               return yield* new VoiceConversationEntryConflictError({
@@ -351,7 +539,7 @@ const makeVoiceConversationRepository = Effect.gen(function* () {
             expectedEpoch: input.expectedEpoch,
             allocated,
           });
-          return yield* insertJournalEntry({
+          const inserted = yield* insertJournalEntry({
             entryId: input.entryId,
             conversationId: input.conversationId,
             epoch,
@@ -362,6 +550,25 @@ const makeVoiceConversationRepository = Effect.gen(function* () {
           }).pipe(
             Effect.mapError(toPersistenceSqlError("VoiceConversationRepository.append:insert")),
           );
+          if (inserted.kind === "transcript.user" || inserted.kind === "transcript.assistant") {
+            const transcript = decodeTranscriptPayload(inserted.payload);
+            if (transcript._tag === "Success") {
+              yield* insertTranscriptProjection({
+                entryId: inserted.entryId,
+                conversationId: inserted.conversationId,
+                contextEpoch: inserted.epoch,
+                sequence: inserted.sequence,
+                role: inserted.kind === "transcript.user" ? "user" : "assistant",
+                text: transcript.value.text,
+                occurredAt: inserted.occurredAt,
+              }).pipe(
+                Effect.mapError(
+                  toPersistenceSqlError("VoiceConversationRepository.append:transcript"),
+                ),
+              );
+            }
+          }
+          return inserted;
         }),
       )
       .pipe(
@@ -388,15 +595,17 @@ const makeVoiceConversationRepository = Effect.gen(function* () {
             if (
               existing.value.conversationId !== input.conversationId ||
               existing.value.kind !== "context-cleared" ||
-              existing.value.epoch !== input.expectedEpoch + 1 ||
-              existing.value.occurredAt !== input.clearedAt
+              existing.value.epoch !== input.expectedEpoch + 1
             ) {
               return yield* new VoiceConversationEntryConflictError({
                 conversationId: input.conversationId,
                 entryId: input.entryId,
               });
             }
-            return yield* getConversationOrFail(input.conversationId);
+            return {
+              conversation: yield* getConversationOrFail(input.conversationId),
+              clearedAt: existing.value.occurredAt,
+            };
           }
 
           const allocated = yield* advanceContextEpoch(input).pipe(
@@ -427,7 +636,10 @@ const makeVoiceConversationRepository = Effect.gen(function* () {
               toPersistenceSqlError("VoiceConversationRepository.clearContext:insert"),
             ),
           );
-          return yield* getConversationOrFail(input.conversationId);
+          return {
+            conversation: yield* getConversationOrFail(input.conversationId),
+            clearedAt: input.clearedAt,
+          };
         }),
       )
       .pipe(
@@ -443,23 +655,58 @@ const makeVoiceConversationRepository = Effect.gen(function* () {
     "VoiceConversationRepository.listContext",
   )(function* (input) {
     const conversation = yield* getConversationOrFail(input.conversationId);
+    if (conversation.activeEpoch !== input.expectedEpoch) {
+      return yield* new VoiceConversationEpochConflictError({
+        conversationId: input.conversationId,
+        expectedEpoch: input.expectedEpoch,
+        actualEpoch: conversation.activeEpoch,
+      });
+    }
     return yield* listContextEntries({
       conversationId: input.conversationId,
-      epoch: conversation.activeEpoch,
+      epoch: input.expectedEpoch,
       limit: input.limit ?? DEFAULT_CONTEXT_LIMIT,
     }).pipe(
       Effect.mapError(toPersistenceSqlError("VoiceConversationRepository.listContext:query")),
     );
   });
 
+  const getTranscriptSnapshotSequence: VoiceConversationRepositoryShape["getTranscriptSnapshotSequence"] =
+    Effect.fn("VoiceConversationRepository.getTranscriptSnapshotSequence")(function* (input) {
+      yield* getConversationOrFail(input.conversationId);
+      const snapshot = yield* transcriptSnapshot(input).pipe(
+        Effect.mapError(
+          toPersistenceSqlError("VoiceConversationRepository.getTranscriptSnapshotSequence:query"),
+        ),
+      );
+      return snapshot.sequence;
+    });
+
+  const listTranscript: VoiceConversationRepositoryShape["listTranscript"] = Effect.fn(
+    "VoiceConversationRepository.listTranscript",
+  )(function* (input) {
+    yield* getConversationOrFail(input.conversationId);
+    const rows = yield* listTranscriptEntries({ ...input, limit: input.limit + 1 }).pipe(
+      Effect.mapError(toPersistenceSqlError("VoiceConversationRepository.listTranscript:query")),
+    );
+    return {
+      entries: rows.slice(Math.max(0, rows.length - input.limit)),
+      hasMore: rows.length > input.limit,
+    } satisfies VoiceConversationTranscriptRepositoryPage;
+  });
+
   return VoiceConversationRepository.of({
     create,
     get,
     list,
+    updateTitle,
+    markCallStarted,
     delete: deleteConversationById,
     clearContext,
     append,
     listContext,
+    getTranscriptSnapshotSequence,
+    listTranscript,
   });
 });
 

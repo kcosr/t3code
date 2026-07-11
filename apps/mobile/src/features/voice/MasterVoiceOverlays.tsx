@@ -1,4 +1,3 @@
-import type { VoiceConversationSummary } from "@t3tools/contracts";
 import type { T3VoiceAudioRoute } from "@t3tools/mobile-voice-native";
 import { SymbolView } from "expo-symbols";
 import { ActivityIndicator, FlatList, Modal, Pressable, View } from "react-native";
@@ -34,73 +33,6 @@ function VoiceSheetHeader(props: {
       </Text>
       <ControlPill icon="xmark" accessibilityLabel={props.closeLabel} onPress={props.onClose} />
     </View>
-  );
-}
-
-export function VoiceConversationPicker(props: {
-  readonly visible: boolean;
-  readonly conversations: ReadonlyArray<VoiceConversationSummary>;
-  readonly onCancel: () => void;
-  readonly onContinue: (conversation: VoiceConversationSummary) => void;
-}) {
-  const insets = useSafeAreaInsets();
-  const iconColor = useThemeColor("--color-icon");
-  return (
-    <Modal
-      animationType="slide"
-      presentationStyle="pageSheet"
-      visible={props.visible}
-      onRequestClose={props.onCancel}
-    >
-      <View
-        className="flex-1 bg-screen"
-        style={{ paddingTop: Math.max(insets.top, 20), paddingBottom: Math.max(insets.bottom, 16) }}
-      >
-        <View className="border-b border-border pb-4">
-          <VoiceSheetHeader
-            title="Voice conversations"
-            closeLabel="Close voice conversations"
-            onClose={props.onCancel}
-          />
-          <Text className="px-5 pt-3 text-sm text-foreground-muted">
-            Calls use an AI-generated voice and may request confirmed T3 actions.
-          </Text>
-        </View>
-        <FlatList
-          data={props.conversations}
-          keyExtractor={(conversation) => conversation.conversationId}
-          contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 24 }}
-          ListEmptyComponent={
-            <Text className="px-2 py-8 text-center text-sm text-foreground-muted">
-              No saved voice conversations
-            </Text>
-          }
-          renderItem={({ item }) => (
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={`Continue ${item.title ?? "voice conversation"}`}
-              className="flex-row items-center gap-3 border-b border-border px-2 py-4"
-              onPress={() => props.onContinue(item)}
-            >
-              <SymbolView
-                name={platformSymbolName("waveform.circle.fill")}
-                size={22}
-                tintColor={iconColor}
-                type="monochrome"
-              />
-              <View className="min-w-0 flex-1">
-                <Text className="text-base font-t3-bold text-foreground" numberOfLines={1}>
-                  {item.title ?? "Voice conversation"}
-                </Text>
-                <Text className="mt-1 text-xs text-foreground-muted">
-                  {new Date(item.updatedAt).toLocaleString()}
-                </Text>
-              </View>
-            </Pressable>
-          )}
-        />
-      </View>
-    </Modal>
   );
 }
 
@@ -249,7 +181,8 @@ function phaseLabel(snapshot: RealtimeVoiceControllerSnapshot): string {
 }
 
 export function MasterVoiceCallBar(props: {
-  readonly available: boolean;
+  readonly historyAvailable: boolean;
+  readonly callAvailable: boolean;
   readonly snapshot: RealtimeVoiceControllerSnapshot;
   readonly attachment: ActiveMasterVoiceAttachment | null;
   readonly transcript: ReadonlyArray<MasterVoiceTranscriptTurn>;
@@ -264,7 +197,7 @@ export function MasterVoiceCallBar(props: {
   const insets = useSafeAreaInsets();
   const iconColor = useThemeColor("--color-icon");
   if (props.snapshot.phase === "idle") {
-    if (!props.available) return null;
+    if (!props.historyAvailable && !props.callAvailable) return null;
     return (
       <View
         className="flex-row items-center gap-3 border-t border-border bg-screen px-3 pt-2"
@@ -275,21 +208,26 @@ export function MasterVoiceCallBar(props: {
             Voice conversation
           </Text>
           <Text className="text-xs text-foreground-muted" numberOfLines={1}>
-            Resume your last conversation
+            {props.callAvailable ? "Resume your last conversation" : "Browse saved conversations"}
           </Text>
         </View>
-        <ControlPill
-          icon="clock.arrow.circlepath"
-          accessibilityLabel="Browse voice conversations"
-          onPress={props.onHistory}
-        />
-        <ControlPill
-          icon="waveform.circle.fill"
-          accessibilityLabel="Resume last voice conversation"
-          variant="primary"
-          disabled={props.resumePending}
-          onPress={props.onResume}
-        />
+        {props.historyAvailable ? (
+          <ControlPill
+            icon="clock.arrow.circlepath"
+            accessibilityLabel="Browse voice conversations"
+            onPress={props.onHistory}
+          />
+        ) : null}
+        {props.callAvailable ? (
+          <ControlPill
+            icon="waveform.circle.fill"
+            label="Resume"
+            accessibilityLabel="Resume last voice conversation"
+            variant="primary"
+            disabled={props.resumePending}
+            onPress={props.onResume}
+          />
+        ) : null}
       </View>
     );
   }

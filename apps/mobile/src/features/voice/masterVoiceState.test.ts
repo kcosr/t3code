@@ -9,9 +9,11 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   durableVoiceConversations,
+  continueVoiceConversationSelection,
   isSameMasterVoiceFocus,
   masterVoiceEnvironmentId,
   reconcileMasterVoiceFocus,
+  newVoiceConversationSelection,
   resumeVoiceConversationSelection,
   type MasterVoiceFocus,
 } from "./masterVoiceState";
@@ -28,11 +30,13 @@ const conversation = (
   id: string,
   retention: VoiceConversationSummary["retention"],
   updatedAt: string,
+  lastCallAt: string | null = null,
 ): VoiceConversationSummary => ({
   conversationId: VoiceConversationId.make(id),
   retention,
   title: id,
   activeEpoch: 1,
+  lastCallAt,
   createdAt: "2026-07-10T00:00:00.000Z",
   updatedAt,
 });
@@ -56,9 +60,9 @@ describe("master voice state", () => {
   it("resumes the most recently active durable conversation by default", () => {
     expect(
       resumeVoiceConversationSelection([
-        conversation("older", "durable", "2026-07-10T00:00:00.000Z"),
+        conversation("older", "durable", "2026-07-13T00:00:00.000Z", "2026-07-10T00:00:00.000Z"),
         conversation("temporary", "ephemeral", "2026-07-12T00:00:00.000Z"),
-        conversation("latest", "durable", "2026-07-11T00:00:00.000Z"),
+        conversation("latest", "durable", "2026-07-11T00:00:00.000Z", "2026-07-11T00:00:00.000Z"),
       ]),
     ).toEqual({
       type: "continue",
@@ -67,12 +71,37 @@ describe("master voice state", () => {
     });
   });
 
+  it("falls back to creation time when no call has started", () => {
+    expect(
+      resumeVoiceConversationSelection([
+        conversation("older", "durable", "2026-07-13T00:00:00.000Z"),
+        {
+          ...conversation("newer", "durable", "2026-07-11T00:00:00.000Z"),
+          createdAt: "2026-07-11T00:00:00.000Z",
+        },
+      ]),
+    ).toMatchObject({ conversationId: VoiceConversationId.make("newer") });
+  });
+
   it("creates the first durable conversation when there is nothing to resume", () => {
     expect(
       resumeVoiceConversationSelection([
         conversation("temporary", "ephemeral", "2026-07-12T00:00:00.000Z"),
       ]),
     ).toEqual({ type: "new", retention: "durable", title: "T3 Voice" });
+  });
+
+  it("keeps explicit new and resume selections distinct", () => {
+    expect(newVoiceConversationSelection()).toEqual({
+      type: "new",
+      retention: "durable",
+      title: "T3 Voice",
+    });
+    expect(continueVoiceConversationSelection(VoiceConversationId.make("selected"))).toEqual({
+      type: "continue",
+      conversationId: VoiceConversationId.make("selected"),
+      takeover: false,
+    });
   });
 
   it("compares focus by environment, project, and thread identity", () => {

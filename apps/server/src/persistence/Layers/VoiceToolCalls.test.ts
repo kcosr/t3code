@@ -39,6 +39,7 @@ layer("VoiceToolCallRepository", (it) => {
 
       const request = {
         conversationId,
+        contextEpoch: 1,
         toolCallId,
         providerFunctionCallId: "provider-call-one",
         toolName: "archive_thread",
@@ -56,6 +57,7 @@ layer("VoiceToolCallRepository", (it) => {
       const commandId = CommandId.make(`voice:${conversationId}:${toolCallId}`);
       const pending = yield* calls.markPending({
         conversationId,
+        contextEpoch: 1,
         toolCallId,
         sessionId,
         confirmationId,
@@ -71,6 +73,7 @@ layer("VoiceToolCallRepository", (it) => {
 
       const terminal = yield* calls.markTerminal({
         conversationId,
+        contextEpoch: 1,
         toolCallId,
         status: "succeeded",
         resultOutput: '{"sequence":42}',
@@ -81,6 +84,7 @@ layer("VoiceToolCallRepository", (it) => {
 
       const ignoredReplay = yield* calls.markTerminal({
         conversationId,
+        contextEpoch: 1,
         toolCallId,
         status: "failed",
         resultOutput: '{"error":"late"}',
@@ -105,6 +109,7 @@ layer("VoiceToolCallRepository", (it) => {
       });
       yield* calls.createRequested({
         conversationId,
+        contextEpoch: 1,
         toolCallId,
         providerFunctionCallId: "provider-call-cascade",
         toolName: "list_projects",
@@ -114,6 +119,43 @@ layer("VoiceToolCallRepository", (it) => {
       });
       yield* conversations.delete({ conversationId });
       assert.isTrue(Option.isNone(yield* calls.get({ conversationId, toolCallId })));
+    }),
+  );
+
+  it.effect("terminalizes nonterminal calls owned by a discarded session", () =>
+    Effect.gen(function* () {
+      const conversations = yield* VoiceConversationRepository;
+      const calls = yield* VoiceToolCallRepository;
+      const conversationId = VoiceConversationId.make("conversation-tool-discard");
+      const sessionId = VoiceSessionId.make("session-discard");
+      const toolCallId = VoiceToolCallId.make("tool-call-discard");
+      yield* conversations.create({
+        conversationId,
+        retention: "durable",
+        title: null,
+        createdAt: "2026-07-10T12:02:00.000Z",
+      });
+      yield* calls.createRequested({
+        conversationId,
+        contextEpoch: 1,
+        toolCallId,
+        providerFunctionCallId: "provider-call-discard",
+        toolName: "archive_thread",
+        canonicalArgumentsJson: "{}",
+        sessionId,
+        createdAt: "2026-07-10T12:02:01.000Z",
+      });
+
+      yield* calls.terminalizeSession({
+        sessionId,
+        resultOutput: '{"error":"session ended"}',
+        updatedAt: "2026-07-10T12:02:02.000Z",
+      });
+
+      const discarded = Option.getOrThrow(yield* calls.get({ conversationId, toolCallId }));
+      assert.strictEqual(discarded.status, "failed");
+      assert.strictEqual(discarded.resultOutput, '{"error":"session ended"}');
+      assert.strictEqual(discarded.contextEpoch, 1);
     }),
   );
 });

@@ -1,6 +1,7 @@
 import {
   CommandId,
   IsoDateTime,
+  PositiveInt,
   TrimmedNonEmptyString,
   VoiceConfirmationId,
   VoiceConversationId,
@@ -26,6 +27,7 @@ export type VoiceToolCallStatus = typeof VoiceToolCallStatus.Type;
 
 export const DurableVoiceToolCall = Schema.Struct({
   conversationId: VoiceConversationId,
+  contextEpoch: PositiveInt,
   toolCallId: VoiceToolCallId,
   providerFunctionCallId: TrimmedNonEmptyString,
   toolName: TrimmedNonEmptyString,
@@ -48,6 +50,7 @@ export type VoiceToolCallRepositoryError = PersistenceSqlError | PersistenceDeco
 export interface VoiceToolCallRepositoryShape {
   readonly createRequested: (input: {
     readonly conversationId: VoiceConversationId;
+    readonly contextEpoch: number;
     readonly toolCallId: VoiceToolCallId;
     readonly providerFunctionCallId: string;
     readonly toolName: string;
@@ -67,6 +70,7 @@ export interface VoiceToolCallRepositoryShape {
   ) => Effect.Effect<Option.Option<DurableVoiceToolCall>, VoiceToolCallRepositoryError>;
   readonly markPending: (input: {
     readonly conversationId: VoiceConversationId;
+    readonly contextEpoch: number;
     readonly toolCallId: VoiceToolCallId;
     readonly sessionId: VoiceSessionId;
     readonly confirmationId: VoiceConfirmationId;
@@ -78,11 +82,17 @@ export interface VoiceToolCallRepositoryShape {
   }) => Effect.Effect<DurableVoiceToolCall, VoiceToolCallRepositoryError>;
   readonly markTerminal: (input: {
     readonly conversationId: VoiceConversationId;
+    readonly contextEpoch: number;
     readonly toolCallId: VoiceToolCallId;
     readonly status: Extract<VoiceToolCallStatus, "succeeded" | "failed" | "rejected" | "expired">;
     readonly resultOutput: string;
     readonly updatedAt: string;
   }) => Effect.Effect<DurableVoiceToolCall, VoiceToolCallRepositoryError>;
+  readonly terminalizeSession: (input: {
+    readonly sessionId: VoiceSessionId;
+    readonly resultOutput: string;
+    readonly updatedAt: string;
+  }) => Effect.Effect<void, VoiceToolCallRepositoryError>;
 }
 
 export class VoiceToolCallRepository extends Context.Service<

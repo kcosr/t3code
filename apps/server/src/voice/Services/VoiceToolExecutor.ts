@@ -15,6 +15,7 @@ import type { VoiceError } from "../Errors.ts";
 export interface VoiceToolCallInput {
   readonly sessionId: VoiceSessionId;
   readonly conversationId: VoiceConversationId;
+  readonly contextEpoch: number;
   readonly toolCallId: VoiceToolCallId;
   readonly providerFunctionCallId: string;
   readonly name: string;

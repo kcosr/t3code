@@ -56,9 +56,15 @@ import {
   VoiceCredentialSetInput,
   VoiceCredentialStatus,
   VoiceConversationClearContextResult,
+  VoiceConversationClearContextInput,
   VoiceConversationCreateInput,
   VoiceConversationDeleteResult,
+  VoiceConversationListPage,
+  VoiceConversationListQuery,
   VoiceConversationSummary,
+  VoiceConversationTranscriptPage,
+  VoiceConversationTranscriptQuery,
+  VoiceConversationUpdateInput,
   VoiceMediaTicket,
   VoiceMediaTicketRequest,
   VoicePublicErrorReason,
@@ -634,8 +640,9 @@ export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
   .add(
     HttpApiEndpoint.get("listConversations", "/api/voice/conversations", {
       headers: OptionalBearerHeaders,
-      success: Schema.Array(VoiceConversationSummary),
-      error: EnvironmentScopedOperationErrors,
+      query: VoiceConversationListQuery,
+      success: VoiceConversationListPage,
+      error: [...EnvironmentScopedOperationErrors, EnvironmentVoiceOperationError],
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
@@ -649,6 +656,37 @@ export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
         EnvironmentInternalError,
       ],
     }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.patch("updateConversation", "/api/voice/conversations/:conversationId", {
+      headers: OptionalBearerHeaders,
+      params: Schema.Struct({ conversationId: VoiceConversationId }),
+      payload: VoiceConversationUpdateInput,
+      success: VoiceConversationSummary,
+      error: [
+        EnvironmentScopeRequiredError,
+        EnvironmentResourceNotFoundError,
+        EnvironmentVoiceOperationError,
+        EnvironmentInternalError,
+      ],
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get(
+      "getConversationTranscript",
+      "/api/voice/conversations/:conversationId/transcript",
+      {
+        headers: OptionalBearerHeaders,
+        params: Schema.Struct({ conversationId: VoiceConversationId }),
+        query: VoiceConversationTranscriptQuery,
+        success: VoiceConversationTranscriptPage,
+        error: [
+          ...EnvironmentScopedOperationErrors,
+          EnvironmentResourceNotFoundError,
+          EnvironmentVoiceOperationError,
+        ],
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
     HttpApiEndpoint.delete("deleteConversation", "/api/voice/conversations/:conversationId", {
@@ -665,10 +703,12 @@ export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
       {
         headers: OptionalBearerHeaders,
         params: Schema.Struct({ conversationId: VoiceConversationId }),
+        payload: VoiceConversationClearContextInput,
         success: VoiceConversationClearContextResult,
         error: [
           EnvironmentScopeRequiredError,
           EnvironmentResourceNotFoundError,
+          EnvironmentVoiceOperationError,
           EnvironmentInternalError,
         ],
       },

@@ -12,6 +12,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
   VoiceConfirmationId,
+  VoiceConversationEntryId,
   VoiceToolCallId,
   VoiceToolName,
   type OrchestrationProjectShell,
@@ -127,6 +128,7 @@ interface PendingCall {
   readonly type: "pending";
   readonly sessionId: VoiceSessionId;
   readonly conversationId: VoiceConversationId;
+  readonly contextEpoch: number;
   readonly toolCallId: VoiceToolCallId;
   readonly providerFunctionCallId: string;
   readonly confirmationId: VoiceConfirmationId;
@@ -281,8 +283,11 @@ const make = Effect.gen(function* () {
     const canonicalArgumentsJson =
       outcome === "requested" ? yield* canonicalizeArguments(input.argumentsJson) : undefined;
     return yield* conversations.appendContextIdempotent({
-      entryId: `voice-tool:${input.conversationId}:${input.toolCallId}:${outcome}`,
+      entryId: VoiceConversationEntryId.make(
+        `voice-tool:${input.conversationId}:${input.toolCallId}:${outcome}`,
+      ),
       conversationId: input.conversationId,
+      expectedEpoch: input.contextEpoch,
       kind: outcome === "requested" ? "tool-request" : "tool-result",
       payload:
         outcome === "requested"
@@ -638,6 +643,8 @@ const make = Effect.gen(function* () {
       const canonicalArgumentsJson = yield* canonicalizeArguments(input.argumentsJson);
       if (
         call.providerFunctionCallId !== input.providerFunctionCallId ||
+        call.sessionId !== input.sessionId ||
+        call.contextEpoch !== input.contextEpoch ||
         call.toolName !== input.name ||
         call.canonicalArgumentsJson !== canonicalArgumentsJson
       ) {
@@ -703,6 +710,7 @@ const make = Effect.gen(function* () {
         type: "pending",
         sessionId: call.sessionId,
         conversationId: call.conversationId,
+        contextEpoch: call.contextEpoch,
         toolCallId: call.toolCallId,
         providerFunctionCallId: call.providerFunctionCallId,
         confirmationId: call.confirmationId,
@@ -737,6 +745,7 @@ const make = Effect.gen(function* () {
               : toolCalls
                   .markTerminal({
                     conversationId: input.conversationId,
+                    contextEpoch: input.contextEpoch,
                     toolCallId: input.toolCallId,
                     status: result.outcome,
                     resultOutput: result.output,
@@ -782,11 +791,21 @@ const make = Effect.gen(function* () {
           }),
         ),
       );
+      if (conversation.activeEpoch !== input.contextEpoch) {
+        return yield* Effect.fail(
+          voiceError(
+            "invalid-phase",
+            "tool.context-epoch",
+            "Voice tool call belongs to an inactive conversation context",
+          ),
+        );
+      }
       const claimed =
         conversation.retention === "durable"
           ? yield* toolCalls
               .createRequested({
                 conversationId: input.conversationId,
+                contextEpoch: input.contextEpoch,
                 toolCallId: input.toolCallId,
                 providerFunctionCallId: input.providerFunctionCallId,
                 toolName: input.name,
@@ -799,6 +818,7 @@ const make = Effect.gen(function* () {
               created: true,
               call: {
                 conversationId: input.conversationId,
+                contextEpoch: input.contextEpoch,
                 toolCallId: input.toolCallId,
                 providerFunctionCallId: input.providerFunctionCallId,
                 toolName: input.name,
@@ -985,6 +1005,7 @@ const make = Effect.gen(function* () {
             type: "pending",
             sessionId: input.sessionId,
             conversationId: input.conversationId,
+            contextEpoch: input.contextEpoch,
             toolCallId: input.toolCallId,
             providerFunctionCallId: input.providerFunctionCallId,
             confirmationId,
@@ -999,6 +1020,7 @@ const make = Effect.gen(function* () {
             yield* toolCalls
               .markPending({
                 conversationId: input.conversationId,
+                contextEpoch: input.contextEpoch,
                 toolCallId: input.toolCallId,
                 sessionId: input.sessionId,
                 confirmationId,
@@ -1122,6 +1144,7 @@ const make = Effect.gen(function* () {
           const toolInput: VoiceToolCallInput = {
             sessionId: pending.sessionId,
             conversationId: pending.conversationId,
+            contextEpoch: pending.contextEpoch,
             toolCallId: pending.toolCallId,
             providerFunctionCallId: pending.providerFunctionCallId,
             name: pending.tool,
@@ -1189,6 +1212,7 @@ const make = Effect.gen(function* () {
         const toolInput: VoiceToolCallInput = {
           sessionId: pending.sessionId,
           conversationId: pending.conversationId,
+          contextEpoch: pending.contextEpoch,
           toolCallId: pending.toolCallId,
           providerFunctionCallId: pending.providerFunctionCallId,
           name: pending.tool,
@@ -1224,14 +1248,31 @@ const make = Effect.gen(function* () {
   );
 
   const discardSession: VoiceToolExecutorShape["discardSession"] = (sessionId) =>
-    SynchronizedRef.update(state, (current) => {
-      const calls = new Map(
-        [...current.calls.entries()].filter(([, call]) => call.sessionId !== sessionId),
-      );
-      const confirmations = new Map(
-        [...current.confirmations.entries()].filter(([, key]) => calls.has(key)),
-      );
-      return { calls, confirmations };
+    Effect.gen(function* () {
+      const updatedAt = yield* nowIso;
+      yield* toolCalls
+        .terminalizeSession({
+          sessionId,
+          resultOutput: jsonOutput({ error: "Voice session ended before the tool completed" }),
+          updatedAt,
+        })
+        .pipe(
+          persistenceFailure("tool.terminalize-session"),
+          Effect.catch((error) =>
+            Effect.logWarning("Failed to terminalize durable voice tool calls").pipe(
+              Effect.annotateLogs({ sessionId, reason: error.reason }),
+            ),
+          ),
+        );
+      yield* SynchronizedRef.update(state, (current) => {
+        const calls = new Map(
+          [...current.calls.entries()].filter(([, call]) => call.sessionId !== sessionId),
+        );
+        const confirmations = new Map(
+          [...current.confirmations.entries()].filter(([, key]) => calls.has(key)),
+        );
+        return { calls, confirmations };
+      });
     });
 
   return VoiceToolExecutor.of({ invoke, decide, expire, discardSession });

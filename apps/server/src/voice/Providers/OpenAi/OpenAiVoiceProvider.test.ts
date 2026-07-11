@@ -20,6 +20,47 @@ import { __testing } from "./OpenAiVoiceProvider.ts";
 const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
 
+it("normalizes stable semantic transcript identities and rejects unidentified finals", () => {
+  const parse = (value: unknown) =>
+    __testing.parseRealtimeEvent({ type: "message", data: encodeJson(value) });
+
+  const assistant = {
+    type: "response.output_audio_transcript.done",
+    event_id: "envelope-one",
+    response_id: "response-one",
+    item_id: "assistant-item-one",
+    output_index: 0,
+    content_index: 1,
+    transcript: "Done.",
+  };
+  expect(parse(assistant)).toEqual([
+    {
+      type: "transcript",
+      role: "assistant",
+      text: "Done.",
+      final: true,
+      sourceId: "output:assistant-item-one:1",
+    },
+  ]);
+  expect(parse({ ...assistant, event_id: "duplicate-envelope" })).toEqual(parse(assistant));
+  expect(
+    parse({
+      type: "conversation.item.input_audio_transcription.completed",
+      transcript: "No identity",
+    }),
+  ).toEqual([
+    {
+      type: "error",
+      detail: "OpenAI sent a final input transcript without a stable identity",
+      recoverable: false,
+    },
+  ]);
+  expect(
+    parse({ type: "conversation.item.input_audio_transcription.completed", transcript: "" }),
+  ).toEqual([]);
+  expect(parse({ type: "response.output_audio_transcript.done", transcript: "" })).toEqual([]);
+});
+
 const credentialStore = (key: Option.Option<string>) =>
   VoiceCredentialStore.of({
     status: Effect.succeed({ configured: Option.isSome(key), updatedAt: null }),
@@ -250,6 +291,8 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
                 type: "message",
                 data: encodeJson({
                   type: "conversation.item.input_audio_transcription.completed",
+                  item_id: "input-item-1",
+                  content_index: 0,
                   transcript: "show my threads",
                 }),
               },
@@ -368,7 +411,13 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       },
     ]);
     expect(events).toEqual([
-      { type: "transcript", role: "user", text: "show my threads", final: true },
+      {
+        type: "transcript",
+        role: "user",
+        text: "show my threads",
+        final: true,
+        sourceId: "input:input-item-1:0",
+      },
       {
         type: "function-call",
         providerFunctionCallId: "call_tools_1",

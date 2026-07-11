@@ -11,6 +11,7 @@ import { VoiceError } from "../Errors.ts";
 
 export interface VoiceSessionLease {
   readonly conversationId: VoiceConversationId;
+  readonly contextEpoch: number;
   readonly sessionId: VoiceSessionId;
   readonly ownerAuthSessionId: AuthSessionId;
   readonly generation: number;
@@ -24,6 +25,7 @@ export interface VoiceSessionAcquireResult {
 export interface VoiceSessionRegistryShape {
   readonly acquire: (input: {
     readonly conversationId: VoiceConversationId;
+    readonly contextEpoch: number;
     readonly ownerAuthSessionId: AuthSessionId;
     readonly takeover: boolean;
   }) => Effect.Effect<VoiceSessionAcquireResult, VoiceError>;
@@ -73,6 +75,7 @@ const make = Effect.gen(function* () {
         const generation = (current.generations.get(input.conversationId) ?? 0) + 1;
         const lease: VoiceSessionLease = {
           conversationId: input.conversationId,
+          contextEpoch: input.contextEpoch,
           sessionId,
           ownerAuthSessionId: input.ownerAuthSessionId,
           generation,
@@ -104,14 +107,22 @@ const make = Effect.gen(function* () {
     SynchronizedRef.get(state).pipe(
       Effect.map((current) => {
         const active = current.byConversation.get(lease.conversationId);
-        return active?.sessionId === lease.sessionId && active.generation === lease.generation;
+        return (
+          active?.sessionId === lease.sessionId &&
+          active.generation === lease.generation &&
+          active.contextEpoch === lease.contextEpoch
+        );
       }),
     );
 
   const release: VoiceSessionRegistryShape["release"] = (lease) =>
     SynchronizedRef.modify(state, (current) => {
       const active = current.byConversation.get(lease.conversationId);
-      if (active?.sessionId !== lease.sessionId || active.generation !== lease.generation) {
+      if (
+        active?.sessionId !== lease.sessionId ||
+        active.generation !== lease.generation ||
+        active.contextEpoch !== lease.contextEpoch
+      ) {
         return [false, current] as const;
       }
       const byConversation = new Map(current.byConversation);

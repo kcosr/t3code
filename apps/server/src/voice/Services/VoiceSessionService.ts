@@ -68,6 +68,8 @@ export interface VoiceSessionServiceShape {
   ) => Effect.Effect<boolean, VoiceError>;
   readonly clearConversationContext: (
     conversationId: VoiceConversationId,
+    expectedEpoch: number,
+    idempotencyKey: string,
   ) => Effect.Effect<VoiceConversationClearContextResult, VoiceError>;
   readonly confirm: (
     ownerAuthSessionId: AuthSessionId,

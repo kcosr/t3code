@@ -10,6 +10,7 @@ import {
   ThreadId,
   TurnId,
   VoiceConversationId,
+  VoiceConversationEntryId,
   VoiceSessionId,
   VoiceToolCallId,
   type AuthEnvironmentScope,
@@ -272,7 +273,7 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
   } as unknown as ProjectionTurnStartRepository["Service"];
   const conversations = VoiceConversationService.of({
     create: () => Effect.die("unused"),
-    listDurable: Effect.die("unused"),
+    listDurable: () => Effect.die("unused"),
     get: () =>
       Effect.succeed(
         Option.some({
@@ -280,17 +281,21 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
           retention,
           title: null,
           activeEpoch: 1,
+          lastCallAt: null,
           createdAt: now,
           updatedAt: now,
         }),
       ),
+    updateTitle: () => Effect.die("unused"),
+    markCallStarted: () => Effect.die("unused"),
     delete: () => Effect.die("unused"),
     clearContext: () => Effect.die("unused"),
+    listTranscript: () => Effect.die("unused"),
     listContext: () => Effect.die("unused"),
     appendContext: (entry) =>
       Ref.update(journal, (all) => [...all, entry]).pipe(
         Effect.as({
-          entryId: `entry-${entry.kind}`,
+          entryId: VoiceConversationEntryId.make(`entry-${entry.kind}`),
           conversationId,
           epoch: 1,
           sequence: 1,
@@ -393,6 +398,25 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
         };
         return [call, new Map(calls).set(key, call)] as const;
       }),
+    terminalizeSession: (input) =>
+      Ref.update(
+        durableCalls,
+        (calls) =>
+          new Map(
+            [...calls.entries()].map(([key, call]) => [
+              key,
+              call.sessionId === input.sessionId &&
+              (call.status === "requested" || call.status === "pending-confirmation")
+                ? {
+                    ...call,
+                    status: "failed" as const,
+                    resultOutput: input.resultOutput,
+                    updatedAt: input.updatedAt,
+                  }
+                : call,
+            ]),
+          ),
+      ),
   });
   const dependencies = Layer.mergeAll(
     Layer.succeed(ProjectionSnapshotQuery, query),
@@ -430,6 +454,7 @@ const call = (
 ) => ({
   sessionId,
   conversationId,
+  contextEpoch: 1,
   toolCallId: VoiceToolCallId.make(id),
   providerFunctionCallId: id,
   name,
@@ -1512,6 +1537,25 @@ it.effect("rejects without dispatch and expires pending calls exactly once", () 
   }),
 );
 
+it.effect("terminalizes durable pending calls when their voice session is discarded", () =>
+  Effect.gen(function* () {
+    const test = yield* makeTest();
+    yield* Effect.gen(function* () {
+      const tools = yield* VoiceToolExecutor;
+      const pending = yield* tools.invoke(
+        call("archive_thread", encodeJson({ threadId }), "discard-call"),
+      );
+      expect(pending.type).toBe("confirmation-required");
+
+      yield* tools.discardSession(sessionId);
+
+      const durable = (yield* Ref.get(test.durableCalls)).get(`${conversationId}:discard-call`);
+      expect(durable?.status).toBe("failed");
+      expect(durable?.contextEpoch).toBe(1);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
 it.effect("survives executor restart and reuses the deterministic orchestration command", () =>
   Effect.gen(function* () {
     const test = yield* makeTest();
@@ -1561,6 +1605,13 @@ it.effect("canonicalizes arguments and rejects changed reuse of a durable tool-c
         .invoke(call("list_projects", '{"limit":11}', "canonical-call"))
         .pipe(Effect.flip);
       expect(conflict.operation).toBe("tool.idempotency");
+      yield* Ref.update(test.durableCalls, (calls) => {
+        const key = `${conversationId}:canonical-call`;
+        const durable = calls.get(key)!;
+        return new Map(calls).set(key, { ...durable, contextEpoch: 2 });
+      });
+      const epochConflict = yield* tools.invoke(first).pipe(Effect.flip);
+      expect(epochConflict.operation).toBe("tool.idempotency");
     }).pipe(Effect.provide(test.layer));
   }),
 );

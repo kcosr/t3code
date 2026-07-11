@@ -149,8 +149,15 @@ Keel review turns may be slow and are not interrupted unless the user requests i
 
 - Public transcript DTOs never expose raw journal payloads, provider IDs, tool arguments, SDP, or
   internal errors.
+- Public transcript reads use a sanitized projection maintained transactionally with the journal;
+  arbitrary journal payloads are never decoded directly into the public response.
 - Normal transcript browsing is bounded and has explicit epoch semantics. Clear Context must not
   accidentally make old entries model-visible again.
+- Transcript browsing spans prior epochs, while provider context compilation remains restricted to
+  the active epoch. Clear requests carry an expected epoch and idempotency key.
+- Every provider transcript and tool journal write is bound to the context epoch captured when its
+  session lease was acquired. A late event from a cleared lease fails rather than entering the new
+  epoch.
 - Clearing or deleting an active conversation terminates its active lease safely.
 
 ### Acceptance
@@ -159,6 +166,7 @@ Keel review turns may be slow and are not interrupted unless the user requests i
 - Paging remains stable while new entries are appended.
 - Rename persists across restart and updates list ordering.
 - Clear and Delete both end and fence active provider/native media.
+- Retried Clear requests advance the epoch at most once, and stale lease writes are rejected.
 - Pre-clear transcript remains inspectable across bounded transcript pages while being excluded
   from future model replay.
 - Schema/redaction tests prove raw unknown journal payloads and provider/tool internals cannot cross

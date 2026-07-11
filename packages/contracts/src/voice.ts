@@ -8,6 +8,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
   VoiceConfirmationId,
+  VoiceConversationEntryId,
   VoiceConversationId,
   VoiceMediaTicketId,
   VoicePlaybackId,
@@ -75,21 +76,101 @@ export type VoiceCredentialSetInput = typeof VoiceCredentialSetInput.Type;
 export const VoiceConversationRetention = Schema.Literals(["ephemeral", "durable"]);
 export type VoiceConversationRetention = typeof VoiceConversationRetention.Type;
 
+export const VOICE_CONVERSATION_TITLE_MAX_CHARS = 256;
+export const VOICE_CONVERSATION_LIST_CURSOR_MAX_CHARS = 2_048;
+export const VOICE_CONVERSATION_LIST_PAGE_MAX_ENTRIES = 50;
+export const VOICE_CONVERSATION_TRANSCRIPT_CURSOR_MAX_CHARS = 2_048;
+export const VOICE_CONVERSATION_TRANSCRIPT_ENTRY_MAX_CHARS = 16_000;
+export const VOICE_CONVERSATION_TRANSCRIPT_PAGE_MAX_ENTRIES = 50;
+
+const VoiceConversationTitle = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(VOICE_CONVERSATION_TITLE_MAX_CHARS),
+);
+
 export const VoiceConversationSummary = Schema.Struct({
   conversationId: VoiceConversationId,
   retention: VoiceConversationRetention,
-  title: Schema.NullOr(TrimmedNonEmptyString),
+  title: Schema.NullOr(VoiceConversationTitle),
   activeEpoch: PositiveInt,
+  lastCallAt: Schema.NullOr(IsoDateTime),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
 export type VoiceConversationSummary = typeof VoiceConversationSummary.Type;
 
+export const VoiceConversationListQuery = Schema.Struct({
+  cursor: Schema.optionalKey(
+    TrimmedNonEmptyString.check(Schema.isMaxLength(VOICE_CONVERSATION_LIST_CURSOR_MAX_CHARS)),
+  ),
+  limit: Schema.optionalKey(
+    Schema.Int.check(
+      Schema.isBetween({ minimum: 1, maximum: VOICE_CONVERSATION_LIST_PAGE_MAX_ENTRIES }),
+    ),
+  ),
+});
+export type VoiceConversationListQuery = typeof VoiceConversationListQuery.Type;
+
+export const VoiceConversationListPage = Schema.Struct({
+  conversations: Schema.Array(VoiceConversationSummary).check(
+    Schema.isMaxLength(VOICE_CONVERSATION_LIST_PAGE_MAX_ENTRIES),
+  ),
+  nextCursor: Schema.NullOr(
+    TrimmedNonEmptyString.check(Schema.isMaxLength(VOICE_CONVERSATION_LIST_CURSOR_MAX_CHARS)),
+  ),
+});
+export type VoiceConversationListPage = typeof VoiceConversationListPage.Type;
+
 export const VoiceConversationCreateInput = Schema.Struct({
   retention: VoiceConversationRetention,
-  title: Schema.optionalKey(TrimmedNonEmptyString),
+  title: Schema.optionalKey(VoiceConversationTitle),
 });
 export type VoiceConversationCreateInput = typeof VoiceConversationCreateInput.Type;
+
+export const VoiceConversationUpdateInput = Schema.Struct({
+  title: Schema.NullOr(VoiceConversationTitle),
+});
+export type VoiceConversationUpdateInput = typeof VoiceConversationUpdateInput.Type;
+
+export const VoiceConversationTranscriptQuery = Schema.Struct({
+  cursor: Schema.optionalKey(
+    TrimmedNonEmptyString.check(Schema.isMaxLength(VOICE_CONVERSATION_TRANSCRIPT_CURSOR_MAX_CHARS)),
+  ),
+  limit: Schema.optionalKey(
+    Schema.Int.check(
+      Schema.isBetween({ minimum: 1, maximum: VOICE_CONVERSATION_TRANSCRIPT_PAGE_MAX_ENTRIES }),
+    ),
+  ),
+});
+export type VoiceConversationTranscriptQuery = typeof VoiceConversationTranscriptQuery.Type;
+
+export const VoiceConversationTranscriptEntry = Schema.Struct({
+  entryId: VoiceConversationEntryId,
+  contextEpoch: PositiveInt,
+  sequence: PositiveInt,
+  role: Schema.Literals(["user", "assistant"]),
+  text: Schema.String.check(Schema.isMaxLength(VOICE_CONVERSATION_TRANSCRIPT_ENTRY_MAX_CHARS)),
+  truncated: Schema.Boolean,
+  occurredAt: IsoDateTime,
+});
+export type VoiceConversationTranscriptEntry = typeof VoiceConversationTranscriptEntry.Type;
+
+export const VoiceConversationTranscriptPage = Schema.Struct({
+  conversationId: VoiceConversationId,
+  activeContextEpoch: PositiveInt,
+  entries: Schema.Array(VoiceConversationTranscriptEntry).check(
+    Schema.isMaxLength(VOICE_CONVERSATION_TRANSCRIPT_PAGE_MAX_ENTRIES),
+  ),
+  nextCursor: Schema.NullOr(
+    TrimmedNonEmptyString.check(Schema.isMaxLength(VOICE_CONVERSATION_TRANSCRIPT_CURSOR_MAX_CHARS)),
+  ),
+});
+export type VoiceConversationTranscriptPage = typeof VoiceConversationTranscriptPage.Type;
+
+export const VoiceConversationClearContextInput = Schema.Struct({
+  expectedEpoch: PositiveInt,
+  idempotencyKey: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+});
+export type VoiceConversationClearContextInput = typeof VoiceConversationClearContextInput.Type;
 
 export const VoiceConversationClearContextResult = Schema.Struct({
   conversationId: VoiceConversationId,

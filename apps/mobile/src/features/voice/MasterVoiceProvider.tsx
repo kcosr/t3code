@@ -1,10 +1,12 @@
-import type {
-  EnvironmentId,
-  VoiceConfirmationId,
-  VoiceConversationSelection,
-  VoiceConversationSummary,
-  VoiceSessionCreateInput,
-  VoiceSessionEvent,
+import {
+  VOICE_CONVERSATION_LIST_PAGE_MAX_ENTRIES,
+  type EnvironmentId,
+  type VoiceConfirmationId,
+  type VoiceConversationId,
+  type VoiceConversationSelection,
+  type VoiceConversationSummary,
+  type VoiceSessionCreateInput,
+  type VoiceSessionEvent,
 } from "@t3tools/contracts";
 import type { VoiceHttpClient } from "@t3tools/client-runtime/voice";
 import type { T3VoiceAudioRoute } from "@t3tools/mobile-voice-native";
@@ -28,15 +30,17 @@ import { usePreparedConnection } from "../../state/session";
 import {
   MasterVoiceCallBar,
   VoiceAudioRoutePicker,
-  VoiceConversationPicker,
   VoiceTranscriptModal,
   type MasterVoiceTranscriptTurn,
   type VoiceAudioRoutePickerState,
 } from "./MasterVoiceOverlays";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
+import { VoiceConversationBrowser, type VoiceConversationClient } from "./VoiceConversationBrowser";
 import {
+  continueVoiceConversationSelection,
   durableVoiceConversations,
   masterVoiceEnvironmentId,
+  newVoiceConversationSelection,
   reconcileMasterVoiceFocus,
   resumeVoiceConversationSelection,
   type ActiveMasterVoiceAttachment,
@@ -60,6 +64,11 @@ interface MasterVoiceRuntime {
   readonly controller: RealtimeVoiceController;
 }
 
+interface VoiceConversationConnection {
+  readonly environmentId: EnvironmentId;
+  readonly client: VoiceHttpClient;
+}
+
 interface MasterVoiceContextValue {
   readonly phase: RealtimeVoiceControllerSnapshot["phase"];
 }
@@ -81,6 +90,38 @@ const errorReason = (cause: unknown): string | null =>
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
 
+const loadResumeSelection = async (
+  client: VoiceHttpClient,
+): Promise<VoiceConversationSelection> => {
+  const conversations: Array<VoiceConversationSummary> = [];
+  let cursor: string | undefined;
+  let shouldLoad = true;
+  do {
+    const page = await Effect.runPromise(
+      client.listConversations({
+        ...(cursor === undefined ? {} : { cursor }),
+        limit: VOICE_CONVERSATION_LIST_PAGE_MAX_ENTRIES,
+      }),
+    );
+    conversations.push(...page.conversations);
+    if (page.nextCursor === null) {
+      shouldLoad = false;
+      continue;
+    }
+
+    const best = durableVoiceConversations(conversations)[0];
+    const oldestUpdatedAt = page.conversations.at(-1)?.updatedAt;
+    if (
+      best !== undefined &&
+      oldestUpdatedAt !== undefined &&
+      (best.lastCallAt ?? best.createdAt).localeCompare(oldestUpdatedAt) >= 0
+    )
+      shouldLoad = false;
+    cursor = page.nextCursor;
+  } while (shouldLoad);
+  return resumeVoiceConversationSelection(conversations);
+};
+
 export function MasterVoiceProvider(props: {
   readonly children: ReactNode;
   readonly focus: MasterVoiceFocus | null;
@@ -89,8 +130,9 @@ export function MasterVoiceProvider(props: {
   const [snapshot, setSnapshot] = useState(INITIAL_SNAPSHOT);
   const [attachment, setAttachment] = useState<ActiveMasterVoiceAttachment | null>(null);
   const [availableEnvironmentId, setAvailableEnvironmentId] = useState<EnvironmentId | null>(null);
-  const [pickerConversations, setPickerConversations] =
-    useState<ReadonlyArray<VoiceConversationSummary> | null>(null);
+  const [conversationConnection, setConversationConnection] =
+    useState<VoiceConversationConnection | null>(null);
+  const [browserVisible, setBrowserVisible] = useState(false);
   const [audioRoutePicker, setAudioRoutePicker] = useState<VoiceAudioRoutePickerState | null>(null);
   const [transcriptVisible, setTranscriptVisible] = useState(false);
   const [resumePending, setResumePending] = useState(false);
@@ -109,6 +151,10 @@ export function MasterVoiceProvider(props: {
     props.focus,
   );
   const prepared = Option.getOrNull(usePreparedConnection(controllerEnvironmentId));
+  const conversationClient: VoiceConversationClient | null =
+    conversationConnection?.environmentId === controllerEnvironmentId
+      ? conversationConnection.client
+      : null;
 
   const handleSessionEvents = useCallback((events: ReadonlyArray<VoiceSessionEvent>) => {
     for (const event of events) {
@@ -142,11 +188,35 @@ export function MasterVoiceProvider(props: {
 
   useEffect(() => {
     let disposed = false;
-    setAvailableEnvironmentId(null);
-    if (controllerEnvironmentId === null || prepared === null || native === null) return;
+    setConversationConnection(null);
+    if (controllerEnvironmentId === null || prepared === null) return;
 
     void (async () => {
       const client = await makeMobileVoiceClient(prepared);
+      if (disposed) return;
+      setConversationConnection({ environmentId: controllerEnvironmentId, client });
+    })().catch(() => {
+      if (!disposed) setConversationConnection(null);
+    });
+
+    return () => {
+      disposed = true;
+      setConversationConnection(null);
+    };
+  }, [controllerEnvironmentId, prepared]);
+
+  useEffect(() => {
+    let disposed = false;
+    setAvailableEnvironmentId(null);
+    if (
+      controllerEnvironmentId === null ||
+      conversationConnection?.environmentId !== controllerEnvironmentId ||
+      native === null
+    )
+      return;
+
+    const client = conversationConnection.client;
+    void (async () => {
       const [capabilities, media] = await Promise.all([
         Effect.runPromise(client.capabilities()),
         native.getMediaCapabilitiesAsync(),
@@ -183,7 +253,7 @@ export function MasterVoiceProvider(props: {
       runtimeRef.current = null;
       void runtime.controller.dispose();
     };
-  }, [controllerEnvironmentId, handleSessionEvents, native, prepared]);
+  }, [controllerEnvironmentId, conversationConnection, handleSessionEvents, native]);
 
   useEffect(() => {
     const current = attachmentRef.current;
@@ -236,7 +306,6 @@ export function MasterVoiceProvider(props: {
       )
         return;
       startInFlightRef.current = true;
-      setPickerConversations(null);
       setTranscript([]);
       const sessionInput: VoiceSessionCreateInput = {
         mode: "realtime-agent",
@@ -276,6 +345,18 @@ export function MasterVoiceProvider(props: {
           );
           return;
         }
+        if (
+          conversation.type === "continue" &&
+          errorReason(cause) === "voice_conversation_not_found"
+        ) {
+          await runtime.controller.stop();
+          Alert.alert(
+            "Conversation no longer available",
+            "It may have been deleted on another device. The conversation list has been refreshed.",
+          );
+          setBrowserVisible(true);
+          return;
+        }
         Alert.alert("Voice conversation failed", errorMessage(cause));
       } finally {
         startInFlightRef.current = false;
@@ -296,8 +377,8 @@ export function MasterVoiceProvider(props: {
       return;
     resumeInFlightRef.current = true;
     setResumePending(true);
-    void Effect.runPromise(runtime.client.listConversations())
-      .then((conversations) => start(resumeVoiceConversationSelection(conversations)))
+    void loadResumeSelection(runtime.client)
+      .then(start)
       .catch((cause) => Alert.alert("Voice conversation unavailable", errorMessage(cause)))
       .finally(() => {
         resumeInFlightRef.current = false;
@@ -306,12 +387,22 @@ export function MasterVoiceProvider(props: {
   }, [props.focus, snapshot.phase, start]);
 
   const browseHistory = useCallback(() => {
-    const runtime = runtimeRef.current;
-    if (runtime === null || snapshot.phase !== "idle" || props.focus === null) return;
-    void Effect.runPromise(runtime.client.listConversations())
-      .then((conversations) => setPickerConversations(durableVoiceConversations(conversations)))
-      .catch((cause) => Alert.alert("Voice conversations unavailable", errorMessage(cause)));
-  }, [props.focus, snapshot.phase]);
+    if (conversationClient === null || snapshot.phase !== "idle" || props.focus === null) return;
+    setBrowserVisible(true);
+  }, [conversationClient, props.focus, snapshot.phase]);
+
+  const startNew = useCallback(() => {
+    if (snapshot.phase !== "idle") return;
+    void start(newVoiceConversationSelection());
+  }, [snapshot.phase, start]);
+
+  const resumeConversation = useCallback(
+    (conversationId: VoiceConversationId) => {
+      if (snapshot.phase !== "idle") return;
+      void start(continueVoiceConversationSelection(conversationId));
+    },
+    [snapshot.phase, start],
+  );
 
   const toggleMuted = useCallback(() => {
     const controller = runtimeRef.current?.controller;
@@ -427,7 +518,8 @@ export function MasterVoiceProvider(props: {
       <View className="flex-1">
         {props.children}
         <MasterVoiceCallBar
-          available={
+          historyAvailable={props.focus !== null && conversationClient !== null}
+          callAvailable={
             props.focus !== null &&
             availableEnvironmentId === props.focus.environmentId &&
             native !== null
@@ -451,17 +543,12 @@ export function MasterVoiceProvider(props: {
           }}
         />
       </View>
-      <VoiceConversationPicker
-        visible={pickerConversations !== null}
-        conversations={pickerConversations ?? []}
-        onCancel={() => setPickerConversations(null)}
-        onContinue={(conversation) =>
-          void start({
-            type: "continue",
-            conversationId: conversation.conversationId,
-            takeover: false,
-          })
-        }
+      <VoiceConversationBrowser
+        visible={browserVisible}
+        client={conversationClient}
+        onClose={() => setBrowserVisible(false)}
+        onNew={startNew}
+        onResume={resumeConversation}
       />
       <VoiceTranscriptModal
         visible={transcriptVisible}
