@@ -1,6 +1,7 @@
 import type { T3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 
 type PlaybackControl = Pick<T3VoiceNativeModule, "cancelPlaybackAsync" | "getStateAsync">;
+type RecordingControl = Pick<T3VoiceNativeModule, "cancelRecordingAsync" | "getStateAsync">;
 
 export interface TraditionalAudioTransitionLock {
   active: boolean;
@@ -31,6 +32,45 @@ export async function startDictationWithAudioHandoff(input: {
   const started = await input.startDictation();
   if (!started) input.resumePlayback();
   return started;
+}
+
+export async function interruptTraditionalAudioForRealtime(input: {
+  readonly cancelDictation: () => Promise<void>;
+  readonly interruptPlayback: () => Promise<boolean>;
+  readonly rollback: () => void;
+}): Promise<() => void> {
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    input.rollback();
+  };
+  try {
+    await input.cancelDictation();
+    if (!(await input.interruptPlayback())) {
+      throw new Error("Traditional voice playback could not be interrupted");
+    }
+    return release;
+  } catch (cause) {
+    release();
+    throw cause;
+  }
+}
+
+export async function releaseRecordingForRealtime(input: {
+  readonly native: RecordingControl;
+  readonly pendingStart: Promise<void> | null;
+  readonly pendingStop: Promise<void> | null;
+  readonly getRecordingId: () => string | null;
+}): Promise<void> {
+  await input.pendingStart;
+  await input.pendingStop;
+  const recordingId = input.getRecordingId();
+  if (recordingId !== null) await input.native.cancelRecordingAsync({ recordingId });
+  const state = await input.native.getStateAsync();
+  if (state.activeRecordingId !== null || state.phase === "recording") {
+    throw new Error("Traditional voice recording could not be interrupted");
+  }
 }
 
 export function dictationResumeTransition(

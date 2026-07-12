@@ -15,6 +15,7 @@ import { releasePlaybackForRecording } from "./traditionalAudioHandoff";
 import {
   initialThreadSpeechPlannerState,
   interruptThreadSpeech,
+  isThreadSpeechSuspended,
   planThreadSpeechToggle,
   restoreThreadSpeechPreference,
   setThreadSpeechEnabled,
@@ -68,6 +69,7 @@ export function useThreadSpeech(input: {
   const operationGenerationRef = useRef(0);
   const mountedRef = useRef(true);
   const suspendedForDictationRef = useRef(false);
+  const suspendedForRealtimeRef = useRef(false);
   const playbackStartRef = useRef<{
     readonly playbackId: string;
     readonly messageId: string;
@@ -371,7 +373,7 @@ export function useThreadSpeech(input: {
       plannerRef.current,
       input.latestAssistant,
       uuidv4,
-      suspendedForDictationRef.current,
+      isThreadSpeechSuspended(suspendedForDictationRef.current, suspendedForRealtimeRef.current),
     );
     plannerRef.current = result.state;
     enqueueActions(result.actions);
@@ -532,7 +534,7 @@ export function useThreadSpeech(input: {
       plannerRef.current,
       latestRef.current,
       uuidv4,
-      suspendedForDictationRef.current,
+      isThreadSpeechSuspended(suspendedForDictationRef.current, suspendedForRealtimeRef.current),
     );
     if (!result.enabled) {
       void disableImmediately(true).catch(() => undefined);
@@ -554,48 +556,66 @@ export function useThreadSpeech(input: {
   const resumeAfterDictation = useCallback(() => {
     if (!suspendedForDictationRef.current) return;
     suspendedForDictationRef.current = false;
+    if (suspendedForRealtimeRef.current) return;
     const result = updateThreadSpeech(plannerRef.current, latestRef.current, uuidv4);
     plannerRef.current = result.state;
     enqueueActions(result.actions);
   }, [enqueueActions]);
 
-  const interrupt = useCallback(async () => {
-    suspendedForDictationRef.current = true;
-    ++operationGenerationRef.current;
-    const pendingStart = playbackStartRef.current;
-    const playback = playbackRef.current;
-    playbackRef.current = null;
+  const resumeAfterRealtime = useCallback(() => {
+    if (!suspendedForRealtimeRef.current) return;
+    suspendedForRealtimeRef.current = false;
     plannerRef.current = interruptThreadSpeech(plannerRef.current, latestRef.current);
-    for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
-    setPlaying(false);
-    setError(null);
-    const cancellation = (async () => {
-      if (native === null) return;
-      const playbackId =
-        playback?.playbackId ??
-        pendingStart?.playbackId ??
-        (await native.getStateAsync()).activePlaybackId ??
-        undefined;
-      if (playbackId !== undefined) {
-        await releasePlaybackForRecording({
-          native,
-          playbackId,
-          ...(pendingStart === null ? {} : { pendingStart: pendingStart.promise }),
-        });
+  }, []);
+
+  const interruptPlayback = useCallback(
+    async (reason: "dictation" | "realtime") => {
+      if (reason === "dictation") suspendedForDictationRef.current = true;
+      if (reason === "realtime") suspendedForRealtimeRef.current = true;
+      ++operationGenerationRef.current;
+      const pendingStart = playbackStartRef.current;
+      const playback = playbackRef.current;
+      playbackRef.current = null;
+      plannerRef.current = interruptThreadSpeech(plannerRef.current, latestRef.current);
+      for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
+      setPlaying(false);
+      setError(null);
+      const cancellation = (async () => {
+        if (native === null) return;
+        const playbackId =
+          playback?.playbackId ??
+          pendingStart?.playbackId ??
+          (await native.getStateAsync()).activePlaybackId ??
+          undefined;
+        if (playbackId !== undefined) {
+          await releasePlaybackForRecording({
+            native,
+            playbackId,
+            ...(pendingStart === null ? {} : { pendingStart: pendingStart.promise }),
+          });
+        }
+      })();
+      actionChainRef.current = cancellation;
+      try {
+        await cancellation;
+        return true;
+      } catch (cause) {
+        if (mountedRef.current) {
+          setError(errorMessage(cause));
+          if (reason === "dictation") resumeAfterDictation();
+          if (reason === "realtime") resumeAfterRealtime();
+        }
+        return false;
       }
-    })();
-    actionChainRef.current = cancellation;
-    try {
-      await cancellation;
-      return true;
-    } catch (cause) {
-      if (mountedRef.current) {
-        setError(errorMessage(cause));
-        resumeAfterDictation();
-      }
-      return false;
-    }
-  }, [native, resumeAfterDictation]);
+    },
+    [native, resumeAfterDictation, resumeAfterRealtime],
+  );
+
+  const interrupt = useCallback(() => interruptPlayback("dictation"), [interruptPlayback]);
+  const interruptForRealtime = useCallback(
+    () => interruptPlayback("realtime"),
+    [interruptPlayback],
+  );
 
   const enable = useCallback(() => {
     if (plannerRef.current.enabled) return;
@@ -629,7 +649,9 @@ export function useThreadSpeech(input: {
     error,
     onToggle: toggle,
     interrupt,
+    interruptForRealtime,
     resumeAfterDictation,
+    resumeAfterRealtime,
     enable,
     lifecycleEvent,
     latestAssistant: input.latestAssistant,

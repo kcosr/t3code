@@ -18,6 +18,7 @@ const ANDROID_SYMBOL_BY_SF_SYMBOL = {
   "speaker.wave.2.fill": "volume_up",
   "stop.fill": "stop",
   "tray.and.arrow.up": "upload",
+  waveform: "graphic_eq",
   "waveform.circle.fill": "graphic_eq",
   xmark: "close",
 } satisfies Partial<Record<SFSymbol, AndroidSymbol>>;

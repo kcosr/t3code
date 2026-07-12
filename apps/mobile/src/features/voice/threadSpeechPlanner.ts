@@ -40,6 +40,9 @@ export const initialThreadSpeechPlannerState = (): ThreadSpeechPlannerState => (
   active: null,
 });
 
+export const isThreadSpeechSuspended = (dictation: boolean, realtime: boolean): boolean =>
+  dictation || realtime;
+
 export const restoreThreadSpeechPreference = (
   state: ThreadSpeechPlannerState,
   enabled: boolean,

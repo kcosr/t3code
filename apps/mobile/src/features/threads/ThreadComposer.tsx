@@ -70,6 +70,7 @@ import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerComm
 import { useComposerDictation } from "../voice/useComposerDictation";
 import {
   dictationResumeTransition,
+  interruptTraditionalAudioForRealtime,
   runExclusiveTraditionalAudioTransition,
   startDictationWithAudioHandoff,
 } from "../voice/traditionalAudioHandoff";
@@ -177,7 +178,9 @@ export interface ThreadComposerProps {
     readonly error: string | null;
     readonly onToggle: () => void;
     readonly interrupt: () => Promise<boolean>;
+    readonly interruptForRealtime: () => Promise<boolean>;
     readonly resumeAfterDictation: () => void;
+    readonly resumeAfterRealtime: () => void;
     readonly enable: () => void;
     readonly lifecycleEvent: import("../voice/useThreadSpeech").ThreadSpeechLifecycleEvent | null;
     readonly latestAssistant: {
@@ -416,13 +419,35 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     if (transition.resume) props.speechPlayback.resumeAfterDictation();
   }, [dictation.phase, props.speechPlayback.resumeAfterDictation]);
 
+  useEffect(() => {
+    if (realtimeVoice.phase === "idle" || realtimeVoice.phase === "error") {
+      props.speechPlayback.resumeAfterRealtime();
+    }
+  }, [props.speechPlayback.resumeAfterRealtime, realtimeVoice.phase]);
+
   useEffect(
     () =>
-      realtimeVoice.registerDictationCancellation(async () => {
+      realtimeVoice.registerTraditionalAudioInterruption(async () => {
+        const restoreAutoListen = autoListenActive;
         pauseAutoListen("realtime-active");
-        await dictation.cancel();
+        return interruptTraditionalAudioForRealtime({
+          cancelDictation: dictation.cancelForRealtime,
+          interruptPlayback: props.speechPlayback.interruptForRealtime,
+          rollback: () => {
+            props.speechPlayback.resumeAfterRealtime();
+            if (restoreAutoListen) void activateAutoListen(true);
+          },
+        });
       }),
-    [dictation.cancel, pauseAutoListen, realtimeVoice.registerDictationCancellation],
+    [
+      activateAutoListen,
+      autoListenActive,
+      dictation.cancelForRealtime,
+      pauseAutoListen,
+      props.speechPlayback.interruptForRealtime,
+      props.speechPlayback.resumeAfterRealtime,
+      realtimeVoice.registerTraditionalAudioInterruption,
+    ],
   );
 
   const toggleDictation = useCallback(async () => {

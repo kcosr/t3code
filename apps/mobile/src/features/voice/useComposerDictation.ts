@@ -20,6 +20,7 @@ import {
   dictationTerminationOwnership,
 } from "./dictationTermination";
 import { canStartComposerDictation } from "./dictationAdmission";
+import { releaseRecordingForRealtime } from "./traditionalAudioHandoff";
 import type { ResolvedVoicePreferences } from "./voicePreferences";
 
 export type ComposerDictationPhase = "idle" | "recording" | "transcribing";
@@ -68,6 +69,8 @@ export function useComposerDictation(input: {
   const operationGenerationRef = useRef(0);
   const mountedRef = useRef(true);
   const startPendingRef = useRef(false);
+  const startSettlementRef = useRef<Promise<void> | null>(null);
+  const stopSettlementRef = useRef<Promise<void> | null>(null);
   const lifecycleRef = useRef({ scopeKey: input.scopeKey, native, prepared });
   const draftRef = useRef(input.draftMessage);
   draftRef.current = input.draftMessage;
@@ -168,6 +171,11 @@ export function useComposerDictation(input: {
       return null;
     const generation = ++operationGenerationRef.current;
     startPendingRef.current = true;
+    let settleStart: (() => void) | undefined;
+    const startSettlement = new Promise<void>((resolve) => {
+      settleStart = resolve;
+    });
+    startSettlementRef.current = startSettlement;
     setError(null);
     try {
       const currentPermission = await native.getMicrophonePermissionAsync();
@@ -188,7 +196,12 @@ export function useComposerDictation(input: {
         },
       });
       if (operationGenerationRef.current !== generation) {
-        await native.cancelRecordingAsync({ recordingId }).catch(() => undefined);
+        try {
+          await native.cancelRecordingAsync({ recordingId });
+        } catch (cause) {
+          recordingIdRef.current = recordingId;
+          throw cause;
+        }
         return null;
       }
       recordingIdRef.current = recordingId;
@@ -201,6 +214,8 @@ export function useComposerDictation(input: {
       return null;
     } finally {
       if (operationGenerationRef.current === generation) startPendingRef.current = false;
+      settleStart?.();
+      if (startSettlementRef.current === startSettlement) startSettlementRef.current = null;
     }
   }, [capability, input.voicePreferences, native, phase, prepared]);
 
@@ -211,6 +226,11 @@ export function useComposerDictation(input: {
     }
     recordingIdRef.current = null;
     stoppingRecordingIdRef.current = recordingId;
+    let settleStop: (() => void) | undefined;
+    const stopSettlement = new Promise<void>((resolve) => {
+      settleStop = resolve;
+    });
+    stopSettlementRef.current = stopSettlement;
     const generation = ++operationGenerationRef.current;
     const draftAtStop = draftRef.current;
     setPhase("transcribing");
@@ -232,6 +252,8 @@ export function useComposerDictation(input: {
     } finally {
       if (stoppingRecordingIdRef.current === recordingId) stoppingRecordingIdRef.current = null;
       if (operationGenerationRef.current === generation) setPhase("idle");
+      settleStop?.();
+      if (stopSettlementRef.current === stopSettlement) stopSettlementRef.current = null;
     }
   }, [native, phase, prepared, transcribeCompletedRecording]);
 
@@ -245,6 +267,32 @@ export function useComposerDictation(input: {
       await native.cancelRecordingAsync({ recordingId }).catch(() => undefined);
     }
     if (mountedRef.current) setPhase("idle");
+  }, [native]);
+
+  const cancelForRealtime = useCallback(async () => {
+    ++operationGenerationRef.current;
+    startPendingRef.current = false;
+    try {
+      if (native !== null) {
+        await releaseRecordingForRealtime({
+          native,
+          pendingStart: startSettlementRef.current,
+          pendingStop: stopSettlementRef.current,
+          getRecordingId: () => recordingIdRef.current,
+        });
+      }
+      recordingIdRef.current = null;
+      if (mountedRef.current) {
+        setError(null);
+        setPhase("idle");
+      }
+    } catch (cause) {
+      if (mountedRef.current) {
+        setError(errorMessage(cause));
+        setPhase(recordingIdRef.current === null ? "idle" : "recording");
+      }
+      throw cause;
+    }
   }, [native]);
 
   useEffect(() => {
@@ -344,5 +392,6 @@ export function useComposerDictation(input: {
     start,
     stop,
     cancel,
+    cancelForRealtime,
   };
 }

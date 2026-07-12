@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   initialThreadSpeechPlannerState,
   interruptThreadSpeech,
+  isThreadSpeechSuspended,
   planThreadSpeechToggle,
   restoreThreadSpeechPreference,
   setThreadSpeechEnabled,
@@ -10,6 +11,17 @@ import {
 } from "./threadSpeechPlanner";
 
 describe("threadSpeechPlanner", () => {
+  it.each([
+    [false, false, false],
+    [true, false, true],
+    [false, true, true],
+    [true, true, true],
+  ] as const)(
+    "reports dictation=%s and realtime=%s suspension as %s",
+    (dictation, realtime, expected) => {
+      expect(isThreadSpeechSuspended(dictation, realtime)).toBe(expected);
+    },
+  );
   it("restores speech without replaying the current streaming response", () => {
     const latest = {
       id: "existing",

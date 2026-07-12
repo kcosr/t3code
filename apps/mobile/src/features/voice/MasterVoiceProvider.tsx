@@ -80,7 +80,9 @@ interface VoiceConversationConnection {
 interface MasterVoiceContextValue {
   readonly phase: RealtimeVoiceControllerSnapshot["phase"];
   readonly stop: () => Promise<void>;
-  readonly registerDictationCancellation: (cancel: () => void | Promise<void>) => () => void;
+  readonly registerTraditionalAudioInterruption: (
+    interrupt: () => void | (() => void) | Promise<void | (() => void)>,
+  ) => () => void;
 }
 
 const INITIAL_SNAPSHOT: RealtimeVoiceControllerSnapshot = {
@@ -162,7 +164,9 @@ export function MasterVoiceProvider(props: {
   const pendingClientActionsRef = useRef(
     new Map<string, Extract<VoiceSessionEvent, { readonly type: "client-action" }>>(),
   );
-  const dictationCancellationsRef = useRef(new Set<() => void | Promise<void>>());
+  const traditionalAudioInterruptionsRef = useRef(
+    new Set<() => void | (() => void) | Promise<void | (() => void)>>(),
+  );
   attachmentRef.current = attachment;
   focusRef.current = props.focus;
 
@@ -432,36 +436,65 @@ export function MasterVoiceProvider(props: {
       });
   }, [acknowledgeClientAction, props.focus]);
 
+  const interruptTraditionalAudio = useCallback(async () => {
+    const releases: Array<void | (() => void)> = [];
+    try {
+      const interruptions = Array.from(traditionalAudioInterruptionsRef.current);
+      for (const interrupt of interruptions) {
+        releases.push(await interrupt());
+      }
+    } catch (cause) {
+      for (const release of releases.toReversed()) {
+        if (typeof release === "function") release();
+      }
+      throw cause;
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      for (const release of releases) {
+        if (typeof release === "function") release();
+      }
+    };
+  }, []);
+
   const start = useCallback(
-    async (conversation: VoiceConversationSelection, takeover = false) => {
+    async (
+      conversation: VoiceConversationSelection,
+      takeover = false,
+      existingAudioRelease?: () => void,
+      ownsStartLock = false,
+    ) => {
       const focus = props.focus;
       const runtime = runtimeRef.current;
       if (
-        startInFlightRef.current ||
+        (!ownsStartLock && startInFlightRef.current) ||
         runtime === null ||
         (focus !== null && runtime.environmentId !== focus.environmentId)
-      )
+      ) {
+        existingAudioRelease?.();
         return;
-      startInFlightRef.current = true;
-      await Promise.allSettled(
-        [...dictationCancellationsRef.current].map(async (cancel) => cancel()),
-      );
-      setTranscript([]);
-      const sessionInput: VoiceSessionCreateInput = {
-        mode: "realtime-agent",
-        conversation:
-          conversation.type === "continue" ? { ...conversation, takeover } : conversation,
-        ...(focus === null ? {} : { projectId: focus.projectId, threadId: focus.threadId }),
-        media: {
-          transports: ["webrtc-sdp-v1"],
-          audioFormats: ["audio/pcm;rate=24000;encoding=s16le;channels=1"],
-          supportsInputRouteSelection: true,
-          supportsOutputRouteSelection: true,
-        },
-        idempotencyKey: uuidv4(),
-      };
-      setAttachment({ environmentId: runtime.environmentId, focus });
+      }
+      if (!ownsStartLock) startInFlightRef.current = true;
+      let releaseTraditionalAudio = existingAudioRelease ?? null;
       try {
+        releaseTraditionalAudio ??= await interruptTraditionalAudio();
+        setTranscript([]);
+        const sessionInput: VoiceSessionCreateInput = {
+          mode: "realtime-agent",
+          conversation:
+            conversation.type === "continue" ? { ...conversation, takeover } : conversation,
+          ...(focus === null ? {} : { projectId: focus.projectId, threadId: focus.threadId }),
+          media: {
+            transports: ["webrtc-sdp-v1"],
+            audioFormats: ["audio/pcm;rate=24000;encoding=s16le;channels=1"],
+            supportsInputRouteSelection: true,
+            supportsOutputRouteSelection: true,
+          },
+          idempotencyKey: uuidv4(),
+        };
+        setAttachment({ environmentId: runtime.environmentId, focus });
         await runtime.controller.start(sessionInput);
         const routeId = preferredAudioRouteIdRef.current;
         if (routeId !== null) {
@@ -472,6 +505,7 @@ export function MasterVoiceProvider(props: {
           }
         }
       } catch (cause) {
+        releaseTraditionalAudio?.();
         if (
           !takeover &&
           conversation.type === "continue" &&
@@ -512,7 +546,7 @@ export function MasterVoiceProvider(props: {
         startInFlightRef.current = false;
       }
     },
-    [props.focus],
+    [interruptTraditionalAudio, props.focus],
   );
 
   const resume = useCallback(() => {
@@ -525,29 +559,46 @@ export function MasterVoiceProvider(props: {
     )
       return;
     resumeInFlightRef.current = true;
+    startInFlightRef.current = true;
     setResumePending(true);
-    void loadResumeSelection(runtime.client)
-      .then(start)
+    void interruptTraditionalAudio()
+      .then(async (releaseTraditionalAudio) => {
+        try {
+          const selection = await loadResumeSelection(runtime.client);
+          await start(selection, false, releaseTraditionalAudio, true);
+        } catch (cause) {
+          releaseTraditionalAudio();
+          throw cause;
+        }
+      })
       .catch((cause) => Alert.alert("Voice conversation unavailable", errorMessage(cause)))
       .finally(() => {
+        startInFlightRef.current = false;
         resumeInFlightRef.current = false;
         setResumePending(false);
       });
-  }, [snapshot.phase, start]);
+  }, [interruptTraditionalAudio, snapshot.phase, start]);
 
   const browseHistory = useCallback(() => {
-    if (conversationClient === null || snapshot.phase !== "idle") return;
+    if (
+      conversationClient === null ||
+      snapshot.phase !== "idle" ||
+      startInFlightRef.current ||
+      resumeInFlightRef.current
+    )
+      return;
     setBrowserVisible(true);
   }, [conversationClient, snapshot.phase]);
 
   const startNew = useCallback(() => {
-    if (snapshot.phase !== "idle") return;
+    if (snapshot.phase !== "idle" || startInFlightRef.current || resumeInFlightRef.current) return;
     void start(newVoiceConversationSelection());
   }, [snapshot.phase, start]);
 
   const resumeConversation = useCallback(
     (conversationId: VoiceConversationId) => {
-      if (snapshot.phase !== "idle") return;
+      if (snapshot.phase !== "idle" || startInFlightRef.current || resumeInFlightRef.current)
+        return;
       void start(continueVoiceConversationSelection(conversationId));
     },
     [snapshot.phase, start],
@@ -628,10 +679,13 @@ export function MasterVoiceProvider(props: {
     await runtimeRef.current?.controller.stop();
   }, [snapshot.phase]);
 
-  const registerDictationCancellation = useCallback((cancel: () => void | Promise<void>) => {
-    dictationCancellationsRef.current.add(cancel);
-    return () => dictationCancellationsRef.current.delete(cancel);
-  }, []);
+  const registerTraditionalAudioInterruption = useCallback(
+    (interrupt: () => void | (() => void) | Promise<void | (() => void)>) => {
+      traditionalAudioInterruptionsRef.current.add(interrupt);
+      return () => traditionalAudioInterruptionsRef.current.delete(interrupt);
+    },
+    [],
+  );
 
   const decideConfirmation = useCallback(
     (confirmation: PendingVoiceConfirmation, decision: "approve" | "reject") => {
@@ -688,8 +742,8 @@ export function MasterVoiceProvider(props: {
   }, [decideConfirmation, pendingConfirmation]);
 
   const contextValue = useMemo<MasterVoiceContextValue>(
-    () => ({ phase: snapshot.phase, stop, registerDictationCancellation }),
-    [registerDictationCancellation, snapshot.phase, stop],
+    () => ({ phase: snapshot.phase, stop, registerTraditionalAudioInterruption }),
+    [registerTraditionalAudioInterruption, snapshot.phase, stop],
   );
 
   return (

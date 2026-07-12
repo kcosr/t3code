@@ -1,8 +1,10 @@
-import type { T3VoiceRuntimeState } from "@t3tools/mobile-voice-native";
+import type { T3VoiceNativeModule, T3VoiceRuntimeState } from "@t3tools/mobile-voice-native";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   dictationResumeTransition,
+  interruptTraditionalAudioForRealtime,
+  releaseRecordingForRealtime,
   releasePlaybackForRecording,
   runExclusiveTraditionalAudioTransition,
   startDictationWithAudioHandoff,
@@ -106,6 +108,102 @@ describe("runExclusiveTraditionalAudioTransition", () => {
 });
 
 describe("traditional audio handoff coordination", () => {
+  it("releases dictation and playback in order before Realtime starts", async () => {
+    const calls: string[] = [];
+
+    await interruptTraditionalAudioForRealtime({
+      cancelDictation: async () => {
+        calls.push("dictation");
+      },
+      interruptPlayback: async () => {
+        calls.push("playback");
+        return true;
+      },
+      rollback: () => calls.push("rollback"),
+    });
+
+    expect(calls).toEqual(["dictation", "playback"]);
+  });
+
+  it("rejects Realtime startup when playback ownership cannot be released", async () => {
+    const rollback = vi.fn();
+    await expect(
+      interruptTraditionalAudioForRealtime({
+        cancelDictation: async () => undefined,
+        interruptPlayback: async () => false,
+        rollback,
+      }),
+    ).rejects.toThrow("Traditional voice playback could not be interrupted");
+    expect(rollback).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not touch playback when dictation ownership cannot be released", async () => {
+    const interruptPlayback = vi.fn(async () => true);
+    const rollback = vi.fn();
+
+    await expect(
+      interruptTraditionalAudioForRealtime({
+        cancelDictation: async () => {
+          throw new Error("Recorder still active");
+        },
+        interruptPlayback,
+        rollback,
+      }),
+    ).rejects.toThrow("Recorder still active");
+    expect(interruptPlayback).not.toHaveBeenCalled();
+    expect(rollback).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for pending recording operations before verifying microphone release", async () => {
+    const order: string[] = [];
+    let settleStart!: () => void;
+    let settleStop!: () => void;
+    const pendingStart = new Promise<void>((resolve) => {
+      settleStart = resolve;
+    });
+    const pendingStop = new Promise<void>((resolve) => {
+      settleStop = resolve;
+    });
+    const native = {
+      cancelRecordingAsync: async () => order.push("cancel"),
+      getStateAsync: async () => {
+        order.push("verify");
+        return { phase: "idle", activeRecordingId: null };
+      },
+    } as unknown as T3VoiceNativeModule;
+    const release = releaseRecordingForRealtime({
+      native,
+      pendingStart,
+      pendingStop,
+      getRecordingId: () => null,
+    });
+
+    await Promise.resolve();
+    expect(order).toEqual([]);
+    settleStart();
+    await Promise.resolve();
+    expect(order).toEqual([]);
+    settleStop();
+    await release;
+    expect(order).toEqual(["verify"]);
+  });
+
+  it("rejects realtime acquisition while the native recorder still owns the microphone", async () => {
+    const native = {
+      cancelRecordingAsync: async () => undefined,
+      getStateAsync: async () => ({ phase: "recording", activeRecordingId: "recording-a" }),
+    } as unknown as T3VoiceNativeModule;
+
+    await expect(
+      releaseRecordingForRealtime({
+        native,
+        pendingStart: null,
+        pendingStop: null,
+        getRecordingId: () => "recording-a",
+      }),
+    ).rejects.toThrow("Traditional voice recording could not be interrupted");
+  });
+
   it("awaits realtime and playback release before starting dictation", async () => {
     const order: string[] = [];
     const started = await startDictationWithAudioHandoff({
