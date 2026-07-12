@@ -442,11 +442,12 @@ class T3VoicePcmPlayerTest {
     scheduler.run()
     assertFalse(finished.await(50, TimeUnit.MILLISECONDS))
     assertTrue(errors.isEmpty())
-    assertEquals(1, output.pauseCount)
+    assertEquals(0, output.pauseCount)
 
     player.resume("suspended")
     assertTrue(finished.await(2, TimeUnit.SECONDS))
-    assertEquals(1, output.resumeCount)
+    assertEquals(0, output.resumeCount)
+    assertEquals(1, output.startCount)
     player.release()
   }
 
