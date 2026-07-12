@@ -197,36 +197,38 @@ const transcriptionRoute = HttpRouter.add(
         );
       }
       const permit = yield* mediaRequestLimiter.acquire(settings.maxConcurrentMediaRequests);
-      const providers = yield* VoiceProviderRegistry;
-      const provider = yield* providers.resolve("transcription.request");
-      const transcriber = provider.transcriber;
-      if (transcriber === undefined) {
-        return yield* invalidRequest("Selected voice provider has no transcriber");
-      }
-      const body = boundVoiceByteStream(
-        transcriber
-          .transcribe({
-            requestId: metadata.requestId,
-            bytes,
-            mediaType: validatedMedia.mediaType,
-            ...(metadata.language === undefined ? {} : { language: metadata.language }),
-            ...(metadata.vocabulary === undefined ? {} : { vocabulary: metadata.vocabulary }),
-          })
-          .pipe(
-            Stream.map((event) => `${encodeTranscriptionEvent(event)}\n`),
-            Stream.encodeText,
-          ),
-        {
-          maximumBytes: VOICE_TRANSCRIPTION_OUTPUT_MAX_BYTES,
-          firstByteTimeoutSeconds: settings.mediaRequestTimeoutSeconds,
-          totalTimeoutSeconds: settings.mediaRequestTimeoutSeconds,
-        },
-      ).pipe(Stream.ensuring(permit.release));
-      return HttpServerResponse.stream(body, {
-        contentType: "application/x-ndjson; charset=utf-8",
-        headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
-      });
-    }).pipe(Effect.onError(() => permit.release));
+      return yield* Effect.gen(function* () {
+        const providers = yield* VoiceProviderRegistry;
+        const provider = yield* providers.resolve("transcription.request");
+        const transcriber = provider.transcriber;
+        if (transcriber === undefined) {
+          return yield* invalidRequest("Selected voice provider has no transcriber");
+        }
+        const body = boundVoiceByteStream(
+          transcriber
+            .transcribe({
+              requestId: metadata.requestId,
+              bytes,
+              mediaType: validatedMedia.mediaType,
+              ...(metadata.language === undefined ? {} : { language: metadata.language }),
+              ...(metadata.vocabulary === undefined ? {} : { vocabulary: metadata.vocabulary }),
+            })
+            .pipe(
+              Stream.map((event) => `${encodeTranscriptionEvent(event)}\n`),
+              Stream.encodeText,
+            ),
+          {
+            maximumBytes: VOICE_TRANSCRIPTION_OUTPUT_MAX_BYTES,
+            firstByteTimeoutSeconds: settings.mediaRequestTimeoutSeconds,
+            totalTimeoutSeconds: settings.mediaRequestTimeoutSeconds,
+          },
+        ).pipe(Stream.ensuring(permit.release));
+        return HttpServerResponse.stream(body, {
+          contentType: "application/x-ndjson; charset=utf-8",
+          headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
+        });
+      }).pipe(Effect.onError(() => permit.release));
+    });
   }).pipe(
     Effect.catchTag("VoiceMediaRequestError", voiceMediaRequestErrorResponse),
     Effect.catchTag("VoiceMediaPolicyError", voiceMediaPolicyErrorResponse),
