@@ -72,6 +72,22 @@ class T3VoiceRecordingCacheTest {
   }
 
   @Test
+  fun sweepProtectsPendingCompletedRecordingFromAgeAndCountLimits() {
+    val now = 100_000L
+    val cache =
+      T3VoiceRecordingCache(
+        cacheRoot,
+        nowMillis = { now },
+        maximumAgeMillis = 1_000,
+        maximumRetainedFiles = 0,
+      )
+    val pending = cache.createTempFile().apply { setLastModified(0) }
+
+    assertEquals(0, cache.sweep(setOf(pending)))
+    assertTrue(pending.exists())
+  }
+
+  @Test
   fun ownershipRequiresTheDedicatedDirectoryAndGeneratedFilenameShape() {
     val cache = T3VoiceRecordingCache(cacheRoot)
     val owned = cache.createTempFile()

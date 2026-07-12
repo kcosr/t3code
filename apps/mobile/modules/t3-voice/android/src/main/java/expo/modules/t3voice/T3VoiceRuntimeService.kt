@@ -281,8 +281,8 @@ class T3VoiceRuntimeService : Service() {
           }
         }
       }
-    recorder.sweepStaleCache()
     T3VoiceStateStore.recordingTermination.value?.recording?.let(recorder::restoreCompleted)
+    recorder.sweepStaleCache()
     player =
       T3VoicePcmPlayer(
         onChunkConsumed = { playbackId, chunkIndex ->

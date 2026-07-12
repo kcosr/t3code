@@ -33,7 +33,7 @@ class T3VoiceEndpointDetectorTest {
   fun speechBeginningImmediatelyIsNotAbsorbedIntoTheNoiseFloor() {
     val detector = T3VoiceEndpointDetector()
 
-    feed(detector, 0L..500L step 50L, amplitude = 8_000)
+    feed(detector, 0L..500L step 50L, amplitude = 1_000)
     feed(detector, 550L..1_650L step 50L, amplitude = 100)
     assertEquals(T3VoiceEndpointDetector.Outcome.SPEECH_ENDED, detector.observe(1_700L, 100))
   }
@@ -137,8 +137,8 @@ class T3VoiceEndpointDetectorTest {
     val detector =
       T3VoiceEndpointDetector(T3VoiceEndpointDetectionConfig(noSpeechTimeoutMs = 30_000L))
 
-    feed(detector, 0L..29_950L step 50L, amplitude = 700)
-    assertEquals(T3VoiceEndpointDetector.Outcome.NO_SPEECH, detector.observe(30_000L, 700))
+    feed(detector, 0L..29_950L step 50L, amplitude = 100)
+    assertEquals(T3VoiceEndpointDetector.Outcome.NO_SPEECH, detector.observe(30_000L, 100))
   }
 
   @Test

@@ -185,11 +185,24 @@ export function useComposerDictation(input: {
   useEffect(() => {
     if (native === null) return;
     const subscription = native.addListener("recordingTerminated", (event) => {
-      if (
+      const orphanedTermination =
         recordingIdRef.current !== event.recordingId &&
-        stoppingRecordingIdRef.current !== event.recordingId
-      )
+        stoppingRecordingIdRef.current !== event.recordingId;
+      if (orphanedTermination) {
+        if (event.outcome === "completed") {
+          void native
+            .deleteRecordingAsync({
+              recordingId: event.recordingId,
+              uri: event.recording.uri,
+            })
+            .catch(() => undefined);
+        } else {
+          void native
+            .acknowledgeRecordingTerminationAsync({ recordingId: event.recordingId })
+            .catch(() => undefined);
+        }
         return;
+      }
       ++operationGenerationRef.current;
       startPendingRef.current = false;
       recordingIdRef.current = null;

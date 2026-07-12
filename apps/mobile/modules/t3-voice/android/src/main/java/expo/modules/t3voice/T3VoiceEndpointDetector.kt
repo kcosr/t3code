@@ -101,7 +101,7 @@ internal class T3VoiceEndpointDetector(
     levelDbfs: Double,
     onsetThresholdDbfs: Double,
   ) {
-    if (elapsedMs < CALIBRATION_MS && levelDbfs < CALIBRATION_SPEECH_FLOOR_DBFS) {
+    if (elapsedMs < CALIBRATION_MS && levelDbfs < onsetThresholdDbfs) {
       onsetCandidateAtMs = null
       noiseFloorDbfs += NOISE_FLOOR_ALPHA * (levelDbfs - noiseFloorDbfs)
       return
@@ -146,7 +146,6 @@ internal class T3VoiceEndpointDetector(
     private const val INITIAL_NOISE_FLOOR_DBFS = -60.0
     private const val NOISE_FLOOR_ALPHA = 0.25
     private const val CALIBRATION_MS = 300L
-    private const val CALIBRATION_SPEECH_FLOOR_DBFS = -24.0
     internal fun amplitudeToDbfs(peakAmplitude: Int): Double {
       require(peakAmplitude in 0..MAX_AMPLITUDE)
       if (peakAmplitude == 0) return SILENCE_DBFS

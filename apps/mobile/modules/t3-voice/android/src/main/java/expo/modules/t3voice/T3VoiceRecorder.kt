@@ -32,9 +32,10 @@ internal class T3VoiceRecordingCache(
     error("A unique T3 voice recording cache file could not be created.")
   }
 
-  fun sweep(): Int {
+  fun sweep(protectedFiles: Set<File> = emptySet()): Int {
     ensureDirectory()
     val now = nowMillis()
+    val protectedCanonical = protectedFiles.mapTo(mutableSetOf()) { it.canonicalFile }
     val owned =
       directory.listFiles().orEmpty()
         .filter(::isOwnedFile)
@@ -42,7 +43,10 @@ internal class T3VoiceRecordingCache(
     var deleted = 0
     owned.forEachIndexed { index, file ->
       val ageMillis = (now - file.lastModified()).coerceAtLeast(0)
-      if (ageMillis >= maximumAgeMillis || index >= maximumRetainedFiles) {
+      if (
+        file.canonicalFile !in protectedCanonical &&
+          (ageMillis >= maximumAgeMillis || index >= maximumRetainedFiles)
+      ) {
         if (file.delete()) deleted += 1
       }
     }
@@ -125,7 +129,7 @@ internal class T3VoiceRecorder(
   private val endpointThread = HandlerThread("t3-voice-endpoint").apply { start() }
   private val endpointHandler = Handler(endpointThread.looper)
 
-  fun sweepStaleCache(): Int = recordingCache.sweep()
+  fun sweepStaleCache(): Int = recordingCache.sweep(completed.values.toSet())
 
   @Synchronized
   fun restoreCompleted(recording: T3VoiceRecordingResult) {
