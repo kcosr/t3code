@@ -55,7 +55,9 @@ import {
   type MasterVoiceFocus,
 } from "./masterVoiceState";
 import {
+  RealtimeControllerHandoff,
   RealtimeVoiceController,
+  RealtimeServerCleanupCoordinator,
   type RealtimeVoiceControllerSnapshot,
 } from "./realtimeVoiceController";
 
@@ -155,6 +157,8 @@ export function MasterVoiceProvider(props: {
   const [transcript, setTranscript] = useState<ReadonlyArray<MasterVoiceTranscriptTurn>>([]);
   const [confirmations, setConfirmations] = useState<ReadonlyArray<PendingVoiceConfirmation>>([]);
   const runtimeRef = useRef<MasterVoiceRuntime | null>(null);
+  const cleanupCoordinatorsRef = useRef(new Map<EnvironmentId, RealtimeServerCleanupCoordinator>());
+  const controllerHandoffsRef = useRef(new Map<EnvironmentId, RealtimeControllerHandoff>());
   const startInFlightRef = useRef(false);
   const resumeInFlightRef = useRef(false);
   const focusUpdateGenerationRef = useRef(0);
@@ -307,17 +311,41 @@ export function MasterVoiceProvider(props: {
 
     const client = conversationConnection.client;
     const environmentOrigin = prepared.httpBaseUrl;
+    let controllerHandoff = controllerHandoffsRef.current.get(controllerEnvironmentId);
+    if (controllerHandoff === undefined) {
+      controllerHandoff = new RealtimeControllerHandoff();
+      controllerHandoffsRef.current.set(controllerEnvironmentId, controllerHandoff);
+    }
+    const handoffReservation = controllerHandoff.reserve();
+    let publishedRuntime: MasterVoiceRuntime | null = null;
     void (async () => {
+      await handoffReservation.ready;
+      if (disposed) {
+        handoffReservation.release();
+        return;
+      }
       const [capabilities, media] = await Promise.all([
         Effect.runPromise(client.capabilities()),
         native.getMediaCapabilitiesAsync(),
       ]);
-      if (disposed) return;
+      if (disposed) {
+        handoffReservation.release();
+        return;
+      }
       const realtimeReady = capabilities.capabilities.some(
         (capability) => capability.capability === "agent.realtime" && capability.state === "ready",
       );
-      if (!realtimeReady || !media.realtimeWebRtc) return;
+      if (!realtimeReady || !media.realtimeWebRtc) {
+        handoffReservation.release();
+        return;
+      }
+      let cleanupCoordinator = cleanupCoordinatorsRef.current.get(controllerEnvironmentId);
+      if (cleanupCoordinator === undefined) {
+        cleanupCoordinator = new RealtimeServerCleanupCoordinator();
+        cleanupCoordinatorsRef.current.set(controllerEnvironmentId, cleanupCoordinator);
+      }
       const controller = new RealtimeVoiceController(native, client, environmentOrigin, {
+        cleanupCoordinator,
         onSnapshot: (next) => {
           if (disposed) return;
           setSnapshot(next);
@@ -356,16 +384,21 @@ export function MasterVoiceProvider(props: {
       }
       if (disposed) {
         await controller.dispose();
+        handoffReservation.release();
         return;
       }
-      const runtime = {
+      const runtime: MasterVoiceRuntime = {
         environmentId: controllerEnvironmentId,
         client,
         controller,
       };
+      publishedRuntime = runtime;
       runtimeRef.current = runtime;
       setAvailableEnvironmentId(controllerEnvironmentId);
-    })().catch(() => {
+    })().catch(async () => {
+      if (publishedRuntime !== null)
+        await publishedRuntime.controller.dispose().catch(() => undefined);
+      handoffReservation.release();
       if (!disposed) setAvailableEnvironmentId(null);
     });
 
@@ -373,9 +406,10 @@ export function MasterVoiceProvider(props: {
       disposed = true;
       setAvailableEnvironmentId(null);
       const runtime = runtimeRef.current;
-      if (runtime?.environmentId !== controllerEnvironmentId) return;
+      if (runtime?.environmentId !== controllerEnvironmentId || runtime !== publishedRuntime)
+        return;
       runtimeRef.current = null;
-      void runtime.controller.dispose();
+      void runtime.controller.dispose().finally(handoffReservation.release);
     };
   }, [
     controllerEnvironmentId,

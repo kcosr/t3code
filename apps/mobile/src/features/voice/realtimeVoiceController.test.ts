@@ -12,6 +12,8 @@ import type { PermissionResponse } from "expo";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  RealtimeControllerHandoff,
+  RealtimeServerCleanupCoordinator,
   RealtimeVoiceController,
   type RealtimeVoiceControllerOptions,
 } from "./realtimeVoiceController";
@@ -450,7 +452,7 @@ describe("RealtimeVoiceController", () => {
     expect(controller.getSnapshot().phase).toBe("active");
   });
 
-  it("bounds a stalled server cleanup so reconnect cannot hang indefinitely", async () => {
+  it("retries a bounded server cleanup before reconnecting", async () => {
     const { client, controller } = makeHarness({ serverCleanupTimeoutMs: 5 });
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     await controller.start(createInput);
@@ -460,11 +462,107 @@ describe("RealtimeVoiceController", () => {
     await controller.start(createInput);
 
     expect(controller.getSnapshot().phase).toBe("active");
+    expect(client.closeSession).toHaveBeenCalledTimes(2);
     expect(warning).toHaveBeenCalledWith(
       "[voice] server session cleanup failed",
       expect.objectContaining({ errorTag: "TimeoutError" }),
     );
     warning.mockRestore();
+  });
+
+  it("does not create a competing lease while prior cleanup remains unreachable", async () => {
+    const { client, controller } = makeHarness({ serverCleanupTimeoutMs: 5 });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await controller.start(createInput);
+    vi.mocked(client.closeSession).mockReturnValue(Effect.never);
+
+    await controller.stop();
+    await expect(controller.start(createInput)).rejects.toThrow(
+      "The previous Realtime session could not be released",
+    );
+
+    expect(client.createSession).toHaveBeenCalledTimes(1);
+    expect(client.closeSession).toHaveBeenCalledTimes(2);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "error",
+      session: null,
+      error: expect.stringContaining("Check connectivity and try again"),
+    });
+    warning.mockRestore();
+  });
+
+  it("carries unresolved cleanup across controller replacement", async () => {
+    const cleanupCoordinator = new RealtimeServerCleanupCoordinator(5);
+    const { client, controller, native } = makeHarness({ cleanupCoordinator });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await controller.start(createInput);
+    vi.mocked(client.closeSession).mockReturnValueOnce(Effect.never);
+
+    await controller.stop();
+    await controller.dispose();
+
+    const replacementClose = vi.fn(() =>
+      Effect.succeed({
+        state: { ...serverSession.state, phase: "ended" as const },
+        closed: true,
+      }),
+    );
+    const replacementCreate = vi.fn(() => Effect.succeed(serverSession));
+    const replacementClient = {
+      ...client,
+      closeSession: replacementClose,
+      createSession: replacementCreate,
+    } as unknown as VoiceHttpClient;
+    const replacement = new RealtimeVoiceController(
+      native,
+      replacementClient,
+      "https://environment.example.test",
+      { onSnapshot: () => undefined },
+      { cleanupCoordinator },
+    );
+    await replacement.start(createInput);
+
+    expect(client.closeSession).toHaveBeenCalledTimes(2);
+    expect(replacementClose).not.toHaveBeenCalled();
+    expect(client.createSession).toHaveBeenCalledTimes(1);
+    expect(replacementCreate).toHaveBeenCalledTimes(1);
+    expect(replacement.getSnapshot().phase).toBe("active");
+    warning.mockRestore();
+  });
+
+  it("holds replacement readiness until the prior controller is disposed", async () => {
+    const handoff = new RealtimeControllerHandoff();
+    const active = handoff.reserve();
+    const replacement = handoff.reserve();
+    let ready = false;
+    const replacementReady = replacement.ready.then(() => {
+      ready = true;
+    });
+
+    await Promise.resolve();
+    expect(ready).toBe(false);
+    active.release();
+    await replacementReady;
+    expect(ready).toBe(true);
+    replacement.release();
+  });
+
+  it("retires cleanup owned by a revoked authentication session", async () => {
+    const cleanupCoordinator = new RealtimeServerCleanupCoordinator(5);
+    const { client, controller } = makeHarness({ cleanupCoordinator });
+    vi.mocked(client.closeSession).mockReturnValue(
+      Effect.fail({ _tag: "EnvironmentAuthInvalidError" }),
+    );
+    await controller.start(createInput);
+
+    await controller.stop();
+    await controller.dispose();
+    vi.mocked(client.createSession).mockClear();
+    await controller.start(createInput);
+
+    expect(client.closeSession).toHaveBeenCalledTimes(1);
+    expect(client.createSession).toHaveBeenCalledTimes(1);
+    expect(controller.getSnapshot().phase).toBe("active");
   });
 
   it("joins and cleans a startup interrupted before signaling completes", async () => {

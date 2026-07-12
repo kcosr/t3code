@@ -59,6 +59,7 @@ export interface RealtimeVoiceControllerOptions {
   readonly scheduler?: TimerScheduler;
   readonly eventPollIntervalMs?: number;
   readonly serverCleanupTimeoutMs?: number;
+  readonly cleanupCoordinator?: RealtimeServerCleanupCoordinator;
 }
 
 const defaultScheduler: TimerScheduler = {
@@ -115,10 +116,107 @@ const nativeRuntimeErrorMessage = (code: string): string => {
   }
 };
 
+type ServerCleanup = Pick<ActiveSession, "sessionId" | "leaseGeneration">;
+interface PendingServerCleanup extends ServerCleanup {
+  readonly client: VoiceHttpClient;
+}
+
+const TERMINAL_CLEANUP_ERROR_TAGS = new Set([
+  "EnvironmentAuthInvalidError",
+  "EnvironmentOperationForbiddenError",
+  "EnvironmentResourceNotFoundError",
+  "EnvironmentScopeRequiredError",
+]);
+
+const cleanupFailureIsTerminal = (cause: unknown): boolean => {
+  const tag = errorTag(cause);
+  if (tag !== null && TERMINAL_CLEANUP_ERROR_TAGS.has(tag)) return true;
+  return (
+    tag === "EnvironmentVoiceOperationError" &&
+    typeof cause === "object" &&
+    cause !== null &&
+    "retryable" in cause &&
+    (cause as { readonly retryable: unknown }).retryable === false
+  );
+};
+
+export class RealtimeServerCleanupCoordinator {
+  private readonly pending = new Map<VoiceSessionState["sessionId"], PendingServerCleanup>();
+  private barrier: Promise<void> = Promise.resolve();
+
+  constructor(private readonly timeoutMs = 10_000) {}
+
+  enqueue(client: VoiceHttpClient, cleanup: ServerCleanup) {
+    const pending = { ...cleanup, client };
+    this.pending.set(cleanup.sessionId, pending);
+    const previous = this.barrier;
+    this.barrier = previous.then(async () => {
+      if (!this.pending.has(cleanup.sessionId)) return;
+      if (await this.tryCleanup(pending)) this.pending.delete(cleanup.sessionId);
+    });
+  }
+
+  async drain(): Promise<void> {
+    await this.barrier;
+    for (const cleanup of this.pending.values()) {
+      if (!(await this.tryCleanup(cleanup))) {
+        throw new Error(
+          "The previous Realtime session could not be released. Check connectivity and try again",
+        );
+      }
+      this.pending.delete(cleanup.sessionId);
+    }
+  }
+
+  settled(): Promise<void> {
+    return this.barrier;
+  }
+
+  private async tryCleanup(cleanup: PendingServerCleanup): Promise<boolean> {
+    try {
+      await Effect.runPromise(
+        cleanup.client
+          .closeSession(cleanup.sessionId, cleanup.leaseGeneration)
+          .pipe(Effect.timeout(`${this.timeoutMs} millis`)),
+      );
+      return true;
+    } catch (cause) {
+      if (cleanupFailureIsTerminal(cause)) return true;
+      console.warn("[voice] server session cleanup failed", {
+        sessionId: cleanup.sessionId,
+        leaseGeneration: cleanup.leaseGeneration,
+        errorTag: errorTag(cause) ?? "unknown",
+      });
+      return false;
+    }
+  }
+}
+
+export class RealtimeControllerHandoff {
+  private tail: Promise<void> = Promise.resolve();
+
+  reserve(): { readonly ready: Promise<void>; readonly release: () => void } {
+    const ready = this.tail;
+    let resolve!: () => void;
+    const occupied = new Promise<void>((completion) => {
+      resolve = completion;
+    });
+    this.tail = ready.then(() => occupied);
+    let released = false;
+    return {
+      ready,
+      release: () => {
+        if (released) return;
+        released = true;
+        resolve();
+      },
+    };
+  }
+}
+
 export class RealtimeVoiceController {
   private readonly scheduler: TimerScheduler;
   private readonly eventPollIntervalMs: number;
-  private readonly serverCleanupTimeoutMs: number;
   private readonly subscriptions: ReadonlyArray<{
     readonly remove: () => void;
   }>;
@@ -128,7 +226,7 @@ export class RealtimeVoiceController {
   private startingNativeSessionId: string | null = null;
   private refreshInFlight = false;
   private nativeRuntimeReconciliation: Promise<void> | null = null;
-  private serverCleanupBarrier: Promise<void> = Promise.resolve();
+  private readonly cleanupCoordinator: RealtimeServerCleanupCoordinator;
   private startInFlight: Promise<void> | null = null;
   private controlFailures: Record<ControlOperation, number> = {
     events: 0,
@@ -149,7 +247,9 @@ export class RealtimeVoiceController {
   ) {
     this.scheduler = options.scheduler ?? defaultScheduler;
     this.eventPollIntervalMs = options.eventPollIntervalMs ?? 1_000;
-    this.serverCleanupTimeoutMs = options.serverCleanupTimeoutMs ?? 10_000;
+    this.cleanupCoordinator =
+      options.cleanupCoordinator ??
+      new RealtimeServerCleanupCoordinator(options.serverCleanupTimeoutMs ?? 10_000);
     this.subscriptions = [
       native.addListener("stateChanged", (state) => this.handleNativeState(state)),
       native.addListener("runtimeError", (event) => this.handleNativeError(event)),
@@ -212,13 +312,12 @@ export class RealtimeVoiceController {
       throw new Error("A Realtime voice session is already starting or active");
     }
     this.setSnapshot({ phase: "starting", session: null, error: null });
-    await this.serverCleanupBarrier;
-    this.ensureCurrentStart(generation);
-
     let serverSession: VoiceSessionCreateResult | null = null;
     let serverState: VoiceSessionState | null = null;
     let nativeSessionId: string | null = null;
     try {
+      await this.cleanupCoordinator.drain();
+      this.ensureCurrentStart(generation);
       const existingPermission = await this.native.getMicrophonePermissionAsync();
       const permission = existingPermission.granted
         ? existingPermission
@@ -436,7 +535,7 @@ export class RealtimeVoiceController {
 
   async dispose(): Promise<void> {
     await this.stop();
-    await this.serverCleanupBarrier;
+    await this.cleanupCoordinator.settled();
     this.subscriptions.forEach((subscription) => subscription.remove());
   }
 
@@ -524,26 +623,8 @@ export class RealtimeVoiceController {
     this.beginServerCleanup(active);
   }
 
-  private beginServerCleanup(active: Pick<ActiveSession, "sessionId" | "leaseGeneration">) {
-    const previous = this.serverCleanupBarrier;
-    this.serverCleanupBarrier = previous
-      .then(() =>
-        Effect.runPromise(
-          this.client
-            .closeSession(active.sessionId, active.leaseGeneration)
-            .pipe(Effect.timeout(`${this.serverCleanupTimeoutMs} millis`)),
-        ),
-      )
-      .then(
-        () => undefined,
-        (cause) => {
-          console.warn("[voice] server session cleanup failed", {
-            sessionId: active.sessionId,
-            leaseGeneration: active.leaseGeneration,
-            errorTag: errorTag(cause) ?? "unknown",
-          });
-        },
-      );
+  private beginServerCleanup(active: ServerCleanup) {
+    this.cleanupCoordinator.enqueue(this.client, active);
   }
 
   private async cleanupAfterServerTermination(active: ActiveSession, error: string | null) {
@@ -586,7 +667,7 @@ export class RealtimeVoiceController {
     if (nativeSessionId !== null) {
       await this.native.stopRealtimeSessionAsync({ nativeSessionId }).catch(() => undefined);
     }
-    await this.serverCleanupBarrier;
+    await this.cleanupCoordinator.settled();
   }
 
   private clearControlTimers() {

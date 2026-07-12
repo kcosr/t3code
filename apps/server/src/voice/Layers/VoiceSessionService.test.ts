@@ -358,6 +358,12 @@ it.effect(
         expect(yield* Ref.get(negotiatedInstructions)).toContain(
           "send_thread_message dispatches immediately and returns a messageId",
         );
+        expect(yield* Ref.get(negotiatedInstructions)).toContain(
+          "Proactively tell the user what you are about to do only when you will call send_thread_message and then synchronously wait",
+        );
+        expect(yield* Ref.get(negotiatedInstructions)).toContain(
+          "do not preannounce other tool operations",
+        );
         yield* Effect.yieldNow;
         const snapshot = yield* sessions.events(owner, created.state.sessionId, 0, 0);
         expect(snapshot.events.some((event) => event.type === "transcript" && event.final)).toBe(
@@ -1129,7 +1135,7 @@ it.effect("expires a session after three missed heartbeat intervals", () =>
 );
 
 it.effect.each(["listening", "speaking"] as const)(
-  "keeps a provider-owned %s session active without client heartbeats",
+  "expires a provider-active %s session when native control heartbeats stop",
   (activity) =>
     Effect.gen(function* () {
       const provider: VoiceProviderAdapter = {
@@ -1168,8 +1174,8 @@ it.effect.each(["listening", "speaking"] as const)(
         yield* Effect.yieldNow;
 
         const snapshot = yield* sessions.events(owner, created.state.sessionId, 0, 0);
-        expect(snapshot.state.phase).toBe(activity);
-        expect(snapshot.events.some((event) => event.type === "error")).toBe(false);
+        expect(snapshot.state.phase).toBe("ended");
+        expect(snapshot.events.some((event) => event.type === "error")).toBe(true);
       }).pipe(Effect.provide(test.layer));
     }),
 );
@@ -1248,6 +1254,15 @@ it.effect("ends an active provider session at the absolute duration limit", () =
         sdp: "offer",
       });
       yield* Effect.yieldNow;
+      yield* Effect.forever(
+        Effect.sleep("10 seconds").pipe(
+          Effect.andThen(
+            sessions
+              .heartbeat(owner, created.state.sessionId, created.state.leaseGeneration)
+              .pipe(Effect.ignore),
+          ),
+        ),
+      ).pipe(Effect.forkScoped);
       yield* TestClock.adjust("56 minutes");
       yield* Effect.yieldNow;
 
@@ -1615,7 +1630,7 @@ it.effect("times out activate-thread and rejects a late acknowledgement", () =>
       yield* Deferred.await(fixture.invocationStarted);
       yield* sessions.events(owner, created.state.sessionId, 2, 1_000);
       expect(yield* Ref.get(fixture.outputs)).toEqual([]);
-      yield* TestClock.adjust("11 seconds");
+      yield* TestClock.adjust("31 seconds");
       yield* Effect.yieldNow;
       yield* Effect.yieldNow;
       expect(yield* Ref.get(fixture.outputs)).toEqual([
