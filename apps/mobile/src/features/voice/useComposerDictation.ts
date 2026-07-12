@@ -19,6 +19,7 @@ import {
   cleanupOrphanedRecordingTermination,
   dictationTerminationOwnership,
 } from "./dictationTermination";
+import { canStartComposerDictation } from "./dictationAdmission";
 
 export type ComposerDictationPhase = "idle" | "recording" | "transcribing";
 
@@ -120,10 +121,15 @@ export function useComposerDictation(input: {
       native === null ||
       prepared === null ||
       capability === null ||
-      phase !== "idle" ||
-      startPendingRef.current
+      !canStartComposerDictation({
+        phase,
+        startPending: startPendingRef.current,
+        activeRecordingId: recordingIdRef.current,
+        stoppingRecordingId: stoppingRecordingIdRef.current,
+        transcribingRecordingId: transcribingRecordingIdRef.current,
+      })
     )
-      return;
+      return false;
     const generation = ++operationGenerationRef.current;
     startPendingRef.current = true;
     setError(null);
@@ -133,7 +139,7 @@ export function useComposerDictation(input: {
         ? currentPermission
         : await native.requestMicrophonePermissionAsync();
       if (!permission.granted) throw new Error("Microphone permission was not granted");
-      if (operationGenerationRef.current !== generation) return;
+      if (operationGenerationRef.current !== generation) return false;
       const recordingId = uuidv4();
       await native.startRecordingAsync({
         recordingId,
@@ -143,14 +149,16 @@ export function useComposerDictation(input: {
       });
       if (operationGenerationRef.current !== generation) {
         await native.cancelRecordingAsync({ recordingId }).catch(() => undefined);
-        return;
+        return false;
       }
       recordingIdRef.current = recordingId;
       setPhase("recording");
+      return true;
     } catch (cause) {
-      if (operationGenerationRef.current !== generation) return;
+      if (operationGenerationRef.current !== generation) return false;
       setError(errorMessage(cause));
       setPhase("idle");
+      return false;
     } finally {
       if (operationGenerationRef.current === generation) startPendingRef.current = false;
     }

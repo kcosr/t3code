@@ -85,10 +85,20 @@ export const setThreadSpeechEnabled = (
   };
 };
 
+export const interruptThreadSpeech = (
+  state: ThreadSpeechPlannerState,
+  latest: AssistantSpeechSnapshot | null,
+): ThreadSpeechPlannerState => ({
+  enabled: state.enabled,
+  baselineMessageId: latest?.id ?? state.baselineMessageId,
+  active: null,
+});
+
 export const planThreadSpeechToggle = (
   state: ThreadSpeechPlannerState,
   latest: AssistantSpeechSnapshot | null,
   createPlaybackId: () => string,
+  suspended = false,
 ): {
   readonly state: ThreadSpeechPlannerState;
   readonly enabled: boolean;
@@ -97,6 +107,14 @@ export const planThreadSpeechToggle = (
 } => {
   const enabled = !state.enabled;
   const toggled = setThreadSpeechEnabled(state, enabled, latest);
+  if (suspended) {
+    return {
+      state: toggled.state,
+      enabled,
+      cancelPlaybackId: null,
+      actions: [],
+    };
+  }
   if (!enabled) {
     return {
       state: toggled.state,
@@ -172,10 +190,12 @@ export const updateThreadSpeech = (
   state: ThreadSpeechPlannerState,
   latest: AssistantSpeechSnapshot | null,
   createPlaybackId: () => string,
+  suspended = false,
 ): {
   readonly state: ThreadSpeechPlannerState;
   readonly actions: ReadonlyArray<ThreadSpeechAction>;
 } => {
+  if (suspended) return { state, actions: [] };
   if (!state.enabled) return { state, actions: [] };
   if (state.active !== null) {
     if (latest === null || latest.id !== state.active.messageId) {

@@ -64,6 +64,11 @@ import {
 import { useComposerPathSearch } from "../../state/use-composer-path-search";
 import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerCommandPopover";
 import { useComposerDictation } from "../voice/useComposerDictation";
+import {
+  dictationResumeTransition,
+  runExclusiveTraditionalAudioTransition,
+  startDictationWithAudioHandoff,
+} from "../voice/traditionalAudioHandoff";
 import { useMasterVoice } from "../voice/MasterVoiceProvider";
 
 /**
@@ -116,6 +121,8 @@ export interface ThreadComposerProps {
     readonly enabled: boolean;
     readonly playing: boolean;
     readonly onToggle: () => void;
+    readonly interrupt: () => Promise<boolean>;
+    readonly resumeAfterDictation: () => void;
   };
 }
 
@@ -282,6 +289,14 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     realtimeVoice.phase === "active" ||
     realtimeVoice.phase === "starting" ||
     realtimeVoice.phase === "stopping";
+  const dictationWasActiveRef = useRef(false);
+  const traditionalAudioTransitionLockRef = useRef({ active: false });
+
+  useEffect(() => {
+    const transition = dictationResumeTransition(dictationWasActiveRef.current, dictation.phase);
+    dictationWasActiveRef.current = transition.wasActive;
+    if (transition.resume) props.speechPlayback.resumeAfterDictation();
+  }, [dictation.phase, props.speechPlayback.resumeAfterDictation]);
 
   useEffect(
     () => realtimeVoice.registerDictationCancellation(dictation.cancel),
@@ -289,13 +304,22 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   );
 
   const toggleDictation = useCallback(async () => {
-    if (dictation.phase === "recording") {
-      await dictation.stop();
-      return;
-    }
-    await realtimeVoice.stop();
-    await dictation.start();
-  }, [dictation, realtimeVoice]);
+    await runExclusiveTraditionalAudioTransition(
+      traditionalAudioTransitionLockRef.current,
+      async () => {
+        if (dictation.phase === "recording") {
+          await dictation.stop();
+          return;
+        }
+        await startDictationWithAudioHandoff({
+          stopRealtime: realtimeVoice.stop,
+          interruptPlayback: props.speechPlayback.interrupt,
+          startDictation: dictation.start,
+          resumePlayback: props.speechPlayback.resumeAfterDictation,
+        });
+      },
+    );
+  }, [dictation, props.speechPlayback, realtimeVoice]);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
   const canSend = hasContent;

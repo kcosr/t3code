@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   initialThreadSpeechPlannerState,
+  interruptThreadSpeech,
   planThreadSpeechToggle,
   restoreThreadSpeechPreference,
   setThreadSpeechEnabled,
@@ -147,6 +148,51 @@ describe("threadSpeechPlanner", () => {
       enabled: false,
       cancelPlaybackId: "playback-1",
       actions: [],
+    });
+  });
+
+  it("interrupts the current response without disabling future spoken responses", () => {
+    const enabled = setThreadSpeechEnabled(initialThreadSpeechPlannerState(), true, null).state;
+    const latest = {
+      id: "current",
+      text: "Response in progress",
+      streaming: true,
+    };
+    const active = updateThreadSpeech(enabled, latest, () => "playback-1").state;
+
+    const interrupted = interruptThreadSpeech(active, latest);
+
+    expect(interrupted).toEqual({
+      enabled: true,
+      baselineMessageId: "current",
+      active: null,
+    });
+    expect(updateThreadSpeech(interrupted, latest, () => "playback-2").actions).toEqual([]);
+    expect(
+      updateThreadSpeech(
+        interrupted,
+        { id: "next", text: "A later response.", streaming: false },
+        () => "playback-2",
+      ).actions[0],
+    ).toEqual({ type: "start", playbackId: "playback-2" });
+  });
+
+  it("defers response planning and preference playback while dictation is active", () => {
+    const enabled = setThreadSpeechEnabled(initialThreadSpeechPlannerState(), true, null).state;
+    const latest = { id: "new", text: "A response arrived during dictation.", streaming: true };
+
+    expect(updateThreadSpeech(enabled, latest, () => "playback-1", true)).toEqual({
+      state: enabled,
+      actions: [],
+    });
+
+    const disabled = planThreadSpeechToggle(enabled, latest, () => "playback-1", true);
+    expect(disabled).toMatchObject({ enabled: false, actions: [] });
+    const reenabled = planThreadSpeechToggle(disabled.state, latest, () => "playback-2", true);
+    expect(reenabled).toMatchObject({ enabled: true, actions: [] });
+    expect(updateThreadSpeech(reenabled.state, latest, () => "playback-2").actions[0]).toEqual({
+      type: "start",
+      playbackId: "playback-2",
     });
   });
 

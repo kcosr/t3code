@@ -536,6 +536,8 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                 enabled: speechPlayback.enabled,
                 playing: speechPlayback.playing,
                 onToggle: handleSpeechPlaybackToggle,
+                interrupt: speechPlayback.interrupt,
+                resumeAfterDictation: speechPlayback.resumeAfterDictation,
               }}
             />
           </View>

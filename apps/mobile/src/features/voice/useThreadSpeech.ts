@@ -11,8 +11,10 @@ import { uuidv4 } from "../../lib/uuid";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import { usePreparedConnection } from "../../state/session";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
+import { releasePlaybackForRecording } from "./traditionalAudioHandoff";
 import {
   initialThreadSpeechPlannerState,
+  interruptThreadSpeech,
   planThreadSpeechToggle,
   restoreThreadSpeechPreference,
   setThreadSpeechEnabled,
@@ -56,6 +58,11 @@ export function useThreadSpeech(input: {
   latestRef.current = input.latestAssistant;
   const actionChainRef = useRef(Promise.resolve());
   const operationGenerationRef = useRef(0);
+  const suspendedForDictationRef = useRef(false);
+  const playbackStartRef = useRef<{
+    readonly playbackId: string;
+    readonly promise: Promise<void>;
+  } | null>(null);
   const playbackRef = useRef<{
     readonly playbackId: string;
     nextChunkIndex: number;
@@ -76,19 +83,37 @@ export function useThreadSpeech(input: {
       if (operationGenerationRef.current !== generation) throw new Error("Playback was cancelled");
       switch (action.type) {
         case "start":
-          await native.startPlaybackAsync({
-            playbackId: action.playbackId,
-            sampleRate: 24_000,
-            channelCount: 1,
-          });
-          playbackRef.current = {
-            playbackId: action.playbackId,
-            nextChunkIndex: 0,
-            pendingFrameBytes: new Uint8Array(),
-            finalizing: false,
-          };
-          consumedChunkIndexRef.current = -1;
-          setPlaying(true);
+          {
+            const startPromise = (async () => {
+              await native.startPlaybackAsync({
+                playbackId: action.playbackId,
+                sampleRate: 24_000,
+                channelCount: 1,
+              });
+              if (operationGenerationRef.current !== generation) {
+                await native
+                  .cancelPlaybackAsync({ playbackId: action.playbackId })
+                  .catch(() => undefined);
+                throw new Error("Playback was cancelled");
+              }
+              playbackRef.current = {
+                playbackId: action.playbackId,
+                nextChunkIndex: 0,
+                pendingFrameBytes: new Uint8Array(),
+                finalizing: false,
+              };
+              consumedChunkIndexRef.current = -1;
+              setPlaying(true);
+            })();
+            playbackStartRef.current = { playbackId: action.playbackId, promise: startPromise };
+            try {
+              await startPromise;
+            } finally {
+              if (playbackStartRef.current?.promise === startPromise) {
+                playbackStartRef.current = null;
+              }
+            }
+          }
           return;
         case "segment": {
           const requestId = VoiceRequestId.make(uuidv4());
@@ -212,7 +237,12 @@ export function useThreadSpeech(input: {
   );
 
   useEffect(() => {
-    const result = updateThreadSpeech(plannerRef.current, input.latestAssistant, uuidv4);
+    const result = updateThreadSpeech(
+      plannerRef.current,
+      input.latestAssistant,
+      uuidv4,
+      suspendedForDictationRef.current,
+    );
     plannerRef.current = result.state;
     enqueueActions(result.actions);
   }, [enqueueActions, input.latestAssistant]);
@@ -308,7 +338,12 @@ export function useThreadSpeech(input: {
       toggledBeforePreferenceHydrationRef.current = true;
       earlyToggleNeedsBaselineRef.current ||= !input.historyReady;
     }
-    const result = planThreadSpeechToggle(plannerRef.current, latestRef.current, uuidv4);
+    const result = planThreadSpeechToggle(
+      plannerRef.current,
+      latestRef.current,
+      uuidv4,
+      suspendedForDictationRef.current,
+    );
     if (!result.enabled) {
       ++operationGenerationRef.current;
       const playback = playbackRef.current;
@@ -326,6 +361,50 @@ export function useThreadSpeech(input: {
     setError(null);
     enqueueActions(result.actions);
   }, [capabilityAvailable, enqueueActions, input.historyReady, native, savePreferences]);
+
+  const resumeAfterDictation = useCallback(() => {
+    if (!suspendedForDictationRef.current) return;
+    suspendedForDictationRef.current = false;
+    const result = updateThreadSpeech(plannerRef.current, latestRef.current, uuidv4);
+    plannerRef.current = result.state;
+    enqueueActions(result.actions);
+  }, [enqueueActions]);
+
+  const interrupt = useCallback(async () => {
+    suspendedForDictationRef.current = true;
+    ++operationGenerationRef.current;
+    const pendingStart = playbackStartRef.current;
+    const playback = playbackRef.current;
+    playbackRef.current = null;
+    plannerRef.current = interruptThreadSpeech(plannerRef.current, latestRef.current);
+    for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
+    setPlaying(false);
+    setError(null);
+    const cancellation = (async () => {
+      if (native === null) return;
+      const playbackId =
+        playback?.playbackId ??
+        pendingStart?.playbackId ??
+        (await native.getStateAsync()).activePlaybackId ??
+        undefined;
+      if (playbackId !== undefined) {
+        await releasePlaybackForRecording({
+          native,
+          playbackId,
+          ...(pendingStart === null ? {} : { pendingStart: pendingStart.promise }),
+        });
+      }
+    })();
+    actionChainRef.current = cancellation;
+    try {
+      await cancellation;
+      return true;
+    } catch (cause) {
+      setError(errorMessage(cause));
+      resumeAfterDictation();
+      return false;
+    }
+  }, [native, resumeAfterDictation]);
 
   useEffect(
     () => () => {
@@ -347,5 +426,7 @@ export function useThreadSpeech(input: {
     playing,
     error,
     onToggle: toggle,
+    interrupt,
+    resumeAfterDictation,
   };
 }
