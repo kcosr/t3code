@@ -6,6 +6,7 @@ import {
   VoiceConversationTranscriptEntry,
   VoiceConversationTranscriptQuery,
   VoiceConversationUpdateInput,
+  VoiceMediaTicketRequest,
   VoiceSpeechRequest,
   VoiceSessionCreateInput,
   VoiceSessionFocusInput,
@@ -14,6 +15,7 @@ import {
   VoiceClientActionAckInput,
   VoiceWebRtcOffer,
   VoiceTranscriptionStreamEvent,
+  VoiceTranscriptionMetadata,
 } from "./voice.ts";
 
 const decodeUnknownSync = Schema.decodeUnknownSync;
@@ -267,5 +269,99 @@ describe("voice contracts", () => {
 
     expect(segment.segmentIndex).toBe(0);
     expect(segment.finalSegment).toBe(false);
+  });
+
+  it("bounds transcription metadata and accepts only canonical Android MP4 uploads", () => {
+    const valid = decodeUnknownSync(VoiceTranscriptionMetadata)({
+      requestId: "voice-request-stt",
+      format: "audio/mp4",
+      language: "en-US",
+      vocabulary: Array.from({ length: 64 }, (_, index) => `term-${index}`),
+    });
+    expect(valid.format).toBe("audio/mp4");
+    expect(() =>
+      decodeUnknownSync(VoiceTranscriptionMetadata)({
+        requestId: "voice-request-stt",
+        format: "audio/wav",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeUnknownSync(VoiceTranscriptionMetadata)({
+        requestId: "voice-request-stt",
+        format: "audio/mp4",
+        language: "not_a_language",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeUnknownSync(VoiceTranscriptionMetadata)({
+        requestId: "voice-request-stt",
+        format: "audio/mp4",
+        vocabulary: Array.from({ length: 65 }, (_, index) => `term-${index}`),
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeUnknownSync(VoiceTranscriptionMetadata)({
+        requestId: "voice-request-stt",
+        format: "audio/mp4",
+        vocabulary: ["x".repeat(129)],
+      }),
+    ).toThrow();
+  });
+
+  it("bounds speech by UTF-8 bytes and restricts presets to server-known values", () => {
+    const base = {
+      requestId: "voice-request-speech",
+      playbackId: "voice-playback-speech",
+      segmentIndex: 0,
+      finalSegment: true,
+    };
+    expect(
+      decodeUnknownSync(VoiceSpeechRequest)({ ...base, text: "x".repeat(8 * 1024), preset: "warm" })
+        .preset,
+    ).toBe("warm");
+    expect(() =>
+      decodeUnknownSync(VoiceSpeechRequest)({
+        ...base,
+        text: "x".repeat(8 * 1024 + 1),
+        preset: "default",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeUnknownSync(VoiceSpeechRequest)({
+        ...base,
+        text: "😀".repeat(2_049),
+        preset: "default",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeUnknownSync(VoiceSpeechRequest)({ ...base, text: "hello", preset: "unknown" }),
+    ).toThrow();
+  });
+
+  it("uses operation-discriminated media ticket bindings", () => {
+    expect(
+      decodeUnknownSync(VoiceMediaTicketRequest)({
+        operation: "speech-stream",
+        requestId: "voice-request-ticket",
+      }),
+    ).toEqual({ operation: "speech-stream", requestId: "voice-request-ticket" });
+    expect(
+      decodeUnknownSync(VoiceMediaTicketRequest)({
+        operation: "voice-heartbeat",
+        sessionId: "voice-session-ticket",
+      }),
+    ).toEqual({ operation: "voice-heartbeat", sessionId: "voice-session-ticket" });
+    expect(() =>
+      decodeUnknownSync(VoiceMediaTicketRequest)({
+        operation: "speech-stream",
+        sessionId: "voice-session-ticket",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeUnknownSync(VoiceMediaTicketRequest)({
+        operation: "voice-heartbeat",
+        requestId: "voice-request-ticket",
+      }),
+    ).toThrow();
   });
 });

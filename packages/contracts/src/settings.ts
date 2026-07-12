@@ -364,8 +364,23 @@ export type ObservabilitySettings = typeof ObservabilitySettings.Type;
 export const VoiceSettings = Schema.Struct({
   enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   maxUploadBytes: Schema.Int.check(
-    Schema.isBetween({ minimum: 1, maximum: 25 * 1024 * 1024 }),
-  ).pipe(Schema.withDecodingDefault(Effect.succeed(25 * 1024 * 1024))),
+    Schema.isBetween({ minimum: 1, maximum: 64 * 1024 * 1024 }),
+  ).pipe(Schema.withDecodingDefault(Effect.succeed(32 * 1024 * 1024))),
+  maxInputDurationSeconds: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 3_600 })).pipe(
+    Schema.withDecodingDefault(Effect.succeed(30 * 60)),
+  ),
+  maxSpeechTextBytes: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 8 * 1024 })).pipe(
+    Schema.withDecodingDefault(Effect.succeed(8 * 1024)),
+  ),
+  maxSpeechOutputBytes: Schema.Int.check(
+    Schema.isBetween({ minimum: 1, maximum: 8 * 1024 * 1024 }),
+  ).pipe(Schema.withDecodingDefault(Effect.succeed(8 * 1024 * 1024))),
+  mediaRequestTimeoutSeconds: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 300 })).pipe(
+    Schema.withDecodingDefault(Effect.succeed(120)),
+  ),
+  maxConcurrentMediaRequests: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 16 })).pipe(
+    Schema.withDecodingDefault(Effect.succeed(4)),
+  ),
   maxConcurrentSessions: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 16 })).pipe(
     Schema.withDecodingDefault(Effect.succeed(1)),
   ),
@@ -535,6 +550,11 @@ export const ServerSettingsPatch = Schema.Struct({
     Schema.Struct({
       enabled: Schema.optionalKey(Schema.Boolean),
       maxUploadBytes: Schema.optionalKey(Schema.Int),
+      maxInputDurationSeconds: Schema.optionalKey(Schema.Int),
+      maxSpeechTextBytes: Schema.optionalKey(Schema.Int),
+      maxSpeechOutputBytes: Schema.optionalKey(Schema.Int),
+      mediaRequestTimeoutSeconds: Schema.optionalKey(Schema.Int),
+      maxConcurrentMediaRequests: Schema.optionalKey(Schema.Int),
       maxConcurrentSessions: Schema.optionalKey(Schema.Int),
       contextTokenBudget: Schema.optionalKey(Schema.Int),
     }),

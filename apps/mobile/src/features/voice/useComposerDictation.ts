@@ -32,6 +32,7 @@ export function useComposerDictation(input: {
   const [phase, setPhase] = useState<ComposerDictationPhase>("idle");
   const [error, setError] = useState<string | null>(null);
   const recordingIdRef = useRef<string | null>(null);
+  const stoppingRecordingIdRef = useRef<string | null>(null);
   const operationGenerationRef = useRef(0);
   const startPendingRef = useRef(false);
   const lifecycleRef = useRef({ scopeKey: input.scopeKey, native, prepared });
@@ -88,6 +89,7 @@ export function useComposerDictation(input: {
       return;
     }
     recordingIdRef.current = null;
+    stoppingRecordingIdRef.current = recordingId;
     const generation = ++operationGenerationRef.current;
     const draftAtStop = draftRef.current;
     setPhase("transcribing");
@@ -136,6 +138,7 @@ export function useComposerDictation(input: {
     } catch (cause) {
       if (operationGenerationRef.current === generation) setError(errorMessage(cause));
     } finally {
+      if (stoppingRecordingIdRef.current === recordingId) stoppingRecordingIdRef.current = null;
       if (completedRecording !== undefined) {
         await native
           .deleteRecordingAsync({
@@ -153,10 +156,33 @@ export function useComposerDictation(input: {
     startPendingRef.current = false;
     const recordingId = recordingIdRef.current;
     recordingIdRef.current = null;
+    stoppingRecordingIdRef.current = null;
     if (native !== null && recordingId !== null) {
       await native.cancelRecordingAsync({ recordingId }).catch(() => undefined);
     }
     setPhase("idle");
+  }, [native]);
+
+  useEffect(() => {
+    if (native === null) return;
+    const subscription = native.addListener("recordingTerminated", (event) => {
+      if (
+        recordingIdRef.current !== event.recordingId &&
+        stoppingRecordingIdRef.current !== event.recordingId
+      )
+        return;
+      ++operationGenerationRef.current;
+      startPendingRef.current = false;
+      recordingIdRef.current = null;
+      stoppingRecordingIdRef.current = null;
+      setPhase("idle");
+      setError(
+        event.code === "recording-duration-limit"
+          ? "Recording stopped after the 30 minute limit"
+          : "Recording stopped after reaching the 32 MiB limit",
+      );
+    });
+    return () => subscription.remove();
   }, [native]);
 
   useEffect(() => {
@@ -175,6 +201,7 @@ export function useComposerDictation(input: {
       startPendingRef.current = false;
       const recordingId = recordingIdRef.current;
       recordingIdRef.current = null;
+      stoppingRecordingIdRef.current = null;
       if (native !== null && recordingId !== null) {
         void native.cancelRecordingAsync({ recordingId });
       }

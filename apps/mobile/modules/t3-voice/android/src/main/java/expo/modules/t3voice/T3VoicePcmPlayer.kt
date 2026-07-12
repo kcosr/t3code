@@ -7,6 +7,9 @@ import android.util.Base64
 import android.os.SystemClock
 import java.util.TreeMap
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 internal interface T3VoicePcmOutput {
@@ -27,13 +30,35 @@ internal interface T3VoicePlaybackClock {
   fun sleep(delayMs: Long)
 }
 
+internal data class T3VoicePcmLimits(
+  val maximumEncodedChunkBytes: Int = 350_000,
+  val maximumDecodedChunkBytes: Int = 256 * 1_024,
+  val maximumQueuedBytes: Int = 1_024 * 1_024,
+  val maximumQueuedChunks: Int = 8,
+  val maximumIndexGap: Int = 8,
+  val maximumTotalBytes: Long = 32L * 1_024L * 1_024L,
+  val maximumTotalChunks: Int = 4_096,
+  val maximumDurationSeconds: Int = 10 * 60,
+  val incompleteStreamTimeoutMs: Long = 15_000,
+)
+
+internal fun interface T3VoicePlaybackTimeoutScheduler {
+  fun schedule(delayMs: Long, action: () -> Unit): T3VoicePlaybackTimeoutTask
+}
+
+internal fun interface T3VoicePlaybackTimeoutTask {
+  fun cancel()
+}
+
 internal class T3VoicePcmPlayer(
   private val onChunkConsumed: (String, Int) -> Unit,
   private val onFinished: (String) -> Unit,
   private val onError: (String, Throwable) -> Unit,
   private val outputFactory: T3VoicePcmOutputFactory = AndroidPcmOutputFactory,
   private val clock: T3VoicePlaybackClock = AndroidPlaybackClock,
-  private val decodePcm: (String) -> ByteArray = { Base64.decode(it, Base64.DEFAULT) },
+  private val decodePcm: (String) -> ByteArray = ::decodeStrictPcm,
+  private val limits: T3VoicePcmLimits = T3VoicePcmLimits(),
+  private val timeoutScheduler: T3VoicePlaybackTimeoutScheduler = AndroidTimeoutScheduler,
 ) {
   private data class ActivePlayback(
     val playbackId: String,
@@ -45,7 +70,12 @@ internal class T3VoicePcmPlayer(
     var finalChunkIndex: Int? = null,
     @Volatile var cancelled: Boolean = false,
     var framesWritten: Long = 0,
+    var queuedBytes: Int = 0,
+    var acceptedBytes: Long = 0,
+    var acceptedChunks: Int = 0,
+    var acceptedFrames: Long = 0,
     var drainScheduled: Boolean = false,
+    var incompleteTimeout: T3VoicePlaybackTimeoutTask? = null,
     val released: AtomicBoolean = AtomicBoolean(false),
   )
 
@@ -70,18 +100,42 @@ internal class T3VoicePcmPlayer(
 
   fun enqueue(playbackId: String, chunkIndex: Int, pcmBase64: String) {
     require(chunkIndex >= 0) { "PCM chunk indexes must be non-negative." }
-    val pcm = decodePcm(pcmBase64)
-    require(pcm.isNotEmpty()) { "PCM chunks must not be empty." }
+    require(pcmBase64.length <= limits.maximumEncodedChunkBytes) { "PCM chunk is too large." }
     synchronized(lock) {
       val playback = requireActive(playbackId)
+      val pcm = decodePcm(pcmBase64)
+      require(pcm.isNotEmpty()) { "PCM chunks must not be empty." }
+      require(pcm.size <= limits.maximumDecodedChunkBytes) { "PCM chunk is too large." }
+      require(pcm.size % playback.bytesPerFrame == 0) { "PCM chunk ended on a partial frame." }
       check(chunkIndex >= playback.nextChunkIndex) { "PCM chunk $chunkIndex was already consumed." }
-      check(playback.pending.putIfAbsent(chunkIndex, pcm) == null) {
-        "PCM chunk $chunkIndex was already queued."
+      check(chunkIndex.toLong() - playback.nextChunkIndex <= limits.maximumIndexGap) {
+        "PCM chunk $chunkIndex is too far ahead of the playback cursor."
       }
+      check(!playback.pending.containsKey(chunkIndex)) { "PCM chunk $chunkIndex was already queued." }
       val finalIndex = playback.finalChunkIndex
       check(finalIndex == null || chunkIndex <= finalIndex) {
         "PCM chunk $chunkIndex is after the declared final chunk $finalIndex."
       }
+      check(playback.pending.size < limits.maximumQueuedChunks) { "PCM playback queue is full." }
+      check(playback.queuedBytes.toLong() + pcm.size <= limits.maximumQueuedBytes) {
+        "PCM playback queue byte limit was exceeded."
+      }
+      check(playback.acceptedChunks < limits.maximumTotalChunks) {
+        "PCM playback chunk limit was exceeded."
+      }
+      check(playback.acceptedBytes + pcm.size <= limits.maximumTotalBytes) {
+        "PCM playback byte limit was exceeded."
+      }
+      val frames = pcm.size / playback.bytesPerFrame
+      val maximumFrames = playback.sampleRate.toLong() * limits.maximumDurationSeconds
+      check(playback.acceptedFrames + frames <= maximumFrames) {
+        "PCM playback duration limit was exceeded."
+      }
+      playback.pending[chunkIndex] = pcm
+      playback.queuedBytes += pcm.size
+      playback.acceptedBytes += pcm.size
+      playback.acceptedChunks += 1
+      playback.acceptedFrames += frames
       scheduleDrainLocked(playback)
     }
   }
@@ -94,7 +148,11 @@ internal class T3VoicePcmPlayer(
       check(finalChunkIndex >= playback.nextChunkIndex - 1) {
         "The final PCM chunk index precedes consumed audio."
       }
+      check(finalChunkIndex.toLong() - playback.nextChunkIndex <= limits.maximumIndexGap) {
+        "The final PCM chunk index is too far ahead of the playback cursor."
+      }
       playback.finalChunkIndex = finalChunkIndex
+      if (finalChunkIndex != playback.nextChunkIndex - 1) armIncompleteTimeoutLocked(playback)
       scheduleDrainLocked(playback)
     }
   }
@@ -105,6 +163,7 @@ internal class T3VoicePcmPlayer(
         val current = requireActive(playbackId)
         current.cancelled = true
         current.pending.clear()
+        current.queuedBytes = 0
         active = null
         current
       }
@@ -146,6 +205,7 @@ internal class T3VoicePcmPlayer(
               if (!isComplete) playback.drainScheduled = false
               Triple(playback, null, isComplete)
             } else {
+              playback.queuedBytes -= pcm.size
               val chunkIndex = playback.nextChunkIndex
               playback.nextChunkIndex += 1
               Triple(playback, chunkIndex to pcm, false)
@@ -153,6 +213,9 @@ internal class T3VoicePcmPlayer(
           }
 
         if (next.third) {
+          synchronized(lock) {
+            if (active === playback) cancelIncompleteTimeoutLocked(playback)
+          }
           awaitPlaybackDrain(next.first)
           val completed =
             synchronized(lock) {
@@ -226,7 +289,33 @@ internal class T3VoicePcmPlayer(
   }
 
   private fun releaseOutputOnce(playback: ActivePlayback, flush: Boolean) {
+    synchronized(lock) { cancelIncompleteTimeoutLocked(playback) }
     if (playback.released.compareAndSet(false, true)) playback.output.release(flush)
+  }
+
+  private fun armIncompleteTimeoutLocked(playback: ActivePlayback) {
+    cancelIncompleteTimeoutLocked(playback)
+    playback.incompleteTimeout =
+      timeoutScheduler.schedule(limits.incompleteStreamTimeoutMs) {
+        val timedOut =
+          synchronized(lock) {
+            if (active !== playback || playback.cancelled) return@schedule
+            val finalIndex = playback.finalChunkIndex ?: return@schedule
+            if (finalIndex == playback.nextChunkIndex - 1) return@schedule
+            active = null
+            playback.cancelled = true
+            playback.pending.clear()
+            playback.queuedBytes = 0
+            playback
+          }
+        releaseOutputOnce(timedOut, flush = true)
+        onError(timedOut.playbackId, IllegalStateException("PCM playback stream was incomplete."))
+      }
+  }
+
+  private fun cancelIncompleteTimeoutLocked(playback: ActivePlayback) {
+    playback.incompleteTimeout?.cancel()
+    playback.incompleteTimeout = null
   }
 
   companion object {
@@ -236,12 +325,30 @@ internal class T3VoicePcmPlayer(
     private const val DRAIN_GRACE_MS = 500L
     private const val MAXIMUM_DRAIN_WAIT_MS = 30_000L
     private const val DRAIN_POLL_INTERVAL_MS = 10L
+    private val BASE64_PATTERN =
+      Regex("^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$")
+
+    private fun decodeStrictPcm(value: String): ByteArray {
+      require(value.isNotEmpty() && value.length % 4 == 0 && BASE64_PATTERN.matches(value)) {
+        "PCM chunk is not valid Base64."
+      }
+      return Base64.decode(value, Base64.NO_WRAP)
+    }
   }
 
   private object AndroidPlaybackClock : T3VoicePlaybackClock {
     override fun elapsedRealtime(): Long = SystemClock.elapsedRealtime()
 
     override fun sleep(delayMs: Long) = Thread.sleep(delayMs)
+  }
+
+  private object AndroidTimeoutScheduler : T3VoicePlaybackTimeoutScheduler {
+    private val executor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+
+    override fun schedule(delayMs: Long, action: () -> Unit): T3VoicePlaybackTimeoutTask {
+      val future: ScheduledFuture<*> = executor.schedule(action, delayMs, TimeUnit.MILLISECONDS)
+      return T3VoicePlaybackTimeoutTask { future.cancel(false) }
+    }
   }
 
   private object AndroidPcmOutputFactory : T3VoicePcmOutputFactory {

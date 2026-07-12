@@ -223,7 +223,16 @@ class T3VoiceRuntimeService : Service() {
 
   override fun onCreate() {
     super.onCreate()
-    recorder = T3VoiceRecorder(applicationContext)
+    recorder =
+      T3VoiceRecorder(applicationContext) { recordingId, code ->
+        synchronized(operationLock) {
+          val owner = recordingOwner?.takeIf { it.id == recordingId } ?: return@T3VoiceRecorder
+          releaseRecordingLocked(owner)
+          T3VoiceStateStore.emit(
+            T3VoiceRuntimeEvent.RecordingTerminated(recordingId, "limit-reached", code),
+          )
+        }
+      }
     recorder.sweepStaleCache()
     player =
       T3VoicePcmPlayer(

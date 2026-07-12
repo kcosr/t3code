@@ -94,17 +94,22 @@ internal data class T3VoiceRecordingResult(
   }
 }
 
-internal class T3VoiceRecorder(private val context: Context) {
+internal class T3VoiceRecorder(
+  private val context: Context,
+  private val onLimitReached: (String, String) -> Unit = { _, _ -> },
+) {
   private data class ActiveRecording(
     val recordingId: String,
     val recorder: MediaRecorder,
     val file: File,
     val startedAtMs: Long,
+    val terminalOwner: T3VoiceRecordingTerminalPolicy.Owner,
   )
 
   private var active: ActiveRecording? = null
   private val completed = mutableMapOf<String, File>()
   private val recordingCache = T3VoiceRecordingCache(context.cacheDir)
+  private val terminalPolicy = T3VoiceRecordingTerminalPolicy()
 
   fun sweepStaleCache(): Int = recordingCache.sweep()
 
@@ -113,6 +118,7 @@ internal class T3VoiceRecorder(private val context: Context) {
     check(active == null) { "A voice recording is already active." }
     val outputFile = recordingCache.createTempFile()
     val recorder = createMediaRecorder()
+    val terminalOwner = terminalPolicy.activate(recordingId)
     try {
       recorder.setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
       recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
@@ -120,10 +126,14 @@ internal class T3VoiceRecorder(private val context: Context) {
       recorder.setAudioSamplingRate(RECORDING_SAMPLE_RATE)
       recorder.setAudioChannels(1)
       recorder.setAudioEncodingBitRate(RECORDING_BIT_RATE)
+      recorder.setMaxDuration(MAXIMUM_RECORDING_DURATION_MS)
+      recorder.setMaxFileSize(MAXIMUM_RECORDING_BYTES)
+      recorder.setOnInfoListener { source, what, _ -> handleRecorderInfo(source, what) }
       recorder.setOutputFile(outputFile.absolutePath)
       recorder.prepare()
       recorder.start()
     } catch (cause: Throwable) {
+      terminalPolicy.deactivate(terminalOwner)
       recorder.release()
       outputFile.delete()
       throw cause
@@ -134,6 +144,7 @@ internal class T3VoiceRecorder(private val context: Context) {
         recorder = recorder,
         file = outputFile,
         startedAtMs = SystemClock.elapsedRealtime(),
+        terminalOwner = terminalOwner,
       )
   }
 
@@ -141,6 +152,7 @@ internal class T3VoiceRecorder(private val context: Context) {
   fun stop(recordingId: String): T3VoiceRecordingResult {
     val recording = requireActive(recordingId)
     active = null
+    terminalPolicy.deactivate(recording.terminalOwner)
     try {
       recording.recorder.stop()
     } catch (cause: RuntimeException) {
@@ -162,6 +174,7 @@ internal class T3VoiceRecorder(private val context: Context) {
   fun cancel(recordingId: String) {
     val recording = requireActive(recordingId)
     active = null
+    terminalPolicy.deactivate(recording.terminalOwner)
     try {
       recording.recorder.stop()
     } catch (_: RuntimeException) {
@@ -191,6 +204,7 @@ internal class T3VoiceRecorder(private val context: Context) {
     val recording = active
     if (recording != null) {
       active = null
+      terminalPolicy.deactivate(recording.terminalOwner)
       recording.recorder.release()
       recording.file.delete()
     }
@@ -206,6 +220,31 @@ internal class T3VoiceRecorder(private val context: Context) {
     return recording
   }
 
+  private fun handleRecorderInfo(source: MediaRecorder, what: Int) {
+    val code =
+      when (what) {
+        MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED -> "recording-duration-limit"
+        MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED -> "recording-file-size-limit"
+        else -> return
+      }
+    val recording =
+      synchronized(this) {
+        val current = active?.takeIf { it.recorder === source } ?: return
+        if (!terminalPolicy.claim(current.terminalOwner)) return
+        active = null
+        current
+      }
+    try {
+      recording.recorder.stop()
+    } catch (_: RuntimeException) {
+      // The capped recording is discarded regardless of finalization state.
+    } finally {
+      recording.recorder.release()
+      recording.file.delete()
+    }
+    onLimitReached(recording.recordingId, code)
+  }
+
   @Suppress("DEPRECATION")
   private fun createMediaRecorder(): MediaRecorder =
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -217,5 +256,7 @@ internal class T3VoiceRecorder(private val context: Context) {
   companion object {
     private const val RECORDING_SAMPLE_RATE = 24_000
     private const val RECORDING_BIT_RATE = 64_000
+    private const val MAXIMUM_RECORDING_DURATION_MS = 30 * 60 * 1_000
+    private const val MAXIMUM_RECORDING_BYTES = 32L * 1_024L * 1_024L
   }
 }

@@ -5,6 +5,7 @@ import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class T3VoicePcmPlayerTest {
@@ -119,6 +120,141 @@ class T3VoicePcmPlayerTest {
     player.release()
   }
 
+  @Test
+  fun validatesOwnerBeforeDecodingAndRejectsPartialFrames() {
+    var decodeCount = 0
+    val player =
+      T3VoicePcmPlayer(
+        onChunkConsumed = { _, _ -> },
+        onFinished = {},
+        onError = { _, _ -> },
+        outputFactory = T3VoicePcmOutputFactory { _, _ -> FakeOutput(0) },
+        decodePcm = {
+          decodeCount += 1
+          byteArrayOf(0, 0, 0)
+        },
+      )
+    player.start("owner", 24_000, 2)
+
+    assertThrows(IllegalStateException::class.java) {
+      player.enqueue("stale", 0, "ignored")
+    }
+    assertEquals(0, decodeCount)
+    assertThrows(IllegalArgumentException::class.java) {
+      player.enqueue("owner", 0, "ignored")
+    }
+    assertEquals(1, decodeCount)
+    player.cancel("owner")
+    player.release()
+  }
+
+  @Test
+  fun rejectsMalformedBase64BeforeAndroidDecode() {
+    val player =
+      T3VoicePcmPlayer(
+        onChunkConsumed = { _, _ -> },
+        onFinished = {},
+        onError = { _, _ -> },
+        outputFactory = T3VoicePcmOutputFactory { _, _ -> FakeOutput(0) },
+      )
+    player.start("owner", 24_000, 1)
+
+    assertThrows(IllegalArgumentException::class.java) {
+      player.enqueue("owner", 0, "%%%=")
+    }
+    player.cancel("owner")
+    player.release()
+  }
+
+  @Test
+  fun enforcesQueuedAndLifetimeBudgets() {
+    val output = BlockingWriteOutput()
+    val player =
+      T3VoicePcmPlayer(
+        onChunkConsumed = { _, _ -> },
+        onFinished = {},
+        onError = { _, _ -> },
+        outputFactory = T3VoicePcmOutputFactory { _, _ -> output },
+        decodePcm = { byteArrayOf(0, 0) },
+        limits =
+          T3VoicePcmLimits(
+            maximumQueuedChunks = 1,
+            maximumQueuedBytes = 2,
+            maximumTotalChunks = 10,
+            maximumTotalBytes = 20,
+          ),
+      )
+    player.start("bounded", 24_000, 1)
+    player.enqueue("bounded", 0, "ignored")
+    assertTrue(output.writeEntered.await(2, TimeUnit.SECONDS))
+    player.enqueue("bounded", 1, "ignored")
+
+    assertThrows(IllegalStateException::class.java) {
+      player.enqueue("bounded", 2, "ignored")
+    }
+    output.allowWriteToComplete.countDown()
+    player.cancel("bounded")
+    player.release()
+  }
+
+  @Test
+  fun enforcesChunkIndexAndTotalByteLimits() {
+    val output = BlockingWriteOutput()
+    val player =
+      T3VoicePcmPlayer(
+        onChunkConsumed = { _, _ -> },
+        onFinished = {},
+        onError = { _, _ -> },
+        outputFactory = T3VoicePcmOutputFactory { _, _ -> output },
+        decodePcm = { byteArrayOf(0, 0) },
+        limits =
+          T3VoicePcmLimits(
+            maximumIndexGap = 1,
+            maximumTotalBytes = 2,
+            maximumTotalChunks = 10,
+          ),
+      )
+    player.start("bounded", 24_000, 1)
+    assertThrows(IllegalStateException::class.java) {
+      player.enqueue("bounded", 2, "ignored")
+    }
+    player.enqueue("bounded", 0, "ignored")
+    assertTrue(output.writeEntered.await(2, TimeUnit.SECONDS))
+    assertThrows(IllegalStateException::class.java) {
+      player.enqueue("bounded", 1, "ignored")
+    }
+    output.allowWriteToComplete.countDown()
+    player.cancel("bounded")
+    player.release()
+  }
+
+  @Test
+  fun incompleteStreamTimeoutReleasesAndReportsExactlyOnce() {
+    val output = FakeOutput(0)
+    val scheduler = FakeTimeoutScheduler()
+    val errors = mutableListOf<String>()
+    val player =
+      T3VoicePcmPlayer(
+        onChunkConsumed = { _, _ -> },
+        onFinished = { throw AssertionError("incomplete playback must not finish") },
+        onError = { id, _ -> errors += id },
+        outputFactory = T3VoicePcmOutputFactory { _, _ -> output },
+        decodePcm = { byteArrayOf(0, 0) },
+        timeoutScheduler = scheduler,
+      )
+    player.start("incomplete", 24_000, 1)
+    player.finish("incomplete", 1)
+
+    scheduler.run()
+    scheduler.run()
+
+    assertEquals(listOf("incomplete"), errors)
+    assertEquals(1, output.releaseCount)
+    assertEquals(listOf(true), output.releaseFlushes)
+    assertThrows(IllegalStateException::class.java) { player.cancel("incomplete") }
+    player.release()
+  }
+
   private class FakeOutput(
     override val playbackHeadPosition: Long,
   ) : T3VoicePcmOutput {
@@ -178,5 +314,18 @@ class T3VoicePcmPlayerTest {
     override fun elapsedRealtime(): Long = 0
 
     override fun sleep(delayMs: Long) = Unit
+  }
+
+  private class FakeTimeoutScheduler : T3VoicePlaybackTimeoutScheduler {
+    private var action: (() -> Unit)? = null
+
+    override fun schedule(delayMs: Long, action: () -> Unit): T3VoicePlaybackTimeoutTask {
+      this.action = action
+      return T3VoicePlaybackTimeoutTask { this.action = null }
+    }
+
+    fun run() {
+      action?.invoke()
+    }
   }
 }

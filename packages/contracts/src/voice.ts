@@ -45,6 +45,9 @@ export const VoiceAudioFormat = Schema.Literals([
 ]);
 export type VoiceAudioFormat = typeof VoiceAudioFormat.Type;
 
+export const VoiceTranscriptionUploadFormat = Schema.Literal("audio/mp4");
+export type VoiceTranscriptionUploadFormat = typeof VoiceTranscriptionUploadFormat.Type;
+
 export const VoiceCapabilityDescriptor = Schema.Struct({
   capability: VoiceCapability,
   state: VoiceCapabilityState,
@@ -466,11 +469,35 @@ export const VoiceConfirmationResult = Schema.Struct({
 });
 export type VoiceConfirmationResult = typeof VoiceConfirmationResult.Type;
 
+export const VOICE_TRANSCRIPTION_LANGUAGE_MAX_CHARS = 35;
+export const VOICE_TRANSCRIPTION_VOCABULARY_MAX_ITEMS = 64;
+export const VOICE_TRANSCRIPTION_VOCABULARY_ITEM_MAX_CHARS = 128;
+export const VOICE_SPEECH_TEXT_MAX_BYTES = 8 * 1024;
+
+const VoiceTranscriptionLanguage = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(VOICE_TRANSCRIPTION_LANGUAGE_MAX_CHARS),
+  Schema.isPattern(/^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/),
+);
+const VoiceTranscriptionVocabularyItem = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(VOICE_TRANSCRIPTION_VOCABULARY_ITEM_MAX_CHARS),
+);
+const VoiceSpeechText = TrimmedNonEmptyString.check(
+  Schema.makeFilter(
+    (text) =>
+      new TextEncoder().encode(text).byteLength <= VOICE_SPEECH_TEXT_MAX_BYTES ||
+      `Speech text must not exceed ${VOICE_SPEECH_TEXT_MAX_BYTES} UTF-8 bytes`,
+  ),
+);
+
 export const VoiceTranscriptionMetadata = Schema.Struct({
   requestId: VoiceRequestId,
-  format: VoiceAudioFormat,
-  language: Schema.optionalKey(TrimmedNonEmptyString),
-  vocabulary: Schema.optionalKey(Schema.Array(TrimmedNonEmptyString)),
+  format: VoiceTranscriptionUploadFormat,
+  language: Schema.optionalKey(VoiceTranscriptionLanguage),
+  vocabulary: Schema.optionalKey(
+    Schema.Array(VoiceTranscriptionVocabularyItem).check(
+      Schema.isMaxLength(VOICE_TRANSCRIPTION_VOCABULARY_MAX_ITEMS),
+    ),
+  ),
 });
 export type VoiceTranscriptionMetadata = typeof VoiceTranscriptionMetadata.Type;
 
@@ -494,13 +521,16 @@ export const VoiceTranscriptionStreamEvent = Schema.Union([
 ]);
 export type VoiceTranscriptionStreamEvent = typeof VoiceTranscriptionStreamEvent.Type;
 
+export const VoiceSpeechPreset = Schema.Literals(["default", "warm"]);
+export type VoiceSpeechPreset = typeof VoiceSpeechPreset.Type;
+
 export const VoiceSpeechRequest = Schema.Struct({
   requestId: VoiceRequestId,
   playbackId: VoicePlaybackId,
   segmentIndex: NonNegativeInt,
   finalSegment: Schema.Boolean,
-  text: TrimmedNonEmptyString,
-  preset: TrimmedNonEmptyString,
+  text: VoiceSpeechText,
+  preset: VoiceSpeechPreset,
 });
 export type VoiceSpeechRequest = typeof VoiceSpeechRequest.Type;
 
@@ -511,11 +541,20 @@ export const VoiceMediaTicketOperation = Schema.Literals([
 ]);
 export type VoiceMediaTicketOperation = typeof VoiceMediaTicketOperation.Type;
 
-export const VoiceMediaTicketRequest = Schema.Struct({
-  operation: VoiceMediaTicketOperation,
-  requestId: Schema.optionalKey(VoiceRequestId),
-  sessionId: Schema.optionalKey(VoiceSessionId),
-});
+export const VoiceMediaTicketRequest = Schema.Union([
+  Schema.Struct({
+    operation: Schema.Literal("transcription-upload"),
+    requestId: VoiceRequestId,
+  }),
+  Schema.Struct({
+    operation: Schema.Literal("speech-stream"),
+    requestId: VoiceRequestId,
+  }),
+  Schema.Struct({
+    operation: Schema.Literal("voice-heartbeat"),
+    sessionId: VoiceSessionId,
+  }),
+]);
 export type VoiceMediaTicketRequest = typeof VoiceMediaTicketRequest.Type;
 
 export const VoiceMediaTicket = Schema.Struct({

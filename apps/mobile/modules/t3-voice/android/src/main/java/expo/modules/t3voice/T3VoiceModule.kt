@@ -94,6 +94,8 @@ class T3VoiceModule : Module() {
               when (event) {
                 is T3VoiceRuntimeEvent.PlaybackChunkConsumed ->
                   sendEvent(PLAYBACK_CHUNK_CONSUMED_EVENT, event.toEventBody())
+                is T3VoiceRuntimeEvent.RecordingTerminated ->
+                  sendEvent(RECORDING_TERMINATED_EVENT, event.toEventBody())
                 is T3VoiceRuntimeEvent.RuntimeError ->
                   sendEvent(RUNTIME_ERROR_EVENT, event.toEventBody())
                 is T3VoiceRuntimeEvent.AudioRouteChanged ->
@@ -140,13 +142,14 @@ class T3VoiceModule : Module() {
       Events(
         STATE_CHANGED_EVENT,
         PLAYBACK_CHUNK_CONSUMED_EVENT,
+        RECORDING_TERMINATED_EVENT,
         RUNTIME_ERROR_EVENT,
         AUDIO_ROUTE_CHANGED_EVENT,
         REALTIME_TERMINATED_EVENT,
       )
 
       Constants(
-        "nativeRevision" to 4,
+        "nativeRevision" to 5,
       )
 
       OnCreate {
@@ -251,7 +254,7 @@ class T3VoiceModule : Module() {
         withBinder(promise, "recording-delete-failed") { voice, result ->
           voice.deleteRecording(
             recordingId = requireIdentifier(input, "recordingId"),
-            uri = requireIdentifier(input, "uri"),
+            uri = requireText(input, "uri", T3VoiceBridgeValidation.MAXIMUM_URI_LENGTH),
           )
           result.resolve()
         }
@@ -274,7 +277,8 @@ class T3VoiceModule : Module() {
           voice.enqueuePlaybackChunk(
             playbackId = requireIdentifier(input, "playbackId"),
             chunkIndex = requireInt(input, "chunkIndex"),
-            pcmBase64 = requireIdentifier(input, "pcmBase64"),
+            pcmBase64 =
+              requireText(input, "pcmBase64", T3VoiceBridgeValidation.MAXIMUM_PCM_BASE64_LENGTH),
           )
           result.resolve()
         }
@@ -339,7 +343,7 @@ class T3VoiceModule : Module() {
 
       AsyncFunction("applyRealtimeAnswerAsync") { input: Map<String, String>, promise: Promise ->
         val nativeSessionId = requireIdentifier(input, "nativeSessionId")
-        val sdp = requireIdentifier(input, "sdp")
+        val sdp = requireText(input, "sdp", T3VoiceBridgeValidation.MAXIMUM_SDP_LENGTH)
         try {
           withBinder(promise, "realtime-answer-rejected") { voice, settlement ->
             voice.applyRealtimeAnswer(
@@ -571,15 +575,15 @@ class T3VoiceModule : Module() {
   }
 
   private fun requireIdentifier(input: Map<String, *>, key: String): String {
-    val value = input[key] as? String
-    require(!value.isNullOrBlank()) { "$key must be a non-empty string." }
-    return value
+    return requireText(input, key, T3VoiceBridgeValidation.MAXIMUM_IDENTIFIER_LENGTH)
   }
 
   private fun requireInt(input: Map<String, Any>, key: String): Int {
-    val value = input[key] as? Number ?: error("$key must be a number.")
-    return value.toInt()
+    return T3VoiceBridgeValidation.requireInt(input, key)
   }
+
+  private fun requireText(input: Map<String, *>, key: String, maximumLength: Int): String =
+    T3VoiceBridgeValidation.requireText(input, key, maximumLength)
 
   private fun cancelCollections() {
     stateCollection?.cancel()
@@ -602,6 +606,7 @@ class T3VoiceModule : Module() {
     private const val MODULE_NAME = "T3Voice"
     private const val STATE_CHANGED_EVENT = "stateChanged"
     private const val PLAYBACK_CHUNK_CONSUMED_EVENT = "playbackChunkConsumed"
+    private const val RECORDING_TERMINATED_EVENT = "recordingTerminated"
     private const val RUNTIME_ERROR_EVENT = "runtimeError"
     private const val AUDIO_ROUTE_CHANGED_EVENT = "audioRouteChanged"
     private const val REALTIME_TERMINATED_EVENT = "realtimeTerminated"

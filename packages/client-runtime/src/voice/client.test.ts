@@ -389,11 +389,11 @@ describe("makeVoiceHttpClient", () => {
           audio: {
             kind: "blob",
             value: new Blob([new Uint8Array([1, 2, 3])], {
-              type: "audio/wav",
+              type: "audio/mp4",
             }),
-            filename: "recording.wav",
+            filename: "recording.m4a",
           },
-          metadata: { requestId: REQUEST_ID, format: "audio/wav" },
+          metadata: { requestId: REQUEST_ID, format: "audio/mp4" },
         })
         .pipe(
           Stream.runCollect,
@@ -415,7 +415,7 @@ describe("makeVoiceHttpClient", () => {
       const body = received?.init?.body;
       expect(body).toBeInstanceOf(FormData);
       expect((body as FormData).get("metadata")).toBe(
-        '{"requestId":"request-1","format":"audio/wav"}',
+        '{"requestId":"request-1","format":"audio/mp4"}',
       );
     }),
   );

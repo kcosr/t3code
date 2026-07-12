@@ -14,7 +14,6 @@ import {
   annotateEnvironmentRequest,
   currentEnvironmentTraceId,
   failEnvironmentInternal,
-  failEnvironmentInvalidRequest,
   failEnvironmentNotFound,
   requireEnvironmentScope,
 } from "../auth/http.ts";
@@ -50,16 +49,17 @@ const failVoiceConversationOperation = (
 const descriptor = (
   capability: VoiceCapabilityDescriptor["capability"],
   state: VoiceCapabilityDescriptor["state"],
-  settings: { readonly maxUploadBytes: number },
+  settings: { readonly maxUploadBytes: number; readonly maxInputDurationSeconds: number },
 ): VoiceCapabilityDescriptor => {
   switch (capability) {
     case "transcription.request":
       return {
         capability,
         state,
-        inputFormats: ["audio/mpeg", "audio/mp4", "audio/m4a", "audio/wav", "audio/webm"],
+        inputFormats: ["audio/mp4"],
         outputFormats: [],
         maxInputBytes: settings.maxUploadBytes,
+        maxInputDurationSeconds: settings.maxInputDurationSeconds,
       };
     case "speech.streaming":
       return {
@@ -85,6 +85,8 @@ const descriptor = (
       };
   }
 };
+
+export const __testing = { descriptor };
 
 export const voiceControlHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
@@ -321,18 +323,21 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
           yield* annotateEnvironmentRequest(args.endpoint.name);
           const principal = yield* requireEnvironmentScope(AuthVoiceUseScope);
           const input = args.payload;
-          const validBinding =
-            (input.operation === "voice-heartbeat" && input.sessionId !== undefined) ||
-            (input.operation !== "voice-heartbeat" && input.requestId !== undefined);
-          if (!validBinding) {
-            return yield* failEnvironmentInvalidRequest("invalid_voice_media_binding");
+          switch (input.operation) {
+            case "transcription-upload":
+            case "speech-stream":
+              return yield* tickets.issue({
+                authSessionId: principal.sessionId,
+                operation: input.operation,
+                requestId: input.requestId,
+              });
+            case "voice-heartbeat":
+              return yield* tickets.issue({
+                authSessionId: principal.sessionId,
+                operation: input.operation,
+                voiceSessionId: input.sessionId,
+              });
           }
-          return yield* tickets.issue({
-            authSessionId: principal.sessionId,
-            operation: input.operation,
-            ...(input.requestId === undefined ? {} : { requestId: input.requestId }),
-            ...(input.sessionId === undefined ? {} : { voiceSessionId: input.sessionId }),
-          });
         }),
       )
       .handle(

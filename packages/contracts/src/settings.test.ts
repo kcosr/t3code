@@ -91,7 +91,12 @@ describe("ServerSettings.voice", () => {
   it("is disabled by default and decodes provider-neutral policy defaults", () => {
     expect(DEFAULT_SERVER_SETTINGS.voice).toMatchObject({
       enabled: false,
-      maxUploadBytes: 25 * 1024 * 1024,
+      maxUploadBytes: 32 * 1024 * 1024,
+      maxInputDurationSeconds: 30 * 60,
+      maxSpeechTextBytes: 8 * 1024,
+      maxSpeechOutputBytes: 8 * 1024 * 1024,
+      mediaRequestTimeoutSeconds: 120,
+      maxConcurrentMediaRequests: 4,
       maxConcurrentSessions: 1,
       contextTokenBudget: 16_000,
     });
@@ -101,6 +106,21 @@ describe("ServerSettings.voice", () => {
     expect(() =>
       Schema.decodeUnknownSync(ServerSettings)({
         voice: { maxConcurrentSessions: 0 },
+      }),
+    ).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(ServerSettings)({
+        voice: { maxInputDurationSeconds: 3_601 },
+      }),
+    ).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(ServerSettings)({
+        voice: { maxSpeechTextBytes: 8 * 1024 + 1 },
+      }),
+    ).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(ServerSettings)({
+        voice: { maxSpeechOutputBytes: 8 * 1024 * 1024 + 1 },
       }),
     ).toThrow();
   });

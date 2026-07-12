@@ -617,7 +617,16 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
       control({
         method: "POST",
         pathname: "/api/voice/media-tickets",
-        run: (client, headers) => client.voice.mediaTicket({ headers, payload }),
+        run: (client, headers) => {
+          switch (payload.operation) {
+            case "transcription-upload":
+              return client.voice.mediaTicket({ headers, payload });
+            case "speech-stream":
+              return client.voice.mediaTicket({ headers, payload });
+            case "voice-heartbeat":
+              return client.voice.mediaTicket({ headers, payload });
+          }
+        },
       }),
     transcribe: (request) => {
       const requestUrl = environmentEndpointUrl(

@@ -73,6 +73,12 @@ export interface T3VoicePlaybackChunkConsumedEvent {
   readonly chunkIndex: number;
 }
 
+export interface T3VoiceRecordingTerminatedEvent {
+  readonly recordingId: string;
+  readonly outcome: "limit-reached";
+  readonly code: "recording-duration-limit" | "recording-file-size-limit";
+}
+
 export interface T3VoiceRuntimeErrorEvent {
   readonly operation: string;
   readonly code: string;
@@ -155,6 +161,10 @@ export interface T3VoiceNativeModule {
     (
       eventName: "playbackChunkConsumed",
       listener: (event: T3VoicePlaybackChunkConsumedEvent) => void,
+    ): T3VoiceEventSubscription;
+    (
+      eventName: "recordingTerminated",
+      listener: (event: T3VoiceRecordingTerminatedEvent) => void,
     ): T3VoiceEventSubscription;
     (
       eventName: "runtimeError",
