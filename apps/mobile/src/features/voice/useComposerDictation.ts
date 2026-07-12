@@ -130,7 +130,6 @@ export function useComposerDictation(input: {
         recordingId,
         endpointDetection: {
           endSilenceMs: 1_200,
-          noSpeechTimeoutMs: null,
         },
       });
       if (operationGenerationRef.current !== generation) {

@@ -42,7 +42,7 @@ export interface T3VoiceRecordingIdentifier {
 export interface T3VoiceRecordingInput extends T3VoiceRecordingIdentifier {
   readonly endpointDetection: {
     readonly endSilenceMs: number;
-    readonly noSpeechTimeoutMs: number | null;
+    readonly noSpeechTimeoutMs?: number;
   };
 }
 

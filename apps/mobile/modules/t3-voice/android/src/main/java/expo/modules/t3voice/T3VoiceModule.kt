@@ -241,7 +241,11 @@ class T3VoiceModule : Module() {
         val endpointInput =
           input["endpointDetection"] as? Map<*, *>
             ?: error("endpointDetection must be an object.")
-        requireExactKeys(endpointInput, setOf("endSilenceMs", "noSpeechTimeoutMs"))
+        requireAllowedKeys(
+          endpointInput,
+          required = setOf("endSilenceMs"),
+          allowed = setOf("endSilenceMs", "noSpeechTimeoutMs"),
+        )
         val endpointConfig =
           T3VoiceEndpointDetectionConfig(
             endSilenceMs = requireLong(endpointInput, "endSilenceMs"),
@@ -621,6 +625,17 @@ class T3VoiceModule : Module() {
 
   private fun requireExactKeys(input: Map<*, *>, expected: Set<String>) {
     check(input.keys == expected) { "Input fields must be exactly ${expected.sorted().joinToString()}." }
+  }
+
+  private fun requireAllowedKeys(
+    input: Map<*, *>,
+    required: Set<String>,
+    allowed: Set<String>,
+  ) {
+    check(input.keys.containsAll(required) && allowed.containsAll(input.keys)) {
+      "Input fields must include ${required.sorted().joinToString()} and may include " +
+        allowed.sorted().joinToString() + "."
+    }
   }
 
   private fun requireText(input: Map<String, *>, key: String, maximumLength: Int): String =
