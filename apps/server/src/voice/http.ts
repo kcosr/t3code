@@ -185,7 +185,6 @@ const transcriptionRoute = HttpRouter.add(
     }
     const settingsService = yield* ServerSettingsService;
     const settings = (yield* settingsService.getSettings).voice;
-    const permit = yield* mediaRequestLimiter.acquire(settings.maxConcurrentMediaRequests);
     return yield* Effect.gen(function* () {
       const { metadata, bytes, validatedMedia } = yield* boundVoiceMediaEffect(
         decodeTranscriptionMultipart,
@@ -197,6 +196,7 @@ const transcriptionRoute = HttpRouter.add(
           { status: 401 },
         );
       }
+      const permit = yield* mediaRequestLimiter.acquire(settings.maxConcurrentMediaRequests);
       const providers = yield* VoiceProviderRegistry;
       const provider = yield* providers.resolve("transcription.request");
       const transcriber = provider.transcriber;
@@ -250,15 +250,18 @@ const speechRoute = HttpRouter.add(
     if (!settings.enabled) {
       return yield* invalidRequest("Voice is disabled on this server");
     }
-    const input = yield* decodeBoundedJson(request, VOICE_SPEECH_REQUEST_MAX_BYTES).pipe(
-      Effect.flatMap((value) =>
-        decodeSpeechRequest(value).pipe(
-          Effect.mapError(
-            (cause) =>
-              new VoiceMediaRequestError({ message: "Invalid voice speech request", cause }),
+    const input = yield* boundVoiceMediaEffect(
+      decodeBoundedJson(request, VOICE_SPEECH_REQUEST_MAX_BYTES).pipe(
+        Effect.flatMap((value) =>
+          decodeSpeechRequest(value).pipe(
+            Effect.mapError(
+              (cause) =>
+                new VoiceMediaRequestError({ message: "Invalid voice speech request", cause }),
+            ),
           ),
         ),
       ),
+      settings.mediaRequestTimeoutSeconds,
     );
     if (new TextEncoder().encode(input.text).byteLength > settings.maxSpeechTextBytes) {
       return yield* invalidRequest("Voice speech text exceeds the configured limit");
