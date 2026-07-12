@@ -10,7 +10,10 @@ import type { T3VoiceNativeModule, T3VoiceRuntimeState } from "@t3tools/mobile-v
 import * as Effect from "effect/Effect";
 import { describe, expect, it, vi } from "vite-plus/test";
 
-import { RealtimeVoiceController } from "./realtimeVoiceController";
+import {
+  RealtimeVoiceController,
+  type RealtimeVoiceControllerOptions,
+} from "./realtimeVoiceController";
 
 const SESSION_ID = VoiceSessionId.make("voice-session-1");
 const createInput: VoiceSessionCreateInput = {
@@ -42,7 +45,7 @@ const serverSession = {
   heartbeatIntervalSeconds: 10,
 };
 
-const makeHarness = () => {
+const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
   const listeners = new Map<string, (event: unknown) => void>();
   let nativeState: T3VoiceRuntimeState = {
     phase: "idle" as const,
@@ -141,7 +144,7 @@ const makeHarness = () => {
       onSnapshot: (snapshot) => snapshots.push(snapshot.phase),
       onAudioRouteChanged: (event) => routeChanges.push(`${event.reason}:${event.routeId}`),
     },
-    { scheduler },
+    { scheduler, ...options },
   );
   const emitNative = (name: string, event: unknown) => {
     if (name === "stateChanged") nativeState = event as typeof nativeState;
@@ -372,6 +375,114 @@ describe("RealtimeVoiceController", () => {
       phase: "idle",
       session: null,
     });
+  });
+
+  it("reports idle after native release while preserving server cleanup as a reconnect barrier", async () => {
+    const { client, controller, native } = makeHarness();
+    await controller.start(createInput);
+    let resolveClose!: () => void;
+    const pendingClose = new Promise<void>((resolve) => {
+      resolveClose = resolve;
+    });
+    vi.mocked(client.closeSession).mockReturnValueOnce(
+      Effect.promise(async () => {
+        await pendingClose;
+        return {
+          state: { ...serverSession.state, phase: "ended" as const },
+          closed: true,
+        };
+      }),
+    );
+    vi.mocked(client.createSession).mockClear();
+
+    await controller.stop();
+
+    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledWith({
+      nativeSessionId: SESSION_ID,
+    });
+    expect(controller.getSnapshot().phase).toBe("idle");
+    const restart = controller.start(createInput);
+    await vi.waitFor(() => expect(controller.getSnapshot().phase).toBe("starting"));
+    expect(controller.getSnapshot().phase).toBe("starting");
+    expect(client.createSession).not.toHaveBeenCalled();
+
+    resolveClose();
+    await restart;
+    expect(client.createSession).toHaveBeenCalledTimes(1);
+    expect(controller.getSnapshot().phase).toBe("active");
+  });
+
+  it("bounds a stalled server cleanup so reconnect cannot hang indefinitely", async () => {
+    const { client, controller } = makeHarness({ serverCleanupTimeoutMs: 5 });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await controller.start(createInput);
+    vi.mocked(client.closeSession).mockReturnValueOnce(Effect.never);
+
+    await controller.stop();
+    await controller.start(createInput);
+
+    expect(controller.getSnapshot().phase).toBe("active");
+    expect(warning).toHaveBeenCalledWith(
+      "[voice] server session cleanup failed",
+      expect.objectContaining({ errorTag: "TimeoutError" }),
+    );
+    warning.mockRestore();
+  });
+
+  it("joins and cleans a startup interrupted before signaling completes", async () => {
+    const { client, controller, native } = makeHarness();
+    let resolveOffer!: () => void;
+    const pendingOffer = new Promise<void>((resolve) => {
+      resolveOffer = resolve;
+    });
+    vi.mocked(client.offerSession).mockReturnValueOnce(
+      Effect.promise(async () => {
+        await pendingOffer;
+        return {
+          sessionId: SESSION_ID,
+          leaseGeneration: 1,
+          sdp: "remote-answer",
+        };
+      }),
+    );
+    const start = controller.start(createInput);
+    await vi.waitFor(() => expect(client.offerSession).toHaveBeenCalledTimes(1));
+
+    const stop = controller.stop();
+    resolveOffer();
+    await Promise.all([start, stop]);
+
+    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledWith({
+      nativeSessionId: SESSION_ID,
+    });
+    expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1);
+    expect(controller.getSnapshot().phase).toBe("idle");
+  });
+
+  it("cancels startup when disposed during initial native reconciliation", async () => {
+    const { client, controller, native } = makeHarness();
+    let resolveReconciliation!: (state: T3VoiceRuntimeState) => void;
+    const reconciliation = new Promise<T3VoiceRuntimeState>((resolve) => {
+      resolveReconciliation = resolve;
+    });
+    vi.mocked(native.getStateAsync).mockReturnValueOnce(reconciliation);
+
+    const start = controller.start(createInput);
+    const dispose = controller.dispose();
+    resolveReconciliation({
+      phase: "idle",
+      isForeground: false,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: null,
+      realtimeConnectionState: null,
+      realtimeMuted: false,
+      sequence: 0,
+    });
+    await Promise.allSettled([start, dispose]);
+
+    expect(client.createSession).not.toHaveBeenCalled();
+    expect(controller.getSnapshot().phase).toBe("idle");
   });
 
   it("does not report idle when explicit stop leaves native media active", async () => {
@@ -732,7 +843,7 @@ describe("RealtimeVoiceController", () => {
     expect(client.closeSession).toHaveBeenCalledTimes(1);
   });
 
-  it("does not let an old native-terminal cleanup overwrite a restarted call", async () => {
+  it("does not let a restart race old native-terminal server cleanup", async () => {
     const { client, controller, emitNative } = makeHarness();
     let resolveClose!: () => void;
     const pendingClose = new Promise<void>((resolve) => {
@@ -757,11 +868,14 @@ describe("RealtimeVoiceController", () => {
     });
     expect(controller.getSnapshot().phase).toBe("error");
 
-    await controller.start(createInput);
+    const restart = controller.start(createInput);
+    await vi.waitFor(() => expect(controller.getSnapshot().phase).toBe("starting"));
+    expect(client.createSession).toHaveBeenCalledTimes(1);
     resolveClose();
-    await Promise.resolve();
+    await restart;
 
     expect(controller.getSnapshot().phase).toBe("active");
+    expect(client.createSession).toHaveBeenCalledTimes(2);
   });
 
   it("lets one terminal owner win when native and server termination race", async () => {

@@ -831,6 +831,7 @@ const make = Effect.gen(function* () {
       const form = new FormData();
       form.set("sdp", input.offer.sdp);
       form.set("session", encodeJson(providerSessionConfig(input.instructions)));
+      const providerCallStartedAt = yield* Clock.currentTimeMillis;
       const response = yield* client
         .execute(
           HttpClientRequest.post(`${OPENAI_API_ORIGIN}/v1/realtime/calls`).pipe(
@@ -864,6 +865,7 @@ const make = Effect.gen(function* () {
         .pipe(
           Effect.flatMap(HttpClientResponse.filterStatusOk),
           Effect.asVoid,
+          Effect.timeout("7 seconds"),
           Effect.mapError(providerError("openai.realtime.hangup")),
         );
       const answerSdp = yield* response.text.pipe(
@@ -885,6 +887,12 @@ const make = Effect.gen(function* () {
           ),
         );
       }
+      const providerCallCompletedAt = yield* Clock.currentTimeMillis;
+      yield* Effect.logInfo("OpenAI Realtime call created", {
+        sessionId: input.sessionId,
+        leaseGeneration: input.leaseGeneration,
+        durationMs: Math.max(0, providerCallCompletedAt - providerCallStartedAt),
+      });
       const sessionScope = yield* Scope.make("sequential");
       const sidebandStartedAt = yield* Clock.currentTimeMillis;
       const sideband = yield* realtimeSocket
@@ -929,6 +937,7 @@ const make = Effect.gen(function* () {
         item,
         identity: continuationIdentity(input.sessionId, input.leaseGeneration, index),
       }));
+      const replayStartedAt = yield* Clock.currentTimeMillis;
       yield* Effect.logInfo("OpenAI Realtime context replay starting", {
         sessionId: input.sessionId,
         leaseGeneration: input.leaseGeneration,
@@ -975,24 +984,27 @@ const make = Effect.gen(function* () {
           }),
         ),
         Effect.tapError(() =>
-          Ref.get(acknowledgedReplayItems).pipe(
-            Effect.flatMap((acknowledgedItemCount) =>
+          Effect.all([Ref.get(acknowledgedReplayItems), Clock.currentTimeMillis]).pipe(
+            Effect.flatMap(([acknowledgedItemCount, replayFailedAt]) =>
               Effect.logWarning("OpenAI Realtime context replay failed", {
                 sessionId: input.sessionId,
                 leaseGeneration: input.leaseGeneration,
                 requestedItemCount: replayItems.length,
                 acknowledgedItemCount,
+                durationMs: Math.max(0, replayFailedAt - replayStartedAt),
               }),
             ),
           ),
         ),
         abortStartup,
       );
+      const replayCompletedAt = yield* Clock.currentTimeMillis;
       yield* Effect.logInfo("OpenAI Realtime context replay completed", {
         sessionId: input.sessionId,
         leaseGeneration: input.leaseGeneration,
         requestedItemCount: replayItems.length,
         acknowledgedItemCount,
+        durationMs: Math.max(0, replayCompletedAt - replayStartedAt),
       });
 
       const submittedToolOutputs = yield* Ref.make(new Set<string>());
@@ -1166,10 +1178,20 @@ const make = Effect.gen(function* () {
           (current) => [!current, true] as const,
         );
         if (!shouldTerminate) return;
+        const terminationStartedAt = yield* Clock.currentTimeMillis;
         const result = yield* hangup.pipe(
           Effect.ensuring(Scope.close(sessionScope, Exit.void)),
           Effect.exit,
         );
+        const terminationCompletedAt = yield* Clock.currentTimeMillis;
+        const terminationAnnotations = {
+          sessionId: input.sessionId,
+          leaseGeneration: input.leaseGeneration,
+          durationMs: Math.max(0, terminationCompletedAt - terminationStartedAt),
+        };
+        yield* result._tag === "Failure"
+          ? Effect.logWarning("OpenAI Realtime termination failed", terminationAnnotations)
+          : Effect.logInfo("OpenAI Realtime termination completed", terminationAnnotations);
         if (result._tag === "Failure") return yield* Effect.failCause(result.cause);
       });
 

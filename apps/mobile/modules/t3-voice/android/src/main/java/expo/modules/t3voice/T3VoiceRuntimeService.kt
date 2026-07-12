@@ -135,15 +135,31 @@ class T3VoiceRuntimeService : Service() {
         check(T3VoiceStateStore.claimRealtime(nativeSessionId)) {
           "The voice runtime is already in use."
         }
+        val diagnosticGeneration = T3VoiceDiagnostics.nextGeneration()
+        T3VoiceDiagnostics.record(
+          diagnosticGeneration,
+          T3VoiceDiagnosticCategory.LIFECYCLE,
+          T3VoiceDiagnosticCode.PREPARE_STARTED,
+        )
         try {
           ensureRuntimeForeground(
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
               ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
           )
-          realtime.prepare(nativeSessionId, callback)
+          realtime.prepare(nativeSessionId, diagnosticGeneration, callback)
         } catch (cause: Throwable) {
           T3VoiceStateStore.releaseRealtimeClaim(nativeSessionId)
           stopRuntimeForegroundLocked()
+          T3VoiceDiagnostics.record(
+            diagnosticGeneration,
+            T3VoiceDiagnosticCategory.TERMINAL,
+            T3VoiceDiagnosticCode.FAILED,
+          )
+          T3VoiceDiagnostics.record(
+            diagnosticGeneration,
+            T3VoiceDiagnosticCategory.LIFECYCLE,
+            T3VoiceDiagnosticCode.FOREGROUND_RELEASED,
+          )
           throw cause
         }
       }
@@ -213,7 +229,7 @@ class T3VoiceRuntimeService : Service() {
             ),
           )
         },
-        onTerminated = { sessionId, outcome, code, retryable ->
+        onTerminated = { sessionId, outcome, code, retryable, diagnosticGeneration ->
           synchronized(operationLock) {
             val terminated =
               T3VoiceStateStore.terminateRealtime(
@@ -224,7 +240,14 @@ class T3VoiceRuntimeService : Service() {
                   retryable = retryable,
                 ),
               )
-            if (terminated) stopRuntimeForegroundLocked()
+            if (terminated) {
+              stopRuntimeForegroundLocked()
+              T3VoiceDiagnostics.record(
+                diagnosticGeneration,
+                T3VoiceDiagnosticCategory.LIFECYCLE,
+                T3VoiceDiagnosticCode.FOREGROUND_RELEASED,
+              )
+            }
           }
         },
       )

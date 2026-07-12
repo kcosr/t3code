@@ -5,7 +5,10 @@ import type {
   T3VoiceRecordingTerminatedEvent,
 } from "@t3tools/mobile-voice-native";
 import { validateRecordingAgainstCapability } from "./dictationPolicy";
-import { cleanupOrphanedRecordingTermination } from "./dictationTermination";
+import {
+  cleanupOrphanedRecordingTermination,
+  dictationTerminationOwnership,
+} from "./dictationTermination";
 
 const capability = {
   capability: "transcription.request" as const,
@@ -43,6 +46,25 @@ describe("dictation capability preflight", () => {
 });
 
 describe("orphaned dictation termination cleanup", () => {
+  it("keeps a redelivered completion owned while its recording is being transcribed", () => {
+    expect(
+      dictationTerminationOwnership({
+        recordingId: "recording-a",
+        activeRecordingId: null,
+        stoppingRecordingId: null,
+        transcribingRecordingId: "recording-a",
+      }),
+    ).toBe("transcribing");
+    expect(
+      dictationTerminationOwnership({
+        recordingId: "recording-b",
+        activeRecordingId: null,
+        stoppingRecordingId: null,
+        transcribingRecordingId: "recording-a",
+      }),
+    ).toBe("orphaned");
+  });
+
   it("deletes retained completed audio", async () => {
     const calls: Array<unknown> = [];
     const native = {

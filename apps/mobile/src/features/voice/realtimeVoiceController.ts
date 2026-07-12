@@ -59,6 +59,7 @@ type ControlOperation = "events" | "heartbeat";
 export interface RealtimeVoiceControllerOptions {
   readonly scheduler?: TimerScheduler;
   readonly eventPollIntervalMs?: number;
+  readonly serverCleanupTimeoutMs?: number;
 }
 
 const defaultScheduler: TimerScheduler = {
@@ -114,6 +115,7 @@ const nativeRuntimeErrorMessage = (code: string): string => {
 export class RealtimeVoiceController {
   private readonly scheduler: TimerScheduler;
   private readonly eventPollIntervalMs: number;
+  private readonly serverCleanupTimeoutMs: number;
   private readonly subscriptions: ReadonlyArray<{
     readonly remove: () => void;
   }>;
@@ -125,6 +127,8 @@ export class RealtimeVoiceController {
   private refreshInFlight = false;
   private heartbeatInFlight = false;
   private nativeRuntimeReconciliation: Promise<void> | null = null;
+  private serverCleanupBarrier: Promise<void> = Promise.resolve();
+  private startInFlight: Promise<void> | null = null;
   private controlFailures: Record<ControlOperation, number> = {
     events: 0,
     heartbeat: 0,
@@ -144,6 +148,7 @@ export class RealtimeVoiceController {
   ) {
     this.scheduler = options.scheduler ?? defaultScheduler;
     this.eventPollIntervalMs = options.eventPollIntervalMs ?? 1_000;
+    this.serverCleanupTimeoutMs = options.serverCleanupTimeoutMs ?? 10_000;
     this.subscriptions = [
       native.addListener("stateChanged", (state) => this.handleNativeState(state)),
       native.addListener("runtimeError", (event) => this.handleNativeError(event)),
@@ -180,12 +185,34 @@ export class RealtimeVoiceController {
   }
 
   async start(input: VoiceSessionCreateInput): Promise<RealtimeVoiceControllerSnapshot> {
+    if (this.startInFlight !== null) {
+      throw new Error("A Realtime voice session is already starting");
+    }
+    const operation = this.startOnce(input);
+    const completion = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.startInFlight = completion;
+    try {
+      return await operation;
+    } finally {
+      if (this.startInFlight === completion) this.startInFlight = null;
+    }
+  }
+
+  private async startOnce(
+    input: VoiceSessionCreateInput,
+  ): Promise<RealtimeVoiceControllerSnapshot> {
+    const generation = ++this.startGeneration;
     await this.reconcileNativeRuntime();
+    this.ensureCurrentStart(generation);
     if (this.snapshot.phase !== "idle" && this.snapshot.phase !== "error") {
       throw new Error("A Realtime voice session is already starting or active");
     }
-    const generation = ++this.startGeneration;
     this.setSnapshot({ phase: "starting", session: null, error: null });
+    await this.serverCleanupBarrier;
+    this.ensureCurrentStart(generation);
 
     let serverSession: VoiceSessionCreateResult | null = null;
     let nativeSessionId: string | null = null;
@@ -262,6 +289,7 @@ export class RealtimeVoiceController {
   }
 
   async stop(): Promise<void> {
+    const startInFlight = this.startInFlight;
     const generation = ++this.startGeneration;
     this.startingNativeSessionId = null;
     this.clearControlTimers();
@@ -269,6 +297,7 @@ export class RealtimeVoiceController {
     this.active = null;
     if (active === null) {
       this.setSnapshot({ phase: "idle", session: null, error: null });
+      await startInFlight;
       return;
     }
     this.setSnapshot({
@@ -276,12 +305,12 @@ export class RealtimeVoiceController {
       session: active.serverState,
       error: null,
     });
-    await Promise.allSettled([
-      this.native.stopRealtimeSessionAsync({
+    this.beginServerCleanup(active);
+    await this.native
+      .stopRealtimeSessionAsync({
         nativeSessionId: active.nativeSessionId,
-      }),
-      Effect.runPromise(this.client.closeSession(active.sessionId, active.leaseGeneration)),
-    ]);
+      })
+      .catch(() => undefined);
     if (generation !== this.startGeneration) return;
     const nativeState = await this.native.getStateAsync();
     if (generation !== this.startGeneration) return;
@@ -392,6 +421,7 @@ export class RealtimeVoiceController {
 
   async dispose(): Promise<void> {
     await this.stop();
+    await this.serverCleanupBarrier;
     this.subscriptions.forEach((subscription) => subscription.remove());
   }
 
@@ -435,10 +465,10 @@ export class RealtimeVoiceController {
 
   private async cleanupAfterControlFailure(active: ActiveSession, message: string) {
     const generation = ++this.startGeneration;
-    await Promise.allSettled([
-      this.native.stopRealtimeSessionAsync({ nativeSessionId: active.nativeSessionId }),
-      Effect.runPromise(this.client.closeSession(active.sessionId, active.leaseGeneration)),
-    ]);
+    this.beginServerCleanup(active);
+    await this.native
+      .stopRealtimeSessionAsync({ nativeSessionId: active.nativeSessionId })
+      .catch(() => undefined);
     if (generation !== this.startGeneration) return;
     const nativeState = await this.native.getStateAsync().catch(() => null);
     if (generation !== this.startGeneration) return;
@@ -487,9 +517,9 @@ export class RealtimeVoiceController {
     );
   }
 
-  private async closeServerAfterNativeTermination(active: ActiveSession, error: string | null) {
+  private closeServerAfterNativeTermination(active: ActiveSession, error: string | null) {
     if (this.active !== active) return;
-    const generation = ++this.startGeneration;
+    this.startGeneration += 1;
     this.active = null;
     this.clearControlTimers();
     this.setSnapshot({
@@ -497,10 +527,29 @@ export class RealtimeVoiceController {
       session: null,
       error,
     });
-    await Effect.runPromise(
-      this.client.closeSession(active.sessionId, active.leaseGeneration),
-    ).catch(() => undefined);
-    if (generation !== this.startGeneration) return;
+    this.beginServerCleanup(active);
+  }
+
+  private beginServerCleanup(active: Pick<ActiveSession, "sessionId" | "leaseGeneration">) {
+    const previous = this.serverCleanupBarrier;
+    this.serverCleanupBarrier = previous
+      .then(() =>
+        Effect.runPromise(
+          this.client
+            .closeSession(active.sessionId, active.leaseGeneration)
+            .pipe(Effect.timeout(`${this.serverCleanupTimeoutMs} millis`)),
+        ),
+      )
+      .then(
+        () => undefined,
+        (cause) => {
+          console.warn("[voice] server session cleanup failed", {
+            sessionId: active.sessionId,
+            leaseGeneration: active.leaseGeneration,
+            errorTag: errorTag(cause) ?? "unknown",
+          });
+        },
+      );
   }
 
   private async cleanupAfterServerTermination(active: ActiveSession, error: string | null) {
@@ -534,18 +583,16 @@ export class RealtimeVoiceController {
     serverState: VoiceSessionState | null,
     nativeSessionId: string | null,
   ) {
-    await Promise.allSettled([
-      ...(nativeSessionId === null
-        ? []
-        : [this.native.stopRealtimeSessionAsync({ nativeSessionId })]),
-      ...(serverState === null
-        ? []
-        : [
-            Effect.runPromise(
-              this.client.closeSession(serverState.sessionId, serverState.leaseGeneration),
-            ),
-          ]),
-    ]);
+    if (serverState !== null) {
+      this.beginServerCleanup({
+        sessionId: serverState.sessionId,
+        leaseGeneration: serverState.leaseGeneration,
+      });
+    }
+    if (nativeSessionId !== null) {
+      await this.native.stopRealtimeSessionAsync({ nativeSessionId }).catch(() => undefined);
+    }
+    await this.serverCleanupBarrier;
   }
 
   private clearControlTimers() {

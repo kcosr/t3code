@@ -15,7 +15,10 @@ import {
 } from "./transcriptionDraft";
 import { useVoiceCapabilityDescriptor } from "./useVoiceCapabilityAvailability";
 import { validateRecordingAgainstCapability } from "./dictationPolicy";
-import { cleanupOrphanedRecordingTermination } from "./dictationTermination";
+import {
+  cleanupOrphanedRecordingTermination,
+  dictationTerminationOwnership,
+} from "./dictationTermination";
 
 export type ComposerDictationPhase = "idle" | "recording" | "transcribing";
 
@@ -35,6 +38,7 @@ export function useComposerDictation(input: {
   const [error, setError] = useState<string | null>(null);
   const recordingIdRef = useRef<string | null>(null);
   const stoppingRecordingIdRef = useRef<string | null>(null);
+  const transcribingRecordingIdRef = useRef<string | null>(null);
   const operationGenerationRef = useRef(0);
   const startPendingRef = useRef(false);
   const lifecycleRef = useRef({ scopeKey: input.scopeKey, native, prepared });
@@ -52,6 +56,7 @@ export function useComposerDictation(input: {
   const transcribeCompletedRecording = useCallback(
     async (completedRecording: T3VoiceRecordingResult, generation: number, draftAtStop: string) => {
       if (native === null || prepared === null) return;
+      transcribingRecordingIdRef.current = completedRecording.recordingId;
       try {
         if (operationGenerationRef.current !== generation) return;
         if (capability !== null) validateRecordingAgainstCapability(completedRecording, capability);
@@ -101,6 +106,9 @@ export function useComposerDictation(input: {
             uri: completedRecording.uri,
           })
           .catch(() => undefined);
+        if (transcribingRecordingIdRef.current === completedRecording.recordingId) {
+          transcribingRecordingIdRef.current = null;
+        }
         if (operationGenerationRef.current === generation) setPhase("idle");
       }
     },
@@ -186,11 +194,20 @@ export function useComposerDictation(input: {
   useEffect(() => {
     if (native === null) return;
     const subscription = native.addListener("recordingTerminated", (event) => {
-      const orphanedTermination =
-        recordingIdRef.current !== event.recordingId &&
-        stoppingRecordingIdRef.current !== event.recordingId;
-      if (orphanedTermination) {
+      const ownership = dictationTerminationOwnership({
+        recordingId: event.recordingId,
+        activeRecordingId: recordingIdRef.current,
+        stoppingRecordingId: stoppingRecordingIdRef.current,
+        transcribingRecordingId: transcribingRecordingIdRef.current,
+      });
+      if (ownership === "orphaned") {
         void cleanupOrphanedRecordingTermination(native, event).catch(() => undefined);
+        return;
+      }
+      if (ownership === "transcribing") {
+        void native
+          .acknowledgeRecordingTerminationAsync({ recordingId: event.recordingId })
+          .catch(() => undefined);
         return;
       }
       ++operationGenerationRef.current;
