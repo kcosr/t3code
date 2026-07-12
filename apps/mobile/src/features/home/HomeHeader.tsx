@@ -4,13 +4,14 @@ import type {
   SidebarThreadSortOrder,
 } from "@t3tools/contracts";
 import { NativeHeaderToolbar, NativeStackScreenOptions } from "../../native/StackHeader";
-import { useCallback, useRef } from "react";
+import { useCallback, useMemo, useRef } from "react";
 import { Platform } from "react-native";
 import type { SearchBarCommands } from "react-native-screens";
 
 import { useThemeColor } from "../../lib/useThemeColor";
 import { useHardwareKeyboardCommand } from "../keyboard/hardwareKeyboardCommands";
 import { withNativeGlassHeaderItem } from "../layout/native-glass-header-items";
+import { SidebarHeaderActions } from "../threads/sidebar-header-actions";
 import { createNativeMailSearchToolbarItem } from "../layout/native-mail-search-toolbar";
 import type { HomeProjectSortOrder } from "./homeThreadList";
 import {
@@ -23,9 +24,14 @@ import {
   PROJECT_SORT_OPTIONS,
   THREAD_SORT_OPTIONS,
 } from "./home-list-options";
-import { createHomeSettingsHeaderItems } from "./home-settings-header-item";
 
 export type HomeHeaderEnvironment = HomeListFilterMenuEnvironment;
+
+function createHomeSettingsHeaderRight(onOpenSettings: () => void) {
+  return function HomeSettingsHeaderRight() {
+    return <SidebarHeaderActions onOpenSettings={onOpenSettings} />;
+  };
+}
 
 export function HomeHeader(props: {
   readonly environments: ReadonlyArray<HomeHeaderEnvironment>;
@@ -50,6 +56,10 @@ export function HomeHeader(props: {
   }, []);
   useHardwareKeyboardCommand("focusSearch", focusSearch);
   const filterMenu = buildHomeListFilterMenu(props);
+  const settingsHeaderRight = useMemo(
+    () => createHomeSettingsHeaderRight(props.onOpenSettings),
+    [props.onOpenSettings],
+  );
 
   return (
     <>
@@ -58,6 +68,7 @@ export function HomeHeader(props: {
           // Static header config (glass, title, fonts) lives in Stack.tsx
           // (GLASS_HEADER_OPTIONS). Only dynamic values are set here.
           headerTintColor: iconColor,
+          headerRight: Platform.OS === "ios" ? undefined : settingsHeaderRight,
           unstable_headerRightItems:
             Platform.OS === "ios"
               ? () => [
@@ -70,7 +81,7 @@ export function HomeHeader(props: {
                     type: "button",
                   }),
                 ]
-              : () => createHomeSettingsHeaderItems(props.onOpenSettings),
+              : undefined,
           unstable_headerToolbarItems:
             Platform.OS === "ios"
               ? () => [

@@ -2,6 +2,7 @@ import { SymbolView } from "expo-symbols";
 import { Pressable, StyleSheet, View, useColorScheme } from "react-native";
 
 import { useThemeColor } from "../../lib/useThemeColor";
+import { platformSymbolName } from "../../components/platformSymbolName";
 
 export interface SidebarHeaderActionsProps {
   readonly onOpenSettings: () => void;
@@ -39,7 +40,12 @@ function FallbackHeaderButton(props: {
             },
       ]}
     >
-      <SymbolView name={props.icon} size={20} tintColor={iconColor} type="monochrome" />
+      <SymbolView
+        name={platformSymbolName(props.icon)}
+        size={20}
+        tintColor={iconColor}
+        type="monochrome"
+      />
     </Pressable>
   );
 }

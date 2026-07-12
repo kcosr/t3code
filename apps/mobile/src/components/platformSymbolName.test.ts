@@ -5,6 +5,7 @@ import { platformSymbolName } from "./platformSymbolName";
 describe("platformSymbolName", () => {
   it.each([
     ["microphone.fill", "mic"],
+    ["gearshape", "settings"],
     ["waveform", "graphic_eq"],
     ["waveform.circle.fill", "graphic_eq"],
     ["speaker.wave.2.fill", "volume_up"],

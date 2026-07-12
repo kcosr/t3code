@@ -7,6 +7,7 @@ const ANDROID_SYMBOL_BY_SF_SYMBOL = {
   "chevron.down": "keyboard_arrow_down",
   "clock.arrow.circlepath": "history",
   desktopcomputer: "computer",
+  gearshape: "settings",
   "mic.fill": "mic",
   "mic.slash.fill": "mic_off",
   "microphone.fill": "mic",
