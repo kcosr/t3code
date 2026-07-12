@@ -137,8 +137,8 @@ class T3VoiceEndpointDetectorTest {
     val detector =
       T3VoiceEndpointDetector(T3VoiceEndpointDetectionConfig(noSpeechTimeoutMs = 30_000L))
 
-    feed(detector, 0L..29_950L step 50L, amplitude = 100)
-    assertEquals(T3VoiceEndpointDetector.Outcome.NO_SPEECH, detector.observe(30_000L, 100))
+    feed(detector, 0L..29_950L step 50L, amplitude = 700)
+    assertEquals(T3VoiceEndpointDetector.Outcome.NO_SPEECH, detector.observe(30_000L, 700))
   }
 
   @Test

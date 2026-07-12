@@ -101,7 +101,10 @@ internal class T3VoiceEndpointDetector(
     levelDbfs: Double,
     onsetThresholdDbfs: Double,
   ) {
-    if (elapsedMs < CALIBRATION_MS && levelDbfs < onsetThresholdDbfs) {
+    if (
+      elapsedMs < CALIBRATION_MS &&
+        levelDbfs < max(onsetThresholdDbfs, CALIBRATION_DIRECT_ONSET_DBFS)
+    ) {
       onsetCandidateAtMs = null
       noiseFloorDbfs += NOISE_FLOOR_ALPHA * (levelDbfs - noiseFloorDbfs)
       return
@@ -146,6 +149,9 @@ internal class T3VoiceEndpointDetector(
     private const val INITIAL_NOISE_FLOOR_DBFS = -60.0
     private const val NOISE_FLOOR_ALPHA = 0.25
     private const val CALIBRATION_MS = 300L
+    // Startup has no prior ambient sample. This gate separates moderate steady room noise from
+    // speech strong enough to begin immediately while the adaptive floor is still calibrating.
+    private const val CALIBRATION_DIRECT_ONSET_DBFS = -32.0
     internal fun amplitudeToDbfs(peakAmplitude: Int): Double {
       require(peakAmplitude in 0..MAX_AMPLITUDE)
       if (peakAmplitude == 0) return SILENCE_DBFS
