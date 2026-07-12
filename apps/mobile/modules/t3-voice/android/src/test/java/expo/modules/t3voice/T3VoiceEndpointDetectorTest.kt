@@ -77,8 +77,8 @@ class T3VoiceEndpointDetectorTest {
     feed(detector, 550L..1_500L step 50L, amplitude = 100)
     assertNull(detector.observe(1_550L, 8_000))
     feed(detector, 1_600L..1_900L step 50L, amplitude = 8_000)
-    feed(detector, 1_950L..3_050L step 50L, amplitude = 100)
-    assertEquals(T3VoiceEndpointDetector.Outcome.SPEECH_ENDED, detector.observe(3_100L, 100))
+    feed(detector, 1_950L..4_050L step 50L, amplitude = 100)
+    assertEquals(T3VoiceEndpointDetector.Outcome.SPEECH_ENDED, detector.observe(4_100L, 100))
   }
 
   @Test
