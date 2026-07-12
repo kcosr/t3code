@@ -172,8 +172,15 @@ export function useThreadComposerState() {
   }, [selectedThreadDetail, selectedThreadShell]);
 
   const onSendVoiceMessage = useCallback(
-    async (text: string) => {
-      if (!selectedThreadShell || text.trim().length === 0) return null;
+    async (input: { environmentId: EnvironmentId; threadId: ThreadId; text: string }) => {
+      if (
+        !selectedThreadShell ||
+        selectedThreadShell.environmentId !== input.environmentId ||
+        selectedThreadShell.id !== input.threadId ||
+        input.text.trim().length === 0
+      ) {
+        return null;
+      }
       const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
       const thread = selectedThreadDetail ?? selectedThreadShell;
       const metadata = makeQueuedMessageMetadata();
@@ -184,7 +191,7 @@ export function useThreadComposerState() {
           threadId: selectedThreadShell.id,
           messageId,
           commandId: CommandId.make(metadata.commandId),
-          text: text.trim(),
+          text: input.text.trim(),
           attachments: [],
           modelSelection: thread.modelSelection,
           runtimeMode: thread.runtimeMode,
@@ -192,7 +199,10 @@ export function useThreadComposerState() {
           createdAt: metadata.createdAt,
         });
         const currentDraft = getComposerDraftSnapshot(threadKey);
-        if (currentDraft.text.trim() === text.trim() && currentDraft.attachments.length === 0) {
+        if (
+          currentDraft.text.trim() === input.text.trim() &&
+          currentDraft.attachments.length === 0
+        ) {
           clearComposerDraftContent(threadKey);
         }
         return messageId;

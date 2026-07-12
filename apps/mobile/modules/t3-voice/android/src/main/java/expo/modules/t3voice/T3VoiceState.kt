@@ -155,6 +155,8 @@ internal object T3VoiceStateStore {
     MutableStateFlow<T3VoiceRuntimeEvent.RealtimeTerminated?>(null)
   private val mutableRecordingTermination =
     MutableStateFlow<T3VoiceRuntimeEvent.RecordingTerminated?>(null)
+  private val mutablePlaybackTermination =
+    MutableStateFlow<T3VoiceRuntimeEvent.PlaybackTerminated?>(null)
 
   val state: StateFlow<T3VoiceRuntimeState> = mutableState.asStateFlow()
   val events: SharedFlow<T3VoiceRuntimeEvent> = mutableEvents.asSharedFlow()
@@ -162,6 +164,8 @@ internal object T3VoiceStateStore {
     mutableRealtimeTermination.asStateFlow()
   val recordingTermination: StateFlow<T3VoiceRuntimeEvent.RecordingTerminated?> =
     mutableRecordingTermination.asStateFlow()
+  val playbackTermination: StateFlow<T3VoiceRuntimeEvent.PlaybackTerminated?> =
+    mutablePlaybackTermination.asStateFlow()
 
   fun claimRealtime(sessionId: String): Boolean {
     while (true) {
@@ -266,7 +270,9 @@ internal object T3VoiceStateStore {
     )
   }
 
+  @Synchronized
   fun claimPlayback(playbackId: String): T3VoiceOperationOwner? {
+    if (mutablePlaybackTermination.value != null) return null
     val owner = T3VoiceOperationOwner(playbackId, nextOperationGeneration.incrementAndGet())
     return owner.takeIf {
       claimIdle {
@@ -296,6 +302,23 @@ internal object T3VoiceStateStore {
         activePlaybackGeneration = null,
       )
     }
+
+  @Synchronized
+  fun terminatePlayback(
+    owner: T3VoiceOperationOwner,
+    event: T3VoiceRuntimeEvent.PlaybackTerminated,
+  ): Boolean {
+    val terminated = releasePlayback(owner)
+    if (terminated) mutablePlaybackTermination.value = event
+    return terminated
+  }
+
+  fun clearPlaybackTermination(playbackId: String) {
+    mutablePlaybackTermination.compareAndSet(
+      mutablePlaybackTermination.value?.takeIf { it.playbackId == playbackId },
+      null,
+    )
+  }
 
   fun setRealtime(sessionId: String, connectionState: String, muted: Boolean) {
     updateIfRealtimeOwner(sessionId) {

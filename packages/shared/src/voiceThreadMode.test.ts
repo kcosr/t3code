@@ -58,7 +58,10 @@ describe("voiceThreadMode", () => {
     expect(waiting.state.phase).toBe("waiting-thread");
     expect(waiting.commands).toEqual([]);
 
-    const armed = transition(waiting.state, { type: "thread-busy-changed", busy: false });
+    const armed = transition(waiting.state, {
+      type: "thread-busy-changed",
+      busy: false,
+    });
     expect(armed.state.phase).toBe("arming");
     expect(armed.commands).toEqual([{ type: "start-recording", token: armed.state.activeToken }]);
   });
@@ -66,7 +69,10 @@ describe("voiceThreadMode", () => {
   it("fences late recorder acquisition and cleans up the orphan", () => {
     const activated = activate();
     const staleToken = activated.state.activeToken!;
-    const paused = transition(activated.state, { type: "pause", reason: "user" });
+    const paused = transition(activated.state, {
+      type: "pause",
+      reason: "user",
+    });
     const late = transition(paused.state, {
       type: "arm-succeeded",
       token: staleToken,
@@ -167,7 +173,10 @@ describe("voiceThreadMode", () => {
       token,
       recordingId: "recording-1",
     });
-    const transcribing = transition(active.state, { type: "recording-completed", token });
+    const transcribing = transition(active.state, {
+      type: "recording-completed",
+      token,
+    });
     const reviewed = transition(transcribing.state, {
       type: "transcription-completed",
       token,
@@ -195,12 +204,18 @@ describe("voiceThreadMode", () => {
       token: active.token,
       transcript: "   ",
     });
-    expect(empty.state).toMatchObject({ phase: "paused", pauseReason: "empty-transcript" });
+    expect(empty.state).toMatchObject({
+      phase: "paused",
+      pauseReason: "empty-transcript",
+    });
 
     const armed = activate();
     const failed = transition(armed.state, {
       type: "arm-failed",
-      token: { ...armed.state.activeToken!, operation: armed.state.activeToken!.operation + 1 },
+      token: {
+        ...armed.state.activeToken!,
+        operation: armed.state.activeToken!.operation + 1,
+      },
     });
     expect(failed.state.phase).toBe("arming");
   });
@@ -338,7 +353,11 @@ describe("voiceThreadMode", () => {
         playbackId: "playback-1",
         pauseReason: null,
       },
-      { type: "playback-drained", playbackId: "playback-1", messageId: "assistant-1" },
+      {
+        type: "playback-drained",
+        playbackId: "playback-1",
+        messageId: "assistant-1",
+      },
     );
     const token = base.state.activeToken!;
     const rearmed = transition(base.state, { type: "guard-elapsed", token });
@@ -413,6 +432,30 @@ describe("voiceThreadMode", () => {
     expect(transition(waiting.state, { type: "response-timeout", token }).state).toMatchObject({
       phase: "paused",
       pauseReason: "response-timeout",
+    });
+  });
+
+  it("bounds playback with the same response-cycle timeout", () => {
+    const speaking: VoiceThreadModeState = {
+      ...initialVoiceThreadModeState(),
+      phase: "speaking",
+      target: target(),
+      activeToken: { targetGeneration: 1, cycle: 1, operation: 2 },
+      assistantMessageId: "assistant-1",
+      playbackId: "playback-1",
+      pauseReason: null,
+    };
+    const result = transition(speaking, {
+      type: "response-timeout",
+      token: speaking.activeToken!,
+    });
+    expect(result.state).toMatchObject({
+      phase: "paused",
+      pauseReason: "response-timeout",
+    });
+    expect(result.commands).toContainEqual({
+      type: "cancel-playback",
+      playbackId: "playback-1",
     });
   });
 });

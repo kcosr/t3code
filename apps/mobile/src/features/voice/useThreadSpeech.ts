@@ -59,6 +59,7 @@ export function useThreadSpeech(input: {
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
   const plannerRef = useRef<ThreadSpeechPlannerState>(initialThreadSpeechPlannerState());
   const preferenceHydratedRef = useRef(false);
+  const lastObservedPreferenceRef = useRef<boolean | null>(null);
   const toggledBeforePreferenceHydrationRef = useRef(false);
   const earlyToggleNeedsBaselineRef = useRef(false);
   const latestRef = useRef(input.latestAssistant);
@@ -78,6 +79,12 @@ export function useThreadSpeech(input: {
     nextChunkIndex: number;
     pendingFrameBytes: Uint8Array;
     finalizing: boolean;
+  } | null>(null);
+  const playbackMessageIdsRef = useRef(new Map<string, string>());
+  const emittedTerminalPlaybackIdsRef = useRef(new Set<string>());
+  const pendingPlaybackAcknowledgementRef = useRef<{
+    readonly playbackId: string;
+    readonly promise: Promise<void>;
   } | null>(null);
   const consumedChunkIndexRef = useRef(-1);
   const consumptionWaitersRef = useRef<
@@ -100,6 +107,79 @@ export function useThreadSpeech(input: {
     },
     [],
   );
+  const emitTerminalLifecycle = useCallback(
+    (
+      playbackId: string,
+      messageId: string,
+      outcome: Extract<ThreadSpeechLifecycleEvent["outcome"], "drained" | "cancelled" | "failed">,
+    ) => {
+      if (emittedTerminalPlaybackIdsRef.current.has(playbackId)) return;
+      emittedTerminalPlaybackIdsRef.current.add(playbackId);
+      emitLifecycle(playbackId, messageId, outcome);
+    },
+    [emitLifecycle],
+  );
+  const handlePlaybackTerminated = useCallback(
+    (event: import("@t3tools/mobile-voice-native").T3VoicePlaybackTerminatedEvent) => {
+      const existing = pendingPlaybackAcknowledgementRef.current;
+      if (existing?.playbackId === event.playbackId) return existing.promise;
+      const messageId = playbackMessageIdsRef.current.get(event.playbackId);
+      const playback = playbackRef.current;
+      if (playback?.playbackId === event.playbackId) playbackRef.current = null;
+      if (mountedRef.current) setPlaying(false);
+      if (event.outcome === "failed" && mountedRef.current) {
+        plannerRef.current = setThreadSpeechEnabled(
+          plannerRef.current,
+          false,
+          latestRef.current,
+        ).state;
+        setEnabled(false);
+        setError("PCM playback failed.");
+      }
+      if (messageId !== undefined) {
+        emitTerminalLifecycle(
+          event.playbackId,
+          messageId,
+          event.outcome === "completed"
+            ? "drained"
+            : event.outcome === "cancelled"
+              ? "cancelled"
+              : "failed",
+        );
+      }
+      playbackMessageIdsRef.current.delete(event.playbackId);
+      for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
+
+      const acknowledgement = (async () => {
+        if (native === null) return;
+        let retryDelayMs = 100;
+        while (mountedRef.current) {
+          try {
+            await native.acknowledgePlaybackTerminationAsync({
+              playbackId: event.playbackId,
+            });
+            return;
+          } catch {
+            await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
+            retryDelayMs = Math.min(2_000, retryDelayMs * 2);
+          }
+        }
+        // The native terminal record remains durable and will be retried by the next mount.
+        return;
+      })().finally(() => {
+        if (pendingPlaybackAcknowledgementRef.current?.playbackId === event.playbackId) {
+          pendingPlaybackAcknowledgementRef.current = null;
+        }
+        emittedTerminalPlaybackIdsRef.current.delete(event.playbackId);
+      });
+      pendingPlaybackAcknowledgementRef.current = {
+        playbackId: event.playbackId,
+        promise: acknowledgement,
+      };
+      return acknowledgement;
+    },
+    [emitTerminalLifecycle, native],
+  );
 
   const executeAction = useCallback(
     async (action: ThreadSpeechAction, generation: number) => {
@@ -108,6 +188,15 @@ export function useThreadSpeech(input: {
       switch (action.type) {
         case "start":
           {
+            const pendingTermination = await native.getPendingPlaybackTerminationAsync();
+            if (pendingTermination !== null) await handlePlaybackTerminated(pendingTermination);
+            if (pendingPlaybackAcknowledgementRef.current !== null) {
+              await pendingPlaybackAcknowledgementRef.current.promise;
+            }
+            if (operationGenerationRef.current !== generation) {
+              throw new Error("Playback was cancelled");
+            }
+            playbackMessageIdsRef.current.set(action.playbackId, action.messageId);
             const startPromise = (async () => {
               await native.startPlaybackAsync({
                 playbackId: action.playbackId,
@@ -209,8 +298,9 @@ export function useThreadSpeech(input: {
           if (playback.nextChunkIndex === 0) {
             await native.cancelPlaybackAsync({ playbackId: action.playbackId });
             playbackRef.current = null;
-            setPlaying(false);
-            emitLifecycle(action.playbackId, playback.messageId, "cancelled");
+            if (operationGenerationRef.current === generation && mountedRef.current) {
+              setPlaying(false);
+            }
           } else {
             playback.finalizing = true;
             await native.finishPlaybackAsync({
@@ -221,18 +311,17 @@ export function useThreadSpeech(input: {
           return;
         }
         case "cancel": {
-          const messageId = playbackRef.current?.messageId ?? latestRef.current?.id ?? "";
           await native.cancelPlaybackAsync({ playbackId: action.playbackId });
           if (playbackRef.current?.playbackId === action.playbackId) {
             playbackRef.current = null;
           }
           for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
-          setPlaying(false);
-          emitLifecycle(action.playbackId, messageId, "cancelled");
+          if (operationGenerationRef.current === generation && mountedRef.current)
+            setPlaying(false);
         }
       }
     },
-    [emitLifecycle, native, prepared],
+    [emitLifecycle, handlePlaybackTerminated, native, prepared],
   );
 
   const enqueueActions = useCallback(
@@ -260,7 +349,8 @@ export function useThreadSpeech(input: {
           setPlaying(false);
           const failed = playback ?? pendingStart ?? startedAction ?? null;
           if (failed !== null) {
-            emitLifecycle(failed.playbackId, failed.messageId, "failed");
+            emitTerminalLifecycle(failed.playbackId, failed.messageId, "failed");
+            playbackMessageIdsRef.current.delete(failed.playbackId);
           }
           for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
           const cancellation =
@@ -273,7 +363,7 @@ export function useThreadSpeech(input: {
           await cancellation;
         });
     },
-    [emitLifecycle, executeAction, native],
+    [emitTerminalLifecycle, executeAction, native],
   );
 
   useEffect(() => {
@@ -307,26 +397,14 @@ export function useThreadSpeech(input: {
   useEffect(() => {
     if (native === null) return;
     const terminatedSubscription = native.addListener("playbackTerminated", (event) => {
-      const playback = playbackRef.current;
-      if (playback === null || playback.playbackId !== event.playbackId) return;
-      playbackRef.current = null;
-      setPlaying(false);
-      if (event.outcome === "failed") {
-        plannerRef.current = setThreadSpeechEnabled(
-          plannerRef.current,
-          false,
-          latestRef.current,
-        ).state;
-        setEnabled(false);
-        setError("PCM playback failed.");
-      }
-      emitLifecycle(
-        playback.playbackId,
-        playback.messageId,
-        event.outcome === "completed" ? "drained" : "failed",
-      );
-      for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
+      void handlePlaybackTerminated(event).catch(() => undefined);
     });
+    void native
+      .getPendingPlaybackTerminationAsync()
+      .then((event) => {
+        if (event !== null) return handlePlaybackTerminated(event);
+      })
+      .catch(() => undefined);
     const consumedSubscription = native.addListener("playbackChunkConsumed", (event) => {
       if (playbackRef.current?.playbackId !== event.playbackId) return;
       consumedChunkIndexRef.current = Math.max(consumedChunkIndexRef.current, event.chunkIndex);
@@ -359,7 +437,46 @@ export function useThreadSpeech(input: {
       errorSubscription.remove();
       for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
     };
-  }, [emitLifecycle, native]);
+  }, [handlePlaybackTerminated, native]);
+
+  const disableImmediately = useCallback(
+    (persist: boolean) => {
+      ++operationGenerationRef.current;
+      const pendingStart = playbackStartRef.current;
+      const playback = playbackRef.current;
+      playbackRef.current = null;
+      plannerRef.current = setThreadSpeechEnabled(
+        plannerRef.current,
+        false,
+        latestRef.current,
+      ).state;
+      for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
+      setEnabled(false);
+      setPlaying(false);
+      setError(null);
+      if (persist) savePreferences({ threadSpeechEnabled: false });
+
+      const cancellation = (async () => {
+        if (native === null) return;
+        const playbackId =
+          playback?.playbackId ??
+          pendingStart?.playbackId ??
+          (await native.getStateAsync()).activePlaybackId ??
+          undefined;
+        if (playbackId === undefined) return;
+        await releasePlaybackForRecording({
+          native,
+          playbackId,
+          ...(pendingStart === null ? {} : { pendingStart: pendingStart.promise }),
+        });
+      })();
+      actionChainRef.current = cancellation.catch((cause) => {
+        if (mountedRef.current) setError(errorMessage(cause));
+      });
+      return cancellation;
+    },
+    [native, savePreferences],
+  );
 
   useEffect(() => {
     if (
@@ -381,10 +498,29 @@ export function useThreadSpeech(input: {
         : preferencesResult.value.threadSpeechEnabled === true,
       latestRef.current,
     );
+    lastObservedPreferenceRef.current = preferencesResult.value.threadSpeechEnabled === true;
     plannerRef.current = restored.state;
     setEnabled(restored.state.enabled);
     enqueueActions(restored.actions);
   }, [enqueueActions, input.historyReady, preferencesResult]);
+
+  useEffect(() => {
+    if (!preferenceHydratedRef.current || !AsyncResult.isSuccess(preferencesResult)) return;
+    const requestedEnabled = preferencesResult.value.threadSpeechEnabled === true;
+    const previouslyRequested = lastObservedPreferenceRef.current;
+    lastObservedPreferenceRef.current = requestedEnabled;
+    if (previouslyRequested === null || previouslyRequested === requestedEnabled) return;
+    if (requestedEnabled === plannerRef.current.enabled) return;
+    if (!requestedEnabled) {
+      void disableImmediately(false).catch(() => undefined);
+      return;
+    }
+    const result = setThreadSpeechEnabled(plannerRef.current, requestedEnabled, latestRef.current);
+    plannerRef.current = result.state;
+    setEnabled(requestedEnabled);
+    setError(null);
+    enqueueActions(result.actions);
+  }, [disableImmediately, enqueueActions, preferencesResult]);
 
   const toggle = useCallback(() => {
     if (!capabilityAvailable) return;
@@ -399,22 +535,21 @@ export function useThreadSpeech(input: {
       suspendedForDictationRef.current,
     );
     if (!result.enabled) {
-      ++operationGenerationRef.current;
-      const playback = playbackRef.current;
-      playbackRef.current = null;
-      for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
-      actionChainRef.current =
-        native !== null && playback !== null
-          ? native.cancelPlaybackAsync({ playbackId: playback.playbackId }).catch(() => undefined)
-          : Promise.resolve();
-      setPlaying(false);
+      void disableImmediately(true).catch(() => undefined);
+      return;
     }
     plannerRef.current = result.state;
     setEnabled(result.enabled);
     savePreferences({ threadSpeechEnabled: result.enabled });
     setError(null);
     enqueueActions(result.actions);
-  }, [capabilityAvailable, enqueueActions, input.historyReady, native, savePreferences]);
+  }, [
+    capabilityAvailable,
+    disableImmediately,
+    enqueueActions,
+    input.historyReady,
+    savePreferences,
+  ]);
 
   const resumeAfterDictation = useCallback(() => {
     if (!suspendedForDictationRef.current) return;
@@ -452,13 +587,6 @@ export function useThreadSpeech(input: {
     actionChainRef.current = cancellation;
     try {
       await cancellation;
-      if (playback !== null || pendingStart !== null) {
-        emitLifecycle(
-          playback?.playbackId ?? pendingStart!.playbackId,
-          playback?.messageId ?? pendingStart?.messageId ?? "",
-          "cancelled",
-        );
-      }
       return true;
     } catch (cause) {
       if (mountedRef.current) {
@@ -467,7 +595,7 @@ export function useThreadSpeech(input: {
       }
       return false;
     }
-  }, [emitLifecycle, native, resumeAfterDictation]);
+  }, [native, resumeAfterDictation]);
 
   const enable = useCallback(() => {
     if (plannerRef.current.enabled) return;

@@ -336,13 +336,55 @@ class T3VoicePcmPlayerTest {
     player.release()
   }
 
+  @Test
+  fun transientSuspensionPausesOutputAndResumesWithoutTerminatingPlayback() {
+    val output = FakeOutput(1)
+    val finished = CountDownLatch(1)
+    val scheduler = FakeTimeoutScheduler()
+    val errors = mutableListOf<String>()
+    val player =
+      T3VoicePcmPlayer(
+        onChunkConsumed = { _, _ -> },
+        onFinished = { finished.countDown() },
+        onError = { id, _ -> errors += id },
+        outputFactory = T3VoicePcmOutputFactory { _, _ -> output },
+        clock = ImmediatePlaybackClock,
+        decodePcm = { byteArrayOf(0, 0) },
+        timeoutScheduler = scheduler,
+      )
+    player.start("suspended", 24_000, 1)
+
+    player.pause("suspended")
+    player.enqueue("suspended", 0, "ignored")
+    player.finish("suspended", 0)
+    scheduler.run()
+    assertFalse(finished.await(50, TimeUnit.MILLISECONDS))
+    assertTrue(errors.isEmpty())
+    assertEquals(1, output.pauseCount)
+
+    player.resume("suspended")
+    assertTrue(finished.await(2, TimeUnit.SECONDS))
+    assertEquals(1, output.resumeCount)
+    player.release()
+  }
+
   private class FakeOutput(
     override val playbackHeadPosition: Long,
   ) : T3VoicePcmOutput {
     var releaseCount = 0
     val releaseFlushes = mutableListOf<Boolean>()
+    var pauseCount = 0
+    var resumeCount = 0
 
     override fun write(pcm: ByteArray, offset: Int, length: Int): Int = length
+
+    override fun pause() {
+      pauseCount += 1
+    }
+
+    override fun resume() {
+      resumeCount += 1
+    }
 
     override fun release(flush: Boolean) {
       releaseCount += 1
@@ -364,6 +406,10 @@ class T3VoicePcmPlayerTest {
       writeExited.countDown()
       return length
     }
+
+    override fun pause() = Unit
+
+    override fun resume() = Unit
 
     override fun release(flush: Boolean) {
       releaseCount += 1

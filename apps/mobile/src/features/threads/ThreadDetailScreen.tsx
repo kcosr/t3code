@@ -80,7 +80,11 @@ export interface ThreadDetailScreenProps {
   readonly onRemoveDraftImage: (imageId: string) => void;
   readonly onStopThread: () => void;
   readonly onSendMessage: () => Promise<MessageId | null>;
-  readonly onSendVoiceMessage: (text: string) => Promise<MessageId | null>;
+  readonly onSendVoiceMessage: (input: {
+    readonly environmentId: EnvironmentId;
+    readonly threadId: ThreadId;
+    readonly text: string;
+  }) => Promise<MessageId | null>;
   readonly onReconnectEnvironment: () => void;
   readonly onUpdateThreadModelSelection: (modelSelection: ModelSelection) => void;
   readonly onUpdateThreadRuntimeMode: (runtimeMode: RuntimeMode) => void;
@@ -389,9 +393,9 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     return messageId;
   }, [props.onSendMessage, selectedThreadKey]);
   const handleSendVoiceMessage = useCallback(
-    async (text: string) => {
+    async (input: { environmentId: EnvironmentId; threadId: ThreadId; text: string }) => {
       const targetThreadKey = selectedThreadKeyRef.current;
-      const messageId = await props.onSendVoiceMessage(text);
+      const messageId = await props.onSendVoiceMessage(input);
       if (messageId !== null && selectedThreadKeyRef.current === targetThreadKey) {
         setAnchorMessageId(messageId);
       }

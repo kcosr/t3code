@@ -14,6 +14,7 @@ import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
@@ -28,6 +29,7 @@ class T3VoiceModule : Module() {
   private var stateCollection: Job? = null
   private var eventCollection: Job? = null
   private var recordingTerminationCollection: Job? = null
+  private var playbackTerminationCollection: Job? = null
   private var realtimeTerminationCollection: Job? = null
   private var rebindScheduled = false
   private var rebindAttemptedSinceConnection = false
@@ -91,12 +93,11 @@ class T3VoiceModule : Module() {
         eventCollection?.cancel()
         eventCollection =
           appContext.mainQueue.launch {
-            connectedBinder.events.collectLatest { event ->
+            connectedBinder.events.collect { event ->
               when (event) {
                 is T3VoiceRuntimeEvent.PlaybackChunkConsumed ->
                   sendEvent(PLAYBACK_CHUNK_CONSUMED_EVENT, event.toEventBody())
-                is T3VoiceRuntimeEvent.PlaybackTerminated ->
-                  sendEvent(PLAYBACK_TERMINATED_EVENT, event.toEventBody())
+                is T3VoiceRuntimeEvent.PlaybackTerminated -> Unit
                 is T3VoiceRuntimeEvent.RecordingTerminated -> Unit
                 is T3VoiceRuntimeEvent.RuntimeError ->
                   sendEvent(RUNTIME_ERROR_EVENT, event.toEventBody())
@@ -112,6 +113,13 @@ class T3VoiceModule : Module() {
           appContext.mainQueue.launch {
             connectedBinder.recordingTermination.collectLatest { event ->
               if (event != null) sendEvent(RECORDING_TERMINATED_EVENT, event.toEventBody())
+            }
+          }
+        playbackTerminationCollection?.cancel()
+        playbackTerminationCollection =
+          appContext.mainQueue.launch {
+            connectedBinder.playbackTermination.collectLatest { event ->
+              if (event != null) sendEvent(PLAYBACK_TERMINATED_EVENT, event.toEventBody())
             }
           }
         realtimeTerminationCollection?.cancel()
@@ -159,7 +167,7 @@ class T3VoiceModule : Module() {
       )
 
       Constants(
-        "nativeRevision" to 6,
+        "nativeRevision" to 7,
       )
 
       OnCreate {
@@ -332,6 +340,20 @@ class T3VoiceModule : Module() {
         withBinder(promise, "playback-cancel-failed") { voice, result ->
           voice.cancelPlayback(requireIdentifier(input, "playbackId"))
           result.resolve()
+        }
+      }
+
+      AsyncFunction("acknowledgePlaybackTerminationAsync") {
+        input: Map<String, String>, promise: Promise ->
+        withBinder(promise, "playback-acknowledgement-failed") { voice, result ->
+          voice.acknowledgePlaybackTermination(requireIdentifier(input, "playbackId"))
+          result.resolve()
+        }
+      }
+
+      AsyncFunction("getPendingPlaybackTerminationAsync") { promise: Promise ->
+        withBinder(promise, "playback-termination-read-failed") { voice, result ->
+          result.resolve(voice.pendingPlaybackTermination())
         }
       }
 
@@ -654,6 +676,8 @@ class T3VoiceModule : Module() {
     realtimeTerminationCollection = null
     recordingTerminationCollection?.cancel()
     recordingTerminationCollection = null
+    playbackTerminationCollection?.cancel()
+    playbackTerminationCollection = null
   }
 
   private fun publicRealtimeFailureMessage(code: String): String =

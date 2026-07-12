@@ -1,5 +1,5 @@
 import { isLiquidGlassSupported, LiquidGlassView } from "@callstack/liquid-glass";
-import { useAtomSet, useAtomValue } from "@effect/atom-react";
+import { useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/unstable/reactivity";
 import type {
   EnvironmentId,
@@ -65,7 +65,7 @@ import {
   resolveProviderOptionDescriptors,
 } from "../../lib/providerOptions";
 import { useComposerPathSearch } from "../../state/use-composer-path-search";
-import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
+import { mobilePreferencesAtom } from "../../state/preferences";
 import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerCommandPopover";
 import { useComposerDictation } from "../voice/useComposerDictation";
 import {
@@ -160,7 +160,11 @@ export interface ThreadComposerProps {
   readonly onRemoveDraftImage: (imageId: string) => void;
   readonly onStopThread: () => void;
   readonly onSendMessage: () => Promise<MessageId | null>;
-  readonly onSendVoiceMessage: (text: string) => Promise<MessageId | null>;
+  readonly onSendVoiceMessage: (input: {
+    readonly environmentId: EnvironmentId;
+    readonly threadId: import("@t3tools/contracts").ThreadId;
+    readonly text: string;
+  }) => Promise<MessageId | null>;
   readonly onUpdateModelSelection: (modelSelection: ModelSelection) => void;
   readonly onUpdateRuntimeMode: (runtimeMode: RuntimeMode) => void;
   readonly onUpdateInteractionMode: (interactionMode: ProviderInteractionMode) => void;
@@ -337,7 +341,6 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
 
   const [previewImageUri, setPreviewImageUri] = useState<string | null>(null);
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
-  const savePreferences = useAtomSet(updateMobilePreferencesAtom);
   const voicePreferences = resolveVoicePreferences(
     AsyncResult.isSuccess(preferencesResult) ? preferencesResult.value : {},
   );
@@ -355,6 +358,10 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     realtimeVoice.phase === "stopping";
   const dictationWasActiveRef = useRef(false);
   const traditionalAudioTransitionLockRef = useRef({ active: false });
+  const canStartAutoListen =
+    props.draftMessage.trim().length === 0 &&
+    props.draftAttachments.length === 0 &&
+    !props.interactionRequired;
   const autoListen = useAutoListenController({
     environmentId: props.environmentId,
     threadId: props.selectedThread.id,
@@ -365,8 +372,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     activeThreadBusy: props.activeThreadBusy,
     threadMessages: props.threadMessages,
     interactionRequired: props.interactionRequired,
-    canStartFromComposer:
-      props.draftMessage.trim().length === 0 && props.draftAttachments.length === 0,
+    canStartFromComposer: canStartAutoListen,
     dictation,
     speech: props.speechPlayback,
     realtimePhase: realtimeVoice.phase,
@@ -375,6 +381,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   });
   const {
     state: autoListenState,
+    active: autoListenActive,
     activate: activateAutoListen,
     pause: pauseAutoListen,
     submitReview: submitAutoListenReview,
@@ -448,11 +455,13 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     voicePreferences.autoListenEnabled,
   ]);
 
-  const toggleAutoListenPreference = useCallback(() => {
-    const enabled = !voicePreferences.autoListenEnabled;
-    savePreferences({ voiceAutoListenEnabled: enabled });
-    if (!enabled) pauseAutoListen("disabled");
-  }, [pauseAutoListen, savePreferences, voicePreferences.autoListenEnabled]);
+  const toggleAutoListenOperation = useCallback(async () => {
+    if (autoListenActive) {
+      pauseAutoListen("user");
+      return;
+    }
+    await activateAutoListen(true);
+  }, [activateAutoListen, autoListenActive, pauseAutoListen]);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
   const canSend = hasContent;
@@ -706,7 +715,8 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       projectTitle: props.environmentLabel ?? "T3 Code",
     });
     try {
-      if (!(await submitAutoListenReview(draftMessage))) await onSendMessage();
+      const review = await submitAutoListenReview(draftMessage);
+      if (!review.handled) await onSendMessage();
     } finally {
       inFlightThreadIdsRef.current.delete(threadKey);
     }
@@ -1024,13 +1034,14 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
               {dictation.available ? (
                 <ControlPill
                   accessibilityLabel={
-                    voicePreferences.autoListenEnabled
-                      ? "Disable Auto Listen"
-                      : "Enable Auto Listen"
+                    autoListenActive
+                      ? `Pause Auto Listen, ${autoListenState.phase}`
+                      : "Start Auto Listen"
                   }
-                  active={voicePreferences.autoListenEnabled}
+                  active={autoListenActive}
+                  disabled={!autoListenActive && !canStartAutoListen}
                   icon="waveform"
-                  onPress={toggleAutoListenPreference}
+                  onPress={() => void toggleAutoListenOperation()}
                 />
               ) : null}
               {realtimeInUse && dictation.available ? (
@@ -1095,13 +1106,14 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                 {dictation.available ? (
                   <ComposerToolbarButton
                     accessibilityLabel={
-                      voicePreferences.autoListenEnabled
-                        ? "Disable Auto Listen"
-                        : "Enable Auto Listen"
+                      autoListenActive
+                        ? `Pause Auto Listen, ${autoListenState.phase}`
+                        : "Start Auto Listen"
                     }
                     icon="waveform"
-                    active={voicePreferences.autoListenEnabled}
-                    onPress={toggleAutoListenPreference}
+                    active={autoListenActive}
+                    disabled={!autoListenActive && !canStartAutoListen}
+                    onPress={() => void toggleAutoListenOperation()}
                     showChevron={false}
                   />
                 ) : null}

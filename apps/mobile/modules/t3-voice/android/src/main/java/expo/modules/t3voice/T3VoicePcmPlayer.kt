@@ -17,6 +17,10 @@ internal interface T3VoicePcmOutput {
 
   fun write(pcm: ByteArray, offset: Int, length: Int): Int
 
+  fun pause()
+
+  fun resume()
+
   fun release(flush: Boolean)
 }
 
@@ -68,6 +72,7 @@ internal class T3VoicePcmPlayer(
     var nextChunkIndex: Int = 0,
     var finalChunkIndex: Int? = null,
     @Volatile var cancelled: Boolean = false,
+    @Volatile var paused: Boolean = false,
     var framesWritten: Long = 0,
     var queuedBytes: Int = 0,
     var acceptedBytes: Long = 0,
@@ -168,6 +173,27 @@ internal class T3VoicePcmPlayer(
     releaseOutputOnce(playback, flush = true)
   }
 
+  fun pause(playbackId: String) {
+    synchronized(lock) {
+      val playback = requireActive(playbackId)
+      if (playback.paused) return
+      playback.paused = true
+      cancelIncompleteTimeoutLocked(playback)
+      playback.output.pause()
+    }
+  }
+
+  fun resume(playbackId: String) {
+    synchronized(lock) {
+      val playback = requireActive(playbackId)
+      if (!playback.paused) return
+      playback.output.resume()
+      playback.paused = false
+      armInactivityTimeoutLocked(playback)
+      scheduleDrainLocked(playback)
+    }
+  }
+
   fun release() {
     val playback =
       synchronized(lock) {
@@ -194,6 +220,10 @@ internal class T3VoicePcmPlayer(
         val next =
           synchronized(lock) {
             if (active !== playback || playback.cancelled) {
+              playback.drainScheduled = false
+              return
+            }
+            if (playback.paused) {
               playback.drainScheduled = false
               return
             }
@@ -270,8 +300,13 @@ internal class T3VoicePcmPlayer(
     val maximumWaitMs =
       ((playback.framesWritten * 1_000L) / playback.sampleRate + DRAIN_GRACE_MS)
         .coerceAtMost(MAXIMUM_DRAIN_WAIT_MS)
-    val deadline = clock.elapsedRealtime() + maximumWaitMs
+    var deadline = clock.elapsedRealtime() + maximumWaitMs
     while (!playback.cancelled && clock.elapsedRealtime() < deadline) {
+      if (playback.paused) {
+        clock.sleep(DRAIN_POLL_INTERVAL_MS)
+        deadline += DRAIN_POLL_INTERVAL_MS
+        continue
+      }
       val playedFrames = playback.output.playbackHeadPosition and 0xffffffffL
       if (playedFrames >= playback.framesWritten) {
         return
@@ -294,6 +329,7 @@ internal class T3VoicePcmPlayer(
   }
 
   private fun armInactivityTimeoutLocked(playback: ActivePlayback) {
+    if (playback.paused) return
     cancelIncompleteTimeoutLocked(playback)
     val timeoutGeneration = playback.timeoutGeneration
     playback.incompleteTimeout =
@@ -388,6 +424,10 @@ internal class T3VoicePcmPlayer(
 
         override fun write(pcm: ByteArray, offset: Int, length: Int): Int =
           track.write(pcm, offset, length, AudioTrack.WRITE_BLOCKING)
+
+        override fun pause() = track.pause()
+
+        override fun resume() = track.play()
 
         override fun release(flush: Boolean) {
           try {

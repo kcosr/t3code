@@ -84,7 +84,7 @@ export interface T3VoicePlaybackChunkConsumedEvent {
 
 export interface T3VoicePlaybackTerminatedEvent {
   readonly playbackId: string;
-  readonly outcome: "completed" | "failed";
+  readonly outcome: "completed" | "failed" | "cancelled";
 }
 
 export type T3VoiceRecordingTerminatedEvent =
@@ -234,6 +234,10 @@ export interface T3VoiceNativeModule {
   readonly enqueuePlaybackChunkAsync: (input: T3VoicePlaybackChunkInput) => Promise<void>;
   readonly finishPlaybackAsync: (input: T3VoicePlaybackFinishInput) => Promise<void>;
   readonly cancelPlaybackAsync: (input: { readonly playbackId: string }) => Promise<void>;
+  readonly acknowledgePlaybackTerminationAsync: (input: {
+    readonly playbackId: string;
+  }) => Promise<void>;
+  readonly getPendingPlaybackTerminationAsync: () => Promise<T3VoicePlaybackTerminatedEvent | null>;
   readonly prepareRealtimeSessionAsync: (
     input: T3VoiceRealtimePrepareInput,
   ) => Promise<T3VoiceRealtimeOffer>;

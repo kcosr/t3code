@@ -10,7 +10,9 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -40,6 +42,9 @@ class T3VoiceRuntimeService : Service() {
 
     val recordingTermination: StateFlow<T3VoiceRuntimeEvent.RecordingTerminated?>
       get() = T3VoiceStateStore.recordingTermination
+
+    val playbackTermination: StateFlow<T3VoiceRuntimeEvent.PlaybackTerminated?>
+      get() = T3VoiceStateStore.playbackTermination
 
     fun startRecording(
       recordingId: String,
@@ -100,6 +105,7 @@ class T3VoiceRuntimeService : Service() {
         playbackOwner = owner
         try {
           ensureRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+          check(playbackAudioFocus.start()) { "Android denied playback audio focus." }
           player.start(playbackId, sampleRate, channelCount)
         } catch (cause: Throwable) {
           releasePlaybackLocked(owner)
@@ -122,10 +128,20 @@ class T3VoiceRuntimeService : Service() {
         try {
           player.cancel(playbackId)
         } finally {
-          releasePlaybackLocked(owner)
+          terminatePlaybackLocked(
+            owner,
+            T3VoiceRuntimeEvent.PlaybackTerminated(playbackId, "cancelled"),
+          )
         }
       }
     }
+
+    fun acknowledgePlaybackTermination(playbackId: String) {
+      T3VoiceStateStore.clearPlaybackTermination(playbackId)
+    }
+
+    fun pendingPlaybackTermination(): Map<String, Any>? =
+      T3VoiceStateStore.playbackTermination.value?.toEventBody()
 
     fun prepareRealtimeSession(
       nativeSessionId: String,
@@ -198,6 +214,8 @@ class T3VoiceRuntimeService : Service() {
   private var playbackOwner: T3VoiceOperationOwner? = null
   private lateinit var recorder: T3VoiceRecorder
   private lateinit var player: T3VoicePcmPlayer
+  private lateinit var playbackAudioFocus: T3VoicePlaybackAudioFocus
+  private val mainHandler = Handler(Looper.getMainLooper())
   private val realtimeDelegate =
     lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
       T3VoiceWebRtcSession(
@@ -314,17 +332,16 @@ class T3VoiceRuntimeService : Service() {
           )
         },
         onFinished = { playbackId ->
-          T3VoiceStateStore.emit(
-            T3VoiceRuntimeEvent.PlaybackTerminated(playbackId, "completed"),
-          )
           synchronized(operationLock) {
-            playbackOwner?.takeIf { it.id == playbackId }?.let(::releasePlaybackLocked)
+            playbackOwner?.takeIf { it.id == playbackId }?.let { owner ->
+              terminatePlaybackLocked(
+                owner,
+                T3VoiceRuntimeEvent.PlaybackTerminated(playbackId, "completed"),
+              )
+            }
           }
         },
         onError = { playbackId, cause ->
-          T3VoiceStateStore.emit(
-            T3VoiceRuntimeEvent.PlaybackTerminated(playbackId, "failed"),
-          )
           T3VoiceStateStore.emit(
             T3VoiceRuntimeEvent.RuntimeError(
               operation = "playback:$playbackId",
@@ -334,7 +351,43 @@ class T3VoiceRuntimeService : Service() {
             ),
           )
           synchronized(operationLock) {
-            playbackOwner?.takeIf { it.id == playbackId }?.let(::releasePlaybackLocked)
+            playbackOwner?.takeIf { it.id == playbackId }?.let { owner ->
+              terminatePlaybackLocked(
+                owner,
+                T3VoiceRuntimeEvent.PlaybackTerminated(playbackId, "failed"),
+              )
+            }
+          }
+        },
+      )
+    playbackAudioFocus =
+      T3VoicePlaybackAudioFocus(
+        this,
+        onSuspend = {
+          mainHandler.post {
+            synchronized(operationLock) {
+              playbackOwner?.let { owner -> runCatching { player.pause(owner.id) } }
+            }
+          }
+        },
+        onResume = {
+          mainHandler.post {
+            synchronized(operationLock) {
+              playbackOwner?.let { owner -> runCatching { player.resume(owner.id) } }
+            }
+          }
+        },
+        onTerminate = {
+          mainHandler.post {
+            synchronized(operationLock) {
+              playbackOwner?.let { owner ->
+                runCatching { player.cancel(owner.id) }
+                terminatePlaybackLocked(
+                  owner,
+                  T3VoiceRuntimeEvent.PlaybackTerminated(owner.id, "cancelled"),
+                )
+              }
+            }
           }
         },
       )
@@ -378,8 +431,32 @@ class T3VoiceRuntimeService : Service() {
   }
 
   override fun onDestroy() {
+    synchronized(operationLock) {
+      recordingOwner?.let { owner ->
+        runCatching { recorder.cancel(owner.id) }
+        terminateRecordingLocked(
+          owner,
+          T3VoiceRuntimeEvent.RecordingTerminated(
+            recordingId = owner.id,
+            recording = null,
+            outcome = "cancelled",
+            reason = "service-destroyed",
+          ),
+          stopForeground = false,
+        )
+      }
+      playbackOwner?.let { owner ->
+        runCatching { player.cancel(owner.id) }
+        terminatePlaybackLocked(
+          owner,
+          T3VoiceRuntimeEvent.PlaybackTerminated(owner.id, "cancelled"),
+          stopForeground = false,
+        )
+      }
+    }
     recorder.release()
     player.release()
+    playbackAudioFocus.stop()
     if (realtimeDelegate.isInitialized()) realtime.release()
     T3VoiceStateStore.setInactive()
     super.onDestroy()
@@ -424,11 +501,24 @@ class T3VoiceRuntimeService : Service() {
     val state = T3VoiceStateStore.state.value
     recordingOwner?.takeIf { it.id == state.activeRecordingId }?.let { owner ->
       runCatching { recorder.cancel(owner.id) }
-      releaseRecordingLocked(owner, stopForeground = false)
+      terminateRecordingLocked(
+        owner,
+        T3VoiceRuntimeEvent.RecordingTerminated(
+          recordingId = owner.id,
+          recording = null,
+          outcome = "cancelled",
+          reason = "notification-stop",
+        ),
+        stopForeground = false,
+      )
     }
     playbackOwner?.takeIf { it.id == state.activePlaybackId }?.let { owner ->
       runCatching { player.cancel(owner.id) }
-      releasePlaybackLocked(owner, stopForeground = false)
+      terminatePlaybackLocked(
+        owner,
+        T3VoiceRuntimeEvent.PlaybackTerminated(owner.id, "cancelled"),
+        stopForeground = false,
+      )
     }
     state.activeRealtimeSessionId?.let {
       val stopped = runCatching { realtime.stop(it) }.getOrDefault(false)
@@ -459,10 +549,11 @@ class T3VoiceRuntimeService : Service() {
   private fun terminateRecordingLocked(
     owner: T3VoiceOperationOwner,
     event: T3VoiceRuntimeEvent.RecordingTerminated,
+    stopForeground: Boolean = true,
   ) {
     if (!T3VoiceStateStore.terminateRecording(owner, event)) return
     if (recordingOwner == owner) recordingOwner = null
-    stopRuntimeForegroundLocked()
+    if (stopForeground) stopRuntimeForegroundLocked()
   }
 
   private fun releasePlaybackLocked(
@@ -470,6 +561,18 @@ class T3VoiceRuntimeService : Service() {
     stopForeground: Boolean = true,
   ) {
     if (!T3VoiceStateStore.releasePlayback(owner)) return
+    playbackAudioFocus.stop()
+    if (playbackOwner == owner) playbackOwner = null
+    if (stopForeground) stopRuntimeForegroundLocked()
+  }
+
+  private fun terminatePlaybackLocked(
+    owner: T3VoiceOperationOwner,
+    event: T3VoiceRuntimeEvent.PlaybackTerminated,
+    stopForeground: Boolean = true,
+  ) {
+    if (!T3VoiceStateStore.terminatePlayback(owner, event)) return
+    playbackAudioFocus.stop()
     if (playbackOwner == owner) playbackOwner = null
     if (stopForeground) stopRuntimeForegroundLocked()
   }

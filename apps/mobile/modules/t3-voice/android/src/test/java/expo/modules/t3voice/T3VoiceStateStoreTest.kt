@@ -14,6 +14,9 @@ class T3VoiceStateStoreTest {
     T3VoiceStateStore.recordingTermination.value?.let {
       T3VoiceStateStore.clearRecordingTermination(it.recordingId)
     }
+    T3VoiceStateStore.playbackTermination.value?.let {
+      T3VoiceStateStore.clearPlaybackTermination(it.playbackId)
+    }
     T3VoiceStateStore.setInactive()
     T3VoiceStateStore.setServiceReady()
   }
@@ -145,5 +148,20 @@ class T3VoiceStateStoreTest {
     T3VoiceStateStore.releaseRealtimeClaim("session-a")
     T3VoiceStateStore.clearRecordingTermination("recording-a")
     assertTrue(T3VoiceStateStore.claimRecording("recording-b") != null)
+  }
+
+  @Test
+  fun playbackTerminationIsDurableAndBlocksReplacementUntilAcknowledged() {
+    val owner = checkNotNull(T3VoiceStateStore.claimPlayback("playback-a"))
+    val terminal = T3VoiceRuntimeEvent.PlaybackTerminated("playback-a", "completed")
+
+    assertTrue(T3VoiceStateStore.terminatePlayback(owner, terminal))
+    assertEquals(terminal, T3VoiceStateStore.playbackTermination.value)
+    assertNull(T3VoiceStateStore.claimPlayback("playback-b"))
+    T3VoiceStateStore.clearPlaybackTermination("other-playback")
+    assertEquals(terminal, T3VoiceStateStore.playbackTermination.value)
+    T3VoiceStateStore.clearPlaybackTermination("playback-a")
+    assertNull(T3VoiceStateStore.playbackTermination.value)
+    assertTrue(T3VoiceStateStore.claimPlayback("playback-b") != null)
   }
 }

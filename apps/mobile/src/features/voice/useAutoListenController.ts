@@ -56,6 +56,10 @@ interface AutoListenSpeechAdapter {
   readonly resumeAfterDictation: () => void;
 }
 
+export type AutoListenReviewResult =
+  | { readonly handled: false }
+  | { readonly handled: true; readonly sent: boolean };
+
 export function useAutoListenController(input: {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
@@ -69,7 +73,11 @@ export function useAutoListenController(input: {
   readonly speech: AutoListenSpeechAdapter;
   readonly realtimePhase: "idle" | "starting" | "active" | "stopping" | "error";
   readonly stopRealtime: () => Promise<void>;
-  readonly onSendVoiceMessage: (text: string) => Promise<MessageId | null>;
+  readonly onSendVoiceMessage: (input: {
+    readonly environmentId: EnvironmentId;
+    readonly threadId: ThreadId;
+    readonly text: string;
+  }) => Promise<MessageId | null>;
 }) {
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
   const [state, setState] = useState<VoiceThreadModeState>(initialVoiceThreadModeState);
@@ -81,6 +89,7 @@ export function useAutoListenController(input: {
   const responseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transcriptionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const submissionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mediaCommandChainRef = useRef(Promise.resolve());
   const mountedRef = useRef(true);
   const reviewSubmissionWaiterRef = useRef<{
     readonly token: import("@t3tools/shared/voiceThreadMode").VoiceThreadModeToken;
@@ -90,6 +99,7 @@ export function useAutoListenController(input: {
   const lastTerminationSequenceRef = useRef(0);
   const lastPlaybackSequenceRef = useRef(0);
   const targetKeyRef = useRef(`${input.environmentId}:${input.threadId}`);
+  const previousAutoListenEnabledRef = useRef(input.preferences.autoListenEnabled);
   generationRef.current = Math.max(generationRef.current, input.persistedTargetGeneration);
 
   const clearTimer = (kind: "guard" | "response" | "transcription" | "submission") => {
@@ -122,106 +132,167 @@ export function useAutoListenController(input: {
       reviewSubmissionWaiterRef.current.resolve(false);
       reviewSubmissionWaiterRef.current = null;
     }
-    for (const command of transition.commands) void executeCommandRef.current(command);
+    for (const command of transition.commands) {
+      if (
+        command.type === "start-recording" ||
+        command.type === "cancel-recording" ||
+        command.type === "cancel-playback"
+      ) {
+        mediaCommandChainRef.current = mediaCommandChainRef.current.then(() =>
+          executeCommandRef.current(command),
+        );
+      } else {
+        void Promise.resolve().then(() => executeCommandRef.current(command));
+      }
+    }
     return transition.state;
   }, []);
 
   executeCommandRef.current = async (command) => {
     const current = inputRef.current;
-    switch (command.type) {
-      case "start-recording": {
-        if (!sameToken(stateRef.current.activeToken, command.token)) return;
-        if (!(await current.speech.interrupt())) {
-          dispatch({ type: "arm-failed", token: command.token });
+    if (
+      !mountedRef.current &&
+      command.type !== "cancel-recording" &&
+      command.type !== "cancel-playback" &&
+      command.type !== "cancel-guard" &&
+      command.type !== "cancel-response-timeout" &&
+      command.type !== "cancel-transcription-timeout" &&
+      command.type !== "cancel-submission-timeout"
+    ) {
+      return;
+    }
+    try {
+      switch (command.type) {
+        case "start-recording": {
+          if (
+            !sameToken(stateRef.current.activeToken, command.token) ||
+            stateRef.current.target?.environmentId !== current.environmentId ||
+            stateRef.current.target?.threadId !== current.threadId
+          ) {
+            return;
+          }
+          if (!(await current.speech.interrupt())) {
+            dispatch({ type: "arm-failed", token: command.token });
+            return;
+          }
+          if (!mountedRef.current || !sameToken(stateRef.current.activeToken, command.token))
+            return;
+          const recordingId = await current.dictation.start();
+          if (!mountedRef.current) {
+            await current.dictation.cancel();
+            return;
+          }
+          dispatch(
+            recordingId === null
+              ? { type: "arm-failed", token: command.token }
+              : { type: "arm-succeeded", token: command.token, recordingId },
+          );
           return;
         }
-        if (!sameToken(stateRef.current.activeToken, command.token)) return;
-        const recordingId = await current.dictation.start();
-        dispatch(
-          recordingId === null
-            ? { type: "arm-failed", token: command.token }
-            : { type: "arm-succeeded", token: command.token, recordingId },
-        );
-        return;
-      }
-      case "cancel-recording":
-        await current.dictation.cancel();
-        return;
-      case "cancel-playback":
-        await current.speech.interrupt();
-        current.speech.resumeAfterDictation();
-        return;
-      case "set-review-draft":
-        return;
-      case "submit-transcript": {
-        if (
-          !sameToken(stateRef.current.activeToken, command.token) ||
-          stateRef.current.target?.environmentId !== command.target.environmentId ||
-          stateRef.current.target?.threadId !== command.target.threadId
-        ) {
+        case "cancel-recording":
+          await current.dictation.cancel();
+          return;
+        case "cancel-playback":
+          await current.speech.interrupt();
+          current.speech.resumeAfterDictation();
+          return;
+        case "set-review-draft":
+          return;
+        case "submit-transcript": {
+          if (
+            !sameToken(stateRef.current.activeToken, command.token) ||
+            stateRef.current.target?.environmentId !== command.target.environmentId ||
+            stateRef.current.target?.threadId !== command.target.threadId ||
+            current.environmentId !== command.target.environmentId ||
+            current.threadId !== command.target.threadId
+          ) {
+            if (
+              reviewSubmissionWaiterRef.current !== null &&
+              sameToken(reviewSubmissionWaiterRef.current.token, command.token)
+            ) {
+              reviewSubmissionWaiterRef.current.resolve(false);
+              reviewSubmissionWaiterRef.current = null;
+            }
+            return;
+          }
+          const messageId = await current.onSendVoiceMessage({
+            environmentId: command.target.environmentId,
+            threadId: command.target.threadId,
+            text: command.transcript,
+          });
+          dispatch(
+            messageId === null
+              ? { type: "submission-failed", token: command.token }
+              : {
+                  type: "submission-succeeded",
+                  token: command.token,
+                  messageId,
+                },
+          );
           if (
             reviewSubmissionWaiterRef.current !== null &&
             sameToken(reviewSubmissionWaiterRef.current.token, command.token)
           ) {
-            reviewSubmissionWaiterRef.current.resolve(false);
+            reviewSubmissionWaiterRef.current.resolve(messageId !== null);
             reviewSubmissionWaiterRef.current = null;
           }
           return;
         }
-        const messageId = await current.onSendVoiceMessage(command.transcript);
-        dispatch(
-          messageId === null
-            ? { type: "submission-failed", token: command.token }
-            : { type: "submission-succeeded", token: command.token, messageId },
-        );
+        case "start-guard":
+          clearTimer("guard");
+          guardTimerRef.current = setTimeout(() => {
+            guardTimerRef.current = null;
+            dispatch({ type: "guard-elapsed", token: command.token });
+          }, command.delayMs);
+          return;
+        case "cancel-guard":
+          clearTimer("guard");
+          return;
+        case "start-response-timeout":
+          clearTimer("response");
+          responseTimerRef.current = setTimeout(() => {
+            responseTimerRef.current = null;
+            dispatch({ type: "response-timeout", token: command.token });
+          }, current.preferences.responseTimeoutMs);
+          return;
+        case "cancel-response-timeout":
+          clearTimer("response");
+          return;
+        case "start-transcription-timeout":
+          clearTimer("transcription");
+          transcriptionTimerRef.current = setTimeout(() => {
+            transcriptionTimerRef.current = null;
+            dispatch({ type: "transcription-timeout", token: command.token });
+          }, current.preferences.transcriptionTimeoutMs);
+          return;
+        case "cancel-transcription-timeout":
+          clearTimer("transcription");
+          return;
+        case "start-submission-timeout":
+          clearTimer("submission");
+          submissionTimerRef.current = setTimeout(() => {
+            submissionTimerRef.current = null;
+            dispatch({ type: "submission-timeout", token: command.token });
+          }, current.preferences.submissionTimeoutMs);
+          return;
+        case "cancel-submission-timeout":
+          clearTimer("submission");
+      }
+    } catch {
+      if (command.type === "start-recording") {
+        dispatch({ type: "arm-failed", token: command.token });
+        return;
+      }
+      if (command.type === "submit-transcript") {
+        dispatch({ type: "submission-failed", token: command.token });
         if (
           reviewSubmissionWaiterRef.current !== null &&
           sameToken(reviewSubmissionWaiterRef.current.token, command.token)
         ) {
-          reviewSubmissionWaiterRef.current.resolve(messageId !== null);
+          reviewSubmissionWaiterRef.current.resolve(false);
           reviewSubmissionWaiterRef.current = null;
         }
-        return;
       }
-      case "start-guard":
-        clearTimer("guard");
-        guardTimerRef.current = setTimeout(() => {
-          guardTimerRef.current = null;
-          dispatch({ type: "guard-elapsed", token: command.token });
-        }, command.delayMs);
-        return;
-      case "cancel-guard":
-        clearTimer("guard");
-        return;
-      case "start-response-timeout":
-        clearTimer("response");
-        responseTimerRef.current = setTimeout(() => {
-          responseTimerRef.current = null;
-          dispatch({ type: "response-timeout", token: command.token });
-        }, current.preferences.responseTimeoutMs);
-        return;
-      case "cancel-response-timeout":
-        clearTimer("response");
-        return;
-      case "start-transcription-timeout":
-        clearTimer("transcription");
-        transcriptionTimerRef.current = setTimeout(() => {
-          transcriptionTimerRef.current = null;
-          dispatch({ type: "transcription-timeout", token: command.token });
-        }, current.preferences.transcriptionTimeoutMs);
-        return;
-      case "cancel-transcription-timeout":
-        clearTimer("transcription");
-        return;
-      case "start-submission-timeout":
-        clearTimer("submission");
-        submissionTimerRef.current = setTimeout(() => {
-          submissionTimerRef.current = null;
-          dispatch({ type: "submission-timeout", token: command.token });
-        }, current.preferences.submissionTimeoutMs);
-        return;
-      case "cancel-submission-timeout":
-        clearTimer("submission");
     }
   };
 
@@ -237,58 +308,73 @@ export function useAutoListenController(input: {
     [dispatch, persistPaused],
   );
 
-  const activate = useCallback(async () => {
-    const current = inputRef.current;
-    if (!current.preferences.autoListenEnabled || !current.canStartFromComposer) return false;
-    if (stateRef.current.phase !== "paused") {
-      dispatch({ type: "pause", reason: "user" });
-    }
-    await current.stopRealtime();
-    const latest = inputRef.current;
-    if (
-      !mountedRef.current ||
-      !latest.preferences.autoListenEnabled ||
-      !latest.canStartFromComposer ||
-      latest.environmentId !== current.environmentId ||
-      latest.threadId !== current.threadId
-    ) {
-      return false;
-    }
-    const generation = ++generationRef.current;
-    const target: VoiceThreadModeTarget = {
-      environmentId: current.environmentId,
-      threadId: current.threadId,
-      generation,
-    };
-    savePreferences({
-      voiceMode: "thread",
-      voiceThreadTarget: {
+  const activate = useCallback(
+    async (enableIfDisabled = false) => {
+      const current = inputRef.current;
+      if (
+        (!current.preferences.autoListenEnabled && !enableIfDisabled) ||
+        !current.canStartFromComposer ||
+        current.interactionRequired
+      ) {
+        return false;
+      }
+      if (stateRef.current.phase !== "paused") {
+        dispatch({ type: "pause", reason: "user" });
+      }
+      try {
+        await current.stopRealtime();
+      } catch {
+        return false;
+      }
+      const latest = inputRef.current;
+      if (
+        !mountedRef.current ||
+        (!latest.preferences.autoListenEnabled && !enableIfDisabled) ||
+        !latest.canStartFromComposer ||
+        latest.interactionRequired ||
+        latest.environmentId !== current.environmentId ||
+        latest.threadId !== current.threadId
+      ) {
+        return false;
+      }
+      const generation = ++generationRef.current;
+      const target: VoiceThreadModeTarget = {
         environmentId: current.environmentId,
         threadId: current.threadId,
         generation,
-      },
-    });
-    dispatch({
-      type: "activate",
-      target,
-      policy: latest.preferences.autoSubmitEnabled ? "auto-submit" : "review",
-      playbackRequired: latest.speech.enabled,
-      threadBusy: latest.activeThreadBusy,
-    });
-    return true;
-  }, [dispatch, savePreferences]);
+      };
+      savePreferences({
+        voiceMode: "thread",
+        voiceThreadTarget: {
+          environmentId: current.environmentId,
+          threadId: current.threadId,
+          generation,
+        },
+      });
+      dispatch({
+        type: "activate",
+        target,
+        policy: latest.preferences.autoSubmitEnabled ? "auto-submit" : "review",
+        playbackRequired: latest.speech.enabled,
+        threadBusy: latest.activeThreadBusy,
+      });
+      return true;
+    },
+    [dispatch, savePreferences],
+  );
 
   const submitReview = useCallback(
-    async (transcript: string) => {
-      if (stateRef.current.phase !== "reviewing") return false;
+    async (transcript: string): Promise<AutoListenReviewResult> => {
+      if (stateRef.current.phase !== "reviewing") return { handled: false };
       const next = dispatch({ type: "review-submit", transcript });
       const token = next.activeToken;
-      if (token === null || next.phase !== "submitting") return true;
+      if (token === null || next.phase !== "submitting") {
+        return { handled: true, sent: false };
+      }
       const completion = new Promise<boolean>((resolve) => {
         reviewSubmissionWaiterRef.current = { token, resolve };
       });
-      await completion;
-      return true;
+      return { handled: true, sent: await completion };
     },
     [dispatch],
   );
@@ -310,10 +396,25 @@ export function useAutoListenController(input: {
   }, [dispatch, input.environmentId, input.threadId, persistPaused]);
 
   useEffect(() => {
-    if (!input.preferences.autoListenEnabled && stateRef.current.phase !== "paused") {
+    const previouslyEnabled = previousAutoListenEnabledRef.current;
+    previousAutoListenEnabledRef.current = input.preferences.autoListenEnabled;
+    if (
+      previouslyEnabled &&
+      !input.preferences.autoListenEnabled &&
+      stateRef.current.phase !== "paused"
+    ) {
       pause("disabled");
     }
   }, [input.preferences.autoListenEnabled, pause]);
+
+  useEffect(() => {
+    if (
+      stateRef.current.phase !== "paused" &&
+      input.speech.enabled !== stateRef.current.playbackRequired
+    ) {
+      pause("user");
+    }
+  }, [input.speech.enabled, pause]);
 
   useEffect(() => {
     if (
@@ -344,7 +445,10 @@ export function useAutoListenController(input: {
       (stateRef.current.phase === "listening" || stateRef.current.phase === "endpointing") &&
       stateRef.current.activeToken !== null
     ) {
-      dispatch({ type: "recording-completed", token: stateRef.current.activeToken });
+      dispatch({
+        type: "recording-completed",
+        token: stateRef.current.activeToken,
+      });
     }
   }, [dispatch, input.dictation.phase]);
 
@@ -358,7 +462,11 @@ export function useAutoListenController(input: {
       stateRef.current.phase === "transcribing" &&
       stateRef.current.recordingId === event.recordingId
     ) {
-      dispatch({ type: "transcription-completed", token, transcript: event.finalDraft });
+      dispatch({
+        type: "transcription-completed",
+        token,
+        transcript: event.finalDraft,
+      });
     }
   }, [dispatch, input.dictation.transcriptionEvent]);
 

@@ -81,19 +81,35 @@ export type VoiceThreadModeEvent =
       readonly threadBusy: boolean;
     }
   | { readonly type: "pause"; readonly reason: VoiceThreadModePauseReason }
-  | { readonly type: "target-changed"; readonly target: VoiceThreadModeTarget | null }
+  | {
+      readonly type: "target-changed";
+      readonly target: VoiceThreadModeTarget | null;
+    }
   | { readonly type: "realtime-active" }
   | { readonly type: "thread-busy-changed"; readonly busy: boolean }
-  | { readonly type: "arm-succeeded"; readonly token: VoiceThreadModeToken; recordingId: string }
+  | {
+      readonly type: "arm-succeeded";
+      readonly token: VoiceThreadModeToken;
+      recordingId: string;
+    }
   | { readonly type: "arm-failed"; readonly token: VoiceThreadModeToken }
-  | { readonly type: "recording-endpointing"; readonly token: VoiceThreadModeToken }
-  | { readonly type: "recording-completed"; readonly token: VoiceThreadModeToken }
+  | {
+      readonly type: "recording-endpointing";
+      readonly token: VoiceThreadModeToken;
+    }
+  | {
+      readonly type: "recording-completed";
+      readonly token: VoiceThreadModeToken;
+    }
   | {
       readonly type: "transcription-completed";
       readonly token: VoiceThreadModeToken;
       readonly transcript: string;
     }
-  | { readonly type: "transcription-failed"; readonly token: VoiceThreadModeToken }
+  | {
+      readonly type: "transcription-failed";
+      readonly token: VoiceThreadModeToken;
+    }
   | { readonly type: "review-submit"; readonly transcript: string }
   | { readonly type: "review-discard" }
   | {
@@ -110,12 +126,30 @@ export type VoiceThreadModeEvent =
       readonly playbackId: string;
       readonly messageId: string;
     }
-  | { readonly type: "playback-drained"; readonly playbackId: string; readonly messageId: string }
-  | { readonly type: "playback-cancelled"; readonly playbackId: string; readonly messageId: string }
-  | { readonly type: "playback-failed"; readonly playbackId: string; readonly messageId: string }
+  | {
+      readonly type: "playback-drained";
+      readonly playbackId: string;
+      readonly messageId: string;
+    }
+  | {
+      readonly type: "playback-cancelled";
+      readonly playbackId: string;
+      readonly messageId: string;
+    }
+  | {
+      readonly type: "playback-failed";
+      readonly playbackId: string;
+      readonly messageId: string;
+    }
   | { readonly type: "guard-elapsed"; readonly token: VoiceThreadModeToken }
-  | { readonly type: "transcription-timeout"; readonly token: VoiceThreadModeToken }
-  | { readonly type: "submission-timeout"; readonly token: VoiceThreadModeToken }
+  | {
+      readonly type: "transcription-timeout";
+      readonly token: VoiceThreadModeToken;
+    }
+  | {
+      readonly type: "submission-timeout";
+      readonly token: VoiceThreadModeToken;
+    }
   | { readonly type: "response-timeout"; readonly token: VoiceThreadModeToken };
 
 export type VoiceThreadModeCommand =
@@ -135,11 +169,20 @@ export type VoiceThreadModeCommand =
       readonly delayMs: number;
     }
   | { readonly type: "cancel-guard" }
-  | { readonly type: "start-response-timeout"; readonly token: VoiceThreadModeToken }
+  | {
+      readonly type: "start-response-timeout";
+      readonly token: VoiceThreadModeToken;
+    }
   | { readonly type: "cancel-response-timeout" }
-  | { readonly type: "start-transcription-timeout"; readonly token: VoiceThreadModeToken }
+  | {
+      readonly type: "start-transcription-timeout";
+      readonly token: VoiceThreadModeToken;
+    }
   | { readonly type: "cancel-transcription-timeout" }
-  | { readonly type: "start-submission-timeout"; readonly token: VoiceThreadModeToken }
+  | {
+      readonly type: "start-submission-timeout";
+      readonly token: VoiceThreadModeToken;
+    }
   | { readonly type: "cancel-submission-timeout" };
 
 export interface VoiceThreadModeTransition {
@@ -210,7 +253,10 @@ const pause = (
 const beginOperation = (
   state: VoiceThreadModeState,
   phase: VoiceThreadModePhase,
-): { readonly state: VoiceThreadModeState; readonly token: VoiceThreadModeToken } => {
+): {
+  readonly state: VoiceThreadModeState;
+  readonly token: VoiceThreadModeToken;
+} => {
   const target = state.target;
   if (target === null) throw new Error("Voice thread mode requires a target");
   const operation = state.nextOperation + 1;
@@ -227,7 +273,10 @@ const beginOperation = (
 
 const arm = (state: VoiceThreadModeState): VoiceThreadModeTransition => {
   const next = beginOperation(state, "arming");
-  return { state: next.state, commands: [{ type: "start-recording", token: next.token }] };
+  return {
+    state: next.state,
+    commands: [{ type: "start-recording", token: next.token }],
+  };
 };
 
 const maybeBeginGuard = (
@@ -321,7 +370,12 @@ export function transitionVoiceThreadMode(
       if (!transcript) return pause(state, "empty-transcript");
       if (state.policy === "review") {
         return {
-          state: { ...state, phase: "reviewing", recordingId: null, transcript },
+          state: {
+            ...state,
+            phase: "reviewing",
+            recordingId: null,
+            transcript,
+          },
           commands: [
             { type: "cancel-transcription-timeout" },
             { type: "set-review-draft", transcript },
@@ -434,7 +488,12 @@ export function transitionVoiceThreadMode(
         return { state, commands: [] };
       }
       return maybeBeginGuard(
-        { ...state, phase: "speaking", playbackId: event.playbackId, playbackDrained: true },
+        {
+          ...state,
+          phase: "speaking",
+          playbackId: event.playbackId,
+          playbackDrained: true,
+        },
         config,
       );
     case "playback-cancelled":
@@ -457,7 +516,8 @@ export function transitionVoiceThreadMode(
           })
         : { state, commands: [] };
     case "response-timeout":
-      return state.phase === "waiting-response" && sameToken(state.activeToken, event.token)
+      return (state.phase === "waiting-response" || state.phase === "speaking") &&
+        sameToken(state.activeToken, event.token)
         ? pause(state, "response-timeout")
         : { state, commands: [] };
   }
