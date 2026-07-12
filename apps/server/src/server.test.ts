@@ -1102,7 +1102,9 @@ const fetchEffect = (input: Parameters<typeof fetch>[0], init?: RequestInit) => 
           (init.headers as Record<string, string> | undefined)?.["content-type"] ??
             "application/json",
         )
-      : (request) => request,
+      : init?.body instanceof FormData
+        ? HttpClientRequest.bodyFormData(init.body)
+        : (request) => request,
   );
   const effect = HttpClient.execute(request);
   return (
@@ -1444,6 +1446,61 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       });
 
       assert.equal(speechResponse.status, 401);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("does not consume media capacity for mismatched transcription requests", () =>
+    Effect.gen(function* () {
+      const maximumConcurrentMediaRequests = 2;
+      yield* buildAppUnderTest({
+        layers: {
+          serverSettings: {
+            getSettings: Effect.succeed({
+              ...DEFAULT_SERVER_SETTINGS,
+              voice: {
+                ...DEFAULT_SERVER_SETTINGS.voice,
+                enabled: true,
+                maxConcurrentMediaRequests: maximumConcurrentMediaRequests,
+              },
+            }),
+          },
+        },
+      });
+      const fileSystem = yield* FileSystem.FileSystem;
+      const fixture = yield* fileSystem.readFile(
+        new URL("./voice/Services/fixtures/silence-aac-lc-mono.m4a", import.meta.url),
+      );
+      const cookie = yield* getAuthenticatedSessionCookieHeader();
+
+      for (let index = 0; index <= maximumConcurrentMediaRequests; index += 1) {
+        const ticketResponse = yield* fetchEffect(
+          yield* getHttpServerUrl("/api/voice/media-tickets"),
+          {
+            method: "POST",
+            headers: { cookie, "content-type": "application/json" },
+            body: jsonRequestBody({
+              operation: "transcription-upload",
+              requestId: `voice-ticket-${index}`,
+            }),
+          },
+        );
+        const ticket = yield* responseJsonEffect<{ readonly token: string }>(ticketResponse);
+        assert.equal(ticketResponse.status, 200);
+
+        const form = new FormData();
+        form.append("audio", new Blob([fixture], { type: "audio/mp4" }), "recording.m4a");
+        form.append(
+          "metadata",
+          JSON.stringify({ requestId: `voice-upload-${index}`, format: "audio/mp4" }),
+        );
+        const response = yield* fetchEffect(yield* getHttpServerUrl("/api/voice/transcriptions"), {
+          method: "POST",
+          headers: { "x-t3-voice-ticket": ticket.token },
+          body: form,
+        });
+
+        assert.equal(response.status, 401);
+      }
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
