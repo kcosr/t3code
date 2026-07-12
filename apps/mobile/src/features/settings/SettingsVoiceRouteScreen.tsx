@@ -2,8 +2,7 @@ import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import { AsyncResult } from "effect/unstable/reactivity";
 import * as Clipboard from "expo-clipboard";
-import { Alert } from "react-native";
-import { ScrollView, View } from "react-native";
+import { Alert, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
@@ -49,8 +48,9 @@ export function SettingsVoiceRouteScreen() {
       Alert.alert("Voice diagnostics unavailable", "This build has no native voice runtime.");
       return;
     }
+    let entries: Awaited<ReturnType<typeof native.getDiagnosticsAsync>>;
     try {
-      const entries = await native.getDiagnosticsAsync();
+      entries = await native.getDiagnosticsAsync();
       if (entries.length === 0) {
         Alert.alert(
           "No voice diagnostics yet",
@@ -58,10 +58,15 @@ export function SettingsVoiceRouteScreen() {
         );
         return;
       }
+    } catch {
+      Alert.alert("Voice diagnostics unavailable", "The diagnostic snapshot could not be read.");
+      return;
+    }
+    try {
       await Clipboard.setStringAsync(formatVoiceDiagnostics(entries));
       Alert.alert("Voice diagnostics copied", `${entries.length} entries copied.`);
     } catch {
-      Alert.alert("Voice diagnostics unavailable", "The diagnostic snapshot could not be read.");
+      Alert.alert("Voice diagnostics not copied", "The diagnostic snapshot could not be copied.");
     }
   };
 
