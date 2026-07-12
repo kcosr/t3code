@@ -37,8 +37,17 @@ export type VoiceDiagnosticEvent =
       readonly type: "session-connected";
       readonly sessionId: VoiceSessionId;
       readonly leaseGeneration: number;
-      readonly signalingDurationMs: number;
+      readonly offerDurationMs: number;
+      readonly contextPreparationDurationMs: number;
+      readonly providerNegotiationDurationMs: number;
       readonly replayItemCount: number;
+    }
+  | {
+      readonly type: "provider-sideband-attached";
+      readonly sessionId: VoiceSessionId;
+      readonly leaseGeneration: number;
+      readonly outcome: "success" | "failure";
+      readonly durationMs: number;
     }
   | {
       readonly type: "session-ended";
@@ -131,8 +140,21 @@ export const voiceDiagnostic = (event: VoiceDiagnosticEvent): VoiceDiagnostic =>
         annotations: {
           sessionId: event.sessionId,
           leaseGeneration: event.leaseGeneration,
-          signalingDurationMs: event.signalingDurationMs,
+          offerDurationMs: event.offerDurationMs,
+          contextPreparationDurationMs: event.contextPreparationDurationMs,
+          providerNegotiationDurationMs: event.providerNegotiationDurationMs,
           replayItemCount: event.replayItemCount,
+        },
+      };
+    case "provider-sideband-attached":
+      return {
+        level: event.outcome === "failure" ? "warning" : "info",
+        message: "voice.provider.sideband-attach",
+        annotations: {
+          sessionId: event.sessionId,
+          leaseGeneration: event.leaseGeneration,
+          outcome: event.outcome,
+          durationMs: event.durationMs,
         },
       };
     case "session-ended":

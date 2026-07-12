@@ -1,5 +1,6 @@
 import type { VoiceTranscriptionStreamEvent } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -23,6 +24,7 @@ import {
 
 import { VoiceError } from "../../Errors.ts";
 import { VoiceCredentialStore } from "../../Services/VoiceCredentialStore.ts";
+import { logVoiceDiagnostic } from "../../Services/VoiceObservability.ts";
 import type {
   RealtimeProviderEvent,
   RealtimeVoiceProvider,
@@ -884,6 +886,7 @@ const make = Effect.gen(function* () {
         );
       }
       const sessionScope = yield* Scope.make("sequential");
+      const sidebandStartedAt = yield* Clock.currentTimeMillis;
       const sideband = yield* realtimeSocket
         .connect({
           url: `wss://api.openai.com/v1/realtime?call_id=${encodeURIComponent(providerRealtimeCallId)}`,
@@ -891,6 +894,19 @@ const make = Effect.gen(function* () {
         })
         .pipe(
           Scope.provide(sessionScope),
+          Effect.onExit((exit) =>
+            Clock.currentTimeMillis.pipe(
+              Effect.flatMap((sidebandCompletedAt) =>
+                logVoiceDiagnostic({
+                  type: "provider-sideband-attached",
+                  sessionId: input.sessionId,
+                  leaseGeneration: input.leaseGeneration,
+                  outcome: Exit.isSuccess(exit) ? "success" : "failure",
+                  durationMs: Math.max(0, sidebandCompletedAt - sidebandStartedAt),
+                }),
+              ),
+            ),
+          ),
           Effect.catch((cause) =>
             hangup.pipe(
               Effect.ignore,

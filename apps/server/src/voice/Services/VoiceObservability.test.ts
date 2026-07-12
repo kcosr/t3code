@@ -34,6 +34,24 @@ it("builds correlated voice diagnostics without accepting content-bearing fields
       providerActivityObserved: true,
     },
   });
+  expect(
+    voiceDiagnostic({
+      type: "provider-sideband-attached",
+      sessionId: "voice-session-1",
+      leaseGeneration: 2,
+      outcome: "success",
+      durationMs: 87,
+    }),
+  ).toEqual({
+    level: "info",
+    message: "voice.provider.sideband-attach",
+    annotations: {
+      sessionId: "voice-session-1",
+      leaseGeneration: 2,
+      outcome: "success",
+      durationMs: 87,
+    },
+  });
 });
 
 it.effect("logs successful and failed media stream completion", () => {

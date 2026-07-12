@@ -347,9 +347,18 @@ it.effect(
         expect(diagnostics.filter(([message]) => message === "voice.session.created")).toHaveLength(
           1,
         );
-        expect(
-          diagnostics.filter(([message]) => message === "voice.session.connected"),
-        ).toHaveLength(1);
+        const connectedDiagnostics = diagnostics.filter(
+          ([message]) => message === "voice.session.connected",
+        );
+        expect(connectedDiagnostics).toHaveLength(1);
+        expect(connectedDiagnostics[0]?.[1]).toMatchObject({
+          sessionId: created.state.sessionId,
+          leaseGeneration: created.state.leaseGeneration,
+          offerDurationMs: expect.any(Number),
+          contextPreparationDurationMs: expect.any(Number),
+          providerNegotiationDurationMs: expect.any(Number),
+          replayItemCount: 0,
+        });
         const endedDiagnostics = diagnostics.filter(
           ([message]) => message === "voice.session.ended",
         );

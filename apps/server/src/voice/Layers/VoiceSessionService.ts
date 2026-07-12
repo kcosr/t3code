@@ -300,7 +300,11 @@ const make = Effect.gen(function* () {
 
   const markConnected = Effect.fn("VoiceSessionService.markConnected")(function* (
     lease: VoiceSessionLease,
-    signalingDurationMs: number,
+    timings: {
+      readonly offerDurationMs: number;
+      readonly contextPreparationDurationMs: number;
+      readonly providerNegotiationDurationMs: number;
+    },
     replayItemCount: number,
   ) {
     const occurredAt = yield* nowIso;
@@ -342,7 +346,7 @@ const make = Effect.gen(function* () {
           type: "session-connected",
           sessionId: lease.sessionId,
           leaseGeneration: lease.generation,
-          signalingDurationMs,
+          ...timings,
           replayItemCount,
         });
         const sessions = new Map(state.sessions);
@@ -1283,7 +1287,7 @@ const make = Effect.gen(function* () {
   const offerUnlocked: VoiceSessionServiceShape["offer"] = Effect.fn(
     "VoiceSessionService.offerUnlocked",
   )(function* (owner, sessionId, offer) {
-    const signalingStartedAt = yield* Clock.currentTimeMillis;
+    const offerStartedAt = yield* Clock.currentTimeMillis;
     if (offer.sessionId !== sessionId) {
       return yield* sessionError(
         "lease-conflict",
@@ -1311,6 +1315,7 @@ const make = Effect.gen(function* () {
       );
     }
     yield* setPhase(session.lease, "connecting");
+    const contextPreparationStartedAt = yield* Clock.currentTimeMillis;
     const entries = yield* conversations.listContext(
       session.lease.conversationId,
       session.lease.contextEpoch,
@@ -1337,6 +1342,8 @@ const make = Effect.gen(function* () {
       ...(session.input.threadId === undefined ? {} : { threadId: session.input.threadId }),
     };
     const initialFocusItem = voiceFocusContextItem(initialFocus);
+    const contextPreparationCompletedAt = yield* Clock.currentTimeMillis;
+    const providerNegotiationStartedAt = contextPreparationCompletedAt;
     const providerSession = yield* adapter.realtime
       .negotiate({
         sessionId,
@@ -1351,6 +1358,7 @@ const make = Effect.gen(function* () {
           endRuntimeSession(session, "error", { reason: "negotiation-failed" }),
         ),
       );
+    const providerNegotiationCompletedAt = yield* Clock.currentTimeMillis;
     const providerAttached = yield* mutateSession(sessionId, (current) => {
       if (current.terminating || current.terminalAt !== undefined) {
         return [false, current] as const;
@@ -1440,7 +1448,17 @@ const make = Effect.gen(function* () {
           const signalingCompletedAt = yield* Clock.currentTimeMillis;
           yield* markConnected(
             session.lease,
-            Math.max(0, signalingCompletedAt - signalingStartedAt),
+            {
+              offerDurationMs: Math.max(0, signalingCompletedAt - offerStartedAt),
+              contextPreparationDurationMs: Math.max(
+                0,
+                contextPreparationCompletedAt - contextPreparationStartedAt,
+              ),
+              providerNegotiationDurationMs: Math.max(
+                0,
+                providerNegotiationCompletedAt - providerNegotiationStartedAt,
+              ),
+            },
             context.items.length + (initialFocusItem === undefined ? 0 : 1),
           );
         }),
