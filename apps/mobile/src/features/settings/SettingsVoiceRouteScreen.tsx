@@ -1,5 +1,8 @@
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
+import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import { AsyncResult } from "effect/unstable/reactivity";
+import * as Clipboard from "expo-clipboard";
+import { Alert } from "react-native";
 import { ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -23,6 +26,8 @@ import {
   VOICE_TRANSCRIPTION_TIMEOUT_MAX_MS,
   VOICE_TRANSCRIPTION_TIMEOUT_MIN_MS,
 } from "../voice/voicePreferences";
+import { formatVoiceDiagnostics } from "../voice/voiceDiagnostics";
+import { SettingsRow } from "./components/SettingsRow";
 import { SettingsSection } from "./components/SettingsSection";
 import { SettingsStepperRow } from "./components/SettingsStepperRow";
 import { SettingsSwitchRow } from "./components/SettingsSwitchRow";
@@ -38,6 +43,27 @@ export function SettingsVoiceRouteScreen() {
   const stored = ready ? preferencesResult.value : {};
   const voice = resolveVoicePreferences(stored);
   const noSpeechEnabled = voice.noSpeechTimeoutMs !== null;
+  const copyDiagnostics = async () => {
+    const native = getT3VoiceNativeModule();
+    if (native === null) {
+      Alert.alert("Voice diagnostics unavailable", "This build has no native voice runtime.");
+      return;
+    }
+    try {
+      const entries = await native.getDiagnosticsAsync();
+      if (entries.length === 0) {
+        Alert.alert(
+          "No voice diagnostics yet",
+          "Use voice once, then copy the diagnostic snapshot.",
+        );
+        return;
+      }
+      await Clipboard.setStringAsync(formatVoiceDiagnostics(entries));
+      Alert.alert("Voice diagnostics copied", `${entries.length} entries copied.`);
+    } catch {
+      Alert.alert("Voice diagnostics unavailable", "The diagnostic snapshot could not be read.");
+    }
+  };
 
   return (
     <View collapsable={false} className="flex-1 bg-sheet">
@@ -165,6 +191,15 @@ export function SettingsVoiceRouteScreen() {
             value={voice.responseTimeoutMs}
             valueLabel={minutes(voice.responseTimeoutMs)}
             onChange={(value) => savePreferences({ voiceResponseTimeoutMs: value })}
+          />
+        </SettingsSection>
+
+        <SettingsSection title="Support">
+          <SettingsRow
+            icon="doc.on.clipboard"
+            label="Copy voice diagnostics"
+            value="Redacted"
+            onPress={() => void copyDiagnostics()}
           />
         </SettingsSection>
       </ScrollView>
