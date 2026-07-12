@@ -124,7 +124,8 @@ internal class T3VoiceWebRtcSession(
           .createPeerConnectionFactory()
       audioSource = peerConnectionFactory.createAudioSource(audioConstraints())
       audioTrack = peerConnectionFactory.createAudioTrack(LOCAL_AUDIO_TRACK_ID, audioSource)
-      check(audioTrack.setEnabled(true)) { "WebRTC could not enable the microphone track." }
+      audioTrack.setEnabled(true)
+      check(audioTrack.enabled()) { "WebRTC could not enable the microphone track." }
       peerConnection =
         peerConnectionFactory.createPeerConnection(
           rtcConfiguration(),
@@ -712,7 +713,7 @@ internal class T3VoiceWebRtcSession(
 
   private fun applyCaptureState(session: ActiveSession) {
     val muted = effectiveMuted(session)
-    check(session.audioTrack.setEnabled(!muted)) { "WebRTC could not change microphone state." }
+    session.audioTrack.setEnabled(!muted)
     session.audioDeviceModule.setMicrophoneMute(muted)
     session.peerConnection.setAudioRecording(!session.captureState.focusSuspended)
     check(session.audioTrack.enabled() == !muted) { "WebRTC microphone state did not change." }
