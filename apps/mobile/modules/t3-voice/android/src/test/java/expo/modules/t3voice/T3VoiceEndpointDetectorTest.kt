@@ -12,10 +12,10 @@ class T3VoiceEndpointDetectorTest {
 
     assertEquals(150L, config.speechOnsetMs)
     assertEquals(250L, config.minimumSpeechMs)
-    assertEquals(1_200L, config.endSilenceMs)
+    assertEquals(2_200L, config.endSilenceMs)
     assertEquals(500L, config.minimumRecordingMs)
     assertNull(config.noSpeechTimeoutMs)
-    assertEquals(30L * 60L * 1_000L, config.maximumUtteranceMs)
+    assertEquals(30L * 60L * 1_000L - 1_000L, config.maximumUtteranceMs)
   }
 
   @Test
@@ -24,9 +24,9 @@ class T3VoiceEndpointDetectorTest {
 
     feed(detector, 0L..250L step 50L, amplitude = 100)
     feed(detector, 300L..800L step 50L, amplitude = 8_000)
-    feed(detector, 850L..1_950L step 50L, amplitude = 100)
-    assertEquals(T3VoiceEndpointDetector.Outcome.SPEECH_ENDED, detector.observe(2_000L, 100))
-    assertNull(detector.observe(2_050L, 100))
+    feed(detector, 850L..2_950L step 50L, amplitude = 100)
+    assertEquals(T3VoiceEndpointDetector.Outcome.SPEECH_ENDED, detector.observe(3_000L, 100))
+    assertNull(detector.observe(3_050L, 100))
   }
 
   @Test
@@ -34,8 +34,8 @@ class T3VoiceEndpointDetectorTest {
     val detector = T3VoiceEndpointDetector()
 
     feed(detector, 0L..500L step 50L, amplitude = 1_000)
-    feed(detector, 550L..1_650L step 50L, amplitude = 100)
-    assertEquals(T3VoiceEndpointDetector.Outcome.SPEECH_ENDED, detector.observe(1_700L, 100))
+    feed(detector, 550L..2_650L step 50L, amplitude = 100)
+    assertEquals(T3VoiceEndpointDetector.Outcome.SPEECH_ENDED, detector.observe(2_700L, 100))
   }
 
   @Test

@@ -235,7 +235,7 @@ class T3VoiceRuntimeService : Service() {
   override fun onCreate() {
     super.onCreate()
     recorder =
-      T3VoiceRecorder(applicationContext) { termination ->
+      T3VoiceRecorder(applicationContext, terminalLock = operationLock) { termination ->
         synchronized(operationLock) {
           val owner =
             recordingOwner?.takeIf {

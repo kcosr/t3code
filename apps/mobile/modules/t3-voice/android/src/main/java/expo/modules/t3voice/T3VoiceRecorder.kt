@@ -111,6 +111,7 @@ internal sealed interface T3VoiceRecordingTermination {
 
 internal class T3VoiceRecorder(
   private val context: Context,
+  private val terminalLock: Any = Any(),
   private val onTerminated: (T3VoiceRecordingTermination) -> Unit = {},
 ) {
   private data class ActiveRecording(
@@ -126,6 +127,7 @@ internal class T3VoiceRecorder(
   private val completed = mutableMapOf<String, File>()
   private val recordingCache = T3VoiceRecordingCache(context.cacheDir)
   private val terminalPolicy = T3VoiceRecordingTerminalPolicy()
+  private val terminalCoordinator = T3VoiceRecordingTerminalCoordinator(terminalLock)
   private val endpointThread = HandlerThread("t3-voice-endpoint").apply { start() }
   private val endpointHandler = Handler(endpointThread.looper)
 
@@ -241,14 +243,16 @@ internal class T3VoiceRecorder(
         MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED -> "media-file-size-limit"
         else -> return
       }
-    val recording =
-      synchronized(this) {
-        val current = active?.takeIf { it.recorder === source } ?: return
-        if (!terminalPolicy.claim(current.terminalOwner)) return
-        active = null
-        current
-      }
-    completeAutomatically(recording, reason)
+    terminalCoordinator.serialized {
+      val recording =
+        synchronized(this) {
+          val current = active?.takeIf { it.recorder === source } ?: return@serialized
+          if (!terminalPolicy.claim(current.terminalOwner)) return@serialized
+          active = null
+          current
+        }
+      completeAutomatically(recording, reason)
+    }
   }
 
   private fun scheduleEndpointPoll(owner: T3VoiceRecordingTerminalPolicy.Owner) {
@@ -265,19 +269,22 @@ internal class T3VoiceRecorder(
             endpointHandler.postDelayed(this, ENDPOINT_POLL_INTERVAL_MS)
             return
           }
-          val recording =
-            synchronized(this@T3VoiceRecorder) {
-              val current = active?.takeIf { it.terminalOwner == owner } ?: return
-              if (!terminalPolicy.claim(owner)) return
-              active = null
-              current
+          terminalCoordinator.serialized {
+            val recording =
+              synchronized(this@T3VoiceRecorder) {
+                val current =
+                  active?.takeIf { it.terminalOwner == owner } ?: return@serialized
+                if (!terminalPolicy.claim(owner)) return@serialized
+                active = null
+                current
+              }
+            when (termination) {
+              T3VoiceEndpointDetector.Outcome.NO_SPEECH -> cancelAutomatically(recording)
+              T3VoiceEndpointDetector.Outcome.SPEECH_ENDED ->
+                completeAutomatically(recording, "speech-ended")
+              T3VoiceEndpointDetector.Outcome.MAXIMUM_UTTERANCE ->
+                completeAutomatically(recording, "maximum-utterance")
             }
-          when (termination) {
-            T3VoiceEndpointDetector.Outcome.NO_SPEECH -> cancelAutomatically(recording)
-            T3VoiceEndpointDetector.Outcome.SPEECH_ENDED ->
-              completeAutomatically(recording, "speech-ended")
-            T3VoiceEndpointDetector.Outcome.MAXIMUM_UTTERANCE ->
-              completeAutomatically(recording, "maximum-utterance")
           }
         }
       },

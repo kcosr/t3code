@@ -20,3 +20,9 @@ internal class T3VoiceRecordingTerminalPolicy {
 
   fun deactivate(owner: Owner): Boolean = claim(owner)
 }
+
+internal class T3VoiceRecordingTerminalCoordinator(
+  private val lock: Any,
+) {
+  fun <T> serialized(operation: () -> T): T = synchronized(lock) { operation() }
+}

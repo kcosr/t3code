@@ -1,5 +1,8 @@
 package expo.modules.t3voice
 
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -53,5 +56,30 @@ class T3VoiceRecordingTerminalPolicyTest {
 
     assertEquals("failed", body["outcome"])
     assertEquals(null, body["recording"])
+  }
+
+  @Test
+  fun automaticTerminalWorkWaitsForManualOperationLock() {
+    val lock = Any()
+    val coordinator = T3VoiceRecordingTerminalCoordinator(lock)
+    val manualEntered = CountDownLatch(1)
+    val releaseManual = CountDownLatch(1)
+    val automaticEntered = CountDownLatch(1)
+    val manual =
+      thread {
+        synchronized(lock) {
+          manualEntered.countDown()
+          releaseManual.await()
+        }
+      }
+    assertTrue(manualEntered.await(1, TimeUnit.SECONDS))
+    val automatic = thread { coordinator.serialized { automaticEntered.countDown() } }
+
+    assertFalse(automaticEntered.await(100, TimeUnit.MILLISECONDS))
+    releaseManual.countDown()
+    assertTrue(automaticEntered.await(1, TimeUnit.SECONDS))
+
+    manual.join()
+    automatic.join()
   }
 }

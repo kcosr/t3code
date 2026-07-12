@@ -9,10 +9,10 @@ internal data class T3VoiceEndpointDetectionConfig(
   val releaseHysteresisDb: Double = 4.0,
   val speechOnsetMs: Long = 150L,
   val minimumSpeechMs: Long = 250L,
-  val endSilenceMs: Long = 1_200L,
+  val endSilenceMs: Long = 2_200L,
   val minimumRecordingMs: Long = 500L,
   val noSpeechTimeoutMs: Long? = null,
-  val maximumUtteranceMs: Long = 30L * 60L * 1_000L,
+  val maximumUtteranceMs: Long = 30L * 60L * 1_000L - 1_000L,
 ) {
   init {
     require(onsetMarginDb in 3.0..30.0) { "onsetMarginDb must be between 3 and 30" }

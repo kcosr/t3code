@@ -15,6 +15,7 @@ import {
 } from "./transcriptionDraft";
 import { useVoiceCapabilityDescriptor } from "./useVoiceCapabilityAvailability";
 import { validateRecordingAgainstCapability } from "./dictationPolicy";
+import { cleanupOrphanedRecordingTermination } from "./dictationTermination";
 
 export type ComposerDictationPhase = "idle" | "recording" | "transcribing";
 
@@ -129,7 +130,7 @@ export function useComposerDictation(input: {
       await native.startRecordingAsync({
         recordingId,
         endpointDetection: {
-          endSilenceMs: 1_200,
+          endSilenceMs: 2_200,
         },
       });
       if (operationGenerationRef.current !== generation) {
@@ -189,18 +190,7 @@ export function useComposerDictation(input: {
         recordingIdRef.current !== event.recordingId &&
         stoppingRecordingIdRef.current !== event.recordingId;
       if (orphanedTermination) {
-        if (event.outcome === "completed") {
-          void native
-            .deleteRecordingAsync({
-              recordingId: event.recordingId,
-              uri: event.recording.uri,
-            })
-            .catch(() => undefined);
-        } else {
-          void native
-            .acknowledgeRecordingTerminationAsync({ recordingId: event.recordingId })
-            .catch(() => undefined);
-        }
+        void cleanupOrphanedRecordingTermination(native, event).catch(() => undefined);
         return;
       }
       ++operationGenerationRef.current;
