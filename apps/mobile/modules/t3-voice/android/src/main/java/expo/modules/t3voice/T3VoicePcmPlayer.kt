@@ -15,6 +15,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 internal interface T3VoicePcmOutput {
   val playbackHeadPosition: Long
 
+  fun start()
+
   fun write(pcm: ByteArray, offset: Int, length: Int): Int
 
   fun pause()
@@ -77,6 +79,7 @@ internal class T3VoicePcmPlayer(
     var queuedBytes: Int = 0,
     var acceptedBytes: Long = 0,
     var acceptedFrames: Long = 0,
+    var outputStarted: Boolean = false,
     var drainScheduled: Boolean = false,
     var incompleteTimeout: T3VoicePlaybackTimeoutTask? = null,
     var timeoutGeneration: Long = 0,
@@ -84,7 +87,7 @@ internal class T3VoicePcmPlayer(
   )
 
   private val executor = Executors.newSingleThreadExecutor()
-  private val lock = Any()
+  private val lock = java.lang.Object()
   private var active: ActivePlayback? = null
 
   fun start(playbackId: String, sampleRate: Int, channelCount: Int) {
@@ -168,6 +171,7 @@ internal class T3VoicePcmPlayer(
         current.pending.clear()
         current.queuedBytes = 0
         active = null
+        lock.notifyAll()
         current
       }
     releaseOutputOnce(playback, flush = true)
@@ -179,7 +183,7 @@ internal class T3VoicePcmPlayer(
       if (playback.paused) return
       playback.paused = true
       cancelIncompleteTimeoutLocked(playback)
-      playback.output.pause()
+      if (playback.outputStarted) playback.output.pause()
     }
   }
 
@@ -187,8 +191,9 @@ internal class T3VoicePcmPlayer(
     synchronized(lock) {
       val playback = requireActive(playbackId)
       if (!playback.paused) return
-      playback.output.resume()
+      if (playback.outputStarted) playback.output.resume()
       playback.paused = false
+      lock.notifyAll()
       armInactivityTimeoutLocked(playback)
       scheduleDrainLocked(playback)
     }
@@ -200,6 +205,7 @@ internal class T3VoicePcmPlayer(
         val current = active
         current?.cancelled = true
         active = null
+        lock.notifyAll()
         current
       }
     if (playback != null) {
@@ -217,6 +223,7 @@ internal class T3VoicePcmPlayer(
   private fun drain(playback: ActivePlayback) {
     try {
       while (true) {
+        startOutputIfBuffered(playback)
         val next =
           synchronized(lock) {
             if (active !== playback || playback.cancelled) {
@@ -244,6 +251,8 @@ internal class T3VoicePcmPlayer(
           synchronized(lock) {
             if (active === playback) cancelIncompleteTimeoutLocked(playback)
           }
+          waitUntilResumedOrCancelled(playback)
+          startOutput(playback)
           check(awaitPlaybackDrain(next.first)) {
             "PCM playback did not drain before the deadline."
           }
@@ -288,13 +297,55 @@ internal class T3VoicePcmPlayer(
     require(pcm.size % playback.bytesPerFrame == 0) { "PCM chunk ended on a partial frame." }
     var offset = 0
     while (offset < pcm.size) {
+      waitUntilResumedOrCancelled(playback)
       if (playback.cancelled) {
         return
       }
-      val written = playback.output.write(pcm, offset, pcm.size - offset)
+      startOutputIfBuffered(playback)
+      val remainingPrebufferBytes =
+        ((prebufferFrames(playback) - playback.framesWritten).coerceAtLeast(0) *
+            playback.bytesPerFrame)
+          .coerceAtMost(Int.MAX_VALUE.toLong())
+          .toInt()
+      val writeLength =
+        if (playback.outputStarted || remainingPrebufferBytes == 0) {
+          pcm.size - offset
+        } else {
+          minOf(pcm.size - offset, remainingPrebufferBytes)
+        }
+      val written = playback.output.write(pcm, offset, writeLength)
       check(written > 0) { "AudioTrack write failed with code $written." }
       offset += written
       playback.framesWritten += written / playback.bytesPerFrame
+    }
+    startOutputIfBuffered(playback)
+  }
+
+  private fun waitUntilResumedOrCancelled(playback: ActivePlayback) {
+    synchronized(lock) {
+      while (active === playback && playback.paused && !playback.cancelled) lock.wait()
+    }
+  }
+
+  private fun prebufferFrames(playback: ActivePlayback): Long =
+    playback.sampleRate.toLong() * PREBUFFER_DURATION_MS / 1_000L
+
+  private fun startOutputIfBuffered(playback: ActivePlayback) {
+    if (playback.framesWritten >= prebufferFrames(playback)) startOutput(playback)
+  }
+
+  private fun startOutput(playback: ActivePlayback) {
+    synchronized(lock) {
+      if (
+        playback.outputStarted ||
+          playback.cancelled ||
+          playback.paused ||
+          active !== playback
+      ) {
+        return
+      }
+      playback.output.start()
+      playback.outputStarted = true
     }
   }
 
@@ -365,7 +416,8 @@ internal class T3VoicePcmPlayer(
   companion object {
     private const val MIN_SAMPLE_RATE = 8_000
     private const val MAX_SAMPLE_RATE = 48_000
-    private const val TARGET_BUFFER_BYTES = 48_000
+    private const val PREBUFFER_DURATION_MS = 500L
+    private const val OUTPUT_BUFFER_DURATION_MS = 1_000L
     private const val DRAIN_GRACE_MS = 500L
     private const val MAXIMUM_DRAIN_WAIT_MS = 30_000L
     private const val DRAIN_POLL_INTERVAL_MS = 10L
@@ -417,14 +469,20 @@ internal class T3VoicePcmPlayer(
         AudioTrack.Builder()
           .setAudioAttributes(attributes)
           .setAudioFormat(format)
-          .setBufferSizeInBytes(maxOf(minimumBuffer * 2, TARGET_BUFFER_BYTES))
+          .setBufferSizeInBytes(
+            maxOf(
+              minimumBuffer * 2,
+              sampleRate * channelCount * Short.SIZE_BYTES * OUTPUT_BUFFER_DURATION_MS / 1_000,
+            ),
+          )
           .setTransferMode(AudioTrack.MODE_STREAM)
           .build()
       check(track.state == AudioTrack.STATE_INITIALIZED) { "Android could not initialize PCM playback." }
-      track.play()
       return object : T3VoicePcmOutput {
         override val playbackHeadPosition: Long
           get() = track.playbackHeadPosition.toLong()
+
+        override fun start() = track.play()
 
         override fun write(pcm: ByteArray, offset: Int, length: Int): Int =
           track.write(pcm, offset, length, AudioTrack.WRITE_BLOCKING)

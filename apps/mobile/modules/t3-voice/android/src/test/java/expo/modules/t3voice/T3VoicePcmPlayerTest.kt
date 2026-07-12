@@ -20,6 +20,54 @@ class T3VoicePcmPlayerTest {
   }
 
   @Test
+  fun prebuffersStoppedOutputBeforeStartingPlayback() {
+    val output = FakeOutput(playbackHeadPosition = 24_000)
+    val consumed = Semaphore(0)
+    val player =
+      T3VoicePcmPlayer(
+        onChunkConsumed = { _, _ -> consumed.release() },
+        onFinished = {},
+        onError = { _, cause -> throw AssertionError("playback must not fail", cause) },
+        outputFactory = T3VoicePcmOutputFactory { _, _ -> output },
+        clock = ImmediatePlaybackClock,
+        decodePcm = { ByteArray(12_000) },
+      )
+
+    player.start("buffered", 24_000, 1)
+    player.enqueue("buffered", 0, "ignored")
+    assertTrue(consumed.tryAcquire(2, TimeUnit.SECONDS))
+    assertEquals(0, output.startCount)
+    player.enqueue("buffered", 1, "ignored")
+    assertTrue(consumed.tryAcquire(2, TimeUnit.SECONDS))
+    assertEquals(1, output.startCount)
+    player.cancel("buffered")
+    player.release()
+  }
+
+  @Test
+  fun finalizedShortPlaybackStartsWithoutFullPrebuffer() {
+    val output = FakeOutput(playbackHeadPosition = 1)
+    val finished = CountDownLatch(1)
+    val player =
+      T3VoicePcmPlayer(
+        onChunkConsumed = { _, _ -> },
+        onFinished = { finished.countDown() },
+        onError = { _, cause -> throw AssertionError("playback must not fail", cause) },
+        outputFactory = T3VoicePcmOutputFactory { _, _ -> output },
+        clock = ImmediatePlaybackClock,
+        decodePcm = { byteArrayOf(0, 0) },
+      )
+
+    player.start("short", 24_000, 1)
+    player.enqueue("short", 0, "ignored")
+    player.finish("short", 0)
+
+    assertTrue(finished.await(2, TimeUnit.SECONDS))
+    assertEquals(1, output.startCount)
+    player.release()
+  }
+
+  @Test
   fun cancellationDuringFinalDrainDoesNotFinishOrFenceReplacement() {
     val firstOutput = FakeOutput(playbackHeadPosition = 0)
     val secondOutput = FakeOutput(playbackHeadPosition = 1)
@@ -409,6 +457,11 @@ class T3VoicePcmPlayerTest {
     val releaseFlushes = mutableListOf<Boolean>()
     var pauseCount = 0
     var resumeCount = 0
+    var startCount = 0
+
+    override fun start() {
+      startCount += 1
+    }
 
     override fun write(pcm: ByteArray, offset: Int, length: Int): Int = length
 
@@ -433,6 +486,8 @@ class T3VoicePcmPlayerTest {
     val writeExited = CountDownLatch(1)
     var releaseCount = 0
     val releaseFlushes = mutableListOf<Boolean>()
+
+    override fun start() = Unit
 
     override fun write(pcm: ByteArray, offset: Int, length: Int): Int {
       writeEntered.countDown()
