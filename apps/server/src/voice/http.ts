@@ -18,6 +18,7 @@ import { VoiceMediaTicketRegistry } from "./Services/VoiceMediaTicketRegistry.ts
 import { inspectVoiceMp4 } from "./Services/VoiceMp4Inspector.ts";
 import {
   boundVoiceByteStream,
+  boundVoiceMediaEffect,
   validateVoiceMultipartShape,
   VOICE_MULTIPART_MAX_PARTS,
   VOICE_MULTIPART_METADATA_MAX_BYTES,
@@ -35,6 +36,7 @@ const decodeTranscriptionMetadata = Schema.decodeUnknownEffect(
   Schema.fromJsonString(VoiceTranscriptionMetadata),
 );
 const decodeSpeechRequest = Schema.decodeUnknownEffect(VoiceSpeechRequest);
+const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
 const encodeTranscriptionEvent = Schema.encodeSync(
   Schema.fromJsonString(VoiceTranscriptionStreamEvent),
 );
@@ -45,23 +47,32 @@ class VoiceMediaRequestError extends Data.TaggedError("VoiceMediaRequestError")<
   readonly cause?: unknown;
 }> {}
 
-const decodeBoundedJson = (request: HttpServerRequest.HttpServerRequest, maximumBytes: number) =>
+export const decodeBoundedJson = (
+  request: HttpServerRequest.HttpServerRequest,
+  maximumBytes: number,
+): Effect.Effect<unknown, VoiceMediaPolicyError | VoiceMediaRequestError> =>
   request.stream.pipe(
-    Stream.runFoldEffect(new Uint8Array(0), (observed, chunk) => {
-      if (observed.byteLength + chunk.byteLength > maximumBytes) {
-        return Effect.fail(new VoiceMediaPolicyError({ reason: "payload-too-large" }));
-      }
-      const combined = new Uint8Array(observed.byteLength + chunk.byteLength);
-      combined.set(observed);
-      combined.set(chunk, observed.byteLength);
-      return Effect.succeed(combined);
-    }),
+    Stream.mapError(
+      (cause) => new VoiceMediaRequestError({ message: "Invalid voice speech request", cause }),
+    ),
+    Stream.runFoldEffect(
+      () => new Uint8Array(0),
+      (observed, chunk) => {
+        if (observed.byteLength + chunk.byteLength > maximumBytes) {
+          return Effect.fail(new VoiceMediaPolicyError({ reason: "payload-too-large" }));
+        }
+        const combined = new Uint8Array(observed.byteLength + chunk.byteLength);
+        combined.set(observed);
+        combined.set(chunk, observed.byteLength);
+        return Effect.succeed(combined);
+      },
+    ),
     Effect.flatMap((bytes) =>
-      Effect.try({
-        try: () => JSON.parse(new TextDecoder().decode(bytes)) as unknown,
-        catch: (cause) =>
-          new VoiceMediaRequestError({ message: "Invalid voice speech request", cause }),
-      }),
+      decodeUnknownJson(new TextDecoder().decode(bytes)).pipe(
+        Effect.mapError(
+          (cause) => new VoiceMediaRequestError({ message: "Invalid voice speech request", cause }),
+        ),
+      ),
     ),
   );
 
@@ -176,7 +187,10 @@ const transcriptionRoute = HttpRouter.add(
     const settings = (yield* settingsService.getSettings).voice;
     const permit = yield* mediaRequestLimiter.acquire(settings.maxConcurrentMediaRequests);
     return yield* Effect.gen(function* () {
-      const { metadata, bytes, validatedMedia } = yield* decodeTranscriptionMultipart;
+      const { metadata, bytes, validatedMedia } = yield* boundVoiceMediaEffect(
+        decodeTranscriptionMultipart,
+        settings.mediaRequestTimeoutSeconds,
+      );
       if (!ticketAuthorizesRequest(authorization, metadata.requestId)) {
         return HttpServerResponse.jsonUnsafe(
           { code: "auth_invalid", reason: "invalid_credential" },
@@ -237,9 +251,13 @@ const speechRoute = HttpRouter.add(
       return yield* invalidRequest("Voice is disabled on this server");
     }
     const input = yield* decodeBoundedJson(request, VOICE_SPEECH_REQUEST_MAX_BYTES).pipe(
-      Effect.flatMap(decodeSpeechRequest),
-      Effect.mapError(
-        (cause) => new VoiceMediaRequestError({ message: "Invalid voice speech request", cause }),
+      Effect.flatMap((value) =>
+        decodeSpeechRequest(value).pipe(
+          Effect.mapError(
+            (cause) =>
+              new VoiceMediaRequestError({ message: "Invalid voice speech request", cause }),
+          ),
+        ),
       ),
     );
     if (new TextEncoder().encode(input.text).byteLength > settings.maxSpeechTextBytes) {

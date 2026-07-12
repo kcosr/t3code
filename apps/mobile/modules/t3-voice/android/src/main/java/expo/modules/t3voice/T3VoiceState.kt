@@ -62,12 +62,16 @@ internal sealed interface T3VoiceRuntimeEvent {
   }
 
   data class RecordingTerminated(
-    val recordingId: String,
+    val recording: T3VoiceRecordingResult,
     val outcome: String,
     val code: String,
   ) : T3VoiceRuntimeEvent {
     override fun toEventBody(): Map<String, Any> =
-      mapOf("recordingId" to recordingId, "outcome" to outcome, "code" to code)
+      mapOf(
+        "recording" to recording.toResultBody(),
+        "outcome" to outcome,
+        "code" to code,
+      )
   }
 
   data class RuntimeError(

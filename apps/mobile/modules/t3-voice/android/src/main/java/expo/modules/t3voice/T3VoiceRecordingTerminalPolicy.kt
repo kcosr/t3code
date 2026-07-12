@@ -20,3 +20,15 @@ internal class T3VoiceRecordingTerminalPolicy {
 
   fun deactivate(owner: Owner): Boolean = claim(owner)
 }
+
+internal object T3VoiceRecordingLimitCleanup {
+  fun run(
+    stop: () -> Unit,
+    release: () -> Unit,
+    notify: () -> Unit,
+  ) {
+    runCatching(stop)
+    runCatching(release)
+    notify()
+  }
+}

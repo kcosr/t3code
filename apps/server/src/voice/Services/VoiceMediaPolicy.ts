@@ -89,6 +89,17 @@ export const VoiceMediaRequestLimiterLive = Layer.effect(
   makeVoiceMediaRequestLimiter,
 );
 
+export const boundVoiceMediaEffect = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  timeoutSeconds: number,
+): Effect.Effect<A, E | VoiceMediaPolicyError, R> =>
+  effect.pipe(
+    Effect.timeoutOrElse({
+      duration: `${timeoutSeconds} seconds`,
+      orElse: () => Effect.fail(new VoiceMediaPolicyError({ reason: "request-timeout" })),
+    }),
+  );
+
 export const boundVoiceByteStream = <E, R>(
   stream: Stream.Stream<Uint8Array, E, R>,
   options: {
@@ -98,13 +109,23 @@ export const boundVoiceByteStream = <E, R>(
   },
 ): Stream.Stream<Uint8Array, E | VoiceMediaPolicyError, R> =>
   Stream.unwrap(
-    Ref.make(0).pipe(
-      Effect.map((observedBytes) =>
-        stream.pipe(
-          Stream.timeoutOrElse({
-            duration: `${options.firstByteTimeoutSeconds} seconds`,
-            orElse: () => Stream.fail(new VoiceMediaPolicyError({ reason: "request-timeout" })),
-          }),
+    Effect.all([Ref.make(0), Ref.make(false)]).pipe(
+      Effect.map(([observedBytes, observedFirstChunk]) => {
+        const firstByteTimeout = Stream.fromEffect(
+          Effect.sleep(`${options.firstByteTimeoutSeconds} seconds`).pipe(
+            Effect.andThen(Ref.get(observedFirstChunk)),
+            Effect.flatMap((observed) =>
+              observed
+                ? Effect.never
+                : Effect.fail(new VoiceMediaPolicyError({ reason: "request-timeout" })),
+            ),
+          ),
+        );
+        const firstByteBound = stream.pipe(
+          Stream.tap(() => Ref.set(observedFirstChunk, true)),
+          Stream.merge(firstByteTimeout, { haltStrategy: "left" }),
+        );
+        return firstByteBound.pipe(
           Stream.mapEffect((chunk) =>
             Ref.updateAndGet(observedBytes, (current) => current + chunk.byteLength).pipe(
               Effect.flatMap((total) =>
@@ -119,7 +140,7 @@ export const boundVoiceByteStream = <E, R>(
               Effect.andThen(Effect.fail(new VoiceMediaPolicyError({ reason: "request-timeout" }))),
             ),
           ),
-        ),
-      ),
+        );
+      }),
     ),
   );

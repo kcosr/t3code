@@ -8,6 +8,7 @@ describe("voice capability descriptors", () => {
       __testing.descriptor("transcription.request", "ready", {
         maxUploadBytes: 32 * 1024 * 1024,
         maxInputDurationSeconds: 30 * 60,
+        maxSpeechTextBytes: 8 * 1024,
       }),
     ).toEqual({
       capability: "transcription.request",
@@ -16,6 +17,22 @@ describe("voice capability descriptors", () => {
       outputFormats: [],
       maxInputBytes: 32 * 1024 * 1024,
       maxInputDurationSeconds: 30 * 60,
+    });
+  });
+
+  it("advertises the enforceable speech input limit", () => {
+    expect(
+      __testing.descriptor("speech.streaming", "ready", {
+        maxUploadBytes: 32 * 1024 * 1024,
+        maxInputDurationSeconds: 30 * 60,
+        maxSpeechTextBytes: 8 * 1024,
+      }),
+    ).toEqual({
+      capability: "speech.streaming",
+      state: "ready",
+      inputFormats: [],
+      outputFormats: ["audio/pcm;rate=24000;encoding=s16le;channels=1"],
+      maxInputBytes: 8 * 1024,
     });
   });
 });

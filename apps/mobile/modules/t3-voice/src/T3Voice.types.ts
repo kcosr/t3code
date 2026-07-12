@@ -74,8 +74,8 @@ export interface T3VoicePlaybackChunkConsumedEvent {
 }
 
 export interface T3VoiceRecordingTerminatedEvent {
-  readonly recordingId: string;
-  readonly outcome: "limit-reached";
+  readonly recording: T3VoiceRecordingResult;
+  readonly outcome: "completed-limit";
   readonly code: "recording-duration-limit" | "recording-file-size-limit";
 }
 

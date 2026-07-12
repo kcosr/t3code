@@ -373,8 +373,8 @@ export const VoiceSettings = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(8 * 1024)),
   ),
   maxSpeechOutputBytes: Schema.Int.check(
-    Schema.isBetween({ minimum: 1, maximum: 8 * 1024 * 1024 }),
-  ).pipe(Schema.withDecodingDefault(Effect.succeed(8 * 1024 * 1024))),
+    Schema.isBetween({ minimum: 1, maximum: 64 * 1024 * 1024 }),
+  ).pipe(Schema.withDecodingDefault(Effect.succeed(32 * 1024 * 1024))),
   mediaRequestTimeoutSeconds: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 300 })).pipe(
     Schema.withDecodingDefault(Effect.succeed(120)),
   ),

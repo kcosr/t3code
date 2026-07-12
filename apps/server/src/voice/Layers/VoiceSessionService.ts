@@ -436,7 +436,6 @@ const make = Effect.gen(function* () {
     const current = (yield* SynchronizedRef.get(runtime)).sessions.get(session.lease.sessionId);
     yield* terminateProvider(current ?? session, options);
     yield* registry.release(session.lease);
-    yield* tickets.revokeVoiceSession(session.lease.sessionId);
     yield* SynchronizedRef.update(runtime, (current) => {
       const idempotency = new Map(current.idempotency);
       idempotency.delete(session.idempotencyId);
@@ -848,7 +847,6 @@ const make = Effect.gen(function* () {
           replacementGeneration: acquired.lease.generation,
         });
         yield* terminateProvider(displaced);
-        yield* tickets.revokeVoiceSession(displaced.lease.sessionId);
         const occurredAt = yield* nowIso;
         yield* mutateSession(
           displaced.lease.sessionId,

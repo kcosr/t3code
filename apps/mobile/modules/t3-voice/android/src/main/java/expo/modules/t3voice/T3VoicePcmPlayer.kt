@@ -36,10 +36,9 @@ internal data class T3VoicePcmLimits(
   val maximumQueuedBytes: Int = 1_024 * 1_024,
   val maximumQueuedChunks: Int = 8,
   val maximumIndexGap: Int = 8,
-  val maximumTotalBytes: Long = 32L * 1_024L * 1_024L,
-  val maximumTotalChunks: Int = 4_096,
-  val maximumDurationSeconds: Int = 10 * 60,
-  val incompleteStreamTimeoutMs: Long = 15_000,
+  val maximumTotalBytes: Long = 48L * 1_024L * 1_024L,
+  val maximumDurationSeconds: Int = 15 * 60,
+  val inactivityTimeoutMs: Long = 30_000,
 )
 
 internal fun interface T3VoicePlaybackTimeoutScheduler {
@@ -72,10 +71,10 @@ internal class T3VoicePcmPlayer(
     var framesWritten: Long = 0,
     var queuedBytes: Int = 0,
     var acceptedBytes: Long = 0,
-    var acceptedChunks: Int = 0,
     var acceptedFrames: Long = 0,
     var drainScheduled: Boolean = false,
     var incompleteTimeout: T3VoicePlaybackTimeoutTask? = null,
+    var timeoutGeneration: Long = 0,
     val released: AtomicBoolean = AtomicBoolean(false),
   )
 
@@ -88,13 +87,15 @@ internal class T3VoicePcmPlayer(
     require(channelCount == 1 || channelCount == 2) { "PCM playback supports one or two channels." }
     synchronized(lock) {
       check(active == null) { "A voice playback is already active." }
-      active =
+      val playback =
         ActivePlayback(
           playbackId = playbackId,
           output = outputFactory.create(sampleRate, channelCount),
           bytesPerFrame = channelCount * Short.SIZE_BYTES,
           sampleRate = sampleRate,
         )
+      active = playback
+      armInactivityTimeoutLocked(playback)
     }
   }
 
@@ -120,9 +121,6 @@ internal class T3VoicePcmPlayer(
       check(playback.queuedBytes.toLong() + pcm.size <= limits.maximumQueuedBytes) {
         "PCM playback queue byte limit was exceeded."
       }
-      check(playback.acceptedChunks < limits.maximumTotalChunks) {
-        "PCM playback chunk limit was exceeded."
-      }
       check(playback.acceptedBytes + pcm.size <= limits.maximumTotalBytes) {
         "PCM playback byte limit was exceeded."
       }
@@ -134,8 +132,8 @@ internal class T3VoicePcmPlayer(
       playback.pending[chunkIndex] = pcm
       playback.queuedBytes += pcm.size
       playback.acceptedBytes += pcm.size
-      playback.acceptedChunks += 1
       playback.acceptedFrames += frames
+      armInactivityTimeoutLocked(playback)
       scheduleDrainLocked(playback)
     }
   }
@@ -152,7 +150,7 @@ internal class T3VoicePcmPlayer(
         "The final PCM chunk index is too far ahead of the playback cursor."
       }
       playback.finalChunkIndex = finalChunkIndex
-      if (finalChunkIndex != playback.nextChunkIndex - 1) armIncompleteTimeoutLocked(playback)
+      if (finalChunkIndex != playback.nextChunkIndex - 1) armInactivityTimeoutLocked(playback)
       scheduleDrainLocked(playback)
     }
   }
@@ -235,7 +233,9 @@ internal class T3VoicePcmPlayer(
         writeFully(next.first, chunk.second)
         val stillOwned =
           synchronized(lock) {
-            active === next.first && !next.first.cancelled
+            val ownsPlayback = active === next.first && !next.first.cancelled
+            if (ownsPlayback) armInactivityTimeoutLocked(next.first)
+            ownsPlayback
           }
         if (stillOwned) onChunkConsumed(next.first.playbackId, chunk.first)
       }
@@ -293,15 +293,18 @@ internal class T3VoicePcmPlayer(
     if (playback.released.compareAndSet(false, true)) playback.output.release(flush)
   }
 
-  private fun armIncompleteTimeoutLocked(playback: ActivePlayback) {
+  private fun armInactivityTimeoutLocked(playback: ActivePlayback) {
     cancelIncompleteTimeoutLocked(playback)
+    val timeoutGeneration = playback.timeoutGeneration
     playback.incompleteTimeout =
-      timeoutScheduler.schedule(limits.incompleteStreamTimeoutMs) {
+      timeoutScheduler.schedule(limits.inactivityTimeoutMs) {
         val timedOut =
           synchronized(lock) {
-            if (active !== playback || playback.cancelled) return@schedule
-            val finalIndex = playback.finalChunkIndex ?: return@schedule
-            if (finalIndex == playback.nextChunkIndex - 1) return@schedule
+            if (
+              active !== playback ||
+                playback.cancelled ||
+                playback.timeoutGeneration != timeoutGeneration
+            ) return@schedule
             active = null
             playback.cancelled = true
             playback.pending.clear()
@@ -309,11 +312,12 @@ internal class T3VoicePcmPlayer(
             playback
           }
         releaseOutputOnce(timedOut, flush = true)
-        onError(timedOut.playbackId, IllegalStateException("PCM playback stream was incomplete."))
+        onError(timedOut.playbackId, IllegalStateException("PCM playback stream became inactive."))
       }
   }
 
   private fun cancelIncompleteTimeoutLocked(playback: ActivePlayback) {
+    playback.timeoutGeneration += 1
     playback.incompleteTimeout?.cancel()
     playback.incompleteTimeout = null
   }

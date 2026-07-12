@@ -58,6 +58,7 @@ import {
 } from "../state/environmentHttpAuth.ts";
 
 const DEFAULT_VOICE_HTTP_TIMEOUT_MS = 30_000;
+const DEFAULT_VOICE_MEDIA_TIMEOUT_MS = 5 * 60_000;
 const VOICE_TICKET_HEADER = "x-t3-voice-ticket";
 const decodeTranscriptionEvent = Schema.decodeUnknownEffect(
   Schema.fromJsonString(VoiceTranscriptionStreamEvent),
@@ -412,6 +413,7 @@ const decodeTranscriptionLines = <E>(lines: Stream.Stream<string, E>, requestUrl
 export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpClient => {
   const signer = Option.fromNullishOr(input.signer);
   const timeoutMs = input.timeoutMs ?? DEFAULT_VOICE_HTTP_TIMEOUT_MS;
+  const mediaTimeoutMs = input.timeoutMs ?? DEFAULT_VOICE_MEDIA_TIMEOUT_MS;
   const control = <A, E>(request: {
     readonly method: "GET" | "POST" | "PATCH" | "DELETE";
     readonly pathname: string;
@@ -623,8 +625,6 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
               return client.voice.mediaTicket({ headers, payload });
             case "speech-stream":
               return client.voice.mediaTicket({ headers, payload });
-            case "voice-heartbeat":
-              return client.voice.mediaTicket({ headers, payload });
           }
         },
       }),
@@ -643,7 +643,7 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
           uploadUriMediaResponse({
             prepared: input.prepared,
             signer,
-            timeoutMs,
+            timeoutMs: mediaTimeoutMs,
             requestUrl,
             upload: (headers, signal) =>
               input.uploadUri!({
@@ -674,7 +674,7 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
           prepared: input.prepared,
           fetch: input.fetch,
           signer,
-          timeoutMs,
+          timeoutMs: mediaTimeoutMs,
           requestUrl,
           send: (headers, signal) =>
             input.fetch(requestUrl, {
@@ -705,7 +705,7 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
           prepared: input.prepared,
           fetch: input.fetch,
           signer,
-          timeoutMs,
+          timeoutMs: mediaTimeoutMs,
           requestUrl,
           send: (headers, signal) =>
             input.fetch(requestUrl, {

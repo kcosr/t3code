@@ -534,11 +534,7 @@ export const VoiceSpeechRequest = Schema.Struct({
 });
 export type VoiceSpeechRequest = typeof VoiceSpeechRequest.Type;
 
-export const VoiceMediaTicketOperation = Schema.Literals([
-  "transcription-upload",
-  "speech-stream",
-  "voice-heartbeat",
-]);
+export const VoiceMediaTicketOperation = Schema.Literals(["transcription-upload", "speech-stream"]);
 export type VoiceMediaTicketOperation = typeof VoiceMediaTicketOperation.Type;
 
 export const VoiceMediaTicketRequest = Schema.Union([
@@ -549,10 +545,6 @@ export const VoiceMediaTicketRequest = Schema.Union([
   Schema.Struct({
     operation: Schema.Literal("speech-stream"),
     requestId: VoiceRequestId,
-  }),
-  Schema.Struct({
-    operation: Schema.Literal("voice-heartbeat"),
-    sessionId: VoiceSessionId,
   }),
 ]);
 export type VoiceMediaTicketRequest = typeof VoiceMediaTicketRequest.Type;

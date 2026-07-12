@@ -224,12 +224,13 @@ class T3VoiceRuntimeService : Service() {
   override fun onCreate() {
     super.onCreate()
     recorder =
-      T3VoiceRecorder(applicationContext) { recordingId, code ->
+      T3VoiceRecorder(applicationContext) { recording, code ->
         synchronized(operationLock) {
-          val owner = recordingOwner?.takeIf { it.id == recordingId } ?: return@T3VoiceRecorder
+          val owner =
+            recordingOwner?.takeIf { it.id == recording.recordingId } ?: return@T3VoiceRecorder
           releaseRecordingLocked(owner)
           T3VoiceStateStore.emit(
-            T3VoiceRuntimeEvent.RecordingTerminated(recordingId, "limit-reached", code),
+            T3VoiceRuntimeEvent.RecordingTerminated(recording, "completed-limit", code),
           )
         }
       }

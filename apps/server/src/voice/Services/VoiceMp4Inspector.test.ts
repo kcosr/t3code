@@ -1,8 +1,15 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import type { Movie } from "mp4box";
 
-import { inspectVoiceMp4, validateVoiceMp4Info } from "./VoiceMp4Inspector.ts";
+import {
+  inspectVoiceMp4,
+  validateVoiceMp4ContainerLayout,
+  validateVoiceMp4Info,
+} from "./VoiceMp4Inspector.ts";
 
 const movie = (overrides: Partial<Movie> = {}): Movie =>
   ({
@@ -28,6 +35,38 @@ const validMovie = (): Movie => {
 };
 
 describe("VoiceMp4Inspector", () => {
+  it.effect("accepts the reproducible ffmpeg AAC-LC mono fixture", () =>
+    Effect.gen(function* () {
+      // Generated with ffmpeg 6.1.1 from anullsrc at 24 kHz for 100 ms; metadata stripped.
+      const bytes = NodeFS.readFileSync(
+        new URL("./fixtures/silence-aac-lc-mono.m4a", import.meta.url),
+      );
+      assert.equal(
+        NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+        "f2eecd0066dd8d378b1fb9244ad4ff3946816d77544347688191d5d282b07fcf",
+      );
+      const result = yield* inspectVoiceMp4(bytes, 1);
+      assert.equal(result.codec, "aac-lc");
+      assert.equal(result.channelCount, 1);
+      assert.equal(result.sampleRate, 24_000);
+      assert.equal(result.byteLength, 855);
+    }),
+  );
+
+  it.effect("accepts one or more media-data boxes but rejects missing data and fragments", () =>
+    Effect.gen(function* () {
+      yield* validateVoiceMp4ContainerLayout(1, 0);
+      yield* validateVoiceMp4ContainerLayout(2, 0);
+      assert.equal(
+        (yield* validateVoiceMp4ContainerLayout(0, 0).pipe(Effect.flip)).reason,
+        "invalid-media",
+      );
+      assert.equal(
+        (yield* validateVoiceMp4ContainerLayout(1, 1).pipe(Effect.flip)).reason,
+        "invalid-media",
+      );
+    }),
+  );
   it.effect("accepts one complete mono AAC-LC track within the duration limit", () =>
     Effect.gen(function* () {
       const result = yield* validateVoiceMp4Info(validMovie(), {

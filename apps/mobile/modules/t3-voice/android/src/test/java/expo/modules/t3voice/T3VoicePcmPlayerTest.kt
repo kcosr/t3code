@@ -2,6 +2,7 @@ package expo.modules.t3voice
 
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.Semaphore
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -9,6 +10,15 @@ import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class T3VoicePcmPlayerTest {
+  @Test
+  fun defaultLifetimeCoversFifteenMinutesOfStandardPcm() {
+    val limits = T3VoicePcmLimits()
+    val standardPcmBytes = 24_000L * 2L * 15L * 60L
+
+    assertTrue(limits.maximumDurationSeconds >= 15 * 60)
+    assertTrue(limits.maximumTotalBytes >= standardPcmBytes)
+  }
+
   @Test
   fun cancellationDuringFinalDrainDoesNotFinishOrFenceReplacement() {
     val firstOutput = FakeOutput(playbackHeadPosition = 0)
@@ -180,7 +190,6 @@ class T3VoicePcmPlayerTest {
           T3VoicePcmLimits(
             maximumQueuedChunks = 1,
             maximumQueuedBytes = 2,
-            maximumTotalChunks = 10,
             maximumTotalBytes = 20,
           ),
       )
@@ -211,7 +220,6 @@ class T3VoicePcmPlayerTest {
           T3VoicePcmLimits(
             maximumIndexGap = 1,
             maximumTotalBytes = 2,
-            maximumTotalChunks = 10,
           ),
       )
     player.start("bounded", 24_000, 1)
@@ -252,6 +260,79 @@ class T3VoicePcmPlayerTest {
     assertEquals(1, output.releaseCount)
     assertEquals(listOf(true), output.releaseFlushes)
     assertThrows(IllegalStateException::class.java) { player.cancel("incomplete") }
+    player.release()
+  }
+
+  @Test
+  fun inactivityBeforeFinishReleasesAndAllowsReplacement() {
+    val firstOutput = FakeOutput(0)
+    val secondOutput = FakeOutput(0)
+    val outputs = ArrayDeque<T3VoicePcmOutput>(listOf(firstOutput, secondOutput))
+    val scheduler = FakeTimeoutScheduler()
+    val errors = mutableListOf<String>()
+    val player =
+      T3VoicePcmPlayer(
+        onChunkConsumed = { _, _ -> },
+        onFinished = {},
+        onError = { id, _ -> errors += id },
+        outputFactory = T3VoicePcmOutputFactory { _, _ -> outputs.removeFirst() },
+        decodePcm = { byteArrayOf(0, 0) },
+        timeoutScheduler = scheduler,
+      )
+    player.start("stalled", 24_000, 1)
+
+    scheduler.run()
+
+    assertEquals(listOf("stalled"), errors)
+    assertEquals(1, firstOutput.releaseCount)
+    player.start("replacement", 24_000, 1)
+    player.cancel("replacement")
+    assertEquals(1, secondOutput.releaseCount)
+    player.release()
+  }
+
+  @Test
+  fun lifetimeAcceptanceDoesNotDependOnTransportChunkCount() {
+    val consumed = Semaphore(0)
+    val player =
+      T3VoicePcmPlayer(
+        onChunkConsumed = { _, _ -> consumed.release() },
+        onFinished = {},
+        onError = { _, cause -> throw AssertionError("bounded playback must not fail", cause) },
+        outputFactory = T3VoicePcmOutputFactory { _, _ -> FakeOutput(10_000) },
+        decodePcm = { byteArrayOf(0, 0) },
+      )
+    player.start("fragmented", 24_000, 1)
+
+    repeat(4_100) { index ->
+      player.enqueue("fragmented", index, "ignored")
+      assertTrue(consumed.tryAcquire(2, TimeUnit.SECONDS))
+    }
+
+    player.cancel("fragmented")
+    player.release()
+  }
+
+  @Test
+  fun staleInactivityTimerCannotTerminateRefreshedPlayback() {
+    val scheduler = QueuedTimeoutScheduler()
+    val errors = mutableListOf<String>()
+    val player =
+      T3VoicePcmPlayer(
+        onChunkConsumed = { _, _ -> },
+        onFinished = {},
+        onError = { id, _ -> errors += id },
+        outputFactory = T3VoicePcmOutputFactory { _, _ -> FakeOutput(1) },
+        decodePcm = { byteArrayOf(0, 0) },
+        timeoutScheduler = scheduler,
+      )
+    player.start("refreshed", 24_000, 1)
+    player.enqueue("refreshed", 0, "ignored")
+
+    scheduler.runEvenIfCancelled(0)
+
+    assertTrue(errors.isEmpty())
+    player.cancel("refreshed")
     player.release()
   }
 
@@ -326,6 +407,22 @@ class T3VoicePcmPlayerTest {
 
     fun run() {
       action?.invoke()
+    }
+  }
+
+  private class QueuedTimeoutScheduler : T3VoicePlaybackTimeoutScheduler {
+    private data class Scheduled(val action: () -> Unit, var cancelled: Boolean = false)
+
+    private val scheduled = mutableListOf<Scheduled>()
+
+    override fun schedule(delayMs: Long, action: () -> Unit): T3VoicePlaybackTimeoutTask {
+      val task = Scheduled(action)
+      scheduled += task
+      return T3VoicePlaybackTimeoutTask { task.cancelled = true }
+    }
+
+    fun runEvenIfCancelled(index: Int) {
+      scheduled[index].action()
     }
   }
 }

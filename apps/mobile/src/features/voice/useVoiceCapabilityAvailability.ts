@@ -1,33 +1,33 @@
 import type { PreparedConnection } from "@t3tools/client-runtime/connection";
-import type { VoiceCapability } from "@t3tools/contracts";
+import type { VoiceCapability, VoiceCapabilityDescriptor } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import { useEffect, useState } from "react";
 
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
 
-export function useVoiceCapabilityAvailability(
+export function useVoiceCapabilityDescriptor(
   prepared: PreparedConnection | null,
   capability: VoiceCapability,
-): boolean {
-  const [available, setAvailable] = useState(false);
+): VoiceCapabilityDescriptor | null {
+  const [descriptor, setDescriptor] = useState<VoiceCapabilityDescriptor | null>(null);
 
   useEffect(() => {
     let disposed = false;
-    setAvailable(false);
+    setDescriptor(null);
     if (prepared === null) return;
 
     void makeMobileVoiceClient(prepared)
       .then((client) => Effect.runPromise(client.capabilities()))
       .then((result) => {
         if (disposed) return;
-        setAvailable(
-          result.capabilities.some(
-            (descriptor) => descriptor.capability === capability && descriptor.state === "ready",
-          ),
+        setDescriptor(
+          result.capabilities.find(
+            (candidate) => candidate.capability === capability && candidate.state === "ready",
+          ) ?? null,
         );
       })
       .catch(() => {
-        if (!disposed) setAvailable(false);
+        if (!disposed) setDescriptor(null);
       });
 
     return () => {
@@ -35,5 +35,12 @@ export function useVoiceCapabilityAvailability(
     };
   }, [capability, prepared]);
 
-  return available;
+  return descriptor;
+}
+
+export function useVoiceCapabilityAvailability(
+  prepared: PreparedConnection | null,
+  capability: VoiceCapability,
+): boolean {
+  return useVoiceCapabilityDescriptor(prepared, capability) !== null;
 }

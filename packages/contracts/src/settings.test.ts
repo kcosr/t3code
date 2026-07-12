@@ -94,7 +94,7 @@ describe("ServerSettings.voice", () => {
       maxUploadBytes: 32 * 1024 * 1024,
       maxInputDurationSeconds: 30 * 60,
       maxSpeechTextBytes: 8 * 1024,
-      maxSpeechOutputBytes: 8 * 1024 * 1024,
+      maxSpeechOutputBytes: 32 * 1024 * 1024,
       mediaRequestTimeoutSeconds: 120,
       maxConcurrentMediaRequests: 4,
       maxConcurrentSessions: 1,
@@ -120,7 +120,7 @@ describe("ServerSettings.voice", () => {
     ).toThrow();
     expect(() =>
       Schema.decodeUnknownSync(ServerSettings)({
-        voice: { maxSpeechOutputBytes: 8 * 1024 * 1024 + 1 },
+        voice: { maxSpeechOutputBytes: 64 * 1024 * 1024 + 1 },
       }),
     ).toThrow();
   });

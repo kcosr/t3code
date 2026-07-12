@@ -5,7 +5,7 @@ import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
+import { getT3VoiceNativeModule, type T3VoiceRecordingResult } from "@t3tools/mobile-voice-native";
 import { uuidv4 } from "../../lib/uuid";
 import { usePreparedConnection } from "../../state/session";
 import {
@@ -13,7 +13,8 @@ import {
   beginTranscriptionDraft,
   renderTranscriptionDraft,
 } from "./transcriptionDraft";
-import { useVoiceCapabilityAvailability } from "./useVoiceCapabilityAvailability";
+import { useVoiceCapabilityDescriptor } from "./useVoiceCapabilityAvailability";
+import { validateRecordingAgainstCapability } from "./dictationPolicy";
 
 export type ComposerDictationPhase = "idle" | "recording" | "transcribing";
 
@@ -28,7 +29,7 @@ export function useComposerDictation(input: {
 }) {
   const prepared = Option.getOrNull(usePreparedConnection(input.environmentId));
   const native = getT3VoiceNativeModule();
-  const capabilityAvailable = useVoiceCapabilityAvailability(prepared, "transcription.request");
+  const capability = useVoiceCapabilityDescriptor(prepared, "transcription.request");
   const [phase, setPhase] = useState<ComposerDictationPhase>("idle");
   const [error, setError] = useState<string | null>(null);
   const recordingIdRef = useRef<string | null>(null);
@@ -47,11 +48,69 @@ export function useComposerDictation(input: {
     [input.onChangeDraftMessage],
   );
 
+  const transcribeCompletedRecording = useCallback(
+    async (completedRecording: T3VoiceRecordingResult, generation: number, draftAtStop: string) => {
+      if (native === null || prepared === null) return;
+      try {
+        if (operationGenerationRef.current !== generation) return;
+        if (capability !== null) validateRecordingAgainstCapability(completedRecording, capability);
+        const requestId = VoiceRequestId.make(uuidv4());
+        const client = await makeMobileVoiceClient(prepared);
+        if (operationGenerationRef.current !== generation) return;
+        const ticket = await Effect.runPromise(
+          client.createMediaTicket({ operation: "transcription-upload", requestId }),
+        );
+        if (operationGenerationRef.current !== generation) return;
+        let draft = beginTranscriptionDraft(draftAtStop);
+        let lastRendered = draftAtStop;
+        const applyEvent = (event: VoiceTranscriptionStreamEvent) =>
+          Effect.sync(() => {
+            if (operationGenerationRef.current !== generation) {
+              throw new Error("Dictation was cancelled");
+            }
+            if (draftRef.current !== lastRendered) {
+              throw new Error("Dictation stopped because the composer was edited");
+            }
+            draft = applyTranscriptionEvent(draft, event);
+            lastRendered = renderTranscriptionDraft(draft);
+            changeDraft(lastRendered);
+          });
+        await Effect.runPromise(
+          client
+            .transcribe({
+              audio: {
+                kind: "uri",
+                uri: completedRecording.uri,
+                filename: "recording.m4a",
+              },
+              metadata: {
+                requestId,
+                format: completedRecording.mimeType,
+              },
+              ticket,
+            })
+            .pipe(Stream.runForEach(applyEvent)),
+        );
+      } catch (cause) {
+        if (operationGenerationRef.current === generation) setError(errorMessage(cause));
+      } finally {
+        await native
+          .deleteRecordingAsync({
+            recordingId: completedRecording.recordingId,
+            uri: completedRecording.uri,
+          })
+          .catch(() => undefined);
+        if (operationGenerationRef.current === generation) setPhase("idle");
+      }
+    },
+    [capability, changeDraft, native, prepared],
+  );
+
   const start = useCallback(async () => {
     if (
       native === null ||
       prepared === null ||
-      !capabilityAvailable ||
+      capability === null ||
       phase !== "idle" ||
       startPendingRef.current
     )
@@ -81,7 +140,7 @@ export function useComposerDictation(input: {
     } finally {
       if (operationGenerationRef.current === generation) startPendingRef.current = false;
     }
-  }, [capabilityAvailable, native, phase, prepared]);
+  }, [capability, native, phase, prepared]);
 
   const stop = useCallback(async () => {
     const recordingId = recordingIdRef.current;
@@ -94,62 +153,17 @@ export function useComposerDictation(input: {
     const draftAtStop = draftRef.current;
     setPhase("transcribing");
     setError(null);
-    let completedRecording: Awaited<ReturnType<typeof native.stopRecordingAsync>> | undefined;
     try {
-      completedRecording = await native.stopRecordingAsync({ recordingId });
+      const completedRecording = await native.stopRecordingAsync({ recordingId });
       if (operationGenerationRef.current !== generation) return;
-      const requestId = VoiceRequestId.make(uuidv4());
-      const client = await makeMobileVoiceClient(prepared);
-      if (operationGenerationRef.current !== generation) return;
-      const ticket = await Effect.runPromise(
-        client.createMediaTicket({ operation: "transcription-upload", requestId }),
-      );
-      if (operationGenerationRef.current !== generation) return;
-      let draft = beginTranscriptionDraft(draftAtStop);
-      let lastRendered = draftAtStop;
-      const applyEvent = (event: VoiceTranscriptionStreamEvent) =>
-        Effect.sync(() => {
-          if (operationGenerationRef.current !== generation) {
-            throw new Error("Dictation was cancelled");
-          }
-          if (draftRef.current !== lastRendered) {
-            throw new Error("Dictation stopped because the composer was edited");
-          }
-          draft = applyTranscriptionEvent(draft, event);
-          lastRendered = renderTranscriptionDraft(draft);
-          changeDraft(lastRendered);
-        });
-      await Effect.runPromise(
-        client
-          .transcribe({
-            audio: {
-              kind: "uri",
-              uri: completedRecording.uri,
-              filename: "recording.m4a",
-            },
-            metadata: {
-              requestId,
-              format: completedRecording.mimeType,
-            },
-            ticket,
-          })
-          .pipe(Stream.runForEach(applyEvent)),
-      );
+      await transcribeCompletedRecording(completedRecording, generation, draftAtStop);
     } catch (cause) {
       if (operationGenerationRef.current === generation) setError(errorMessage(cause));
     } finally {
       if (stoppingRecordingIdRef.current === recordingId) stoppingRecordingIdRef.current = null;
-      if (completedRecording !== undefined) {
-        await native
-          .deleteRecordingAsync({
-            recordingId: completedRecording.recordingId,
-            uri: completedRecording.uri,
-          })
-          .catch(() => undefined);
-      }
       if (operationGenerationRef.current === generation) setPhase("idle");
     }
-  }, [changeDraft, native, phase, prepared]);
+  }, [native, phase, prepared, transcribeCompletedRecording]);
 
   const cancel = useCallback(async () => {
     ++operationGenerationRef.current;
@@ -167,23 +181,21 @@ export function useComposerDictation(input: {
     if (native === null) return;
     const subscription = native.addListener("recordingTerminated", (event) => {
       if (
-        recordingIdRef.current !== event.recordingId &&
-        stoppingRecordingIdRef.current !== event.recordingId
+        recordingIdRef.current !== event.recording.recordingId &&
+        stoppingRecordingIdRef.current !== event.recording.recordingId
       )
         return;
       ++operationGenerationRef.current;
       startPendingRef.current = false;
       recordingIdRef.current = null;
       stoppingRecordingIdRef.current = null;
-      setPhase("idle");
-      setError(
-        event.code === "recording-duration-limit"
-          ? "Recording stopped after the 30 minute limit"
-          : "Recording stopped after reaching the 32 MiB limit",
-      );
+      setPhase("transcribing");
+      setError(null);
+      const generation = operationGenerationRef.current;
+      void transcribeCompletedRecording(event.recording, generation, draftRef.current);
     });
     return () => subscription.remove();
-  }, [native]);
+  }, [native, transcribeCompletedRecording]);
 
   useEffect(() => {
     const previous = lifecycleRef.current;
@@ -209,7 +221,7 @@ export function useComposerDictation(input: {
   }, [input.scopeKey, native, prepared]);
 
   return {
-    available: native !== null && prepared !== null && capabilityAvailable,
+    available: native !== null && prepared !== null && capability !== null,
     phase,
     error,
     start,

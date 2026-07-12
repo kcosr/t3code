@@ -818,7 +818,10 @@ const make = Effect.gen(function* () {
           );
           return HttpClientResponse.stream(
             client.execute(request).pipe(Effect.flatMap(HttpClientResponse.filterStatusOk)),
-          ).pipe(Stream.mapError(providerError("openai.synthesize")));
+          ).pipe(
+            Stream.tapError((cause) => logHttpFailure("openai.synthesize", cause)),
+            Stream.mapError(providerError("openai.synthesize")),
+          );
         }),
       ),
   };

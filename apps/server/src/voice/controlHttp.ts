@@ -14,6 +14,7 @@ import {
   annotateEnvironmentRequest,
   currentEnvironmentTraceId,
   failEnvironmentInternal,
+  failEnvironmentInvalidRequest,
   failEnvironmentNotFound,
   requireEnvironmentScope,
 } from "../auth/http.ts";
@@ -49,7 +50,11 @@ const failVoiceConversationOperation = (
 const descriptor = (
   capability: VoiceCapabilityDescriptor["capability"],
   state: VoiceCapabilityDescriptor["state"],
-  settings: { readonly maxUploadBytes: number; readonly maxInputDurationSeconds: number },
+  settings: {
+    readonly maxUploadBytes: number;
+    readonly maxInputDurationSeconds: number;
+    readonly maxSpeechTextBytes: number;
+  },
 ): VoiceCapabilityDescriptor => {
   switch (capability) {
     case "transcription.request":
@@ -67,6 +72,7 @@ const descriptor = (
         state,
         inputFormats: [],
         outputFormats: ["audio/pcm;rate=24000;encoding=s16le;channels=1"],
+        maxInputBytes: settings.maxSpeechTextBytes,
       };
     case "transcription.realtime":
       return {
@@ -326,17 +332,17 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
           switch (input.operation) {
             case "transcription-upload":
             case "speech-stream":
-              return yield* tickets.issue({
-                authSessionId: principal.sessionId,
-                operation: input.operation,
-                requestId: input.requestId,
-              });
-            case "voice-heartbeat":
-              return yield* tickets.issue({
-                authSessionId: principal.sessionId,
-                operation: input.operation,
-                voiceSessionId: input.sessionId,
-              });
+              return yield* tickets
+                .issue({
+                  authSessionId: principal.sessionId,
+                  operation: input.operation,
+                  requestId: input.requestId,
+                })
+                .pipe(
+                  Effect.catchTag("VoiceMediaTicketLimitError", () =>
+                    failEnvironmentInvalidRequest("voice_media_ticket_limit"),
+                  ),
+                );
           }
         }),
       )

@@ -345,12 +345,6 @@ describe("voice contracts", () => {
         requestId: "voice-request-ticket",
       }),
     ).toEqual({ operation: "speech-stream", requestId: "voice-request-ticket" });
-    expect(
-      decodeUnknownSync(VoiceMediaTicketRequest)({
-        operation: "voice-heartbeat",
-        sessionId: "voice-session-ticket",
-      }),
-    ).toEqual({ operation: "voice-heartbeat", sessionId: "voice-session-ticket" });
     expect(() =>
       decodeUnknownSync(VoiceMediaTicketRequest)({
         operation: "speech-stream",
@@ -360,7 +354,7 @@ describe("voice contracts", () => {
     expect(() =>
       decodeUnknownSync(VoiceMediaTicketRequest)({
         operation: "voice-heartbeat",
-        requestId: "voice-request-ticket",
+        sessionId: "voice-session-ticket",
       }),
     ).toThrow();
   });

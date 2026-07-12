@@ -15,6 +15,12 @@ export interface ValidatedVoiceMp4 {
 const invalidMedia = () => new VoiceMediaPolicyError({ reason: "invalid-media" });
 const unsupportedMedia = () => new VoiceMediaPolicyError({ reason: "unsupported-media" });
 
+export const validateVoiceMp4ContainerLayout = (
+  mediaDataBoxCount: number,
+  movieFragmentBoxCount: number,
+): Effect.Effect<void, VoiceMediaPolicyError> =>
+  mediaDataBoxCount >= 1 && movieFragmentBoxCount === 0 ? Effect.void : Effect.fail(invalidMedia());
+
 export const validateVoiceMp4Info = (
   info: Movie,
   options: { readonly maximumDurationSeconds: number; readonly byteLength: number },
@@ -70,18 +76,26 @@ export const inspectVoiceMp4 = (
       file.onError = () => {
         parseFailed = true;
       };
-      const copy = bytes.slice().buffer as ArrayBuffer & { fileStart: number };
+      const copy = Uint8Array.from(bytes).buffer as ArrayBuffer & { fileStart: number };
       copy.fileStart = 0;
       file.appendBuffer(copy, true);
       file.flush();
-      if (parseFailed || info === undefined || file.mdats.length !== 1 || file.moofs.length > 0) {
+      if (parseFailed || info === undefined) {
         throw invalidMedia();
       }
-      return info;
+      return {
+        info,
+        mediaDataBoxCount: file.mdats.length,
+        movieFragmentBoxCount: file.moofs.length,
+      };
     },
     catch: (cause) => (cause instanceof VoiceMediaPolicyError ? cause : invalidMedia()),
   }).pipe(
-    Effect.flatMap((info) =>
-      validateVoiceMp4Info(info, { maximumDurationSeconds, byteLength: bytes.byteLength }),
+    Effect.flatMap(({ info, mediaDataBoxCount, movieFragmentBoxCount }) =>
+      validateVoiceMp4ContainerLayout(mediaDataBoxCount, movieFragmentBoxCount).pipe(
+        Effect.andThen(
+          validateVoiceMp4Info(info, { maximumDurationSeconds, byteLength: bytes.byteLength }),
+        ),
+      ),
     ),
   );

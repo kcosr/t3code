@@ -577,7 +577,6 @@ it.effect("completes focus journal failure cleanup outside the cancelled update"
     );
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
-      const mediaTickets = yield* VoiceMediaTicketRegistry;
       const owner = AuthSessionId.make("focus-journal-failure-owner");
       const created = yield* sessions.create(
         principal(owner),
@@ -588,13 +587,6 @@ it.effect("completes focus journal failure cleanup outside the cancelled update"
         leaseGeneration: created.state.leaseGeneration,
         sdp: "offer",
       });
-      const ticket = yield* mediaTickets.issue({
-        authSessionId: owner,
-        operation: "voice-heartbeat",
-        requestId: VoiceRequestId.make("focus-journal-failure-ticket"),
-        voiceSessionId: created.state.sessionId,
-      });
-
       const updating = yield* sessions
         .updateFocus(owner, created.state.sessionId, {
           leaseGeneration: created.state.leaseGeneration,
@@ -613,8 +605,6 @@ it.effect("completes focus journal failure cleanup outside the cancelled update"
       yield* Deferred.await(terminationCompleted);
       yield* Effect.yieldNow;
       expect((yield* sessions.get(owner, created.state.sessionId)).phase).toBe("error");
-      expect(yield* mediaTickets.consume(ticket.token, "voice-heartbeat")).toBeUndefined();
-
       const continued = yield* sessions.create(
         principal(owner),
         input(false, "after-focus-journal-failure"),
@@ -1771,14 +1761,13 @@ it.effect("revokes provider sessions and media tickets with their auth session",
       });
       const ticket = yield* mediaTickets.issue({
         authSessionId: owner,
-        operation: "voice-heartbeat",
+        operation: "speech-stream",
         requestId: VoiceRequestId.make("revoked-request"),
-        voiceSessionId: created.state.sessionId,
       });
       yield* sessions.revokeAuthSession(owner);
       expect(yield* Ref.get(terminated)).toBe(1);
       expect((yield* sessions.get(owner, created.state.sessionId)).phase).toBe("ended");
-      expect(yield* mediaTickets.consume(ticket.token, "voice-heartbeat")).toBeUndefined();
+      expect(yield* mediaTickets.consume(ticket.token, "speech-stream")).toBeUndefined();
     }).pipe(Effect.provide(test.layer));
   }),
 );

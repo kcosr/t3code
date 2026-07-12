@@ -3,11 +3,11 @@ import type {
   VoiceMediaTicket,
   VoiceMediaTicketOperation,
   VoiceRequestId,
-  VoiceSessionId,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Encoding from "effect/Encoding";
@@ -17,22 +17,24 @@ import * as SynchronizedRef from "effect/SynchronizedRef";
 export interface VoiceMediaTicketScope {
   readonly authSessionId: AuthSessionId;
   readonly operation: VoiceMediaTicketOperation;
-  readonly requestId?: VoiceRequestId;
-  readonly voiceSessionId?: VoiceSessionId;
+  readonly requestId: VoiceRequestId;
   readonly expiresAt: number;
 }
 
 export interface VoiceMediaTicketIssueInput extends Omit<VoiceMediaTicketScope, "expiresAt"> {}
 
 export interface VoiceMediaTicketRegistryShape {
-  readonly issue: (input: VoiceMediaTicketIssueInput) => Effect.Effect<VoiceMediaTicket>;
+  readonly issue: (
+    input: VoiceMediaTicketIssueInput,
+  ) => Effect.Effect<VoiceMediaTicket, VoiceMediaTicketLimitError>;
   readonly consume: (
     token: string,
     operation: VoiceMediaTicketOperation,
   ) => Effect.Effect<VoiceMediaTicketScope | undefined>;
   readonly revokeAuthSession: (authSessionId: AuthSessionId) => Effect.Effect<void>;
-  readonly revokeVoiceSession: (voiceSessionId: VoiceSessionId) => Effect.Effect<void>;
 }
+
+export class VoiceMediaTicketLimitError extends Data.TaggedError("VoiceMediaTicketLimitError") {}
 
 export class VoiceMediaTicketRegistry extends Context.Service<
   VoiceMediaTicketRegistry,
@@ -47,9 +49,13 @@ interface TicketRecord {
 export interface VoiceMediaTicketRegistryOptions {
   readonly lifetimeMs?: number;
   readonly now?: () => number;
+  readonly maximumOutstandingPerAuthSession?: number;
+  readonly maximumOutstandingGlobal?: number;
 }
 
 const DEFAULT_LIFETIME_MS = 60_000;
+const DEFAULT_MAXIMUM_OUTSTANDING_PER_AUTH_SESSION = 16;
+const DEFAULT_MAXIMUM_OUTSTANDING_GLOBAL = 256;
 const encoder = new TextEncoder();
 const bytesToHex = (bytes: Uint8Array): string =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -61,6 +67,10 @@ const makeWithOptions = Effect.fn("VoiceMediaTicketRegistry.make")(function* (
   const state = yield* SynchronizedRef.make<ReadonlyMap<string, TicketRecord>>(new Map());
   const currentTimeMillis = options.now ? Effect.sync(options.now) : Clock.currentTimeMillis;
   const lifetimeMs = options.lifetimeMs ?? DEFAULT_LIFETIME_MS;
+  const maximumOutstandingPerAuthSession =
+    options.maximumOutstandingPerAuthSession ?? DEFAULT_MAXIMUM_OUTSTANDING_PER_AUTH_SESSION;
+  const maximumOutstandingGlobal =
+    options.maximumOutstandingGlobal ?? DEFAULT_MAXIMUM_OUTSTANDING_GLOBAL;
   const hash = (token: string) =>
     crypto.digest("SHA-256", encoder.encode(token)).pipe(Effect.map(bytesToHex), Effect.orDie);
 
@@ -79,11 +89,21 @@ const makeWithOptions = Effect.fn("VoiceMediaTicketRegistry.make")(function* (
         ...input,
         expiresAt: now + lifetimeMs,
       };
-      yield* SynchronizedRef.update(state, (records) => {
+      const issued = yield* SynchronizedRef.modify(state, (records) => {
         const next = prune(records, now);
+        const ownerCount = Array.from(next.values()).filter(
+          (record) => record.scope.authSessionId === input.authSessionId,
+        ).length;
+        if (
+          next.size >= maximumOutstandingGlobal ||
+          ownerCount >= maximumOutstandingPerAuthSession
+        ) {
+          return [false, next] as const;
+        }
         next.set(tokenHash, { tokenHash, scope });
-        return next;
+        return [true, next] as const;
       });
+      if (!issued) return yield* new VoiceMediaTicketLimitError();
       return {
         ticketId: ticketId as VoiceMediaTicket["ticketId"],
         token,
@@ -122,8 +142,6 @@ const makeWithOptions = Effect.fn("VoiceMediaTicketRegistry.make")(function* (
     consume,
     revokeAuthSession: (authSessionId) =>
       revokeWhere((scope) => scope.authSessionId === authSessionId),
-    revokeVoiceSession: (voiceSessionId) =>
-      revokeWhere((scope) => scope.voiceSessionId === voiceSessionId),
   });
 });
 

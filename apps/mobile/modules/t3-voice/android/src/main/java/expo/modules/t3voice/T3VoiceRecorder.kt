@@ -96,7 +96,7 @@ internal data class T3VoiceRecordingResult(
 
 internal class T3VoiceRecorder(
   private val context: Context,
-  private val onLimitReached: (String, String) -> Unit = { _, _ -> },
+  private val onLimitReached: (T3VoiceRecordingResult, String) -> Unit = { _, _ -> },
 ) {
   private data class ActiveRecording(
     val recordingId: String,
@@ -234,15 +234,22 @@ internal class T3VoiceRecorder(
         active = null
         current
       }
-    try {
-      recording.recorder.stop()
-    } catch (_: RuntimeException) {
-      // The capped recording is discarded regardless of finalization state.
-    } finally {
-      recording.recorder.release()
-      recording.file.delete()
-    }
-    onLimitReached(recording.recordingId, code)
+    T3VoiceRecordingLimitCleanup.run(
+      stop = recording.recorder::stop,
+      release = recording.recorder::release,
+      notify = {
+        synchronized(this) { completed[recording.recordingId] = recording.file }
+        onLimitReached(
+          T3VoiceRecordingResult(
+            recordingId = recording.recordingId,
+            uri = Uri.fromFile(recording.file).toString(),
+            durationMs = SystemClock.elapsedRealtime() - recording.startedAtMs,
+            byteLength = recording.file.length(),
+          ),
+          code,
+        )
+      },
+    )
   }
 
   @Suppress("DEPRECATION")
