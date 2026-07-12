@@ -470,15 +470,24 @@ export function transitionVoiceThreadMode(
       if (state.assistantMessageId !== event.messageId) return { state, commands: [] };
       return maybeBeginGuard({ ...state, assistantStreamComplete: true }, config);
     case "playback-started":
-      if (state.phase !== "waiting-response" && state.phase !== "speaking") {
+      if (
+        state.phase !== "waiting-response" &&
+        state.phase !== "speaking" &&
+        state.phase !== "guarding"
+      ) {
         return { state, commands: [] };
       }
       if (state.assistantMessageId !== event.messageId || state.playbackId !== null) {
         return { state, commands: [] };
       }
       return {
-        state: { ...state, phase: "speaking", playbackId: event.playbackId },
-        commands: [],
+        state: {
+          ...state,
+          phase: "speaking",
+          playbackId: event.playbackId,
+          playbackDrained: false,
+        },
+        commands: state.phase === "guarding" ? [{ type: "cancel-guard" }] : [],
       };
     case "playback-drained":
       if (
@@ -487,7 +496,7 @@ export function transitionVoiceThreadMode(
       ) {
         return { state, commands: [] };
       }
-      return maybeBeginGuard(
+      const drained = maybeBeginGuard(
         {
           ...state,
           phase: "speaking",
@@ -496,6 +505,9 @@ export function transitionVoiceThreadMode(
         },
         config,
       );
+      return state.phase === "guarding"
+        ? { state: drained.state, commands: [{ type: "cancel-guard" }, ...drained.commands] }
+        : drained;
     case "playback-cancelled":
       return state.assistantMessageId === event.messageId &&
         (state.playbackId === null || state.playbackId === event.playbackId)
@@ -513,6 +525,7 @@ export function transitionVoiceThreadMode(
             assistantMessageId: null,
             assistantStreamComplete: false,
             playbackId: null,
+            playbackDrained: false,
           })
         : { state, commands: [] };
     case "response-timeout":

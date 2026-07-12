@@ -540,7 +540,9 @@ export function useAutoListenController(input: {
     if (event === null || event.sequence <= lastPlaybackSequenceRef.current) return;
     if (
       stateRef.current.assistantMessageId !== event.messageId ||
-      (stateRef.current.phase !== "waiting-response" && stateRef.current.phase !== "speaking")
+      (stateRef.current.phase !== "waiting-response" &&
+        stateRef.current.phase !== "speaking" &&
+        stateRef.current.phase !== "guarding")
     ) {
       return;
     }

@@ -341,6 +341,118 @@ describe("voiceThreadMode", () => {
     expect(completed.state.phase).toBe("guarding");
   });
 
+  it("cancels an optimistic guard when playback starts after response completion", () => {
+    const guarding: VoiceThreadModeState = {
+      ...initialVoiceThreadModeState(),
+      phase: "guarding",
+      target: target(),
+      playbackRequired: false,
+      assistantMessageId: "assistant-1",
+      assistantStreamComplete: true,
+      pauseReason: null,
+    };
+    const speaking = transition(guarding, {
+      type: "playback-started",
+      playbackId: "playback-1",
+      messageId: "assistant-1",
+    });
+    expect(speaking.state).toMatchObject({
+      phase: "speaking",
+      playbackRequired: false,
+      playbackId: "playback-1",
+    });
+    expect(speaking.commands).toEqual([{ type: "cancel-guard" }]);
+
+    const drained = transition(speaking.state, {
+      type: "playback-drained",
+      playbackId: "playback-1",
+      messageId: "assistant-1",
+    });
+    expect(drained.state.phase).toBe("guarding");
+    expect(drained.commands).toEqual([
+      { type: "cancel-response-timeout" },
+      { type: "start-guard", token: drained.state.activeToken, delayMs: 750 },
+    ]);
+  });
+
+  it("restarts the guard when only delayed playback drain is observed", () => {
+    const guarding: VoiceThreadModeState = {
+      ...initialVoiceThreadModeState(),
+      phase: "guarding",
+      target: target(),
+      playbackRequired: false,
+      assistantMessageId: "assistant-1",
+      assistantStreamComplete: true,
+      pauseReason: null,
+    };
+    const drained = transition(guarding, {
+      type: "playback-drained",
+      playbackId: "playback-1",
+      messageId: "assistant-1",
+    });
+    expect(drained.state.phase).toBe("guarding");
+    expect(drained.commands).toEqual([
+      { type: "cancel-guard" },
+      { type: "cancel-response-timeout" },
+      { type: "start-guard", token: drained.state.activeToken, delayMs: 750 },
+    ]);
+  });
+
+  it("requires a fresh playback drain in every auto listen cycle", () => {
+    const firstGuard: VoiceThreadModeState = {
+      ...initialVoiceThreadModeState(),
+      phase: "guarding",
+      target: target(),
+      playbackRequired: true,
+      playbackDrained: true,
+      assistantMessageId: "assistant-1",
+      assistantStreamComplete: true,
+      activeToken: { targetGeneration: 1, cycle: 1, operation: 4 },
+      cycle: 1,
+      nextOperation: 4,
+      pauseReason: null,
+    };
+    const secondArming = transition(firstGuard, {
+      type: "guard-elapsed",
+      token: firstGuard.activeToken!,
+    });
+    expect(secondArming.state).toMatchObject({
+      phase: "arming",
+      assistantMessageId: null,
+      playbackDrained: false,
+    });
+    const secondListening = transition(secondArming.state, {
+      type: "arm-succeeded",
+      token: secondArming.state.activeToken!,
+      recordingId: "recording-2",
+    });
+    const secondTranscribing = transition(secondListening.state, {
+      type: "recording-completed",
+      token: secondListening.state.activeToken!,
+    });
+    const secondSubmitting = transition(secondTranscribing.state, {
+      type: "transcription-completed",
+      token: secondTranscribing.state.activeToken!,
+      transcript: "second cycle",
+    });
+    const secondWaiting = transition(secondSubmitting.state, {
+      type: "submission-succeeded",
+      token: secondSubmitting.state.activeToken!,
+      messageId: MessageId.make("message-2"),
+    });
+    const secondResponse = transition(secondWaiting.state, {
+      type: "assistant-stream-started",
+      messageId: "assistant-2",
+    });
+    const secondResponseComplete = transition(secondResponse.state, {
+      type: "assistant-stream-completed",
+      messageId: "assistant-2",
+    });
+
+    expect(secondResponseComplete.state.phase).toBe("waiting-response");
+    expect(secondResponseComplete.commands).toEqual([]);
+  });
+
   it("bounds transcription and submission with phase- and token-fenced timeouts", () => {
     const active = listening();
     const transcribing = transition(active.state, {
