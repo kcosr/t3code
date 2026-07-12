@@ -580,10 +580,12 @@ export function useAutoListenController(input: {
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (next) => {
-      console.info("[voice.auto-listen] app-state", {
-        next,
-        phase: stateRef.current.phase,
-      });
+      if (stateRef.current.phase !== "paused" || stateRef.current.pauseReason === "lifecycle") {
+        console.info("[voice.auto-listen] app-state", {
+          next,
+          phase: stateRef.current.phase,
+        });
+      }
       if (next !== "active" && stateRef.current.phase !== "paused") pause("lifecycle");
     });
     return () => subscription.remove();
