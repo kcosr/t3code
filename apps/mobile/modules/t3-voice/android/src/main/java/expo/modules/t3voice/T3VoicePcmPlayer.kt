@@ -472,7 +472,8 @@ internal class T3VoicePcmPlayer(
           .setBufferSizeInBytes(
             maxOf(
               minimumBuffer * 2,
-              sampleRate * channelCount * Short.SIZE_BYTES * OUTPUT_BUFFER_DURATION_MS / 1_000,
+              (sampleRate * channelCount * Short.SIZE_BYTES * OUTPUT_BUFFER_DURATION_MS / 1_000L)
+                .toInt(),
             ),
           )
           .setTransferMode(AudioTrack.MODE_STREAM)
