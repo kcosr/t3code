@@ -42,7 +42,7 @@ interface AutoListenDictationAdapter {
   readonly transcriptionEvent: ComposerTranscriptionEvent | null;
   readonly terminationEvent: ComposerRecordingTerminationEvent | null;
   readonly start: () => Promise<string | null>;
-  readonly stop: () => Promise<void>;
+  readonly stop: () => Promise<boolean>;
   readonly cancel: () => Promise<void>;
   readonly cancelForRealtime: () => Promise<void>;
 }
@@ -213,9 +213,7 @@ export function useAutoListenController(input: {
           await current.dictation.cancel();
           return;
         case "stop-recording":
-          try {
-            await current.dictation.stop();
-          } catch {
+          if (!(await current.dictation.stop())) {
             dispatch({ type: "manual-stop-failed", token: command.token });
           }
           return;

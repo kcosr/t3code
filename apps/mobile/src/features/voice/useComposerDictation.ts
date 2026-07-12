@@ -222,7 +222,7 @@ export function useComposerDictation(input: {
   const stop = useCallback(async () => {
     const recordingId = recordingIdRef.current;
     if (native === null || prepared === null || phase !== "recording" || recordingId === null) {
-      return;
+      return false;
     }
     recordingIdRef.current = null;
     stoppingRecordingIdRef.current = recordingId;
@@ -244,11 +244,13 @@ export function useComposerDictation(input: {
             uri: completedRecording.uri,
           })
           .catch(() => undefined);
-        return;
+        return false;
       }
       await transcribeCompletedRecording(completedRecording, generation, draftAtStop);
+      return true;
     } catch (cause) {
       if (operationGenerationRef.current === generation) setError(errorMessage(cause));
+      return false;
     } finally {
       if (stoppingRecordingIdRef.current === recordingId) stoppingRecordingIdRef.current = null;
       if (operationGenerationRef.current === generation) setPhase("idle");
