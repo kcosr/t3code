@@ -1493,11 +1493,18 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           "metadata",
           JSON.stringify({ requestId: `voice-upload-${index}`, format: "audio/mp4" }),
         );
-        const response = yield* fetchEffect(yield* getHttpServerUrl("/api/voice/transcriptions"), {
-          method: "POST",
-          headers: { "x-t3-voice-ticket": ticket.token },
-          body: form,
-        });
+        const response = yield* Effect.raceFirst(
+          fetchEffect(yield* getHttpServerUrl("/api/voice/transcriptions"), {
+            method: "POST",
+            headers: { "x-t3-voice-ticket": ticket.token },
+            body: form,
+          }),
+          Effect.sleep("2 seconds").pipe(
+            Effect.andThen(
+              Effect.die(new Error("Timed out while draining the multipart voice upload")),
+            ),
+          ),
+        );
 
         assert.equal(response.status, 401);
       }

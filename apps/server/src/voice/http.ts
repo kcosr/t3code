@@ -43,6 +43,26 @@ const encodeTranscriptionEvent = Schema.encodeSync(
 );
 const mediaRequestLimiter = Effect.runSync(makeVoiceMediaRequestLimiter);
 
+type DrainedMultipartEntry =
+  | {
+      readonly kind: "file";
+      readonly part: Multipart.File;
+      readonly bytes: Uint8Array;
+    }
+  | {
+      readonly kind: "field";
+      readonly part: Multipart.Field;
+    };
+
+const drainMultipartEntry = (
+  part: Multipart.Part,
+): Effect.Effect<DrainedMultipartEntry, Multipart.MultipartError> =>
+  Multipart.isFile(part)
+    ? part.contentEffect.pipe(
+        Effect.map((bytes): DrainedMultipartEntry => ({ kind: "file", part, bytes })),
+      )
+    : Effect.succeed<DrainedMultipartEntry>({ kind: "field", part });
+
 class VoiceMediaRequestError extends Data.TaggedError("VoiceMediaRequestError")<{
   readonly message: string;
   readonly cause?: unknown;
@@ -120,7 +140,8 @@ const decodeTranscriptionMultipart = Effect.gen(function* () {
     return yield* invalidRequest("Voice is disabled on this server");
   }
   const request = yield* HttpServerRequest.HttpServerRequest;
-  const parts = yield* request.multipartStream.pipe(
+  const entries = yield* request.multipartStream.pipe(
+    Stream.mapEffect(drainMultipartEntry),
     Stream.runCollect,
     Effect.provide(
       Multipart.limitsServices({
@@ -138,35 +159,31 @@ const decodeTranscriptionMultipart = Effect.gen(function* () {
     ),
   );
   yield* validateVoiceMultipartShape(
-    Array.from(parts, (part) => ({
-      kind: Multipart.isFile(part) ? ("file" as const) : ("field" as const),
-      key: part.key,
+    Array.from(entries, (entry) => ({
+      kind: entry.kind,
+      key: entry.part.key,
     })),
   );
-  const audio = Array.from(parts).find(
-    (part): part is Multipart.File => Multipart.isFile(part) && part.key === "audio",
+  const audioEntry = Array.from(entries).find(
+    (entry) => entry.kind === "file" && entry.part.key === "audio",
   );
-  const metadataPart = Array.from(parts).find(
-    (part): part is Multipart.Field => Multipart.isField(part) && part.key === "metadata",
+  const metadataEntry = Array.from(entries).find(
+    (entry) => entry.kind === "field" && entry.part.key === "metadata",
   );
-  if (audio === undefined || metadataPart === undefined) {
+  if (audioEntry?.kind !== "file" || metadataEntry?.kind !== "field") {
     return yield* invalidRequest("Voice transcription requires audio and metadata parts");
   }
-  const metadata = yield* decodeTranscriptionMetadata(metadataPart.value).pipe(
+  const metadata = yield* decodeTranscriptionMetadata(metadataEntry.part.value).pipe(
     Effect.mapError(
       (cause) =>
         new VoiceMediaRequestError({ message: "Invalid voice transcription metadata", cause }),
     ),
   );
-  const bytes = yield* audio.contentEffect.pipe(
-    Effect.mapError(
-      (cause) => new VoiceMediaRequestError({ message: "Invalid voice audio upload", cause }),
-    ),
-  );
+  const bytes = audioEntry.bytes;
   if (bytes.byteLength > settings.maxUploadBytes) {
     return yield* invalidRequest("Voice transcription payload exceeds the configured limit");
   }
-  if (audio.contentType !== "audio/mp4") {
+  if (audioEntry.part.contentType !== "audio/mp4") {
     return yield* invalidRequest("Voice transcription audio type is unsupported");
   }
   const validatedMedia = yield* inspectVoiceMp4(bytes, settings.maxInputDurationSeconds);
