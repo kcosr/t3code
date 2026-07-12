@@ -52,6 +52,7 @@ export function useThreadSpeech(input: {
   readonly scopeKey: string;
   readonly historyReady: boolean;
   readonly latestAssistant: AssistantSpeechSnapshot | null;
+  readonly realtimeActive: boolean;
 }) {
   const prepared = Option.getOrNull(usePreparedConnection(input.environmentId));
   const native = getT3VoiceNativeModule();
@@ -69,7 +70,8 @@ export function useThreadSpeech(input: {
   const operationGenerationRef = useRef(0);
   const mountedRef = useRef(true);
   const suspendedForDictationRef = useRef(false);
-  const suspendedForRealtimeRef = useRef(false);
+  const suspendedForRealtimeRef = useRef(input.realtimeActive);
+  const realtimeActiveRef = useRef(input.realtimeActive);
   const playbackStartRef = useRef<{
     readonly playbackId: string;
     readonly messageId: string;
@@ -96,6 +98,13 @@ export function useThreadSpeech(input: {
   const [playing, setPlaying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lifecycleEvent, setLifecycleEvent] = useState<ThreadSpeechLifecycleEvent | null>(null);
+  if (realtimeActiveRef.current !== input.realtimeActive) {
+    realtimeActiveRef.current = input.realtimeActive;
+    suspendedForRealtimeRef.current = input.realtimeActive;
+    if (!input.realtimeActive) {
+      plannerRef.current = interruptThreadSpeech(plannerRef.current, latestRef.current);
+    }
+  }
   const lifecycleSequenceRef = useRef(0);
   const emitLifecycle = useCallback(
     (playbackId: string, messageId: string, outcome: ThreadSpeechLifecycleEvent["outcome"]) => {
@@ -616,6 +625,11 @@ export function useThreadSpeech(input: {
     () => interruptPlayback("realtime"),
     [interruptPlayback],
   );
+
+  useEffect(() => {
+    if (!input.realtimeActive) return;
+    void interruptPlayback("realtime");
+  }, [input.realtimeActive, interruptPlayback]);
 
   const enable = useCallback(() => {
     if (plannerRef.current.enabled) return;

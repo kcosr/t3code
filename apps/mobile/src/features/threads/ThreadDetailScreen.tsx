@@ -43,6 +43,7 @@ import {
 } from "./ThreadComposer";
 import { ThreadFeed } from "./ThreadFeed";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
+import { useMasterVoice } from "../voice/MasterVoiceProvider";
 import { useThreadSpeech } from "../voice/useThreadSpeech";
 
 export interface ThreadDetailScreenProps {
@@ -274,11 +275,16 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     () => latestAssistantSpeechSnapshot(selectedThreadFeed),
     [selectedThreadFeed],
   );
+  const realtimeVoice = useMasterVoice();
   const speechPlayback = useThreadSpeech({
     environmentId: props.environmentId,
     scopeKey: selectedThreadKey,
     historyReady: contentPresentationKind === "ready",
     latestAssistant,
+    realtimeActive:
+      realtimeVoice.phase === "starting" ||
+      realtimeVoice.phase === "active" ||
+      realtimeVoice.phase === "stopping",
   });
   const handleSpeechPlaybackToggle = speechPlayback.onToggle;
   const composerChrome = composerExpanded ? COMPOSER_EXPANDED_CHROME : COMPOSER_COLLAPSED_CHROME;
