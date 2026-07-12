@@ -119,7 +119,11 @@ const nativeRuntimeErrorMessage = (code: string): string => {
 type ServerCleanup = Pick<ActiveSession, "sessionId" | "leaseGeneration">;
 interface PendingServerCleanup extends ServerCleanup {
   readonly client: VoiceHttpClient;
+  readonly enqueuedAtMonotonicMillis: number;
 }
+
+const MAX_BLOCKING_SERVER_CLEANUP_AGE_MILLIS = 40_000;
+const monotonicNow = (): number => globalThis.performance.now();
 
 const TERMINAL_CLEANUP_ERROR_TAGS = new Set([
   "EnvironmentAuthInvalidError",
@@ -144,10 +148,13 @@ export class RealtimeServerCleanupCoordinator {
   private readonly pending = new Map<VoiceSessionState["sessionId"], PendingServerCleanup>();
   private barrier: Promise<void> = Promise.resolve();
 
-  constructor(private readonly timeoutMs = 10_000) {}
+  constructor(
+    private readonly timeoutMs = 10_000,
+    private readonly now: () => number = monotonicNow,
+  ) {}
 
   enqueue(client: VoiceHttpClient, cleanup: ServerCleanup) {
-    const pending = { ...cleanup, client };
+    const pending = { ...cleanup, client, enqueuedAtMonotonicMillis: this.now() };
     this.pending.set(cleanup.sessionId, pending);
     const previous = this.barrier;
     this.barrier = previous.then(async () => {
@@ -159,6 +166,13 @@ export class RealtimeServerCleanupCoordinator {
   async drain(): Promise<void> {
     await this.barrier;
     for (const cleanup of this.pending.values()) {
+      if (
+        this.now() - cleanup.enqueuedAtMonotonicMillis >=
+        MAX_BLOCKING_SERVER_CLEANUP_AGE_MILLIS
+      ) {
+        this.pending.delete(cleanup.sessionId);
+        continue;
+      }
       if (!(await this.tryCleanup(cleanup))) {
         throw new Error(
           "The previous Realtime session could not be released. Check connectivity and try again",

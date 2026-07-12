@@ -1630,7 +1630,7 @@ it.effect("times out activate-thread and rejects a late acknowledgement", () =>
       yield* Deferred.await(fixture.invocationStarted);
       yield* sessions.events(owner, created.state.sessionId, 2, 1_000);
       expect(yield* Ref.get(fixture.outputs)).toEqual([]);
-      yield* TestClock.adjust("31 seconds");
+      yield* TestClock.adjust("6 seconds");
       yield* Effect.yieldNow;
       yield* Effect.yieldNow;
       expect(yield* Ref.get(fixture.outputs)).toEqual([

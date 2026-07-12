@@ -565,6 +565,45 @@ describe("RealtimeVoiceController", () => {
     expect(controller.getSnapshot().phase).toBe("active");
   });
 
+  it("retires a non-retryable voice cleanup error", async () => {
+    const cleanupCoordinator = new RealtimeServerCleanupCoordinator(5);
+    const { client, controller } = makeHarness({ cleanupCoordinator });
+    vi.mocked(client.closeSession).mockReturnValue(
+      Effect.fail({ _tag: "EnvironmentVoiceOperationError", retryable: false }),
+    );
+    await controller.start(createInput);
+
+    await controller.stop();
+    await controller.start(createInput);
+
+    expect(client.closeSession).toHaveBeenCalledTimes(1);
+    expect(client.createSession).toHaveBeenCalledTimes(2);
+    expect(controller.getSnapshot().phase).toBe("active");
+  });
+
+  it("keeps a retryable voice cleanup error blocking until the server watchdog bound", async () => {
+    let now = 1_000;
+    const cleanupCoordinator = new RealtimeServerCleanupCoordinator(5, () => now);
+    const { client, controller } = makeHarness({ cleanupCoordinator });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.mocked(client.closeSession).mockReturnValue(
+      Effect.fail({ _tag: "EnvironmentVoiceOperationError", retryable: true }),
+    );
+    await controller.start(createInput);
+
+    await controller.stop();
+    await expect(controller.start(createInput)).rejects.toThrow(
+      "The previous Realtime session could not be released",
+    );
+    now += 40_000;
+    await controller.start(createInput);
+
+    expect(client.closeSession).toHaveBeenCalledTimes(2);
+    expect(client.createSession).toHaveBeenCalledTimes(2);
+    expect(controller.getSnapshot().phase).toBe("active");
+    warning.mockRestore();
+  });
+
   it("joins and cleans a startup interrupted before signaling completes", async () => {
     const { client, controller, native } = makeHarness();
     let resolveOffer!: () => void;

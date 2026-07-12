@@ -16,6 +16,7 @@ import {
   newVoiceConversationSelection,
   newVoiceConversationTitle,
   resumeVoiceConversationSelection,
+  VoiceFocusUpdateQueue,
   type MasterVoiceFocus,
 } from "./masterVoiceState";
 
@@ -44,6 +45,36 @@ const conversation = (
 });
 
 describe("master voice state", () => {
+  it("serializes focus updates and only commits the latest request", async () => {
+    const queue = new VoiceFocusUpdateQueue();
+    const order: Array<string> = [];
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    const first = queue.enqueue(
+      async () => {
+        order.push("first:start");
+        await firstBlocked;
+        order.push("first:end");
+      },
+      () => order.push("first:commit"),
+    );
+    await Promise.resolve();
+    const second = queue.enqueue(
+      async () => {
+        order.push("second:start");
+      },
+      () => order.push("second:commit"),
+    );
+    releaseFirst();
+
+    await expect(first).resolves.toBe(false);
+    await expect(second).resolves.toBe(true);
+    expect(order).toEqual(["first:start", "first:end", "second:start", "second:commit"]);
+  });
+
   it("keeps the active environment authoritative across route focus changes", () => {
     expect(masterVoiceEnvironmentId(environmentId, null)).toBe(environmentId);
     expect(masterVoiceEnvironmentId(null, focus)).toBe(environmentId);
@@ -142,6 +173,15 @@ describe("master voice state", () => {
       type: "update",
       attachment: { environmentId, focus: nextFocus },
     });
+  });
+
+  it("refreshes a resolved thread title without requiring a server focus write", () => {
+    expect(
+      reconcileMasterVoiceFocus(
+        { environmentId, focus: { ...focus, threadTitle: "Thread" } },
+        focus,
+      ),
+    ).toEqual({ type: "refresh", attachment: { environmentId, focus } });
   });
 
   it("stops instead of carrying an active voice session into another environment", () => {

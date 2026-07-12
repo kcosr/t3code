@@ -855,9 +855,11 @@ All clients use the same server signaling, capability, confirmation, and bounded
 
 - `VoiceSessionRegistry` owns one Effect scope per provider session.
 - Ending a T3 session interrupts sideband readers, tool fibers, timers, and provider connections.
-- Client heartbeat expiry fences only pre-media setup in `creating`, `signaling`, and `connecting`.
-  After provider media attaches, provider closure and the absolute session-duration limit own
-  liveness so React timer suspension cannot end healthy background media.
+- Native control heartbeats own client liveness in every session phase. Missing heartbeats end the
+  session after the bounded failure grace even when provider media was previously active; the
+  Android foreground service keeps those heartbeats alive while React is suspended or the screen
+  is locked. Provider closure and the absolute session-duration limit remain independent terminal
+  conditions.
 - Ordinary React event-subscription disconnect does not close healthy native media. A recreated
   controller explicitly stops and reconciles an orphaned native peer before starting another call.
 - Provider errors are normalized into recoverable, terminal, or policy failures.

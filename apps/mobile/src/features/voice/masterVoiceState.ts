@@ -21,10 +21,39 @@ export interface ActiveMasterVoiceAttachment {
 export type MasterVoiceFocusReconciliation =
   | { readonly type: "preserve" }
   | {
+      readonly type: "refresh";
+      readonly attachment: ActiveMasterVoiceAttachment;
+    }
+  | {
       readonly type: "update";
       readonly attachment: ActiveMasterVoiceAttachment;
     }
   | { readonly type: "stop" };
+
+export class VoiceFocusUpdateQueue {
+  private generation = 0;
+  private tail: Promise<void> = Promise.resolve();
+
+  invalidate(): void {
+    this.generation += 1;
+  }
+
+  enqueue(run: () => Promise<void>, commit: () => void): Promise<boolean> {
+    const generation = ++this.generation;
+    const update = this.tail.then(async () => {
+      if (generation !== this.generation) return false;
+      await run();
+      if (generation !== this.generation) return false;
+      commit();
+      return true;
+    });
+    this.tail = update.then(
+      () => undefined,
+      () => undefined,
+    );
+    return update;
+  }
+}
 
 export function durableVoiceConversations(
   conversations: ReadonlyArray<VoiceConversationSummary>,
@@ -107,6 +136,9 @@ export function reconcileMasterVoiceFocus(
 ): MasterVoiceFocusReconciliation {
   if (attachment === null || focus === null) return { type: "preserve" };
   if (attachment.environmentId !== focus.environmentId) return { type: "stop" };
-  if (isSameMasterVoiceFocus(attachment.focus, focus)) return { type: "preserve" };
+  if (isSameMasterVoiceFocus(attachment.focus, focus))
+    return attachment.focus?.threadTitle === focus.threadTitle
+      ? { type: "preserve" }
+      : { type: "refresh", attachment: { ...attachment, focus } };
   return { type: "update", attachment: { ...attachment, focus } };
 }

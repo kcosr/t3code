@@ -17,6 +17,30 @@ export const clientActionAcknowledgementInput = (
   };
 };
 
+export const executeThreadActivation = async (options: {
+  readonly navigate: () => void;
+  readonly updateFocus: () => Promise<void>;
+  readonly acknowledge: (
+    outcome: ClientActionAcknowledgementInput["outcome"],
+    message?: string,
+  ) => Promise<void>;
+  readonly errorMessage: (cause: unknown) => string;
+}): Promise<void> => {
+  try {
+    options.navigate();
+  } catch (cause) {
+    await options.acknowledge("failed", options.errorMessage(cause));
+    return;
+  }
+  const focusUpdate = options.updateFocus().then(
+    () => ({ success: true as const }),
+    (cause: unknown) => ({ success: false as const, cause }),
+  );
+  await options.acknowledge("succeeded");
+  const focusResult = await focusUpdate;
+  if (!focusResult.success) throw focusResult.cause;
+};
+
 export const acknowledgeClientActionWithRetry = async (options: {
   readonly expiresAtMillis: number;
   readonly acknowledge: (input: ClientActionAcknowledgementInput) => Promise<void>;

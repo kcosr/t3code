@@ -52,7 +52,7 @@ const HEARTBEAT_FAILURE_GRACE_SECONDS = HEARTBEAT_INTERVAL_SECONDS * 3;
 const SESSION_DURATION_SECONDS = 55 * 60;
 const MAX_BUFFERED_EVENTS = 512;
 const MAX_RETAINED_TERMINAL_SESSIONS = 128;
-const CLIENT_ACTION_TIMEOUT_MILLIS = 30_000;
+const CLIENT_ACTION_TIMEOUT_MILLIS = 5_000;
 const INSTRUCTIONS = [
   "You are the T3 voice agent. Be concise and use only the supplied T3 tools. Proactively tell the user what you are about to do only when you will call send_thread_message and then synchronously wait for that agent turn with wait_for_thread_turn; do not preannounce other tool operations.",
   "Prior conversation items are the user's actual history from this same ongoing conversation: use them as memory, preserve continuity across calls and devices, and never claim that you cannot remember information present in that history.",
