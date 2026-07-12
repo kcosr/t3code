@@ -38,7 +38,13 @@ class T3VoiceRuntimeService : Service() {
     val realtimeTermination: StateFlow<T3VoiceRuntimeEvent.RealtimeTerminated?>
       get() = T3VoiceStateStore.realtimeTermination
 
-    fun startRecording(recordingId: String) {
+    val recordingTermination: StateFlow<T3VoiceRuntimeEvent.RecordingTerminated?>
+      get() = T3VoiceStateStore.recordingTermination
+
+    fun startRecording(
+      recordingId: String,
+      endpointConfig: T3VoiceEndpointDetectionConfig,
+    ) {
       synchronized(operationLock) {
         val owner =
           checkNotNull(T3VoiceStateStore.claimRecording(recordingId)) {
@@ -47,7 +53,7 @@ class T3VoiceRuntimeService : Service() {
         recordingOwner = owner
         try {
           ensureRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-          recorder.start(recordingId)
+          recorder.start(recordingId, endpointConfig)
         } catch (cause: Throwable) {
           releaseRecordingLocked(owner)
           throw cause
@@ -78,6 +84,11 @@ class T3VoiceRuntimeService : Service() {
 
     fun deleteRecording(recordingId: String, uri: String) {
       recorder.delete(recordingId, uri)
+      T3VoiceStateStore.clearRecordingTermination(recordingId)
+    }
+
+    fun acknowledgeRecordingTermination(recordingId: String) {
+      T3VoiceStateStore.clearRecordingTermination(recordingId)
     }
 
     fun startPlayback(playbackId: String, sampleRate: Int, channelCount: Int) {
@@ -224,14 +235,50 @@ class T3VoiceRuntimeService : Service() {
   override fun onCreate() {
     super.onCreate()
     recorder =
-      T3VoiceRecorder(applicationContext) { recording, code ->
+      T3VoiceRecorder(applicationContext) { termination ->
         synchronized(operationLock) {
           val owner =
-            recordingOwner?.takeIf { it.id == recording.recordingId } ?: return@T3VoiceRecorder
-          releaseRecordingLocked(owner)
-          T3VoiceStateStore.emit(
-            T3VoiceRuntimeEvent.RecordingTerminated(recording, "completed-limit", code),
-          )
+            recordingOwner?.takeIf {
+              it.id ==
+                when (termination) {
+                  is T3VoiceRecordingTermination.Completed -> termination.recording.recordingId
+                  is T3VoiceRecordingTermination.Cancelled -> termination.recordingId
+                  is T3VoiceRecordingTermination.Failed -> termination.recordingId
+                }
+            } ?: return@T3VoiceRecorder
+          when (termination) {
+            is T3VoiceRecordingTermination.Completed ->
+              terminateRecordingLocked(
+                owner,
+                T3VoiceRuntimeEvent.RecordingTerminated(
+                  recordingId = termination.recording.recordingId,
+                  recording = termination.recording,
+                  outcome = "completed",
+                  reason = termination.reason,
+                ),
+              )
+            is T3VoiceRecordingTermination.Cancelled ->
+              terminateRecordingLocked(
+                owner,
+                T3VoiceRuntimeEvent.RecordingTerminated(
+                  recordingId = termination.recordingId,
+                  recording = null,
+                  outcome = "cancelled",
+                  reason = termination.reason,
+                ),
+              )
+            is T3VoiceRecordingTermination.Failed -> {
+              releaseRecordingLocked(owner)
+              T3VoiceStateStore.emit(
+                T3VoiceRuntimeEvent.RuntimeError(
+                  operation = "recording:${termination.recordingId}",
+                  code = "recording-finalization-failed",
+                  message = termination.message,
+                  recoverable = true,
+                ),
+              )
+            }
+          }
         }
       }
     recorder.sweepStaleCache()
@@ -377,6 +424,15 @@ class T3VoiceRuntimeService : Service() {
     if (!T3VoiceStateStore.releaseRecording(owner)) return
     if (recordingOwner == owner) recordingOwner = null
     if (stopForeground) stopRuntimeForegroundLocked()
+  }
+
+  private fun terminateRecordingLocked(
+    owner: T3VoiceOperationOwner,
+    event: T3VoiceRuntimeEvent.RecordingTerminated,
+  ) {
+    if (!T3VoiceStateStore.terminateRecording(owner, event)) return
+    if (recordingOwner == owner) recordingOwner = null
+    stopRuntimeForegroundLocked()
   }
 
   private fun releasePlaybackLocked(

@@ -62,15 +62,17 @@ internal sealed interface T3VoiceRuntimeEvent {
   }
 
   data class RecordingTerminated(
-    val recording: T3VoiceRecordingResult,
+    val recordingId: String,
+    val recording: T3VoiceRecordingResult?,
     val outcome: String,
-    val code: String,
+    val reason: String,
   ) : T3VoiceRuntimeEvent {
-    override fun toEventBody(): Map<String, Any> =
+    override fun toEventBody(): Map<String, Any?> =
       mapOf(
-        "recording" to recording.toResultBody(),
+        "recordingId" to recordingId,
+        "recording" to recording?.toResultBody(),
         "outcome" to outcome,
-        "code" to code,
+        "reason" to reason,
       )
   }
 
@@ -140,11 +142,15 @@ internal object T3VoiceStateStore {
   private val nextOperationGeneration = AtomicLong(0)
   private val mutableRealtimeTermination =
     MutableStateFlow<T3VoiceRuntimeEvent.RealtimeTerminated?>(null)
+  private val mutableRecordingTermination =
+    MutableStateFlow<T3VoiceRuntimeEvent.RecordingTerminated?>(null)
 
   val state: StateFlow<T3VoiceRuntimeState> = mutableState.asStateFlow()
   val events: SharedFlow<T3VoiceRuntimeEvent> = mutableEvents.asSharedFlow()
   val realtimeTermination: StateFlow<T3VoiceRuntimeEvent.RealtimeTerminated?> =
     mutableRealtimeTermination.asStateFlow()
+  val recordingTermination: StateFlow<T3VoiceRuntimeEvent.RecordingTerminated?> =
+    mutableRecordingTermination.asStateFlow()
 
   fun claimRealtime(sessionId: String): Boolean {
     while (true) {
@@ -163,6 +169,7 @@ internal object T3VoiceStateStore {
           sequence = current.sequence + 1,
         )
       if (mutableState.compareAndSet(current, next)) {
+        mutableRecordingTermination.value = null
         mutableRealtimeTermination.value = null
         return true
       }
@@ -229,6 +236,22 @@ internal object T3VoiceStateStore {
         activeRecordingGeneration = null,
       )
     }
+
+  fun terminateRecording(
+    owner: T3VoiceOperationOwner,
+    event: T3VoiceRuntimeEvent.RecordingTerminated,
+  ): Boolean {
+    val terminated = releaseRecording(owner)
+    if (terminated) mutableRecordingTermination.value = event
+    return terminated
+  }
+
+  fun clearRecordingTermination(recordingId: String) {
+    mutableRecordingTermination.compareAndSet(
+      mutableRecordingTermination.value?.takeIf { it.recordingId == recordingId },
+      null,
+    )
+  }
 
   fun claimPlayback(playbackId: String): T3VoiceOperationOwner? {
     val owner = T3VoiceOperationOwner(playbackId, nextOperationGeneration.incrementAndGet())

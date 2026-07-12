@@ -86,7 +86,7 @@ class T3VoiceRuntimeServiceInstrumentedTest {
     val first = bindService()
     try {
       val binder = checkNotNull(first.binder.get())
-      binder.startRecording(recordingId)
+      binder.startRecording(recordingId, T3VoiceEndpointDetectionConfig(noSpeechTimeoutMs = null))
       waitUntil {
         binder.state.value.phase == T3VoiceRuntimePhase.RECORDING &&
           binder.state.value.isForeground &&

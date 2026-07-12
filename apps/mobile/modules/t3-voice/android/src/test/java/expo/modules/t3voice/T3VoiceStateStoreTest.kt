@@ -11,6 +11,9 @@ import org.junit.Test
 class T3VoiceStateStoreTest {
   @Before
   fun resetStore() {
+    T3VoiceStateStore.recordingTermination.value?.let {
+      T3VoiceStateStore.clearRecordingTermination(it.recordingId)
+    }
     T3VoiceStateStore.setInactive()
     T3VoiceStateStore.setServiceReady()
   }
@@ -102,5 +105,25 @@ class T3VoiceStateStoreTest {
     assertNull(T3VoiceStateStore.state.value.activeRealtimeSessionId)
     assertEquals("failed", T3VoiceStateStore.state.value.realtimeConnectionState)
     assertEquals(terminal, T3VoiceStateStore.realtimeTermination.value)
+  }
+
+  @Test
+  fun recordingTerminationIsDurableUntilMatchingAcknowledgement() {
+    val owner = checkNotNull(T3VoiceStateStore.claimRecording("recording-a"))
+    val recording = T3VoiceRecordingResult("recording-a", "file:///recording.m4a", 1_000, 4_096)
+    val terminal =
+      T3VoiceRuntimeEvent.RecordingTerminated(
+        recordingId = recording.recordingId,
+        recording = recording,
+        outcome = "completed",
+        reason = "speech-ended",
+      )
+
+    assertTrue(T3VoiceStateStore.terminateRecording(owner, terminal))
+    assertEquals(terminal, T3VoiceStateStore.recordingTermination.value)
+    T3VoiceStateStore.clearRecordingTermination("other-recording")
+    assertEquals(terminal, T3VoiceStateStore.recordingTermination.value)
+    T3VoiceStateStore.clearRecordingTermination(recording.recordingId)
+    assertNull(T3VoiceStateStore.recordingTermination.value)
   }
 }

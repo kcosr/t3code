@@ -4,6 +4,8 @@ import android.content.Context
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.SystemClock
 import java.io.File
 import java.util.UUID
@@ -94,9 +96,18 @@ internal data class T3VoiceRecordingResult(
   }
 }
 
+internal sealed interface T3VoiceRecordingTermination {
+  data class Completed(val recording: T3VoiceRecordingResult, val reason: String) :
+    T3VoiceRecordingTermination
+
+  data class Cancelled(val recordingId: String, val reason: String) : T3VoiceRecordingTermination
+
+  data class Failed(val recordingId: String, val message: String) : T3VoiceRecordingTermination
+}
+
 internal class T3VoiceRecorder(
   private val context: Context,
-  private val onLimitReached: (T3VoiceRecordingResult, String) -> Unit = { _, _ -> },
+  private val onTerminated: (T3VoiceRecordingTermination) -> Unit = {},
 ) {
   private data class ActiveRecording(
     val recordingId: String,
@@ -104,17 +115,23 @@ internal class T3VoiceRecorder(
     val file: File,
     val startedAtMs: Long,
     val terminalOwner: T3VoiceRecordingTerminalPolicy.Owner,
+    val endpointDetector: T3VoiceEndpointDetector,
   )
 
   private var active: ActiveRecording? = null
   private val completed = mutableMapOf<String, File>()
   private val recordingCache = T3VoiceRecordingCache(context.cacheDir)
   private val terminalPolicy = T3VoiceRecordingTerminalPolicy()
+  private val endpointThread = HandlerThread("t3-voice-endpoint").apply { start() }
+  private val endpointHandler = Handler(endpointThread.looper)
 
   fun sweepStaleCache(): Int = recordingCache.sweep()
 
   @Synchronized
-  fun start(recordingId: String) {
+  fun start(
+    recordingId: String,
+    endpointConfig: T3VoiceEndpointDetectionConfig,
+  ) {
     check(active == null) { "A voice recording is already active." }
     val outputFile = recordingCache.createTempFile()
     val recorder = createMediaRecorder()
@@ -145,29 +162,17 @@ internal class T3VoiceRecorder(
         file = outputFile,
         startedAtMs = SystemClock.elapsedRealtime(),
         terminalOwner = terminalOwner,
+        endpointDetector = T3VoiceEndpointDetector(endpointConfig),
       )
+    scheduleEndpointPoll(terminalOwner)
   }
 
   @Synchronized
   fun stop(recordingId: String): T3VoiceRecordingResult {
     val recording = requireActive(recordingId)
+    check(terminalPolicy.claim(recording.terminalOwner)) { "The recording already terminated." }
     active = null
-    terminalPolicy.deactivate(recording.terminalOwner)
-    try {
-      recording.recorder.stop()
-    } catch (cause: RuntimeException) {
-      recording.file.delete()
-      throw IllegalStateException("The recording was too short or could not be finalized.", cause)
-    } finally {
-      recording.recorder.release()
-    }
-    completed[recording.recordingId] = recording.file
-    return T3VoiceRecordingResult(
-      recordingId = recording.recordingId,
-      uri = Uri.fromFile(recording.file).toString(),
-      durationMs = SystemClock.elapsedRealtime() - recording.startedAtMs,
-      byteLength = recording.file.length(),
-    )
+    return finalizeCompleted(recording)
   }
 
   @Synchronized
@@ -210,6 +215,7 @@ internal class T3VoiceRecorder(
     }
     completed.values.forEach(File::delete)
     completed.clear()
+    endpointThread.quitSafely()
   }
 
   private fun requireActive(recordingId: String): ActiveRecording {
@@ -221,10 +227,10 @@ internal class T3VoiceRecorder(
   }
 
   private fun handleRecorderInfo(source: MediaRecorder, what: Int) {
-    val code =
+    val reason =
       when (what) {
-        MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED -> "recording-duration-limit"
-        MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED -> "recording-file-size-limit"
+        MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED -> "media-duration-limit"
+        MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED -> "media-file-size-limit"
         else -> return
       }
     val recording =
@@ -234,22 +240,92 @@ internal class T3VoiceRecorder(
         active = null
         current
       }
-    T3VoiceRecordingLimitCleanup.run(
-      stop = recording.recorder::stop,
-      release = recording.recorder::release,
-      notify = {
-        synchronized(this) { completed[recording.recordingId] = recording.file }
-        onLimitReached(
-          T3VoiceRecordingResult(
-            recordingId = recording.recordingId,
-            uri = Uri.fromFile(recording.file).toString(),
-            durationMs = SystemClock.elapsedRealtime() - recording.startedAtMs,
-            byteLength = recording.file.length(),
-          ),
-          code,
-        )
+    completeAutomatically(recording, reason)
+  }
+
+  private fun scheduleEndpointPoll(owner: T3VoiceRecordingTerminalPolicy.Owner) {
+    endpointHandler.postDelayed(
+      object : Runnable {
+        override fun run() {
+          val termination =
+            synchronized(this@T3VoiceRecorder) {
+              val recording = active?.takeIf { it.terminalOwner == owner } ?: return
+              val elapsed = SystemClock.elapsedRealtime() - recording.startedAtMs
+              recording.endpointDetector.observe(elapsed, recording.recorder.maxAmplitude)
+            }
+          if (termination == null) {
+            endpointHandler.postDelayed(this, ENDPOINT_POLL_INTERVAL_MS)
+            return
+          }
+          val recording =
+            synchronized(this@T3VoiceRecorder) {
+              val current = active?.takeIf { it.terminalOwner == owner } ?: return
+              if (!terminalPolicy.claim(owner)) return
+              active = null
+              current
+            }
+          when (termination) {
+            T3VoiceEndpointDetector.Outcome.NO_SPEECH -> cancelAutomatically(recording)
+            T3VoiceEndpointDetector.Outcome.SPEECH_ENDED ->
+              completeAutomatically(recording, "speech-ended")
+            T3VoiceEndpointDetector.Outcome.MAXIMUM_UTTERANCE ->
+              completeAutomatically(recording, "maximum-utterance")
+          }
+        }
       },
+      ENDPOINT_POLL_INTERVAL_MS,
     )
+  }
+
+  private fun completeAutomatically(recording: ActiveRecording, reason: String) {
+    val result = try {
+      finalizeCompleted(recording)
+    } catch (_: RuntimeException) {
+      onTerminated(
+        T3VoiceRecordingTermination.Failed(
+          recording.recordingId,
+          "The recording could not be finalized.",
+        ),
+      )
+      return
+    }
+    onTerminated(T3VoiceRecordingTermination.Completed(result, reason))
+  }
+
+  private fun cancelAutomatically(recording: ActiveRecording) {
+    stopAndDelete(recording)
+    onTerminated(T3VoiceRecordingTermination.Cancelled(recording.recordingId, "no-speech"))
+  }
+
+  private fun finalizeCompleted(recording: ActiveRecording): T3VoiceRecordingResult {
+    try {
+      recording.recorder.stop()
+    } catch (cause: RuntimeException) {
+      recording.file.delete()
+      throw IllegalStateException("The recording was too short or could not be finalized.", cause)
+    } finally {
+      recording.recorder.release()
+    }
+    val result =
+      T3VoiceRecordingResult(
+        recordingId = recording.recordingId,
+        uri = Uri.fromFile(recording.file).toString(),
+        durationMs = SystemClock.elapsedRealtime() - recording.startedAtMs,
+        byteLength = recording.file.length(),
+      )
+    synchronized(this) { completed[recording.recordingId] = recording.file }
+    return result
+  }
+
+  private fun stopAndDelete(recording: ActiveRecording) {
+    try {
+      recording.recorder.stop()
+    } catch (_: RuntimeException) {
+      // A silent or short recording may not contain a complete MPEG-4 sample.
+    } finally {
+      recording.recorder.release()
+      recording.file.delete()
+    }
   }
 
   @Suppress("DEPRECATION")
@@ -265,5 +341,6 @@ internal class T3VoiceRecorder(
     private const val RECORDING_BIT_RATE = 64_000
     private const val MAXIMUM_RECORDING_DURATION_MS = 30 * 60 * 1_000
     private const val MAXIMUM_RECORDING_BYTES = 32L * 1_024L * 1_024L
+    private const val ENDPOINT_POLL_INTERVAL_MS = 50L
   }
 }

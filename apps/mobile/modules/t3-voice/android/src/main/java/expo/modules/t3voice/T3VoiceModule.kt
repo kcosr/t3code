@@ -27,6 +27,7 @@ class T3VoiceModule : Module() {
   private val bindingRealtimeOwner = T3VoiceBindingRealtimeOwnerPolicy()
   private var stateCollection: Job? = null
   private var eventCollection: Job? = null
+  private var recordingTerminationCollection: Job? = null
   private var realtimeTerminationCollection: Job? = null
   private var rebindScheduled = false
   private var rebindAttemptedSinceConnection = false
@@ -94,8 +95,7 @@ class T3VoiceModule : Module() {
               when (event) {
                 is T3VoiceRuntimeEvent.PlaybackChunkConsumed ->
                   sendEvent(PLAYBACK_CHUNK_CONSUMED_EVENT, event.toEventBody())
-                is T3VoiceRuntimeEvent.RecordingTerminated ->
-                  sendEvent(RECORDING_TERMINATED_EVENT, event.toEventBody())
+                is T3VoiceRuntimeEvent.RecordingTerminated -> Unit
                 is T3VoiceRuntimeEvent.RuntimeError ->
                   sendEvent(RUNTIME_ERROR_EVENT, event.toEventBody())
                 is T3VoiceRuntimeEvent.AudioRouteChanged ->
@@ -103,6 +103,13 @@ class T3VoiceModule : Module() {
                 is T3VoiceRuntimeEvent.RealtimeTerminated ->
                   sendEvent(REALTIME_TERMINATED_EVENT, event.toEventBody())
               }
+            }
+          }
+        recordingTerminationCollection?.cancel()
+        recordingTerminationCollection =
+          appContext.mainQueue.launch {
+            connectedBinder.recordingTermination.collectLatest { event ->
+              if (event != null) sendEvent(RECORDING_TERMINATED_EVENT, event.toEventBody())
             }
           }
         realtimeTerminationCollection?.cancel()
@@ -149,7 +156,7 @@ class T3VoiceModule : Module() {
       )
 
       Constants(
-        "nativeRevision" to 5,
+        "nativeRevision" to 6,
       )
 
       OnCreate {
@@ -185,6 +192,7 @@ class T3VoiceModule : Module() {
         mapOf(
           "microphone" to true,
           "boundedRecording" to true,
+          "automaticEndpointDetection" to true,
           "orderedPcmPlayback" to true,
           "realtimeWebRtc" to true,
           "bluetoothRouting" to (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S),
@@ -227,12 +235,22 @@ class T3VoiceModule : Module() {
         )
       }
 
-      AsyncFunction("startRecordingAsync") { input: Map<String, String>, promise: Promise ->
+      AsyncFunction("startRecordingAsync") { input: Map<String, Any?>, promise: Promise ->
+        requireExactKeys(input, setOf("recordingId", "endpointDetection"))
         val recordingId = requireIdentifier(input, "recordingId")
+        val endpointInput =
+          input["endpointDetection"] as? Map<*, *>
+            ?: error("endpointDetection must be an object.")
+        requireExactKeys(endpointInput, setOf("endSilenceMs", "noSpeechTimeoutMs"))
+        val endpointConfig =
+          T3VoiceEndpointDetectionConfig(
+            endSilenceMs = requireLong(endpointInput, "endSilenceMs"),
+            noSpeechTimeoutMs = optionalLong(endpointInput, "noSpeechTimeoutMs"),
+          )
         val context = requireNotNull(appContext.reactContext) { "React context is unavailable." }
         T3VoiceRuntimeService.startForRecording(context, recordingId)
         withBinder(promise, "recording-start-failed") { voice, result ->
-          voice.startRecording(recordingId)
+          voice.startRecording(recordingId, endpointConfig)
           result.resolve()
         }
       }
@@ -256,6 +274,14 @@ class T3VoiceModule : Module() {
             recordingId = requireIdentifier(input, "recordingId"),
             uri = requireText(input, "uri", T3VoiceBridgeValidation.MAXIMUM_URI_LENGTH),
           )
+          result.resolve()
+        }
+      }
+
+      AsyncFunction("acknowledgeRecordingTerminationAsync") {
+        input: Map<String, String>, promise: Promise ->
+        withBinder(promise, "recording-acknowledgement-failed") { voice, result ->
+          voice.acknowledgeRecordingTermination(requireIdentifier(input, "recordingId"))
           result.resolve()
         }
       }
@@ -582,6 +608,21 @@ class T3VoiceModule : Module() {
     return T3VoiceBridgeValidation.requireInt(input, key)
   }
 
+  private fun requireLong(input: Map<*, *>, key: String): Long =
+    optionalLong(input, key) ?: error("$key must be an integer.")
+
+  private fun optionalLong(input: Map<*, *>, key: String): Long? {
+    val value = input[key] ?: return null
+    val number = value as? Number ?: error("$key must be an integer or null.")
+    val long = number.toLong()
+    check(number.toDouble() == long.toDouble()) { "$key must be an integer." }
+    return long
+  }
+
+  private fun requireExactKeys(input: Map<*, *>, expected: Set<String>) {
+    check(input.keys == expected) { "Input fields must be exactly ${expected.sorted().joinToString()}." }
+  }
+
   private fun requireText(input: Map<String, *>, key: String, maximumLength: Int): String =
     T3VoiceBridgeValidation.requireText(input, key, maximumLength)
 
@@ -592,6 +633,8 @@ class T3VoiceModule : Module() {
     eventCollection = null
     realtimeTerminationCollection?.cancel()
     realtimeTerminationCollection = null
+    recordingTerminationCollection?.cancel()
+    recordingTerminationCollection = null
   }
 
   private fun publicRealtimeFailureMessage(code: String): String =

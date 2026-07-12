@@ -126,7 +126,13 @@ export function useComposerDictation(input: {
       if (!permission.granted) throw new Error("Microphone permission was not granted");
       if (operationGenerationRef.current !== generation) return;
       const recordingId = uuidv4();
-      await native.startRecordingAsync({ recordingId });
+      await native.startRecordingAsync({
+        recordingId,
+        endpointDetection: {
+          endSilenceMs: 1_200,
+          noSpeechTimeoutMs: 30_000,
+        },
+      });
       if (operationGenerationRef.current !== generation) {
         await native.cancelRecordingAsync({ recordingId }).catch(() => undefined);
         return;
@@ -181,16 +187,23 @@ export function useComposerDictation(input: {
     if (native === null) return;
     const subscription = native.addListener("recordingTerminated", (event) => {
       if (
-        recordingIdRef.current !== event.recording.recordingId &&
-        stoppingRecordingIdRef.current !== event.recording.recordingId
+        recordingIdRef.current !== event.recordingId &&
+        stoppingRecordingIdRef.current !== event.recordingId
       )
         return;
       ++operationGenerationRef.current;
       startPendingRef.current = false;
       recordingIdRef.current = null;
       stoppingRecordingIdRef.current = null;
-      setPhase("transcribing");
       setError(null);
+      if (event.outcome === "cancelled") {
+        setPhase("idle");
+        void native
+          .acknowledgeRecordingTerminationAsync({ recordingId: event.recordingId })
+          .catch(() => undefined);
+        return;
+      }
+      setPhase("transcribing");
       const generation = operationGenerationRef.current;
       void transcribeCompletedRecording(event.recording, generation, draftRef.current);
     });

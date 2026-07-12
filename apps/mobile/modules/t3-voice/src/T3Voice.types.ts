@@ -29,13 +29,21 @@ export interface T3VoiceRuntimeState {
 export interface T3VoiceMediaCapabilities {
   readonly microphone: boolean;
   readonly boundedRecording: boolean;
+  readonly automaticEndpointDetection: boolean;
   readonly orderedPcmPlayback: boolean;
   readonly realtimeWebRtc: boolean;
   readonly bluetoothRouting: boolean;
 }
 
-export interface T3VoiceRecordingInput {
+export interface T3VoiceRecordingIdentifier {
   readonly recordingId: string;
+}
+
+export interface T3VoiceRecordingInput extends T3VoiceRecordingIdentifier {
+  readonly endpointDetection: {
+    readonly endSilenceMs: number;
+    readonly noSpeechTimeoutMs: number | null;
+  };
 }
 
 export interface T3VoiceRecordingResult {
@@ -73,11 +81,23 @@ export interface T3VoicePlaybackChunkConsumedEvent {
   readonly chunkIndex: number;
 }
 
-export interface T3VoiceRecordingTerminatedEvent {
-  readonly recording: T3VoiceRecordingResult;
-  readonly outcome: "completed-limit";
-  readonly code: "recording-duration-limit" | "recording-file-size-limit";
-}
+export type T3VoiceRecordingTerminatedEvent =
+  | {
+      readonly recordingId: string;
+      readonly recording: T3VoiceRecordingResult;
+      readonly outcome: "completed";
+      readonly reason:
+        | "speech-ended"
+        | "maximum-utterance"
+        | "media-duration-limit"
+        | "media-file-size-limit";
+    }
+  | {
+      readonly recordingId: string;
+      readonly recording: null;
+      readonly outcome: "cancelled";
+      readonly reason: "no-speech";
+    };
 
 export interface T3VoiceRuntimeErrorEvent {
   readonly operation: string;
@@ -186,9 +206,14 @@ export interface T3VoiceNativeModule {
   readonly getBluetoothPermissionAsync: () => Promise<PermissionResponse>;
   readonly requestBluetoothPermissionAsync: () => Promise<PermissionResponse>;
   readonly startRecordingAsync: (input: T3VoiceRecordingInput) => Promise<void>;
-  readonly stopRecordingAsync: (input: T3VoiceRecordingInput) => Promise<T3VoiceRecordingResult>;
-  readonly cancelRecordingAsync: (input: T3VoiceRecordingInput) => Promise<void>;
+  readonly stopRecordingAsync: (
+    input: T3VoiceRecordingIdentifier,
+  ) => Promise<T3VoiceRecordingResult>;
+  readonly cancelRecordingAsync: (input: T3VoiceRecordingIdentifier) => Promise<void>;
   readonly deleteRecordingAsync: (input: T3VoiceRecordingDeleteInput) => Promise<void>;
+  readonly acknowledgeRecordingTerminationAsync: (
+    input: T3VoiceRecordingIdentifier,
+  ) => Promise<void>;
   readonly startPlaybackAsync: (input: T3VoicePlaybackInput) => Promise<void>;
   readonly enqueuePlaybackChunkAsync: (input: T3VoicePlaybackChunkInput) => Promise<void>;
   readonly finishPlaybackAsync: (input: T3VoicePlaybackFinishInput) => Promise<void>;
