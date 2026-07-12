@@ -169,7 +169,6 @@ internal object T3VoiceStateStore {
           sequence = current.sequence + 1,
         )
       if (mutableState.compareAndSet(current, next)) {
-        mutableRecordingTermination.value = null
         mutableRealtimeTermination.value = null
         return true
       }
@@ -206,7 +205,9 @@ internal object T3VoiceStateStore {
     update { it.copy(isForeground = isForeground) }
   }
 
+  @Synchronized
   fun claimRecording(recordingId: String): T3VoiceOperationOwner? {
+    if (mutableRecordingTermination.value != null) return null
     val owner = T3VoiceOperationOwner(recordingId, nextOperationGeneration.incrementAndGet())
     return owner.takeIf {
       claimIdle {
@@ -237,6 +238,7 @@ internal object T3VoiceStateStore {
       )
     }
 
+  @Synchronized
   fun terminateRecording(
     owner: T3VoiceOperationOwner,
     event: T3VoiceRuntimeEvent.RecordingTerminated,

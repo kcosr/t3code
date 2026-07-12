@@ -40,4 +40,18 @@ class T3VoiceRecordingTerminalPolicyTest {
     assertEquals("completed", body["outcome"])
     assertEquals(recording.toResultBody(), body["recording"])
   }
+
+  @Test
+  fun finalizationFailureHasNoRecordingToUpload() {
+    val body =
+      T3VoiceRuntimeEvent.RecordingTerminated(
+        recordingId = "recording",
+        recording = null,
+        outcome = "failed",
+        reason = "finalization-failed",
+      ).toEventBody()
+
+    assertEquals("failed", body["outcome"])
+    assertEquals(null, body["recording"])
+  }
 }

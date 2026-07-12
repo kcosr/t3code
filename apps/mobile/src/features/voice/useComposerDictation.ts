@@ -130,7 +130,7 @@ export function useComposerDictation(input: {
         recordingId,
         endpointDetection: {
           endSilenceMs: 1_200,
-          noSpeechTimeoutMs: 30_000,
+          noSpeechTimeoutMs: null,
         },
       });
       if (operationGenerationRef.current !== generation) {
@@ -197,6 +197,14 @@ export function useComposerDictation(input: {
       stoppingRecordingIdRef.current = null;
       setError(null);
       if (event.outcome === "cancelled") {
+        setPhase("idle");
+        void native
+          .acknowledgeRecordingTerminationAsync({ recordingId: event.recordingId })
+          .catch(() => undefined);
+        return;
+      }
+      if (event.outcome === "failed") {
+        setError("The recording could not be finalized.");
         setPhase("idle");
         void native
           .acknowledgeRecordingTerminationAsync({ recordingId: event.recordingId })

@@ -126,4 +126,24 @@ class T3VoiceStateStoreTest {
     T3VoiceStateStore.clearRecordingTermination(recording.recordingId)
     assertNull(T3VoiceStateStore.recordingTermination.value)
   }
+
+  @Test
+  fun pendingRecordingTerminationBlocksReplacementButSurvivesRealtime() {
+    val owner = checkNotNull(T3VoiceStateStore.claimRecording("recording-a"))
+    val terminal =
+      T3VoiceRuntimeEvent.RecordingTerminated(
+        recordingId = "recording-a",
+        recording = null,
+        outcome = "failed",
+        reason = "finalization-failed",
+      )
+    assertTrue(T3VoiceStateStore.terminateRecording(owner, terminal))
+
+    assertNull(T3VoiceStateStore.claimRecording("recording-b"))
+    assertTrue(T3VoiceStateStore.claimRealtime("session-a"))
+    assertEquals(terminal, T3VoiceStateStore.recordingTermination.value)
+    T3VoiceStateStore.releaseRealtimeClaim("session-a")
+    T3VoiceStateStore.clearRecordingTermination("recording-a")
+    assertTrue(T3VoiceStateStore.claimRecording("recording-b") != null)
+  }
 }

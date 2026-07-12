@@ -268,13 +268,13 @@ class T3VoiceRuntimeService : Service() {
                 ),
               )
             is T3VoiceRecordingTermination.Failed -> {
-              releaseRecordingLocked(owner)
-              T3VoiceStateStore.emit(
-                T3VoiceRuntimeEvent.RuntimeError(
-                  operation = "recording:${termination.recordingId}",
-                  code = "recording-finalization-failed",
-                  message = termination.message,
-                  recoverable = true,
+              terminateRecordingLocked(
+                owner,
+                T3VoiceRuntimeEvent.RecordingTerminated(
+                  recordingId = termination.recordingId,
+                  recording = null,
+                  outcome = "failed",
+                  reason = "finalization-failed",
                 ),
               )
             }
@@ -282,6 +282,7 @@ class T3VoiceRuntimeService : Service() {
         }
       }
     recorder.sweepStaleCache()
+    T3VoiceStateStore.recordingTermination.value?.recording?.let(recorder::restoreCompleted)
     player =
       T3VoicePcmPlayer(
         onChunkConsumed = { playbackId, chunkIndex ->

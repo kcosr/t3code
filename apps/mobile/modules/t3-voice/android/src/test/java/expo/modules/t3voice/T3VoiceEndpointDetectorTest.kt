@@ -14,7 +14,7 @@ class T3VoiceEndpointDetectorTest {
     assertEquals(250L, config.minimumSpeechMs)
     assertEquals(1_200L, config.endSilenceMs)
     assertEquals(500L, config.minimumRecordingMs)
-    assertEquals(30_000L, config.noSpeechTimeoutMs)
+    assertNull(config.noSpeechTimeoutMs)
     assertEquals(30L * 60L * 1_000L, config.maximumUtteranceMs)
   }
 
@@ -27,6 +27,15 @@ class T3VoiceEndpointDetectorTest {
     feed(detector, 850L..1_950L step 50L, amplitude = 100)
     assertEquals(T3VoiceEndpointDetector.Outcome.SPEECH_ENDED, detector.observe(2_000L, 100))
     assertNull(detector.observe(2_050L, 100))
+  }
+
+  @Test
+  fun speechBeginningImmediatelyIsNotAbsorbedIntoTheNoiseFloor() {
+    val detector = T3VoiceEndpointDetector()
+
+    feed(detector, 0L..500L step 50L, amplitude = 8_000)
+    feed(detector, 550L..1_650L step 50L, amplitude = 100)
+    assertEquals(T3VoiceEndpointDetector.Outcome.SPEECH_ENDED, detector.observe(1_700L, 100))
   }
 
   @Test
@@ -49,7 +58,8 @@ class T3VoiceEndpointDetectorTest {
 
   @Test
   fun onsetImpulseDoesNotCountAsSpeech() {
-    val detector = T3VoiceEndpointDetector()
+    val detector =
+      T3VoiceEndpointDetector(T3VoiceEndpointDetectionConfig(noSpeechTimeoutMs = 30_000L))
 
     feed(detector, 0L..250L step 50L, amplitude = 100)
     assertNull(detector.observe(300L, 12_000))
@@ -60,7 +70,8 @@ class T3VoiceEndpointDetectorTest {
 
   @Test
   fun internalPauseShorterThanEndSilenceDoesNotTerminate() {
-    val detector = T3VoiceEndpointDetector()
+    val detector =
+      T3VoiceEndpointDetector(T3VoiceEndpointDetectionConfig(noSpeechTimeoutMs = 30_000L))
 
     feed(detector, 0L..500L step 50L, amplitude = 8_000)
     feed(detector, 550L..1_500L step 50L, amplitude = 100)
@@ -72,7 +83,8 @@ class T3VoiceEndpointDetectorTest {
 
   @Test
   fun allZeroInputTimesOutWithoutTriggeringSpeech() {
-    val detector = T3VoiceEndpointDetector()
+    val detector =
+      T3VoiceEndpointDetector(T3VoiceEndpointDetectionConfig(noSpeechTimeoutMs = 30_000L))
 
     feed(detector, 0L..29_950L step 50L, amplitude = 0)
     assertEquals(T3VoiceEndpointDetector.Outcome.NO_SPEECH, detector.observe(30_000L, 0))
@@ -122,7 +134,8 @@ class T3VoiceEndpointDetectorTest {
 
   @Test
   fun adaptiveNoiseFloorDoesNotTreatSteadyAmbientNoiseAsSpeech() {
-    val detector = T3VoiceEndpointDetector()
+    val detector =
+      T3VoiceEndpointDetector(T3VoiceEndpointDetectionConfig(noSpeechTimeoutMs = 30_000L))
 
     feed(detector, 0L..29_950L step 50L, amplitude = 700)
     assertEquals(T3VoiceEndpointDetector.Outcome.NO_SPEECH, detector.observe(30_000L, 700))

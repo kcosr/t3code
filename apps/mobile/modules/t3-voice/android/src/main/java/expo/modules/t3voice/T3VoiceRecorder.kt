@@ -102,7 +102,7 @@ internal sealed interface T3VoiceRecordingTermination {
 
   data class Cancelled(val recordingId: String, val reason: String) : T3VoiceRecordingTermination
 
-  data class Failed(val recordingId: String, val message: String) : T3VoiceRecordingTermination
+  data class Failed(val recordingId: String) : T3VoiceRecordingTermination
 }
 
 internal class T3VoiceRecorder(
@@ -126,6 +126,12 @@ internal class T3VoiceRecorder(
   private val endpointHandler = Handler(endpointThread.looper)
 
   fun sweepStaleCache(): Int = recordingCache.sweep()
+
+  @Synchronized
+  fun restoreCompleted(recording: T3VoiceRecordingResult) {
+    val file = Uri.parse(recording.uri).path?.let(::File) ?: return
+    if (file.exists() && recordingCache.owns(file)) completed[recording.recordingId] = file
+  }
 
   @Synchronized
   fun start(
@@ -213,8 +219,6 @@ internal class T3VoiceRecorder(
       recording.recorder.release()
       recording.file.delete()
     }
-    completed.values.forEach(File::delete)
-    completed.clear()
     endpointThread.quitSafely()
   }
 
@@ -282,10 +286,7 @@ internal class T3VoiceRecorder(
       finalizeCompleted(recording)
     } catch (_: RuntimeException) {
       onTerminated(
-        T3VoiceRecordingTermination.Failed(
-          recording.recordingId,
-          "The recording could not be finalized.",
-        ),
+        T3VoiceRecordingTermination.Failed(recording.recordingId),
       )
       return
     }

@@ -97,6 +97,12 @@ export type T3VoiceRecordingTerminatedEvent =
       readonly recording: null;
       readonly outcome: "cancelled";
       readonly reason: "no-speech";
+    }
+  | {
+      readonly recordingId: string;
+      readonly recording: null;
+      readonly outcome: "failed";
+      readonly reason: "finalization-failed";
     };
 
 export interface T3VoiceRuntimeErrorEvent {
