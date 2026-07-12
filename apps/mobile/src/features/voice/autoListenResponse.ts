@@ -9,19 +9,22 @@ export function findCompletedAutoListenResponse(
   messages: ReadonlyArray<AutoListenThreadMessage>,
   submittedMessageId: string,
 ): AutoListenThreadMessage | null {
-  const submitted = messages.find(
+  const submittedIndex = messages.findIndex(
     (message) => message.id === submittedMessageId && message.role === "user",
   );
-  if (submitted?.turnId === null || submitted?.turnId === undefined) return null;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
+  if (submittedIndex < 0) return null;
+  const submitted = messages[submittedIndex];
+  if (submitted === undefined) return null;
+  const nextUserIndex =
+    submitted.turnId === null
+      ? messages.findIndex((message, index) => index > submittedIndex && message.role === "user")
+      : -1;
+  const upperBound = nextUserIndex < 0 ? messages.length : nextUserIndex;
+  for (let index = upperBound - 1; index > submittedIndex; index -= 1) {
     const message = messages[index];
-    if (
-      message?.role === "assistant" &&
-      message.turnId === submitted.turnId &&
-      !message.streaming
-    ) {
-      return message;
-    }
+    if (message?.role !== "assistant") continue;
+    if (submitted.turnId !== null && message.turnId !== submitted.turnId) continue;
+    return message.streaming ? null : message;
   }
   return null;
 }

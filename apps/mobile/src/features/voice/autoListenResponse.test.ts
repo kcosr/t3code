@@ -17,13 +17,52 @@ describe("findCompletedAutoListenResponse", () => {
     ).toBe("final");
   });
 
-  it("does not accept unrelated, unbound, or streaming responses", () => {
+  it("correlates a response by ordering when queued user messages have no turn id", () => {
+    expect(
+      findCompletedAutoListenResponse(
+        [
+          { id: "older", role: "assistant", turnId: "turn-0", streaming: false },
+          { id: "sent", role: "user", turnId: null, streaming: false },
+          { id: "response", role: "assistant", turnId: "turn-2", streaming: false },
+        ],
+        "sent",
+      )?.id,
+    ).toBe("response");
+  });
+
+  it("does not accept earlier, missing, or streaming responses", () => {
+    expect(
+      findCompletedAutoListenResponse(
+        [
+          { id: "older", role: "assistant", turnId: "turn-0", streaming: false },
+          { id: "sent", role: "user", turnId: null, streaming: false },
+        ],
+        "sent",
+      ),
+    ).toBeNull();
     expect(
       findCompletedAutoListenResponse(
         [
           { id: "sent", role: "user", turnId: null, streaming: false },
-          { id: "other", role: "assistant", turnId: "turn-2", streaming: false },
+          { id: "later", role: "user", turnId: null, streaming: false },
+          { id: "later-response", role: "assistant", turnId: "turn-2", streaming: false },
         ],
+        "sent",
+      ),
+    ).toBeNull();
+    expect(
+      findCompletedAutoListenResponse(
+        [
+          { id: "sent", role: "user", turnId: null, streaming: false },
+          { id: "commentary", role: "assistant", turnId: "turn-1", streaming: false },
+          { id: "final", role: "assistant", turnId: "turn-1", streaming: true },
+        ],
+        "sent",
+      ),
+    ).toBeNull();
+    expect(
+      findCompletedAutoListenResponse(
+        [{ id: "other", role: "assistant", turnId: "turn-2", streaming: false }],
         "sent",
       ),
     ).toBeNull();
