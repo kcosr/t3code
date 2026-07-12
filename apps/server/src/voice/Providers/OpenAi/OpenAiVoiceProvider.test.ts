@@ -133,11 +133,11 @@ it("reports provider failures without logging provider messages or transcript co
       providerErrorType: "invalid_request_error",
       providerErrorCode: "context_length_exceeded",
       providerErrorParam: "session.truncation",
-      providerEventId: "event_123",
       providerMessagePresent: true,
     },
   });
   expect(JSON.stringify(providerErrorDiagnostic)).not.toContain(privateMessage);
+  expect(JSON.stringify(providerErrorDiagnostic)).not.toContain("event_123");
   expect(
     __testing.parseRealtimeEvent({
       type: "message",

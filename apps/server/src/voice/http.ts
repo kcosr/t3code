@@ -16,6 +16,7 @@ import { authenticateRawRouteWithScope } from "../auth/http.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
 import { VoiceMediaTicketRegistry } from "./Services/VoiceMediaTicketRegistry.ts";
 import { inspectVoiceMp4 } from "./Services/VoiceMp4Inspector.ts";
+import { observeVoiceMediaStream } from "./Services/VoiceObservability.ts";
 import {
   boundVoiceByteStream,
   boundVoiceMediaEffect,
@@ -204,23 +205,31 @@ const transcriptionRoute = HttpRouter.add(
         if (transcriber === undefined) {
           return yield* invalidRequest("Selected voice provider has no transcriber");
         }
-        const body = boundVoiceByteStream(
-          transcriber
-            .transcribe({
-              requestId: metadata.requestId,
-              bytes,
-              mediaType: validatedMedia.mediaType,
-              ...(metadata.language === undefined ? {} : { language: metadata.language }),
-              ...(metadata.vocabulary === undefined ? {} : { vocabulary: metadata.vocabulary }),
-            })
-            .pipe(
-              Stream.map((event) => `${encodeTranscriptionEvent(event)}\n`),
-              Stream.encodeText,
-            ),
+        const body = observeVoiceMediaStream(
+          boundVoiceByteStream(
+            transcriber
+              .transcribe({
+                requestId: metadata.requestId,
+                bytes,
+                mediaType: validatedMedia.mediaType,
+                ...(metadata.language === undefined ? {} : { language: metadata.language }),
+                ...(metadata.vocabulary === undefined ? {} : { vocabulary: metadata.vocabulary }),
+              })
+              .pipe(
+                Stream.map((event) => `${encodeTranscriptionEvent(event)}\n`),
+                Stream.encodeText,
+              ),
+            {
+              maximumBytes: VOICE_TRANSCRIPTION_OUTPUT_MAX_BYTES,
+              firstByteTimeoutSeconds: settings.mediaRequestTimeoutSeconds,
+              totalTimeoutSeconds: settings.mediaRequestTimeoutSeconds,
+            },
+          ),
           {
-            maximumBytes: VOICE_TRANSCRIPTION_OUTPUT_MAX_BYTES,
-            firstByteTimeoutSeconds: settings.mediaRequestTimeoutSeconds,
-            totalTimeoutSeconds: settings.mediaRequestTimeoutSeconds,
+            operation: "transcription",
+            requestId: metadata.requestId,
+            inputBytes: validatedMedia.byteLength,
+            inputDurationMs: validatedMedia.durationMilliseconds,
           },
         ).pipe(Stream.ensuring(permit.release));
         return HttpServerResponse.stream(body, {
@@ -290,14 +299,21 @@ const speechRoute = HttpRouter.add(
         text: input.text,
         preset: input.preset,
       });
-      const body = boundVoiceByteStream(providerStream, {
-        maximumBytes: settings.maxSpeechOutputBytes,
-        firstByteTimeoutSeconds: Math.min(
-          VOICE_SPEECH_FIRST_BYTE_TIMEOUT_SECONDS,
-          settings.mediaRequestTimeoutSeconds,
-        ),
-        totalTimeoutSeconds: settings.mediaRequestTimeoutSeconds,
-      }).pipe(Stream.ensuring(permit.release));
+      const body = observeVoiceMediaStream(
+        boundVoiceByteStream(providerStream, {
+          maximumBytes: settings.maxSpeechOutputBytes,
+          firstByteTimeoutSeconds: Math.min(
+            VOICE_SPEECH_FIRST_BYTE_TIMEOUT_SECONDS,
+            settings.mediaRequestTimeoutSeconds,
+          ),
+          totalTimeoutSeconds: settings.mediaRequestTimeoutSeconds,
+        }),
+        {
+          operation: "speech",
+          requestId: input.requestId,
+          inputBytes: new TextEncoder().encode(input.text).byteLength,
+        },
+      ).pipe(Stream.ensuring(permit.release));
       return HttpServerResponse.stream(body, {
         contentType: "audio/pcm",
         headers: {

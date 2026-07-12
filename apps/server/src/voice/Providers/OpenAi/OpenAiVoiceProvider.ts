@@ -403,9 +403,6 @@ const realtimeDiagnostic = (
       ...(safeOperationalValue(error.param) === undefined
         ? {}
         : { providerErrorParam: safeOperationalValue(error.param)! }),
-      ...(safeOperationalValue(error.event_id) === undefined
-        ? {}
-        : { providerEventId: safeOperationalValue(error.event_id)! }),
       providerMessagePresent: typeof error.message === "string" && error.message.length > 0,
     },
   };
@@ -917,6 +914,8 @@ const make = Effect.gen(function* () {
         identity: continuationIdentity(input.sessionId, input.leaseGeneration, index),
       }));
       yield* Effect.logInfo("OpenAI Realtime context replay starting", {
+        sessionId: input.sessionId,
+        leaseGeneration: input.leaseGeneration,
         requestedItemCount: replayItems.length,
       });
       const acknowledgedReplayItems = yield* Ref.make(0);
@@ -963,6 +962,8 @@ const make = Effect.gen(function* () {
           Ref.get(acknowledgedReplayItems).pipe(
             Effect.flatMap((acknowledgedItemCount) =>
               Effect.logWarning("OpenAI Realtime context replay failed", {
+                sessionId: input.sessionId,
+                leaseGeneration: input.leaseGeneration,
                 requestedItemCount: replayItems.length,
                 acknowledgedItemCount,
               }),
@@ -972,6 +973,8 @@ const make = Effect.gen(function* () {
         abortStartup,
       );
       yield* Effect.logInfo("OpenAI Realtime context replay completed", {
+        sessionId: input.sessionId,
+        leaseGeneration: input.leaseGeneration,
         requestedItemCount: replayItems.length,
         acknowledgedItemCount,
       });

@@ -23,6 +23,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
@@ -293,6 +294,10 @@ it.effect(
         },
       };
       const test = yield* makeLayer(provider);
+      const diagnostics: Array<ReadonlyArray<unknown>> = [];
+      const logger = Logger.make<unknown, void>(({ message }) => {
+        diagnostics.push(message as ReadonlyArray<unknown>);
+      });
       yield* Effect.gen(function* () {
         const sessions = yield* VoiceSessionService;
         const owner = AuthSessionId.make("phone");
@@ -339,7 +344,31 @@ it.effect(
         );
         expect(repeated.closed).toBe(false);
         expect(yield* Ref.get(terminated)).toBe(1);
-      }).pipe(Effect.provide(test.layer));
+        expect(diagnostics.filter(([message]) => message === "voice.session.created")).toHaveLength(
+          1,
+        );
+        expect(
+          diagnostics.filter(([message]) => message === "voice.session.connected"),
+        ).toHaveLength(1);
+        const endedDiagnostics = diagnostics.filter(
+          ([message]) => message === "voice.session.ended",
+        );
+        expect(endedDiagnostics).toHaveLength(1);
+        expect(endedDiagnostics[0]?.[1]).toMatchObject({
+          sessionId: created.state.sessionId,
+          leaseGeneration: created.state.leaseGeneration,
+          outcome: "ended",
+          reason: "client-request",
+          previousPhase: "listening",
+          providerAttached: true,
+          providerActivityObserved: true,
+        });
+        expect(JSON.stringify(diagnostics)).not.toContain("show threads");
+        expect(JSON.stringify(diagnostics)).not.toContain("fake-offer");
+      }).pipe(
+        Effect.provide(test.layer),
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      );
     }),
 );
 
