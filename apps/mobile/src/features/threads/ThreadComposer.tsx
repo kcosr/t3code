@@ -1,4 +1,6 @@
 import { isLiquidGlassSupported, LiquidGlassView } from "@callstack/liquid-glass";
+import { useAtomSet, useAtomValue } from "@effect/atom-react";
+import { AsyncResult } from "effect/unstable/reactivity";
 import type {
   EnvironmentId,
   MessageId,
@@ -14,6 +16,7 @@ import {
   serializeComposerFileLink,
   type ComposerTrigger,
 } from "@t3tools/shared/composerTrigger";
+import type { VoiceThreadModePauseReason } from "@t3tools/shared/voiceThreadMode";
 import type { ReactNode } from "react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
@@ -62,6 +65,7 @@ import {
   resolveProviderOptionDescriptors,
 } from "../../lib/providerOptions";
 import { useComposerPathSearch } from "../../state/use-composer-path-search";
+import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerCommandPopover";
 import { useComposerDictation } from "../voice/useComposerDictation";
 import {
@@ -70,6 +74,8 @@ import {
   startDictationWithAudioHandoff,
 } from "../voice/traditionalAudioHandoff";
 import { useMasterVoice } from "../voice/MasterVoiceProvider";
+import { resolveVoicePreferences } from "../voice/voicePreferences";
+import { useAutoListenController } from "../voice/useAutoListenController";
 
 /**
  * Height of the collapsed composer (pill + vertical padding, excluding safe-area inset).
@@ -82,6 +88,42 @@ export const COMPOSER_COLLAPSED_CHROME = 60;
  * Used by the parent to compute the larger feed bottom inset when the composer is focused.
  */
 export const COMPOSER_EXPANDED_CHROME = 174;
+
+function autoListenPauseMessage(reason: VoiceThreadModePauseReason): string {
+  switch (reason) {
+    case "permission":
+      return "Microphone permission is unavailable.";
+    case "audio-route":
+      return "The selected audio route is unavailable.";
+    case "no-speech":
+    case "empty-transcript":
+      return "No speech was recognized.";
+    case "recording-failed":
+      return "Recording could not continue.";
+    case "transcription-failed":
+      return "Transcription failed.";
+    case "transcription-timeout":
+      return "Transcription timed out.";
+    case "submission-failed":
+      return "The message could not be sent.";
+    case "submission-timeout":
+      return "Sending the message timed out.";
+    case "interaction-required":
+      return "The thread needs approval or user input.";
+    case "response-timeout":
+      return "The thread response timed out.";
+    case "playback-cancelled":
+      return "Spoken response playback was stopped.";
+    case "playback-failed":
+      return "Spoken response playback failed.";
+    case "user":
+    case "disabled":
+    case "target-changed":
+    case "realtime-active":
+    case "lifecycle":
+      return "Auto Listen stopped.";
+  }
+}
 
 export interface ThreadComposerProps {
   readonly draftMessage: string;
@@ -102,6 +144,13 @@ export interface ThreadComposerProps {
   readonly serverConfig: T3ServerConfig | null;
   readonly queueCount: number;
   readonly activeThreadBusy: boolean;
+  readonly threadMessages: ReadonlyArray<{
+    readonly id: string;
+    readonly role: "user" | "assistant" | "system";
+    readonly turnId: string | null;
+    readonly streaming: boolean;
+  }>;
+  readonly interactionRequired: boolean;
   readonly environmentId: EnvironmentId;
   readonly projectCwd: string | null;
   readonly editorRef?: RefObject<ComposerEditorHandle | null>;
@@ -111,6 +160,7 @@ export interface ThreadComposerProps {
   readonly onRemoveDraftImage: (imageId: string) => void;
   readonly onStopThread: () => void;
   readonly onSendMessage: () => Promise<MessageId | null>;
+  readonly onSendVoiceMessage: (text: string) => Promise<MessageId | null>;
   readonly onUpdateModelSelection: (modelSelection: ModelSelection) => void;
   readonly onUpdateRuntimeMode: (runtimeMode: RuntimeMode) => void;
   readonly onUpdateInteractionMode: (interactionMode: ProviderInteractionMode) => void;
@@ -120,9 +170,17 @@ export interface ThreadComposerProps {
     readonly available: boolean;
     readonly enabled: boolean;
     readonly playing: boolean;
+    readonly error: string | null;
     readonly onToggle: () => void;
     readonly interrupt: () => Promise<boolean>;
     readonly resumeAfterDictation: () => void;
+    readonly enable: () => void;
+    readonly lifecycleEvent: import("../voice/useThreadSpeech").ThreadSpeechLifecycleEvent | null;
+    readonly latestAssistant: {
+      readonly id: string;
+      readonly text: string;
+      readonly streaming: boolean;
+    } | null;
   };
 }
 
@@ -278,11 +336,17 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const { onExpandedChange } = props;
 
   const [previewImageUri, setPreviewImageUri] = useState<string | null>(null);
+  const preferencesResult = useAtomValue(mobilePreferencesAtom);
+  const savePreferences = useAtomSet(updateMobilePreferencesAtom);
+  const voicePreferences = resolveVoicePreferences(
+    AsyncResult.isSuccess(preferencesResult) ? preferencesResult.value : {},
+  );
   const dictation = useComposerDictation({
     environmentId: props.environmentId,
     scopeKey: props.selectedThread.id,
     draftMessage: props.draftMessage,
     onChangeDraftMessage: props.onChangeDraftMessage,
+    voicePreferences,
   });
   const realtimeVoice = useMasterVoice();
   const realtimeInUse =
@@ -291,6 +355,53 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     realtimeVoice.phase === "stopping";
   const dictationWasActiveRef = useRef(false);
   const traditionalAudioTransitionLockRef = useRef({ active: false });
+  const autoListen = useAutoListenController({
+    environmentId: props.environmentId,
+    threadId: props.selectedThread.id,
+    preferences: voicePreferences,
+    persistedTargetGeneration: AsyncResult.isSuccess(preferencesResult)
+      ? (preferencesResult.value.voiceThreadTarget?.generation ?? 0)
+      : 0,
+    activeThreadBusy: props.activeThreadBusy,
+    threadMessages: props.threadMessages,
+    interactionRequired: props.interactionRequired,
+    canStartFromComposer:
+      props.draftMessage.trim().length === 0 && props.draftAttachments.length === 0,
+    dictation,
+    speech: props.speechPlayback,
+    realtimePhase: realtimeVoice.phase,
+    stopRealtime: realtimeVoice.stop,
+    onSendVoiceMessage: props.onSendVoiceMessage,
+  });
+  const {
+    state: autoListenState,
+    activate: activateAutoListen,
+    pause: pauseAutoListen,
+    submitReview: submitAutoListenReview,
+  } = autoListen;
+  const autoListenAlertCycleRef = useRef(0);
+
+  useEffect(() => {
+    if (
+      autoListenState.phase !== "paused" ||
+      autoListenState.cycle <= autoListenAlertCycleRef.current
+    ) {
+      return;
+    }
+    autoListenAlertCycleRef.current = autoListenState.cycle;
+    const reason = autoListenState.pauseReason;
+    if (
+      reason === null ||
+      reason === "user" ||
+      reason === "disabled" ||
+      reason === "target-changed" ||
+      reason === "realtime-active" ||
+      reason === "lifecycle"
+    ) {
+      return;
+    }
+    Alert.alert("Auto Listen paused", autoListenPauseMessage(reason));
+  }, [autoListenState]);
 
   useEffect(() => {
     const transition = dictationResumeTransition(dictationWasActiveRef.current, dictation.phase);
@@ -299,8 +410,12 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   }, [dictation.phase, props.speechPlayback.resumeAfterDictation]);
 
   useEffect(
-    () => realtimeVoice.registerDictationCancellation(dictation.cancel),
-    [dictation.cancel, realtimeVoice],
+    () =>
+      realtimeVoice.registerDictationCancellation(async () => {
+        pauseAutoListen("realtime-active");
+        await dictation.cancel();
+      }),
+    [dictation.cancel, pauseAutoListen, realtimeVoice.registerDictationCancellation],
   );
 
   const toggleDictation = useCallback(async () => {
@@ -311,15 +426,33 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
           await dictation.stop();
           return;
         }
+        if (voicePreferences.autoListenEnabled) {
+          if (await activateAutoListen()) return;
+        }
         await startDictationWithAudioHandoff({
           stopRealtime: realtimeVoice.stop,
           interruptPlayback: props.speechPlayback.interrupt,
-          startDictation: dictation.start,
+          startDictation: async () => (await dictation.start()) !== null,
           resumePlayback: props.speechPlayback.resumeAfterDictation,
         });
       },
     );
-  }, [dictation, props.speechPlayback, realtimeVoice]);
+  }, [
+    activateAutoListen,
+    dictation.phase,
+    dictation.start,
+    dictation.stop,
+    props.speechPlayback.interrupt,
+    props.speechPlayback.resumeAfterDictation,
+    realtimeVoice.stop,
+    voicePreferences.autoListenEnabled,
+  ]);
+
+  const toggleAutoListenPreference = useCallback(() => {
+    const enabled = !voicePreferences.autoListenEnabled;
+    savePreferences({ voiceAutoListenEnabled: enabled });
+    if (!enabled) pauseAutoListen("disabled");
+  }, [pauseAutoListen, savePreferences, voicePreferences.autoListenEnabled]);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
   const canSend = hasContent;
@@ -573,12 +706,14 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       projectTitle: props.environmentLabel ?? "T3 Code",
     });
     try {
-      await onSendMessage();
+      if (!(await submitAutoListenReview(draftMessage))) await onSendMessage();
     } finally {
       inFlightThreadIdsRef.current.delete(threadKey);
     }
   }, [
     onSendMessage,
+    submitAutoListenReview,
+    draftMessage,
     props.environmentId,
     props.environmentLabel,
     props.selectedThread.id,
@@ -886,6 +1021,18 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
               entering={FadeIn.duration(180)}
               exiting={FadeOut.duration(100)}
             >
+              {dictation.available ? (
+                <ControlPill
+                  accessibilityLabel={
+                    voicePreferences.autoListenEnabled
+                      ? "Disable Auto Listen"
+                      : "Enable Auto Listen"
+                  }
+                  active={voicePreferences.autoListenEnabled}
+                  icon="waveform"
+                  onPress={toggleAutoListenPreference}
+                />
+              ) : null}
               {realtimeInUse && dictation.available ? (
                 <ControlPill
                   icon="microphone.fill"
@@ -942,6 +1089,19 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                     variant={dictation.phase === "recording" ? "danger" : "default"}
                     disabled={dictation.phase === "transcribing"}
                     onPress={() => void toggleDictation()}
+                    showChevron={false}
+                  />
+                ) : null}
+                {dictation.available ? (
+                  <ComposerToolbarButton
+                    accessibilityLabel={
+                      voicePreferences.autoListenEnabled
+                        ? "Disable Auto Listen"
+                        : "Enable Auto Listen"
+                    }
+                    icon="waveform"
+                    active={voicePreferences.autoListenEnabled}
+                    onPress={toggleAutoListenPreference}
                     showChevron={false}
                   />
                 ) : null}

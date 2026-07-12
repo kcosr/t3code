@@ -113,6 +113,8 @@ function LocalSettingsRouteScreen() {
           <SettingsRow icon="paintbrush" label="Appearance" target="SettingsAppearance" />
         </SettingsSection>
 
+        <VoiceSettingsSection />
+
         <ArchivedThreadsSettingsSection />
 
         <AppSettingsSection />
@@ -485,6 +487,8 @@ function ConfiguredSettingsRouteScreen() {
           <SettingsRow icon="paintbrush" label="Appearance" target="SettingsAppearance" />
         </SettingsSection>
 
+        <VoiceSettingsSection />
+
         <ArchivedThreadsSettingsSection />
 
         <AppSettingsSection />
@@ -544,6 +548,14 @@ function ArchivedThreadsSettingsSection() {
   return (
     <SettingsSection title="Threads">
       <SettingsRow icon="archivebox" label="Archived Threads" target="SettingsArchive" />
+    </SettingsSection>
+  );
+}
+
+function VoiceSettingsSection() {
+  return (
+    <SettingsSection title="Voice">
+      <SettingsRow icon="waveform" label="Voice" target="SettingsVoice" />
     </SettingsSection>
   );
 }

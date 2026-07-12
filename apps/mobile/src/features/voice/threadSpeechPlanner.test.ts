@@ -31,7 +31,7 @@ describe("threadSpeechPlanner", () => {
         () => "playback-2",
       ).actions,
     ).toEqual([
-      { type: "start", playbackId: "playback-2" },
+      { type: "start", playbackId: "playback-2", messageId: "next" },
       {
         type: "segment",
         playbackId: "playback-2",
@@ -73,7 +73,7 @@ describe("threadSpeechPlanner", () => {
       () => "playback-1",
     );
     expect(first.actions).toEqual([
-      { type: "start", playbackId: "playback-1" },
+      { type: "start", playbackId: "playback-1", messageId: "new" },
       {
         type: "segment",
         playbackId: "playback-1",
@@ -116,6 +116,7 @@ describe("threadSpeechPlanner", () => {
     expect(result.actions[0]).toEqual({
       type: "start",
       playbackId: "playback-1",
+      messageId: "active",
     });
     expect(result.actions[1]).toMatchObject({
       type: "segment",
@@ -174,7 +175,7 @@ describe("threadSpeechPlanner", () => {
         { id: "next", text: "A later response.", streaming: false },
         () => "playback-2",
       ).actions[0],
-    ).toEqual({ type: "start", playbackId: "playback-2" });
+    ).toEqual({ type: "start", playbackId: "playback-2", messageId: "next" });
   });
 
   it("defers response planning and preference playback while dictation is active", () => {
@@ -193,6 +194,7 @@ describe("threadSpeechPlanner", () => {
     expect(updateThreadSpeech(reenabled.state, latest, () => "playback-2").actions[0]).toEqual({
       type: "start",
       playbackId: "playback-2",
+      messageId: "new",
     });
   });
 
@@ -216,7 +218,7 @@ describe("threadSpeechPlanner", () => {
 
     expect(result.actions).toEqual([
       { type: "cancel", playbackId: "playback-1" },
-      { type: "start", playbackId: "playback-2" },
+      { type: "start", playbackId: "playback-2", messageId: "second" },
       {
         type: "segment",
         playbackId: "playback-2",

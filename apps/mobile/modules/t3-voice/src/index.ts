@@ -12,6 +12,7 @@ export type {
   T3VoicePlaybackFinishInput,
   T3VoicePlaybackInput,
   T3VoicePlaybackChunkConsumedEvent,
+  T3VoicePlaybackTerminatedEvent,
   T3VoicePlaybackChunkInput,
   T3VoiceRecordingInput,
   T3VoiceRecordingDeleteInput,

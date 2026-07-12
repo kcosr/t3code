@@ -20,8 +20,23 @@ import {
   dictationTerminationOwnership,
 } from "./dictationTermination";
 import { canStartComposerDictation } from "./dictationAdmission";
+import type { ResolvedVoicePreferences } from "./voicePreferences";
 
 export type ComposerDictationPhase = "idle" | "recording" | "transcribing";
+
+export interface ComposerTranscriptionEvent {
+  readonly sequence: number;
+  readonly recordingId: string;
+  readonly draftAtStart: string;
+  readonly finalDraft: string;
+}
+
+export interface ComposerRecordingTerminationEvent {
+  readonly sequence: number;
+  readonly recordingId: string;
+  readonly outcome: "cancelled" | "failed";
+  readonly reason: "no-speech" | "finalization-failed";
+}
 
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
@@ -31,16 +46,27 @@ export function useComposerDictation(input: {
   readonly scopeKey: string;
   readonly draftMessage: string;
   readonly onChangeDraftMessage: (value: string) => void;
+  readonly voicePreferences: Pick<
+    ResolvedVoicePreferences,
+    "endSilenceMs" | "noSpeechTimeoutMs" | "maximumUtteranceMs"
+  >;
 }) {
   const prepared = Option.getOrNull(usePreparedConnection(input.environmentId));
   const native = getT3VoiceNativeModule();
   const capability = useVoiceCapabilityDescriptor(prepared, "transcription.request");
   const [phase, setPhase] = useState<ComposerDictationPhase>("idle");
   const [error, setError] = useState<string | null>(null);
+  const [transcriptionEvent, setTranscriptionEvent] = useState<ComposerTranscriptionEvent | null>(
+    null,
+  );
+  const [terminationEvent, setTerminationEvent] =
+    useState<ComposerRecordingTerminationEvent | null>(null);
+  const eventSequenceRef = useRef(0);
   const recordingIdRef = useRef<string | null>(null);
   const stoppingRecordingIdRef = useRef<string | null>(null);
   const transcribingRecordingIdRef = useRef<string | null>(null);
   const operationGenerationRef = useRef(0);
+  const mountedRef = useRef(true);
   const startPendingRef = useRef(false);
   const lifecycleRef = useRef({ scopeKey: input.scopeKey, native, prepared });
   const draftRef = useRef(input.draftMessage);
@@ -58,6 +84,7 @@ export function useComposerDictation(input: {
     async (completedRecording: T3VoiceRecordingResult, generation: number, draftAtStop: string) => {
       if (native === null || prepared === null) return;
       transcribingRecordingIdRef.current = completedRecording.recordingId;
+      let finalDraft: string | null = null;
       try {
         if (operationGenerationRef.current !== generation) return;
         if (capability !== null) validateRecordingAgainstCapability(completedRecording, capability);
@@ -98,9 +125,18 @@ export function useComposerDictation(input: {
             })
             .pipe(Stream.runForEach(applyEvent)),
         );
+        finalDraft = lastRendered;
       } catch (cause) {
         if (operationGenerationRef.current === generation) setError(errorMessage(cause));
       } finally {
+        if (finalDraft !== null && operationGenerationRef.current === generation) {
+          setTranscriptionEvent({
+            sequence: ++eventSequenceRef.current,
+            recordingId: completedRecording.recordingId,
+            draftAtStart: draftAtStop,
+            finalDraft,
+          });
+        }
         await native
           .deleteRecordingAsync({
             recordingId: completedRecording.recordingId,
@@ -129,7 +165,7 @@ export function useComposerDictation(input: {
         transcribingRecordingId: transcribingRecordingIdRef.current,
       })
     )
-      return false;
+      return null;
     const generation = ++operationGenerationRef.current;
     startPendingRef.current = true;
     setError(null);
@@ -139,30 +175,34 @@ export function useComposerDictation(input: {
         ? currentPermission
         : await native.requestMicrophonePermissionAsync();
       if (!permission.granted) throw new Error("Microphone permission was not granted");
-      if (operationGenerationRef.current !== generation) return false;
+      if (operationGenerationRef.current !== generation) return null;
       const recordingId = uuidv4();
       await native.startRecordingAsync({
         recordingId,
         endpointDetection: {
-          endSilenceMs: 2_200,
+          endSilenceMs: input.voicePreferences.endSilenceMs,
+          maximumUtteranceMs: input.voicePreferences.maximumUtteranceMs,
+          ...(input.voicePreferences.noSpeechTimeoutMs === null
+            ? {}
+            : { noSpeechTimeoutMs: input.voicePreferences.noSpeechTimeoutMs }),
         },
       });
       if (operationGenerationRef.current !== generation) {
         await native.cancelRecordingAsync({ recordingId }).catch(() => undefined);
-        return false;
+        return null;
       }
       recordingIdRef.current = recordingId;
       setPhase("recording");
-      return true;
+      return recordingId;
     } catch (cause) {
-      if (operationGenerationRef.current !== generation) return false;
+      if (operationGenerationRef.current !== generation) return null;
       setError(errorMessage(cause));
       setPhase("idle");
-      return false;
+      return null;
     } finally {
       if (operationGenerationRef.current === generation) startPendingRef.current = false;
     }
-  }, [capability, native, phase, prepared]);
+  }, [capability, input.voicePreferences, native, phase, prepared]);
 
   const stop = useCallback(async () => {
     const recordingId = recordingIdRef.current;
@@ -177,7 +217,15 @@ export function useComposerDictation(input: {
     setError(null);
     try {
       const completedRecording = await native.stopRecordingAsync({ recordingId });
-      if (operationGenerationRef.current !== generation) return;
+      if (operationGenerationRef.current !== generation) {
+        await native
+          .deleteRecordingAsync({
+            recordingId: completedRecording.recordingId,
+            uri: completedRecording.uri,
+          })
+          .catch(() => undefined);
+        return;
+      }
       await transcribeCompletedRecording(completedRecording, generation, draftAtStop);
     } catch (cause) {
       if (operationGenerationRef.current === generation) setError(errorMessage(cause));
@@ -196,7 +244,7 @@ export function useComposerDictation(input: {
     if (native !== null && recordingId !== null) {
       await native.cancelRecordingAsync({ recordingId }).catch(() => undefined);
     }
-    setPhase("idle");
+    if (mountedRef.current) setPhase("idle");
   }, [native]);
 
   useEffect(() => {
@@ -224,6 +272,12 @@ export function useComposerDictation(input: {
       stoppingRecordingIdRef.current = null;
       setError(null);
       if (event.outcome === "cancelled") {
+        setTerminationEvent({
+          sequence: ++eventSequenceRef.current,
+          recordingId: event.recordingId,
+          outcome: "cancelled",
+          reason: "no-speech",
+        });
         setPhase("idle");
         void native
           .acknowledgeRecordingTerminationAsync({ recordingId: event.recordingId })
@@ -231,6 +285,12 @@ export function useComposerDictation(input: {
         return;
       }
       if (event.outcome === "failed") {
+        setTerminationEvent({
+          sequence: ++eventSequenceRef.current,
+          recordingId: event.recordingId,
+          outcome: "failed",
+          reason: "finalization-failed",
+        });
         setError("The recording could not be finalized.");
         setPhase("idle");
         void native
@@ -268,10 +328,19 @@ export function useComposerDictation(input: {
     };
   }, [input.scopeKey, native, prepared]);
 
+  useEffect(
+    () => () => {
+      mountedRef.current = false;
+    },
+    [],
+  );
+
   return {
     available: native !== null && prepared !== null && capability !== null,
     phase,
     error,
+    transcriptionEvent,
+    terminationEvent,
     start,
     stop,
     cancel,

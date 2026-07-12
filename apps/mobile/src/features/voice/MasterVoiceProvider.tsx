@@ -321,6 +321,11 @@ export function MasterVoiceProvider(props: {
             pendingClientActionsRef.current.clear();
           }
           if (next.phase !== "active") setAudioRoutePicker(null);
+          if (next.phase === "active") {
+            savePreferences({ voiceMode: "realtime" });
+          } else if (next.phase === "idle" || next.phase === "error") {
+            savePreferences({ voiceMode: "off" });
+          }
         },
         onSessionEvents: handleSessionEvents,
         onAudioRouteChanged: (event) => {

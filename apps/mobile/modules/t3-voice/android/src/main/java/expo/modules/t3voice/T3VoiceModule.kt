@@ -95,6 +95,8 @@ class T3VoiceModule : Module() {
               when (event) {
                 is T3VoiceRuntimeEvent.PlaybackChunkConsumed ->
                   sendEvent(PLAYBACK_CHUNK_CONSUMED_EVENT, event.toEventBody())
+                is T3VoiceRuntimeEvent.PlaybackTerminated ->
+                  sendEvent(PLAYBACK_TERMINATED_EVENT, event.toEventBody())
                 is T3VoiceRuntimeEvent.RecordingTerminated -> Unit
                 is T3VoiceRuntimeEvent.RuntimeError ->
                   sendEvent(RUNTIME_ERROR_EVENT, event.toEventBody())
@@ -149,6 +151,7 @@ class T3VoiceModule : Module() {
       Events(
         STATE_CHANGED_EVENT,
         PLAYBACK_CHUNK_CONSUMED_EVENT,
+        PLAYBACK_TERMINATED_EVENT,
         RECORDING_TERMINATED_EVENT,
         RUNTIME_ERROR_EVENT,
         AUDIO_ROUTE_CHANGED_EVENT,
@@ -243,13 +246,14 @@ class T3VoiceModule : Module() {
             ?: error("endpointDetection must be an object.")
         requireAllowedKeys(
           endpointInput,
-          required = setOf("endSilenceMs"),
-          allowed = setOf("endSilenceMs", "noSpeechTimeoutMs"),
+          required = setOf("endSilenceMs", "maximumUtteranceMs"),
+          allowed = setOf("endSilenceMs", "noSpeechTimeoutMs", "maximumUtteranceMs"),
         )
         val endpointConfig =
           T3VoiceEndpointDetectionConfig(
             endSilenceMs = requireLong(endpointInput, "endSilenceMs"),
             noSpeechTimeoutMs = optionalLong(endpointInput, "noSpeechTimeoutMs"),
+            maximumUtteranceMs = requireLong(endpointInput, "maximumUtteranceMs"),
           )
         val context = requireNotNull(appContext.reactContext) { "React context is unavailable." }
         T3VoiceRuntimeService.startForRecording(context, recordingId)
@@ -664,6 +668,7 @@ class T3VoiceModule : Module() {
     private const val MODULE_NAME = "T3Voice"
     private const val STATE_CHANGED_EVENT = "stateChanged"
     private const val PLAYBACK_CHUNK_CONSUMED_EVENT = "playbackChunkConsumed"
+    private const val PLAYBACK_TERMINATED_EVENT = "playbackTerminated"
     private const val RECORDING_TERMINATED_EVENT = "recordingTerminated"
     private const val RUNTIME_ERROR_EVENT = "runtimeError"
     private const val AUDIO_ROUTE_CHANGED_EVENT = "audioRouteChanged"

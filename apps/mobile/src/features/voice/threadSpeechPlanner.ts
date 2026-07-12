@@ -25,7 +25,7 @@ export interface ThreadSpeechPlannerState {
 }
 
 export type ThreadSpeechAction =
-  | { readonly type: "start"; readonly playbackId: string }
+  | { readonly type: "start"; readonly playbackId: string; readonly messageId: string }
   | {
       readonly type: "segment";
       readonly playbackId: string;
@@ -234,6 +234,6 @@ export const updateThreadSpeech = (
   const updated = appendSnapshot({ ...state, active }, active, latest);
   return {
     state: updated.state,
-    actions: [{ type: "start", playbackId }, ...updated.actions],
+    actions: [{ type: "start", playbackId, messageId: latest.id }, ...updated.actions],
   };
 };

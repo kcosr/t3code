@@ -43,6 +43,7 @@ export interface T3VoiceRecordingInput extends T3VoiceRecordingIdentifier {
   readonly endpointDetection: {
     readonly endSilenceMs: number;
     readonly noSpeechTimeoutMs?: number;
+    readonly maximumUtteranceMs: number;
   };
 }
 
@@ -79,6 +80,11 @@ export interface T3VoicePlaybackFinishInput {
 export interface T3VoicePlaybackChunkConsumedEvent {
   readonly playbackId: string;
   readonly chunkIndex: number;
+}
+
+export interface T3VoicePlaybackTerminatedEvent {
+  readonly playbackId: string;
+  readonly outcome: "completed" | "failed";
 }
 
 export type T3VoiceRecordingTerminatedEvent =
@@ -187,6 +193,10 @@ export interface T3VoiceNativeModule {
     (
       eventName: "playbackChunkConsumed",
       listener: (event: T3VoicePlaybackChunkConsumedEvent) => void,
+    ): T3VoiceEventSubscription;
+    (
+      eventName: "playbackTerminated",
+      listener: (event: T3VoicePlaybackTerminatedEvent) => void,
     ): T3VoiceEventSubscription;
     (
       eventName: "recordingTerminated",

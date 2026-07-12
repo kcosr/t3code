@@ -80,6 +80,7 @@ export interface ThreadDetailScreenProps {
   readonly onRemoveDraftImage: (imageId: string) => void;
   readonly onStopThread: () => void;
   readonly onSendMessage: () => Promise<MessageId | null>;
+  readonly onSendVoiceMessage: (text: string) => Promise<MessageId | null>;
   readonly onReconnectEnvironment: () => void;
   readonly onUpdateThreadModelSelection: (modelSelection: ModelSelection) => void;
   readonly onUpdateThreadRuntimeMode: (runtimeMode: RuntimeMode) => void;
@@ -126,6 +127,7 @@ function latestAssistantSpeechSnapshot(feed: ReadonlyArray<ThreadFeedEntry>): {
   readonly id: string;
   readonly text: string;
   readonly streaming: boolean;
+  readonly turnId: string | null;
 } | null {
   for (let index = feed.length - 1; index >= 0; index -= 1) {
     const entry = feed[index];
@@ -134,6 +136,7 @@ function latestAssistantSpeechSnapshot(feed: ReadonlyArray<ThreadFeedEntry>): {
         id: entry.message.id,
         text: entry.message.text,
         streaming: entry.message.streaming,
+        turnId: entry.message.turnId,
       };
     }
   }
@@ -385,6 +388,17 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     composerEditorRef.current?.blur();
     return messageId;
   }, [props.onSendMessage, selectedThreadKey]);
+  const handleSendVoiceMessage = useCallback(
+    async (text: string) => {
+      const targetThreadKey = selectedThreadKeyRef.current;
+      const messageId = await props.onSendVoiceMessage(text);
+      if (messageId !== null && selectedThreadKeyRef.current === targetThreadKey) {
+        setAnchorMessageId(messageId);
+      }
+      return messageId;
+    },
+    [props.onSendVoiceMessage],
+  );
 
   const collapseComposer = useCallback(() => {
     composerEditorRef.current?.blur();
@@ -517,6 +531,21 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               serverConfig={props.serverConfig}
               queueCount={props.selectedThreadQueueCount}
               activeThreadBusy={props.activeThreadBusy}
+              threadMessages={selectedThreadFeed.flatMap((entry) =>
+                entry.type === "message"
+                  ? [
+                      {
+                        id: entry.message.id,
+                        role: entry.message.role,
+                        turnId: entry.message.turnId,
+                        streaming: entry.message.streaming,
+                      },
+                    ]
+                  : [],
+              )}
+              interactionRequired={
+                props.activePendingApproval !== null || props.activePendingUserInput !== null
+              }
               environmentId={props.environmentId}
               projectCwd={props.projectWorkspaceRoot}
               bottomInset={composerBottomInset}
@@ -526,6 +555,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               onRemoveDraftImage={props.onRemoveDraftImage}
               onStopThread={props.onStopThread}
               onSendMessage={handleSendMessage}
+              onSendVoiceMessage={handleSendVoiceMessage}
               onReconnectEnvironment={props.onReconnectEnvironment}
               onUpdateModelSelection={props.onUpdateThreadModelSelection}
               onUpdateRuntimeMode={props.onUpdateThreadRuntimeMode}
@@ -535,9 +565,13 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                 available: speechPlayback.available,
                 enabled: speechPlayback.enabled,
                 playing: speechPlayback.playing,
+                error: speechPlayback.error,
                 onToggle: handleSpeechPlaybackToggle,
                 interrupt: speechPlayback.interrupt,
                 resumeAfterDictation: speechPlayback.resumeAfterDictation,
+                enable: speechPlayback.enable,
+                lifecycleEvent: speechPlayback.lifecycleEvent,
+                latestAssistant: speechPlayback.latestAssistant,
               }}
             />
           </View>

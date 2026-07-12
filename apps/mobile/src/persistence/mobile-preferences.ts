@@ -9,6 +9,23 @@ import * as Semaphore from "effect/Semaphore";
 import * as MobileDatabase from "./mobile-database";
 import * as MobileSecureStorage from "./mobile-secure-storage";
 import { MobileStorageDecodeError, MobileStorageEncodeError } from "./mobile-storage";
+import {
+  clampVoicePreference,
+  VOICE_END_SILENCE_MAX_MS,
+  VOICE_END_SILENCE_MIN_MS,
+  VOICE_MAXIMUM_UTTERANCE_MAX_MS,
+  VOICE_MAXIMUM_UTTERANCE_MIN_MS,
+  VOICE_NO_SPEECH_MAX_MS,
+  VOICE_NO_SPEECH_MIN_MS,
+  VOICE_REARM_GUARD_MAX_MS,
+  VOICE_REARM_GUARD_MIN_MS,
+  VOICE_RESPONSE_TIMEOUT_MAX_MS,
+  VOICE_RESPONSE_TIMEOUT_MIN_MS,
+  VOICE_SUBMISSION_TIMEOUT_MAX_MS,
+  VOICE_SUBMISSION_TIMEOUT_MIN_MS,
+  VOICE_TRANSCRIPTION_TIMEOUT_MAX_MS,
+  VOICE_TRANSCRIPTION_TIMEOUT_MIN_MS,
+} from "../lib/voicePreferenceBounds";
 
 const PREFERENCES_KEY = "t3code.preferences";
 const PREFERENCES_FALLBACK_KEY = "t3code.preferences.fallback";
@@ -17,6 +34,21 @@ export interface Preferences {
   readonly liveActivitiesEnabled?: boolean;
   readonly threadSpeechEnabled?: boolean;
   readonly voiceAudioRouteId?: string;
+  readonly voiceAutoListenEnabled?: boolean;
+  readonly voiceAutoSubmitEnabled?: boolean;
+  readonly voiceEndSilenceMs?: number;
+  readonly voiceNoSpeechTimeoutMs?: number | null;
+  readonly voiceMaximumUtteranceMs?: number;
+  readonly voicePostPlaybackGuardMs?: number;
+  readonly voiceTranscriptionTimeoutMs?: number;
+  readonly voiceSubmissionTimeoutMs?: number;
+  readonly voiceResponseTimeoutMs?: number;
+  readonly voiceMode?: "off" | "realtime" | "thread";
+  readonly voiceThreadTarget?: {
+    readonly environmentId: string;
+    readonly threadId: string;
+    readonly generation: number;
+  };
   readonly baseFontSize?: number;
   readonly terminalFontSize?: number | null;
   readonly markdownFontSize?: number;
@@ -68,6 +100,21 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     liveActivitiesEnabled?: boolean;
     threadSpeechEnabled?: boolean;
     voiceAudioRouteId?: string;
+    voiceAutoListenEnabled?: boolean;
+    voiceAutoSubmitEnabled?: boolean;
+    voiceEndSilenceMs?: number;
+    voiceNoSpeechTimeoutMs?: number | null;
+    voiceMaximumUtteranceMs?: number;
+    voicePostPlaybackGuardMs?: number;
+    voiceTranscriptionTimeoutMs?: number;
+    voiceSubmissionTimeoutMs?: number;
+    voiceResponseTimeoutMs?: number;
+    voiceMode?: "off" | "realtime" | "thread";
+    voiceThreadTarget?: {
+      readonly environmentId: string;
+      readonly threadId: string;
+      readonly generation: number;
+    };
     baseFontSize?: number;
     terminalFontSize?: number | null;
     markdownFontSize?: number;
@@ -85,6 +132,84 @@ function sanitizePreferences(parsed: Preferences): Preferences {
   }
   if (typeof parsed.voiceAudioRouteId === "string" && parsed.voiceAudioRouteId.length > 0) {
     preferences.voiceAudioRouteId = parsed.voiceAudioRouteId;
+  }
+  if (typeof parsed.voiceAutoListenEnabled === "boolean") {
+    preferences.voiceAutoListenEnabled = parsed.voiceAutoListenEnabled;
+  }
+  if (typeof parsed.voiceAutoSubmitEnabled === "boolean") {
+    preferences.voiceAutoSubmitEnabled = parsed.voiceAutoSubmitEnabled;
+  }
+  if (Number.isFinite(parsed.voiceEndSilenceMs)) {
+    preferences.voiceEndSilenceMs = clampVoicePreference(
+      parsed.voiceEndSilenceMs!,
+      VOICE_END_SILENCE_MIN_MS,
+      VOICE_END_SILENCE_MAX_MS,
+    );
+  }
+  if (parsed.voiceNoSpeechTimeoutMs === null || Number.isFinite(parsed.voiceNoSpeechTimeoutMs)) {
+    preferences.voiceNoSpeechTimeoutMs =
+      parsed.voiceNoSpeechTimeoutMs === null
+        ? null
+        : clampVoicePreference(
+            parsed.voiceNoSpeechTimeoutMs!,
+            VOICE_NO_SPEECH_MIN_MS,
+            VOICE_NO_SPEECH_MAX_MS,
+          );
+  }
+  if (Number.isFinite(parsed.voiceMaximumUtteranceMs)) {
+    preferences.voiceMaximumUtteranceMs = clampVoicePreference(
+      parsed.voiceMaximumUtteranceMs!,
+      VOICE_MAXIMUM_UTTERANCE_MIN_MS,
+      VOICE_MAXIMUM_UTTERANCE_MAX_MS,
+    );
+  }
+  if (Number.isFinite(parsed.voicePostPlaybackGuardMs)) {
+    preferences.voicePostPlaybackGuardMs = clampVoicePreference(
+      parsed.voicePostPlaybackGuardMs!,
+      VOICE_REARM_GUARD_MIN_MS,
+      VOICE_REARM_GUARD_MAX_MS,
+    );
+  }
+  if (Number.isFinite(parsed.voiceTranscriptionTimeoutMs)) {
+    preferences.voiceTranscriptionTimeoutMs = clampVoicePreference(
+      parsed.voiceTranscriptionTimeoutMs!,
+      VOICE_TRANSCRIPTION_TIMEOUT_MIN_MS,
+      VOICE_TRANSCRIPTION_TIMEOUT_MAX_MS,
+    );
+  }
+  if (Number.isFinite(parsed.voiceSubmissionTimeoutMs)) {
+    preferences.voiceSubmissionTimeoutMs = clampVoicePreference(
+      parsed.voiceSubmissionTimeoutMs!,
+      VOICE_SUBMISSION_TIMEOUT_MIN_MS,
+      VOICE_SUBMISSION_TIMEOUT_MAX_MS,
+    );
+  }
+  if (Number.isFinite(parsed.voiceResponseTimeoutMs)) {
+    preferences.voiceResponseTimeoutMs = clampVoicePreference(
+      parsed.voiceResponseTimeoutMs!,
+      VOICE_RESPONSE_TIMEOUT_MIN_MS,
+      VOICE_RESPONSE_TIMEOUT_MAX_MS,
+    );
+  }
+  if (
+    parsed.voiceMode === "off" ||
+    parsed.voiceMode === "realtime" ||
+    parsed.voiceMode === "thread"
+  ) {
+    preferences.voiceMode = parsed.voiceMode;
+  }
+  const voiceThreadTarget = parsed.voiceThreadTarget;
+  if (
+    typeof voiceThreadTarget === "object" &&
+    voiceThreadTarget !== null &&
+    typeof voiceThreadTarget.environmentId === "string" &&
+    voiceThreadTarget.environmentId.length > 0 &&
+    typeof voiceThreadTarget.threadId === "string" &&
+    voiceThreadTarget.threadId.length > 0 &&
+    Number.isSafeInteger(voiceThreadTarget.generation) &&
+    voiceThreadTarget.generation > 0
+  ) {
+    preferences.voiceThreadTarget = voiceThreadTarget;
   }
   if (typeof parsed.baseFontSize === "number") preferences.baseFontSize = parsed.baseFontSize;
   if (typeof parsed.terminalFontSize === "number" || parsed.terminalFontSize === null) {

@@ -314,11 +314,17 @@ class T3VoiceRuntimeService : Service() {
           )
         },
         onFinished = { playbackId ->
+          T3VoiceStateStore.emit(
+            T3VoiceRuntimeEvent.PlaybackTerminated(playbackId, "completed"),
+          )
           synchronized(operationLock) {
             playbackOwner?.takeIf { it.id == playbackId }?.let(::releasePlaybackLocked)
           }
         },
         onError = { playbackId, cause ->
+          T3VoiceStateStore.emit(
+            T3VoiceRuntimeEvent.PlaybackTerminated(playbackId, "failed"),
+          )
           T3VoiceStateStore.emit(
             T3VoiceRuntimeEvent.RuntimeError(
               operation = "playback:$playbackId",

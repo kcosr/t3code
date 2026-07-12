@@ -182,6 +182,19 @@ describe("mobile connection storage", () => {
       JSON.stringify({
         threadSpeechEnabled: true,
         voiceAudioRouteId: "speaker",
+        voiceAutoListenEnabled: true,
+        voiceAutoSubmitEnabled: false,
+        voiceEndSilenceMs: 2_200,
+        voiceNoSpeechTimeoutMs: null,
+        voiceMaximumUtteranceMs: 1_799_000,
+        voicePostPlaybackGuardMs: 750,
+        voiceResponseTimeoutMs: 600_000,
+        voiceMode: "thread",
+        voiceThreadTarget: {
+          environmentId: "environment-1",
+          threadId: "thread-1",
+          generation: 3,
+        },
         unsupportedSpeechSetting: "ignored",
       }),
       10,
@@ -189,10 +202,30 @@ describe("mobile connection storage", () => {
     await expect(loadPreferences()).resolves.toEqual({
       threadSpeechEnabled: true,
       voiceAudioRouteId: "speaker",
+      voiceAutoListenEnabled: true,
+      voiceAutoSubmitEnabled: false,
+      voiceEndSilenceMs: 2_200,
+      voiceNoSpeechTimeoutMs: null,
+      voiceMaximumUtteranceMs: 1_799_000,
+      voicePostPlaybackGuardMs: 750,
+      voiceResponseTimeoutMs: 600_000,
+      voiceMode: "thread",
+      voiceThreadTarget: {
+        environmentId: "environment-1",
+        threadId: "thread-1",
+        generation: 3,
+      },
     });
 
     mocks.setPreferencesJson(
-      JSON.stringify({ threadSpeechEnabled: "yes", voiceAudioRouteId: "" }),
+      JSON.stringify({
+        threadSpeechEnabled: "yes",
+        voiceAudioRouteId: "",
+        voiceAutoListenEnabled: "yes",
+        voiceEndSilenceMs: Number.NaN,
+        voiceMode: "invalid",
+        voiceThreadTarget: { environmentId: "", threadId: "thread", generation: 0 },
+      }),
       20,
     );
     await expect(loadPreferences()).resolves.toEqual({});

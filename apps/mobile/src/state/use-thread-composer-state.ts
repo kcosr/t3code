@@ -171,6 +171,41 @@ export function useThreadComposerState() {
     }
   }, [selectedThreadDetail, selectedThreadShell]);
 
+  const onSendVoiceMessage = useCallback(
+    async (text: string) => {
+      if (!selectedThreadShell || text.trim().length === 0) return null;
+      const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
+      const thread = selectedThreadDetail ?? selectedThreadShell;
+      const metadata = makeQueuedMessageMetadata();
+      const messageId = MessageId.make(metadata.messageId);
+      try {
+        await enqueueThreadOutboxMessage({
+          environmentId: selectedThreadShell.environmentId,
+          threadId: selectedThreadShell.id,
+          messageId,
+          commandId: CommandId.make(metadata.commandId),
+          text: text.trim(),
+          attachments: [],
+          modelSelection: thread.modelSelection,
+          runtimeMode: thread.runtimeMode,
+          interactionMode: thread.interactionMode,
+          createdAt: metadata.createdAt,
+        });
+        const currentDraft = getComposerDraftSnapshot(threadKey);
+        if (currentDraft.text.trim() === text.trim() && currentDraft.attachments.length === 0) {
+          clearComposerDraftContent(threadKey);
+        }
+        return messageId;
+      } catch (error) {
+        setPendingConnectionError(
+          error instanceof Error ? error.message : "Failed to save the voice message.",
+        );
+        return null;
+      }
+    },
+    [selectedThreadDetail, selectedThreadShell],
+  );
+
   const onChangeDraftMessage = useCallback(
     (value: string) => {
       if (!selectedThreadShell) {
@@ -305,6 +340,7 @@ export function useThreadComposerState() {
     onNativePasteImages,
     onRemoveDraftImage,
     onSendMessage,
+    onSendVoiceMessage,
     onUpdateModelSelection,
     onUpdateRuntimeMode,
     onUpdateInteractionMode,
