@@ -24,6 +24,7 @@ import {
   findCompletedAutoListenResponse,
   type AutoListenThreadMessage,
 } from "./autoListenResponse";
+import { releaseAutoListenForManualDictation } from "./traditionalAudioHandoff";
 
 const sameToken = (
   left: import("@t3tools/shared/voiceThreadMode").VoiceThreadModeToken | null,
@@ -41,6 +42,7 @@ interface AutoListenDictationAdapter {
   readonly terminationEvent: ComposerRecordingTerminationEvent | null;
   readonly start: () => Promise<string | null>;
   readonly cancel: () => Promise<void>;
+  readonly cancelForRealtime: () => Promise<void>;
 }
 
 interface AutoListenSpeechAdapter {
@@ -121,12 +123,27 @@ export function useAutoListenController(input: {
 
   const dispatch = useCallback((event: VoiceThreadModeEvent) => {
     const current = inputRef.current;
-    const transition = transitionVoiceThreadMode(stateRef.current, event, {
+    const previous = stateRef.current;
+    const transition = transitionVoiceThreadMode(previous, event, {
       rearmGuardMs: current.preferences.postPlaybackGuardMs,
       transcriptionTimeoutMs: current.preferences.transcriptionTimeoutMs,
       submissionTimeoutMs: current.preferences.submissionTimeoutMs,
     });
     stateRef.current = transition.state;
+    if (
+      previous.phase !== transition.state.phase ||
+      previous.pauseReason !== transition.state.pauseReason
+    ) {
+      console.info("[voice.auto-listen] transition", {
+        event: event.type,
+        from: previous.phase,
+        to: transition.state.phase,
+        pauseReason: transition.state.pauseReason,
+        commands: transition.commands.map((command) => command.type),
+        cycle: transition.state.cycle,
+        operation: transition.state.activeToken?.operation ?? null,
+      });
+    }
     if (mountedRef.current) setState(transition.state);
     if (transition.state.phase === "paused" && reviewSubmissionWaiterRef.current !== null) {
       reviewSubmissionWaiterRef.current.resolve(false);
@@ -307,6 +324,18 @@ export function useAutoListenController(input: {
     },
     [dispatch, persistPaused],
   );
+
+  const deactivateForManualDictation = useCallback(async () => {
+    await releaseAutoListenForManualDictation({
+      pause: () => {
+        if (stateRef.current.phase === "paused") return;
+        dispatch({ type: "pause", reason: "user" });
+        persistPaused();
+      },
+      waitForMediaCommands: () => mediaCommandChainRef.current,
+      verifyRecordingReleased: () => inputRef.current.dictation.cancelForRealtime(),
+    });
+  }, [dispatch, persistPaused]);
 
   const activate = useCallback(
     async (enableIfDisabled = false) => {
@@ -551,6 +580,10 @@ export function useAutoListenController(input: {
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (next) => {
+      console.info("[voice.auto-listen] app-state", {
+        next,
+        phase: stateRef.current.phase,
+      });
       if (next !== "active" && stateRef.current.phase !== "paused") pause("lifecycle");
     });
     return () => subscription.remove();
@@ -576,6 +609,7 @@ export function useAutoListenController(input: {
     state,
     active: state.phase !== "paused",
     activate,
+    deactivateForManualDictation,
     pause,
     submitReview,
   };

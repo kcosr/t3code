@@ -69,10 +69,11 @@ import { mobilePreferencesAtom } from "../../state/preferences";
 import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerCommandPopover";
 import { useComposerDictation } from "../voice/useComposerDictation";
 import {
+  activateAutoListenWithAudioHandoff,
   dictationResumeTransition,
   interruptTraditionalAudioForRealtime,
   runExclusiveTraditionalAudioTransition,
-  startDictationWithAudioHandoff,
+  startManualDictationWithAudioHandoff,
 } from "../voice/traditionalAudioHandoff";
 import { useMasterVoice } from "../voice/MasterVoiceProvider";
 import { resolveVoicePreferences } from "../voice/voicePreferences";
@@ -386,6 +387,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     state: autoListenState,
     active: autoListenActive,
     activate: activateAutoListen,
+    deactivateForManualDictation: deactivateAutoListenForManualDictation,
     pause: pauseAutoListen,
     submitReview: submitAutoListenReview,
   } = autoListen;
@@ -454,14 +456,13 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     await runExclusiveTraditionalAudioTransition(
       traditionalAudioTransitionLockRef.current,
       async () => {
-        if (dictation.phase === "recording") {
+        if (dictation.phase === "recording" && !autoListenActive) {
           await dictation.stop();
           return;
         }
-        if (voicePreferences.autoListenEnabled) {
-          if (await activateAutoListen()) return;
-        }
-        await startDictationWithAudioHandoff({
+        await startManualDictationWithAudioHandoff({
+          autoListenActive,
+          deactivateAutoListen: deactivateAutoListenForManualDictation,
           stopRealtime: realtimeVoice.stop,
           interruptPlayback: props.speechPlayback.interrupt,
           startDictation: async () => (await dictation.start()) !== null,
@@ -470,23 +471,36 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       },
     );
   }, [
-    activateAutoListen,
+    autoListenActive,
+    deactivateAutoListenForManualDictation,
     dictation.phase,
     dictation.start,
     dictation.stop,
     props.speechPlayback.interrupt,
     props.speechPlayback.resumeAfterDictation,
     realtimeVoice.stop,
-    voicePreferences.autoListenEnabled,
   ]);
 
   const toggleAutoListenOperation = useCallback(async () => {
-    if (autoListenActive) {
-      pauseAutoListen("user");
-      return;
-    }
-    await activateAutoListen(true);
-  }, [activateAutoListen, autoListenActive, pauseAutoListen]);
+    await runExclusiveTraditionalAudioTransition(
+      traditionalAudioTransitionLockRef.current,
+      async () => {
+        if (autoListenActive) {
+          await deactivateAutoListenForManualDictation();
+          return;
+        }
+        await activateAutoListenWithAudioHandoff({
+          releaseManualDictation: dictation.cancelForRealtime,
+          activateAutoListen: () => activateAutoListen(true),
+        });
+      },
+    );
+  }, [
+    activateAutoListen,
+    autoListenActive,
+    deactivateAutoListenForManualDictation,
+    dictation.cancelForRealtime,
+  ]);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
   const canSend = hasContent;

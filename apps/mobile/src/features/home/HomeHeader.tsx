@@ -8,7 +8,6 @@ import { useCallback, useRef } from "react";
 import { Platform } from "react-native";
 import type { SearchBarCommands } from "react-native-screens";
 
-import { nativeHeaderScrollEdgeEffects } from "../../native/StackHeader";
 import { useThemeColor } from "../../lib/useThemeColor";
 import { useHardwareKeyboardCommand } from "../keyboard/hardwareKeyboardCommands";
 import { withNativeGlassHeaderItem } from "../layout/native-glass-header-items";
@@ -24,9 +23,9 @@ import {
   PROJECT_SORT_OPTIONS,
   THREAD_SORT_OPTIONS,
 } from "./home-list-options";
+import { createHomeSettingsHeaderItems } from "./home-settings-header-item";
 
 export type HomeHeaderEnvironment = HomeListFilterMenuEnvironment;
-const HEADER_SCROLL_EDGE_EFFECTS = nativeHeaderScrollEdgeEffects(Platform.OS, Platform.Version);
 
 export function HomeHeader(props: {
   readonly environments: ReadonlyArray<HomeHeaderEnvironment>;
@@ -71,7 +70,7 @@ export function HomeHeader(props: {
                     type: "button",
                   }),
                 ]
-              : undefined,
+              : () => createHomeSettingsHeaderItems(props.onOpenSettings),
           unstable_headerToolbarItems:
             Platform.OS === "ios"
               ? () => [
@@ -107,17 +106,6 @@ export function HomeHeader(props: {
                 },
         }}
       />
-
-      {Platform.OS === "ios" ? null : (
-        <NativeHeaderToolbar placement="right">
-          <NativeHeaderToolbar.Button
-            accessibilityLabel="Open settings"
-            icon="gearshape"
-            onPress={props.onOpenSettings}
-            separateBackground
-          />
-        </NativeHeaderToolbar>
-      )}
 
       {Platform.OS === "ios" ? null : (
         <NativeHeaderToolbar placement="bottom">
