@@ -265,6 +265,40 @@ describe("voiceThreadMode", () => {
     ]);
   });
 
+  it("waits when playback starts only after the assistant response completes", () => {
+    const waiting: VoiceThreadModeState = {
+      ...initialVoiceThreadModeState(),
+      phase: "waiting-response",
+      target: target(),
+      playbackRequired: true,
+      submittedMessageId: MessageId.make("message-1"),
+      pauseReason: null,
+    };
+    const responseStarted = transition(waiting, {
+      type: "assistant-stream-started",
+      messageId: "assistant-1",
+    });
+    const responseCompleted = transition(responseStarted.state, {
+      type: "assistant-stream-completed",
+      messageId: "assistant-1",
+    });
+    expect(responseCompleted.state.phase).toBe("waiting-response");
+
+    const playbackStarted = transition(responseCompleted.state, {
+      type: "playback-started",
+      playbackId: "playback-1",
+      messageId: "assistant-1",
+    });
+    expect(playbackStarted.state.phase).toBe("speaking");
+
+    const drained = transition(playbackStarted.state, {
+      type: "playback-drained",
+      playbackId: "playback-1",
+      messageId: "assistant-1",
+    });
+    expect(drained.state.phase).toBe("guarding");
+  });
+
   it("also guards when playback drains before the assistant stream completes", () => {
     const base: VoiceThreadModeState = {
       ...initialVoiceThreadModeState(),

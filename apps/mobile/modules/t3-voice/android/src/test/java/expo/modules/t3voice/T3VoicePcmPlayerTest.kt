@@ -63,6 +63,40 @@ class T3VoicePcmPlayerTest {
   }
 
   @Test
+  fun finalDrainTimeoutFailsInsteadOfReportingPlaybackComplete() {
+    val output = FakeOutput(playbackHeadPosition = 0)
+    val clock = AdvancingPlaybackClock()
+    val finished = mutableListOf<String>()
+    val errors = mutableListOf<String>()
+    val terminal = CountDownLatch(1)
+    val player =
+      T3VoicePcmPlayer(
+        onChunkConsumed = { _, _ -> },
+        onFinished = {
+          finished += it
+          terminal.countDown()
+        },
+        onError = { id, _ ->
+          errors += id
+          terminal.countDown()
+        },
+        outputFactory = T3VoicePcmOutputFactory { _, _ -> output },
+        clock = clock,
+        decodePcm = { byteArrayOf(0, 0) },
+      )
+
+    player.start("stalled-drain", 24_000, 1)
+    player.enqueue("stalled-drain", 0, "ignored")
+    player.finish("stalled-drain", 0)
+
+    assertTrue("playback did not terminate", terminal.await(2, TimeUnit.SECONDS))
+    assertTrue(finished.isEmpty())
+    assertEquals(listOf("stalled-drain"), errors)
+    assertEquals(listOf(true), output.releaseFlushes)
+    player.release()
+  }
+
+  @Test
   fun releaseAndLateDrainFailureCleanUpCancelledOutputExactlyOnce() {
     val output = FakeOutput(playbackHeadPosition = 0)
     val clock = BlockingDrainClock(throwAfterRelease = true)
@@ -441,6 +475,16 @@ class T3VoicePcmPlayerTest {
     override fun elapsedRealtime(): Long = 0
 
     override fun sleep(delayMs: Long) = Unit
+  }
+
+  private class AdvancingPlaybackClock : T3VoicePlaybackClock {
+    private var now = 0L
+
+    override fun elapsedRealtime(): Long = now
+
+    override fun sleep(delayMs: Long) {
+      now += delayMs
+    }
   }
 
   private class FakeTimeoutScheduler : T3VoicePlaybackTimeoutScheduler {

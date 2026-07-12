@@ -244,7 +244,9 @@ internal class T3VoicePcmPlayer(
           synchronized(lock) {
             if (active === playback) cancelIncompleteTimeoutLocked(playback)
           }
-          awaitPlaybackDrain(next.first)
+          check(awaitPlaybackDrain(next.first)) {
+            "PCM playback did not drain before the deadline."
+          }
           val completed =
             synchronized(lock) {
               if (active !== playback || playback.cancelled) {
@@ -296,7 +298,7 @@ internal class T3VoicePcmPlayer(
     }
   }
 
-  private fun awaitPlaybackDrain(playback: ActivePlayback) {
+  private fun awaitPlaybackDrain(playback: ActivePlayback): Boolean {
     val maximumWaitMs =
       ((playback.framesWritten * 1_000L) / playback.sampleRate + DRAIN_GRACE_MS)
         .coerceAtMost(MAXIMUM_DRAIN_WAIT_MS)
@@ -309,10 +311,12 @@ internal class T3VoicePcmPlayer(
       }
       val playedFrames = playback.output.playbackHeadPosition and 0xffffffffL
       if (playedFrames >= playback.framesWritten) {
-        return
+        return true
       }
       clock.sleep(DRAIN_POLL_INTERVAL_MS)
     }
+    return playback.cancelled ||
+      (playback.output.playbackHeadPosition and 0xffffffffL) >= playback.framesWritten
   }
 
   private fun requireActive(playbackId: String): ActivePlayback {

@@ -348,6 +348,9 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const voicePreferences = resolveVoicePreferences(
     AsyncResult.isSuccess(preferencesResult) ? preferencesResult.value : {},
   );
+  const spokenResponsesEnabled =
+    AsyncResult.isSuccess(preferencesResult) &&
+    preferencesResult.value.threadSpeechEnabled === true;
   const dictation = useComposerDictation({
     environmentId: props.environmentId,
     scopeKey: props.selectedThread.id,
@@ -378,7 +381,10 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     interactionRequired: props.interactionRequired,
     canStartFromComposer: canStartAutoListen,
     dictation,
-    speech: props.speechPlayback,
+    speech: {
+      ...props.speechPlayback,
+      playbackRequired: spokenResponsesEnabled,
+    },
     realtimePhase: realtimeVoice.phase,
     stopRealtime: realtimeVoice.stop,
     onSendVoiceMessage: props.onSendVoiceMessage,

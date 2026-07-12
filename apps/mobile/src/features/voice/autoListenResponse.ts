@@ -5,6 +5,17 @@ export interface AutoListenThreadMessage {
   readonly streaming: boolean;
 }
 
+export function hasUserMessageAfter(
+  messages: ReadonlyArray<AutoListenThreadMessage>,
+  messageId: string,
+): boolean {
+  const submittedIndex = messages.findIndex((message) => message.id === messageId);
+  return (
+    submittedIndex >= 0 &&
+    messages.some((message, index) => index > submittedIndex && message.role === "user")
+  );
+}
+
 export function findCompletedAutoListenResponse(
   messages: ReadonlyArray<AutoListenThreadMessage>,
   submittedMessageId: string,

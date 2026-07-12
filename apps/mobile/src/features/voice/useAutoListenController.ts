@@ -22,6 +22,7 @@ import type {
 import type { ThreadSpeechLifecycleEvent } from "./useThreadSpeech";
 import {
   findCompletedAutoListenResponse,
+  hasUserMessageAfter,
   type AutoListenThreadMessage,
 } from "./autoListenResponse";
 import { releaseAutoListenForManualDictation } from "./traditionalAudioHandoff";
@@ -46,7 +47,7 @@ interface AutoListenDictationAdapter {
 }
 
 interface AutoListenSpeechAdapter {
-  readonly enabled: boolean;
+  readonly playbackRequired: boolean;
   readonly error: string | null;
   readonly lifecycleEvent: ThreadSpeechLifecycleEvent | null;
   readonly latestAssistant: {
@@ -384,7 +385,7 @@ export function useAutoListenController(input: {
         type: "activate",
         target,
         policy: latest.preferences.autoSubmitEnabled ? "auto-submit" : "review",
-        playbackRequired: latest.speech.enabled,
+        playbackRequired: latest.speech.playbackRequired,
         threadBusy: latest.activeThreadBusy,
       });
       return true;
@@ -439,11 +440,11 @@ export function useAutoListenController(input: {
   useEffect(() => {
     if (
       stateRef.current.phase !== "paused" &&
-      input.speech.enabled !== stateRef.current.playbackRequired
+      input.speech.playbackRequired !== stateRef.current.playbackRequired
     ) {
       pause("user");
     }
-  }, [input.speech.enabled, pause]);
+  }, [input.speech.playbackRequired, pause]);
 
   useEffect(() => {
     if (
@@ -526,10 +527,13 @@ export function useAutoListenController(input: {
       return;
     }
     const assistant = findCompletedAutoListenResponse(input.threadMessages, submittedMessageId);
-    if (assistant === null) return;
+    if (assistant === null) {
+      if (hasUserMessageAfter(input.threadMessages, submittedMessageId)) pause("user");
+      return;
+    }
     dispatch({ type: "assistant-stream-started", messageId: assistant.id });
     dispatch({ type: "assistant-stream-completed", messageId: assistant.id });
-  }, [dispatch, input.activeThreadBusy, input.threadMessages, state.submittedMessageId]);
+  }, [dispatch, input.activeThreadBusy, input.threadMessages, pause, state.submittedMessageId]);
 
   useEffect(() => {
     const event = input.speech.lifecycleEvent;
