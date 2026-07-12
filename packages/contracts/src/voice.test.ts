@@ -7,8 +7,12 @@ import {
   VoiceConversationTranscriptQuery,
   VoiceConversationUpdateInput,
   VoiceMediaTicketRequest,
+  VoiceNativeControlGrant,
+  VoiceNativeHeartbeatInput,
+  VoiceNativeHeartbeatResult,
   VoiceSpeechRequest,
   VoiceSessionCreateInput,
+  VoiceSessionCreateResult,
   VoiceSessionFocusInput,
   VoiceSessionEvent,
   VoiceSessionEventsResult,
@@ -20,6 +24,7 @@ import {
 
 const decodeUnknownSync = Schema.decodeUnknownSync;
 const encodeSync = Schema.encodeSync;
+const decodeWebRtcOffer = decodeUnknownSync(VoiceWebRtcOffer);
 
 describe("voice contracts", () => {
   it("decodes a provider-neutral realtime session request", () => {
@@ -50,7 +55,7 @@ describe("voice contracts", () => {
   it("preserves SDP line endings", () => {
     const sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
     expect(
-      Schema.decodeUnknownSync(VoiceWebRtcOffer)({
+      decodeWebRtcOffer({
         sessionId: "voice-session-1",
         leaseGeneration: 1,
         sdp,
@@ -357,5 +362,57 @@ describe("voice contracts", () => {
         sessionId: "voice-session-ticket",
       }),
     ).toThrow();
+  });
+
+  it("decodes exact native control grant and heartbeat shapes", () => {
+    const grant = {
+      token: "native-control-token",
+      sessionId: "voice-session-native",
+      leaseGeneration: 2,
+      expiresAt: "2026-07-12T12:00:00.000Z",
+      heartbeatIntervalSeconds: 10,
+      failureGraceSeconds: 30,
+    };
+    expect(decodeUnknownSync(VoiceNativeControlGrant)(grant)).toEqual(grant);
+    expect(() =>
+      decodeUnknownSync(VoiceNativeControlGrant)({ ...grant, token: "x".repeat(129) }),
+    ).toThrow();
+    expect(decodeUnknownSync(VoiceNativeHeartbeatInput)({ leaseGeneration: 2 })).toEqual({
+      leaseGeneration: 2,
+    });
+    const heartbeat = {
+      sessionId: grant.sessionId,
+      leaseGeneration: 2,
+      phase: "listening",
+      disposition: "live",
+      expiresAt: grant.expiresAt,
+    } as const;
+    expect(decodeUnknownSync(VoiceNativeHeartbeatResult)(heartbeat)).toEqual(heartbeat);
+    const createResult = {
+      state: {
+        sessionId: grant.sessionId,
+        conversationId: "voice-conversation-native",
+        mode: "realtime-agent",
+        phase: "signaling",
+        leaseGeneration: 2,
+        sequence: 0,
+      },
+      transport: { kind: "webrtc-sdp-v1", signalingPath: "/offer" },
+      expiresAt: grant.expiresAt,
+      heartbeatIntervalSeconds: 10,
+      nativeControlGrant: grant,
+    } as const;
+    expect(decodeUnknownSync(VoiceSessionCreateResult)(createResult)).toMatchObject({
+      nativeControlGrant: grant,
+    });
+
+    for (const [schema, value] of [
+      [VoiceNativeControlGrant, { ...grant, extra: true }],
+      [VoiceNativeHeartbeatInput, { leaseGeneration: 2, extra: true }],
+      [VoiceNativeHeartbeatResult, { ...heartbeat, extra: true }],
+      [VoiceSessionCreateResult, { ...createResult, extra: true }],
+    ] as const) {
+      expect(() => decodeUnknownSync(schema)(value, { onExcessProperty: "error" })).toThrow();
+    }
   });
 });

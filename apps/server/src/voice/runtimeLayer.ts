@@ -18,6 +18,7 @@ import {
   OpenAiVoiceProviderLive,
 } from "./Providers/OpenAi/OpenAiVoiceProvider.ts";
 import { VoiceMediaTicketRegistryLive } from "./Services/VoiceMediaTicketRegistry.ts";
+import { VoiceNativeControlGrantRegistryLive } from "./Services/VoiceNativeControlGrantRegistry.ts";
 import { VoiceSessionRegistryLive } from "./Services/VoiceSessionRegistry.ts";
 import {
   makeVoiceProviderRegistry,
@@ -95,6 +96,7 @@ const VoiceSessionDependenciesLive = Layer.mergeAll(
 const VoiceCoreDependenciesLive = Layer.mergeAll(
   VoiceSessionDependenciesLive,
   VoiceMediaTicketRegistryLive,
+  VoiceNativeControlGrantRegistryLive,
 );
 
 const VoiceSessionServiceConfiguredLive = VoiceSessionServiceLive.pipe(

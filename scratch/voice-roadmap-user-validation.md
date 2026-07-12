@@ -11,4 +11,10 @@ implemented and autonomously tested.
 
 ## Pending checks
 
-- None yet.
+- On the final Android build, verify that granting or denying the background voice notification
+  permission behaves as expected and that the notification Stop action is usable from the locked
+  notification shade during both dictation and a Realtime conversation.
+- Verify that a Realtime conversation remains connected and a long dictation keeps recording for
+  several minutes after backgrounding the app, locking the screen, and allowing the device to
+  enter Doze/app standby; confirm the server does not reap the Realtime session for missed native
+  heartbeats.

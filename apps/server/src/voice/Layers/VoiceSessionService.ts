@@ -35,6 +35,7 @@ import { VoiceConversationService } from "../Services/VoiceConversationService.t
 import type { RealtimeProviderEvent, RealtimeProviderSession } from "../Services/VoiceProvider.ts";
 import { VoiceProviderRegistry } from "../Services/VoiceProviderRegistry.ts";
 import { VoiceMediaTicketRegistry } from "../Services/VoiceMediaTicketRegistry.ts";
+import { VoiceNativeControlGrantRegistry } from "../Services/VoiceNativeControlGrantRegistry.ts";
 import { logVoiceDiagnostic, type VoiceSessionEndReason } from "../Services/VoiceObservability.ts";
 import { VoiceSessionRegistry, type VoiceSessionLease } from "../Services/VoiceSessionRegistry.ts";
 import {
@@ -48,6 +49,7 @@ import {
 } from "../Services/VoiceToolExecutor.ts";
 
 const HEARTBEAT_INTERVAL_SECONDS = 10;
+const HEARTBEAT_FAILURE_GRACE_SECONDS = HEARTBEAT_INTERVAL_SECONDS * 3;
 const SESSION_DURATION_SECONDS = 55 * 60;
 const MAX_BUFFERED_EVENTS = 512;
 const MAX_RETAINED_TERMINAL_SESSIONS = 128;
@@ -182,6 +184,7 @@ const make = Effect.gen(function* () {
   const tools = yield* VoiceToolExecutor;
   const settingsService = yield* ServerSettingsService;
   const tickets = yield* VoiceMediaTicketRegistry;
+  const nativeControlGrants = yield* VoiceNativeControlGrantRegistry;
   const projection = yield* ProjectionSnapshotQuery;
   const serviceScope = yield* Scope.make("sequential");
   const lifecycleMutex = yield* Semaphore.make(1);
@@ -517,6 +520,7 @@ const make = Effect.gen(function* () {
     yield* emit(session.lease, { type: "state", phase });
     const current = (yield* SynchronizedRef.get(runtime)).sessions.get(session.lease.sessionId);
     yield* terminateProvider(current ?? session, options);
+    yield* nativeControlGrants.revokeSession(session.lease.sessionId);
     yield* registry.release(session.lease);
     yield* SynchronizedRef.update(runtime, (current) => {
       const idempotency = new Map(current.idempotency);
@@ -850,6 +854,12 @@ const make = Effect.gen(function* () {
     const existingId = (yield* SynchronizedRef.get(runtime)).idempotency.get(idempotencyId);
     if (existingId !== undefined) {
       const existing = yield* requireOwned(ownerAuthSessionId, existingId);
+      const token = yield* nativeControlGrants.issue({
+        authSessionId: ownerAuthSessionId,
+        sessionId: existing.lease.sessionId,
+        leaseGeneration: existing.lease.generation,
+        expiresAt: Date.parse(existing.expiresAt),
+      });
       return {
         state: existing.state,
         transport: {
@@ -858,6 +868,14 @@ const make = Effect.gen(function* () {
         },
         expiresAt: existing.expiresAt,
         heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
+        nativeControlGrant: {
+          token,
+          sessionId: existing.lease.sessionId,
+          leaseGeneration: existing.lease.generation,
+          expiresAt: existing.expiresAt,
+          heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
+          failureGraceSeconds: HEARTBEAT_FAILURE_GRACE_SECONDS,
+        },
       };
     }
     const initialFocus = yield* validateFocus({
@@ -935,6 +953,7 @@ const make = Effect.gen(function* () {
       takeover: input.conversation.type === "continue" && input.conversation.takeover,
     });
     if (Option.isSome(acquired.replacedSessionId)) {
+      yield* nativeControlGrants.revokeSession(acquired.replacedSessionId.value);
       const displaced = (yield* SynchronizedRef.get(runtime)).sessions.get(
         acquired.replacedSessionId.value,
       );
@@ -1101,6 +1120,12 @@ const make = Effect.gen(function* () {
       acquired.lease.sessionId,
       (current) => [undefined, { ...current, heartbeatFiber }] as const,
     );
+    const nativeControlToken = yield* nativeControlGrants.issue({
+      authSessionId: ownerAuthSessionId,
+      sessionId: acquired.lease.sessionId,
+      leaseGeneration: acquired.lease.generation,
+      expiresAt: Date.parse(expiresAt),
+    });
     return {
       state,
       transport: {
@@ -1109,6 +1134,14 @@ const make = Effect.gen(function* () {
       },
       expiresAt,
       heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
+      nativeControlGrant: {
+        token: nativeControlToken,
+        sessionId: acquired.lease.sessionId,
+        leaseGeneration: acquired.lease.generation,
+        expiresAt,
+        heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
+        failureGraceSeconds: HEARTBEAT_FAILURE_GRACE_SECONDS,
+      },
     };
   });
 
@@ -1500,6 +1533,7 @@ const make = Effect.gen(function* () {
     lifecycleMutex.withPermits(1)(
       Effect.gen(function* () {
         yield* tickets.revokeAuthSession(owner);
+        yield* nativeControlGrants.revokeAuthSession(owner);
         const owned = Array.from((yield* SynchronizedRef.get(runtime)).sessions.values()).filter(
           (session) =>
             session.lease.ownerAuthSessionId === owner && session.terminalAt === undefined,

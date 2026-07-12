@@ -183,6 +183,7 @@ export function useComposerDictation(input: {
         ? currentPermission
         : await native.requestMicrophonePermissionAsync();
       if (!permission.granted) throw new Error("Microphone permission was not granted");
+      await native.requestNotificationPermissionAsync().catch(() => undefined);
       if (operationGenerationRef.current !== generation) return null;
       const recordingId = uuidv4();
       await native.startRecordingAsync({

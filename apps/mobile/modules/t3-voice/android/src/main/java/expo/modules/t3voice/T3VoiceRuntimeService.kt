@@ -29,6 +29,21 @@ internal class T3VoiceForegroundReleaseCoordinator(
   }
 }
 
+internal object T3VoiceRealtimeControlStartPolicy {
+  fun startIfOwned(
+    expectedSessionId: String,
+    activeSessionId: String?,
+    startControl: () -> Unit,
+    keepServiceStarted: () -> Unit,
+  ) {
+    check(activeSessionId == expectedSessionId) {
+      "The Realtime peer terminated during preparation."
+    }
+    startControl()
+    keepServiceStarted()
+  }
+}
+
 class T3VoiceRuntimeService : Service() {
   internal inner class VoiceBinder : Binder() {
     val state: StateFlow<T3VoiceRuntimeState>
@@ -59,6 +74,7 @@ class T3VoiceRuntimeService : Service() {
         try {
           ensureRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
           recorder.start(recordingId, endpointConfig)
+          keepServiceStarted(ACTION_START_RECORDING, recordingId)
         } catch (cause: Throwable) {
           releaseRecordingLocked(owner)
           throw cause
@@ -107,6 +123,7 @@ class T3VoiceRuntimeService : Service() {
           ensureRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
           check(playbackAudioFocus.start()) { "Android denied playback audio focus." }
           player.start(playbackId, sampleRate, channelCount)
+          keepServiceStarted(ACTION_START_PLAYBACK, playbackId)
         } catch (cause: Throwable) {
           releasePlaybackLocked(owner)
           throw cause
@@ -145,6 +162,8 @@ class T3VoiceRuntimeService : Service() {
 
     fun prepareRealtimeSession(
       nativeSessionId: String,
+      environmentOrigin: String,
+      nativeControlGrant: T3VoiceNativeControlGrant,
       callback: T3VoiceWebRtcResultCallback<String>,
     ) {
       synchronized(operationLock) {
@@ -163,7 +182,19 @@ class T3VoiceRuntimeService : Service() {
               ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
           )
           realtime.prepare(nativeSessionId, diagnosticGeneration, callback)
+          T3VoiceRealtimeControlStartPolicy.startIfOwned(
+            expectedSessionId = nativeSessionId,
+            activeSessionId = T3VoiceStateStore.state.value.activeRealtimeSessionId,
+            startControl = {
+              nativeControlHeartbeat.start(environmentOrigin, nativeControlGrant)
+            },
+            keepServiceStarted = {
+              keepServiceStarted(ACTION_START_REALTIME, nativeSessionId)
+            },
+          )
         } catch (cause: Throwable) {
+          nativeControlHeartbeat.stop()
+          runCatching { realtime.stop(nativeSessionId) }
           T3VoiceStateStore.releaseRealtimeClaim(nativeSessionId)
           stopRuntimeForegroundLocked()
           T3VoiceDiagnostics.record(
@@ -216,6 +247,22 @@ class T3VoiceRuntimeService : Service() {
   private lateinit var player: T3VoicePcmPlayer
   private lateinit var playbackAudioFocus: T3VoicePlaybackAudioFocus
   private val mainHandler = Handler(Looper.getMainLooper())
+  private val nativeControlHeartbeat =
+    T3VoiceNativeControlHeartbeat { sessionId, termination ->
+      mainHandler.post {
+        synchronized(operationLock) {
+          if (T3VoiceStateStore.state.value.activeRealtimeSessionId == sessionId) {
+            when (termination) {
+              T3VoiceNativeControlTermination.SESSION_ENDED -> realtime.stop(sessionId)
+              T3VoiceNativeControlTermination.CONTROL_REJECTED ->
+                realtime.failNativeControl(sessionId, retryable = false)
+              T3VoiceNativeControlTermination.TRANSIENT_FAILURE ->
+                realtime.failNativeControl(sessionId, retryable = true)
+            }
+          }
+        }
+      }
+    }
   private val realtimeDelegate =
     lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
       T3VoiceWebRtcSession(
@@ -259,6 +306,7 @@ class T3VoiceRuntimeService : Service() {
                 ),
               )
             if (terminated) {
+              nativeControlHeartbeat.stop()
               stopRuntimeForegroundLocked()
               T3VoiceDiagnostics.record(
                 diagnosticGeneration,
@@ -453,11 +501,13 @@ class T3VoiceRuntimeService : Service() {
           stopForeground = false,
         )
       }
+      nativeControlHeartbeat.stop()
     }
     recorder.release()
     player.release()
     playbackAudioFocus.stop()
     if (realtimeDelegate.isInitialized()) realtime.release()
+    nativeControlHeartbeat.destroy()
     T3VoiceStateStore.setInactive()
     super.onDestroy()
   }
@@ -470,6 +520,15 @@ class T3VoiceRuntimeService : Service() {
       startForeground(NOTIFICATION_ID, notification)
     }
     T3VoiceStateStore.setForeground(true)
+  }
+
+  private fun keepServiceStarted(action: String, operationId: String) {
+    val intent =
+      Intent(this, T3VoiceRuntimeService::class.java).apply {
+        this.action = action
+        putExtra(EXTRA_OPERATION_ID, operationId)
+      }
+    startService(intent)
   }
 
   private fun reconcileStartCommand(
@@ -521,6 +580,7 @@ class T3VoiceRuntimeService : Service() {
       )
     }
     state.activeRealtimeSessionId?.let {
+      nativeControlHeartbeat.stop()
       val stopped = runCatching { realtime.stop(it) }.getOrDefault(false)
       if (!stopped) T3VoiceStateStore.releaseRealtimeClaim(it)
     }
@@ -658,18 +718,6 @@ class T3VoiceRuntimeService : Service() {
     private const val ACTION_START_PLAYBACK = "expo.modules.t3voice.action.START_PLAYBACK"
     private const val ACTION_START_REALTIME = "expo.modules.t3voice.action.START_REALTIME"
     private const val EXTRA_OPERATION_ID = "operationId"
-
-    fun startForRecording(context: Context, recordingId: String) {
-      start(context, ACTION_START_RECORDING, recordingId)
-    }
-
-    fun startForPlayback(context: Context, playbackId: String) {
-      start(context, ACTION_START_PLAYBACK, playbackId)
-    }
-
-    fun startForRealtime(context: Context, nativeSessionId: String) {
-      start(context, ACTION_START_REALTIME, nativeSessionId)
-    }
 
     fun requestStop(context: Context) {
       start(context, ACTION_STOP, null)

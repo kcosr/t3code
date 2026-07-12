@@ -132,8 +132,20 @@ export interface T3VoiceRealtimeTerminatedEvent {
   readonly retryable: boolean;
 }
 
-export interface T3VoiceRealtimePrepareInput {
+export interface T3VoiceRealtimeIdentifier {
   readonly nativeSessionId: string;
+}
+
+export interface T3VoiceRealtimePrepareInput extends T3VoiceRealtimeIdentifier {
+  readonly environmentOrigin: string;
+  readonly nativeControlGrant: {
+    readonly token: string;
+    readonly sessionId: string;
+    readonly leaseGeneration: number;
+    readonly expiresAt: string;
+    readonly heartbeatIntervalSeconds: number;
+    readonly failureGraceSeconds: number;
+  };
 }
 
 export interface T3VoiceRealtimeOffer {
@@ -141,7 +153,7 @@ export interface T3VoiceRealtimeOffer {
   readonly sdp: string;
 }
 
-export interface T3VoiceRealtimeAnswerInput extends T3VoiceRealtimePrepareInput {
+export interface T3VoiceRealtimeAnswerInput extends T3VoiceRealtimeIdentifier {
   readonly sdp: string;
 }
 
@@ -234,6 +246,8 @@ export interface T3VoiceNativeModule {
   readonly getStateAsync: () => Promise<T3VoiceRuntimeState>;
   readonly getMicrophonePermissionAsync: () => Promise<PermissionResponse>;
   readonly requestMicrophonePermissionAsync: () => Promise<PermissionResponse>;
+  readonly getNotificationPermissionAsync: () => Promise<PermissionResponse>;
+  readonly requestNotificationPermissionAsync: () => Promise<PermissionResponse>;
   readonly getBluetoothPermissionAsync: () => Promise<PermissionResponse>;
   readonly requestBluetoothPermissionAsync: () => Promise<PermissionResponse>;
   readonly startRecordingAsync: (input: T3VoiceRecordingInput) => Promise<void>;
@@ -257,14 +271,14 @@ export interface T3VoiceNativeModule {
     input: T3VoiceRealtimePrepareInput,
   ) => Promise<T3VoiceRealtimeOffer>;
   readonly applyRealtimeAnswerAsync: (input: T3VoiceRealtimeAnswerInput) => Promise<void>;
-  readonly stopRealtimeSessionAsync: (input: T3VoiceRealtimePrepareInput) => Promise<boolean>;
+  readonly stopRealtimeSessionAsync: (input: T3VoiceRealtimeIdentifier) => Promise<boolean>;
   readonly setRealtimeMutedAsync: (
-    input: T3VoiceRealtimePrepareInput & { readonly muted: boolean },
+    input: T3VoiceRealtimeIdentifier & { readonly muted: boolean },
   ) => Promise<void>;
   readonly getAudioRoutesAsync: () => Promise<ReadonlyArray<T3VoiceAudioRoute>>;
   readonly getDiagnosticsAsync: () => Promise<ReadonlyArray<T3VoiceDiagnosticEntry>>;
   readonly setAudioRouteAsync: (
-    input: T3VoiceRealtimePrepareInput & {
+    input: T3VoiceRealtimeIdentifier & {
       readonly routeId: T3VoiceAudioRoute["id"];
     },
   ) => Promise<ReadonlyArray<T3VoiceAudioRoute>>;

@@ -8,6 +8,7 @@ import {
 } from "@t3tools/contracts";
 import type { T3VoiceNativeModule, T3VoiceRuntimeState } from "@t3tools/mobile-voice-native";
 import * as Effect from "effect/Effect";
+import type { PermissionResponse } from "expo";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
@@ -43,6 +44,14 @@ const serverSession = {
   },
   expiresAt: "2026-07-10T22:00:00.000Z" as never,
   heartbeatIntervalSeconds: 10,
+  nativeControlGrant: {
+    token: "native-control-token",
+    sessionId: SESSION_ID,
+    leaseGeneration: 1,
+    expiresAt: "2026-07-10T22:00:00.000Z" as never,
+    heartbeatIntervalSeconds: 8,
+    failureGraceSeconds: 30,
+  },
 };
 
 const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
@@ -60,6 +69,8 @@ const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
   const native = {
     getMicrophonePermissionAsync: vi.fn(async () => ({ granted: true })),
     requestMicrophonePermissionAsync: vi.fn(),
+    getNotificationPermissionAsync: vi.fn(async () => ({ granted: true })),
+    requestNotificationPermissionAsync: vi.fn(async () => ({ granted: true })),
     getStateAsync: vi.fn(async () => nativeState),
     prepareRealtimeSessionAsync: vi.fn(async () => {
       nativeState = {
@@ -140,6 +151,7 @@ const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
   const controller = new RealtimeVoiceController(
     native,
     client,
+    "https://environment.example.test",
     {
       onSnapshot: (snapshot) => snapshots.push(snapshot.phase),
       onAudioRouteChanged: (event) => routeChanges.push(`${event.reason}:${event.routeId}`),
@@ -294,6 +306,8 @@ describe("RealtimeVoiceController", () => {
     expect(client.createSession).toHaveBeenCalledWith(createInput);
     expect(native.prepareRealtimeSessionAsync).toHaveBeenCalledWith({
       nativeSessionId: SESSION_ID,
+      environmentOrigin: "https://environment.example.test",
+      nativeControlGrant: serverSession.nativeControlGrant,
     });
     expect(client.offerSession).toHaveBeenCalledWith({
       sessionId: SESSION_ID,
@@ -311,6 +325,30 @@ describe("RealtimeVoiceController", () => {
     });
     expect(snapshots).toContain("starting");
     expect(snapshots).toContain("active");
+  });
+
+  it("requests notification visibility without making denial block startup", async () => {
+    const { controller, native } = makeHarness();
+    vi.mocked(native.requestNotificationPermissionAsync).mockResolvedValueOnce({
+      granted: false,
+      status: "denied" as PermissionResponse["status"],
+      expires: "never",
+      canAskAgain: true,
+    });
+
+    await controller.start(createInput);
+
+    expect(native.requestNotificationPermissionAsync).toHaveBeenCalledTimes(1);
+    expect(controller.getSnapshot().phase).toBe("active");
+  });
+
+  it("leaves lease heartbeats exclusively with the native runtime", async () => {
+    const { client, controller, runScheduled } = makeHarness();
+    await controller.start(createInput);
+
+    await runScheduled(1_000);
+
+    expect(client.heartbeatSession).not.toHaveBeenCalled();
   });
 
   it("closes both native and server sessions when signaling fails", async () => {
@@ -592,53 +630,6 @@ describe("RealtimeVoiceController", () => {
     });
   });
 
-  it("tracks heartbeat and event failures independently", async () => {
-    const { client, controller, native, runScheduled } = makeHarness();
-    await controller.start(createInput);
-    const invalidResponse = Object.assign(new Error("invalid response"), {
-      _tag: "RemoteEnvironmentAuthInvalidJsonError",
-    });
-    vi.mocked(client.sessionEvents).mockReturnValue(Effect.fail(invalidResponse as never));
-    vi.mocked(client.heartbeatSession).mockReturnValue(Effect.die(new Error("offline")));
-
-    await controller.refreshEvents();
-    await runScheduled(10_000);
-    await controller.refreshEvents();
-    await runScheduled(10_000);
-
-    expect(controller.getSnapshot().phase).toBe("active");
-    expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
-
-    await controller.refreshEvents();
-
-    await vi.waitFor(() => {
-      expect(controller.getSnapshot()).toMatchObject({
-        phase: "error",
-        error: expect.stringContaining("Realtime event stream returned an invalid response"),
-      });
-    });
-  });
-
-  it("keeps heartbeat requests single-flight", async () => {
-    const { client, controller, runScheduled } = makeHarness();
-    await controller.start(createInput);
-    let resolveHeartbeat!: (state: typeof serverSession.state) => void;
-    const pendingHeartbeat = new Promise<typeof serverSession.state>((resolve) => {
-      resolveHeartbeat = resolve;
-    });
-    vi.mocked(client.heartbeatSession).mockReturnValue(Effect.promise(() => pendingHeartbeat));
-
-    await runScheduled(10_000);
-    await runScheduled(10_000);
-
-    expect(client.heartbeatSession).toHaveBeenCalledTimes(1);
-    resolveHeartbeat(serverSession.state);
-    await vi.waitFor(async () => {
-      await runScheduled(10_000);
-      expect(client.heartbeatSession).toHaveBeenCalledTimes(2);
-    });
-  });
-
   it("keeps event polling single-flight", async () => {
     const { client, controller } = makeHarness();
     await controller.start(createInput);
@@ -742,6 +733,23 @@ describe("RealtimeVoiceController", () => {
       });
     });
     expect(client.closeSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers resume after transient native control loss", async () => {
+    const { controller, emitNative } = makeHarness();
+    await controller.start(createInput);
+
+    emitNative("realtimeTerminated", {
+      nativeSessionId: SESSION_ID,
+      outcome: "failed",
+      code: "native-control-lost",
+      retryable: true,
+    });
+
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "error",
+      error: "The Realtime control connection was lost. Resume to reconnect",
+    });
   });
 
   it("does not surface raw native diagnostic payloads", async () => {

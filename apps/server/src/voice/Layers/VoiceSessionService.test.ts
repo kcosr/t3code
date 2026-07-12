@@ -42,6 +42,10 @@ import {
   VoiceMediaTicketRegistry,
   VoiceMediaTicketRegistryLive,
 } from "../Services/VoiceMediaTicketRegistry.ts";
+import {
+  VoiceNativeControlGrantRegistry,
+  VoiceNativeControlGrantRegistryLive,
+} from "../Services/VoiceNativeControlGrantRegistry.ts";
 import { VoiceSessionService } from "../Services/VoiceSessionService.ts";
 import { VoiceToolExecutor } from "../Services/VoiceToolExecutor.ts";
 import { VoiceContextCompilerLive } from "./VoiceContextCompiler.ts";
@@ -180,6 +184,7 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
     voiceProviderRegistryLayer([provider], new Map([["agent.realtime", provider.id]])),
     VoiceSessionRegistryLive.pipe(Layer.provide(NodeServices.layer)),
     VoiceMediaTicketRegistryLive.pipe(Layer.provide(NodeServices.layer)),
+    VoiceNativeControlGrantRegistryLive.pipe(Layer.provide(NodeServices.layer)),
     serverSettingsLayerTest({ voice: voiceSettings }),
     Layer.succeed(VoiceToolExecutor, toolExecutor),
     Layer.mock(ProjectionSnapshotQuery)(projection),
@@ -250,6 +255,36 @@ const makeActivateThreadFixture = Effect.fn("test.makeActivateThreadFixture")(fu
   });
   return { actionId, executor, invocationStarted, outputs, projectId, provider, threadId };
 });
+
+it.effect("returns the same native grant when an idempotent create result is replayed", () =>
+  Effect.gen(function* () {
+    const provider: VoiceProviderAdapter = {
+      id: "fake-idempotent-native-grant",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: { negotiate: () => Effect.die("unused") },
+    };
+    const test = yield* makeLayer(provider);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const grants = yield* VoiceNativeControlGrantRegistry;
+      const owner = AuthSessionId.make("idempotent-native-owner");
+      const first = yield* sessions.create(principal(owner), input(false, "idempotent-native"));
+      const replay = yield* sessions.create(principal(owner), input(false, "idempotent-native"));
+
+      expect(replay.state.sessionId).toBe(first.state.sessionId);
+      expect(replay.nativeControlGrant.token).toBe(first.nativeControlGrant.token);
+      expect(yield* grants.authorize(first.nativeControlGrant.token)).toMatchObject({
+        authSessionId: owner,
+        sessionId: first.state.sessionId,
+        leaseGeneration: first.state.leaseGeneration,
+      });
+      expect(yield* grants.authorize(replay.nativeControlGrant.token)).toMatchObject({
+        sessionId: replay.state.sessionId,
+        leaseGeneration: replay.state.leaseGeneration,
+      });
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
 
 it.effect(
   "negotiates, normalizes events, journals final transcripts, and closes exactly once",
@@ -1790,6 +1825,7 @@ it.effect("revokes provider sessions and media tickets with their auth session",
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const mediaTickets = yield* VoiceMediaTicketRegistry;
+      const nativeControlGrants = yield* VoiceNativeControlGrantRegistry;
       const owner = AuthSessionId.make("revoked-owner");
       const created = yield* sessions.create(principal(owner), input(false, "revoked"));
       yield* sessions.offer(owner, created.state.sessionId, {
@@ -1806,6 +1842,9 @@ it.effect("revokes provider sessions and media tickets with their auth session",
       expect(yield* Ref.get(terminated)).toBe(1);
       expect((yield* sessions.get(owner, created.state.sessionId)).phase).toBe("ended");
       expect(yield* mediaTickets.consume(ticket.token, "speech-stream")).toBeUndefined();
+      expect(
+        yield* nativeControlGrants.authorize(created.nativeControlGrant.token),
+      ).toBeUndefined();
     }).pipe(Effect.provide(test.layer));
   }),
 );

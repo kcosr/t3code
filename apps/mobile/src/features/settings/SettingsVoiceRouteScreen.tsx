@@ -2,7 +2,9 @@ import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import { AsyncResult } from "effect/unstable/reactivity";
 import * as Clipboard from "expo-clipboard";
-import { Alert, ScrollView, View } from "react-native";
+import { useFocusEffect } from "@react-navigation/native";
+import { useCallback, useState } from "react";
+import { Alert, Linking, Platform, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
@@ -42,6 +44,49 @@ export function SettingsVoiceRouteScreen() {
   const stored = ready ? preferencesResult.value : {};
   const voice = resolveVoicePreferences(stored);
   const noSpeechEnabled = voice.noSpeechTimeoutMs !== null;
+  const [notificationPermission, setNotificationPermission] = useState<
+    "checking" | "granted" | "denied" | "open-settings" | "unavailable"
+  >("checking");
+  const refreshNotificationPermission = useCallback(async () => {
+    if (Platform.OS !== "android") {
+      setNotificationPermission("unavailable");
+      return;
+    }
+    const native = getT3VoiceNativeModule();
+    if (native === null) {
+      setNotificationPermission("unavailable");
+      return;
+    }
+    try {
+      const permission = await native.getNotificationPermissionAsync();
+      setNotificationPermission(
+        permission.granted ? "granted" : permission.canAskAgain ? "denied" : "open-settings",
+      );
+    } catch {
+      setNotificationPermission("unavailable");
+    }
+  }, []);
+  useFocusEffect(
+    useCallback(() => {
+      void refreshNotificationPermission();
+    }, [refreshNotificationPermission]),
+  );
+  const requestNotificationPermission = async () => {
+    if (notificationPermission === "open-settings") {
+      await Linking.openSettings();
+      return;
+    }
+    const native = getT3VoiceNativeModule();
+    if (native === null) return;
+    try {
+      const permission = await native.requestNotificationPermissionAsync();
+      setNotificationPermission(
+        permission.granted ? "granted" : permission.canAskAgain ? "denied" : "open-settings",
+      );
+    } catch {
+      setNotificationPermission("unavailable");
+    }
+  };
   const copyDiagnostics = async () => {
     const native = getT3VoiceNativeModule();
     if (native === null) {
@@ -200,6 +245,29 @@ export function SettingsVoiceRouteScreen() {
         </SettingsSection>
 
         <SettingsSection title="Support">
+          {Platform.OS === "android" ? (
+            <SettingsRow
+              icon="bell"
+              label="Background voice notification"
+              value={
+                notificationPermission === "checking"
+                  ? "Checking"
+                  : notificationPermission === "granted"
+                    ? "Allowed"
+                    : notificationPermission === "denied"
+                      ? "Not allowed"
+                      : notificationPermission === "open-settings"
+                        ? "Open settings"
+                        : "Unavailable"
+              }
+              disabled={
+                notificationPermission === "checking" ||
+                notificationPermission === "granted" ||
+                notificationPermission === "unavailable"
+              }
+              onPress={() => void requestNotificationPermission()}
+            />
+          ) : null}
           <SettingsRow
             icon="doc.on.clipboard"
             label="Copy voice diagnostics"

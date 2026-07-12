@@ -399,6 +399,16 @@ internal class T3VoiceWebRtcSession(
     return true
   }
 
+  fun failNativeControl(sessionId: String, retryable: Boolean) {
+    fail(
+      sessionId,
+      ERROR_NATIVE_CONTROL_LOST,
+      "The native voice control lease was lost.",
+      null,
+      retryable,
+    )
+  }
+
   fun release() {
     val session = synchronized(lock) { active?.also { active = null } }
     if (session != null) {
@@ -1011,6 +1021,7 @@ internal class T3VoiceWebRtcSession(
     private const val ERROR_DATA_CHANNEL_CLOSED = "realtime-event-channel-closed"
     private const val ERROR_PROVIDER_EVENT = "realtime-provider-error"
     private const val ERROR_SESSION_STOPPED = "realtime-session-stopped"
+    private const val ERROR_NATIVE_CONTROL_LOST = "native-control-lost"
     private val initialized = AtomicBoolean(false)
 
     private fun initializeWebRtc(context: Context) {

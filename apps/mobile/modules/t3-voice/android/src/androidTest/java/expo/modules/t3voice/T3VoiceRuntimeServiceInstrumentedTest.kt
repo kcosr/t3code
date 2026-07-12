@@ -47,6 +47,7 @@ class T3VoiceRuntimeServiceInstrumentedTest {
       context.packageManager.getPackageInfo(context.packageName, PackageManager.GET_PERMISSIONS)
     val permissions = packageInfo.requestedPermissions.orEmpty().toSet()
     assertTrue(Manifest.permission.RECORD_AUDIO in permissions)
+    assertTrue(Manifest.permission.ACCESS_NETWORK_STATE in permissions)
     assertTrue(Manifest.permission.FOREGROUND_SERVICE in permissions)
     assertTrue(Manifest.permission.FOREGROUND_SERVICE_MICROPHONE in permissions)
     assertTrue(Manifest.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK in permissions)
@@ -77,35 +78,89 @@ class T3VoiceRuntimeServiceInstrumentedTest {
   }
 
   @Test
-  fun recordingOwnsForegroundUntilCancelledAndServiceCanRebind() {
+  fun recordingSurvivesUnbindAndNotificationStopAfterRebind() {
     InstrumentationRegistry.getInstrumentation().uiAutomation.grantRuntimePermission(
       context.packageName,
       Manifest.permission.RECORD_AUDIO,
     )
     val recordingId = UUID.randomUUID().toString()
     val first = bindService()
-    try {
-      val binder = checkNotNull(first.binder.get())
-      binder.startRecording(recordingId, T3VoiceEndpointDetectionConfig(noSpeechTimeoutMs = null))
-      waitUntil {
-        binder.state.value.phase == T3VoiceRuntimePhase.RECORDING &&
-          binder.state.value.isForeground &&
-          binder.state.value.activeRecordingId == recordingId
-      }
-      binder.cancelRecording(recordingId)
-      waitUntil {
-        binder.state.value.phase == T3VoiceRuntimePhase.IDLE &&
-          !binder.state.value.isForeground &&
-          binder.state.value.activeRecordingId == null
-      }
-    } finally {
-      context.unbindService(first.connection)
+    val firstBinder = checkNotNull(first.binder.get())
+    firstBinder.startRecording(recordingId, T3VoiceEndpointDetectionConfig(noSpeechTimeoutMs = null))
+    waitUntil {
+      firstBinder.state.value.phase == T3VoiceRuntimePhase.RECORDING &&
+        firstBinder.state.value.isForeground &&
+        firstBinder.state.value.activeRecordingId == recordingId
     }
-    waitUntil { T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.INACTIVE }
+    context.unbindService(first.connection)
+    waitUntil {
+      T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.RECORDING &&
+        T3VoiceStateStore.state.value.activeRecordingId == recordingId
+    }
 
     val second = bindService()
     try {
-      assertEquals(T3VoiceRuntimePhase.IDLE, second.binder.get()!!.state.value.phase)
+      val secondBinder = checkNotNull(second.binder.get())
+      assertEquals(T3VoiceRuntimePhase.RECORDING, secondBinder.state.value.phase)
+      assertEquals(recordingId, secondBinder.state.value.activeRecordingId)
+      T3VoiceRuntimeService.requestStop(context)
+      waitUntil {
+        secondBinder.state.value.phase == T3VoiceRuntimePhase.IDLE &&
+          !secondBinder.state.value.isForeground &&
+          secondBinder.state.value.activeRecordingId == null
+      }
+    } finally {
+      context.unbindService(second.connection)
+    }
+    waitUntil { T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.INACTIVE }
+  }
+
+  @Test
+  fun realtimeSurvivesUnbindAndNotificationStopAfterRebind() {
+    InstrumentationRegistry.getInstrumentation().uiAutomation.grantRuntimePermission(
+      context.packageName,
+      Manifest.permission.RECORD_AUDIO,
+    )
+    val sessionId = UUID.randomUUID().toString()
+    val first = bindService()
+    val firstBinder = checkNotNull(first.binder.get())
+    firstBinder.prepareRealtimeSession(
+      nativeSessionId = sessionId,
+      environmentOrigin = "https://127.0.0.1",
+      nativeControlGrant =
+        T3VoiceNativeControlGrant(
+          token = "instrumentation-only-token",
+          sessionId = sessionId,
+          leaseGeneration = 1,
+          expiresAtEpochMillis = System.currentTimeMillis() + 60_000,
+          heartbeatIntervalMillis = 1_000,
+          failureGraceMillis = 30_000,
+        ),
+      callback =
+        object : T3VoiceWebRtcResultCallback<String> {
+          override fun onSuccess(result: String) = Unit
+
+          override fun onFailure(code: String, message: String, cause: Throwable?) = Unit
+        },
+    )
+    waitUntil {
+      firstBinder.state.value.phase == T3VoiceRuntimePhase.REALTIME &&
+        firstBinder.state.value.isForeground &&
+        firstBinder.state.value.activeRealtimeSessionId == sessionId
+    }
+    context.unbindService(first.connection)
+    waitUntil { T3VoiceStateStore.state.value.activeRealtimeSessionId == sessionId }
+
+    val second = bindService()
+    try {
+      val secondBinder = checkNotNull(second.binder.get())
+      assertEquals(sessionId, secondBinder.state.value.activeRealtimeSessionId)
+      T3VoiceRuntimeService.requestStop(context)
+      waitUntil {
+        secondBinder.state.value.phase == T3VoiceRuntimePhase.IDLE &&
+          !secondBinder.state.value.isForeground &&
+          secondBinder.state.value.activeRealtimeSessionId == null
+      }
     } finally {
       context.unbindService(second.connection)
     }

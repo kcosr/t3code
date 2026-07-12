@@ -43,7 +43,6 @@ interface ActiveSession {
   readonly sessionId: VoiceSessionState["sessionId"];
   readonly nativeSessionId: string;
   readonly leaseGeneration: number;
-  readonly heartbeatIntervalMs: number;
   serverState: VoiceSessionState;
   afterSequence: number;
   lastServerError: string | null;
@@ -54,7 +53,7 @@ interface TimerScheduler {
   readonly clearInterval: (handle: unknown) => void;
 }
 
-type ControlOperation = "events" | "heartbeat";
+type ControlOperation = "events";
 
 export interface RealtimeVoiceControllerOptions {
   readonly scheduler?: TimerScheduler;
@@ -82,7 +81,7 @@ const controlFailureMessage = (operation: ControlOperation, cause: unknown): str
   return `Realtime control connection failed during ${operation}: ${messageFor(cause)}`;
 };
 
-const nativeTerminationMessage = (code: string): string => {
+const nativeTerminationMessage = (code: string, retryable = false): string => {
   switch (code) {
     case "realtime-connection-failed":
       return "The Realtime media connection failed";
@@ -94,6 +93,10 @@ const nativeTerminationMessage = (code: string): string => {
       return "The Realtime offer could not be created";
     case "realtime-prepare-failed":
       return "The Realtime media session could not be prepared";
+    case "native-control-lost":
+      return retryable
+        ? "The Realtime control connection was lost. Resume to reconnect"
+        : "The Realtime session lost native control";
     default:
       return "The Realtime media session ended unexpectedly";
   }
@@ -120,18 +123,15 @@ export class RealtimeVoiceController {
     readonly remove: () => void;
   }>;
   private active: ActiveSession | null = null;
-  private heartbeatTimer: unknown | null = null;
   private eventTimer: unknown | null = null;
   private startGeneration = 0;
   private startingNativeSessionId: string | null = null;
   private refreshInFlight = false;
-  private heartbeatInFlight = false;
   private nativeRuntimeReconciliation: Promise<void> | null = null;
   private serverCleanupBarrier: Promise<void> = Promise.resolve();
   private startInFlight: Promise<void> | null = null;
   private controlFailures: Record<ControlOperation, number> = {
     events: 0,
-    heartbeat: 0,
   };
   private snapshot: RealtimeVoiceControllerSnapshot = {
     phase: "idle",
@@ -143,6 +143,7 @@ export class RealtimeVoiceController {
   constructor(
     private readonly native: T3VoiceNativeModule,
     private readonly client: VoiceHttpClient,
+    private readonly environmentOrigin: string,
     private readonly listener: RealtimeVoiceControllerListener,
     options: RealtimeVoiceControllerOptions = {},
   ) {
@@ -215,6 +216,7 @@ export class RealtimeVoiceController {
     this.ensureCurrentStart(generation);
 
     let serverSession: VoiceSessionCreateResult | null = null;
+    let serverState: VoiceSessionState | null = null;
     let nativeSessionId: string | null = null;
     try {
       const existingPermission = await this.native.getMicrophonePermissionAsync();
@@ -222,20 +224,34 @@ export class RealtimeVoiceController {
         ? existingPermission
         : await this.native.requestMicrophonePermissionAsync();
       if (!permission.granted) throw new Error("Microphone permission was not granted");
+      // Notification denial must not block voice, but request while Android is visible so the
+      // foreground service can expose its Stop action in the notification drawer.
+      await this.native.requestNotificationPermissionAsync().catch(() => undefined);
       this.ensureCurrentStart(generation);
 
       serverSession = await Effect.runPromise(this.client.createSession(input));
+      serverState = serverSession.state;
       this.ensureCurrentStart(generation);
       nativeSessionId = serverSession.state.sessionId;
       this.startingNativeSessionId = nativeSessionId;
-      const nativeOffer = await this.native.prepareRealtimeSessionAsync({
-        nativeSessionId,
-      });
+      let nativeControlGrant: VoiceSessionCreateResult["nativeControlGrant"] | null =
+        serverSession.nativeControlGrant;
+      let nativeOffer;
+      try {
+        nativeOffer = await this.native.prepareRealtimeSessionAsync({
+          nativeSessionId,
+          environmentOrigin: this.environmentOrigin,
+          nativeControlGrant,
+        });
+      } finally {
+        nativeControlGrant = null;
+        serverSession = null;
+      }
       this.ensureCurrentStart(generation);
       const answer = await Effect.runPromise(
         this.client.offerSession({
-          sessionId: serverSession.state.sessionId,
-          leaseGeneration: serverSession.state.leaseGeneration,
+          sessionId: serverState.sessionId,
+          leaseGeneration: serverState.leaseGeneration,
           sdp: nativeOffer.sdp,
         }),
       );
@@ -256,12 +272,11 @@ export class RealtimeVoiceController {
       }
 
       const active: ActiveSession = {
-        sessionId: serverSession.state.sessionId,
+        sessionId: serverState.sessionId,
         nativeSessionId,
-        leaseGeneration: serverSession.state.leaseGeneration,
-        heartbeatIntervalMs: serverSession.heartbeatIntervalSeconds * 1_000,
-        serverState: serverSession.state,
-        afterSequence: serverSession.state.sequence,
+        leaseGeneration: serverState.leaseGeneration,
+        serverState,
+        afterSequence: serverState.sequence,
         lastServerError: null,
       };
       this.startingNativeSessionId = null;
@@ -273,10 +288,10 @@ export class RealtimeVoiceController {
         native: nativeState,
         error: null,
       });
-      this.startControlTimers(active);
+      this.startControlTimers();
       return this.snapshot;
     } catch (cause) {
-      await this.cleanupPartialSession(serverSession?.state ?? null, nativeSessionId);
+      await this.cleanupPartialSession(serverState, nativeSessionId);
       if (generation !== this.startGeneration) return this.snapshot;
       this.startingNativeSessionId = null;
       this.setSnapshot({
@@ -425,32 +440,11 @@ export class RealtimeVoiceController {
     this.subscriptions.forEach((subscription) => subscription.remove());
   }
 
-  private startControlTimers(active: ActiveSession) {
+  private startControlTimers() {
     this.clearControlTimers();
-    this.heartbeatTimer = this.scheduler.setInterval(() => {
-      void this.heartbeat(active);
-    }, active.heartbeatIntervalMs);
     this.eventTimer = this.scheduler.setInterval(() => {
       void this.refreshEvents();
     }, this.eventPollIntervalMs);
-  }
-
-  private async heartbeat(active: ActiveSession) {
-    if (this.active !== active || this.heartbeatInFlight) return;
-    this.heartbeatInFlight = true;
-    try {
-      const state = await Effect.runPromise(
-        this.client.heartbeatSession(active.sessionId, active.leaseGeneration),
-      );
-      if (this.active !== active) return;
-      active.serverState = state;
-      this.controlFailures.heartbeat = 0;
-      this.setSnapshot({ session: state });
-    } catch (cause) {
-      if (this.active === active) this.handleControlFailure("heartbeat", cause);
-    } finally {
-      this.heartbeatInFlight = false;
-    }
   }
 
   private handleControlFailure(operation: ControlOperation, cause: unknown) {
@@ -513,7 +507,7 @@ export class RealtimeVoiceController {
     if (active === null || event.nativeSessionId !== active.nativeSessionId) return;
     void this.closeServerAfterNativeTermination(
       active,
-      event.outcome === "ended" ? null : nativeTerminationMessage(event.code),
+      event.outcome === "ended" ? null : nativeTerminationMessage(event.code, event.retryable),
     );
   }
 
@@ -596,9 +590,7 @@ export class RealtimeVoiceController {
   }
 
   private clearControlTimers() {
-    if (this.heartbeatTimer !== null) this.scheduler.clearInterval(this.heartbeatTimer);
     if (this.eventTimer !== null) this.scheduler.clearInterval(this.eventTimer);
-    this.heartbeatTimer = null;
     this.eventTimer = null;
   }
 
@@ -635,7 +627,6 @@ export class RealtimeVoiceController {
 
   private resetControlFailures() {
     this.controlFailures.events = 0;
-    this.controlFailures.heartbeat = 0;
   }
 
   private requireActive(): ActiveSession {

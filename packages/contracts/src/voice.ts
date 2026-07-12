@@ -263,13 +263,38 @@ export const VoiceSessionState = Schema.Struct({
 });
 export type VoiceSessionState = typeof VoiceSessionState.Type;
 
+export const VoiceNativeControlGrant = Schema.Struct({
+  token: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  sessionId: VoiceSessionId,
+  leaseGeneration: PositiveInt,
+  expiresAt: IsoDateTime,
+  heartbeatIntervalSeconds: PositiveInt,
+  failureGraceSeconds: PositiveInt,
+});
+export type VoiceNativeControlGrant = typeof VoiceNativeControlGrant.Type;
+
 export const VoiceSessionCreateResult = Schema.Struct({
   state: VoiceSessionState,
   transport: VoiceMediaTransport,
   expiresAt: IsoDateTime,
   heartbeatIntervalSeconds: PositiveInt,
+  nativeControlGrant: VoiceNativeControlGrant,
 });
 export type VoiceSessionCreateResult = typeof VoiceSessionCreateResult.Type;
+
+export const VoiceNativeHeartbeatInput = Schema.Struct({
+  leaseGeneration: PositiveInt,
+});
+export type VoiceNativeHeartbeatInput = typeof VoiceNativeHeartbeatInput.Type;
+
+export const VoiceNativeHeartbeatResult = Schema.Struct({
+  sessionId: VoiceSessionId,
+  leaseGeneration: PositiveInt,
+  phase: VoiceSessionPhase,
+  disposition: Schema.Literals(["live", "terminal"]),
+  expiresAt: IsoDateTime,
+});
+export type VoiceNativeHeartbeatResult = typeof VoiceNativeHeartbeatResult.Type;
 
 export const VoiceSessionLeaseInput = Schema.Struct({
   leaseGeneration: PositiveInt,

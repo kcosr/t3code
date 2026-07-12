@@ -300,11 +300,13 @@ export function MasterVoiceProvider(props: {
     if (
       controllerEnvironmentId === null ||
       conversationConnection?.environmentId !== controllerEnvironmentId ||
+      prepared === null ||
       native === null
     )
       return;
 
     const client = conversationConnection.client;
+    const environmentOrigin = prepared.httpBaseUrl;
     void (async () => {
       const [capabilities, media] = await Promise.all([
         Effect.runPromise(client.capabilities()),
@@ -315,7 +317,7 @@ export function MasterVoiceProvider(props: {
         (capability) => capability.capability === "agent.realtime" && capability.state === "ready",
       );
       if (!realtimeReady || !media.realtimeWebRtc) return;
-      const controller = new RealtimeVoiceController(native, client, {
+      const controller = new RealtimeVoiceController(native, client, environmentOrigin, {
         onSnapshot: (next) => {
           if (disposed) return;
           setSnapshot(next);

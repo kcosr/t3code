@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import java.time.Instant
 import expo.modules.interfaces.permissions.Permissions
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
@@ -167,7 +168,7 @@ class T3VoiceModule : Module() {
       )
 
       Constants(
-        "nativeRevision" to 7,
+        "nativeRevision" to 8,
       )
 
       OnCreate {
@@ -230,6 +231,22 @@ class T3VoiceModule : Module() {
         )
       }
 
+      AsyncFunction("getNotificationPermissionAsync") { promise: Promise ->
+        Permissions.getPermissionsWithPermissionsManager(
+          appContext.permissions,
+          promise,
+          Manifest.permission.POST_NOTIFICATIONS,
+        )
+      }
+
+      AsyncFunction("requestNotificationPermissionAsync") { promise: Promise ->
+        Permissions.askForPermissionsWithPermissionsManager(
+          appContext.permissions,
+          promise,
+          Manifest.permission.POST_NOTIFICATIONS,
+        )
+      }
+
       AsyncFunction("getBluetoothPermissionAsync") { promise: Promise ->
         Permissions.getPermissionsWithPermissionsManager(
           appContext.permissions,
@@ -263,8 +280,6 @@ class T3VoiceModule : Module() {
             noSpeechTimeoutMs = optionalLong(endpointInput, "noSpeechTimeoutMs"),
             maximumUtteranceMs = requireLong(endpointInput, "maximumUtteranceMs"),
           )
-        val context = requireNotNull(appContext.reactContext) { "React context is unavailable." }
-        T3VoiceRuntimeService.startForRecording(context, recordingId)
         withBinder(promise, "recording-start-failed") { voice, result ->
           voice.startRecording(recordingId, endpointConfig)
           result.resolve()
@@ -306,8 +321,6 @@ class T3VoiceModule : Module() {
         val playbackId = requireIdentifier(input, "playbackId")
         val sampleRate = requireInt(input, "sampleRate")
         val channelCount = requireInt(input, "channelCount")
-        val context = requireNotNull(appContext.reactContext) { "React context is unavailable." }
-        T3VoiceRuntimeService.startForPlayback(context, playbackId)
         withBinder(promise, "playback-start-failed") { voice, result ->
           voice.startPlayback(playbackId, sampleRate, channelCount)
           result.resolve()
@@ -357,17 +370,65 @@ class T3VoiceModule : Module() {
         }
       }
 
-      AsyncFunction("prepareRealtimeSessionAsync") { input: Map<String, String>, promise: Promise ->
+      AsyncFunction("prepareRealtimeSessionAsync") { input: Map<String, Any>, promise: Promise ->
         val nativeSessionId = requireIdentifier(input, "nativeSessionId")
-        val context = requireNotNull(appContext.reactContext) { "React context is unavailable." }
-        try {
-          T3VoiceRuntimeService.startForRealtime(context, nativeSessionId)
+        val environmentOrigin = requireText(input, "environmentOrigin", 2_048)
+        @Suppress("UNCHECKED_CAST")
+        val grantInput =
+          input["nativeControlGrant"] as? Map<String, Any>
+            ?: error("nativeControlGrant is required.")
+        requireExactKeys(
+          grantInput,
+          setOf(
+            "token",
+            "sessionId",
+            "leaseGeneration",
+            "expiresAt",
+            "heartbeatIntervalSeconds",
+            "failureGraceSeconds",
+          ),
+        )
+        val grantSessionId = requireIdentifier(grantInput, "sessionId")
+        check(grantSessionId == nativeSessionId) { "Native control grant session does not match." }
+        val nativeControlGrant =
+          T3VoiceNativeControlGrant(
+            token = requireText(grantInput, "token", 128),
+            sessionId = grantSessionId,
+            leaseGeneration = requireLong(grantInput, "leaseGeneration"),
+            expiresAtEpochMillis =
+              Instant.parse(requireText(grantInput, "expiresAt", 128)).toEpochMilli(),
+            heartbeatIntervalMillis =
+              Math.multiplyExact(requireLong(grantInput, "heartbeatIntervalSeconds"), 1_000L),
+            failureGraceMillis =
+              Math.multiplyExact(requireLong(grantInput, "failureGraceSeconds"), 1_000L),
+          )
+        check(nativeControlGrant.leaseGeneration > 0) { "leaseGeneration must be positive." }
+        check(nativeControlGrant.heartbeatIntervalMillis > 0) {
+          "heartbeatIntervalSeconds must be positive."
+        }
+        check(nativeControlGrant.failureGraceMillis > 0) {
+          "failureGraceSeconds must be positive."
+        }
+        if (
+          runCatching {
+              T3VoiceNativeControlOriginPolicy.heartbeatUrl(environmentOrigin, nativeSessionId)
+            }
+            .isFailure
+        ) {
+          promise.reject(
+            "realtime-secure-environment-required",
+            publicRealtimeFailureMessage("realtime-secure-environment-required"),
+            null,
+          )
+        } else try {
           withBinder(
             promise,
             "realtime-prepare-failed",
           ) { voice, settlement ->
             voice.prepareRealtimeSession(
               nativeSessionId,
+              environmentOrigin,
+              nativeControlGrant,
               object : T3VoiceWebRtcResultCallback<String> {
                 override fun onSuccess(result: String) {
                   settlement.resolve(
@@ -682,6 +743,8 @@ class T3VoiceModule : Module() {
 
   private fun publicRealtimeFailureMessage(code: String): String =
     when (code) {
+      "realtime-secure-environment-required" ->
+        "Realtime voice requires an HTTPS environment."
       "realtime-answer-rejected" -> "The Realtime answer was rejected."
       "realtime-ice-timeout" -> "The Realtime connection timed out."
       "realtime-offer-failed" -> "The Realtime offer could not be created."
