@@ -62,6 +62,7 @@ export interface VoiceThreadModeState {
   readonly assistantStreamComplete: boolean;
   readonly playbackId: string | null;
   readonly playbackDrained: boolean;
+  readonly manualStopToDraft: boolean;
   readonly sawThreadBusy: boolean;
   readonly pauseReason: VoiceThreadModePauseReason | null;
 }
@@ -99,6 +100,14 @@ export type VoiceThreadModeEvent =
     }
   | {
       readonly type: "recording-completed";
+      readonly token: VoiceThreadModeToken;
+    }
+  | {
+      readonly type: "manual-stop-requested";
+      readonly token: VoiceThreadModeToken;
+    }
+  | {
+      readonly type: "manual-stop-failed";
       readonly token: VoiceThreadModeToken;
     }
   | {
@@ -155,6 +164,11 @@ export type VoiceThreadModeEvent =
 export type VoiceThreadModeCommand =
   | { readonly type: "start-recording"; readonly token: VoiceThreadModeToken }
   | { readonly type: "cancel-recording"; readonly recordingId: string | null }
+  | {
+      readonly type: "stop-recording";
+      readonly token: VoiceThreadModeToken;
+      readonly recordingId: string;
+    }
   | { readonly type: "cancel-playback"; readonly playbackId: string | null }
   | { readonly type: "set-review-draft"; readonly transcript: string }
   | {
@@ -183,7 +197,8 @@ export type VoiceThreadModeCommand =
       readonly type: "start-submission-timeout";
       readonly token: VoiceThreadModeToken;
     }
-  | { readonly type: "cancel-submission-timeout" };
+  | { readonly type: "cancel-submission-timeout" }
+  | { readonly type: "persist-voice-off" };
 
 export interface VoiceThreadModeTransition {
   readonly state: VoiceThreadModeState;
@@ -205,6 +220,7 @@ export const initialVoiceThreadModeState = (): VoiceThreadModeState => ({
   assistantStreamComplete: false,
   playbackId: null,
   playbackDrained: false,
+  manualStopToDraft: false,
   sawThreadBusy: false,
   pauseReason: "disabled",
 });
@@ -244,6 +260,7 @@ const pause = (
     assistantStreamComplete: false,
     playbackId: null,
     playbackDrained: false,
+    manualStopToDraft: false,
     sawThreadBusy: false,
     pauseReason: reason,
   },
@@ -362,11 +379,58 @@ export function transitionVoiceThreadMode(
             commands: [{ type: "start-transcription-timeout", token: event.token }],
           }
         : { state, commands: [] };
+    case "manual-stop-requested":
+      if (
+        (state.phase !== "listening" &&
+          state.phase !== "endpointing" &&
+          state.phase !== "transcribing") ||
+        !sameToken(state.activeToken, event.token) ||
+        state.recordingId === null ||
+        state.manualStopToDraft
+      ) {
+        return { state, commands: [] };
+      }
+      return {
+        state: { ...state, manualStopToDraft: true },
+        commands:
+          state.phase === "transcribing"
+            ? []
+            : [{ type: "stop-recording", token: event.token, recordingId: state.recordingId }],
+      };
+    case "manual-stop-failed":
+      return state.manualStopToDraft && sameToken(state.activeToken, event.token)
+        ? pause(state, "recording-failed")
+        : { state, commands: [] };
     case "transcription-completed": {
       if (state.phase !== "transcribing" || !sameToken(state.activeToken, event.token)) {
         return { state, commands: [] };
       }
       const transcript = event.transcript.trim();
+      if (state.manualStopToDraft) {
+        return {
+          state: {
+            ...state,
+            phase: "paused",
+            cycle: state.cycle + 1,
+            activeToken: null,
+            recordingId: null,
+            transcript,
+            submittedMessageId: null,
+            assistantMessageId: null,
+            assistantStreamComplete: false,
+            playbackId: null,
+            playbackDrained: false,
+            manualStopToDraft: false,
+            sawThreadBusy: false,
+            pauseReason: "user",
+          },
+          commands: [
+            { type: "cancel-transcription-timeout" },
+            { type: "set-review-draft", transcript },
+            { type: "persist-voice-off" },
+          ],
+        };
+      }
       if (!transcript) return pause(state, "empty-transcript");
       if (state.policy === "review") {
         return {

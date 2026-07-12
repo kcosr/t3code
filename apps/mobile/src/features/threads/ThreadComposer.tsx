@@ -394,6 +394,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     active: autoListenActive,
     activate: activateAutoListen,
     deactivateForManualDictation: deactivateAutoListenForManualDictation,
+    stopToDraft: stopAutoListenToDraft,
     pause: pauseAutoListen,
     submitReview: submitAutoListenReview,
   } = autoListen;
@@ -492,6 +493,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       traditionalAudioTransitionLockRef.current,
       async () => {
         if (autoListenActive) {
+          if (await stopAutoListenToDraft()) return;
           await deactivateAutoListenForManualDictation();
           return;
         }
@@ -506,6 +508,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     autoListenActive,
     deactivateAutoListenForManualDictation,
     dictation.cancelForRealtime,
+    stopAutoListenToDraft,
   ]);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;

@@ -8,6 +8,7 @@ internal enum class T3VoiceDiagnosticCategory {
   ROUTE,
   FOCUS,
   TERMINAL,
+  ENDPOINT,
 }
 
 internal enum class T3VoiceDiagnosticCode {
@@ -38,6 +39,8 @@ internal enum class T3VoiceDiagnosticCode {
   STOP_STARTED,
   MEDIA_RELEASED,
   FOREGROUND_RELEASED,
+  ENDPOINT_SAMPLE,
+  ENDPOINT_TERMINATED,
 }
 
 internal data class T3VoiceDiagnosticEntry(
@@ -47,16 +50,30 @@ internal data class T3VoiceDiagnosticEntry(
   val code: T3VoiceDiagnosticCode,
   val primaryCount: Int,
   val secondaryCount: Int,
+  val endpoint: T3VoiceEndpointDiagnostic? = null,
 ) {
   fun toResultBody(): Map<String, Any> =
-    mapOf(
-      "elapsedRealtimeMillis" to elapsedRealtimeMillis,
-      "generation" to generation,
-      "category" to category.name.lowercase(),
-      "code" to code.name.lowercase().replace('_', '-'),
-      "primaryCount" to primaryCount,
-      "secondaryCount" to secondaryCount,
-    )
+    buildMap {
+      putAll(
+        mapOf(
+          "elapsedRealtimeMillis" to elapsedRealtimeMillis,
+          "generation" to generation,
+          "category" to category.name.lowercase(),
+          "code" to code.name.lowercase().replace('_', '-'),
+          "primaryCount" to primaryCount,
+          "secondaryCount" to secondaryCount,
+        ),
+      )
+      endpoint?.let {
+        put("endpointElapsedMs", it.elapsedMs)
+        put("levelDbfsBucket", it.levelDbfsBucket)
+        put("noiseFloorDbfsBucket", it.noiseFloorDbfsBucket)
+        put("releaseThresholdDbfsBucket", it.releaseThresholdDbfsBucket)
+        put("speechConfirmed", it.speechConfirmed)
+        put("silenceElapsedMs", it.silenceElapsedMs)
+        put("silenceResetCount", it.silenceResetCount)
+      }
+    }
 }
 
 internal class T3VoiceDiagnosticRing(
@@ -107,6 +124,29 @@ internal class T3VoiceDiagnosticRing(
   }
 
   @Synchronized
+  fun recordEndpoint(generation: Long, diagnostic: T3VoiceEndpointDiagnostic) {
+    val timestamp = maxOf(lastTimestamp, clock().coerceAtLeast(0))
+    lastTimestamp = timestamp
+    if (entries.size == capacity) entries.removeFirst()
+    entries.addLast(
+      T3VoiceDiagnosticEntry(
+        elapsedRealtimeMillis = timestamp,
+        generation = generation.coerceAtLeast(0),
+        category = T3VoiceDiagnosticCategory.ENDPOINT,
+        code =
+          if (diagnostic.terminal) {
+            T3VoiceDiagnosticCode.ENDPOINT_TERMINATED
+          } else {
+            T3VoiceDiagnosticCode.ENDPOINT_SAMPLE
+          },
+        primaryCount = 0,
+        secondaryCount = 0,
+        endpoint = diagnostic,
+      ),
+    )
+  }
+
+  @Synchronized
   fun snapshot(): List<T3VoiceDiagnosticEntry> = entries.toList()
 
   companion object {
@@ -130,4 +170,7 @@ internal object T3VoiceDiagnostics {
   ) = ring.record(generation, category, code, primaryCount, secondaryCount)
 
   fun snapshot(): List<Map<String, Any>> = ring.snapshot().map(T3VoiceDiagnosticEntry::toResultBody)
+
+  fun recordEndpoint(generation: Long, diagnostic: T3VoiceEndpointDiagnostic) =
+    ring.recordEndpoint(generation, diagnostic)
 }

@@ -167,6 +167,7 @@ internal class T3VoiceRecorder(
       outputFile.delete()
       throw cause
     }
+    val diagnosticGeneration = T3VoiceDiagnostics.nextGeneration()
     active =
       ActiveRecording(
         recordingId = recordingId,
@@ -174,7 +175,10 @@ internal class T3VoiceRecorder(
         file = outputFile,
         startedAtMs = SystemClock.elapsedRealtime(),
         terminalOwner = terminalOwner,
-        endpointDetector = T3VoiceEndpointDetector(endpointConfig),
+        endpointDetector =
+          T3VoiceEndpointDetector(endpointConfig) { diagnostic ->
+            T3VoiceDiagnostics.recordEndpoint(diagnosticGeneration, diagnostic)
+          },
       )
     scheduleEndpointPoll(terminalOwner)
   }
@@ -183,6 +187,7 @@ internal class T3VoiceRecorder(
   fun stop(recordingId: String): T3VoiceRecordingResult {
     val recording = requireActive(recordingId)
     check(terminalPolicy.claim(recording.terminalOwner)) { "The recording already terminated." }
+    recordTerminalDiagnostic(recording)
     active = null
     return finalizeCompleted(recording)
   }
@@ -190,6 +195,7 @@ internal class T3VoiceRecorder(
   @Synchronized
   fun cancel(recordingId: String) {
     val recording = requireActive(recordingId)
+    recordTerminalDiagnostic(recording)
     active = null
     terminalPolicy.deactivate(recording.terminalOwner)
     try {
@@ -220,6 +226,7 @@ internal class T3VoiceRecorder(
   fun release() {
     val recording = active
     if (recording != null) {
+      recordTerminalDiagnostic(recording)
       active = null
       terminalPolicy.deactivate(recording.terminalOwner)
       recording.recorder.release()
@@ -251,6 +258,7 @@ internal class T3VoiceRecorder(
           active = null
           current
         }
+      recordTerminalDiagnostic(recording)
       completeAutomatically(recording, reason)
     }
   }
@@ -289,6 +297,13 @@ internal class T3VoiceRecorder(
         }
       },
       ENDPOINT_POLL_INTERVAL_MS,
+    )
+  }
+
+  private fun recordTerminalDiagnostic(recording: ActiveRecording) {
+    recording.endpointDetector.recordTerminalDiagnostic(
+      SystemClock.elapsedRealtime() - recording.startedAtMs,
+      runCatching { recording.recorder.maxAmplitude }.getOrDefault(0),
     )
   }
 

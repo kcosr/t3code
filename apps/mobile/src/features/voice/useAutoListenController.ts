@@ -42,6 +42,7 @@ interface AutoListenDictationAdapter {
   readonly transcriptionEvent: ComposerTranscriptionEvent | null;
   readonly terminationEvent: ComposerRecordingTerminationEvent | null;
   readonly start: () => Promise<string | null>;
+  readonly stop: () => Promise<void>;
   readonly cancel: () => Promise<void>;
   readonly cancelForRealtime: () => Promise<void>;
 }
@@ -153,6 +154,7 @@ export function useAutoListenController(input: {
     for (const command of transition.commands) {
       if (
         command.type === "start-recording" ||
+        command.type === "stop-recording" ||
         command.type === "cancel-recording" ||
         command.type === "cancel-playback"
       ) {
@@ -210,11 +212,21 @@ export function useAutoListenController(input: {
         case "cancel-recording":
           await current.dictation.cancel();
           return;
+        case "stop-recording":
+          try {
+            await current.dictation.stop();
+          } catch {
+            dispatch({ type: "manual-stop-failed", token: command.token });
+          }
+          return;
         case "cancel-playback":
           await current.speech.interrupt();
           current.speech.resumeAfterDictation();
           return;
         case "set-review-draft":
+          return;
+        case "persist-voice-off":
+          savePreferences({ voiceMode: "off" });
           return;
         case "submit-transcript": {
           if (
@@ -337,6 +349,21 @@ export function useAutoListenController(input: {
       verifyRecordingReleased: () => inputRef.current.dictation.cancelForRealtime(),
     });
   }, [dispatch, persistPaused]);
+
+  const stopToDraft = useCallback(async () => {
+    const current = stateRef.current;
+    if (
+      (current.phase !== "listening" &&
+        current.phase !== "endpointing" &&
+        current.phase !== "transcribing") ||
+      current.activeToken === null ||
+      current.recordingId === null
+    ) {
+      return false;
+    }
+    const next = dispatch({ type: "manual-stop-requested", token: current.activeToken });
+    return next.manualStopToDraft;
+  }, [dispatch]);
 
   const activate = useCallback(
     async (enableIfDisabled = false) => {
@@ -498,7 +525,7 @@ export function useAutoListenController(input: {
         transcript: event.finalDraft,
       });
     }
-  }, [dispatch, input.dictation.transcriptionEvent]);
+  }, [dispatch, input.dictation.transcriptionEvent, pause]);
 
   useEffect(() => {
     const event = input.dictation.terminationEvent;
@@ -618,6 +645,7 @@ export function useAutoListenController(input: {
     active: state.phase !== "paused",
     activate,
     deactivateForManualDictation,
+    stopToDraft,
     pause,
     submitReview,
   };

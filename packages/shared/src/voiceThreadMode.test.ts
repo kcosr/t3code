@@ -159,6 +159,105 @@ describe("voiceThreadMode", () => {
     ]);
   });
 
+  it("manually stops auto-submit capture into the draft without submitting", () => {
+    const active = listening();
+    const requested = transition(active.state, {
+      type: "manual-stop-requested",
+      token: active.token,
+    });
+    expect(requested.state.manualStopToDraft).toBe(true);
+    expect(requested.commands).toEqual([
+      { type: "stop-recording", token: active.token, recordingId: "recording-1" },
+    ]);
+    expect(
+      transition(requested.state, {
+        type: "manual-stop-requested",
+        token: active.token,
+      }).commands,
+    ).toEqual([]);
+
+    const transcribing = transition(requested.state, {
+      type: "recording-completed",
+      token: active.token,
+    });
+    const completed = transition(transcribing.state, {
+      type: "transcription-completed",
+      token: active.token,
+      transcript: " keep this draft ",
+    });
+    expect(completed.state).toMatchObject({
+      phase: "paused",
+      pauseReason: "user",
+      transcript: "keep this draft",
+      manualStopToDraft: false,
+    });
+    expect(completed.commands).toEqual([
+      { type: "cancel-transcription-timeout" },
+      { type: "set-review-draft", transcript: "keep this draft" },
+      { type: "persist-voice-off" },
+    ]);
+    expect(completed.commands.some((command) => command.type === "submit-transcript")).toBe(false);
+  });
+
+  it("keeps an automatic endpoint transcription when stop-to-draft is tapped at the boundary", () => {
+    const active = listening();
+    const transcribing = transition(active.state, {
+      type: "recording-completed",
+      token: active.token,
+    });
+    const requested = transition(transcribing.state, {
+      type: "manual-stop-requested",
+      token: active.token,
+    });
+    expect(requested.state.manualStopToDraft).toBe(true);
+    expect(requested.commands).toEqual([]);
+
+    const completed = transition(requested.state, {
+      type: "transcription-completed",
+      token: active.token,
+      transcript: "endpoint won",
+    });
+    expect(completed.state.phase).toBe("paused");
+    expect(completed.commands).toContainEqual({
+      type: "set-review-draft",
+      transcript: "endpoint won",
+    });
+  });
+
+  it("ignores stale manual stop requests", () => {
+    const active = listening();
+    const stale = transition(active.state, {
+      type: "manual-stop-requested",
+      token: { ...active.token, operation: active.token.operation + 1 },
+    });
+    expect(stale.state).toEqual(active.state);
+    expect(stale.commands).toEqual([]);
+  });
+
+  it("pauses when native manual stop fails", () => {
+    const active = listening();
+    const requested = transition(active.state, {
+      type: "manual-stop-requested",
+      token: active.token,
+    });
+    const failed = transition(requested.state, {
+      type: "manual-stop-failed",
+      token: active.token,
+    });
+
+    expect(failed.state).toMatchObject({
+      phase: "paused",
+      pauseReason: "recording-failed",
+      manualStopToDraft: false,
+    });
+    expect(
+      transition(requested.state, {
+        type: "manual-stop-failed",
+        token: { ...active.token, operation: active.token.operation + 1 },
+      }).state,
+    ).toEqual(requested.state);
+  });
+
   it("puts review policy transcripts in the draft without submitting or rearming", () => {
     const activated = transition(initialVoiceThreadModeState(), {
       type: "activate",

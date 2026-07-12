@@ -74,14 +74,27 @@ class T3VoiceDiagnosticRingTest {
       T3VoiceDiagnosticEntry::class.java.declaredFields.filterNot {
         Modifier.isStatic(it.modifiers)
       }
-    assertEquals(6, fields.size)
+    assertEquals(7, fields.size)
     assertFalse(fields.any { it.type == String::class.java })
     assertFalse(fields.any { it.type == ByteArray::class.java })
     assertTrue(
       fields.all {
         it.type == java.lang.Long.TYPE ||
           it.type == Integer.TYPE ||
-          it.type.isEnum
+          it.type.isEnum ||
+          it.type == T3VoiceEndpointDiagnostic::class.java
+      },
+    )
+    val endpointFields =
+      T3VoiceEndpointDiagnostic::class.java.declaredFields.filterNot {
+        Modifier.isStatic(it.modifiers)
+      }
+    assertFalse(endpointFields.any { it.type == String::class.java || it.type == ByteArray::class.java })
+    assertTrue(
+      endpointFields.all {
+        it.type == java.lang.Long.TYPE ||
+          it.type == Integer.TYPE ||
+          it.type == java.lang.Boolean.TYPE
       },
     )
   }
@@ -114,5 +127,43 @@ class T3VoiceDiagnosticRingTest {
   fun capacityItselfHasAHardUpperBound() {
     val failure = runCatching { T3VoiceDiagnosticRing(capacity = 257) }
     assertTrue(failure.isFailure)
+  }
+
+  @Test
+  fun endpointSnapshotContainsOnlyBucketedDetectorMeasurements() {
+    val ring = T3VoiceDiagnosticRing(capacity = 1, clock = { 42L })
+    ring.recordEndpoint(
+      generation = 9,
+      diagnostic =
+        T3VoiceEndpointDiagnostic(
+          elapsedMs = 500,
+          levelDbfsBucket = -39,
+          noiseFloorDbfsBucket = -54,
+          releaseThresholdDbfsBucket = -45,
+          speechConfirmed = true,
+          silenceElapsedMs = 250,
+          silenceResetCount = 2,
+          terminal = true,
+        ),
+    )
+
+    assertEquals(
+      mapOf(
+        "elapsedRealtimeMillis" to 42L,
+        "generation" to 9L,
+        "category" to "endpoint",
+        "code" to "endpoint-terminated",
+        "primaryCount" to 0,
+        "secondaryCount" to 0,
+        "endpointElapsedMs" to 500L,
+        "levelDbfsBucket" to -39,
+        "noiseFloorDbfsBucket" to -54,
+        "releaseThresholdDbfsBucket" to -45,
+        "speechConfirmed" to true,
+        "silenceElapsedMs" to 250L,
+        "silenceResetCount" to 2,
+      ),
+      ring.snapshot().single().toResultBody(),
+    )
   }
 }

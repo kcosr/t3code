@@ -152,7 +152,13 @@ export interface T3VoiceAudioRoute {
   readonly selected: boolean;
 }
 
-export type T3VoiceDiagnosticCategory = "lifecycle" | "state" | "route" | "focus" | "terminal";
+export type T3VoiceDiagnosticCategory =
+  | "lifecycle"
+  | "state"
+  | "route"
+  | "focus"
+  | "terminal"
+  | "endpoint";
 
 export type T3VoiceDiagnosticCode =
   | "started"
@@ -172,7 +178,9 @@ export type T3VoiceDiagnosticCode =
   | "device-callback-unavailable"
   | "device-callback-unregistered"
   | "ended"
-  | "failed";
+  | "failed"
+  | "endpoint-sample"
+  | "endpoint-terminated";
 
 export interface T3VoiceDiagnosticEntry {
   readonly elapsedRealtimeMillis: number;
@@ -181,6 +189,13 @@ export interface T3VoiceDiagnosticEntry {
   readonly code: T3VoiceDiagnosticCode;
   readonly primaryCount: number;
   readonly secondaryCount: number;
+  readonly endpointElapsedMs?: number;
+  readonly levelDbfsBucket?: number;
+  readonly noiseFloorDbfsBucket?: number;
+  readonly releaseThresholdDbfsBucket?: number;
+  readonly speechConfirmed?: boolean;
+  readonly silenceElapsedMs?: number;
+  readonly silenceResetCount?: number;
 }
 
 export interface T3VoiceNativeModule {

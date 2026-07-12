@@ -2,6 +2,18 @@ package expo.modules.t3voice
 
 import kotlin.math.log10
 import kotlin.math.max
+import kotlin.math.roundToInt
+
+internal data class T3VoiceEndpointDiagnostic(
+  val elapsedMs: Long,
+  val levelDbfsBucket: Int,
+  val noiseFloorDbfsBucket: Int,
+  val releaseThresholdDbfsBucket: Int,
+  val speechConfirmed: Boolean,
+  val silenceElapsedMs: Long,
+  val silenceResetCount: Int,
+  val terminal: Boolean,
+)
 
 internal data class T3VoiceEndpointDetectionConfig(
   val onsetMarginDb: Double = 12.0,
@@ -39,6 +51,7 @@ internal data class T3VoiceEndpointDetectionConfig(
 
 internal class T3VoiceEndpointDetector(
   private val config: T3VoiceEndpointDetectionConfig = T3VoiceEndpointDetectionConfig(),
+  private val onDiagnostic: (T3VoiceEndpointDiagnostic) -> Unit = {},
 ) {
   enum class Outcome {
     SPEECH_ENDED,
@@ -53,6 +66,9 @@ internal class T3VoiceEndpointDetector(
   private var speechConfirmed = false
   private var accumulatedSpeechMs = 0L
   private var lastSpeechAtMs: Long? = null
+  private var silenceTracking = false
+  private var silenceResetCount = 0
+  private var lastDiagnosticAtMs: Long? = null
 
   fun observe(elapsedMs: Long, peakAmplitude: Int): Outcome? {
     require(elapsedMs >= 0L) { "elapsedMs must be non-negative" }
@@ -67,21 +83,31 @@ internal class T3VoiceEndpointDetector(
     val previousElapsedMs = lastElapsedMs
     lastElapsedMs = elapsedMs
 
-    if (elapsedMs >= config.maximumUtteranceMs) {
-      return finish(if (speechConfirmed) Outcome.MAXIMUM_UTTERANCE else Outcome.NO_SPEECH)
-    }
-    if (!speechConfirmed && config.noSpeechTimeoutMs?.let { elapsedMs >= it } == true) {
-      return finish(Outcome.NO_SPEECH)
-    }
-
     val levelDbfs = amplitudeToDbfs(peakAmplitude)
     val onsetThresholdDbfs = max(noiseFloorDbfs + config.onsetMarginDb, config.onsetFloorDbfs)
+    val releaseThresholdDbfs = onsetThresholdDbfs - config.releaseHysteresisDb
+    val forcedOutcome =
+      when {
+        elapsedMs >= config.maximumUtteranceMs ->
+          if (speechConfirmed) Outcome.MAXIMUM_UTTERANCE else Outcome.NO_SPEECH
+        !speechConfirmed && config.noSpeechTimeoutMs?.let { elapsedMs >= it } == true ->
+          Outcome.NO_SPEECH
+        else -> null
+      }
+    if (forcedOutcome != null) {
+      emitDiagnostic(elapsedMs, levelDbfs, releaseThresholdDbfs, terminal = true)
+      return finish(forcedOutcome)
+    }
 
     if (!speechConfirmed) {
       observeBeforeSpeech(elapsedMs, levelDbfs, onsetThresholdDbfs)
     } else {
-      observeAfterSpeech(elapsedMs, previousElapsedMs, levelDbfs, onsetThresholdDbfs)
+      observeAfterSpeech(elapsedMs, previousElapsedMs, levelDbfs, releaseThresholdDbfs)
     }
+
+    val diagnosticReleaseThresholdDbfs =
+      max(noiseFloorDbfs + config.onsetMarginDb, config.onsetFloorDbfs) -
+        config.releaseHysteresisDb
 
     val lastSpeech = lastSpeechAtMs
     if (
@@ -91,9 +117,28 @@ internal class T3VoiceEndpointDetector(
         elapsedMs - lastSpeech >= config.endSilenceMs &&
         elapsedMs >= config.minimumRecordingMs
     ) {
+      emitDiagnostic(elapsedMs, levelDbfs, diagnosticReleaseThresholdDbfs, terminal = true)
       return finish(Outcome.SPEECH_ENDED)
     }
+    emitDiagnostic(elapsedMs, levelDbfs, diagnosticReleaseThresholdDbfs, terminal = false)
     return null
+  }
+
+  fun recordTerminalDiagnostic(elapsedMs: Long, peakAmplitude: Int) {
+    if (terminal) return
+    require(elapsedMs >= 0L) { "elapsedMs must be non-negative" }
+    require(peakAmplitude in 0..MAX_AMPLITUDE) {
+      "peakAmplitude must be between 0 and $MAX_AMPLITUDE"
+    }
+    val levelDbfs = amplitudeToDbfs(peakAmplitude)
+    val onsetThresholdDbfs = max(noiseFloorDbfs + config.onsetMarginDb, config.onsetFloorDbfs)
+    emitDiagnostic(
+      elapsedMs,
+      levelDbfs,
+      onsetThresholdDbfs - config.releaseHysteresisDb,
+      terminal = true,
+    )
+    terminal = true
   }
 
   private fun observeBeforeSpeech(
@@ -129,13 +174,50 @@ internal class T3VoiceEndpointDetector(
     elapsedMs: Long,
     previousElapsedMs: Long?,
     levelDbfs: Double,
-    onsetThresholdDbfs: Double,
+    releaseThresholdDbfs: Double,
   ) {
-    val releaseThresholdDbfs = onsetThresholdDbfs - config.releaseHysteresisDb
-    if (levelDbfs < releaseThresholdDbfs) return
+    if (levelDbfs < releaseThresholdDbfs) {
+      silenceTracking = true
+      return
+    }
+
+    if (silenceTracking) {
+      silenceResetCount += 1
+      silenceTracking = false
+    }
 
     accumulatedSpeechMs += (elapsedMs - (previousElapsedMs ?: elapsedMs)).coerceAtLeast(0L)
     lastSpeechAtMs = elapsedMs
+  }
+
+  private fun emitDiagnostic(
+    elapsedMs: Long,
+    levelDbfs: Double,
+    releaseThresholdDbfs: Double,
+    terminal: Boolean,
+  ) {
+    val lastDiagnostic = lastDiagnosticAtMs
+    if (!terminal && lastDiagnostic != null && elapsedMs - lastDiagnostic < DIAGNOSTIC_INTERVAL_MS) {
+      return
+    }
+    lastDiagnosticAtMs = elapsedMs
+    val diagnostic =
+      T3VoiceEndpointDiagnostic(
+        elapsedMs = elapsedMs,
+        levelDbfsBucket = dbfsBucket(levelDbfs),
+        noiseFloorDbfsBucket = dbfsBucket(noiseFloorDbfs),
+        releaseThresholdDbfsBucket = dbfsBucket(releaseThresholdDbfs),
+        speechConfirmed = speechConfirmed,
+        silenceElapsedMs =
+          if (speechConfirmed) {
+            lastSpeechAtMs?.let { (elapsedMs - it).coerceAtLeast(0L) } ?: 0L
+          } else {
+            0L
+          },
+        silenceResetCount = silenceResetCount,
+        terminal = terminal,
+      )
+    runCatching { onDiagnostic(diagnostic) }
   }
 
   private fun finish(outcome: Outcome): Outcome {
@@ -149,9 +231,13 @@ internal class T3VoiceEndpointDetector(
     private const val INITIAL_NOISE_FLOOR_DBFS = -60.0
     private const val NOISE_FLOOR_ALPHA = 0.25
     private const val CALIBRATION_MS = 300L
+    private const val DIAGNOSTIC_INTERVAL_MS = 500L
+    private const val DBFS_BUCKET_SIZE = 3.0
     // Startup has no prior ambient sample. This gate separates moderate steady room noise from
     // speech strong enough to begin immediately while the adaptive floor is still calibrating.
     private const val CALIBRATION_DIRECT_ONSET_DBFS = -32.0
+    private fun dbfsBucket(value: Double): Int =
+      (value / DBFS_BUCKET_SIZE).roundToInt() * DBFS_BUCKET_SIZE.toInt()
     internal fun amplitudeToDbfs(peakAmplitude: Int): Double {
       require(peakAmplitude in 0..MAX_AMPLITUDE)
       if (peakAmplitude == 0) return SILENCE_DBFS

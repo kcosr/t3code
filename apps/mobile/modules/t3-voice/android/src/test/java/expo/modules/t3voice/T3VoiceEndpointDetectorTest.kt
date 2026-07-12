@@ -142,6 +142,63 @@ class T3VoiceEndpointDetectorTest {
   }
 
   @Test
+  fun diagnosticsAreRateLimitedAndReportSilenceResetsAtTermination() {
+    val diagnostics = mutableListOf<T3VoiceEndpointDiagnostic>()
+    val detector =
+      T3VoiceEndpointDetector(
+        T3VoiceEndpointDetectionConfig(
+          speechOnsetMs = 50L,
+          minimumSpeechMs = 50L,
+          endSilenceMs = 250L,
+          noSpeechTimeoutMs = 30_000L,
+        ),
+        diagnostics::add,
+      )
+
+    feed(detector, 0L..250L step 50L, amplitude = 100)
+    feed(detector, 300L..500L step 50L, amplitude = 8_000)
+    feed(detector, 550L..650L step 50L, amplitude = 100)
+    assertNull(detector.observe(700L, 8_000))
+    feed(detector, 750L..900L step 50L, amplitude = 100)
+    assertEquals(T3VoiceEndpointDetector.Outcome.SPEECH_ENDED, detector.observe(950L, 100))
+
+    assertEquals(listOf(0L, 500L, 950L), diagnostics.map { it.elapsedMs })
+    assertEquals(1, diagnostics.last().silenceResetCount)
+    assertEquals(250L, diagnostics.last().silenceElapsedMs)
+    assertEquals(true, diagnostics.last().speechConfirmed)
+    assertEquals(true, diagnostics.last().terminal)
+    diagnostics.forEach {
+      assertEquals(0, it.levelDbfsBucket % 3)
+      assertEquals(0, it.noiseFloorDbfsBucket % 3)
+      assertEquals(0, it.releaseThresholdDbfsBucket % 3)
+    }
+  }
+
+  @Test
+  fun diagnosticFailuresCannotInterruptEndpointDetection() {
+    val detector =
+      T3VoiceEndpointDetector(
+        T3VoiceEndpointDetectionConfig(noSpeechTimeoutMs = 1_000L),
+      ) { error("diagnostic sink failed") }
+
+    assertNull(detector.observe(0L, 0))
+    assertEquals(T3VoiceEndpointDetector.Outcome.NO_SPEECH, detector.observe(1_000L, 0))
+  }
+
+  @Test
+  fun manualTerminationEmitsAFinalDiagnosticInsideTheRateLimitWindow() {
+    val diagnostics = mutableListOf<T3VoiceEndpointDiagnostic>()
+    val detector = T3VoiceEndpointDetector(onDiagnostic = diagnostics::add)
+
+    assertNull(detector.observe(0L, 100))
+    detector.recordTerminalDiagnostic(100L, 100)
+
+    assertEquals(listOf(false, true), diagnostics.map { it.terminal })
+    assertEquals(listOf(0L, 100L), diagnostics.map { it.elapsedMs })
+    assertNull(detector.observe(150L, 8_000))
+  }
+
+  @Test
   fun rejectsInvalidConfigAndNonMonotonicSamples() {
     assertThrows(IllegalArgumentException::class.java) {
       T3VoiceEndpointDetectionConfig(endSilenceMs = 100L)
