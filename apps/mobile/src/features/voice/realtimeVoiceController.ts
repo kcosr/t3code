@@ -307,21 +307,28 @@ export class RealtimeVoiceController {
     if (this.detached) {
       return Promise.reject(new Error("Cannot reconcile a detached Realtime controller"));
     }
-    if (this.active !== null || this.snapshot.phase === "starting") {
-      return Promise.reject(new Error("Cannot reconcile native media during an active session"));
+    if (this.nativeRuntimeReconciliation !== null) return this.nativeRuntimeReconciliation;
+    if (this.snapshot.phase === "starting") {
+      return Promise.reject(new Error("Cannot reconcile native media while starting a session"));
     }
-    if (this.nativeRuntimeReconciliation === null) {
-      const reconciliation = this.reconcileNativeRuntimeOnce();
-      this.nativeRuntimeReconciliation = reconciliation.then(
-        () => {
-          if (this.nativeRuntimeReconciliation !== null) this.nativeRuntimeReconciliation = null;
-        },
-        (cause) => {
-          if (this.nativeRuntimeReconciliation !== null) this.nativeRuntimeReconciliation = null;
-          throw cause;
-        },
-      );
-    }
+    const reconciliation = this.reconcileNativeRuntimeOnce();
+    this.nativeRuntimeReconciliation = reconciliation.then(
+      () => {
+        if (this.nativeRuntimeReconciliation !== null) this.nativeRuntimeReconciliation = null;
+      },
+      (cause) => {
+        if (!this.detached && this.snapshot.phase === "starting") {
+          this.setSnapshot({
+            phase: "error",
+            session: null,
+            error: `Could not attach to the active Realtime session: ${messageFor(cause)}`,
+            focus: null,
+          });
+        }
+        if (this.nativeRuntimeReconciliation !== null) this.nativeRuntimeReconciliation = null;
+        throw cause;
+      },
+    );
     return this.nativeRuntimeReconciliation;
   }
 
@@ -346,13 +353,15 @@ export class RealtimeVoiceController {
   private async startOnce(
     input: VoiceSessionCreateInput,
   ): Promise<RealtimeVoiceControllerSnapshot> {
-    const generation = ++this.startGeneration;
+    const reconciliationGeneration = this.startGeneration;
     await this.reconcileNativeRuntime();
-    this.ensureCurrentStart(generation);
+    if (this.detached) throw new Error("Cannot start a detached Realtime controller");
     if (this.snapshot.phase === "active") return this.snapshot;
+    this.ensureCurrentStart(reconciliationGeneration);
     if (this.snapshot.phase !== "idle" && this.snapshot.phase !== "error") {
       throw new Error("A Realtime voice session is already starting or active");
     }
+    const generation = ++this.startGeneration;
     this.setSnapshot({ phase: "starting", session: null, error: null, focus: null });
     let serverSession: VoiceSessionCreateResult | null = null;
     let serverState: VoiceSessionState | null = null;
@@ -819,11 +828,22 @@ export class RealtimeVoiceController {
   }
 
   private async reconcileNativeRuntimeOnce(): Promise<void> {
-    const generation = this.startGeneration;
+    let generation = this.startGeneration;
     const before = await this.native.getStateAsync();
     if (this.detached || generation !== this.startGeneration) return;
     this.setSnapshot({ native: before });
     const nativeSessionId = before.activeRealtimeSessionId;
+    const existingActive = this.active;
+    if (existingActive !== null) {
+      if (nativeSessionId === existingActive.nativeSessionId) return;
+      this.closeServerAfterNativeTermination(
+        existingActive,
+        nativeSessionId === null
+          ? "The Realtime media session ended while T3 was in the background"
+          : "The Realtime media session was replaced while T3 was in the background",
+      );
+      generation = this.startGeneration;
+    }
     if (nativeSessionId === null) return;
     this.setSnapshot({ phase: "starting", session: null, error: null, focus: null });
 
@@ -850,8 +870,15 @@ export class RealtimeVoiceController {
       }
       const after = await this.native.getStateAsync();
       if (after.activeRealtimeSessionId !== null) {
-        this.setSnapshot({ native: after });
-        throw stopFailure ?? new Error("The stale Realtime media session could not be stopped");
+        const cause = stopFailure ?? new Error("The stale Realtime media session could not be stopped");
+        this.setSnapshot({
+          native: after,
+          phase: "error",
+          session: null,
+          error: messageFor(cause),
+          focus: null,
+        });
+        throw cause;
       }
       await this.clearAttachment(sessionId, null);
       this.setSnapshot({ native: after, phase: "idle", session: null, error: null, focus: null });
@@ -866,7 +893,9 @@ export class RealtimeVoiceController {
       return;
     }
     if (after.activeRealtimeSessionId !== nativeSessionId) {
-      throw new Error("The native Realtime session changed during attachment");
+      const cause = new Error("The native Realtime session changed during attachment");
+      this.setSnapshot({ phase: "error", session: null, error: cause.message, focus: null });
+      throw cause;
     }
 
     const persisted = await this.loadAttachment(sessionId, state.leaseGeneration, state.sequence);
@@ -890,12 +919,22 @@ export class RealtimeVoiceController {
       return;
     }
     const confirmed = await this.native.getStateAsync();
-    if (
-      this.detached ||
-      generation !== this.startGeneration ||
-      confirmed.activeRealtimeSessionId !== nativeSessionId
-    ) {
+    if (this.detached || generation !== this.startGeneration) {
       await this.clearAttachment(active.sessionId, active.attachmentOwnerId);
+      return;
+    }
+    if (confirmed.activeRealtimeSessionId !== nativeSessionId) {
+      await this.clearAttachment(active.sessionId, active.attachmentOwnerId);
+      this.setSnapshot({
+        native: confirmed,
+        phase: confirmed.activeRealtimeSessionId === null ? "idle" : "error",
+        session: null,
+        error:
+          confirmed.activeRealtimeSessionId === null
+            ? null
+            : "The native Realtime session changed during attachment",
+        focus: null,
+      });
       return;
     }
     this.active = active;

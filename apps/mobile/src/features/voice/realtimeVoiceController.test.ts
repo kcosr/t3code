@@ -310,6 +310,62 @@ describe("RealtimeVoiceController", () => {
     expect(client.createSession).not.toHaveBeenCalled();
   });
 
+  it("joins foreground adoption when Resume overlaps the server attachment", async () => {
+    const { client, controller, native } = makeHarness();
+    const nativeActive = {
+      phase: "realtime" as const,
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected" as const,
+      realtimeMuted: false,
+      sequence: 8,
+    };
+    vi.mocked(native.getStateAsync).mockResolvedValue(nativeActive);
+    let resolveSession!: (state: typeof serverSession.state) => void;
+    vi.mocked(client.getSession).mockReturnValue(
+      Effect.promise(
+        () =>
+          new Promise<typeof serverSession.state>((resolve) => {
+            resolveSession = resolve;
+          }),
+      ),
+    );
+
+    const adoption = controller.reconcileNativeRuntime();
+    await vi.waitFor(() => expect(controller.getSnapshot().phase).toBe("starting"));
+    const resume = controller.start(createInput);
+    resolveSession(serverSession.state);
+    await Promise.all([adoption, resume]);
+
+    expect(controller.getSnapshot().phase).toBe("active");
+    expect(client.createSession).not.toHaveBeenCalled();
+  });
+
+  it("reconciles a missed native stop after returning to the foreground", async () => {
+    const { client, controller, native } = makeHarness();
+    await controller.start(createInput);
+    vi.mocked(native.getStateAsync).mockResolvedValue({
+      phase: "idle",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: null,
+      realtimeConnectionState: "closed",
+      realtimeMuted: false,
+      sequence: 20,
+    });
+
+    await controller.reconcileNativeRuntime();
+
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "error",
+      native: { activeRealtimeSessionId: null },
+    });
+    await vi.waitFor(() => expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1));
+  });
+
   it("recreates after a crash from the durable consumed cursor and focus", async () => {
     const attachments = makeAttachmentStore({
       ownerId: "previous-owner",

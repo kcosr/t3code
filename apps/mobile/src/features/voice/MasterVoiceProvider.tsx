@@ -449,11 +449,11 @@ export function MasterVoiceProvider(props: {
       return sessionId;
     };
     const reconcileForegroundRuntime = async (nativeSessionId: string | null) => {
-      if (nativeSessionId === null || disposed) return;
+      if (disposed) return;
       const runtime = runtimeRef.current;
       if (runtime === null) return;
       const phase = runtime.controller.getSnapshot().phase;
-      if (phase === "active" || phase === "starting" || phase === "stopping") return;
+      if (phase === "starting" || phase === "stopping") return;
       await runtime.controller.reconcileNativeRuntime();
     };
     const refresh = async () => {
