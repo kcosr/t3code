@@ -34,6 +34,7 @@ export const VOICE_RESPONSE_TIMEOUT_DEFAULT_MS = 10 * 60_000;
 export interface ResolvedVoicePreferences {
   readonly autoListenEnabled: boolean;
   readonly autoSubmitEnabled: boolean;
+  readonly cuesEnabled: boolean;
   readonly endSilenceMs: number;
   readonly noSpeechTimeoutMs: number | null;
   readonly maximumUtteranceMs: number;
@@ -54,6 +55,7 @@ export function resolveVoicePreferences(preferences: Preferences): ResolvedVoice
   return {
     autoListenEnabled: preferences.voiceAutoListenEnabled === true,
     autoSubmitEnabled: preferences.voiceAutoSubmitEnabled !== false,
+    cuesEnabled: preferences.voiceCuesEnabled !== false,
     endSilenceMs: clampRounded(
       preferences.voiceEndSilenceMs,
       VOICE_END_SILENCE_DEFAULT_MS,

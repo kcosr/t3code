@@ -147,7 +147,9 @@ class T3VoiceStateStoreTest {
 
     val recording = checkNotNull(T3VoiceStateStore.claimRecording("recording-a"))
     val recordingState = T3VoiceStateStore.state.value
-    assertEquals(T3VoiceRuntimePhase.RECORDING, recordingState.phase)
+    assertEquals(T3VoiceRuntimePhase.ARMING, recordingState.phase)
+    assertTrue(T3VoiceStateStore.markRecordingStarted(recording))
+    assertEquals(T3VoiceRuntimePhase.RECORDING, T3VoiceStateStore.state.value.phase)
     assertEquals(recording.generation, recordingState.activeRecordingGeneration)
     assertNull(recordingState.activePlaybackId)
     assertNull(recordingState.activePlaybackGeneration)
@@ -180,7 +182,7 @@ class T3VoiceStateStoreTest {
       )
 
     T3VoiceStateStore.terminateRealtime(terminal)
-    T3VoiceStateStore.setRealtime("session-a", "connected", false)
+    T3VoiceStateStore.setRealtime("session-a", "connected", false, true)
 
     assertNull(T3VoiceStateStore.state.value.activeRealtimeSessionId)
     assertEquals("failed", T3VoiceStateStore.state.value.realtimeConnectionState)

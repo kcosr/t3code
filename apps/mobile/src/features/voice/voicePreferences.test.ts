@@ -15,6 +15,7 @@ describe("resolveVoicePreferences", () => {
     expect(resolveVoicePreferences({})).toEqual({
       autoListenEnabled: false,
       autoSubmitEnabled: true,
+      cuesEnabled: true,
       endSilenceMs: VOICE_END_SILENCE_DEFAULT_MS,
       noSpeechTimeoutMs: null,
       maximumUtteranceMs: VOICE_MAXIMUM_UTTERANCE_DEFAULT_MS,
@@ -30,6 +31,7 @@ describe("resolveVoicePreferences", () => {
       resolveVoicePreferences({
         voiceAutoListenEnabled: true,
         voiceAutoSubmitEnabled: false,
+        voiceCuesEnabled: false,
         voiceEndSilenceMs: 100,
         voiceNoSpeechTimeoutMs: null,
         voiceMaximumUtteranceMs: 99_000_000,
@@ -39,6 +41,7 @@ describe("resolveVoicePreferences", () => {
     ).toEqual({
       autoListenEnabled: true,
       autoSubmitEnabled: false,
+      cuesEnabled: false,
       endSilenceMs: 500,
       noSpeechTimeoutMs: null,
       maximumUtteranceMs: 30 * 60_000,

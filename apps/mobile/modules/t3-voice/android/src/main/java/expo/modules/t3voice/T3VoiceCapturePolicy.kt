@@ -3,9 +3,10 @@ package expo.modules.t3voice
 internal data class T3VoiceCaptureState(
   val userMuted: Boolean = false,
   val focusSuspended: Boolean = false,
+  val inputReady: Boolean = false,
 ) {
   val effectiveMuted: Boolean
-    get() = userMuted || focusSuspended
+    get() = userMuted || focusSuspended || !inputReady
 }
 
 internal object T3VoiceCapturePolicy {
@@ -14,4 +15,7 @@ internal object T3VoiceCapturePolicy {
 
   fun setFocusSuspended(state: T3VoiceCaptureState, suspended: Boolean): T3VoiceCaptureState =
     state.copy(focusSuspended = suspended)
+
+  fun setInputReady(state: T3VoiceCaptureState, ready: Boolean): T3VoiceCaptureState =
+    state.copy(inputReady = ready)
 }

@@ -247,6 +247,14 @@ class T3VoiceControlPolicyTest {
     assertEquals(
       microphone or media,
       T3VoiceForegroundLifecyclePolicy.reconciledServiceTypes(
+        T3VoiceRuntimePhase.ARMING,
+        ready,
+        false,
+      ),
+    )
+    assertEquals(
+      microphone or media,
+      T3VoiceForegroundLifecyclePolicy.reconciledServiceTypes(
         T3VoiceRuntimePhase.RECORDING,
         ready,
         false,

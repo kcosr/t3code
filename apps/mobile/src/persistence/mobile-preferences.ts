@@ -36,6 +36,7 @@ export interface Preferences {
   readonly voiceAudioRouteId?: string;
   readonly voiceAutoListenEnabled?: boolean;
   readonly voiceAutoSubmitEnabled?: boolean;
+  readonly voiceCuesEnabled?: boolean;
   readonly voiceEndSilenceMs?: number;
   readonly voiceNoSpeechTimeoutMs?: number | null;
   readonly voiceMaximumUtteranceMs?: number;
@@ -104,6 +105,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     voiceAudioRouteId?: string;
     voiceAutoListenEnabled?: boolean;
     voiceAutoSubmitEnabled?: boolean;
+    voiceCuesEnabled?: boolean;
     voiceEndSilenceMs?: number;
     voiceNoSpeechTimeoutMs?: number | null;
     voiceMaximumUtteranceMs?: number;
@@ -142,6 +144,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
   }
   if (typeof parsed.voiceAutoSubmitEnabled === "boolean") {
     preferences.voiceAutoSubmitEnabled = parsed.voiceAutoSubmitEnabled;
+  }
+  if (typeof parsed.voiceCuesEnabled === "boolean") {
+    preferences.voiceCuesEnabled = parsed.voiceCuesEnabled;
   }
   if (Number.isFinite(parsed.voiceEndSilenceMs)) {
     preferences.voiceEndSilenceMs = clampVoicePreference(

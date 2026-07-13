@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.update
 internal enum class T3VoiceRuntimePhase {
   INACTIVE,
   IDLE,
+  ARMING,
   RECORDING,
   PLAYING,
   REALTIME,
@@ -32,6 +33,7 @@ internal data class T3VoiceRuntimeState(
   val activeRealtimeSessionId: String?,
   val realtimeConnectionState: String?,
   val realtimeMuted: Boolean,
+  val realtimeInputReady: Boolean,
   val sequence: Long,
 ) {
   fun toEventBody(): Map<String, Any?> =
@@ -43,6 +45,7 @@ internal data class T3VoiceRuntimeState(
       "activeRealtimeSessionId" to activeRealtimeSessionId,
       "realtimeConnectionState" to realtimeConnectionState,
       "realtimeMuted" to realtimeMuted,
+      "realtimeInputReady" to realtimeInputReady,
       "sequence" to sequence.toDouble(),
     )
 }
@@ -178,6 +181,7 @@ internal object T3VoiceStateStore {
         activeRealtimeSessionId = null,
         realtimeConnectionState = null,
         realtimeMuted = false,
+        realtimeInputReady = false,
         sequence = 0,
       ),
     )
@@ -238,6 +242,7 @@ internal object T3VoiceStateStore {
           activeRealtimeSessionId = sessionId,
           realtimeConnectionState = "preparing",
           realtimeMuted = false,
+          realtimeInputReady = false,
           sequence = current.sequence + 1,
         )
       if (mutableState.compareAndSet(current, next)) {
@@ -254,6 +259,7 @@ internal object T3VoiceStateStore {
         activeRealtimeSessionId = null,
         realtimeConnectionState = null,
         realtimeMuted = false,
+        realtimeInputReady = false,
       )
     }
   }
@@ -269,6 +275,7 @@ internal object T3VoiceStateStore {
         activeRealtimeSessionId = null,
         realtimeConnectionState = null,
         realtimeMuted = false,
+        realtimeInputReady = false,
       )
     }
   }
@@ -284,7 +291,7 @@ internal object T3VoiceStateStore {
     return owner.takeIf {
       claimIdle {
         it.copy(
-          phase = T3VoiceRuntimePhase.RECORDING,
+          phase = T3VoiceRuntimePhase.ARMING,
           activeRecordingId = recordingId,
           activeRecordingGeneration = owner.generation,
           activePlaybackId = null,
@@ -292,6 +299,7 @@ internal object T3VoiceStateStore {
           activeRealtimeSessionId = null,
           realtimeConnectionState = null,
           realtimeMuted = false,
+          realtimeInputReady = false,
         )
       }
     }
@@ -308,6 +316,15 @@ internal object T3VoiceStateStore {
         activeRecordingId = null,
         activeRecordingGeneration = null,
       )
+    }
+
+  fun markRecordingStarted(owner: T3VoiceOperationOwner): Boolean =
+    updateIfOperationOwner(
+      owner,
+      T3VoiceRuntimeState::activeRecordingId,
+      T3VoiceRuntimeState::activeRecordingGeneration,
+    ) {
+      it.copy(phase = T3VoiceRuntimePhase.RECORDING)
     }
 
   @Synchronized
@@ -342,6 +359,7 @@ internal object T3VoiceStateStore {
           activeRealtimeSessionId = null,
           realtimeConnectionState = null,
           realtimeMuted = false,
+          realtimeInputReady = false,
         )
       }
     }
@@ -377,7 +395,12 @@ internal object T3VoiceStateStore {
     )
   }
 
-  fun setRealtime(sessionId: String, connectionState: String, muted: Boolean) {
+  fun setRealtime(
+    sessionId: String,
+    connectionState: String,
+    muted: Boolean,
+    inputReady: Boolean,
+  ) {
     updateIfRealtimeOwner(sessionId) {
       it.copy(
         phase = T3VoiceRuntimePhase.REALTIME,
@@ -388,6 +411,7 @@ internal object T3VoiceStateStore {
         activeRealtimeSessionId = sessionId,
         realtimeConnectionState = connectionState,
         realtimeMuted = muted,
+        realtimeInputReady = inputReady,
       )
     }
   }
@@ -401,6 +425,7 @@ internal object T3VoiceStateStore {
           activeRealtimeSessionId = null,
           realtimeConnectionState = connectionState,
           realtimeMuted = false,
+          realtimeInputReady = false,
         )
       }
     if (terminated) mutableRealtimeTermination.value = event
@@ -419,6 +444,7 @@ internal object T3VoiceStateStore {
         activeRealtimeSessionId = null,
         realtimeConnectionState = null,
         realtimeMuted = false,
+        realtimeInputReady = false,
       )
     }
   }

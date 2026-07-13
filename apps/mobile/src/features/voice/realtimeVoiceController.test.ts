@@ -103,6 +103,7 @@ const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
     activeRealtimeSessionId: null,
     realtimeConnectionState: null,
     realtimeMuted: false,
+    realtimeInputReady: false,
     sequence: 0,
   };
   const native = {
@@ -118,6 +119,7 @@ const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
         isForeground: true,
         activeRealtimeSessionId: SESSION_ID,
         realtimeConnectionState: "offer-ready" as const,
+        realtimeInputReady: false,
         sequence: nativeState.sequence + 1,
       };
       return { nativeSessionId: SESSION_ID, sdp: "local-offer" };
@@ -125,9 +127,11 @@ const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
     applyRealtimeAnswerAsync: vi.fn(async () => {
       nativeState = {
         ...nativeState,
-        realtimeConnectionState: "connecting" as const,
+        realtimeConnectionState: "connected" as const,
+        realtimeInputReady: true,
         sequence: nativeState.sequence + 1,
       };
+      listeners.get("stateChanged")?.(nativeState);
     }),
     stopRealtimeSessionAsync: vi.fn(async () => {
       nativeState = {
@@ -136,6 +140,7 @@ const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
         isForeground: false,
         activeRealtimeSessionId: null,
         realtimeConnectionState: "closed" as const,
+        realtimeInputReady: false,
         sequence: nativeState.sequence + 1,
       };
       return true;
@@ -273,6 +278,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: SESSION_ID,
       realtimeConnectionState: "connected",
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 8,
     });
 
@@ -301,6 +307,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: SESSION_ID,
       realtimeConnectionState: "connected",
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 8,
     });
 
@@ -320,6 +327,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: SESSION_ID,
       realtimeConnectionState: "connected" as const,
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 8,
     };
     vi.mocked(native.getStateAsync).mockResolvedValue(nativeActive);
@@ -354,6 +362,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: null,
       realtimeConnectionState: "closed",
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 20,
     });
 
@@ -376,6 +385,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: SESSION_ID,
       realtimeConnectionState: "connected" as const,
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 8,
     };
     vi.mocked(native.getStateAsync)
@@ -405,6 +415,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: SESSION_ID,
       realtimeConnectionState: "connected" as const,
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 8,
     };
     vi.mocked(native.getStateAsync)
@@ -456,6 +467,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: SESSION_ID,
       realtimeConnectionState: "connected",
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 8,
     });
     vi.mocked(client.getSession).mockReturnValue(
@@ -499,6 +511,7 @@ describe("RealtimeVoiceController", () => {
         activeRealtimeSessionId: SESSION_ID,
         realtimeConnectionState: "connected",
         realtimeMuted: false,
+        realtimeInputReady: true,
         sequence: 8,
       });
 
@@ -519,6 +532,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: SESSION_ID,
       realtimeConnectionState: "connected",
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 4,
     });
     vi.mocked(client.getSession).mockReturnValue(Effect.die(new Error("server unavailable")));
@@ -549,6 +563,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: SESSION_ID,
       realtimeConnectionState: "connected",
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 3,
     };
     vi.mocked(native.getStateAsync).mockResolvedValueOnce(staleNative);
@@ -576,6 +591,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: SESSION_ID,
       realtimeConnectionState: "connected",
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 3,
     };
     vi.mocked(native.getStateAsync)
@@ -597,6 +613,7 @@ describe("RealtimeVoiceController", () => {
     expect(native.prepareRealtimeSessionAsync).toHaveBeenCalledWith({
       nativeSessionId: SESSION_ID,
       environmentOrigin: "https://environment.example.test",
+      audioRouteId: "system",
       nativeControlGrant: serverSession.nativeControlGrant,
     });
     expect(client.offerSession).toHaveBeenCalledWith({
@@ -615,6 +632,120 @@ describe("RealtimeVoiceController", () => {
     });
     expect(snapshots).toContain("starting");
     expect(snapshots).toContain("active");
+  });
+
+  it("remains starting until the connected peer finishes its ready cue", async () => {
+    const { controller, emitNative, native } = makeHarness();
+    vi.mocked(native.applyRealtimeAnswerAsync).mockResolvedValue(undefined);
+
+    const starting = controller.start(createInput);
+    await vi.waitFor(() => expect(native.applyRealtimeAnswerAsync).toHaveBeenCalledOnce());
+
+    emitNative("stateChanged", {
+      phase: "realtime",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected",
+      realtimeMuted: false,
+      realtimeInputReady: false,
+      sequence: 2,
+    });
+    expect(controller.getSnapshot().phase).toBe("starting");
+
+    emitNative("stateChanged", {
+      phase: "realtime",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected",
+      realtimeMuted: false,
+      realtimeInputReady: true,
+      sequence: 3,
+    });
+
+    await expect(starting).resolves.toMatchObject({ phase: "active" });
+  });
+
+  it("stops native media immediately while the ready cue is pending", async () => {
+    const { controller, native } = makeHarness();
+    vi.mocked(native.applyRealtimeAnswerAsync).mockResolvedValue(undefined);
+
+    const starting = controller.start(createInput);
+    await vi.waitFor(() => expect(native.applyRealtimeAnswerAsync).toHaveBeenCalledOnce());
+
+    await controller.stop();
+    await expect(starting).resolves.toBeDefined();
+    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledWith({ nativeSessionId: SESSION_ID });
+    expect(controller.getSnapshot()).toMatchObject({ phase: "idle", session: null });
+  });
+
+  it("fails startup immediately when native media terminates during the ready cue", async () => {
+    const { controller, emitNative, native } = makeHarness();
+    vi.mocked(native.applyRealtimeAnswerAsync).mockResolvedValue(undefined);
+
+    const starting = controller.start(createInput);
+    await vi.waitFor(() => expect(native.applyRealtimeAnswerAsync).toHaveBeenCalledOnce());
+    emitNative("stateChanged", {
+      phase: "realtime",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected",
+      realtimeMuted: false,
+      realtimeInputReady: false,
+      sequence: 2,
+    });
+    await Promise.resolve();
+    emitNative("realtimeTerminated", {
+      nativeSessionId: SESSION_ID,
+      outcome: "failed",
+      code: "realtime-connection-failed",
+      retryable: true,
+    });
+
+    await expect(starting).rejects.toThrow(/failed|ended/i);
+    expect(controller.getSnapshot().phase).toBe("error");
+  });
+
+  it("fails adoption immediately when native media terminates before input is ready", async () => {
+    const { controller, emitNative, native } = makeHarness();
+    const connecting: T3VoiceRuntimeState = {
+      phase: "realtime",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected",
+      realtimeMuted: false,
+      realtimeInputReady: false,
+      sequence: 8,
+    };
+    vi.mocked(native.getStateAsync).mockResolvedValue(connecting);
+
+    const adoption = controller.reconcileNativeRuntime();
+    await vi.waitFor(() => expect(controller.getSnapshot().phase).toBe("starting"));
+    await Promise.resolve();
+    emitNative("realtimeTerminated", {
+      nativeSessionId: SESSION_ID,
+      outcome: "failed",
+      code: "realtime-connection-failed",
+      retryable: true,
+    });
+
+    await expect(adoption).rejects.toThrow(/failed|ended/i);
+    emitNative("stateChanged", {
+      ...connecting,
+      phase: "idle",
+      isForeground: false,
+      activeRealtimeSessionId: null,
+      realtimeConnectionState: "closed",
+      sequence: 9,
+    });
+    expect(controller.getSnapshot().native?.activeRealtimeSessionId).toBeNull();
   });
 
   it("requests notification visibility without making denial block startup", async () => {
@@ -665,6 +796,7 @@ describe("RealtimeVoiceController", () => {
         activeRealtimeSessionId: null,
         realtimeConnectionState: null,
         realtimeMuted: false,
+        realtimeInputReady: true,
         sequence: 0,
       })
       .mockResolvedValueOnce({
@@ -675,6 +807,7 @@ describe("RealtimeVoiceController", () => {
         activeRealtimeSessionId: null,
         realtimeConnectionState: "failed",
         realtimeMuted: false,
+        realtimeInputReady: true,
         sequence: 2,
       });
 
@@ -735,6 +868,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: SESSION_ID,
       realtimeConnectionState: "connected" as const,
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 8,
     };
     vi.mocked(native.getStateAsync).mockResolvedValue(nativeActive);
@@ -794,6 +928,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: SESSION_ID,
       realtimeConnectionState: "connected" as const,
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 8,
     };
     emitNative("stateChanged", nativeActive);
@@ -1090,6 +1225,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: null,
       realtimeConnectionState: null,
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 0,
     });
     await Promise.allSettled([start, dispose]);
@@ -1225,6 +1361,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: SESSION_ID,
       realtimeConnectionState: "connected",
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 8,
     });
     vi.mocked(second.client.getSession).mockReturnValue(
@@ -1432,6 +1569,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: null,
       realtimeConnectionState: "failed",
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 2,
     });
     emitNative("realtimeTerminated", {
@@ -1459,6 +1597,7 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: SESSION_ID,
       realtimeConnectionState: "connected",
       realtimeMuted: true,
+      realtimeInputReady: true,
       sequence: 0,
     });
     emitNative("stateChanged", {
@@ -1469,13 +1608,15 @@ describe("RealtimeVoiceController", () => {
       activeRealtimeSessionId: "an-older-session",
       realtimeConnectionState: "connected",
       realtimeMuted: true,
+      realtimeInputReady: true,
       sequence: 3,
     });
 
     expect(controller.getSnapshot().native).toMatchObject({
       activeRealtimeSessionId: SESSION_ID,
-      realtimeConnectionState: "connecting",
+      realtimeConnectionState: "connected",
       realtimeMuted: false,
+      realtimeInputReady: true,
       sequence: 2,
     });
   });

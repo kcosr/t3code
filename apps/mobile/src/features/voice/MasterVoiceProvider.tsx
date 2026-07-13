@@ -285,6 +285,13 @@ export function MasterVoiceProvider(props: {
     nativePermissions.microphone !== null &&
     nativePermissions.notification !== null;
   const preferredAudioRouteId = preferences?.voiceAudioRouteId ?? null;
+
+  useEffect(() => {
+    if (native === null || preferences === null) return;
+    void native
+      .setVoiceCuesEnabledAsync({ enabled: preferences.voiceCuesEnabled !== false })
+      .catch(() => undefined);
+  }, [native, preferences?.voiceCuesEnabled]);
   const preferredAudioRouteIdRef = useRef(preferredAudioRouteId);
   preferredAudioRouteIdRef.current = preferredAudioRouteId;
 
@@ -767,7 +774,11 @@ export function MasterVoiceProvider(props: {
               .catch(() => undefined);
           },
         },
-        { cleanupCoordinator, attachmentStore: realtimeVoiceAttachmentStore },
+        {
+          cleanupCoordinator,
+          attachmentStore: realtimeVoiceAttachmentStore,
+          preferredAudioRouteId: () => preferredAudioRouteIdRef.current ?? "system",
+        },
       );
       try {
         await controller.reconcileNativeRuntime();

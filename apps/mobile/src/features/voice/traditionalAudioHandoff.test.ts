@@ -21,6 +21,7 @@ const idleState = (): T3VoiceRuntimeState => ({
   activeRealtimeSessionId: null,
   realtimeConnectionState: null,
   realtimeMuted: false,
+  realtimeInputReady: false,
   sequence: 1,
 });
 

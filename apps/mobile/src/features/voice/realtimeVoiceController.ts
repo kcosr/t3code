@@ -73,6 +73,7 @@ export interface RealtimeVoiceControllerOptions {
   readonly cleanupCoordinator?: RealtimeServerCleanupCoordinator;
   readonly attachmentStore?: RealtimeVoiceAttachmentStore;
   readonly attachmentOwnerIdFactory?: () => string;
+  readonly preferredAudioRouteId?: () => string;
 }
 
 const defaultScheduler: TimerScheduler = {
@@ -259,7 +260,14 @@ export class RealtimeVoiceController {
   private readonly cleanupCoordinator: RealtimeServerCleanupCoordinator;
   private readonly attachmentStore: RealtimeVoiceAttachmentStore | null;
   private readonly attachmentOwnerIdFactory: () => string;
+  private readonly preferredAudioRouteId: () => string;
   private startInFlight: Promise<void> | null = null;
+  private inputReadyWaiter: {
+    readonly sessionId: string;
+    readonly resolve: (state: T3VoiceRuntimeState) => void;
+    readonly reject: (cause: Error) => void;
+    readonly timeout: ReturnType<typeof globalThis.setTimeout>;
+  } | null = null;
   private detached = false;
   private subscriptionsRemoved = false;
   private controlFailures: Record<ControlOperation, number> = {
@@ -287,6 +295,7 @@ export class RealtimeVoiceController {
       new RealtimeServerCleanupCoordinator(options.serverCleanupTimeoutMs ?? 10_000);
     this.attachmentStore = options.attachmentStore ?? null;
     this.attachmentOwnerIdFactory = options.attachmentOwnerIdFactory ?? defaultAttachmentOwnerId;
+    this.preferredAudioRouteId = options.preferredAudioRouteId ?? (() => "system");
     this.subscriptions = [
       native.addListener("stateChanged", (state) => this.handleNativeState(state)),
       native.addListener("runtimeError", (event) => this.handleNativeError(event)),
@@ -391,6 +400,7 @@ export class RealtimeVoiceController {
         nativeOffer = await this.native.prepareRealtimeSessionAsync({
           nativeSessionId,
           environmentOrigin: this.environmentOrigin,
+          audioRouteId: this.preferredAudioRouteId(),
           nativeControlGrant,
         });
       } finally {
@@ -411,7 +421,7 @@ export class RealtimeVoiceController {
         sdp: answer.sdp,
       });
       this.ensureCurrentStart(generation);
-      const nativeState = await this.native.getStateAsync();
+      const nativeState = await this.waitForInputReady(nativeSessionId);
       this.ensureCurrentStart(generation);
       if (
         nativeState.activeRealtimeSessionId !== nativeSessionId ||
@@ -470,12 +480,19 @@ export class RealtimeVoiceController {
 
   async stop(): Promise<void> {
     const startInFlight = this.startInFlight;
+    const startingNativeSessionId = this.startingNativeSessionId;
     const generation = ++this.startGeneration;
+    this.cancelInputReadyWaiter("Realtime voice session start was cancelled");
     this.startingNativeSessionId = null;
     this.clearControlTimers();
     const active = this.active;
     this.active = null;
     if (active === null) {
+      if (startingNativeSessionId !== null) {
+        await this.native
+          .stopRealtimeSessionAsync({ nativeSessionId: startingNativeSessionId })
+          .catch(() => undefined);
+      }
       await startInFlight;
       const nativeSessionId = this.snapshot.native?.activeRealtimeSessionId ?? null;
       if (nativeSessionId === null) {
@@ -671,6 +688,7 @@ export class RealtimeVoiceController {
     const preserveActiveSnapshot = this.active !== null;
     this.detached = true;
     this.startGeneration += 1;
+    this.cancelInputReadyWaiter("Realtime controller detached");
     this.startingNativeSessionId = null;
     this.clearControlTimers();
     this.removeSubscriptions();
@@ -736,11 +754,67 @@ export class RealtimeVoiceController {
   private handleNativeState(state: T3VoiceRuntimeState) {
     const currentSequence = this.snapshot.native?.sequence ?? -1;
     if (state.sequence < currentSequence) return;
+    const waiter = this.inputReadyWaiter;
+    if (
+      waiter !== null &&
+      (state.activeRealtimeSessionId !== waiter.sessionId ||
+        state.realtimeConnectionState === "failed" ||
+        state.realtimeConnectionState === "closed")
+    ) {
+      this.cancelInputReadyWaiter("The Realtime media session ended during startup");
+    }
     const expectedSessionId = this.active?.nativeSessionId ?? this.startingNativeSessionId;
     if (expectedSessionId !== null && state.activeRealtimeSessionId !== expectedSessionId) {
       return;
     }
     this.setSnapshot({ native: state });
+    if (
+      waiter !== null &&
+      this.inputReadyWaiter === waiter &&
+      state.activeRealtimeSessionId === waiter.sessionId &&
+      state.realtimeConnectionState === "connected" &&
+      state.realtimeInputReady
+    ) {
+      this.inputReadyWaiter = null;
+      globalThis.clearTimeout(waiter.timeout);
+      waiter.resolve(state);
+    }
+  }
+
+  private async waitForInputReady(nativeSessionId: string): Promise<T3VoiceRuntimeState> {
+    const current = await this.native.getStateAsync();
+    if (
+      current.activeRealtimeSessionId === nativeSessionId &&
+      current.realtimeConnectionState === "connected" &&
+      current.realtimeInputReady
+    ) {
+      return current;
+    }
+    if (current.activeRealtimeSessionId !== nativeSessionId) {
+      throw new Error("The Realtime media session ended during startup");
+    }
+    this.cancelInputReadyWaiter("Realtime voice readiness was replaced");
+    const ready = new Promise<T3VoiceRuntimeState>((resolve, reject) => {
+      const timeout = globalThis.setTimeout(() => {
+        if (this.inputReadyWaiter?.sessionId !== nativeSessionId) return;
+        this.inputReadyWaiter = null;
+        reject(new Error("The Realtime microphone did not become ready"));
+      }, 20_000);
+      this.inputReadyWaiter = { sessionId: nativeSessionId, resolve, reject, timeout };
+    });
+    void this.native.getStateAsync().then(
+      (state) => this.handleNativeState(state),
+      () => undefined,
+    );
+    return ready;
+  }
+
+  private cancelInputReadyWaiter(message: string) {
+    const waiter = this.inputReadyWaiter;
+    if (waiter === null) return;
+    this.inputReadyWaiter = null;
+    globalThis.clearTimeout(waiter.timeout);
+    waiter.reject(new Error(message));
   }
 
   private handleNativeError(event: T3VoiceRuntimeErrorEvent) {
@@ -751,7 +825,15 @@ export class RealtimeVoiceController {
 
   private handleNativeTermination(event: T3VoiceRealtimeTerminatedEvent) {
     const active = this.active;
-    if (active === null || event.nativeSessionId !== active.nativeSessionId) return;
+    if (active === null) {
+      const startingSessionId =
+        this.startingNativeSessionId ?? this.inputReadyWaiter?.sessionId ?? null;
+      if (event.nativeSessionId === startingSessionId) {
+        this.cancelInputReadyWaiter(nativeTerminationMessage(event.code, event.retryable));
+      }
+      return;
+    }
+    if (event.nativeSessionId !== active.nativeSessionId) return;
     void this.closeServerAfterNativeTermination(
       active,
       event.outcome === "ended" ? null : nativeTerminationMessage(event.code, event.retryable),
@@ -871,7 +953,8 @@ export class RealtimeVoiceController {
       }
       const after = await this.native.getStateAsync();
       if (after.activeRealtimeSessionId !== null) {
-        const cause = stopFailure ?? new Error("The stale Realtime media session could not be stopped");
+        const cause =
+          stopFailure ?? new Error("The stale Realtime media session could not be stopped");
         this.setSnapshot({
           native: after,
           phase: "error",
@@ -919,7 +1002,7 @@ export class RealtimeVoiceController {
       await this.clearAttachment(active.sessionId, active.attachmentOwnerId);
       return;
     }
-    const confirmed = await this.native.getStateAsync();
+    let confirmed = await this.native.getStateAsync();
     if (this.detached || generation !== this.startGeneration) {
       await this.clearAttachment(active.sessionId, active.attachmentOwnerId);
       return;
@@ -939,6 +1022,20 @@ export class RealtimeVoiceController {
       });
       if (replacementCause !== null) throw replacementCause;
       return;
+    }
+    if (!confirmed.realtimeInputReady) {
+      this.startingNativeSessionId = nativeSessionId;
+      try {
+        confirmed = await this.waitForInputReady(nativeSessionId);
+      } finally {
+        if (this.startingNativeSessionId === nativeSessionId) {
+          this.startingNativeSessionId = null;
+        }
+      }
+      if (this.detached || generation !== this.startGeneration) {
+        await this.clearAttachment(active.sessionId, active.attachmentOwnerId);
+        return;
+      }
     }
     this.active = active;
     this.resetControlFailures();

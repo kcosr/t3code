@@ -4,7 +4,13 @@ export interface T3VoiceEventSubscription {
   readonly remove: () => void;
 }
 
-export type T3VoiceRuntimePhase = "inactive" | "idle" | "recording" | "playing" | "realtime";
+export type T3VoiceRuntimePhase =
+  | "inactive"
+  | "idle"
+  | "arming"
+  | "recording"
+  | "playing"
+  | "realtime";
 
 export type T3VoiceRealtimeConnectionState =
   | "preparing"
@@ -23,6 +29,7 @@ export interface T3VoiceRuntimeState {
   readonly activeRealtimeSessionId: string | null;
   readonly realtimeConnectionState: T3VoiceRealtimeConnectionState | null;
   readonly realtimeMuted: boolean;
+  readonly realtimeInputReady: boolean;
   readonly sequence: number;
 }
 
@@ -311,6 +318,7 @@ export interface T3VoiceRealtimeIdentifier {
 
 export interface T3VoiceRealtimePrepareInput extends T3VoiceRealtimeIdentifier {
   readonly environmentOrigin: string;
+  readonly audioRouteId: string;
   readonly nativeControlGrant: {
     readonly token: string;
     readonly sessionId: string;
@@ -477,6 +485,7 @@ export interface T3VoiceNativeModule {
   readonly setReadinessSnapshotAsync: (
     input: T3VoiceReadinessSnapshot,
   ) => Promise<T3VoicePersistedReadinessSnapshot>;
+  readonly setVoiceCuesEnabledAsync: (input: { readonly enabled: boolean }) => Promise<void>;
   readonly registerVoiceControllerAsync: (input: T3VoiceControllerRegistration) => Promise<void>;
   readonly unregisterVoiceControllerAsync: (input: T3VoiceControllerRegistration) => Promise<void>;
   readonly getPendingVoiceCommandAsync: () => Promise<T3VoiceCommandEvent | null>;

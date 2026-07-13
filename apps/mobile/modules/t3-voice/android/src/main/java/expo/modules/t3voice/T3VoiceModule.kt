@@ -191,7 +191,7 @@ class T3VoiceModule : Module() {
       )
 
       Constants(
-        "nativeRevision" to 11,
+        "nativeRevision" to 12,
       )
 
       OnCreate {
@@ -443,6 +443,15 @@ class T3VoiceModule : Module() {
         }
       }
 
+      AsyncFunction("setVoiceCuesEnabledAsync") { input: Map<String, Any>, promise: Promise ->
+        requireExactKeys(input, setOf("enabled"))
+        val enabled = input["enabled"] as? Boolean ?: error("enabled must be a boolean.")
+        withBinder(promise, "voice-cue-settings-update-failed") { service, settlement ->
+          service.setVoiceCuesEnabled(enabled)
+          settlement.resolve()
+        }
+      }
+
       AsyncFunction("registerVoiceControllerAsync") { input: Map<String, Any>, promise: Promise ->
         requireExactKeys(input, setOf("controllerGeneration"))
         val generation = requireLong(input, "controllerGeneration")
@@ -689,8 +698,13 @@ class T3VoiceModule : Module() {
       }
 
       AsyncFunction("prepareRealtimeSessionAsync") { input: Map<String, Any>, promise: Promise ->
+        requireExactKeys(
+          input,
+          setOf("nativeSessionId", "environmentOrigin", "audioRouteId", "nativeControlGrant"),
+        )
         val nativeSessionId = requireIdentifier(input, "nativeSessionId")
         val environmentOrigin = requireText(input, "environmentOrigin", 2_048)
+        val audioRouteId = requireText(input, "audioRouteId", 64)
         @Suppress("UNCHECKED_CAST")
         val grantInput =
           input["nativeControlGrant"] as? Map<String, Any>
@@ -746,6 +760,7 @@ class T3VoiceModule : Module() {
             voice.prepareRealtimeSession(
               nativeSessionId,
               environmentOrigin,
+              audioRouteId,
               nativeControlGrant,
               object : T3VoiceWebRtcResultCallback<String> {
                 override fun onSuccess(result: String) {

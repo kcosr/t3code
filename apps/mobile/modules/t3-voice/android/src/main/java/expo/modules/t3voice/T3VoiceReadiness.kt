@@ -487,6 +487,9 @@ internal object T3VoiceForegroundLifecyclePolicy {
     when (phase) {
       T3VoiceRuntimePhase.RECORDING ->
         android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+      T3VoiceRuntimePhase.ARMING ->
+        android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+          android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
       T3VoiceRuntimePhase.PLAYING ->
         android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
       T3VoiceRuntimePhase.REALTIME ->

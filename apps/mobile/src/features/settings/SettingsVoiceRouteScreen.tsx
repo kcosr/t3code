@@ -198,6 +198,13 @@ export function SettingsVoiceRouteScreen() {
             value={stored.threadSpeechEnabled === true}
             onValueChange={(value) => savePreferences({ threadSpeechEnabled: value })}
           />
+          <SettingsSwitchRow
+            disabled={!ready}
+            icon="bell"
+            label="Voice cues"
+            value={voice.cuesEnabled}
+            onValueChange={(value) => savePreferences({ voiceCuesEnabled: value })}
+          />
         </SettingsSection>
 
         {Platform.OS === "android" ? (

@@ -32,7 +32,7 @@ internal interface T3VoiceWebRtcResultCallback<T> {
 
 internal class T3VoiceWebRtcSession(
   context: Context,
-  private val onStateChanged: (String, String, Boolean) -> Unit,
+  private val onStateChanged: (String, String, Boolean, Boolean) -> Unit,
   private val onRouteChanged: (String, T3VoiceAudioRouteChange) -> Unit,
   private val onError: (String, String, String, Boolean) -> Unit,
   private val onTerminated: (String, String, String, Boolean, Long) -> Unit,
@@ -40,6 +40,7 @@ internal class T3VoiceWebRtcSession(
   private data class ActiveSession(
     val sessionId: String,
     val diagnosticGeneration: Long,
+    val audioRouteId: String,
     val audioOwner: T3VoiceRealtimeAudioOwnerPolicy.Owner,
     val audioDeviceModule: JavaAudioDeviceModule,
     val peerConnectionFactory: PeerConnectionFactory,
@@ -125,8 +126,8 @@ internal class T3VoiceWebRtcSession(
           .createPeerConnectionFactory()
       audioSource = peerConnectionFactory.createAudioSource(audioConstraints())
       audioTrack = peerConnectionFactory.createAudioTrack(LOCAL_AUDIO_TRACK_ID, audioSource)
-      audioTrack.setEnabled(true)
-      check(audioTrack.enabled()) { "WebRTC could not enable the microphone track." }
+      audioTrack.setEnabled(false)
+      audioDeviceModule.setMicrophoneMute(true)
       peerConnection =
         peerConnectionFactory.createPeerConnection(
           rtcConfiguration(),
@@ -135,8 +136,8 @@ internal class T3VoiceWebRtcSession(
       check(peerConnection.addTrack(audioTrack, listOf(LOCAL_MEDIA_STREAM_ID)) != null) {
         "WebRTC could not attach the microphone track."
       }
-      peerConnection.setAudioPlayout(true)
-      peerConnection.setAudioRecording(true)
+      peerConnection.setAudioPlayout(false)
+      peerConnection.setAudioRecording(false)
       dataChannel =
         peerConnection.createDataChannel(
           DATA_CHANNEL_LABEL,
@@ -167,6 +168,7 @@ internal class T3VoiceWebRtcSession(
   fun prepare(
     sessionId: String,
     diagnosticGeneration: Long,
+    audioRouteId: String,
     callback: T3VoiceWebRtcResultCallback<String>,
   ) {
     require(sessionId.isNotBlank()) { "nativeSessionId must be a non-empty string." }
@@ -193,6 +195,7 @@ internal class T3VoiceWebRtcSession(
           ActiveSession(
             sessionId = sessionId,
             diagnosticGeneration = diagnosticGeneration,
+            audioRouteId = audioRouteId,
             audioOwner = audioOwner,
             audioDeviceModule = prepared.audioDeviceModule,
             peerConnectionFactory = prepared.peerConnectionFactory,
@@ -228,19 +231,7 @@ internal class T3VoiceWebRtcSession(
         throw cause
       }
     try {
-      val routerStart = audioRouter.start()
-      check(routerStart.transition.state != T3VoiceAudioFocusState.TERMINATED) {
-        "Android denied Realtime audio focus."
-      }
-      T3VoiceDiagnostics.record(
-        diagnosticGeneration,
-        T3VoiceDiagnosticCategory.FOCUS,
-        T3VoiceDiagnosticCode.AUDIO_FOCUS_GRANTED,
-      )
-      synchronized(lock) {
-        active?.takeIf { it === session }?.audioRouterGeneration = routerStart.ownerGeneration
-      }
-      onStateChanged(sessionId, STATE_PREPARING, false)
+      onStateChanged(sessionId, STATE_PREPARING, false, false)
       peerConnection.createOffer(OfferObserver(sessionId), offerConstraints())
     } catch (cause: Throwable) {
       fail(
@@ -269,7 +260,8 @@ internal class T3VoiceWebRtcSession(
         armConnectionTimeout(session)
         session.peerConnection
       }
-    onStateChanged(sessionId, STATE_CONNECTING, isMuted(sessionId))
+    val capture = captureState(sessionId)
+    onStateChanged(sessionId, STATE_CONNECTING, capture.userMuted, capture.inputReady)
     try {
       peer.setRemoteDescription(
         object : BaseSdpObserver() {
@@ -331,9 +323,25 @@ internal class T3VoiceWebRtcSession(
         val session = requireActive(sessionId)
         session.captureState = T3VoiceCapturePolicy.setUserMuted(session.captureState, muted)
         applyCaptureState(session)
-        connectionStateFor(session) to effectiveMuted(session)
+        Triple(connectionStateFor(session), session.captureState.userMuted, session.captureState.inputReady)
       }
-    onStateChanged(sessionId, update.first, update.second)
+    onStateChanged(sessionId, update.first, update.second, update.third)
+  }
+
+  fun setInputReady(sessionId: String, ready: Boolean) {
+    val update =
+      synchronized(lock) {
+        val session = requireActive(sessionId)
+        if (ready) {
+          check(session.peerConnection.connectionState() == PeerConnection.PeerConnectionState.CONNECTED) {
+            "Realtime input cannot become ready before the peer is connected."
+          }
+        }
+        session.captureState = T3VoiceCapturePolicy.setInputReady(session.captureState, ready)
+        applyCaptureState(session)
+        Triple(connectionStateFor(session), session.captureState.userMuted, session.captureState.inputReady)
+      }
+    onStateChanged(sessionId, update.first, update.second, update.third)
   }
 
   fun routes(): List<Map<String, Any>> = audioRouter.routes().map(T3VoiceAudioRoute::toResultBody)
@@ -395,7 +403,7 @@ internal class T3VoiceWebRtcSession(
         session.diagnosticGeneration,
       )
     }
-    onStateChanged(sessionId, STATE_CLOSED, effectiveMuted(session))
+    onStateChanged(sessionId, STATE_CLOSED, session.captureState.userMuted, false)
     return true
   }
 
@@ -452,12 +460,17 @@ internal class T3VoiceWebRtcSession(
             session.offerTimeout = null
             val callback = session.offerCallback
             session.offerCallback = null
-            Triple(callback, description, effectiveMuted(session))
+            Triple(callback, description, session.captureState)
           }
         }
       }
     if (result != null) {
-      onStateChanged(sessionId, STATE_OFFER_READY, result.third)
+      onStateChanged(
+        sessionId,
+        STATE_OFFER_READY,
+        result.third.userMuted,
+        result.third.inputReady,
+      )
       result.first?.onSuccess(result.second)
     }
   }
@@ -492,6 +505,34 @@ internal class T3VoiceWebRtcSession(
       )
       return
     }
+    if (state == PeerConnection.PeerConnectionState.CONNECTED) {
+      val routeSetup =
+        runCatching {
+          synchronized(lock) {
+            val session = active?.takeIf { it.sessionId == sessionId } ?: return
+            val routerStart = audioRouter.start()
+            check(routerStart.transition.state != T3VoiceAudioFocusState.TERMINATED) {
+              "Android denied Realtime audio focus."
+            }
+            runCatching { audioRouter.select(session.audioRouteId, routerStart.ownerGeneration) }
+              .onFailure {
+                audioRouter.select(T3VoiceAudioRouteKind.SYSTEM.id, routerStart.ownerGeneration)
+              }
+            session.audioRouterGeneration = routerStart.ownerGeneration
+            session.peerConnection.setAudioPlayout(true)
+          }
+        }
+      if (routeSetup.isFailure) {
+        fail(
+          sessionId,
+          ERROR_AUDIO_FOCUS_FAILED,
+          "Realtime audio routing could not start.",
+          routeSetup.exceptionOrNull(),
+          true,
+        )
+        return
+      }
+    }
     val stateUpdate =
       synchronized(lock) {
         val session = active?.takeIf { it.sessionId == sessionId } ?: return
@@ -500,7 +541,7 @@ internal class T3VoiceWebRtcSession(
           PeerConnection.PeerConnectionState.DISCONNECTED -> armDisconnectedTimeout(session)
           else -> Unit
         }
-        effectiveMuted(session) to session.diagnosticGeneration
+        Triple(session.captureState, session.diagnosticGeneration, normalized)
       }
     if (state == PeerConnection.PeerConnectionState.CONNECTED) {
       T3VoiceDiagnostics.record(
@@ -514,7 +555,12 @@ internal class T3VoiceWebRtcSession(
         T3VoiceDiagnosticCode.PEER_CONNECTED,
       )
     }
-    onStateChanged(sessionId, normalized, stateUpdate.first)
+    onStateChanged(
+      sessionId,
+      stateUpdate.third,
+      stateUpdate.first.userMuted,
+      stateUpdate.first.inputReady,
+    )
   }
 
   private fun handleAudioFocusActions(actions: List<T3VoiceAudioFocusAction>) {
@@ -569,13 +615,16 @@ internal class T3VoiceWebRtcSession(
       if (focusMuted || focusResumed) {
         val currentConnectionState = runCatching { connectionState(session.sessionId) }.getOrNull()
           ?: return
+        val capture =
+          synchronized(lock) {
+            if (active !== session) return
+            session.captureState
+          }
         onStateChanged(
           session.sessionId,
           currentConnectionState,
-          synchronized(lock) {
-            if (active !== session) return
-            effectiveMuted(session)
-          },
+          capture.userMuted,
+          capture.inputReady,
         )
       }
     }
@@ -716,7 +765,7 @@ internal class T3VoiceWebRtcSession(
         session.diagnosticGeneration,
       )
     }
-    onStateChanged(session.sessionId, STATE_FAILED, effectiveMuted(session))
+    onStateChanged(session.sessionId, STATE_FAILED, session.captureState.userMuted, false)
   }
 
   private fun releaseSession(session: ActiveSession) {
@@ -780,12 +829,14 @@ internal class T3VoiceWebRtcSession(
     val muted = effectiveMuted(session)
     session.audioTrack.setEnabled(!muted)
     session.audioDeviceModule.setMicrophoneMute(muted)
-    session.peerConnection.setAudioRecording(!session.captureState.focusSuspended)
+    session.peerConnection.setAudioRecording(
+      session.captureState.inputReady && !session.captureState.focusSuspended,
+    )
     check(session.audioTrack.enabled() == !muted) { "WebRTC microphone state did not change." }
   }
 
-  private fun isMuted(sessionId: String): Boolean =
-    synchronized(lock) { effectiveMuted(requireActive(sessionId)) }
+  private fun captureState(sessionId: String): T3VoiceCaptureState =
+    synchronized(lock) { requireActive(sessionId).captureState }
 
   private fun connectionState(sessionId: String): String {
     val session = synchronized(lock) { requireActive(sessionId) }
