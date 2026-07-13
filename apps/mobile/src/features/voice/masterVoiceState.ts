@@ -210,6 +210,20 @@ export function shouldRetireUnresolvableNativeVoiceOwner(input: {
   );
 }
 
+export async function refreshMasterVoiceForeground(input: {
+  readonly refreshPermissions: () => Promise<void>;
+  readonly refreshOwnership: () => Promise<unknown>;
+  readonly reconcileRuntime: () => Promise<void>;
+  readonly onPermissionsUnavailable: () => void;
+}): Promise<void> {
+  const [permissions] = await Promise.allSettled([
+    input.refreshPermissions(),
+    input.refreshOwnership(),
+    input.reconcileRuntime(),
+  ]);
+  if (permissions.status === "rejected") input.onPermissionsUnavailable();
+}
+
 export interface NativeRealtimeOwnerState {
   readonly checked: boolean;
   readonly sequence: number;

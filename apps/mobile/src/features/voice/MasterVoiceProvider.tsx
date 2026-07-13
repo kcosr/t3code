@@ -87,6 +87,7 @@ import {
   newVoiceConversationSelection,
   nextVoiceThreadTarget,
   reconcileMasterVoiceFocus,
+  refreshMasterVoiceForeground,
   resumeVoiceConversationSelection,
   acceptNativeRealtimeOwnerState,
   restoreMasterVoiceAttachment,
@@ -448,7 +449,7 @@ export function MasterVoiceProvider(props: {
       );
       return sessionId;
     };
-    const reconcileForegroundRuntime = async (nativeSessionId: string | null) => {
+    const reconcileForegroundRuntime = async () => {
       if (disposed) return;
       const runtime = runtimeRef.current;
       if (runtime === null) return;
@@ -456,7 +457,7 @@ export function MasterVoiceProvider(props: {
       if (phase === "starting" || phase === "stopping") return;
       await runtime.controller.reconcileNativeRuntime();
     };
-    const refresh = async () => {
+    const refreshPermissions = async () => {
       const [microphone, notification] = await Promise.all([
         native.getMicrophonePermissionAsync(),
         native.getNotificationPermissionAsync(),
@@ -467,14 +468,17 @@ export function MasterVoiceProvider(props: {
           notification: notification.granted,
         });
       }
-      return refreshOwnership();
     };
-    const refreshAndReconcile = () =>
-      refresh()
-        .then((sessionId) => reconcileForegroundRuntime(sessionId).catch(() => undefined))
-        .catch(() => {
+    const refreshAndReconcile = () => {
+      void refreshMasterVoiceForeground({
+        refreshPermissions,
+        refreshOwnership,
+        reconcileRuntime: reconcileForegroundRuntime,
+        onPermissionsUnavailable: () => {
           if (!disposed) setNativePermissions({ microphone: null, notification: null });
-        });
+        },
+      });
+    };
     void refreshAndReconcile();
     const subscription = AppState.addEventListener("change", (state) => {
       if (state === "active") void refreshAndReconcile();
@@ -482,7 +486,7 @@ export function MasterVoiceProvider(props: {
     const nativeStateSubscription = native.addListener("stateChanged", (state) => {
       if (disposed) return;
       acceptState(state);
-      void refreshOwnership().then(reconcileForegroundRuntime).catch(() => undefined);
+      refreshAndReconcile();
     });
     return () => {
       disposed = true;

@@ -366,6 +366,75 @@ describe("RealtimeVoiceController", () => {
     await vi.waitFor(() => expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1));
   });
 
+  it("does not create a session when native ownership changes at final adoption", async () => {
+    const { client, controller, native } = makeHarness();
+    const nativeActive = {
+      phase: "realtime" as const,
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected" as const,
+      realtimeMuted: false,
+      sequence: 8,
+    };
+    vi.mocked(native.getStateAsync)
+      .mockResolvedValueOnce(nativeActive)
+      .mockResolvedValueOnce(nativeActive)
+      .mockResolvedValueOnce({
+        ...nativeActive,
+        activeRealtimeSessionId: "replacement",
+        sequence: 9,
+      });
+
+    await expect(controller.start(createInput)).rejects.toThrow(
+      "The native Realtime session changed during attachment",
+    );
+
+    expect(controller.getSnapshot().phase).toBe("error");
+    expect(client.createSession).not.toHaveBeenCalled();
+  });
+
+  it("does not let a stale adoption rejection overwrite a completed stop", async () => {
+    const { client, controller, native } = makeHarness();
+    const nativeActive = {
+      phase: "realtime" as const,
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected" as const,
+      realtimeMuted: false,
+      sequence: 8,
+    };
+    vi.mocked(native.getStateAsync)
+      .mockResolvedValueOnce(nativeActive)
+      .mockResolvedValue({
+        ...nativeActive,
+        phase: "idle",
+        activeRealtimeSessionId: null,
+        realtimeConnectionState: "closed",
+        sequence: 9,
+      });
+    let rejectSession!: (cause: Error) => void;
+    vi.mocked(client.getSession).mockReturnValue(
+      Effect.promise(
+        () =>
+          new Promise<typeof serverSession.state>((_resolve, reject) => {
+            rejectSession = reject;
+          }),
+      ),
+    );
+
+    const adoption = controller.reconcileNativeRuntime();
+    await vi.waitFor(() => expect(controller.getSnapshot().phase).toBe("starting"));
+    const stopping = controller.stop();
+    rejectSession(new Error("late server rejection"));
+    await Promise.all([adoption, stopping]);
+
+    expect(controller.getSnapshot()).toMatchObject({ phase: "idle", error: null });
+  });
+
   it("recreates after a crash from the durable consumed cursor and focus", async () => {
     const attachments = makeAttachmentStore({
       ownerId: "previous-owner",

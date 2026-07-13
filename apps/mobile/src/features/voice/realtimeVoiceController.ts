@@ -852,6 +852,7 @@ export class RealtimeVoiceController {
     try {
       state = await Effect.runPromise(this.client.getSession(sessionId));
     } catch (cause) {
+      if (this.detached || generation !== this.startGeneration) return;
       this.setSnapshot({
         phase: "error",
         session: null,
@@ -925,16 +926,18 @@ export class RealtimeVoiceController {
     }
     if (confirmed.activeRealtimeSessionId !== nativeSessionId) {
       await this.clearAttachment(active.sessionId, active.attachmentOwnerId);
+      const replacementCause =
+        confirmed.activeRealtimeSessionId === null
+          ? null
+          : new Error("The native Realtime session changed during attachment");
       this.setSnapshot({
         native: confirmed,
-        phase: confirmed.activeRealtimeSessionId === null ? "idle" : "error",
+        phase: replacementCause === null ? "idle" : "error",
         session: null,
-        error:
-          confirmed.activeRealtimeSessionId === null
-            ? null
-            : "The native Realtime session changed during attachment",
+        error: replacementCause?.message ?? null,
         focus: null,
       });
+      if (replacementCause !== null) throw replacementCause;
       return;
     }
     this.active = active;

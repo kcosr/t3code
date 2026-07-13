@@ -5,7 +5,7 @@ import {
   VoiceConversationId,
   type VoiceConversationSummary,
 } from "@t3tools/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   acceptNativeRealtimeOwnerState,
@@ -16,6 +16,7 @@ import {
   masterVoiceControllerEnvironmentId,
   nextVoiceThreadTarget,
   reconcileMasterVoiceFocus,
+  refreshMasterVoiceForeground,
   restoreMasterVoiceAttachment,
   shouldRetireUnresolvableNativeVoiceOwner,
   shouldRevokeUnavailableVoiceEnvironment,
@@ -78,6 +79,27 @@ const conversation = (
 });
 
 describe("master voice state", () => {
+  it.each(["permissions", "ownership"] as const)(
+    "reconciles the runtime when %s refresh fails",
+    async (failure) => {
+      const reconciled = vi.fn(async () => undefined);
+      const permissionsUnavailable = vi.fn();
+
+      await refreshMasterVoiceForeground({
+        refreshPermissions: async () => {
+          if (failure === "permissions") throw new Error("permissions unavailable");
+        },
+        refreshOwnership: async () => {
+          if (failure === "ownership") throw new Error("ownership unavailable");
+        },
+        reconcileRuntime: reconciled,
+        onPermissionsUnavailable: permissionsUnavailable,
+      });
+
+      expect(reconciled).toHaveBeenCalledOnce();
+      expect(permissionsUnavailable).toHaveBeenCalledTimes(failure === "permissions" ? 1 : 0);
+    },
+  );
   it("rejects an older native owner observation", () => {
     const current = {
       checked: true,
