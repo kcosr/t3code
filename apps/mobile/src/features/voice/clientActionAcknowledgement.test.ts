@@ -4,6 +4,7 @@ import {
   acknowledgeClientActionWithRetry,
   clientActionAcknowledgementInput,
   executeThreadActivation,
+  isPendingVoiceEventLive,
   type ClientActionAcknowledgementInput,
 } from "./clientActionAcknowledgement";
 
@@ -106,5 +107,15 @@ describe("client action acknowledgement", () => {
       outcome: "failed",
       message: "navigation failed",
     });
+  });
+
+  it("executes only pending events with a valid future deadline", () => {
+    expect(
+      isPendingVoiceEventLive("2026-07-12T18:00:01.000Z", Date.parse("2026-07-12T18:00:00Z")),
+    ).toBe(true);
+    expect(
+      isPendingVoiceEventLive("2026-07-12T18:00:00.000Z", Date.parse("2026-07-12T18:00:00Z")),
+    ).toBe(false);
+    expect(isPendingVoiceEventLive("invalid", Date.parse("2026-07-12T18:00:00Z"))).toBe(false);
   });
 });

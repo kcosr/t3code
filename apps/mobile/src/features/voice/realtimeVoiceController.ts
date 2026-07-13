@@ -242,6 +242,8 @@ export class RealtimeVoiceController {
   private nativeRuntimeReconciliation: Promise<void> | null = null;
   private readonly cleanupCoordinator: RealtimeServerCleanupCoordinator;
   private startInFlight: Promise<void> | null = null;
+  private detached = false;
+  private subscriptionsRemoved = false;
   private controlFailures: Record<ControlOperation, number> = {
     events: 0,
   };
@@ -281,6 +283,9 @@ export class RealtimeVoiceController {
   }
 
   reconcileNativeRuntime(): Promise<void> {
+    if (this.detached) {
+      return Promise.reject(new Error("Cannot reconcile a detached Realtime controller"));
+    }
     if (this.active !== null || this.snapshot.phase === "starting") {
       return Promise.reject(new Error("Cannot reconcile native media during an active session"));
     }
@@ -300,6 +305,7 @@ export class RealtimeVoiceController {
   }
 
   async start(input: VoiceSessionCreateInput): Promise<RealtimeVoiceControllerSnapshot> {
+    if (this.detached) throw new Error("Cannot start a detached Realtime controller");
     if (this.startInFlight !== null) {
       throw new Error("A Realtime voice session is already starting");
     }
@@ -516,6 +522,7 @@ export class RealtimeVoiceController {
   }
 
   async refreshEvents(): Promise<void> {
+    if (this.detached) return;
     const active = this.active;
     if (active === null || this.refreshInFlight) return;
     this.refreshInFlight = true;
@@ -523,7 +530,7 @@ export class RealtimeVoiceController {
       const result = await Effect.runPromise(
         this.client.sessionEvents(active.sessionId, active.afterSequence),
       );
-      if (this.active !== active) return;
+      if (this.detached || this.active !== active) return;
       const terminalHandoff = result.events.some(
         (event) => event.type === "client-action" && event.action === "handoff-to-thread-voice",
       );
@@ -562,7 +569,21 @@ export class RealtimeVoiceController {
   async dispose(): Promise<void> {
     await this.stop();
     await this.cleanupCoordinator.settled();
-    this.subscriptions.forEach((subscription) => subscription.remove());
+    this.removeSubscriptions();
+  }
+
+  async detach(): Promise<void> {
+    if (this.detached) return;
+    this.detached = true;
+    this.startGeneration += 1;
+    this.startingNativeSessionId = null;
+    this.clearControlTimers();
+    this.removeSubscriptions();
+    const reconciliation = this.nativeRuntimeReconciliation;
+    await Promise.all([
+      this.startInFlight ?? Promise.resolve(),
+      reconciliation?.catch(() => undefined) ?? Promise.resolve(),
+    ]);
   }
 
   private startControlTimers() {
@@ -703,33 +724,57 @@ export class RealtimeVoiceController {
 
   private async reconcileNativeRuntimeOnce(): Promise<void> {
     const before = await this.native.getStateAsync();
+    if (this.detached) return;
     this.setSnapshot({ native: before });
     const nativeSessionId = before.activeRealtimeSessionId;
     if (nativeSessionId === null) return;
 
     const sessionId = VoiceSessionId.make(nativeSessionId);
-    const closeServer = async () => {
+    const state = await Effect.runPromise(this.client.getSession(sessionId));
+    if (this.detached) return;
+    if (state.phase === "ended" || state.phase === "error") {
+      let stopFailure: unknown = null;
       try {
-        const state = await Effect.runPromise(this.client.getSession(sessionId));
-        await Effect.runPromise(this.client.closeSession(sessionId, state.leaseGeneration));
-      } catch {
-        // The native peer must still be stopped when its original environment or auth is unavailable.
+        await this.native.stopRealtimeSessionAsync({ nativeSessionId });
+      } catch (cause) {
+        stopFailure = cause;
       }
-    };
-
-    let stopFailure: unknown = null;
-    try {
-      await this.native.stopRealtimeSessionAsync({ nativeSessionId });
-    } catch (cause) {
-      stopFailure = cause;
+      const after = await this.native.getStateAsync();
+      this.setSnapshot({ native: after });
+      if (after.activeRealtimeSessionId !== null) {
+        throw stopFailure ?? new Error("The stale Realtime media session could not be stopped");
+      }
+      return;
     }
-    await closeServer();
 
     const after = await this.native.getStateAsync();
+    if (this.detached) return;
     this.setSnapshot({ native: after });
-    if (after.activeRealtimeSessionId !== null) {
-      throw stopFailure ?? new Error("The orphaned Realtime media session could not be stopped");
+    if (after.activeRealtimeSessionId === null) return;
+    if (after.activeRealtimeSessionId !== nativeSessionId) {
+      throw new Error("The native Realtime session changed during attachment");
     }
+
+    const active: ActiveSession = {
+      sessionId: state.sessionId,
+      nativeSessionId,
+      leaseGeneration: state.leaseGeneration,
+      serverState: state,
+      // Native may have received server events while React was suspended. Replaying from the
+      // beginning avoids creating an observation gap during attachment.
+      afterSequence: 0,
+      lastServerError: null,
+    };
+    this.active = active;
+    this.resetControlFailures();
+    this.setSnapshot({ phase: "active", session: state, native: after, error: null });
+    this.startControlTimers();
+  }
+
+  private removeSubscriptions() {
+    if (this.subscriptionsRemoved) return;
+    this.subscriptionsRemoved = true;
+    this.subscriptions.forEach((subscription) => subscription.remove());
   }
 
   private resetControlFailures() {
@@ -749,6 +794,6 @@ export class RealtimeVoiceController {
 
   private setSnapshot(update: Partial<RealtimeVoiceControllerSnapshot>) {
     this.snapshot = { ...this.snapshot, ...update };
-    this.listener.onSnapshot(this.snapshot);
+    if (!this.detached) this.listener.onSnapshot(this.snapshot);
   }
 }

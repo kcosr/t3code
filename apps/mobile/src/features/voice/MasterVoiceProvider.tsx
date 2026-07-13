@@ -42,6 +42,7 @@ import {
   acknowledgeClientActionWithRetry,
   clientActionAcknowledgementInput,
   executeThreadActivation,
+  isPendingVoiceEventLive,
 } from "./clientActionAcknowledgement";
 import {
   MasterVoiceCallBar,
@@ -66,6 +67,7 @@ import {
 } from "./nativeVoiceReadiness";
 import {
   makeNativeVoiceRuntimeProvisioningAdapter,
+  nativeVoiceRuntimeRefreshAt,
   NativeVoiceRuntimeProvisioningCoordinator,
 } from "./nativeVoiceRuntimeProvisioning";
 import { resolveNativeVoiceRuntimeTarget } from "./nativeVoiceRuntimeTarget";
@@ -104,6 +106,7 @@ interface MasterVoiceRuntime {
 
 interface VoiceConversationConnection {
   readonly environmentId: EnvironmentId;
+  readonly environmentOrigin: string;
   readonly client: VoiceHttpClient;
 }
 
@@ -208,15 +211,16 @@ export function MasterVoiceProvider(props: {
   const [transcript, setTranscript] = useState<ReadonlyArray<MasterVoiceTranscriptTurn>>([]);
   const [confirmations, setConfirmations] = useState<ReadonlyArray<PendingVoiceConfirmation>>([]);
   const [nativePermissions, setNativePermissions] = useState({
-    microphone: false,
-    notification: false,
+    microphone: null as boolean | null,
+    notification: null as boolean | null,
   });
   const [readinessRetry, setReadinessRetry] = useState(0);
   const runtimeRef = useRef<MasterVoiceRuntime | null>(null);
   const nativeProvisioningEpochRef = useRef(0);
-  const priorNativeProvisioningRef = useRef<{
-    readonly environmentId: EnvironmentId;
-    readonly coordinator: NativeVoiceRuntimeProvisioningCoordinator;
+  const nativeGrantRefreshRequestedRef = useRef(false);
+  const nativeGrantRefreshScheduleRef = useRef<{
+    readonly key: string;
+    readonly refreshAtEpochMillis: number;
   } | null>(null);
   const cleanupCoordinatorsRef = useRef(new Map<EnvironmentId, RealtimeServerCleanupCoordinator>());
   const controllerHandoffsRef = useRef(new Map<EnvironmentId, RealtimeControllerHandoff>());
@@ -252,6 +256,10 @@ export function MasterVoiceProvider(props: {
   nativeThreadCommandRef.current = nativeThreadCommand;
 
   const preferences = Option.getOrNull(AsyncResult.value(preferencesResult));
+  const nativeReadinessInputsReady =
+    preferences !== null &&
+    nativePermissions.microphone !== null &&
+    nativePermissions.notification !== null;
   const preferredAudioRouteId = preferences?.voiceAudioRouteId ?? null;
   const preferredAudioRouteIdRef = useRef(preferredAudioRouteId);
   preferredAudioRouteIdRef.current = preferredAudioRouteId;
@@ -294,8 +302,8 @@ export function MasterVoiceProvider(props: {
         preferences,
         controllerEnvironmentId === null ? null : String(controllerEnvironmentId),
         {
-          microphonePermissionGranted: nativePermissions.microphone,
-          notificationPermissionGranted: nativePermissions.notification,
+          microphonePermissionGranted: nativePermissions.microphone === true,
+          notificationPermissionGranted: nativePermissions.notification === true,
           threadTargetValid: backgroundThreadTargetValid,
         },
       ),
@@ -329,7 +337,7 @@ export function MasterVoiceProvider(props: {
       }
     };
     void refresh().catch(() => {
-      if (!disposed) setNativePermissions({ microphone: false, notification: false });
+      if (!disposed) setNativePermissions({ microphone: null, notification: null });
     });
     const subscription = AppState.addEventListener("change", (state) => {
       if (state === "active") void refresh();
@@ -344,30 +352,11 @@ export function MasterVoiceProvider(props: {
       ? conversationConnection.client
       : null;
   const nativeProvisioning = useMemo(() => {
-    if (native === null || conversationConnection === null) return null;
+    if (native === null) return null;
     return new NativeVoiceRuntimeProvisioningCoordinator(
-      conversationConnection.client,
       makeNativeVoiceRuntimeProvisioningAdapter(native, uuidv4),
     );
-  }, [conversationConnection, native]);
-
-  useEffect(() => {
-    if (nativeProvisioning === null || controllerEnvironmentId === null) return;
-    const previous = priorNativeProvisioningRef.current;
-    priorNativeProvisioningRef.current = {
-      environmentId: controllerEnvironmentId,
-      coordinator: nativeProvisioning,
-    };
-    if (
-      previous === null ||
-      (previous.environmentId === controllerEnvironmentId &&
-        previous.coordinator === nativeProvisioning)
-    ) {
-      return;
-    }
-    const epoch = ++nativeProvisioningEpochRef.current;
-    void previous.coordinator.disable(epoch).catch(() => undefined);
-  }, [controllerEnvironmentId, nativeProvisioning]);
+  }, [native]);
 
   useEffect(() => {
     if (native === null || prepared === null || controllerEnvironmentId === null) return;
@@ -443,6 +432,7 @@ export function MasterVoiceProvider(props: {
             [...current, { role: event.role, text: event.text }].slice(-100),
           );
         } else if (event.type === "confirmation-required") {
+          if (!isPendingVoiceEventLive(event.expiresAt)) continue;
           setConfirmations((current) =>
             current.some((confirmation) => confirmation.confirmationId === event.confirmationId)
               ? current
@@ -464,6 +454,7 @@ export function MasterVoiceProvider(props: {
           setConfirmations([]);
           pendingClientActionsRef.current.clear();
         } else if (event.type === "client-action" && event.action === "activate-thread") {
+          if (!isPendingVoiceEventLive(event.expiresAt)) continue;
           if (pendingClientActionsRef.current.has(event.actionId)) continue;
           pendingClientActionsRef.current.set(event.actionId, event);
           const visibleFocus = focusRef.current;
@@ -525,6 +516,7 @@ export function MasterVoiceProvider(props: {
       if (disposed) return;
       setConversationConnection({
         environmentId: controllerEnvironmentId,
+        environmentOrigin: new URL(prepared.httpBaseUrl).origin,
         client,
       });
     })().catch(() => {
@@ -622,7 +614,7 @@ export function MasterVoiceProvider(props: {
         throw cause;
       }
       if (disposed) {
-        await controller.dispose();
+        await controller.detach();
         handoffReservation?.release();
         return;
       }
@@ -636,7 +628,7 @@ export function MasterVoiceProvider(props: {
       setAvailableEnvironmentId(controllerEnvironmentId);
     })().catch(async () => {
       if (publishedRuntime !== null)
-        await publishedRuntime.controller.dispose().catch(() => undefined);
+        await publishedRuntime.controller.detach().catch(() => undefined);
       handoffReservation?.release();
       if (!disposed) setAvailableEnvironmentId(null);
     });
@@ -649,7 +641,7 @@ export function MasterVoiceProvider(props: {
         return;
       runtimeRef.current = null;
       void runtime.controller
-        .dispose()
+        .detach()
         .catch(() => undefined)
         .finally(() => handoffReservation?.release());
     };
@@ -853,10 +845,18 @@ export function MasterVoiceProvider(props: {
   resumeRef.current = resume;
 
   useEffect(() => {
-    if (native === null || nativeProvisioning === null || controllerEnvironmentId === null) return;
+    if (
+      native === null ||
+      nativeProvisioning === null ||
+      controllerEnvironmentId === null ||
+      conversationConnection === null ||
+      !nativeReadinessInputsReady
+    )
+      return;
     const readiness = nativeReadiness;
     let disposed = false;
     let registeredGeneration: number | null = null;
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
     const epoch = nativeOperationsRef.current.begin();
     const provisioningEpoch = ++nativeProvisioningEpochRef.current;
     activeNativeEpochRef.current = epoch;
@@ -998,16 +998,22 @@ export function MasterVoiceProvider(props: {
         const readinessToPersist =
           pendingDisable === null ? readiness : { ...readiness, enabled: false };
         if (!readinessToPersist.enabled || prepared === null) {
-          await nativeProvisioning.disable(provisioningEpoch);
+          await nativeProvisioning.disable(provisioningEpoch, {
+            client: conversationConnection.client,
+            environmentOrigin: conversationConnection.environmentOrigin,
+          });
           nativeOperationsRef.current.assertCurrent(epoch);
+          nativeGrantRefreshRequestedRef.current = false;
+          nativeGrantRefreshScheduleRef.current = null;
           return;
         }
+        const attachedFocus = attachmentRef.current?.focus ?? null;
         const resolvedTarget = await resolveNativeVoiceRuntimeTarget({
           client: conversationConnection!.client,
           mode: readinessToPersist.mode,
           environmentId: controllerEnvironmentId,
           activeConversationId: snapshot.session?.conversationId ?? null,
-          focus: props.focus,
+          focus: snapshot.session === null ? focusRef.current : attachedFocus,
           threadTarget: preferences?.voiceThreadTarget,
           threads: threadShellsRef.current,
           autoRearm: readinessToPersist.autoRearm,
@@ -1020,15 +1026,42 @@ export function MasterVoiceProvider(props: {
               ? String(resolvedTarget.target.conversation.conversationId)
               : `${controllerEnvironmentId}/${resolvedTarget.target.threadId}`,
         };
-        const provisioned = await nativeProvisioning.provision({
+        const provisioned = await nativeProvisioning.provision(conversationConnection.client, {
           epoch: provisioningEpoch,
           readiness: exactReadiness,
           environmentOrigin: new URL(prepared.httpBaseUrl).origin,
           operation:
             resolvedTarget.target.mode === "realtime" ? "realtime-start" : "thread-turn-start",
           resolvedTarget,
+          refreshRequested: nativeGrantRefreshRequestedRef.current,
         });
         nativeOperationsRef.current.assertCurrent(epoch);
+        if (nativeGrantRefreshRequestedRef.current) {
+          nativeGrantRefreshRequestedRef.current = false;
+          nativeGrantRefreshScheduleRef.current = null;
+        }
+        const expiresAtEpochMillis = Date.parse(provisioned.expiresAt);
+        const refreshKey = `${provisioned.runtimeId}:${provisioned.readinessGeneration}:${expiresAtEpochMillis}`;
+        const existingSchedule = nativeGrantRefreshScheduleRef.current;
+        const schedule =
+          existingSchedule?.key === refreshKey
+            ? existingSchedule
+            : {
+                key: refreshKey,
+                refreshAtEpochMillis: nativeVoiceRuntimeRefreshAt(expiresAtEpochMillis, Date.now()),
+              };
+        nativeGrantRefreshScheduleRef.current = schedule;
+        const scheduleRefresh = () => {
+          if (disposed) return;
+          const remaining = schedule.refreshAtEpochMillis - Date.now();
+          if (remaining > 0) {
+            refreshTimer = setTimeout(scheduleRefresh, Math.min(remaining, 2_147_000_000));
+            return;
+          }
+          nativeGrantRefreshRequestedRef.current = true;
+          setReadinessRetry((current) => current + 1);
+        };
+        scheduleRefresh();
         nativeReadinessGenerationRef.current = provisioned.readinessGeneration;
         if (disposed) return;
         const generation = nativeControllerGenerationRef.current.register(
@@ -1070,6 +1103,7 @@ export function MasterVoiceProvider(props: {
 
     return () => {
       disposed = true;
+      if (refreshTimer !== null) clearTimeout(refreshTimer);
       foregroundCommands.dispose();
       const pendingThreadCommand = nativeThreadCommandRef.current;
       if (
@@ -1112,16 +1146,23 @@ export function MasterVoiceProvider(props: {
       );
     };
   }, [
+    attachment?.focus?.environmentId,
+    attachment?.focus?.projectId,
+    attachment?.focus?.threadId,
     backgroundTargetEnvironmentId,
     backgroundTargetThreadId,
     controllerEnvironmentId,
+    conversationConnection,
     native,
     nativeProvisioning,
     nativeReadiness,
+    nativeReadinessInputsReady,
     navigation,
     prepared,
     preferences?.voiceThreadTarget,
-    props.focus,
+    props.focus?.environmentId,
+    props.focus?.projectId,
+    props.focus?.threadId,
     readinessRetry,
     savePreferences,
     snapshot.session?.conversationId,

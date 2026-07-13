@@ -60,6 +60,7 @@ const serverSession = {
 
 const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
   const listeners = new Map<string, (event: unknown) => void>();
+  const subscriptionRemovals: Array<ReturnType<typeof vi.fn>> = [];
   let nativeState: T3VoiceRuntimeState = {
     phase: "idle" as const,
     isForeground: false,
@@ -111,7 +112,9 @@ const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
     setAudioRouteAsync: vi.fn(async () => []),
     addListener: vi.fn((name: string, listener: (event: never) => void) => {
       listeners.set(name, (event) => listener(event as never));
-      return { remove: vi.fn() };
+      const remove = vi.fn();
+      subscriptionRemovals.push(remove);
+      return { remove };
     }),
   } as unknown as T3VoiceNativeModule;
   const client = {
@@ -195,6 +198,7 @@ const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
     routeChanges,
     scheduler,
     snapshots,
+    subscriptionRemovals,
   };
 };
 
@@ -219,9 +223,9 @@ describe("RealtimeVoiceController", () => {
     expect(routeChanges).toEqual(["selected-route-unavailable:system"]);
   });
 
-  it("stops an orphaned native session and closes its authenticated server lease", async () => {
+  it("adopts a live native session and replays background events from a safe sequence", async () => {
     const { client, controller, native } = makeHarness();
-    vi.mocked(native.getStateAsync).mockResolvedValueOnce({
+    vi.mocked(native.getStateAsync).mockResolvedValue({
       phase: "realtime",
       isForeground: true,
       activeRecordingId: null,
@@ -234,13 +238,20 @@ describe("RealtimeVoiceController", () => {
 
     await Promise.all([controller.reconcileNativeRuntime(), controller.reconcileNativeRuntime()]);
 
-    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledTimes(1);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "active",
+      session: serverSession.state,
+      native: { activeRealtimeSessionId: SESSION_ID },
+    });
     expect(client.getSession).toHaveBeenCalledWith(SESSION_ID);
-    expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1);
-    expect(controller.getSnapshot().native?.activeRealtimeSessionId).toBeNull();
+    expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
+    expect(client.closeSession).not.toHaveBeenCalled();
+
+    await controller.refreshEvents();
+    expect(client.sessionEvents).toHaveBeenCalledWith(SESSION_ID, 0);
   });
 
-  it("still stops an orphan when its original server lease is unavailable", async () => {
+  it("preserves native media when the server session cannot be authorized", async () => {
     const { client, controller, native } = makeHarness();
     vi.mocked(native.getStateAsync).mockResolvedValueOnce({
       phase: "realtime",
@@ -254,16 +265,16 @@ describe("RealtimeVoiceController", () => {
     });
     vi.mocked(client.getSession).mockReturnValue(Effect.die(new Error("server unavailable")));
 
-    await controller.reconcileNativeRuntime();
+    await expect(controller.reconcileNativeRuntime()).rejects.toThrow("server unavailable");
 
-    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledTimes(1);
+    expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
     expect(client.closeSession).not.toHaveBeenCalled();
-    expect(controller.getSnapshot().native?.activeRealtimeSessionId).toBeNull();
+    expect(controller.getSnapshot().native?.activeRealtimeSessionId).toBe(SESSION_ID);
   });
 
-  it("blocks startup when native state confirms an orphan survived the stop request", async () => {
+  it("cleans native media only when the server confirms the session is terminal", async () => {
     const { client, controller, native } = makeHarness();
-    const orphan: T3VoiceRuntimeState = {
+    const staleNative: T3VoiceRuntimeState = {
       phase: "realtime",
       isForeground: true,
       activeRecordingId: null,
@@ -273,16 +284,22 @@ describe("RealtimeVoiceController", () => {
       realtimeMuted: false,
       sequence: 3,
     };
-    vi.mocked(native.getStateAsync).mockResolvedValueOnce(orphan).mockResolvedValueOnce(orphan);
-    vi.mocked(native.stopRealtimeSessionAsync).mockRejectedValueOnce(new Error("binder failed"));
+    vi.mocked(native.getStateAsync).mockResolvedValueOnce(staleNative);
+    vi.mocked(client.getSession).mockReturnValueOnce(
+      Effect.succeed({ ...serverSession.state, phase: "ended" as const }),
+    );
 
-    await expect(controller.start(createInput)).rejects.toThrow("binder failed");
+    await controller.reconcileNativeRuntime();
 
-    expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1);
-    expect(client.createSession).not.toHaveBeenCalled();
+    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledWith({ nativeSessionId: SESSION_ID });
+    expect(client.closeSession).not.toHaveBeenCalled();
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "idle",
+      native: { activeRealtimeSessionId: null },
+    });
   });
 
-  it("blocks startup when orphan cleanup leaves a different realtime peer active", async () => {
+  it("blocks startup when native ownership changes during attachment", async () => {
     const { controller, native } = makeHarness();
     const orphan: T3VoiceRuntimeState = {
       phase: "realtime",
@@ -299,8 +316,9 @@ describe("RealtimeVoiceController", () => {
       .mockResolvedValueOnce({ ...orphan, activeRealtimeSessionId: "replacement", sequence: 4 });
 
     await expect(controller.start(createInput)).rejects.toThrow(
-      "The orphaned Realtime media session could not be stopped",
+      "The native Realtime session changed during attachment",
     );
+    expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
   });
 
   it("signals an ICE-complete native offer through the authenticated server", async () => {
@@ -418,6 +436,71 @@ describe("RealtimeVoiceController", () => {
       phase: "idle",
       session: null,
     });
+  });
+
+  it("detaches React observers while preserving an established native session", async () => {
+    const { client, controller, native, scheduler, subscriptionRemovals } = makeHarness();
+    await controller.start(createInput);
+    vi.mocked(native.stopRealtimeSessionAsync).mockClear();
+    vi.mocked(client.closeSession).mockClear();
+
+    await controller.detach();
+
+    expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
+    expect(client.closeSession).not.toHaveBeenCalled();
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "active",
+      session: serverSession.state,
+      native: { activeRealtimeSessionId: SESSION_ID },
+    });
+    expect(scheduler.clearInterval).toHaveBeenCalledTimes(1);
+    expect(subscriptionRemovals).toHaveLength(4);
+    expect(subscriptionRemovals.every((remove) => remove.mock.calls.length === 1)).toBe(true);
+  });
+
+  it("fences an attachment that completes after React detaches", async () => {
+    const { client, controller, native, scheduler } = makeHarness();
+    const nativeActive = {
+      phase: "realtime" as const,
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected" as const,
+      realtimeMuted: false,
+      sequence: 8,
+    };
+    vi.mocked(native.getStateAsync).mockResolvedValue(nativeActive);
+    let resolveSession!: (state: typeof serverSession.state) => void;
+    const pendingSession = new Promise<typeof serverSession.state>((resolve) => {
+      resolveSession = resolve;
+    });
+    vi.mocked(client.getSession).mockReturnValue(Effect.promise(() => pendingSession));
+
+    const reconciliation = controller.reconcileNativeRuntime();
+    await vi.waitFor(() => expect(client.getSession).toHaveBeenCalledTimes(1));
+    const detachment = controller.detach();
+    resolveSession(serverSession.state);
+    await Promise.all([reconciliation, detachment]);
+
+    expect(controller.getSnapshot()).toMatchObject({ phase: "idle", session: null });
+    expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
+    expect(client.closeSession).not.toHaveBeenCalled();
+    expect(scheduler.setInterval).not.toHaveBeenCalled();
+  });
+
+  it("keeps dispose destructive after a prior detach", async () => {
+    const { client, controller, native } = makeHarness();
+    await controller.start(createInput);
+    await controller.detach();
+
+    await controller.dispose();
+
+    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledWith({
+      nativeSessionId: SESSION_ID,
+    });
+    expect(client.closeSession).toHaveBeenCalledWith(SESSION_ID, 1);
+    expect(controller.getSnapshot().phase).toBe("idle");
   });
 
   it("reports idle after native release while preserving server cleanup as a reconnect barrier", async () => {

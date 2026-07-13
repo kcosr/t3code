@@ -19,6 +19,11 @@ export const clientActionAcknowledgementInput = (
   };
 };
 
+export const isPendingVoiceEventLive = (expiresAt: string, nowMillis = Date.now()): boolean => {
+  const expiresAtMillis = Date.parse(expiresAt);
+  return Number.isFinite(expiresAtMillis) && expiresAtMillis > nowMillis;
+};
+
 export const executeThreadActivation = async (options: {
   readonly navigate: () => void;
   readonly updateFocus: () => Promise<void>;

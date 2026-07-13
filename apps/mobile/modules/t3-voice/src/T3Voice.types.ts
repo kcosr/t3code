@@ -174,11 +174,16 @@ export interface T3VoiceBackgroundRuntimeGrantInput {
 export interface T3VoiceBackgroundReadinessPrepareInput {
   readonly readiness: T3VoiceReadinessSnapshot;
   readonly runtimeId: string;
+  readonly environmentOrigin: string;
+  readonly operation: T3VoiceBackgroundGrantOperation;
+  readonly targetIdentity: string;
 }
 
 export interface T3VoiceBackgroundPreparedReadiness {
   readonly runtimeId: string;
   readonly readiness: T3VoicePersistedReadinessSnapshot;
+  readonly environmentOrigin: string;
+  readonly operation: T3VoiceBackgroundGrantOperation;
 }
 
 export interface T3VoiceBackgroundReadinessActivateInput {
@@ -190,6 +195,41 @@ export interface T3VoiceBackgroundReadinessActivateInput {
 export interface T3VoiceBackgroundDisabledReadiness {
   readonly runtimeId: string | null;
   readonly readiness: T3VoicePersistedReadinessSnapshot;
+}
+
+export interface T3VoiceBackgroundAuthorityInspectInput {
+  readonly readiness: T3VoiceReadinessSnapshot;
+  readonly environmentOrigin: string;
+  readonly operation: T3VoiceBackgroundGrantOperation;
+  readonly targetIdentity: string;
+}
+
+/** Sanitized durable authority metadata. Target identity digests and grants never cross this bridge. */
+export interface T3VoiceBackgroundAuthoritySnapshot {
+  readonly state: "prepared" | "active";
+  readonly runtimeId: string;
+  readonly readiness: T3VoicePersistedReadinessSnapshot;
+  readonly environmentOrigin: string;
+  readonly operation: T3VoiceBackgroundGrantOperation;
+  readonly expiresAtEpochMillis: number | null;
+  readonly refreshPending: boolean;
+}
+
+export interface T3VoiceBackgroundRuntimeRevocation {
+  readonly runtimeId: string;
+  readonly environmentOrigin: string;
+}
+
+export interface T3VoiceBackgroundGrantRefreshInput {
+  readonly runtimeId: string;
+  readonly readinessGeneration: number;
+  readonly environmentOrigin: string;
+  readonly operation: T3VoiceBackgroundGrantOperation;
+  readonly targetIdentity: string;
+}
+
+export interface T3VoiceBackgroundGrantInstallInput {
+  readonly grant: T3VoiceBackgroundRuntimeGrantInput;
 }
 
 export type T3VoiceBackgroundExecutionPhase =
@@ -378,7 +418,20 @@ export interface T3VoiceNativeModule {
   readonly activateBackgroundVoiceReadinessAsync: (
     input: T3VoiceBackgroundReadinessActivateInput,
   ) => Promise<T3VoicePersistedReadinessSnapshot>;
+  readonly inspectBackgroundVoiceAuthorityAsync: (
+    input: T3VoiceBackgroundAuthorityInspectInput,
+  ) => Promise<T3VoiceBackgroundAuthoritySnapshot | null>;
   readonly disableBackgroundVoiceReadinessAsync: () => Promise<T3VoiceBackgroundDisabledReadiness>;
+  readonly getPendingBackgroundVoiceRuntimeRevocationAsync: () => Promise<T3VoiceBackgroundRuntimeRevocation | null>;
+  readonly acknowledgeBackgroundVoiceRuntimeRevocationAsync: (
+    input: T3VoiceBackgroundRuntimeRevocation,
+  ) => Promise<void>;
+  readonly beginBackgroundVoiceGrantRefreshAsync: (
+    input: T3VoiceBackgroundGrantRefreshInput,
+  ) => Promise<T3VoiceBackgroundAuthoritySnapshot>;
+  readonly installBackgroundVoiceRuntimeGrantAsync: (
+    input: T3VoiceBackgroundGrantInstallInput,
+  ) => Promise<T3VoiceBackgroundAuthoritySnapshot>;
   readonly getMicrophonePermissionAsync: () => Promise<PermissionResponse>;
   readonly requestMicrophonePermissionAsync: () => Promise<PermissionResponse>;
   readonly getNotificationPermissionAsync: () => Promise<PermissionResponse>;

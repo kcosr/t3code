@@ -247,20 +247,68 @@ class T3VoiceModule : Module() {
         input: Map<String, Any?>,
         promise: Promise,
         ->
-        requireExactKeys(input, setOf("readiness", "runtimeId"))
+        requireExactKeys(
+          input,
+          setOf("readiness", "runtimeId", "environmentOrigin", "operation", "targetIdentity"),
+        )
         val readinessInput =
           input["readiness"] as? Map<*, *>
             ?: throw IllegalArgumentException("readiness must be an object.")
         @Suppress("UNCHECKED_CAST")
         val readiness = parseReadinessConfig(readinessInput as Map<String, Any?>)
         val runtimeId = requireText(input, "runtimeId", 128)
+        val environmentOrigin = requireText(input, "environmentOrigin", 2_048)
+        val operation =
+          T3VoiceRuntimeGrantOperation.fromWireValue(requireText(input, "operation", 64))
+        val targetIdentityDigest =
+          T3VoiceRuntimeTargetIdentity.digest(
+            requireText(input, "targetIdentity", MAXIMUM_TARGET_IDENTITY_LENGTH),
+          )
         withBinder(promise, "voice-readiness-prepare-failed") { service, settlement ->
-          val prepared = service.prepareBackgroundVoiceReadiness(readiness, runtimeId)
+          val prepared =
+            service.prepareBackgroundVoiceReadiness(
+              readiness,
+              runtimeId,
+              environmentOrigin,
+              operation,
+              targetIdentityDigest,
+            )
           settlement.resolve(
             mapOf(
               "runtimeId" to prepared.runtimeId,
               "readiness" to readinessBody(prepared.config),
+              "environmentOrigin" to prepared.environmentOrigin,
+              "operation" to prepared.operation.wireValue,
             ),
+          )
+        }
+      }
+
+      AsyncFunction("inspectBackgroundVoiceAuthorityAsync") {
+        input: Map<String, Any?>,
+        promise: Promise,
+        ->
+        requireExactKeys(input, setOf("readiness", "environmentOrigin", "operation", "targetIdentity"))
+        val readinessInput =
+          input["readiness"] as? Map<*, *>
+            ?: throw IllegalArgumentException("readiness must be an object.")
+        @Suppress("UNCHECKED_CAST")
+        val readiness = parseReadinessConfig(readinessInput as Map<String, Any?>)
+        val environmentOrigin = requireText(input, "environmentOrigin", 2_048)
+        val operation =
+          T3VoiceRuntimeGrantOperation.fromWireValue(requireText(input, "operation", 64))
+        val targetIdentityDigest =
+          T3VoiceRuntimeTargetIdentity.digest(
+            requireText(input, "targetIdentity", MAXIMUM_TARGET_IDENTITY_LENGTH),
+          )
+        withBinder(promise, "voice-authority-inspection-failed") { service, settlement ->
+          settlement.resolve(
+            service.inspectBackgroundVoiceAuthority(
+              readiness,
+              environmentOrigin,
+              operation,
+              targetIdentityDigest,
+            )?.let(::authorityBody),
           )
         }
       }
@@ -303,6 +351,64 @@ class T3VoiceModule : Module() {
               "readiness" to readinessBody(disabled.config),
             ),
           )
+        }
+      }
+
+      AsyncFunction("getPendingBackgroundVoiceRuntimeRevocationAsync") { promise: Promise ->
+        withBinder(promise, "voice-runtime-revocation-read-failed") { service, settlement ->
+          settlement.resolve(service.pendingRuntimeRevocation()?.let(::runtimeRevocationBody))
+        }
+      }
+
+      AsyncFunction("acknowledgeBackgroundVoiceRuntimeRevocationAsync") {
+        input: Map<String, Any?>,
+        promise: Promise,
+        ->
+        requireExactKeys(input, setOf("runtimeId", "environmentOrigin"))
+        val expected =
+          T3VoicePendingRuntimeRevocation(
+            requireText(input, "runtimeId", 128),
+            T3VoiceBackgroundOriginPolicy.normalize(
+              requireText(input, "environmentOrigin", 2_048),
+            ),
+          )
+        withBinder(promise, "voice-runtime-revocation-acknowledgement-failed") {
+          service,
+          settlement,
+          ->
+          check(service.acknowledgeRuntimeRevocation(expected)) {
+            "The pending background voice runtime revocation is stale."
+          }
+          settlement.resolve()
+        }
+      }
+
+      AsyncFunction("beginBackgroundVoiceGrantRefreshAsync") {
+        input: Map<String, Any?>,
+        promise: Promise,
+        ->
+        requireExactKeys(
+          input,
+          setOf("runtimeId", "readinessGeneration", "environmentOrigin", "operation", "targetIdentity"),
+        )
+        val metadata = parseRuntimeGrantMetadata(input, expiresAtEpochMillis = 1)
+        withBinder(promise, "voice-runtime-grant-refresh-begin-failed") { service, settlement ->
+          settlement.resolve(authorityBody(service.beginBackgroundVoiceGrantRefresh(metadata)))
+        }
+      }
+
+      AsyncFunction("installBackgroundVoiceRuntimeGrantAsync") {
+        input: Map<String, Any?>,
+        promise: Promise,
+        ->
+        requireExactKeys(input, setOf("grant"))
+        val grantInput =
+          input["grant"] as? Map<*, *>
+            ?: throw IllegalArgumentException("grant must be an object.")
+        @Suppress("UNCHECKED_CAST")
+        val grant = parseRuntimeGrant(grantInput as Map<String, Any?>)
+        withBinder(promise, "voice-runtime-grant-install-failed") { service, settlement ->
+          settlement.resolve(authorityBody(service.installBackgroundVoiceRuntimeGrant(grant)))
         }
       }
 
@@ -936,6 +1042,41 @@ class T3VoiceModule : Module() {
       token = requireText(input, "token", 128),
     )
   }
+
+  private fun parseRuntimeGrantMetadata(
+    input: Map<String, Any?>,
+    expiresAtEpochMillis: Long,
+  ): T3VoiceRuntimeGrantMetadata =
+    T3VoiceRuntimeGrantMetadata(
+      runtimeId = requireText(input, "runtimeId", 128),
+      readinessGeneration = requireLong(input, "readinessGeneration"),
+      environmentOrigin = requireText(input, "environmentOrigin", 2_048),
+      operation = T3VoiceRuntimeGrantOperation.fromWireValue(requireText(input, "operation", 64)),
+      targetIdentityDigest =
+        T3VoiceRuntimeTargetIdentity.digest(
+          requireText(input, "targetIdentity", MAXIMUM_TARGET_IDENTITY_LENGTH),
+        ),
+      expiresAtEpochMillis = expiresAtEpochMillis,
+    )
+
+  private fun authorityBody(snapshot: T3VoiceBackgroundAuthoritySnapshot): Map<String, Any?> =
+    mapOf(
+      "state" to snapshot.state.wireValue,
+      "runtimeId" to snapshot.runtimeId,
+      "readiness" to readinessBody(snapshot.config),
+      "environmentOrigin" to snapshot.environmentOrigin,
+      "operation" to snapshot.operation.wireValue,
+      "expiresAtEpochMillis" to snapshot.expiresAtEpochMillis?.toDouble(),
+      "refreshPending" to snapshot.refreshPending,
+    )
+
+  private fun runtimeRevocationBody(
+    revocation: T3VoicePendingRuntimeRevocation,
+  ): Map<String, Any> =
+    mapOf(
+      "runtimeId" to revocation.runtimeId,
+      "environmentOrigin" to T3VoiceBackgroundOriginPolicy.normalize(revocation.environmentOrigin),
+    )
 
   private fun readinessBody(snapshot: T3VoiceReadinessConfig): Map<String, Any?> =
     mapOf(

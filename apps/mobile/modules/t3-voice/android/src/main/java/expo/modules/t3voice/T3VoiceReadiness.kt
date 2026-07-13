@@ -45,11 +45,39 @@ internal data class T3VoiceReadinessConfig(
 internal data class T3VoicePreparedReadiness(
   val config: T3VoiceReadinessConfig,
   val runtimeId: String,
+  val environmentOrigin: String,
+  val operation: T3VoiceRuntimeGrantOperation,
+  val targetIdentityDigest: String,
 )
+
+internal data class T3VoicePendingRuntimeRevocation(
+  val runtimeId: String,
+  val environmentOrigin: String,
+) {
+  init {
+    require(runtimeId.isNotBlank() && runtimeId.length <= 128)
+    T3VoiceBackgroundOriginPolicy.normalize(environmentOrigin)
+  }
+}
 
 internal data class T3VoiceDisabledReadiness(
   val config: T3VoiceReadinessConfig,
   val runtimeId: String?,
+)
+
+internal enum class T3VoiceBackgroundAuthorityState(val wireValue: String) {
+  PREPARED("prepared"),
+  ACTIVE("active"),
+}
+
+internal data class T3VoiceBackgroundAuthoritySnapshot(
+  val state: T3VoiceBackgroundAuthorityState,
+  val runtimeId: String,
+  val config: T3VoiceReadinessConfig,
+  val environmentOrigin: String,
+  val operation: T3VoiceRuntimeGrantOperation,
+  val expiresAtEpochMillis: Long?,
+  val refreshPending: Boolean,
 )
 
 internal class T3VoiceReadinessStore(context: Context) {
@@ -84,6 +112,13 @@ internal class T3VoiceReadinessStore(context: Context) {
         .putLong(KEY_GENERATION, config.generation)
         .remove(KEY_PREPARED)
         .remove(KEY_PREPARED_RUNTIME_ID)
+        .remove(KEY_PREPARED_ENVIRONMENT_ORIGIN)
+        .remove(KEY_PREPARED_OPERATION)
+        .remove(KEY_PREPARED_TARGET_DIGEST)
+        .remove(KEY_ACTIVE_RUNTIME_ID)
+        .remove(KEY_ACTIVE_ENVIRONMENT_ORIGIN)
+        .remove(KEY_ACTIVE_OPERATION)
+        .remove(KEY_ACTIVE_TARGET_DIGEST)
         .commit(),
     ) { "Could not persist voice readiness." }
   }
@@ -91,12 +126,28 @@ internal class T3VoiceReadinessStore(context: Context) {
   fun prepared(): T3VoicePreparedReadiness? {
     if (!preferences.getBoolean(KEY_PREPARED, false)) return null
     val runtimeId = preferences.getString(KEY_PREPARED_RUNTIME_ID, null) ?: return null
-    return T3VoicePreparedReadiness(read().copy(enabled = true), runtimeId)
+    val environmentOrigin = preferences.getString(KEY_PREPARED_ENVIRONMENT_ORIGIN, null) ?: return null
+    val operation =
+      T3VoiceRuntimeGrantOperation.fromWireValue(
+        preferences.getString(KEY_PREPARED_OPERATION, null) ?: return null,
+      )
+    val targetIdentityDigest = preferences.getString(KEY_PREPARED_TARGET_DIGEST, null) ?: return null
+    require(targetIdentityDigest.matches(SHA256_HEX_PATTERN))
+    return T3VoicePreparedReadiness(
+      read().copy(enabled = true),
+      runtimeId,
+      T3VoiceBackgroundOriginPolicy.normalize(environmentOrigin),
+      operation,
+      targetIdentityDigest,
+    )
   }
 
-  fun writePrepared(config: T3VoiceReadinessConfig, runtimeId: String) {
+  fun writePrepared(prepared: T3VoicePreparedReadiness) {
+    val config = prepared.config
     require(config.enabled && config.generation > 0)
-    require(runtimeId.isNotBlank() && runtimeId.length <= 128)
+    require(prepared.runtimeId.isNotBlank() && prepared.runtimeId.length <= 128)
+    val normalizedOrigin = T3VoiceBackgroundOriginPolicy.normalize(prepared.environmentOrigin)
+    require(prepared.targetIdentityDigest.matches(SHA256_HEX_PATTERN))
     check(
       preferences.edit()
         .putBoolean(KEY_ENABLED, false)
@@ -106,9 +157,116 @@ internal class T3VoiceReadinessStore(context: Context) {
         .putBoolean(KEY_AUTO_REARM, config.autoRearm)
         .putLong(KEY_GENERATION, config.generation)
         .putBoolean(KEY_PREPARED, true)
-        .putString(KEY_PREPARED_RUNTIME_ID, runtimeId)
+        .putString(KEY_PREPARED_RUNTIME_ID, prepared.runtimeId)
+        .putString(KEY_PREPARED_ENVIRONMENT_ORIGIN, normalizedOrigin)
+        .putString(KEY_PREPARED_OPERATION, prepared.operation.wireValue)
+        .putString(KEY_PREPARED_TARGET_DIGEST, prepared.targetIdentityDigest)
+        .remove(KEY_ACTIVE_RUNTIME_ID)
+        .remove(KEY_ACTIVE_ENVIRONMENT_ORIGIN)
+        .remove(KEY_ACTIVE_OPERATION)
+        .remove(KEY_ACTIVE_TARGET_DIGEST)
         .commit(),
     ) { "Could not reserve voice readiness." }
+  }
+
+  fun activeAuthority(): T3VoicePreparedReadiness? {
+    val config = read()
+    if (!config.enabled) return null
+    val runtimeId = preferences.getString(KEY_ACTIVE_RUNTIME_ID, null) ?: return null
+    val origin = preferences.getString(KEY_ACTIVE_ENVIRONMENT_ORIGIN, null) ?: return null
+    val operation =
+      T3VoiceRuntimeGrantOperation.fromWireValue(
+        preferences.getString(KEY_ACTIVE_OPERATION, null) ?: return null,
+      )
+    val digest = preferences.getString(KEY_ACTIVE_TARGET_DIGEST, null) ?: return null
+    require(digest.matches(SHA256_HEX_PATTERN))
+    return T3VoicePreparedReadiness(
+      config,
+      runtimeId,
+      T3VoiceBackgroundOriginPolicy.normalize(origin),
+      operation,
+      digest,
+    )
+  }
+
+  fun writeActivated(config: T3VoiceReadinessConfig, authority: T3VoicePreparedReadiness) {
+    require(config.enabled && config.generation == authority.config.generation)
+    check(
+      preferences.edit()
+        .putBoolean(KEY_ENABLED, true)
+        .putString(KEY_MODE, config.mode.name)
+        .putString(KEY_TARGET_ID, config.targetId)
+        .putString(KEY_AUDIO_ROUTE_ID, config.audioRouteId)
+        .putBoolean(KEY_AUTO_REARM, config.autoRearm)
+        .putLong(KEY_GENERATION, config.generation)
+        .putString(KEY_ACTIVE_RUNTIME_ID, authority.runtimeId)
+        .putString(
+          KEY_ACTIVE_ENVIRONMENT_ORIGIN,
+          T3VoiceBackgroundOriginPolicy.normalize(authority.environmentOrigin),
+        )
+        .putString(KEY_ACTIVE_OPERATION, authority.operation.wireValue)
+        .putString(KEY_ACTIVE_TARGET_DIGEST, authority.targetIdentityDigest)
+        .remove(KEY_PREPARED)
+        .remove(KEY_PREPARED_RUNTIME_ID)
+        .remove(KEY_PREPARED_ENVIRONMENT_ORIGIN)
+        .remove(KEY_PREPARED_OPERATION)
+        .remove(KEY_PREPARED_TARGET_DIGEST)
+        .commit(),
+    ) { "Could not activate voice readiness authority." }
+  }
+
+  fun pendingRuntimeRevocation(): T3VoicePendingRuntimeRevocation? {
+    val runtimeId = preferences.getString(KEY_PENDING_REVOCATION_RUNTIME_ID, null)
+    val environmentOrigin = preferences.getString(KEY_PENDING_REVOCATION_ENVIRONMENT_ORIGIN, null)
+    if (runtimeId === null && environmentOrigin === null) return null
+    check(runtimeId !== null && environmentOrigin !== null) {
+      "The pending background voice revocation is incomplete."
+    }
+    return T3VoicePendingRuntimeRevocation(runtimeId, environmentOrigin)
+  }
+
+  fun writeDisabledForRuntimeRevocation(
+    config: T3VoiceReadinessConfig,
+    revocation: T3VoicePendingRuntimeRevocation?,
+  ) {
+    require(!config.enabled)
+    val edit =
+      preferences.edit()
+        .putBoolean(KEY_ENABLED, false)
+        .putString(KEY_MODE, config.mode.name)
+        .putString(KEY_TARGET_ID, config.targetId)
+        .putString(KEY_AUDIO_ROUTE_ID, config.audioRouteId)
+        .putBoolean(KEY_AUTO_REARM, config.autoRearm)
+        .putLong(KEY_GENERATION, config.generation)
+        .remove(KEY_PREPARED)
+        .remove(KEY_PREPARED_RUNTIME_ID)
+        .remove(KEY_PREPARED_ENVIRONMENT_ORIGIN)
+        .remove(KEY_PREPARED_OPERATION)
+        .remove(KEY_PREPARED_TARGET_DIGEST)
+        .remove(KEY_ACTIVE_RUNTIME_ID)
+        .remove(KEY_ACTIVE_ENVIRONMENT_ORIGIN)
+        .remove(KEY_ACTIVE_OPERATION)
+        .remove(KEY_ACTIVE_TARGET_DIGEST)
+    if (revocation === null) {
+      edit.remove(KEY_PENDING_REVOCATION_RUNTIME_ID)
+        .remove(KEY_PENDING_REVOCATION_ENVIRONMENT_ORIGIN)
+    } else {
+      edit.putString(KEY_PENDING_REVOCATION_RUNTIME_ID, revocation.runtimeId)
+        .putString(
+          KEY_PENDING_REVOCATION_ENVIRONMENT_ORIGIN,
+          T3VoiceBackgroundOriginPolicy.normalize(revocation.environmentOrigin),
+        )
+    }
+    check(edit.commit()) { "Could not persist disabled voice authority." }
+  }
+
+  fun acknowledgeRuntimeRevocation(expected: T3VoicePendingRuntimeRevocation): Boolean {
+    val pending = pendingRuntimeRevocation() ?: return false
+    if (pending != expected) return false
+    return preferences.edit()
+      .remove(KEY_PENDING_REVOCATION_RUNTIME_ID)
+      .remove(KEY_PENDING_REVOCATION_ENVIRONMENT_ORIGIN)
+      .commit()
   }
 
   fun pendingDisabled(): T3VoiceRuntimeEvent.ReadinessDisabled? {
@@ -117,9 +275,12 @@ internal class T3VoiceReadinessStore(context: Context) {
     return T3VoiceRuntimeEvent.ReadinessDisabled(generation, "notification")
   }
 
-  fun writeDisabledWithPending(config: T3VoiceReadinessConfig) {
+  fun writeDisabledWithPending(
+    config: T3VoiceReadinessConfig,
+    revocation: T3VoicePendingRuntimeRevocation?,
+  ) {
     require(!config.enabled)
-    preferences.edit()
+    val edit = preferences.edit()
       .putBoolean(KEY_ENABLED, false)
       .putString(KEY_MODE, config.mode.name)
       .putString(KEY_TARGET_ID, config.targetId)
@@ -129,7 +290,21 @@ internal class T3VoiceReadinessStore(context: Context) {
       .putLong(KEY_PENDING_DISABLED_GENERATION, config.generation)
       .remove(KEY_PREPARED)
       .remove(KEY_PREPARED_RUNTIME_ID)
-      .apply()
+      .remove(KEY_PREPARED_ENVIRONMENT_ORIGIN)
+      .remove(KEY_PREPARED_OPERATION)
+      .remove(KEY_PREPARED_TARGET_DIGEST)
+      .remove(KEY_ACTIVE_RUNTIME_ID)
+      .remove(KEY_ACTIVE_ENVIRONMENT_ORIGIN)
+      .remove(KEY_ACTIVE_OPERATION)
+      .remove(KEY_ACTIVE_TARGET_DIGEST)
+    if (revocation !== null) {
+      edit.putString(KEY_PENDING_REVOCATION_RUNTIME_ID, revocation.runtimeId)
+        .putString(
+          KEY_PENDING_REVOCATION_ENVIRONMENT_ORIGIN,
+          T3VoiceBackgroundOriginPolicy.normalize(revocation.environmentOrigin),
+        )
+    }
+    check(edit.commit()) { "Could not persist notification-disabled voice authority." }
   }
 
   fun acknowledgePendingDisabled(generation: Long): Boolean {
@@ -149,6 +324,17 @@ internal class T3VoiceReadinessStore(context: Context) {
     private const val KEY_PENDING_DISABLED_GENERATION = "pending_disabled_generation"
     private const val KEY_PREPARED = "prepared"
     private const val KEY_PREPARED_RUNTIME_ID = "prepared_runtime_id"
+    private const val KEY_PREPARED_ENVIRONMENT_ORIGIN = "prepared_environment_origin"
+    private const val KEY_PREPARED_OPERATION = "prepared_operation"
+    private const val KEY_PREPARED_TARGET_DIGEST = "prepared_target_digest"
+    private const val KEY_PENDING_REVOCATION_RUNTIME_ID = "pending_revocation_runtime_id"
+    private const val KEY_PENDING_REVOCATION_ENVIRONMENT_ORIGIN =
+      "pending_revocation_environment_origin"
+    private const val KEY_ACTIVE_RUNTIME_ID = "active_runtime_id"
+    private const val KEY_ACTIVE_ENVIRONMENT_ORIGIN = "active_environment_origin"
+    private const val KEY_ACTIVE_OPERATION = "active_operation"
+    private const val KEY_ACTIVE_TARGET_DIGEST = "active_target_digest"
+    private val SHA256_HEX_PATTERN = Regex("^[0-9a-f]{64}$")
   }
 }
 
@@ -158,10 +344,20 @@ internal object T3VoiceReadinessReservationPolicy {
     prepared: T3VoicePreparedReadiness?,
     desired: T3VoiceReadinessConfig,
     proposedRuntimeId: String,
+    environmentOrigin: String,
+    operation: T3VoiceRuntimeGrantOperation,
+    targetIdentityDigest: String,
   ): T3VoicePreparedReadiness {
     require(desired.enabled) { "Prepared voice readiness must be enabled." }
     require(proposedRuntimeId.isNotBlank() && proposedRuntimeId.length <= 128)
-    if (prepared != null && prepared.config.sameReservationPayload(desired)) {
+    val normalizedOrigin = T3VoiceBackgroundOriginPolicy.normalize(environmentOrigin)
+    if (
+      prepared != null &&
+        prepared.config.sameReservationPayload(desired) &&
+        prepared.environmentOrigin == normalizedOrigin &&
+        prepared.operation == operation &&
+        prepared.targetIdentityDigest == targetIdentityDigest
+    ) {
       return prepared.copy(
         config = desired.copy(enabled = false, generation = prepared.config.generation),
       )
@@ -170,6 +366,9 @@ internal object T3VoiceReadinessReservationPolicy {
     return T3VoicePreparedReadiness(
       desired.copy(enabled = false, generation = nextGeneration),
       proposedRuntimeId,
+      normalizedOrigin,
+      operation,
+      targetIdentityDigest,
     )
   }
 
@@ -275,10 +474,10 @@ internal object T3VoiceForegroundLifecyclePolicy {
 
   fun readinessServiceTypes(
     config: T3VoiceReadinessConfig,
-    controllerAttached: Boolean,
+    @Suppress("UNUSED_PARAMETER") controllerAttached: Boolean,
   ): Int {
     var types = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-    if (controllerAttached && config.microphonePermissionGranted) {
+    if (config.microphonePermissionGranted) {
       types = types or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
     }
     return types
@@ -340,6 +539,7 @@ internal enum class T3VoiceControlCommand {
 }
 
 internal enum class T3VoiceControlDecision {
+  START_NATIVE_REALTIME,
   REQUEST_CONTROLLER_START,
   STOP_ACTIVE,
   TOGGLE_REALTIME_MUTE,
@@ -351,6 +551,8 @@ internal object T3VoiceControlPolicy {
     command: T3VoiceControlCommand,
     phase: T3VoiceRuntimePhase,
     controllerAttached: Boolean,
+    nativeRealtimeAvailable: Boolean = false,
+    readinessMode: T3VoiceReadinessMode = T3VoiceReadinessMode.REALTIME,
   ): T3VoiceControlDecision =
     when (command) {
       T3VoiceControlCommand.STOP ->
@@ -366,7 +568,13 @@ internal object T3VoiceControlPolicy {
           T3VoiceControlDecision.IGNORE
         }
       T3VoiceControlCommand.PRIMARY ->
-        if (phase == T3VoiceRuntimePhase.IDLE && controllerAttached) {
+        if (phase == T3VoiceRuntimePhase.IDLE && nativeRealtimeAvailable) {
+          T3VoiceControlDecision.START_NATIVE_REALTIME
+        } else if (
+          phase == T3VoiceRuntimePhase.IDLE &&
+            readinessMode == T3VoiceReadinessMode.THREAD &&
+            controllerAttached
+        ) {
           T3VoiceControlDecision.REQUEST_CONTROLLER_START
         } else if (phase != T3VoiceRuntimePhase.IDLE && phase != T3VoiceRuntimePhase.INACTIVE) {
           T3VoiceControlDecision.STOP_ACTIVE

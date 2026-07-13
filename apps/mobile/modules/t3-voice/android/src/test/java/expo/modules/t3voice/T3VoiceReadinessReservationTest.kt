@@ -16,6 +16,9 @@ internal class T3VoiceReadinessReservationTest {
         prepared = null,
         desired = desired,
         proposedRuntimeId = "runtime-first",
+        environmentOrigin = ORIGIN,
+        operation = T3VoiceRuntimeGrantOperation.REALTIME_START,
+        targetIdentityDigest = DIGEST,
       )
     val retried =
       T3VoiceReadinessReservationPolicy.reserve(
@@ -31,6 +34,9 @@ internal class T3VoiceReadinessReservationTest {
           ),
         desired = desired,
         proposedRuntimeId = "runtime-ignored",
+        environmentOrigin = ORIGIN,
+        operation = T3VoiceRuntimeGrantOperation.REALTIME_START,
+        targetIdentityDigest = DIGEST,
       )
 
     assertEquals(5, retried.config.generation)
@@ -46,6 +52,9 @@ internal class T3VoiceReadinessReservationTest {
       T3VoicePreparedReadiness(
         desiredReadiness("conversation-1").copy(generation = 5),
         "runtime-stable",
+        ORIGIN,
+        T3VoiceRuntimeGrantOperation.REALTIME_START,
+        DIGEST,
       )
     val replacement =
       T3VoiceReadinessReservationPolicy.reserve(
@@ -53,6 +62,9 @@ internal class T3VoiceReadinessReservationTest {
         prepared = first,
         desired = desiredReadiness("conversation-2"),
         proposedRuntimeId = "runtime-stable",
+        environmentOrigin = ORIGIN,
+        operation = T3VoiceRuntimeGrantOperation.REALTIME_START,
+        targetIdentityDigest = T3VoiceRuntimeTargetIdentity.digest("conversation-2"),
       )
 
     assertEquals(6, replacement.config.generation)
@@ -60,9 +72,45 @@ internal class T3VoiceReadinessReservationTest {
   }
 
   @Test
+  fun `changed canonical target digest cannot adopt a prepared reservation`() {
+    val desired = desiredReadiness("conversation-1")
+    val first =
+      T3VoiceReadinessReservationPolicy.reserve(
+        current = T3VoiceReadinessConfig(generation = 4),
+        prepared = null,
+        desired = desired,
+        proposedRuntimeId = "runtime-first",
+        environmentOrigin = ORIGIN,
+        operation = T3VoiceRuntimeGrantOperation.REALTIME_START,
+        targetIdentityDigest = DIGEST,
+      )
+
+    val replacement =
+      T3VoiceReadinessReservationPolicy.reserve(
+        current = first.config,
+        prepared = first,
+        desired = desired,
+        proposedRuntimeId = "runtime-second",
+        environmentOrigin = ORIGIN,
+        operation = T3VoiceRuntimeGrantOperation.REALTIME_START,
+        targetIdentityDigest = T3VoiceRuntimeTargetIdentity.digest("different-canonical-target"),
+      )
+
+    assertEquals(6, replacement.config.generation)
+    assertEquals("runtime-second", replacement.runtimeId)
+  }
+
+  @Test
   fun `activation requires exact desired payload and generation`() {
     val desired = desiredReadiness("conversation-1")
-    val prepared = T3VoicePreparedReadiness(desired.copy(generation = 5), "runtime-1")
+    val prepared =
+      T3VoicePreparedReadiness(
+        desired.copy(generation = 5),
+        "runtime-1",
+        ORIGIN,
+        T3VoiceRuntimeGrantOperation.REALTIME_START,
+        DIGEST,
+      )
     val activated =
       T3VoiceReadinessReservationPolicy.requireActivation(
         locked = prepared.config.copy(enabled = false),
@@ -99,4 +147,9 @@ internal class T3VoiceReadinessReservationTest {
       notificationPermissionGranted = true,
       microphonePermissionGranted = true,
     )
+
+  private companion object {
+    const val ORIGIN = "https://environment.example.test"
+    val DIGEST = T3VoiceRuntimeTargetIdentity.digest("conversation-1")
+  }
 }

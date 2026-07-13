@@ -247,6 +247,7 @@ internal class T3VoiceRuntimeGrantStore(
           KEY_EXPIRES_AT to grant.metadata.expiresAtEpochMillis.toString(),
           KEY_INITIALIZATION_VECTOR to encode(encrypted.initializationVector),
           KEY_CIPHERTEXT to encode(encrypted.ciphertext),
+          KEY_REFRESH_PENDING to null,
         ),
       ),
     ) { "Could not persist the background voice grant." }
@@ -289,13 +290,59 @@ internal class T3VoiceRuntimeGrantStore(
     }
 
   @Synchronized
+  fun metadataIgnoringExpiry(): T3VoiceRuntimeGrantMetadata? =
+    when (val loaded = loadIgnoringExpiry()) {
+      is T3VoiceRuntimeGrantLoadResult.Available -> loaded.grant.metadata
+      else -> null
+    }
+
+  @Synchronized
+  fun storedMetadata(): T3VoiceRuntimeGrantMetadata? {
+    val present = GRANT_METADATA_KEYS.associateWith(storage::getString)
+    if (present.values.all { it === null }) return null
+    if (present.values.any { it === null }) return null
+    return runCatching {
+      T3VoiceRuntimeGrantMetadata(
+        runtimeId = present.getValue(KEY_RUNTIME_ID)!!,
+        readinessGeneration = present.getValue(KEY_READINESS_GENERATION)!!.toLong(),
+        environmentOrigin = present.getValue(KEY_ENVIRONMENT_ORIGIN)!!,
+        operation = T3VoiceRuntimeGrantOperation.fromWireValue(present.getValue(KEY_OPERATION)!!),
+        targetIdentityDigest = present.getValue(KEY_TARGET_IDENTITY_DIGEST)!!,
+        expiresAtEpochMillis = present.getValue(KEY_EXPIRES_AT)!!.toLong(),
+      )
+    }.getOrNull()
+  }
+
+  @Synchronized
+  fun beginRefresh(expected: T3VoiceRuntimeGrantMetadata): T3VoiceRuntimeGrantMetadata {
+    val current =
+      (loadIgnoringExpiry() as? T3VoiceRuntimeGrantLoadResult.Available)?.grant?.metadata
+        ?: error("An installed background voice grant is required for refresh.")
+    require(current.sameAuthority(expected)) { "Background voice grant refresh authority is stale." }
+    check(storage.put(mapOf(KEY_REFRESH_PENDING to "1"))) {
+      "Could not persist background voice grant refresh state."
+    }
+    return current
+  }
+
+  @Synchronized
+  fun isRefreshPending(metadata: T3VoiceRuntimeGrantMetadata): Boolean {
+    val value = storage.getString(KEY_REFRESH_PENDING) ?: return false
+    check(value == "1") { "Invalid background voice grant refresh state." }
+    val current =
+      (loadIgnoringExpiry() as? T3VoiceRuntimeGrantLoadResult.Available)?.grant?.metadata
+        ?: return false
+    return current.sameAuthority(metadata)
+  }
+
+  @Synchronized
   fun clear(deleteKey: Boolean = false) {
     check(storage.clear(ALL_KEYS)) { "Could not clear the background voice grant." }
     if (deleteKey) cipher.deleteKey()
   }
 
   private fun loadIgnoringExpiry(): T3VoiceRuntimeGrantLoadResult {
-    val present = ALL_KEYS.associateWith(storage::getString)
+    val present = GRANT_KEYS.associateWith(storage::getString)
     if (present.values.all { it === null }) return T3VoiceRuntimeGrantLoadResult.Missing
     if (present.values.any { it === null }) return T3VoiceRuntimeGrantLoadResult.Locked
     return try {
@@ -353,7 +400,8 @@ internal class T3VoiceRuntimeGrantStore(
     const val KEY_EXPIRES_AT = "runtime_grant_expires_at"
     const val KEY_INITIALIZATION_VECTOR = "runtime_grant_iv"
     const val KEY_CIPHERTEXT = "runtime_grant_ciphertext"
-    val ALL_KEYS =
+    const val KEY_REFRESH_PENDING = "runtime_grant_refresh_pending"
+    val GRANT_METADATA_KEYS =
       setOf(
         KEY_RUNTIME_ID,
         KEY_READINESS_GENERATION,
@@ -361,8 +409,23 @@ internal class T3VoiceRuntimeGrantStore(
         KEY_OPERATION,
         KEY_TARGET_IDENTITY_DIGEST,
         KEY_EXPIRES_AT,
+      )
+    val GRANT_KEYS =
+      GRANT_METADATA_KEYS +
+      setOf(
         KEY_INITIALIZATION_VECTOR,
         KEY_CIPHERTEXT,
       )
+    val ALL_KEYS = GRANT_KEYS + KEY_REFRESH_PENDING
   }
 }
+
+private fun T3VoiceRuntimeGrantMetadata.sameAuthority(
+  other: T3VoiceRuntimeGrantMetadata,
+): Boolean =
+  runtimeId == other.runtimeId &&
+    readinessGeneration == other.readinessGeneration &&
+    T3VoiceBackgroundOriginPolicy.normalize(environmentOrigin) ==
+    T3VoiceBackgroundOriginPolicy.normalize(other.environmentOrigin) &&
+    operation == other.operation &&
+    targetIdentityDigest == other.targetIdentityDigest

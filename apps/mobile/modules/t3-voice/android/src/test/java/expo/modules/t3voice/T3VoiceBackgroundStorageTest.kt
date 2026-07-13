@@ -118,6 +118,48 @@ internal class T3VoiceBackgroundStorageTest {
   }
 
   @Test
+  fun `credential refresh marker is durable exact and cleared by rotated grant`() {
+    val storage = MemoryBackgroundStorage()
+    val store = T3VoiceRuntimeGrantStore(storage, TestGrantCipher(), clockMillis = { 1_000 })
+    val first = runtimeGrant(generation = 7, token = "first-token")
+    store.provision(first)
+
+    assertFalse(store.isRefreshPending(first.metadata))
+    assertEquals(first.metadata, store.beginRefresh(first.metadata.copy(expiresAtEpochMillis = 1)))
+    assertTrue(store.isRefreshPending(first.metadata))
+    assertThrows(IllegalArgumentException::class.java) {
+      store.beginRefresh(
+        first.metadata.copy(targetIdentityDigest = T3VoiceRuntimeTargetIdentity.digest("other")),
+      )
+    }
+
+    val rotated = first.copy(
+      metadata = first.metadata.copy(expiresAtEpochMillis = 60_000),
+      token = "rotated-token",
+    )
+    store.provision(rotated)
+
+    assertFalse(store.isRefreshPending(rotated.metadata))
+    assertEquals(
+      "rotated-token",
+      (store.load() as T3VoiceRuntimeGrantLoadResult.Available).grant.token,
+    )
+  }
+
+  @Test
+  fun `stored metadata survives unavailable grant decryption for revocation`() {
+    val storage = MemoryBackgroundStorage()
+    val store = T3VoiceRuntimeGrantStore(storage, TestGrantCipher(), clockMillis = { 1_000 })
+    val grant = runtimeGrant(generation = 7, token = "first-token")
+    store.provision(grant)
+    val ciphertextKey = storage.values.keys.single { it.endsWith("ciphertext") }
+    storage.values[ciphertextKey] = "00"
+
+    assertEquals(T3VoiceRuntimeGrantLoadResult.Locked, store.load())
+    assertEquals(grant.metadata, store.storedMetadata())
+  }
+
+  @Test
   fun `clear deletes grant ciphertext and optionally its key`() {
     val storage = MemoryBackgroundStorage()
     val cipher = TestGrantCipher()

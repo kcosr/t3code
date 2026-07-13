@@ -9,13 +9,14 @@ import org.junit.Test
 
 class T3VoiceControlPolicyTest {
   @Test
-  fun `idle primary requires an attached controller`() {
+  fun `idle realtime primary starts natively and never falls back to React`() {
     assertEquals(
-      T3VoiceControlDecision.REQUEST_CONTROLLER_START,
+      T3VoiceControlDecision.START_NATIVE_REALTIME,
       T3VoiceControlPolicy.decide(
         T3VoiceControlCommand.PRIMARY,
         T3VoiceRuntimePhase.IDLE,
         controllerAttached = true,
+        nativeRealtimeAvailable = true,
       ),
     )
     assertEquals(
@@ -23,7 +24,21 @@ class T3VoiceControlPolicyTest {
       T3VoiceControlPolicy.decide(
         T3VoiceControlCommand.PRIMARY,
         T3VoiceRuntimePhase.IDLE,
-        controllerAttached = false,
+        controllerAttached = true,
+        nativeRealtimeAvailable = false,
+      ),
+    )
+  }
+
+  @Test
+  fun `idle thread primary retains the thread controller handoff`() {
+    assertEquals(
+      T3VoiceControlDecision.REQUEST_CONTROLLER_START,
+      T3VoiceControlPolicy.decide(
+        T3VoiceControlCommand.PRIMARY,
+        T3VoiceRuntimePhase.IDLE,
+        controllerAttached = true,
+        readinessMode = T3VoiceReadinessMode.THREAD,
       ),
     )
   }
@@ -196,7 +211,7 @@ class T3VoiceControlPolicyTest {
   }
 
   @Test
-  fun `sticky restart readiness remains locked and media only`() {
+  fun `sticky readiness retains microphone ownership without React`() {
     val restored =
       T3VoiceReadinessConfig(
         enabled = true,
@@ -205,7 +220,8 @@ class T3VoiceControlPolicyTest {
       )
     assertTrue(T3VoiceForegroundLifecyclePolicy.shouldRemainStarted(restored))
     assertEquals(
-      android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+      android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+        android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
       T3VoiceForegroundLifecyclePolicy.reconciledServiceTypes(
         T3VoiceRuntimePhase.IDLE,
         restored,

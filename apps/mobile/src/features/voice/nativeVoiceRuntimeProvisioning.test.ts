@@ -13,6 +13,8 @@ import {
   ConflictingNativeVoiceRuntimeProvisioningEpochError,
   InvalidNativeVoiceRuntimeProvisioningResultError,
   NativeVoiceRuntimeProvisioningCoordinator,
+  nativeVoiceRuntimeRefreshAt,
+  PendingNativeVoiceRuntimeRevocationOriginError,
   type NativeVoiceRuntimeProvisioningAdapter,
   StaleNativeVoiceRuntimeProvisioningEpochError,
 } from "./nativeVoiceRuntimeProvisioning";
@@ -66,6 +68,11 @@ function provisioningInput(epoch = 1) {
   };
 }
 
+function requireValue<A>(value: A | null): A {
+  if (value === null) throw new Error("Expected a value.");
+  return value;
+}
+
 type GrantClient = Pick<
   VoiceHttpClient,
   "provisionNativeRuntimeGrant" | "revokeNativeRuntimeGrant"
@@ -114,6 +121,7 @@ function makeClient(input?: {
 }
 
 function makeNative(input?: {
+  readonly inspect?: NativeVoiceRuntimeProvisioningAdapter["inspect"];
   readonly activate?: (attempt: number) => Promise<void>;
   readonly disable?: (attempt: number) => Promise<void>;
   readonly prepare?: () => Promise<{
@@ -121,12 +129,36 @@ function makeNative(input?: {
     readonly readinessGeneration: number;
   }>;
   readonly disabledRuntimeId?: VoiceNativeRuntimeId | null;
+  readonly pendingRevocation?: { readonly runtimeId: string; readonly environmentOrigin: string };
   readonly order?: string[];
 }) {
   let activateAttempt = 0;
   let disableAttempt = 0;
-  const prepare = vi.fn<NativeVoiceRuntimeProvisioningAdapter["prepare"]>(async () => {
+  let authority: "none" | "prepared" | "active" = "none";
+  let authorityTargetIdentity: string | null = null;
+  let authorityEnvironmentOrigin = "https://termstation";
+  let refreshPending = false;
+  let expiresAtEpochMillis = Date.parse(EXPIRES_AT);
+  let pendingRevocation: { runtimeId: string; environmentOrigin: string } | null =
+    input?.pendingRevocation ?? null;
+  const inspect = vi.fn<NativeVoiceRuntimeProvisioningAdapter["inspect"]>(async (request) => {
+    if (input?.inspect !== undefined) return input.inspect(request);
+    if (authority === "none" || authorityTargetIdentity !== request.targetIdentity) return null;
+    return {
+      state: authority,
+      runtimeId: RUNTIME_ID,
+      readiness: { ...readiness, generation: 7 },
+      environmentOrigin: authorityEnvironmentOrigin,
+      operation: "thread-turn-start",
+      expiresAtEpochMillis: authority === "active" ? expiresAtEpochMillis : null,
+      refreshPending,
+    };
+  });
+  const prepare = vi.fn<NativeVoiceRuntimeProvisioningAdapter["prepare"]>(async (request) => {
     input?.order?.push("native-prepare");
+    authority = "prepared";
+    authorityTargetIdentity = request.targetIdentity;
+    authorityEnvironmentOrigin = new URL(request.environmentOrigin).origin;
     return (
       (await input?.prepare?.()) ?? {
         runtimeId: RUNTIME_ID,
@@ -138,15 +170,70 @@ function makeNative(input?: {
     input?.order?.push("native-activate");
     activateAttempt += 1;
     await input?.activate?.(activateAttempt);
+    authority = "active";
   });
   const disable = vi.fn<NativeVoiceRuntimeProvisioningAdapter["disable"]>(async () => {
     input?.order?.push("native-disable");
     disableAttempt += 1;
     await input?.disable?.(disableAttempt);
-    return { runtimeId: input?.disabledRuntimeId ?? RUNTIME_ID };
+    const runtimeId = authority === "none" ? null : (input?.disabledRuntimeId ?? RUNTIME_ID);
+    if (runtimeId !== null) {
+      pendingRevocation = {
+        runtimeId,
+        environmentOrigin: authorityEnvironmentOrigin,
+      };
+    }
+    authority = "none";
+    authorityTargetIdentity = null;
+    refreshPending = false;
+    return { runtimeId };
   });
+  const pending = vi.fn(async () => pendingRevocation);
+  const acknowledge = vi.fn(async () => {
+    pendingRevocation = null;
+  });
+  const beginRefresh = vi.fn<NativeVoiceRuntimeProvisioningAdapter["beginRefresh"]>(async () => {
+    if (authority !== "active") throw new Error("authority is not active");
+    refreshPending = true;
+    return requireValue(
+      await inspect({
+        readiness,
+        environmentOrigin: "https://termstation",
+        operation: "thread-turn-start",
+        targetIdentity: requireValue(authorityTargetIdentity),
+      }),
+    );
+  });
+  const installRefresh = vi.fn<NativeVoiceRuntimeProvisioningAdapter["installRefresh"]>(
+    async (grantInput) => {
+      if (!refreshPending) throw new Error("refresh was not begun");
+      expiresAtEpochMillis = grantInput.expiresAtEpochMillis;
+      refreshPending = false;
+      return requireValue(
+        await inspect({
+          readiness,
+          environmentOrigin: grantInput.environmentOrigin,
+          operation: grantInput.operation,
+          targetIdentity: grantInput.targetIdentity,
+        }),
+      );
+    },
+  );
   return {
-    native: { prepare, activate, disable } satisfies NativeVoiceRuntimeProvisioningAdapter,
+    native: {
+      inspect,
+      prepare,
+      activate,
+      beginRefresh,
+      installRefresh,
+      disable,
+      pendingRevocation: pending,
+      acknowledgeRevocation: acknowledge,
+    } satisfies NativeVoiceRuntimeProvisioningAdapter,
+    inspect,
+    beginRefresh,
+    installRefresh,
+    acknowledge,
     prepare,
     activate,
     disable,
@@ -158,11 +245,16 @@ describe("NativeVoiceRuntimeProvisioningCoordinator", () => {
     const order: string[] = [];
     const { client, provision } = makeClient({ order });
     const { native, prepare, activate } = makeNative({ order });
-    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(client, native);
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
 
-    const result = await coordinator.provision(provisioningInput());
+    const result = await coordinator.provision(client, provisioningInput());
 
-    expect(order).toEqual(["native-prepare", "server-provision", "native-activate"]);
+    expect(order).toEqual([
+      "native-disable",
+      "native-prepare",
+      "server-provision",
+      "native-activate",
+    ]);
     expect(prepare).toHaveBeenCalledWith({
       epoch: 1,
       readiness,
@@ -194,18 +286,18 @@ describe("NativeVoiceRuntimeProvisioningCoordinator", () => {
         attempt === 1 ? Promise.reject(new Error("response lost")) : Promise.resolve(grant()),
     });
     const { native, prepare, activate, disable } = makeNative();
-    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(client, native);
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
 
-    await expect(coordinator.provision(provisioningInput())).rejects.toBeInstanceOf(Error);
-    await expect(coordinator.provision(provisioningInput())).resolves.toMatchObject({
+    await expect(coordinator.provision(client, provisioningInput())).rejects.toBeInstanceOf(Error);
+    await expect(coordinator.provision(client, provisioningInput())).resolves.toMatchObject({
       readinessGeneration: 7,
     });
 
-    expect(prepare).toHaveBeenCalledTimes(2);
+    expect(prepare).toHaveBeenCalledOnce();
     expect(provision).toHaveBeenCalledTimes(2);
     expect(provision.mock.calls.map((call) => call[1].generation)).toEqual([7, 7]);
     expect(activate).toHaveBeenCalledOnce();
-    expect(disable).not.toHaveBeenCalled();
+    expect(disable).toHaveBeenCalledOnce();
   });
 
   it("retries native activation at the same generation with a freshly rotated token", async () => {
@@ -217,25 +309,180 @@ describe("NativeVoiceRuntimeProvisioningCoordinator", () => {
       activate: (attempt) =>
         attempt === 1 ? Promise.reject(new Error("keystore busy")) : Promise.resolve(),
     });
-    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(client, native);
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
 
-    await expect(coordinator.provision(provisioningInput())).rejects.toThrow("keystore busy");
-    await expect(coordinator.provision(provisioningInput())).resolves.toMatchObject({
+    await expect(coordinator.provision(client, provisioningInput())).rejects.toThrow(
+      "keystore busy",
+    );
+    await expect(coordinator.provision(client, provisioningInput())).resolves.toMatchObject({
       readinessGeneration: 7,
     });
 
     expect(provision).toHaveBeenCalledTimes(2);
     expect(activate.mock.calls.map((call) => call[0].token)).toEqual(issuedTokens);
+    expect(disable).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an equivalent active reservation across a newer React epoch", async () => {
+    const { client, provision } = makeClient();
+    const { native, prepare, activate, disable } = makeNative();
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
+
+    const first = await coordinator.provision(client, provisioningInput(1));
+    const second = await coordinator.provision(client, provisioningInput(2));
+
+    expect(second).toEqual(first);
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(provision).toHaveBeenCalledOnce();
+    expect(activate).toHaveBeenCalledOnce();
+    expect(disable).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes an exact active authority without disabling or preparing it", async () => {
+    const { client, provision } = makeClient();
+    const { native, prepare, activate, disable, beginRefresh, installRefresh } = makeNative();
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
+
+    await coordinator.provision(client, provisioningInput(1));
+    const refreshed = await coordinator.provision(client, {
+      ...provisioningInput(2),
+      refreshRequested: true,
+    });
+
+    expect(refreshed.expiresAt).toBe(EXPIRES_AT);
+    expect(provision).toHaveBeenCalledTimes(2);
+    expect(beginRefresh).toHaveBeenCalledOnce();
+    expect(installRefresh).toHaveBeenCalledOnce();
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(activate).toHaveBeenCalledOnce();
+    expect(disable).toHaveBeenCalledOnce();
+  });
+
+  it("recovers a refresh whose server response was lost", async () => {
+    const { client, provision } = makeClient({
+      provision: (attempt) =>
+        attempt === 2 ? Promise.reject(new Error("response lost")) : Promise.resolve(grant()),
+    });
+    const { native, beginRefresh, installRefresh } = makeNative();
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
+
+    await coordinator.provision(client, provisioningInput(1));
+    await expect(
+      coordinator.provision(client, { ...provisioningInput(2), refreshRequested: true }),
+    ).rejects.toBeInstanceOf(Error);
+    await expect(coordinator.provision(client, provisioningInput(2))).resolves.toMatchObject({
+      readinessGeneration: 7,
+    });
+
+    expect(provision).toHaveBeenCalledTimes(3);
+    expect(beginRefresh).toHaveBeenCalledOnce();
+    expect(installRefresh).toHaveBeenCalledOnce();
+  });
+
+  it("reprovisions when a newer React epoch changes the target", async () => {
+    const nextTarget = {
+      ...target,
+      threadId: ThreadId.make("thread-2"),
+    };
+    const nextResolvedTarget: ResolvedNativeVoiceRuntimeTarget = {
+      target: nextTarget,
+      targetIdentity: canonicalNativeVoiceRuntimeTargetIdentity(nextTarget),
+    };
+    const { client, provision } = makeClient({
+      provision: (attempt) =>
+        Promise.resolve(
+          attempt === 1
+            ? grant()
+            : {
+                ...grant("next-secret"),
+                target: nextTarget,
+              },
+        ),
+    });
+    const { native, prepare, activate } = makeNative();
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
+
+    await coordinator.provision(client, provisioningInput(1));
+    await coordinator.provision(client, {
+      ...provisioningInput(2),
+      readiness: { ...readiness, targetId: "project-1/thread-2" },
+      resolvedTarget: nextResolvedTarget,
+    });
+
+    expect(prepare).toHaveBeenCalledTimes(2);
+    expect(provision).toHaveBeenCalledTimes(2);
+    expect(activate).toHaveBeenCalledTimes(2);
+  });
+
+  it("revokes an old environment with its original client before switching", async () => {
+    const nextTarget = { ...target, threadId: ThreadId.make("thread-other-environment") };
+    const first = makeClient();
+    const second = makeClient({
+      provision: () => Promise.resolve({ ...grant("other-secret"), target: nextTarget }),
+    });
+    const { native } = makeNative();
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
+
+    await coordinator.provision(first.client, provisioningInput(1));
+    await coordinator.provision(second.client, {
+      ...provisioningInput(2),
+      environmentOrigin: "https://other.example.test/path",
+      readiness: { ...readiness, targetId: "project-1/thread-other-environment" },
+      resolvedTarget: {
+        target: nextTarget,
+        targetIdentity: canonicalNativeVoiceRuntimeTargetIdentity(nextTarget),
+      },
+    });
+
+    expect(first.revoke).toHaveBeenCalledOnce();
+    expect(second.revoke).not.toHaveBeenCalled();
+    expect(second.provision).toHaveBeenCalledOnce();
+  });
+
+  it("drains a durable revocation before provisioning after process restart", async () => {
+    const { client, provision, revoke } = makeClient();
+    const { native, acknowledge } = makeNative({
+      pendingRevocation: {
+        runtimeId: RUNTIME_ID,
+        environmentOrigin: "https://termstation",
+      },
+    });
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
+
+    await coordinator.provision(client, provisioningInput());
+
+    expect(revoke).toHaveBeenCalledOnce();
+    expect(acknowledge).toHaveBeenCalledOnce();
+    expect(provision).toHaveBeenCalledOnce();
+  });
+
+  it("blocks replacement when a durable revocation belongs to another environment", async () => {
+    const { client, provision, revoke } = makeClient();
+    const { native, acknowledge, disable } = makeNative({
+      pendingRevocation: {
+        runtimeId: RUNTIME_ID,
+        environmentOrigin: "https://other.example.test",
+      },
+    });
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
+
+    await expect(coordinator.provision(client, provisioningInput())).rejects.toBeInstanceOf(
+      PendingNativeVoiceRuntimeRevocationOriginError,
+    );
+
+    expect(revoke).not.toHaveBeenCalled();
+    expect(acknowledge).not.toHaveBeenCalled();
     expect(disable).not.toHaveBeenCalled();
+    expect(provision).not.toHaveBeenCalled();
   });
 
   it("rejects a non-canonical target identity before native or server mutation", async () => {
     const { client, provision } = makeClient();
     const { native, prepare } = makeNative();
-    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(client, native);
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
 
     await expect(
-      coordinator.provision({
+      coordinator.provision(client, {
         ...provisioningInput(),
         resolvedTarget: { target, targetIdentity: '{"mode":"thread"}' },
       }),
@@ -258,34 +505,37 @@ describe("NativeVoiceRuntimeProvisioningCoordinator", () => {
         return { runtimeId: RUNTIME_ID, readinessGeneration: 7 };
       },
     });
-    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(client, native);
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
 
-    const stale = coordinator.provision(provisioningInput(1));
-    await vi.waitFor(() => expect(order).toEqual(["native-prepare"]));
-    const disabled = coordinator.disable(2);
+    const stale = coordinator.provision(client, provisioningInput(1));
+    await vi.waitFor(() => expect(order).toEqual(["native-disable", "native-prepare"]));
+    const disabled = coordinator.disable(2, {
+      client,
+      environmentOrigin: "https://termstation",
+    });
     releasePrepare();
 
     await expect(stale).rejects.toBeInstanceOf(StaleNativeVoiceRuntimeProvisioningEpochError);
     await expect(disabled).resolves.toBeUndefined();
     expect(provision).not.toHaveBeenCalled();
-    expect(disable).toHaveBeenCalledTimes(2);
-    expect(revoke).toHaveBeenCalledTimes(2);
+    expect(disable).toHaveBeenCalledTimes(3);
+    expect(revoke).toHaveBeenCalledOnce();
     expect(order).toEqual([
+      "native-disable",
       "native-prepare",
       "native-disable",
       "server-revoke",
       "native-disable",
-      "server-revoke",
     ]);
   });
 
   it("rejects older and conflicting same-epoch intents synchronously", () => {
     const { client } = makeClient();
     const { native } = makeNative();
-    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(client, native);
-    const current = coordinator.provision(provisioningInput(2));
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
+    const current = coordinator.provision(client, provisioningInput(2));
 
-    expect(() => coordinator.provision(provisioningInput(1))).toThrow(
+    expect(() => coordinator.provision(client, provisioningInput(1))).toThrow(
       StaleNativeVoiceRuntimeProvisioningEpochError,
     );
     expect(() => coordinator.disable(2)).toThrow(
@@ -302,36 +552,58 @@ describe("NativeVoiceRuntimeProvisioningCoordinator", () => {
         attempt === 1 ? Promise.reject(new Error("offline")) : Promise.resolve(),
     });
     const { native, disable } = makeNative({ order });
-    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(client, native);
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
 
-    await expect(coordinator.disable(1)).rejects.toBeInstanceOf(Error);
-    await expect(coordinator.disable(1)).resolves.toBeUndefined();
+    await coordinator.provision(client, provisioningInput());
+    order.length = 0;
+    const fallback = { client, environmentOrigin: "https://termstation" };
+    await expect(coordinator.disable(2, fallback)).rejects.toBeInstanceOf(Error);
+    await expect(coordinator.disable(2, fallback)).resolves.toBeUndefined();
 
-    expect(disable).toHaveBeenCalledTimes(2);
+    expect(disable).toHaveBeenCalledTimes(3);
     expect(revoke).toHaveBeenCalledTimes(2);
     expect(order).toEqual(["native-disable", "server-revoke", "native-disable", "server-revoke"]);
   });
 
   it("finishes a failed native cleanup before provisioning a newer epoch", async () => {
     const order: string[] = [];
-    const { client, provision, revoke } = makeClient({ order });
+    const replacementTarget = { ...target, threadId: ThreadId.make("thread-replacement") };
+    const { client, provision, revoke } = makeClient({
+      order,
+      provision: (attempt) =>
+        Promise.resolve(
+          attempt === 1 ? grant() : { ...grant("replacement"), target: replacementTarget },
+        ),
+    });
     const { native, disable } = makeNative({
       order,
       disable: (attempt) =>
-        attempt === 1 ? Promise.reject(new Error("native busy")) : Promise.resolve(),
+        attempt === 2 ? Promise.reject(new Error("native busy")) : Promise.resolve(),
     });
-    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(client, native);
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
 
-    await coordinator.provision(provisioningInput(1));
-    await expect(coordinator.disable(2)).rejects.toThrow("native busy");
-    await expect(coordinator.provision(provisioningInput(3))).resolves.toMatchObject({
+    await coordinator.provision(client, provisioningInput(1));
+    await expect(
+      coordinator.disable(2, { client, environmentOrigin: "https://termstation" }),
+    ).rejects.toThrow("native busy");
+    await expect(
+      coordinator.provision(client, {
+        ...provisioningInput(3),
+        readiness: { ...readiness, targetId: "project-1/thread-replacement" },
+        resolvedTarget: {
+          target: replacementTarget,
+          targetIdentity: canonicalNativeVoiceRuntimeTargetIdentity(replacementTarget),
+        },
+      }),
+    ).resolves.toMatchObject({
       readinessGeneration: 7,
     });
 
-    expect(disable).toHaveBeenCalledTimes(2);
+    expect(disable).toHaveBeenCalledTimes(3);
     expect(revoke).toHaveBeenCalledOnce();
     expect(provision).toHaveBeenCalledTimes(2);
     expect(order).toEqual([
+      "native-disable",
       "native-prepare",
       "server-provision",
       "native-activate",
@@ -342,5 +614,20 @@ describe("NativeVoiceRuntimeProvisioningCoordinator", () => {
       "server-provision",
       "native-activate",
     ]);
+  });
+});
+
+describe("nativeVoiceRuntimeRefreshAt", () => {
+  it("refreshes long grants one day before expiry", () => {
+    const now = 1_800_000_000_000;
+    const expiresAt = now + 30 * 24 * 60 * 60 * 1_000;
+    expect(nativeVoiceRuntimeRefreshAt(expiresAt, now)).toBe(expiresAt - 24 * 60 * 60 * 1_000);
+  });
+
+  it("uses the final fifth of a short grant and refreshes expired grants immediately", () => {
+    const now = 1_800_000_000_000;
+    const expiresAt = now + 60 * 60 * 1_000;
+    expect(nativeVoiceRuntimeRefreshAt(expiresAt, now)).toBe(now + 48 * 60 * 1_000);
+    expect(nativeVoiceRuntimeRefreshAt(now - 1, now)).toBe(now);
   });
 });
