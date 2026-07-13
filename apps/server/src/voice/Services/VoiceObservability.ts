@@ -83,6 +83,7 @@ export type VoiceSessionEndReason =
   | "event-stream-failed"
   | "heartbeat-timeout"
   | "handed-off-to-thread-voice"
+  | "stopped-by-voice-agent"
   | "negotiation-failed"
   | "native-runtime-revoked"
   | "provider-closed"
@@ -107,6 +108,7 @@ const expectedSessionEndReasons = new Set<VoiceSessionEndReason>([
   "conversation-deleted",
   "duration-limit",
   "handed-off-to-thread-voice",
+  "stopped-by-voice-agent",
   "native-runtime-revoked",
   "takeover",
 ]);

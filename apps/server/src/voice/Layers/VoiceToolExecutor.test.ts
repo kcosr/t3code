@@ -625,7 +625,7 @@ it.effect("accepts a terminal thread-voice handoff and durably deduplicates its 
 
       const result = yield* tools.invoke(input);
       expect(result.type).toBe("terminal-completed");
-      if (result.type !== "terminal-completed") return;
+      if (result.type !== "terminal-completed" || result.tool !== "handoff_to_thread_voice") return;
       expect(result.terminalAction).toMatchObject({
         projectId,
         threadId,
@@ -641,6 +641,31 @@ it.effect("accepts a terminal thread-voice handoff and durably deduplicates its 
 
       const duplicate = yield* tools.invoke(input);
       expect(duplicate).toEqual(result);
+      expect(yield* Ref.get(test.durableCalls)).toHaveLength(1);
+      expect(yield* Ref.get(test.journal)).toHaveLength(2);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("accepts a terminal Realtime stop and durably deduplicates it", () =>
+  Effect.gen(function* () {
+    const test = yield* makeTest();
+    yield* Effect.gen(function* () {
+      const tools = yield* VoiceToolExecutor;
+      const input = call("stop_realtime_voice", "{}", "stop-realtime-one");
+
+      const result = yield* tools.invoke(input);
+      expect(result).toMatchObject({
+        type: "terminal-completed",
+        tool: "stop_realtime_voice",
+        outcome: "succeeded",
+        terminalAction: { type: "stop-realtime" },
+      });
+      expect(result.type === "terminal-completed" ? decodeJson(result.output) : null).toEqual({
+        status: "accepted",
+      });
+
+      expect(yield* tools.invoke(input)).toEqual(result);
       expect(yield* Ref.get(test.durableCalls)).toHaveLength(1);
       expect(yield* Ref.get(test.journal)).toHaveLength(2);
     }).pipe(Effect.provide(test.layer));

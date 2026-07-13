@@ -55,30 +55,39 @@ class T3VoiceNativeControlTest {
     assertEquals(
       T3VoiceNativeHeartbeatResult.SUCCESS,
       T3VoiceNativeHeartbeatResponsePolicy.validate(
-        "session-1", 2, "live", "listening", "2026-07-12T12:00:00Z", fields, "session-1", 2,
+        "session-1", 2, "live", "listening", false, "2026-07-12T12:00:00Z", fields, "session-1", 2,
       ),
     )
     assertEquals(
       T3VoiceNativeHeartbeatResult.SESSION_TERMINAL,
       T3VoiceNativeHeartbeatResponsePolicy.validate(
-        "session-1", 2, "terminal", "ended", "2026-07-12T12:00:00Z", fields, "session-1", 2,
+        "session-1", 2, "terminal", "ended", false, "2026-07-12T12:00:00Z", fields, "session-1", 2,
+      ),
+    )
+    assertEquals(
+      T3VoiceNativeHeartbeatResult.SESSION_TERMINAL_HANDOFF,
+      T3VoiceNativeHeartbeatResponsePolicy.validate(
+        "session-1", 2, "terminal", "ended", true, "2026-07-12T12:00:00Z", fields, "session-1", 2,
       ),
     )
     listOf(
       T3VoiceNativeHeartbeatResponsePolicy.validate(
-        "wrong", 2, "live", "listening", "2026-07-12T12:00:00Z", fields, "session-1", 2,
+        "wrong", 2, "live", "listening", false, "2026-07-12T12:00:00Z", fields, "session-1", 2,
       ),
       T3VoiceNativeHeartbeatResponsePolicy.validate(
-        "session-1", 3, "live", "listening", "2026-07-12T12:00:00Z", fields, "session-1", 2,
+        "session-1", 3, "live", "listening", false, "2026-07-12T12:00:00Z", fields, "session-1", 2,
       ),
       T3VoiceNativeHeartbeatResponsePolicy.validate(
-        "session-1", 2, "live", "listening", "2026-07-12T12:00:00Z", fields - "expiresAt", "session-1", 2,
+        "session-1", 2, "live", "listening", false, "2026-07-12T12:00:00Z", fields - "expiresAt", "session-1", 2,
       ),
       T3VoiceNativeHeartbeatResponsePolicy.validate(
-        "session-1", 2, "live", "unknown", "2026-07-12T12:00:00Z", fields, "session-1", 2,
+        "session-1", 2, "live", "unknown", false, "2026-07-12T12:00:00Z", fields, "session-1", 2,
       ),
       T3VoiceNativeHeartbeatResponsePolicy.validate(
-        "session-1", 2, "live", "listening", "not-a-timestamp", fields, "session-1", 2,
+        "session-1", 2, "live", "listening", false, "not-a-timestamp", fields, "session-1", 2,
+      ),
+      T3VoiceNativeHeartbeatResponsePolicy.validate(
+        "session-1", 2, "terminal", "ended", null, "2026-07-12T12:00:00Z", fields, "session-1", 2,
       ),
     ).forEach { assertEquals(T3VoiceNativeHeartbeatResult.TERMINAL_FAILURE, it) }
   }

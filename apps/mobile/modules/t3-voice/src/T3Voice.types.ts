@@ -480,6 +480,7 @@ export interface T3VoiceNativeModule {
   readonly getPendingThreadVoiceHandoffAsync: () => Promise<T3VoiceThreadVoiceHandoffEvent | null>;
   readonly acknowledgeThreadVoiceHandoffAsync: (input: {
     readonly actionId: string;
+    readonly outcome: "adopted" | "failed";
   }) => Promise<void>;
   readonly armThreadVoiceHandoffAsync: (input: T3VoiceRealtimeIdentifier) => Promise<void>;
   readonly setReadinessSnapshotAsync: (
@@ -511,6 +512,7 @@ export interface T3VoiceNativeModule {
   ) => Promise<T3VoiceRealtimeOffer>;
   readonly applyRealtimeAnswerAsync: (input: T3VoiceRealtimeAnswerInput) => Promise<void>;
   readonly stopRealtimeSessionAsync: (input: T3VoiceRealtimeIdentifier) => Promise<boolean>;
+  readonly drainAndStopRealtimeSessionAsync: (input: T3VoiceRealtimeIdentifier) => Promise<void>;
   readonly setRealtimeMutedAsync: (
     input: T3VoiceRealtimeIdentifier & { readonly muted: boolean },
   ) => Promise<void>;

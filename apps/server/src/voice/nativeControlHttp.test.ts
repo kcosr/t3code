@@ -876,6 +876,7 @@ describe("native voice control HTTP", () => {
           leaseGeneration: 4,
           phase: "listening",
           disposition: "live",
+          handoffPending: false,
           expiresAt: "2026-07-12T18:00:00.000Z",
         });
         expect(calls()).toBe(expectedSequence);
@@ -981,6 +982,7 @@ describe("native voice control HTTP", () => {
             expect(await response.json()).toMatchObject({
               phase: "ended",
               disposition: "terminal",
+              handoffPending: false,
             });
           },
           { phase: "ended" },

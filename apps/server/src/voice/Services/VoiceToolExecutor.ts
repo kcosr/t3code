@@ -47,20 +47,29 @@ export interface VoiceToolCompletedResult {
   readonly submitOutput: boolean;
 }
 
-export interface VoiceToolTerminalResult {
+interface VoiceToolTerminalResultBase {
   readonly type: "terminal-completed";
   readonly toolCallId: VoiceToolCallId;
   readonly providerFunctionCallId: string;
-  readonly tool: "handoff_to_thread_voice";
   readonly outcome: "succeeded";
   readonly output: string;
-  readonly terminalAction: {
-    readonly actionId: VoiceClientActionId;
-    readonly projectId: ProjectId;
-    readonly threadId: ThreadId;
-    readonly autoRearm: true;
-  };
 }
+
+export type VoiceToolTerminalResult =
+  | (VoiceToolTerminalResultBase & {
+      readonly tool: "stop_realtime_voice";
+      readonly terminalAction: { readonly type: "stop-realtime" };
+    })
+  | (VoiceToolTerminalResultBase & {
+      readonly tool: "handoff_to_thread_voice";
+      readonly terminalAction: {
+        readonly type: "handoff-to-thread-voice";
+        readonly actionId: VoiceClientActionId;
+        readonly projectId: ProjectId;
+        readonly threadId: ThreadId;
+        readonly autoRearm: true;
+      };
+    });
 
 export type VoiceToolExecutionResult = VoiceToolCompletedResult | VoiceToolTerminalResult;
 

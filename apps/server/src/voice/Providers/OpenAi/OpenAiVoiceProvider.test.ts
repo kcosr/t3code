@@ -568,6 +568,7 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       "search_history",
       "read_history",
       "activate_thread",
+      "stop_realtime_voice",
       "handoff_to_thread_voice",
       "create_thread",
       "send_thread_message",

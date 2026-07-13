@@ -511,6 +511,7 @@ const makeTerminalHandoffFixture = Effect.fn("test.makeTerminalHandoffFixture")(
           threadId,
         }),
         terminalAction: {
+          type: "handoff-to-thread-voice" as const,
           actionId,
           projectId,
           threadId,

@@ -496,12 +496,22 @@ const heartbeatRoute = HttpRouter.add(
       .pipe(Effect.option);
     if (state._tag === "None") return unauthorized();
 
+    const terminal = state.value.phase === "ended" || state.value.phase === "error";
+    const handoffPending = terminal
+      ? (yield* sessions.listPendingHandoffActions(
+          grant.authSessionId,
+          grant.sessionId,
+          grant.leaseGeneration,
+          20,
+        )).length > 0
+      : false;
+
     const result: VoiceNativeHeartbeatResult = {
       sessionId: state.value.sessionId,
       leaseGeneration: state.value.leaseGeneration,
       phase: state.value.phase,
-      disposition:
-        state.value.phase === "ended" || state.value.phase === "error" ? "terminal" : "live",
+      disposition: terminal ? "terminal" : "live",
+      handoffPending,
       expiresAt: DateTime.formatIso(DateTime.makeUnsafe(grant.expiresAt)),
     };
     return HttpServerResponse.jsonUnsafe(result, {

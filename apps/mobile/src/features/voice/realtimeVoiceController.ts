@@ -57,6 +57,7 @@ interface ActiveSession {
   focus: RealtimeVoiceAttachmentRecord["focus"];
   pendingEvents: ReadonlyArray<RealtimeVoicePendingEvent>;
   deliveredThroughSequence: number;
+  terminalStopRequested: boolean;
 }
 
 interface TimerScheduler {
@@ -445,6 +446,7 @@ export class RealtimeVoiceController {
             : { projectId: input.projectId, threadId: input.threadId },
         pendingEvents: [],
         deliveredThroughSequence: -1,
+        terminalStopRequested: false,
       };
       this.startingNativeSessionId = null;
       this.active = active;
@@ -522,12 +524,12 @@ export class RealtimeVoiceController {
       session: active.serverState,
       error: null,
     });
-    this.beginServerCleanup(active);
     await this.native
       .stopRealtimeSessionAsync({
         nativeSessionId: active.nativeSessionId,
       })
       .catch(() => undefined);
+    this.beginServerCleanup(active);
     if (generation !== this.startGeneration) return;
     const nativeState = await this.native.getStateAsync();
     if (generation !== this.startGeneration) return;
@@ -633,9 +635,19 @@ export class RealtimeVoiceController {
       const terminalHandoff = result.events.some(
         (event) => event.type === "client-action" && event.action === "handoff-to-thread-voice",
       );
+      const terminalStop = result.events.some(
+        (event) => event.type === "terminal-action" && event.action === "stop-realtime-voice",
+      );
       if (terminalHandoff) {
         await this.native
           .armThreadVoiceHandoffAsync({ nativeSessionId: active.nativeSessionId })
+          .catch(() => undefined);
+        if (this.active !== active) return;
+      }
+      if (terminalStop) {
+        active.terminalStopRequested = true;
+        await this.native
+          .drainAndStopRealtimeSessionAsync({ nativeSessionId: active.nativeSessionId })
           .catch(() => undefined);
         if (this.active !== active) return;
       }
@@ -661,6 +673,7 @@ export class RealtimeVoiceController {
       await this.updateAttachment(active);
       const serverError = result.events.toReversed().find((event) => event.type === "error");
       if (serverError !== undefined) active.lastServerError = serverError.reason;
+      if (active.terminalStopRequested) return;
       const fenced = result.events.some((event) => event.type === "lease-fenced");
       if (fenced || result.state.phase === "ended" || result.state.phase === "error") {
         await this.cleanupAfterServerTermination(
@@ -996,6 +1009,7 @@ export class RealtimeVoiceController {
       focus: persisted?.focus ?? null,
       pendingEvents: persisted?.pendingEvents ?? [],
       deliveredThroughSequence: -1,
+      terminalStopRequested: false,
     };
     await this.replaceAttachment(active);
     if (this.detached || generation !== this.startGeneration) {

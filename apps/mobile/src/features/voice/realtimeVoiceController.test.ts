@@ -145,6 +145,7 @@ const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
       };
       return true;
     }),
+    drainAndStopRealtimeSessionAsync: vi.fn(async () => undefined),
     armThreadVoiceHandoffAsync: vi.fn(async () => undefined),
     setRealtimeMutedAsync: vi.fn(async () => undefined),
     getAudioRoutesAsync: vi.fn(async () => []),
@@ -1778,6 +1779,38 @@ describe("RealtimeVoiceController", () => {
       nativeSessionId: SESSION_ID,
     });
     expect(order).toEqual(["arm", "stop"]);
+  });
+
+  it("requests a local playout drain before cleaning up an agent-requested stop", async () => {
+    const { client, controller, native } = makeHarness();
+    await controller.start(createInput);
+    const order: string[] = [];
+    vi.mocked(native.drainAndStopRealtimeSessionAsync).mockImplementation(async () => {
+      order.push("drain-stop");
+    });
+    vi.mocked(client.sessionEvents).mockReturnValue(
+      Effect.succeed({
+        state: { ...serverSession.state, phase: "ended" as const, sequence: 1 },
+        events: [
+          {
+            sessionId: SESSION_ID,
+            leaseGeneration: 1,
+            sequence: 1,
+            occurredAt: "2026-07-10T22:01:00.000Z",
+            type: "terminal-action",
+            action: "stop-realtime-voice",
+          },
+        ],
+      }),
+    );
+
+    await controller.refreshEvents();
+
+    expect(native.drainAndStopRealtimeSessionAsync).toHaveBeenCalledWith({
+      nativeSessionId: SESSION_ID,
+    });
+    expect(order).toEqual(["drain-stop"]);
+    expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
   });
 
   it("still completes terminal cleanup when native handoff arming loses a binder race", async () => {

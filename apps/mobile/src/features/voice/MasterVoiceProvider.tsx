@@ -137,7 +137,10 @@ interface MasterVoiceContextValue {
         readonly threadId: ThreadId;
       })
     | null;
-  readonly consumeThreadVoiceHandoff: (actionId: string) => void;
+  readonly settleThreadVoiceHandoff: (
+    actionId: string,
+    outcome: "adopted" | "failed",
+  ) => Promise<void>;
   readonly nativeThreadCommand:
     | (T3VoiceCommandEvent & {
         readonly environmentId: EnvironmentId;
@@ -514,7 +517,7 @@ export function MasterVoiceProvider(props: {
   useEffect(() => {
     if (native === null || prepared === null || controllerEnvironmentId === null) return;
     const accept = (event: T3VoiceThreadVoiceHandoffEvent) => {
-      if (event.environmentOrigin !== prepared.httpBaseUrl) return;
+      if (event.environmentOrigin !== new URL(prepared.httpBaseUrl).origin) return;
       if (acceptedThreadVoiceHandoffIdRef.current === event.actionId) return;
       acceptedThreadVoiceHandoffIdRef.current = event.actionId;
       setThreadVoiceHandoff({
@@ -1627,9 +1630,13 @@ export function MasterVoiceProvider(props: {
       threadVoiceHandoff,
       nativeThreadCommand,
       completeNativeThreadCommand,
-      consumeThreadVoiceHandoff: (actionId) => {
+      settleThreadVoiceHandoff: async (actionId, outcome) => {
+        if (native === null) throw new Error("The native voice runtime is unavailable");
+        await native.acknowledgeThreadVoiceHandoffAsync({ actionId, outcome });
         setThreadVoiceHandoff((current) => (current?.actionId === actionId ? null : current));
-        void native?.acknowledgeThreadVoiceHandoffAsync({ actionId });
+        if (acceptedThreadVoiceHandoffIdRef.current === actionId) {
+          acceptedThreadVoiceHandoffIdRef.current = null;
+        }
       },
     }),
     [

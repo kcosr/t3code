@@ -499,6 +499,7 @@ export const VoiceNativeHeartbeatResult = Schema.Struct({
   leaseGeneration: PositiveInt,
   phase: VoiceSessionPhase,
   disposition: Schema.Literals(["live", "terminal"]),
+  handoffPending: Schema.Boolean,
   expiresAt: IsoDateTime,
 });
 export type VoiceNativeHeartbeatResult = typeof VoiceNativeHeartbeatResult.Type;
@@ -576,6 +577,7 @@ export const VoiceToolName = Schema.Literals([
   "search_history",
   "read_history",
   "activate_thread",
+  "stop_realtime_voice",
   "handoff_to_thread_voice",
   "create_thread",
   "send_thread_message",
@@ -655,6 +657,11 @@ export const VoiceSessionEvent = Schema.Union([
     projectId: ProjectId,
     threadId: ThreadId,
     expiresAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    ...VoiceEventBase,
+    type: Schema.Literal("terminal-action"),
+    action: Schema.Literal("stop-realtime-voice"),
   }),
   Schema.Struct({
     ...VoiceEventBase,

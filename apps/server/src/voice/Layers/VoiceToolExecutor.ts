@@ -84,6 +84,7 @@ const ListThreadsArguments = Schema.Struct({
 });
 const ThreadArguments = Schema.Struct({ threadId: ThreadId });
 const HandoffToThreadVoiceArguments = Schema.Struct({ projectId: ProjectId, threadId: ThreadId });
+const StopRealtimeVoiceArguments = Schema.Struct({});
 const HandoffToThreadVoiceOutput = Schema.Struct({
   status: Schema.Literal("accepted"),
   actionId: VoiceClientActionId,
@@ -197,6 +198,7 @@ type ReadVoiceTool = Extract<
   | "search_history"
   | "read_history"
   | "activate_thread"
+  | "stop_realtime_voice"
   | "handoff_to_thread_voice"
 >;
 type MutationVoiceTool = Exclude<VoiceToolName, ReadVoiceTool>;
@@ -211,6 +213,7 @@ const VOICE_TOOL_ACCESS = {
   search_history: "history-read",
   read_history: "history-read",
   activate_thread: "orchestration-read",
+  stop_realtime_voice: "orchestration-read",
   handoff_to_thread_voice: "orchestration-read",
   create_thread: "orchestration-operate",
   send_thread_message: "orchestration-operate",
@@ -542,11 +545,27 @@ const make = Effect.gen(function* () {
       outcome: "succeeded",
       output,
       terminalAction: {
+        type: "handoff-to-thread-voice",
         actionId,
         projectId: args.projectId,
         threadId: args.threadId,
         autoRearm: true,
       },
+    } satisfies VoiceToolExecutionResult;
+  });
+
+  const terminalStop = Effect.fn("VoiceToolExecutor.terminalStop")(function* (
+    input: VoiceToolCallInput,
+  ) {
+    yield* parseArguments(StopRealtimeVoiceArguments, input);
+    return {
+      type: "terminal-completed",
+      toolCallId: input.toolCallId,
+      providerFunctionCallId: input.providerFunctionCallId,
+      tool: "stop_realtime_voice",
+      outcome: "succeeded",
+      output: jsonOutput({ status: "accepted" }),
+      terminalAction: { type: "stop-realtime" },
     } satisfies VoiceToolExecutionResult;
   });
 
@@ -653,7 +672,7 @@ const make = Effect.gen(function* () {
 
   const executeRead = Effect.fn("VoiceToolExecutor.executeRead")(function* (
     input: VoiceToolCallInput,
-    tool: Exclude<ReadVoiceTool, "handoff_to_thread_voice">,
+    tool: Exclude<ReadVoiceTool, "handoff_to_thread_voice" | "stop_realtime_voice">,
   ) {
     switch (tool) {
       case "list_projects": {
@@ -955,11 +974,27 @@ const make = Effect.gen(function* () {
         outcome: "succeeded",
         output: call.resultOutput,
         terminalAction: {
+          type: "handoff-to-thread-voice",
           actionId: value.actionId,
           projectId: value.projectId,
           threadId: value.threadId,
           autoRearm: true,
         },
+      };
+    }
+    if (
+      call.toolName === "stop_realtime_voice" &&
+      call.status === "succeeded" &&
+      call.resultOutput !== null
+    ) {
+      return {
+        type: "terminal-completed",
+        toolCallId: call.toolCallId,
+        providerFunctionCallId: call.providerFunctionCallId,
+        tool: "stop_realtime_voice",
+        outcome: "succeeded",
+        output: call.resultOutput,
+        terminalAction: { type: "stop-realtime" },
       };
     }
     return {
@@ -1443,42 +1478,59 @@ const make = Effect.gen(function* () {
 
       const execution = Effect.gen(function* () {
         yield* appendJournal(input, "requested");
-        const result: VoiceToolExecutionResult =
-          resolution.tool === "handoff_to_thread_voice"
-            ? yield* terminalHandoff(input).pipe(
-                Effect.catch((cause) =>
-                  Effect.succeed(
-                    completed(
-                      input,
-                      resolution.tool,
-                      "failed",
-                      jsonOutput({
-                        error: cause instanceof Error ? cause.message : "Invalid tool arguments",
-                      }),
-                    ),
-                  ),
+        let result: VoiceToolExecutionResult;
+        if (resolution.tool === "handoff_to_thread_voice") {
+          result = yield* terminalHandoff(input).pipe(
+            Effect.match({
+              onFailure: (cause) =>
+                completed(
+                  input,
+                  resolution.tool,
+                  "failed",
+                  jsonOutput({
+                    error: cause instanceof Error ? cause.message : "Invalid tool arguments",
+                  }),
                 ),
-              )
-            : yield* executeRead(input, resolution.tool).pipe(
-                Effect.match({
-                  onFailure: (cause) =>
-                    completed(
-                      input,
-                      resolution.tool,
-                      "failed",
-                      jsonOutput({
-                        error: cause instanceof Error ? cause.message : "Invalid tool arguments",
-                      }),
-                    ),
-                  onSuccess: (output) =>
-                    completed(
-                      input,
-                      resolution.tool,
-                      output.startsWith('{"error"') ? "failed" : "succeeded",
-                      output,
-                    ),
-                }),
-              );
+              onSuccess: (value) => value,
+            }),
+          );
+        } else if (resolution.tool === "stop_realtime_voice") {
+          result = yield* terminalStop(input).pipe(
+            Effect.match({
+              onFailure: (cause) =>
+                completed(
+                  input,
+                  resolution.tool,
+                  "failed",
+                  jsonOutput({
+                    error: cause instanceof Error ? cause.message : "Invalid tool arguments",
+                  }),
+                ),
+              onSuccess: (value) => value,
+            }),
+          );
+        } else {
+          result = yield* executeRead(input, resolution.tool).pipe(
+            Effect.match({
+              onFailure: (cause) =>
+                completed(
+                  input,
+                  resolution.tool,
+                  "failed",
+                  jsonOutput({
+                    error: cause instanceof Error ? cause.message : "Invalid tool arguments",
+                  }),
+                ),
+              onSuccess: (output) =>
+                completed(
+                  input,
+                  resolution.tool,
+                  output.startsWith('{"error"') ? "failed" : "succeeded",
+                  output,
+                ),
+            }),
+          );
+        }
         yield* appendJournal(input, result.outcome, result.output);
         yield* persistCompleted(input, result, requestedAt);
         return result;

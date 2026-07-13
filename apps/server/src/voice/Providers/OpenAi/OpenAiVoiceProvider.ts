@@ -300,6 +300,17 @@ const REALTIME_TOOLS = [
   },
   {
     type: "function",
+    name: "stop_realtime_voice",
+    description:
+      "Terminally end this Realtime voice interaction without starting another voice mode. Call this as the final action when the user asks to stop, end, or disconnect Realtime voice. Do not speak after calling it.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
     name: "handoff_to_thread_voice",
     description:
       "Terminally end this Realtime interaction and start auto-rearming traditional voice capture for the selected T3 thread. Call this as the final action only when the user asks to switch to standard thread voice. Do not speak before or after calling it unless clarification is required.",

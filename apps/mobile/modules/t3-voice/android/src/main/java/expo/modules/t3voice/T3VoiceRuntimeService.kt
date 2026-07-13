@@ -626,10 +626,26 @@ class T3VoiceRuntimeService : Service() {
       T3VoiceStateStore.recordingTermination.value?.toEventBody()
 
     fun pendingThreadVoiceHandoff(): Map<String, Any>? =
-      T3VoiceStateStore.pendingThreadVoiceHandoff()?.toEventBody()
+      synchronized(operationLock) {
+        val handoff = T3VoiceStateStore.pendingThreadVoiceHandoff() ?: return@synchronized null
+        if (handoff.expiresAtEpochMillis <= System.currentTimeMillis()) {
+          cancelNativeHandoffRecordingLocked(handoff.recordingId, "handoff-adoption-expired")
+          T3VoiceStateStore.clearThreadVoiceHandoff(handoff.actionId)
+          return@synchronized null
+        }
+        handoff.toEventBody()
+      }
 
-    fun acknowledgeThreadVoiceHandoff(actionId: String) {
-      T3VoiceStateStore.clearThreadVoiceHandoff(actionId)
+    fun acknowledgeThreadVoiceHandoff(actionId: String, outcome: String) {
+      synchronized(operationLock) {
+        val handoff = T3VoiceStateStore.pendingThreadVoiceHandoff()
+          ?.takeIf { it.actionId == actionId }
+          ?: return@synchronized
+        if (outcome == "failed") {
+          cancelNativeHandoffRecordingLocked(handoff.recordingId, "handoff-adoption-failed")
+        }
+        T3VoiceStateStore.clearThreadVoiceHandoff(actionId)
+      }
     }
 
     fun armThreadVoiceHandoff(nativeSessionId: String) {
@@ -765,6 +781,13 @@ class T3VoiceRuntimeService : Service() {
         realtime.stop(nativeSessionId)
       }
 
+    fun drainAndStopRealtimeSession(nativeSessionId: String) {
+      synchronized(operationLock) {
+        if (T3VoiceStateStore.state.value.activeRealtimeSessionId != nativeSessionId) return
+        drainRealtimeForStopLocked(nativeSessionId)
+      }
+    }
+
     fun setRealtimeMuted(nativeSessionId: String, muted: Boolean) {
       realtime.setMuted(nativeSessionId, muted)
     }
@@ -831,6 +854,7 @@ class T3VoiceRuntimeService : Service() {
   private var nextCueGeneration = 0L
   private var realtimeReadyCue: Pair<String, Long>? = null
   private var realtimeEndedCue: Pair<String, Long>? = null
+  private var realtimeStopDrainSessionId: String? = null
   private var pendingRecordingStart: T3VoicePendingRecordingStart? = null
   private var recordingEndedCue: Pair<String, Long>? = null
   private val mainHandler = Handler(Looper.getMainLooper())
@@ -842,9 +866,12 @@ class T3VoiceRuntimeService : Service() {
           if (T3VoiceStateStore.state.value.activeRealtimeSessionId == sessionId) {
             when (termination) {
               T3VoiceNativeControlTermination.SESSION_ENDED -> {
-                awaitingHandoffAction = handoffEligibleSessionId == sessionId
+                awaitingHandoffAction = false
+                drainRealtimeForStopLocked(sessionId)
+              }
+              T3VoiceNativeControlTermination.HANDOFF_PENDING -> {
+                awaitingHandoffAction = true
                 nativeHandoffPoller.beginTerminalWindow()
-                realtime.stop(sessionId)
               }
               T3VoiceNativeControlTermination.CONTROL_REJECTED ->
                 realtime.failNativeControl(sessionId, retryable = false)
@@ -864,6 +891,7 @@ class T3VoiceRuntimeService : Service() {
           synchronized(operationLock) {
             if (handoffEligibleSessionId == sessionId) {
               if (T3VoiceStateStore.state.value.activeRealtimeSessionId == sessionId) {
+                awaitingHandoffAction = false
                 runCatching { realtime.stop(sessionId) }
               }
               backgroundRealtimeAttempt?.takeIf {
@@ -996,6 +1024,32 @@ class T3VoiceRuntimeService : Service() {
         }
       }) {
       completeRealtimeReadyCueLocked(sessionId, generation)
+    }
+  }
+
+  private fun drainRealtimeForStopLocked(sessionId: String) {
+    if (realtimeStopDrainSessionId == sessionId) return
+    cancelRealtimeReadyCueLocked(sessionId)
+    realtimeStopDrainSessionId = sessionId
+    try {
+      realtime.drainPlayout(sessionId) {
+        mainHandler.post {
+          if (!serviceDestroyed) synchronized(operationLock) {
+            if (realtimeStopDrainSessionId == sessionId) realtimeStopDrainSessionId = null
+            if (
+              !handoffInProgress &&
+                T3VoiceStateStore.state.value.activeRealtimeSessionId == sessionId
+            ) {
+              runCatching { realtime.stop(sessionId) }
+            }
+          }
+        }
+      }
+    } catch (_: Throwable) {
+      if (realtimeStopDrainSessionId == sessionId) realtimeStopDrainSessionId = null
+      if (T3VoiceStateStore.state.value.activeRealtimeSessionId == sessionId) {
+        runCatching { realtime.stop(sessionId) }
+      }
     }
   }
 
@@ -3552,6 +3606,20 @@ class T3VoiceRuntimeService : Service() {
         environmentOrigin = environmentOrigin,
         expiresAtEpochMillis = action.expiresAtEpochMillis,
       ),
+    )
+    mainHandler.postDelayed(
+      {
+        if (!serviceDestroyed) synchronized(operationLock) {
+          val pending = T3VoiceStateStore.pendingThreadVoiceHandoff()
+            ?.takeIf { it.actionId == action.actionId && it.recordingId == recordingId }
+            ?: return@synchronized
+          if (pending.expiresAtEpochMillis <= System.currentTimeMillis()) {
+            cancelNativeHandoffRecordingLocked(recordingId, "handoff-adoption-expired")
+            T3VoiceStateStore.clearThreadVoiceHandoff(action.actionId)
+          }
+        }
+      },
+      maxOf(0L, action.expiresAtEpochMillis - System.currentTimeMillis()),
     )
   }
 

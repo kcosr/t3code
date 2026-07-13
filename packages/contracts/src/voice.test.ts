@@ -495,6 +495,7 @@ describe("voice contracts", () => {
       leaseGeneration: 2,
       phase: "listening",
       disposition: "live",
+      handoffPending: false,
       expiresAt: grant.expiresAt,
     } as const;
     expect(decodeUnknownSync(VoiceNativeHeartbeatResult)(heartbeat)).toEqual(heartbeat);

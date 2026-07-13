@@ -76,6 +76,7 @@ const BACKGROUND_VOICE_TOOLS = new Set([
   "search_history",
   "read_history",
   "activate_thread",
+  "stop_realtime_voice",
   "handoff_to_thread_voice",
 ]);
 
@@ -149,7 +150,7 @@ interface RuntimeSession {
   readonly terminalAt?: number;
   readonly terminalOrder?: number;
   readonly terminating?: boolean;
-  readonly terminalHandoffClaimed?: boolean;
+  readonly terminalToolClaimed?: boolean;
   readonly terminalHandoffReady?: boolean;
   readonly providerSession?: RealtimeProviderSession;
   readonly eventFiber?: Fiber.Fiber<void, never>;
@@ -523,7 +524,7 @@ const make = Effect.gen(function* () {
     yield* emit(session.lease, { type: "state", phase });
     const current = (yield* SynchronizedRef.get(runtime)).sessions.get(session.lease.sessionId);
     yield* terminateProvider(current ?? session, options);
-    yield* terminationSnapshot.terminalHandoffClaimed
+    yield* terminationSnapshot.terminalToolClaimed
       ? nativeControlGrants.releaseSessionControl(session.lease.sessionId)
       : nativeControlGrants.revokeSession(session.lease.sessionId);
     yield* registry.release(session.lease);
@@ -548,24 +549,26 @@ const make = Effect.gen(function* () {
     return true;
   });
 
-  const endHandoffProviderSession = Effect.fn("VoiceSessionService.endHandoffProviderSession")(
-    function* (sessionId: VoiceSessionId) {
+  const endTerminalProviderSession = Effect.fn("VoiceSessionService.endTerminalProviderSession")(
+    function* (sessionId: VoiceSessionId, reason: VoiceSessionEndReason) {
       const current = (yield* SynchronizedRef.get(runtime)).sessions.get(sessionId);
-      if (current === undefined || !current.terminalHandoffClaimed) return false;
-      return yield* endRuntimeSession(current, "ended", {
-        reason: "handed-off-to-thread-voice",
-      });
+      if (current === undefined || !current.terminalToolClaimed) return false;
+      return yield* endRuntimeSession(current, "ended", { reason });
     },
   );
 
-  const scheduleHandoffProviderTermination = Effect.fn(
-    "VoiceSessionService.scheduleHandoffProviderTermination",
-  )(function* (sessionId: VoiceSessionId, activatedAtMillis: number) {
+  const scheduleTerminalProviderTermination = Effect.fn(
+    "VoiceSessionService.scheduleTerminalProviderTermination",
+  )(function* (
+    sessionId: VoiceSessionId,
+    activatedAtMillis: number,
+    reason: VoiceSessionEndReason,
+  ) {
     const now = yield* Clock.currentTimeMillis;
     yield* Effect.sleep(
       `${Math.max(0, activatedAtMillis + HANDOFF_PROVIDER_DRAIN_MILLIS - now)} millis`,
     );
-    yield* endHandoffProviderSession(sessionId);
+    yield* endTerminalProviderSession(sessionId, reason);
   });
 
   yield* Effect.addFinalizer(() =>
@@ -725,13 +728,13 @@ const make = Effect.gen(function* () {
     providerSession: RealtimeProviderSession,
     result: Extract<
       import("../Services/VoiceToolExecutor.ts").VoiceToolInvokeResult,
-      { readonly type: "terminal-completed" }
+      { readonly type: "terminal-completed"; readonly tool: "handoff_to_thread_voice" }
     >,
   ) {
     const claimed = yield* mutateSession<boolean>(lease.sessionId, (session) => {
-      if (session.terminalHandoffClaimed || session.terminating || session.terminalAt !== undefined)
+      if (session.terminalToolClaimed || session.terminating || session.terminalAt !== undefined)
         return [false, session] as const;
-      return [true, { ...session, terminalHandoffClaimed: true }] as const;
+      return [true, { ...session, terminalToolClaimed: true }] as const;
     });
     if (Option.isNone(claimed) || !claimed.value) return;
 
@@ -838,9 +841,11 @@ const make = Effect.gen(function* () {
     // Once activation is durable, its expiry and bounded provider teardown must
     // exist even if publishing the client event or journaling the boundary fails.
     yield* scheduleHandoffExpiry(expiresAtMillis).pipe(Effect.forkIn(serviceScope));
-    yield* scheduleHandoffProviderTermination(lease.sessionId, activatedAtMillis).pipe(
-      Effect.forkIn(serviceScope),
-    );
+    yield* scheduleTerminalProviderTermination(
+      lease.sessionId,
+      activatedAtMillis,
+      "handed-off-to-thread-voice",
+    ).pipe(Effect.forkIn(serviceScope));
     yield* emit(lease, {
       type: "tool",
       toolCallId: result.toolCallId,
@@ -867,6 +872,58 @@ const make = Effect.gen(function* () {
         reason: "handed-off-to-thread-voice",
         targetThreadId: result.terminalAction.threadId,
         handedOffAt: activatedAt,
+      },
+    });
+  });
+
+  const submitTerminalStop = Effect.fn("VoiceSessionService.submitTerminalStop")(function* (
+    lease: VoiceSessionLease,
+    providerSession: RealtimeProviderSession,
+    result: Extract<
+      import("../Services/VoiceToolExecutor.ts").VoiceToolInvokeResult,
+      { readonly type: "terminal-completed"; readonly tool: "stop_realtime_voice" }
+    >,
+  ) {
+    const claimed = yield* mutateSession<boolean>(lease.sessionId, (session) => {
+      if (session.terminalToolClaimed || session.terminating || session.terminalAt !== undefined)
+        return [false, session] as const;
+      return [true, { ...session, terminalToolClaimed: true }] as const;
+    });
+    if (Option.isNone(claimed) || !claimed.value) return;
+
+    const itemHash = NodeCrypto.createHash("sha256")
+      .update(`${lease.conversationId}\0${result.toolCallId}`)
+      .digest("base64url")
+      .slice(0, 28);
+    yield* providerSession.completeTerminalToolCall({
+      providerFunctionCallId: result.providerFunctionCallId,
+      output: result.output,
+      itemId: `t3s_${itemHash}`,
+    });
+    const completedAtMillis = yield* Clock.currentTimeMillis;
+    yield* scheduleTerminalProviderTermination(
+      lease.sessionId,
+      completedAtMillis,
+      "stopped-by-voice-agent",
+    ).pipe(Effect.forkIn(serviceScope));
+    yield* emit(lease, {
+      type: "tool",
+      toolCallId: result.toolCallId,
+      tool: result.tool,
+      outcome: result.outcome,
+    });
+    yield* emit(lease, {
+      type: "terminal-action",
+      action: "stop-realtime-voice",
+    });
+    yield* conversations.appendContextIdempotent({
+      entryId: VoiceConversationEntryId.make(`voice-stop:${result.toolCallId}:boundary`),
+      conversationId: lease.conversationId,
+      expectedEpoch: lease.contextEpoch,
+      kind: "call-boundary",
+      payload: {
+        reason: "stopped-by-voice-agent",
+        stoppedAt: DateTime.formatIso(DateTime.makeUnsafe(completedAtMillis)),
       },
     });
   });
@@ -909,7 +966,7 @@ const make = Effect.gen(function* () {
       ]);
     }
     const runtimeSession = (yield* SynchronizedRef.get(runtime)).sessions.get(lease.sessionId);
-    if (runtimeSession === undefined || runtimeSession.terminalHandoffClaimed) return;
+    if (runtimeSession === undefined || runtimeSession.terminalToolClaimed) return;
     const grantedScopes = runtimeSession.grantedScopes;
     switch (event.type) {
       case "activity":
@@ -967,7 +1024,9 @@ const make = Effect.gen(function* () {
               result.type === "completed"
                 ? submitCompletedTool(lease, providerSession, result)
                 : result.type === "terminal-completed"
-                  ? submitTerminalHandoff(lease, providerSession, result)
+                  ? result.tool === "handoff_to_thread_voice"
+                    ? submitTerminalHandoff(lease, providerSession, result)
+                    : submitTerminalStop(lease, providerSession, result)
                   : Effect.void,
             ),
             Effect.catch((error) =>
@@ -995,7 +1054,11 @@ const make = Effect.gen(function* () {
           return;
         }
         if (result.type === "terminal-completed") {
-          yield* submitTerminalHandoff(lease, providerSession, result);
+          if (result.tool === "handoff_to_thread_voice") {
+            yield* submitTerminalHandoff(lease, providerSession, result);
+          } else {
+            yield* submitTerminalStop(lease, providerSession, result);
+          }
           return;
         }
         if (result.newlyCreated) {
@@ -2051,9 +2114,10 @@ const make = Effect.gen(function* () {
         );
       yield* persistHandoffOutcome(settled);
       yield* nativeControlGrants.revokeSession(VoiceSessionId.make(settled.realtimeSessionId));
-      yield* endHandoffProviderSession(VoiceSessionId.make(settled.realtimeSessionId)).pipe(
-        Effect.forkIn(serviceScope),
-      );
+      yield* endTerminalProviderSession(
+        VoiceSessionId.make(settled.realtimeSessionId),
+        "handed-off-to-thread-voice",
+      ).pipe(Effect.forkIn(serviceScope));
       if (settled.status === "expired") {
         return yield* sessionError(
           "invalid-phase",

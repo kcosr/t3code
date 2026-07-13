@@ -688,8 +688,13 @@ class T3VoiceModule : Module() {
       }
 
       AsyncFunction("acknowledgeThreadVoiceHandoffAsync") { input: Map<String, String>, promise: Promise ->
+        requireExactKeys(input, setOf("actionId", "outcome"))
         withBinder(promise, "thread-voice-handoff-acknowledgement-failed") { voice, result ->
-          voice.acknowledgeThreadVoiceHandoff(requireIdentifier(input, "actionId"))
+          val outcome = requireText(input, "outcome", 16)
+          check(outcome == "adopted" || outcome == "failed") {
+            "outcome must be adopted or failed."
+          }
+          voice.acknowledgeThreadVoiceHandoff(requireIdentifier(input, "actionId"), outcome)
           result.resolve()
         }
       }
@@ -830,6 +835,13 @@ class T3VoiceModule : Module() {
       AsyncFunction("stopRealtimeSessionAsync") { input: Map<String, String>, promise: Promise ->
         withBinder(promise, "realtime-stop-failed") { voice, result ->
           result.resolve(voice.stopRealtimeSession(requireIdentifier(input, "nativeSessionId")))
+        }
+      }
+
+      AsyncFunction("drainAndStopRealtimeSessionAsync") { input: Map<String, String>, promise: Promise ->
+        withBinder(promise, "realtime-drained-stop-failed") { voice, result ->
+          voice.drainAndStopRealtimeSession(requireIdentifier(input, "nativeSessionId"))
+          result.resolve()
         }
       }
 

@@ -407,6 +407,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   } = autoListen;
   const autoListenAlertCycleRef = useRef(0);
   const nativeThreadActivationRef = useRef(new NativeThreadCommandActivationCoordinator());
+  const handoffAdoptionsRef = useRef(new Set<string>());
 
   useEffect(() => {
     const command = realtimeVoice.nativeThreadCommand;
@@ -442,15 +443,20 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     ) {
       return;
     }
-    let disposed = false;
-    void dictation.adopt(handoff.recordingId).then((adopted) => {
-      if (disposed) return;
-      if (adopted && handoff.autoRearm) adoptAutoListenRecording(handoff.recordingId);
-      realtimeVoice.consumeThreadVoiceHandoff(handoff.actionId);
-    });
-    return () => {
-      disposed = true;
-    };
+    if (handoffAdoptionsRef.current.has(handoff.actionId)) return;
+    handoffAdoptionsRef.current.add(handoff.actionId);
+    void dictation
+      .adopt(handoff.recordingId)
+      .then(async (adopted) => {
+        if (adopted && handoff.autoRearm) adoptAutoListenRecording(handoff.recordingId);
+        await realtimeVoice.settleThreadVoiceHandoff(
+          handoff.actionId,
+          adopted ? "adopted" : "failed",
+        );
+      })
+      .catch(() => realtimeVoice.settleThreadVoiceHandoff(handoff.actionId, "failed"))
+      .finally(() => handoffAdoptionsRef.current.delete(handoff.actionId))
+      .catch(() => undefined);
   }, [
     adoptAutoListenRecording,
     dictation,

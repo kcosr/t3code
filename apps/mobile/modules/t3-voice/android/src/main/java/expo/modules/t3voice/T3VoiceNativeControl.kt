@@ -26,12 +26,14 @@ internal data class T3VoiceNativeControlGrant(
 internal enum class T3VoiceNativeHeartbeatResult {
   SUCCESS,
   SESSION_TERMINAL,
+  SESSION_TERMINAL_HANDOFF,
   TRANSIENT_FAILURE,
   TERMINAL_FAILURE,
 }
 
 internal enum class T3VoiceNativeControlTermination {
   SESSION_ENDED,
+  HANDOFF_PENDING,
   CONTROL_REJECTED,
   TRANSIENT_FAILURE,
 }
@@ -76,6 +78,7 @@ internal object T3VoiceNativeHeartbeatResponsePolicy {
     leaseGeneration: Long?,
     disposition: String?,
     phase: String?,
+    handoffPending: Boolean?,
     expiresAt: String?,
     seenFields: Set<String>,
     expectedSessionId: String,
@@ -88,18 +91,27 @@ internal object T3VoiceNativeHeartbeatResponsePolicy {
     if (expiresAt == null) {
       return T3VoiceNativeHeartbeatResult.TERMINAL_FAILURE
     }
+    if (handoffPending == null) {
+      return T3VoiceNativeHeartbeatResult.TERMINAL_FAILURE
+    }
     if (runCatching { Instant.parse(expiresAt) }.isFailure) {
       return T3VoiceNativeHeartbeatResult.TERMINAL_FAILURE
     }
     return when {
-      disposition == "live" && phase in LIVE_PHASES -> T3VoiceNativeHeartbeatResult.SUCCESS
+      disposition == "live" && phase in LIVE_PHASES && handoffPending == false ->
+        T3VoiceNativeHeartbeatResult.SUCCESS
       disposition == "terminal" && phase in TERMINAL_PHASES ->
-        T3VoiceNativeHeartbeatResult.SESSION_TERMINAL
+        if (handoffPending == true) {
+          T3VoiceNativeHeartbeatResult.SESSION_TERMINAL_HANDOFF
+        } else {
+          T3VoiceNativeHeartbeatResult.SESSION_TERMINAL
+        }
       else -> T3VoiceNativeHeartbeatResult.TERMINAL_FAILURE
     }
   }
 
-  val REQUIRED_FIELDS = setOf("sessionId", "leaseGeneration", "phase", "disposition", "expiresAt")
+  val REQUIRED_FIELDS =
+    setOf("sessionId", "leaseGeneration", "phase", "disposition", "handoffPending", "expiresAt")
   private val LIVE_PHASES =
     setOf(
       "creating",
@@ -437,6 +449,7 @@ internal class T3VoiceHttpsNativeHeartbeatTransport : T3VoiceNativeHeartbeatTran
       var generation: Long? = null
       var phase: String? = null
       var disposition: String? = null
+      var handoffPending: Boolean? = null
       var expiresAt: String? = null
       JsonReader(InputStreamReader(BoundedInputStream(input, MAXIMUM_RESPONSE_BYTES), Charsets.UTF_8)).use {
         reader ->
@@ -449,6 +462,7 @@ internal class T3VoiceHttpsNativeHeartbeatTransport : T3VoiceNativeHeartbeatTran
             "leaseGeneration" -> generation = reader.nextLong()
             "phase" -> phase = reader.nextString()
             "disposition" -> disposition = reader.nextString()
+            "handoffPending" -> handoffPending = reader.nextBoolean()
             "expiresAt" -> expiresAt = reader.nextString()
           }
         }
@@ -460,6 +474,7 @@ internal class T3VoiceHttpsNativeHeartbeatTransport : T3VoiceNativeHeartbeatTran
         generation,
         disposition,
         phase,
+        handoffPending,
         expiresAt,
         seen,
         expectedSessionId,
@@ -551,8 +566,16 @@ internal class T3VoiceNativeControlHeartbeat(
     synchronized(lock) {
       if (grant !== current) return
       if (result == T3VoiceNativeHeartbeatResult.SUCCESS) lastSuccessMillis = now
-      if (result == T3VoiceNativeHeartbeatResult.SESSION_TERMINAL) {
-        termination = T3VoiceNativeControlTermination.SESSION_ENDED
+      if (
+        result == T3VoiceNativeHeartbeatResult.SESSION_TERMINAL ||
+          result == T3VoiceNativeHeartbeatResult.SESSION_TERMINAL_HANDOFF
+      ) {
+        termination =
+          if (result == T3VoiceNativeHeartbeatResult.SESSION_TERMINAL_HANDOFF) {
+            T3VoiceNativeControlTermination.HANDOFF_PENDING
+          } else {
+            T3VoiceNativeControlTermination.SESSION_ENDED
+          }
         stopLocked()
       } else if (
         T3VoiceNativeHeartbeatPolicy.shouldLoseControl(
