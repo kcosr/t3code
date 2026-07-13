@@ -198,6 +198,57 @@ export class NativeVoiceCommandCompletionGate {
   }
 }
 
+export class NativeVoiceForegroundCommandGate<A> {
+  private pending: A | null = null;
+  private active = false;
+  private disposed = false;
+  private activationTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(
+    private readonly activationDelayMs: number,
+    private readonly dispatch: (command: A) => void,
+  ) {}
+
+  enqueue(command: A): void {
+    if (this.disposed) return;
+    this.pending = command;
+    this.scheduleDispatch();
+  }
+
+  setActive(active: boolean): void {
+    if (this.disposed || this.active === active) return;
+    this.active = active;
+    if (!active) {
+      this.cancelActivationTimer();
+      return;
+    }
+    this.scheduleDispatch();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.pending = null;
+    this.cancelActivationTimer();
+  }
+
+  private scheduleDispatch(): void {
+    if (!this.active || this.pending === null || this.activationTimer !== null) return;
+    this.activationTimer = setTimeout(() => {
+      this.activationTimer = null;
+      if (this.disposed || !this.active || this.pending === null) return;
+      const command = this.pending;
+      this.pending = null;
+      this.dispatch(command);
+    }, this.activationDelayMs);
+  }
+
+  private cancelActivationTimer(): void {
+    if (this.activationTimer === null) return;
+    clearTimeout(this.activationTimer);
+    this.activationTimer = null;
+  }
+}
+
 export class NativeThreadCommandActivationCoordinator {
   private readonly handled = new Set<string>();
 

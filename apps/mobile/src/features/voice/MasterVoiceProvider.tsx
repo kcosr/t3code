@@ -56,6 +56,7 @@ import {
   isNextNativeReadinessGeneration,
   NativeVoiceCommandCompletionGate,
   NativeVoiceCommandDeduplicator,
+  NativeVoiceForegroundCommandGate,
   NativeVoiceControllerGeneration,
   NativeVoiceOperationEpoch,
   reconcilePendingNativeReadinessDisable,
@@ -68,6 +69,7 @@ import {
   durableVoiceConversations,
   masterVoiceEnvironmentId,
   newVoiceConversationSelection,
+  nextVoiceThreadTarget,
   reconcileMasterVoiceFocus,
   resumeVoiceConversationSelection,
   VoiceFocusUpdateQueue,
@@ -258,6 +260,16 @@ export function MasterVoiceProvider(props: {
             project.environmentId === thread.environmentId && project.id === thread.projectId,
         ),
     );
+
+  useEffect(() => {
+    const target = nextVoiceThreadTarget(preferences?.voiceThreadTarget, props.focus);
+    if (target !== null) savePreferences({ voiceThreadTarget: target });
+  }, [
+    preferences?.voiceThreadTarget,
+    props.focus?.environmentId,
+    props.focus?.threadId,
+    savePreferences,
+  ]);
 
   const controllerEnvironmentId = masterVoiceEnvironmentId(
     attachment?.environmentId ?? null,
@@ -826,12 +838,11 @@ export function MasterVoiceProvider(props: {
       }
     };
 
-    const acceptCommand = (event: T3VoiceCommandEvent) => {
+    const runCommand = (event: T3VoiceCommandEvent) => {
       if (
         disposed ||
         !nativeOperationsRef.current.isCurrent(epoch) ||
-        !nativeControllerGenerationRef.current.accepts(event) ||
-        !nativeCommandsRef.current.claim(event.commandId)
+        !nativeControllerGenerationRef.current.accepts(event)
       )
         return;
       if (readiness.mode === "realtime") {
@@ -877,7 +888,25 @@ export function MasterVoiceProvider(props: {
         void completeNativeThreadCommandRef.current(event.commandId, "failure");
       }
     };
+    const foregroundCommands = new NativeVoiceForegroundCommandGate<T3VoiceCommandEvent>(
+      300,
+      runCommand,
+    );
+    foregroundCommands.setActive(AppState.currentState === "active");
+    const acceptCommand = (event: T3VoiceCommandEvent) => {
+      if (
+        disposed ||
+        !nativeOperationsRef.current.isCurrent(epoch) ||
+        !nativeControllerGenerationRef.current.accepts(event) ||
+        !nativeCommandsRef.current.claim(event.commandId)
+      )
+        return;
+      foregroundCommands.enqueue(event);
+    };
     const subscription = native.addListener("voiceCommand", acceptCommand);
+    const appStateSubscription = AppState.addEventListener("change", (state) => {
+      foregroundCommands.setActive(state === "active");
+    });
     const disabledSubscription = native.addListener("readinessDisabled", (event) => {
       if (!nativeOperationsRef.current.isCurrent(epoch)) return;
       const currentGeneration = nativeReadinessGenerationRef.current;
@@ -975,6 +1004,7 @@ export function MasterVoiceProvider(props: {
 
     return () => {
       disposed = true;
+      foregroundCommands.dispose();
       const pendingThreadCommand = nativeThreadCommandRef.current;
       if (
         pendingThreadCommand !== null &&
@@ -1002,6 +1032,7 @@ export function MasterVoiceProvider(props: {
       nativeThreadCommandRef.current = null;
       if (activeNativeEpochRef.current === epoch) activeNativeEpochRef.current = null;
       subscription.remove();
+      appStateSubscription.remove();
       disabledSubscription.remove();
       setNativeThreadCommand(null);
       if (registeredGeneration === null) return;

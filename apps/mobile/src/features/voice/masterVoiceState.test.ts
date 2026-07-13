@@ -12,6 +12,7 @@ import {
   continueVoiceConversationSelection,
   isSameMasterVoiceFocus,
   masterVoiceEnvironmentId,
+  nextVoiceThreadTarget,
   reconcileMasterVoiceFocus,
   newVoiceConversationSelection,
   newVoiceConversationTitle,
@@ -28,6 +29,28 @@ const focus: MasterVoiceFocus = {
   threadId: ThreadId.make("thread-one"),
   threadTitle: "Voice work",
 };
+
+describe("voice thread target", () => {
+  it("persists a newly selected thread with a monotonic target generation", () => {
+    expect(nextVoiceThreadTarget(undefined, focus)).toEqual({
+      environmentId,
+      threadId: focus.threadId,
+      generation: 1,
+    });
+    expect(
+      nextVoiceThreadTarget(
+        { environmentId: "previous", threadId: "previous", generation: 8 },
+        focus,
+      ),
+    ).toEqual({ environmentId, threadId: focus.threadId, generation: 9 });
+  });
+
+  it("does not rewrite the selected target or clear it outside a thread", () => {
+    const current = { environmentId, threadId: focus.threadId, generation: 8 };
+    expect(nextVoiceThreadTarget(current, focus)).toBeNull();
+    expect(nextVoiceThreadTarget(current, null)).toBeNull();
+  });
+});
 
 const conversation = (
   id: string,

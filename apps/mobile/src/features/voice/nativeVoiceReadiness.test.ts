@@ -4,6 +4,7 @@ import {
   NativeVoiceControllerGeneration,
   NativeVoiceCommandDeduplicator,
   NativeVoiceCommandCompletionGate,
+  NativeVoiceForegroundCommandGate,
   NativeThreadCommandActivationCoordinator,
   NativeVoiceOperationEpoch,
   completeNativeVoiceCommandAttempt,
@@ -259,6 +260,42 @@ describe("native voice readiness", () => {
     expect(commands.claim("command-1")).toBe(false);
     commands.release("command-1");
     expect(commands.claim("command-1")).toBe(true);
+  });
+
+  it("retains a background command until React remains active", () => {
+    vi.useFakeTimers();
+    const dispatch = vi.fn();
+    const gate = new NativeVoiceForegroundCommandGate(300, dispatch);
+
+    gate.enqueue("command-1");
+    vi.advanceTimersByTime(1_000);
+    expect(dispatch).not.toHaveBeenCalled();
+
+    gate.setActive(true);
+    vi.advanceTimersByTime(299);
+    expect(dispatch).not.toHaveBeenCalled();
+    gate.setActive(false);
+    vi.advanceTimersByTime(1_000);
+    expect(dispatch).not.toHaveBeenCalled();
+
+    gate.setActive(true);
+    vi.advanceTimersByTime(300);
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(dispatch).toHaveBeenCalledWith("command-1");
+    gate.dispose();
+    vi.useRealTimers();
+  });
+
+  it("does not dispatch a queued command after controller disposal", () => {
+    vi.useFakeTimers();
+    const dispatch = vi.fn();
+    const gate = new NativeVoiceForegroundCommandGate(300, dispatch);
+    gate.enqueue("command-1");
+    gate.setActive(true);
+    gate.dispose();
+    vi.runAllTimers();
+    expect(dispatch).not.toHaveBeenCalled();
+    vi.useRealTimers();
   });
 
   it("allows only one completion winner for a thread command", () => {

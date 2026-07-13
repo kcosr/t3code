@@ -13,6 +13,12 @@ export interface MasterVoiceFocus {
   readonly threadTitle: string;
 }
 
+export interface PersistedVoiceThreadTarget {
+  readonly environmentId: string;
+  readonly threadId: string;
+  readonly generation: number;
+}
+
 export interface ActiveMasterVoiceAttachment {
   readonly environmentId: EnvironmentId;
   readonly focus: MasterVoiceFocus | null;
@@ -127,6 +133,21 @@ export function isSameMasterVoiceFocus(
       left.projectId === right.projectId &&
       left.threadId === right.threadId)
   );
+}
+
+export function nextVoiceThreadTarget(
+  current: PersistedVoiceThreadTarget | undefined,
+  focus: MasterVoiceFocus | null,
+): PersistedVoiceThreadTarget | null {
+  if (focus === null) return null;
+  if (current?.environmentId === focus.environmentId && current.threadId === focus.threadId) {
+    return null;
+  }
+  return {
+    environmentId: focus.environmentId,
+    threadId: focus.threadId,
+    generation: Math.max(1, (current?.generation ?? 0) + 1),
+  };
 }
 
 /** Keeps a call alive while navigating locally, but never carries it across environments. */
