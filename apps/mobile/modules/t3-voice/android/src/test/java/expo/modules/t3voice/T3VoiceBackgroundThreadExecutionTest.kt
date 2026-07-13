@@ -541,6 +541,13 @@ class T3VoiceBackgroundThreadExecutionTest {
       claim,
       NOW,
     ))
+    assertNull(T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
+      T3VoiceRuntimeGrantLoadResult.Available(
+        grant(T3VoiceRuntimeTargetIdentity.digest("project-1/thread-2")),
+      ),
+      claim,
+      NOW,
+    ))
     val expired = grant(targetDigest).copy(
       metadata = grant(targetDigest).metadata.copy(expiresAtEpochMillis = NOW),
     )

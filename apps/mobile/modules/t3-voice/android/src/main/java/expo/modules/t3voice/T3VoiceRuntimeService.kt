@@ -1136,17 +1136,15 @@ class T3VoiceRuntimeService : Service() {
     val loaded = backgroundThreadOperationStore.load()
     val now = System.currentTimeMillis()
     val grant = runCatching { T3VoiceRuntimeGrantStore(applicationContext).load() }.getOrNull()
-    val claim = (loaded as? T3VoiceBackgroundThreadOperationLoadResult.Available)?.state?.claim
+    val preparedClaim = ((loaded as? T3VoiceBackgroundThreadOperationLoadResult.Available)?.state
+      as? T3VoiceBackgroundThreadOperationState.Prepared)?.claim
     val parentGrantAvailable =
-      claim != null &&
-        (grant as? T3VoiceRuntimeGrantLoadResult.Available)?.grant?.metadata?.let { metadata ->
-          metadata.runtimeId == claim.runtimeId &&
-            metadata.readinessGeneration == claim.readinessGeneration &&
-            T3VoiceBackgroundOriginPolicy.normalize(metadata.environmentOrigin) ==
-              T3VoiceBackgroundOriginPolicy.normalize(claim.environmentOrigin) &&
-            metadata.operation == T3VoiceRuntimeGrantOperation.THREAD_TURN_START &&
-            metadata.expiresAtEpochMillis > now
-        } == true
+      preparedClaim != null &&
+        T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
+          grant ?: T3VoiceRuntimeGrantLoadResult.Missing,
+          preparedClaim,
+          now,
+        ) != null
     when (T3VoiceBackgroundThreadStoredStatePolicy.decide(
       loaded,
       parentGrantAvailable,
@@ -1173,6 +1171,14 @@ class T3VoiceRuntimeService : Service() {
       }
       T3VoiceBackgroundThreadStoredStateDecision.REVOKE -> Unit
     }
+    revokePersistedThreadOperationLocked(loaded, grant)
+    return false
+  }
+
+  private fun revokePersistedThreadOperationLocked(
+    loaded: T3VoiceBackgroundThreadOperationLoadResult,
+    grant: T3VoiceRuntimeGrantLoadResult?,
+  ) {
     T3VoiceDiagnostics.record(
       0,
       T3VoiceDiagnosticCategory.TERMINAL,
@@ -1203,7 +1209,6 @@ class T3VoiceRuntimeService : Service() {
       backgroundSnapshotStore.clear()
       backgroundSnapshot = T3VoiceBackgroundSnapshot()
     }
-    return false
   }
 
   override fun onBind(intent: Intent?): IBinder {
@@ -1458,14 +1463,18 @@ class T3VoiceRuntimeService : Service() {
     }
     val prepared = (persisted as? T3VoiceBackgroundThreadOperationLoadResult.Available)
       ?.state as? T3VoiceBackgroundThreadOperationState.Prepared
+    val loadedGrant = runCatching { T3VoiceRuntimeGrantStore(applicationContext).load() }
+      .getOrNull()
     val authorization =
       if (prepared?.cancelRequested == true) {
         T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
-          runCatching { T3VoiceRuntimeGrantStore(applicationContext).load() }.getOrNull()
-            ?: return,
+          loadedGrant ?: T3VoiceRuntimeGrantLoadResult.Missing,
           prepared.claim,
           System.currentTimeMillis(),
-        ) ?: return
+        ) ?: run {
+          revokePersistedThreadOperationLocked(persisted, loadedGrant)
+          return
+        }
       } else {
         nativeThreadAuthorityLocked() ?: return
       }
