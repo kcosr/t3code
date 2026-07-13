@@ -7,6 +7,7 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
+import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.HttpsURLConnection
@@ -30,7 +31,11 @@ internal object T3VoiceBackgroundOriginPolicy {
     return URI("https", null, uri.host, uri.port, null, null, null).toASCIIString()
   }
 
-  fun endpoint(origin: String, path: String): URL {
+  fun endpoint(
+    origin: String,
+    path: String,
+    queryParameters: Map<String, String> = emptyMap(),
+  ): URL {
     val normalized = URI(normalize(origin))
     val pathUri = URI(path)
     require(
@@ -42,8 +47,32 @@ internal object T3VoiceBackgroundOriginPolicy {
         pathUri.normalize().rawPath == pathUri.rawPath &&
         pathUri.rawPath.split('/').none { it == "." || it == ".." },
     ) { "Invalid background voice endpoint path." }
-    return URI("https", null, normalized.host, normalized.port, pathUri.rawPath, null, null).toURL()
+    queryParameters.forEach { (name, value) ->
+      require(name.matches(QUERY_NAME_PATTERN) && value.length <= MAXIMUM_QUERY_VALUE_LENGTH) {
+        "Invalid background voice query parameter."
+      }
+    }
+    val query =
+      queryParameters.entries
+        .sortedBy(Map.Entry<String, String>::key)
+        .joinToString("&") { (name, value) ->
+          "$name=${URLEncoder.encode(value, Charsets.UTF_8).replace("+", "%20")}"
+        }
+        .ifEmpty { null }
+    val endpoint =
+      buildString {
+        append(normalized.toASCIIString())
+        append(pathUri.rawPath)
+        if (query !== null) {
+          append('?')
+          append(query)
+        }
+      }
+    return URI(endpoint).toURL()
   }
+
+  private val QUERY_NAME_PATTERN = Regex("^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+  private const val MAXIMUM_QUERY_VALUE_LENGTH = 256
 }
 
 internal enum class T3VoiceBackgroundHttpMethod {
@@ -92,9 +121,10 @@ internal data class T3VoiceBackgroundHttpRequest(
   val body: T3VoiceBackgroundRequestBody? = null,
   val maximumRequestBytes: Long = DEFAULT_MAXIMUM_REQUEST_BYTES,
   val maximumResponseBytes: Int = DEFAULT_MAXIMUM_RESPONSE_BYTES,
+  val queryParameters: Map<String, String> = emptyMap(),
 ) {
   init {
-    T3VoiceBackgroundOriginPolicy.endpoint(origin, path)
+    T3VoiceBackgroundOriginPolicy.endpoint(origin, path, queryParameters)
     require(maximumRequestBytes in 0..ABSOLUTE_MAXIMUM_REQUEST_BYTES) {
       "Invalid background request limit."
     }
@@ -213,7 +243,13 @@ internal class T3VoiceBackgroundHttpCall(
     if (cancelled.get()) return cancelledResult()
     val connection =
       try {
-        openConnection(T3VoiceBackgroundOriginPolicy.endpoint(request.origin, request.path))
+        openConnection(
+          T3VoiceBackgroundOriginPolicy.endpoint(
+            request.origin,
+            request.path,
+            request.queryParameters,
+          ),
+        )
       } catch (_: Exception) {
         return if (cancelled.get()) cancelledResult() else retryableResult()
       }
