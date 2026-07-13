@@ -137,6 +137,15 @@ export function useThreadSpeech(input: {
       const messageId = playbackMessageIdsRef.current.get(event.playbackId);
       const playback = playbackRef.current;
       if (playback?.playbackId === event.playbackId) playbackRef.current = null;
+      if (playbackStartRef.current?.playbackId === event.playbackId) {
+        playbackStartRef.current = null;
+      }
+      if (event.outcome === "cancelled") {
+        ++operationGenerationRef.current;
+        actionChainRef.current = Promise.resolve();
+        plannerRef.current = interruptThreadSpeech(plannerRef.current, latestRef.current);
+        if (mountedRef.current) setError(null);
+      }
       if (mountedRef.current) setPlaying(false);
       if (event.outcome === "failed" && mountedRef.current) {
         plannerRef.current = setThreadSpeechEnabled(
