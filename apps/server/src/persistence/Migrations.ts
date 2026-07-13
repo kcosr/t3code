@@ -55,6 +55,7 @@ import Migration0039 from "./Migrations/039_ThreadMessageHistorySearch.ts";
 import Migration0040 from "./Migrations/040_VoiceEntryHistorySearch.ts";
 import Migration0041 from "./Migrations/041_VoiceHandoffActions.ts";
 import Migration0042 from "./Migrations/042_VoiceNativeControlGrants.ts";
+import Migration0043 from "./Migrations/043_VoiceNativeRuntimeGrants.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -109,6 +110,7 @@ export const migrationEntries = [
   [40, "VoiceEntryHistorySearch", Migration0040],
   [41, "VoiceHandoffActions", Migration0041],
   [42, "VoiceNativeControlGrants", Migration0042],
+  [43, "VoiceNativeRuntimeGrants", Migration0043],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

@@ -11,6 +11,7 @@ import { ProjectionTurnStartRepositoryLive } from "../persistence/Layers/Project
 import { VoiceToolCallRepositoryLive } from "../persistence/Layers/VoiceToolCalls.ts";
 import { VoiceHandoffActionRepositoryLive } from "../persistence/Layers/VoiceHandoffActions.ts";
 import { VoiceNativeControlGrantRepositoryLive } from "../persistence/Layers/VoiceNativeControlGrants.ts";
+import { VoiceNativeRuntimeGrantRepositoryLive } from "../persistence/Layers/VoiceNativeRuntimeGrants.ts";
 import { VoiceContextCompilerLive } from "./Layers/VoiceContextCompiler.ts";
 import { VoiceSessionServiceLive } from "./Layers/VoiceSessionService.ts";
 import { VoiceSessionLifecycleLive } from "./Layers/VoiceSessionLifecycle.ts";
@@ -21,6 +22,7 @@ import {
 } from "./Providers/OpenAi/OpenAiVoiceProvider.ts";
 import { VoiceMediaTicketRegistryLive } from "./Services/VoiceMediaTicketRegistry.ts";
 import { VoiceNativeControlGrantRegistryLive } from "./Services/VoiceNativeControlGrantRegistry.ts";
+import { VoiceNativeRuntimeGrantRegistryLive } from "./Layers/VoiceNativeRuntimeGrantRegistry.ts";
 import { VoiceSessionRegistryLive } from "./Services/VoiceSessionRegistry.ts";
 import {
   makeVoiceProviderRegistry,
@@ -101,6 +103,17 @@ const VoiceCoreDependenciesLive = Layer.mergeAll(
   VoiceNativeControlGrantRegistryLive.pipe(Layer.provide(VoiceNativeControlGrantRepositoryLive)),
   VoiceHandoffActionRepositoryLive,
   VoiceNativeControlGrantRepositoryLive,
+  VoiceNativeRuntimeGrantRepositoryLive,
+  VoiceNativeRuntimeGrantRegistryLive.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        VoiceNativeRuntimeGrantRepositoryLive,
+        VoiceNativeControlGrantRegistryLive.pipe(
+          Layer.provide(VoiceNativeControlGrantRepositoryLive),
+        ),
+      ),
+    ),
+  ),
 );
 
 const VoiceSessionServiceConfiguredLive = VoiceSessionServiceLive.pipe(
@@ -108,7 +121,7 @@ const VoiceSessionServiceConfiguredLive = VoiceSessionServiceLive.pipe(
 );
 
 const VoiceLifecycleConfiguredLive = VoiceSessionLifecycleLive.pipe(
-  Layer.provide(VoiceSessionServiceConfiguredLive),
+  Layer.provide(Layer.merge(VoiceSessionServiceConfiguredLive, VoiceCoreDependenciesLive)),
 );
 
 export const VoiceRuntimeLive = Layer.mergeAll(

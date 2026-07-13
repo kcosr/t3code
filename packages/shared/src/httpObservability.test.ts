@@ -3,7 +3,7 @@ import * as Headers from "effect/unstable/http/Headers";
 import { it } from "@effect/vitest";
 import { describe, expect } from "vite-plus/test";
 
-import { httpHeaderRedactionLayer } from "./httpObservability";
+import { httpHeaderRedactionLayer } from "./httpObservability.ts";
 
 describe("HTTP observability", () => {
   it.effect("redacts authentication and native voice control headers", () =>
@@ -13,6 +13,7 @@ describe("HTTP observability", () => {
       expect(names).toContain("authorization");
       expect(names).toContain("dpop");
       expect(names).toContain("x-t3-voice-control");
+      expect(names).toContain("x-t3-voice-runtime");
     }).pipe(Effect.provide(httpHeaderRedactionLayer)),
   );
 });

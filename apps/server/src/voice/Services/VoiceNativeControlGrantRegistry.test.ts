@@ -23,7 +23,7 @@ const run = <A, E>(
   >,
 ) =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 42 });
+    yield* runMigrations({ toMigrationInclusive: 43 });
     return yield* effect;
   }).pipe(Effect.provide(persistence));
 

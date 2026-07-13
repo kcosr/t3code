@@ -12,6 +12,7 @@ import {
   VoiceConversationEntryId,
   VoiceConversationId,
   VoiceMediaTicketId,
+  VoiceNativeRuntimeId,
   VoicePlaybackId,
   VoiceRequestId,
   VoiceSessionId,
@@ -272,6 +273,63 @@ export const VoiceNativeControlGrant = Schema.Struct({
   failureGraceSeconds: PositiveInt,
 });
 export type VoiceNativeControlGrant = typeof VoiceNativeControlGrant.Type;
+
+export const VoiceNativeRuntimeTarget = Schema.Union([
+  Schema.Struct({
+    mode: Schema.Literal("realtime"),
+    conversation: Schema.Struct({
+      type: Schema.Literal("continue"),
+      conversationId: VoiceConversationId,
+    }),
+    focus: Schema.Union([
+      Schema.Struct({ type: Schema.Literal("none") }),
+      Schema.Struct({ type: Schema.Literal("project"), projectId: ProjectId }),
+      Schema.Struct({
+        type: Schema.Literal("thread"),
+        projectId: ProjectId,
+        threadId: ThreadId,
+      }),
+    ]),
+  }),
+  Schema.Struct({
+    mode: Schema.Literal("thread"),
+    projectId: ProjectId,
+    threadId: ThreadId,
+    speechPreset: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+    autoRearm: Schema.Boolean,
+  }),
+]);
+export type VoiceNativeRuntimeTarget = typeof VoiceNativeRuntimeTarget.Type;
+
+export const VoiceNativeRuntimeGrantProvisionInput = Schema.Struct({
+  generation: PositiveInt,
+  target: VoiceNativeRuntimeTarget,
+});
+export type VoiceNativeRuntimeGrantProvisionInput =
+  typeof VoiceNativeRuntimeGrantProvisionInput.Type;
+
+export const VoiceNativeRuntimeGrant = Schema.Struct({
+  token: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  runtimeId: VoiceNativeRuntimeId,
+  generation: PositiveInt,
+  target: VoiceNativeRuntimeTarget,
+  expiresAt: IsoDateTime,
+});
+export type VoiceNativeRuntimeGrant = typeof VoiceNativeRuntimeGrant.Type;
+
+export const VoiceNativeRuntimeGrantRevocationResult = Schema.Struct({
+  runtimeId: VoiceNativeRuntimeId,
+  revoked: Schema.Boolean,
+});
+export type VoiceNativeRuntimeGrantRevocationResult =
+  typeof VoiceNativeRuntimeGrantRevocationResult.Type;
+
+export const VoiceNativeRealtimeStartInput = Schema.Struct({
+  runtimeId: VoiceNativeRuntimeId,
+  generation: PositiveInt,
+  clientOperationId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+});
+export type VoiceNativeRealtimeStartInput = typeof VoiceNativeRealtimeStartInput.Type;
 
 export const VoiceSessionCreateResult = Schema.Struct({
   state: VoiceSessionState,

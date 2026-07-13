@@ -14,6 +14,7 @@ import {
   VoiceClientActionId,
   VoiceConversationEntryId,
   VoiceConversationId,
+  VoiceNativeRuntimeId,
   VoiceRequestId,
   type VoiceConversationSummary,
   VoiceSessionId,
@@ -108,6 +109,7 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
   },
   projection: Partial<ProjectionSnapshotQuery["Service"]> = {},
   appendContextOverride?: VoiceConversationService["Service"]["appendContext"],
+  rejectNativeControlGrant = false,
 ) {
   const appended = yield* Ref.make<Array<VoiceConversationJournalEntry>>([]);
   const conversationEpoch = yield* Ref.make(1);
@@ -192,10 +194,12 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
   });
   const nativeControlGrantRepository = VoiceNativeControlGrantRepository.of({
     insert: (grant, now) =>
-      Ref.update(nativeControlGrantRecords, (records) => {
-        const active = new Map([...records].filter(([, record]) => record.expiresAt > now));
-        return active.set(grant.tokenHash, grant);
-      }),
+      rejectNativeControlGrant && grant.runtimeId !== undefined
+        ? Effect.succeed(false)
+        : Ref.update(nativeControlGrantRecords, (records) => {
+            const active = new Map([...records].filter(([, record]) => record.expiresAt > now));
+            return active.set(grant.tokenHash, grant);
+          }).pipe(Effect.as(true)),
     findActive: (tokenHash, now) =>
       Ref.modify(nativeControlGrantRecords, (records) => {
         const active = new Map([...records].filter(([, record]) => record.expiresAt > now));
@@ -224,6 +228,17 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
         nativeControlGrantRecords,
         (records) =>
           new Map([...records].filter(([, record]) => record.authSessionId !== authSessionId)),
+      ),
+    revokeRuntime: (authSessionId, runtimeId) =>
+      Ref.update(
+        nativeControlGrantRecords,
+        (records) =>
+          new Map(
+            [...records].filter(
+              ([, record]) =>
+                record.authSessionId !== authSessionId || record.runtimeId !== runtimeId,
+            ),
+          ),
       ),
   });
   const nativeControlGrantRepositoryLayer = Layer.succeed(
@@ -543,6 +558,48 @@ it.effect("rotates the native grant when an idempotent create result is replayed
         sessionId: replay.state.sessionId,
         leaseGeneration: replay.state.leaseGeneration,
       });
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("releases a newly created session when runtime-fenced child issuance is rejected", () =>
+  Effect.gen(function* () {
+    const provider: VoiceProviderAdapter = {
+      id: "fake-rejected-native-child",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: { negotiate: () => Effect.die("unused") },
+    };
+    const test = yield* makeLayer(
+      provider,
+      undefined,
+      { enabled: true, maxConcurrentSessions: 1 },
+      {},
+      undefined,
+      true,
+    );
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("rejected-native-child-owner");
+      const rejected = yield* sessions
+        .create(
+          {
+            ...principal(owner),
+            nativeRuntime: {
+              runtimeId: VoiceNativeRuntimeId.make("rejected-runtime"),
+              generation: 1,
+            },
+          },
+          input(false, "rejected-native-child"),
+        )
+        .pipe(Effect.flip);
+      expect(rejected).toMatchObject({ reason: "invalid-phase" });
+      expect((yield* Ref.get(test.nativeControlGrantRecords)).size).toBe(0);
+
+      const replacement = yield* sessions.create(
+        principal(owner),
+        input(false, "after-rejected-native-child"),
+      );
+      expect(replacement.state.phase).toBe("signaling");
     }).pipe(Effect.provide(test.layer));
   }),
 );

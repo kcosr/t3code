@@ -1,4 +1,6 @@
 import {
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
   AuthVoiceManageScope,
   AuthVoiceUseScope,
   EnvironmentResourceNotFoundError,
@@ -8,6 +10,7 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as DateTime from "effect/DateTime";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import {
@@ -23,6 +26,8 @@ import { VoiceCredentialStore } from "./Services/VoiceCredentialStore.ts";
 import { VoiceConversationService } from "./Services/VoiceConversationService.ts";
 import { VoiceMediaTicketRegistry } from "./Services/VoiceMediaTicketRegistry.ts";
 import { VoiceSessionService } from "./Services/VoiceSessionService.ts";
+import { VoiceNativeRuntimeGrantRegistry } from "./Services/VoiceNativeRuntimeGrantRegistry.ts";
+import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import type { VoiceError } from "./Errors.ts";
 
 const failVoiceOperation = (error: VoiceError) =>
@@ -92,7 +97,15 @@ const descriptor = (
   }
 };
 
-export const __testing = { descriptor };
+const nativeRuntimeExpiresAt = (now: DateTime.DateTime, principalExpiresAt?: DateTime.DateTime) =>
+  DateTime.makeUnsafe(
+    Math.min(
+      DateTime.toEpochMillis(DateTime.addDuration(now, "30 days")),
+      principalExpiresAt?.epochMilliseconds ?? Number.POSITIVE_INFINITY,
+    ),
+  );
+
+export const __testing = { descriptor, nativeRuntimeExpiresAt };
 
 export const voiceControlHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
@@ -103,8 +116,81 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
     const credentials = yield* VoiceCredentialStore;
     const tickets = yield* VoiceMediaTicketRegistry;
     const sessions = yield* VoiceSessionService;
+    const nativeRuntimeGrants = yield* VoiceNativeRuntimeGrantRegistry;
+    const projectionQuery = yield* ProjectionSnapshotQuery;
 
     return handlers
+      .handle(
+        "provisionNativeVoiceRuntimeGrant",
+        Effect.fn("environment.voice.provisionNativeRuntimeGrant")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          const principal = yield* requireEnvironmentScope(AuthVoiceUseScope);
+          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
+          const target = args.payload.target;
+          if (target.mode === "realtime") {
+            const conversation = yield* conversations
+              .get(target.conversation.conversationId)
+              .pipe(Effect.catch(failVoiceOperation));
+            if (Option.isNone(conversation) || conversation.value.retention !== "durable") {
+              return yield* failEnvironmentInvalidRequest("native_voice_target_invalid");
+            }
+          }
+          if (target.mode === "thread") {
+            const thread = yield* projectionQuery
+              .getThreadShellById(target.threadId)
+              .pipe(Effect.catch((error) => failEnvironmentInternal("internal_error", error)));
+            if (Option.isNone(thread) || thread.value.projectId !== target.projectId) {
+              return yield* failEnvironmentInvalidRequest("native_voice_target_invalid");
+            }
+          } else if (target.focus.type === "thread") {
+            const thread = yield* projectionQuery
+              .getThreadShellById(target.focus.threadId)
+              .pipe(Effect.catch((error) => failEnvironmentInternal("internal_error", error)));
+            if (Option.isNone(thread) || thread.value.projectId !== target.focus.projectId) {
+              return yield* failEnvironmentInvalidRequest("native_voice_target_invalid");
+            }
+          } else if (target.mode === "realtime" && target.focus.type === "project") {
+            const project = yield* projectionQuery
+              .getProjectShellById(target.focus.projectId)
+              .pipe(Effect.catch((error) => failEnvironmentInternal("internal_error", error)));
+            if (Option.isNone(project)) {
+              return yield* failEnvironmentInvalidRequest("native_voice_target_invalid");
+            }
+          }
+          const now = yield* DateTime.now;
+          const expiresAt = nativeRuntimeExpiresAt(now, principal.expiresAt);
+          const grant = yield* nativeRuntimeGrants
+            .issue({
+              authSessionId: principal.sessionId,
+              runtimeId: args.params.runtimeId,
+              generation: args.payload.generation,
+              grantedScopes: new Set(principal.scopes),
+              target,
+              expiresAt: DateTime.toEpochMillis(expiresAt),
+            })
+            .pipe(Effect.catch(failVoiceOperation));
+          return {
+            token: grant.token,
+            runtimeId: args.params.runtimeId,
+            generation: args.payload.generation,
+            target,
+            expiresAt: DateTime.formatIso(expiresAt),
+          };
+        }),
+      )
+      .handle(
+        "revokeNativeVoiceRuntimeGrant",
+        Effect.fn("environment.voice.revokeNativeRuntimeGrant")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          const principal = yield* requireEnvironmentScope(AuthVoiceUseScope);
+          const revoked = yield* nativeRuntimeGrants.revokeRuntime(
+            principal.sessionId,
+            args.params.runtimeId,
+          );
+          return { runtimeId: args.params.runtimeId, revoked };
+        }),
+      )
       .handle(
         "createSession",
         Effect.fn("environment.voice.createSession")(function* (args) {

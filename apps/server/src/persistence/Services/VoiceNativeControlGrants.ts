@@ -1,4 +1,4 @@
-import type { AuthSessionId, VoiceSessionId } from "@t3tools/contracts";
+import type { AuthSessionId, VoiceNativeRuntimeId, VoiceSessionId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 
@@ -10,14 +10,18 @@ export interface PersistedVoiceNativeControlGrant {
   readonly sessionId: VoiceSessionId;
   readonly leaseGeneration: number;
   readonly expiresAt: number;
-  readonly capabilities: ReadonlySet<"session-control" | "handoff-actions">;
+  readonly capabilities: ReadonlySet<
+    "session-control" | "handoff-actions" | "webrtc-signaling" | "session-close"
+  >;
+  readonly runtimeId?: VoiceNativeRuntimeId;
+  readonly runtimeGeneration?: number;
 }
 
 export interface VoiceNativeControlGrantRepositoryShape {
   readonly insert: (
     grant: PersistedVoiceNativeControlGrant,
     now: number,
-  ) => Effect.Effect<void, PersistenceSqlError>;
+  ) => Effect.Effect<boolean, PersistenceSqlError>;
   readonly findActive: (
     tokenHash: string,
     now: number,
@@ -28,6 +32,10 @@ export interface VoiceNativeControlGrantRepositoryShape {
   readonly revokeSession: (sessionId: VoiceSessionId) => Effect.Effect<void, PersistenceSqlError>;
   readonly revokeAuthSession: (
     authSessionId: AuthSessionId,
+  ) => Effect.Effect<void, PersistenceSqlError>;
+  readonly revokeRuntime: (
+    authSessionId: AuthSessionId,
+    runtimeId: VoiceNativeRuntimeId,
   ) => Effect.Effect<void, PersistenceSqlError>;
 }
 

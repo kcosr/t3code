@@ -11,6 +11,7 @@ import {
   VoiceClientActionId,
   type VoiceNativeHandoffAction,
   VoiceConversationId,
+  VoiceNativeRuntimeId,
   VoiceSessionId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -20,7 +21,12 @@ import * as HttpServer from "effect/unstable/http/HttpServer";
 
 import { voiceNativeControlRoutesLayer } from "./nativeControlHttp.ts";
 import { VoiceError } from "./Errors.ts";
-import { VoiceNativeControlGrantRegistry } from "./Services/VoiceNativeControlGrantRegistry.ts";
+import {
+  VoiceNativeControlGrantRegistry,
+  type VoiceNativeControlGrantScope,
+} from "./Services/VoiceNativeControlGrantRegistry.ts";
+import { VoiceNativeRuntimeGrantRegistry } from "./Services/VoiceNativeRuntimeGrantRegistry.ts";
+import type { VoiceNativeRuntimeGrantScope } from "./Services/VoiceNativeRuntimeGrantRegistry.ts";
 import { VoiceSessionService } from "./Services/VoiceSessionService.ts";
 
 const sessionId = VoiceSessionId.make("voice-session-native-http");
@@ -39,11 +45,21 @@ const grantScope = {
 const runWithServer = <A>(
   run: (baseUrl: string, heartbeatCalls: () => number) => Promise<A>,
   options: {
-    readonly authorize?: (candidate: string, call: number) => typeof grantScope | undefined;
+    readonly authorize?: (
+      candidate: string,
+      call: number,
+    ) => VoiceNativeControlGrantScope | undefined;
     readonly phase?: "listening" | "ended";
     readonly heartbeatFails?: boolean;
+    readonly createError?: VoiceError;
+    readonly offerError?: VoiceError;
+    readonly closeError?: VoiceError;
     readonly grants?: VoiceNativeControlGrantRegistry["Service"];
     readonly pendingActions?: ReadonlyArray<VoiceNativeHandoffAction>;
+    readonly runtimeAuthorize?: (candidate: string) => VoiceNativeRuntimeGrantScope | undefined;
+    readonly onCreate?: Parameters<VoiceSessionService["Service"]["create"]>[1] extends infer Input
+      ? (input: Input) => void
+      : never;
   } = {},
 ) => {
   let calls = 0;
@@ -63,8 +79,37 @@ const runWithServer = <A>(
     revokeSession: () => Effect.void,
     releaseSessionControl: () => Effect.void,
     revokeAuthSession: () => Effect.void,
+    revokeRuntime: () => Effect.void,
   });
   const sessions = Layer.mock(VoiceSessionService)({
+    create: (_principal, input) => {
+      options.onCreate?.(input);
+      if (options.createError !== undefined) return Effect.fail(options.createError);
+      return Effect.succeed({
+        state: {
+          sessionId,
+          conversationId: VoiceConversationId.make("native-http-conversation"),
+          mode: "realtime-agent",
+          phase: "signaling",
+          leaseGeneration: 4,
+          sequence: 0,
+        },
+        transport: {
+          kind: "webrtc-sdp-v1",
+          signalingPath: `/api/voice/sessions/${sessionId}/webrtc-offer`,
+        },
+        expiresAt: "2026-07-12T18:00:00.000Z",
+        heartbeatIntervalSeconds: 8,
+        nativeControlGrant: {
+          token,
+          sessionId,
+          leaseGeneration: 4,
+          expiresAt: "2026-07-12T18:00:00.000Z",
+          heartbeatIntervalSeconds: 8,
+          failureGraceSeconds: 30,
+        },
+      });
+    },
     heartbeat: (_owner, heartbeatSessionId, leaseGeneration) => {
       calls += 1;
       if (options.heartbeatFails) {
@@ -103,12 +148,47 @@ const runWithServer = <A>(
         outcome: input.outcome,
       });
     },
+    offer: (_owner, offeredSessionId, offer) => {
+      calls += 1;
+      if (options.offerError !== undefined) return Effect.fail(options.offerError);
+      return Effect.succeed({
+        sessionId: offeredSessionId,
+        leaseGeneration: offer.leaseGeneration,
+        sdp: "answer-sdp",
+      });
+    },
+    close: (_owner, closedSessionId, leaseGeneration) => {
+      calls += 1;
+      if (options.closeError !== undefined) return Effect.fail(options.closeError);
+      return Effect.succeed({
+        state: {
+          sessionId: closedSessionId,
+          conversationId: VoiceConversationId.make("native-http-conversation"),
+          mode: "realtime-agent",
+          phase: "ended",
+          leaseGeneration,
+          sequence: 1,
+        },
+        closed: true,
+      });
+    },
   });
   const serverLayer = HttpRouter.serve(voiceNativeControlRoutesLayer, {
     disableListenLog: true,
     disableLogger: true,
   }).pipe(
     Layer.provide(Layer.succeed(VoiceNativeControlGrantRegistry, options.grants ?? grants)),
+    Layer.provide(
+      Layer.succeed(
+        VoiceNativeRuntimeGrantRegistry,
+        VoiceNativeRuntimeGrantRegistry.of({
+          issue: () => Effect.die("unused"),
+          authorize: (candidate) => Effect.succeed(options.runtimeAuthorize?.(candidate)),
+          revokeRuntime: () => Effect.succeed(false),
+          revokeAuthSession: () => Effect.void,
+        }),
+      ),
+    ),
     Layer.provide(sessions),
     Layer.provideMerge(
       NodeHttpServer.layer(NodeHttp.createServer, {
@@ -152,6 +232,262 @@ const expectNoStore = (response: Response) =>
   expect(response.headers.get("cache-control")).toBe("no-store");
 
 describe("native voice control HTTP", () => {
+  it.effect("starts fresh Realtime only for the exact grant-bound conversation and focus", () => {
+    const runtimeId = VoiceNativeRuntimeId.make("android-runtime");
+    const conversationId = VoiceConversationId.make("grant-bound-conversation");
+    const inputs: Array<Parameters<VoiceSessionService["Service"]["create"]>[1]> = [];
+    const runtimeScope: VoiceNativeRuntimeGrantScope = {
+      authSessionId: grantScope.authSessionId,
+      runtimeId,
+      generation: 7,
+      grantedScopes: new Set(),
+      target: {
+        mode: "realtime",
+        conversation: { type: "continue", conversationId },
+        focus: {
+          type: "thread",
+          projectId: ProjectId.make("project-bound"),
+          threadId: ThreadId.make("thread-bound"),
+        },
+      },
+      expiresAt,
+    };
+    return runWithServer(
+      async (baseUrl) => {
+        for (const clientOperationId of ["same-operation", "same-operation"]) {
+          const response = await fetch(`${baseUrl}/api/voice/native/realtime-sessions`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-t3-voice-runtime": "runtime-token",
+            },
+            body: `{"runtimeId":"${runtimeId}","generation":7,"clientOperationId":"${clientOperationId}"}`,
+          });
+          expect(response.status).toBe(200);
+          expect(await response.json()).toMatchObject({
+            transport: {
+              signalingPath: `/api/voice/native/realtime-sessions/${sessionId}/webrtc-offer`,
+            },
+          });
+        }
+        expect(inputs).toHaveLength(2);
+        expect(inputs[0]).toMatchObject({
+          conversation: { type: "continue", conversationId, takeover: false },
+          projectId: "project-bound",
+          threadId: "thread-bound",
+        });
+        expect(inputs[1]?.idempotencyKey).toBe(inputs[0]?.idempotencyKey);
+      },
+      {
+        runtimeAuthorize: (candidate) => (candidate === "runtime-token" ? runtimeScope : undefined),
+        onCreate: (input) => inputs.push(input),
+      },
+    );
+  });
+
+  it.effect("rejects malformed or oversized native start bodies as invalid requests", () => {
+    const runtimeId = VoiceNativeRuntimeId.make("android-invalid-body");
+    const created: Array<unknown> = [];
+    const runtimeScope: VoiceNativeRuntimeGrantScope = {
+      authSessionId: grantScope.authSessionId,
+      runtimeId,
+      generation: 2,
+      grantedScopes: new Set(),
+      target: {
+        mode: "realtime",
+        conversation: {
+          type: "continue",
+          conversationId: VoiceConversationId.make("invalid-body-conversation"),
+        },
+        focus: { type: "none" },
+      },
+      expiresAt,
+    };
+    return runWithServer(
+      async (baseUrl) => {
+        for (const body of ["{", `{"padding":"${"x".repeat(2_048)}"}`]) {
+          const response = await fetch(`${baseUrl}/api/voice/native/realtime-sessions`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-t3-voice-runtime": "runtime-token",
+            },
+            body,
+          });
+          expect(response.status).toBe(400);
+          expect(await response.json()).toMatchObject({ code: "invalid_request" });
+        }
+        expect(created).toHaveLength(0);
+      },
+      {
+        runtimeAuthorize: (candidate) => (candidate === "runtime-token" ? runtimeScope : undefined),
+        onCreate: (input) => created.push(input),
+      },
+    );
+  });
+
+  it.effect("re-authorizes signaling and close immediately before mutation", () =>
+    runWithServer(
+      async (baseUrl, calls) => {
+        const offer = await fetch(
+          `${baseUrl}/api/voice/native/realtime-sessions/${sessionId}/webrtc-offer`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-t3-voice-control": token },
+            body: `{"sessionId":"${sessionId}","leaseGeneration":4,"sdp":"offer-sdp"}`,
+          },
+        );
+        expect(offer.status).toBe(401);
+        expect(calls()).toBe(0);
+      },
+      {
+        authorize: (candidate, call) =>
+          candidate === token && call === 1
+            ? {
+                ...grantScope,
+                capabilities: new Set(["webrtc-signaling", "session-close"]),
+              }
+            : undefined,
+      },
+    ),
+  );
+
+  it.effect("preserves actionable voice failures after native credentials are authorized", () => {
+    const providerError = new VoiceError({
+      reason: "provider-unavailable",
+      operation: "native-http-test",
+      detail: "Realtime provider is temporarily unavailable",
+      retryable: true,
+    });
+    return runWithServer(
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/voice/native/realtime-sessions`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-t3-voice-runtime": "runtime-token",
+          },
+          body: '{"runtimeId":"android-runtime","generation":7,"clientOperationId":"failed-start"}',
+        });
+        expect(response.status).toBe(503);
+        expect(await response.json()).toEqual({
+          code: "voice_operation_failed",
+          reason: "provider-unavailable",
+          message: "Realtime provider is temporarily unavailable",
+          retryable: true,
+        });
+      },
+      {
+        runtimeAuthorize: (candidate) =>
+          candidate === "runtime-token"
+            ? {
+                authSessionId: grantScope.authSessionId,
+                runtimeId: VoiceNativeRuntimeId.make("android-runtime"),
+                generation: 7,
+                grantedScopes: new Set(),
+                target: {
+                  mode: "realtime",
+                  conversation: {
+                    type: "continue",
+                    conversationId: VoiceConversationId.make("native-http-conversation"),
+                  },
+                  focus: { type: "none" },
+                },
+                expiresAt,
+              }
+            : undefined,
+        createError: providerError,
+      },
+    );
+  });
+
+  it.effect(
+    "does not collapse authorized signaling or close failures into authentication errors",
+    () =>
+      Effect.gen(function* () {
+        yield* runWithServer(
+          async (baseUrl) => {
+            const response = await fetch(
+              `${baseUrl}/api/voice/native/realtime-sessions/${sessionId}/webrtc-offer`,
+              {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-t3-voice-control": token },
+                body: `{"sessionId":"${sessionId}","leaseGeneration":4,"sdp":"offer-sdp"}`,
+              },
+            );
+            expect(response.status).toBe(409);
+            expect(await response.json()).toMatchObject({
+              reason: "lease-conflict",
+              retryable: true,
+            });
+          },
+          {
+            authorize: (candidate) =>
+              candidate === token
+                ? { ...grantScope, capabilities: new Set(["webrtc-signaling"]) }
+                : undefined,
+            offerError: new VoiceError({
+              reason: "lease-conflict",
+              operation: "native-offer-test",
+              detail: "The session lease changed",
+              retryable: true,
+            }),
+          },
+        );
+        yield* runWithServer(
+          async (baseUrl) => {
+            const response = await fetch(
+              `${baseUrl}/api/voice/native/realtime-sessions/${sessionId}/close`,
+              {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-t3-voice-control": token },
+                body: '{"leaseGeneration":4}',
+              },
+            );
+            expect(response.status).toBe(404);
+            expect(await response.json()).toMatchObject({
+              reason: "session-not-found",
+              retryable: false,
+            });
+          },
+          {
+            authorize: (candidate) =>
+              candidate === token
+                ? { ...grantScope, capabilities: new Set(["session-close"]) }
+                : undefined,
+            closeError: new VoiceError({
+              reason: "session-not-found",
+              operation: "native-close-test",
+              detail: "The voice session no longer exists",
+              retryable: false,
+            }),
+          },
+        );
+      }),
+  );
+
+  it.effect("re-authorizes close immediately before mutation", () =>
+    runWithServer(
+      async (baseUrl, calls) => {
+        const response = await fetch(
+          `${baseUrl}/api/voice/native/realtime-sessions/${sessionId}/close`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-t3-voice-control": token },
+            body: '{"leaseGeneration":4}',
+          },
+        );
+        expect(response.status).toBe(401);
+        expect(calls()).toBe(0);
+      },
+      {
+        authorize: (candidate, call) =>
+          candidate === token && call === 1
+            ? { ...grantScope, capabilities: new Set(["session-close"]) }
+            : undefined,
+      },
+    ),
+  );
   it.effect("polls and acknowledges handoff actions with the native grant", () =>
     runWithServer(
       async (baseUrl) => {

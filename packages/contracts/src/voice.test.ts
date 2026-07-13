@@ -12,6 +12,11 @@ import {
   VoiceNativeHandoffActionListResult,
   VoiceNativeHeartbeatInput,
   VoiceNativeHeartbeatResult,
+  VoiceNativeRealtimeStartInput,
+  VoiceNativeRuntimeGrant,
+  VoiceNativeRuntimeGrantProvisionInput,
+  VoiceNativeRuntimeGrantRevocationResult,
+  VoiceNativeRuntimeTarget,
   VoiceSpeechRequest,
   VoiceSessionCreateInput,
   VoiceSessionCreateResult,
@@ -29,6 +34,50 @@ const encodeSync = Schema.encodeSync;
 const decodeWebRtcOffer = decodeUnknownSync(VoiceWebRtcOffer);
 
 describe("voice contracts", () => {
+  it("strictly round-trips exact native runtime authority contracts", () => {
+    const target = {
+      mode: "realtime",
+      conversation: { type: "continue", conversationId: "voice-conversation-native" },
+      focus: { type: "none" },
+    } as const;
+    const values = [
+      [VoiceNativeRuntimeTarget, target],
+      [VoiceNativeRuntimeGrantProvisionInput, { generation: 3, target }],
+      [
+        VoiceNativeRuntimeGrant,
+        {
+          token: "runtime-token",
+          runtimeId: "android-main",
+          generation: 3,
+          target,
+          expiresAt: "2026-07-14T00:00:00.000Z",
+        },
+      ],
+      [VoiceNativeRuntimeGrantRevocationResult, { runtimeId: "android-main", revoked: true }],
+      [
+        VoiceNativeRealtimeStartInput,
+        { runtimeId: "android-main", generation: 3, clientOperationId: "start-1" },
+      ],
+    ] as const;
+    for (const [schema, value] of values) {
+      const decoded = decodeUnknownSync(schema)(value, { onExcessProperty: "error" });
+      expect(decodeUnknownSync(schema)(encodeSync(schema)(decoded))).toEqual(decoded);
+      expect(() =>
+        decodeUnknownSync(schema)({ ...value, extra: true }, { onExcessProperty: "error" }),
+      ).toThrow();
+    }
+    expect(() =>
+      decodeUnknownSync(VoiceNativeRuntimeTarget)(
+        {
+          mode: "realtime",
+          conversation: { type: "new-durable" },
+          focus: { type: "none" },
+        },
+        { onExcessProperty: "error" },
+      ),
+    ).toThrow();
+  });
+
   it("decodes a provider-neutral realtime session request", () => {
     const decoded = decodeUnknownSync(VoiceSessionCreateInput)({
       mode: "realtime-agent",

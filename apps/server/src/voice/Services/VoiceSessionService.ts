@@ -30,6 +30,10 @@ import type { VoiceError } from "../Errors.ts";
 export interface VoiceSessionPrincipal {
   readonly sessionId: AuthSessionId;
   readonly scopes: ReadonlySet<AuthEnvironmentScope>;
+  readonly nativeRuntime?: {
+    readonly runtimeId: import("@t3tools/contracts").VoiceNativeRuntimeId;
+    readonly generation: number;
+  };
 }
 
 export interface VoiceSessionServiceShape {

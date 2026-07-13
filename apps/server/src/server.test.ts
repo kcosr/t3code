@@ -3249,6 +3249,76 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("provisions and revokes exact-conversation native voice runtime authority", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const bearerToken = yield* getAuthenticatedBearerSessionToken();
+      const headers = {
+        authorization: `Bearer ${bearerToken}`,
+        "content-type": "application/json",
+      };
+      const conversationResponse = yield* fetchEffect("/api/voice/conversations", {
+        method: "POST",
+        headers,
+        body: jsonRequestBody({ retention: "durable", title: "Native runtime test" }),
+      });
+      const conversation = yield* responseJsonEffect<{ readonly conversationId: string }>(
+        conversationResponse,
+      );
+      assert.equal(conversationResponse.status, 200);
+
+      const runtimeId = "android-server-test";
+      const provisionBody = jsonRequestBody({
+        generation: 1,
+        target: {
+          mode: "realtime",
+          conversation: { type: "continue", conversationId: conversation.conversationId },
+          focus: { type: "none" },
+        },
+      });
+      const provisionResponse = yield* fetchEffect(
+        `/api/voice/native-runtimes/${runtimeId}/grant`,
+        {
+          method: "PUT",
+          headers,
+          body: provisionBody,
+        },
+      );
+      const provisioned = yield* responseJsonEffect<{
+        readonly token: string;
+        readonly runtimeId: string;
+        readonly generation: number;
+        readonly target: unknown;
+        readonly expiresAt: string;
+      }>(provisionResponse);
+      assert.equal(provisionResponse.status, 200);
+      assert.equal(provisioned.runtimeId, runtimeId);
+      assert.equal(provisioned.generation, 1);
+      assert.isTrue(provisioned.token.length > 20);
+
+      const retryResponse = yield* fetchEffect(`/api/voice/native-runtimes/${runtimeId}/grant`, {
+        method: "PUT",
+        headers,
+        body: provisionBody,
+      });
+      const retried = yield* responseJsonEffect<{ readonly token: string }>(retryResponse);
+      assert.equal(retryResponse.status, 200);
+      assert.notEqual(retried.token, provisioned.token);
+
+      const revokeResponse = yield* fetchEffect(`/api/voice/native-runtimes/${runtimeId}/grant`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${bearerToken}` },
+      });
+      const revoked = yield* responseJsonEffect<{
+        readonly runtimeId: string;
+        readonly revoked: boolean;
+      }>(revokeResponse);
+      assert.equal(revokeResponse.status, 200);
+      assert.deepEqual(revoked, { runtimeId, revoked: true });
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("does not allow management-only access tokens to operate the environment", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest();

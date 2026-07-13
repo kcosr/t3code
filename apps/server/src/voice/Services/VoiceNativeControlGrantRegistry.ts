@@ -1,4 +1,4 @@
-import type { AuthSessionId, VoiceSessionId } from "@t3tools/contracts";
+import type { AuthSessionId, VoiceNativeRuntimeId, VoiceSessionId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -8,6 +8,7 @@ import * as Layer from "effect/Layer";
 import * as NodeCrypto from "node:crypto";
 
 import { VoiceNativeControlGrantRepository } from "../../persistence/Services/VoiceNativeControlGrants.ts";
+import { VoiceError } from "../Errors.ts";
 
 export interface VoiceNativeControlGrantScope {
   readonly authSessionId: AuthSessionId;
@@ -15,16 +16,26 @@ export interface VoiceNativeControlGrantScope {
   readonly leaseGeneration: number;
   readonly expiresAt: number;
   readonly capabilities: ReadonlySet<VoiceNativeControlCapability>;
+  readonly runtimeId?: VoiceNativeRuntimeId;
+  readonly runtimeGeneration?: number;
 }
 
-export type VoiceNativeControlCapability = "session-control" | "handoff-actions";
+export type VoiceNativeControlCapability =
+  | "session-control"
+  | "handoff-actions"
+  | "webrtc-signaling"
+  | "session-close";
 
 export interface VoiceNativeControlGrantRegistryShape {
-  readonly issue: (scope: VoiceNativeControlGrantScope) => Effect.Effect<string>;
+  readonly issue: (scope: VoiceNativeControlGrantScope) => Effect.Effect<string, VoiceError>;
   readonly authorize: (token: string) => Effect.Effect<VoiceNativeControlGrantScope | undefined>;
   readonly revokeSession: (sessionId: VoiceSessionId) => Effect.Effect<void>;
   readonly releaseSessionControl: (sessionId: VoiceSessionId) => Effect.Effect<void>;
   readonly revokeAuthSession: (authSessionId: AuthSessionId) => Effect.Effect<void>;
+  readonly revokeRuntime: (
+    authSessionId: AuthSessionId,
+    runtimeId: VoiceNativeRuntimeId,
+  ) => Effect.Effect<void>;
 }
 
 export class VoiceNativeControlGrantRegistry extends Context.Service<
@@ -49,7 +60,26 @@ const makeWithOptions = Effect.fn("VoiceNativeControlGrantRegistry.make")(functi
       .randomBytes(32)
       .pipe(Effect.map(Encoding.encodeBase64Url), Effect.orDie);
     const now = yield* currentTimeMillis;
-    yield* repository.insert({ tokenHash: hash(token), ...scope }, now).pipe(Effect.orDie);
+    const inserted = yield* repository.insert({ tokenHash: hash(token), ...scope }, now).pipe(
+      Effect.mapError(
+        (cause) =>
+          new VoiceError({
+            reason: "provider-unavailable",
+            operation: "native-control-grant.issue",
+            detail: "Native voice authority storage is unavailable",
+            retryable: true,
+            cause,
+          }),
+      ),
+    );
+    if (!inserted) {
+      return yield* new VoiceError({
+        reason: "invalid-phase",
+        operation: "native-control-grant.issue",
+        detail: "Native voice runtime authority changed before session control was issued",
+        retryable: true,
+      });
+    }
     return token;
   });
 
@@ -66,6 +96,10 @@ const makeWithOptions = Effect.fn("VoiceNativeControlGrantRegistry.make")(functi
       leaseGeneration: record.leaseGeneration,
       expiresAt: record.expiresAt,
       capabilities: record.capabilities,
+      ...(record.runtimeId === undefined ? {} : { runtimeId: record.runtimeId }),
+      ...(record.runtimeGeneration === undefined
+        ? {}
+        : { runtimeGeneration: record.runtimeGeneration }),
     };
   });
 
@@ -77,6 +111,8 @@ const makeWithOptions = Effect.fn("VoiceNativeControlGrantRegistry.make")(functi
       repository.releaseSessionControl(sessionId).pipe(Effect.orDie),
     revokeAuthSession: (authSessionId) =>
       repository.revokeAuthSession(authSessionId).pipe(Effect.orDie),
+    revokeRuntime: (authSessionId, runtimeId) =>
+      repository.revokeRuntime(authSessionId, runtimeId).pipe(Effect.orDie),
   });
 });
 

@@ -74,6 +74,7 @@ export type VoiceDiagnosticEvent =
 
 export type VoiceSessionEndReason =
   | "auth-revoked"
+  | "authority-issuance-failed"
   | "client-request"
   | "context-persistence-failed"
   | "conversation-cleared"

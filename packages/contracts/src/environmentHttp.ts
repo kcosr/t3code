@@ -31,6 +31,7 @@ import {
   VoiceConversationId,
   VoiceConfirmationId,
   VoiceClientActionId,
+  VoiceNativeRuntimeId,
   VoiceSessionId,
 } from "./baseSchemas.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
@@ -70,6 +71,9 @@ import {
   VoiceConversationUpdateInput,
   VoiceMediaTicket,
   VoiceMediaTicketRequest,
+  VoiceNativeRuntimeGrant,
+  VoiceNativeRuntimeGrantProvisionInput,
+  VoiceNativeRuntimeGrantRevocationResult,
   VoicePublicErrorReason,
   VoiceSessionCloseResult,
   VoiceSessionCreateInput,
@@ -106,6 +110,7 @@ export const EnvironmentRequestInvalidReason = Schema.Literals([
   "invalid_command",
   "invalid_voice_media_binding",
   "voice_media_ticket_limit",
+  "native_voice_target_invalid",
 ]);
 export type EnvironmentRequestInvalidReason = typeof EnvironmentRequestInvalidReason.Type;
 
@@ -632,6 +637,35 @@ export class EnvironmentHistoryHttpApi extends HttpApiGroup.make("history")
   .middleware(EnvironmentHistoryPrivacyBoundary) {}
 
 export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
+  .add(
+    HttpApiEndpoint.put(
+      "provisionNativeVoiceRuntimeGrant",
+      "/api/voice/native-runtimes/:runtimeId/grant",
+      {
+        headers: OptionalBearerHeaders,
+        params: Schema.Struct({ runtimeId: VoiceNativeRuntimeId }),
+        payload: VoiceNativeRuntimeGrantProvisionInput,
+        success: VoiceNativeRuntimeGrant,
+        error: [
+          EnvironmentRequestInvalidError,
+          ...EnvironmentScopedOperationErrors,
+          EnvironmentVoiceOperationError,
+        ],
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.delete(
+      "revokeNativeVoiceRuntimeGrant",
+      "/api/voice/native-runtimes/:runtimeId/grant",
+      {
+        headers: OptionalBearerHeaders,
+        params: Schema.Struct({ runtimeId: VoiceNativeRuntimeId }),
+        success: VoiceNativeRuntimeGrantRevocationResult,
+        error: EnvironmentScopedOperationErrors,
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
+  )
   .add(
     HttpApiEndpoint.post("createSession", "/api/voice/sessions", {
       headers: OptionalBearerHeaders,

@@ -1046,13 +1046,31 @@ const make = Effect.gen(function* () {
     const existingId = (yield* SynchronizedRef.get(runtime)).idempotency.get(idempotencyId);
     if (existingId !== undefined) {
       const existing = yield* requireOwned(ownerAuthSessionId, existingId);
-      const token = yield* nativeControlGrants.issue({
-        authSessionId: ownerAuthSessionId,
-        sessionId: existing.lease.sessionId,
-        leaseGeneration: existing.lease.generation,
-        expiresAt: Date.parse(existing.expiresAt),
-        capabilities: new Set(["session-control", "handoff-actions"]),
-      });
+      const token = yield* nativeControlGrants
+        .issue({
+          authSessionId: ownerAuthSessionId,
+          sessionId: existing.lease.sessionId,
+          leaseGeneration: existing.lease.generation,
+          expiresAt: Date.parse(existing.expiresAt),
+          capabilities: new Set([
+            "session-control",
+            "handoff-actions",
+            ...(principal.nativeRuntime === undefined
+              ? []
+              : (["webrtc-signaling", "session-close"] as const)),
+          ]),
+          ...(principal.nativeRuntime === undefined
+            ? {}
+            : {
+                runtimeId: principal.nativeRuntime.runtimeId,
+                runtimeGeneration: principal.nativeRuntime.generation,
+              }),
+        })
+        .pipe(
+          Effect.tapError(() =>
+            endRuntimeSession(existing, "error", { reason: "authority-issuance-failed" }),
+          ),
+        );
       return {
         state: existing.state,
         transport: {
@@ -1311,13 +1329,38 @@ const make = Effect.gen(function* () {
       acquired.lease.sessionId,
       (current) => [undefined, { ...current, heartbeatFiber }] as const,
     );
-    const nativeControlToken = yield* nativeControlGrants.issue({
-      authSessionId: ownerAuthSessionId,
-      sessionId: acquired.lease.sessionId,
-      leaseGeneration: acquired.lease.generation,
-      expiresAt: Date.parse(expiresAt),
-      capabilities: new Set(["session-control", "handoff-actions"]),
-    });
+    const nativeControlToken = yield* nativeControlGrants
+      .issue({
+        authSessionId: ownerAuthSessionId,
+        sessionId: acquired.lease.sessionId,
+        leaseGeneration: acquired.lease.generation,
+        expiresAt: Date.parse(expiresAt),
+        capabilities: new Set([
+          "session-control",
+          "handoff-actions",
+          ...(principal.nativeRuntime === undefined
+            ? []
+            : (["webrtc-signaling", "session-close"] as const)),
+        ]),
+        ...(principal.nativeRuntime === undefined
+          ? {}
+          : {
+              runtimeId: principal.nativeRuntime.runtimeId,
+              runtimeGeneration: principal.nativeRuntime.generation,
+            }),
+      })
+      .pipe(
+        Effect.tapError(() =>
+          SynchronizedRef.get(runtime).pipe(
+            Effect.flatMap((current) => {
+              const session = current.sessions.get(acquired.lease.sessionId);
+              return session === undefined
+                ? Effect.void
+                : endRuntimeSession(session, "error", { reason: "authority-issuance-failed" });
+            }),
+          ),
+        ),
+      );
     return {
       state,
       transport: {
