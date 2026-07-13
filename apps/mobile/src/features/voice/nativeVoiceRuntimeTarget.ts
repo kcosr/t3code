@@ -33,7 +33,9 @@ export class NativeVoiceRuntimeTargetUnavailableError extends Data.TaggedError(
   }
 }
 
-const encodeTargetIdentity = Schema.encodeSync(Schema.fromJsonString(VoiceNativeRuntimeTarget));
+export const canonicalNativeVoiceRuntimeTargetIdentity = Schema.encodeSync(
+  Schema.fromJsonString(VoiceNativeRuntimeTarget),
+);
 
 export interface ResolvedNativeVoiceRuntimeTarget {
   readonly target: VoiceNativeRuntimeTargetType;
@@ -90,7 +92,7 @@ async function resolveRealtimeConversationId(input: {
 }
 
 function withIdentity(target: VoiceNativeRuntimeTargetType): ResolvedNativeVoiceRuntimeTarget {
-  return { target, targetIdentity: encodeTargetIdentity(target) };
+  return { target, targetIdentity: canonicalNativeVoiceRuntimeTargetIdentity(target) };
 }
 
 export async function resolveNativeVoiceRuntimeTarget(input: {
