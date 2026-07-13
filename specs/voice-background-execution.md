@@ -70,9 +70,10 @@ DELETE /api/voice/native-runtimes/:runtimeId/grant
 ```
 
 Issuance validates `voice:use` plus the required orchestration scopes, verifies that the target is
-current and accessible, and returns the raw token once. Realtime issuance resolves the user's
-selected or most-recent durable conversation to an exact conversation ID. If none exists, the
-grant explicitly permits one new durable conversation rather than arbitrary selection.
+current and accessible, and returns the raw token once. Realtime authority always names one exact
+durable conversation ID. If no conversation exists, React creates it through the existing
+authenticated conversation API before provisioning native authority. Grant issuance does not
+create conversations or retain a second, open-ended target shape.
 
 ## Fresh Realtime
 
@@ -83,8 +84,8 @@ POST /api/voice/native/realtime-sessions/:sessionId/close
 ```
 
 1. Android sends the runtime ID, generation, and a client operation ID under the runtime grant.
-2. T3 derives the session idempotency key and creates or continues only the grant-bound
-   conversation and focus.
+2. T3 derives the session idempotency key and continues only the exact grant-bound conversation
+   and focus.
 3. T3 returns the normal session result and a session child grant.
 4. Android prepares its native WebRTC peer and SDP offer.
 5. The child grant exchanges the offer for an answer under exact session and lease fencing.
@@ -162,6 +163,8 @@ Events include:
 - phase changes;
 - message and turn correlation IDs;
 - immutable `speech-ready` segment index and finality;
+- an explicit speech-terminal signal, including an explicit no-speech terminal state, so coding
+  turn completion never implies that delayed speech synthesis has finished;
 - approval-required or user-input-required attention;
 - terminal completion, cancellation, or typed retryable/permanent failure.
 
