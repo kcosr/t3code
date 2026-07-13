@@ -10,6 +10,24 @@ implemented on a branch stacked from the reviewed commit immediately before it. 
 considered complete until implementation, verification, adversarial review, Keel review, commit,
 and push are complete.
 
+The current remaining sequence, after the reviewed Android background-control milestone, is:
+
+1. `feature/voice-background-execution` — make fresh Realtime startup and complete Active Thread
+   turns independent of a live React runtime.
+2. `feature/voice-long-context` — deterministic context compilation, provider truncation, and
+   duration-based call rotation.
+3. Final integrated review, exact Android build/deployment, and deferred device validation for the
+   current voice goal.
+4. `feature/voice-runtime-provider` — after compaction work is complete, integrate the separately
+   deployed Voice Runtime as a per-capability provider for bounded STT and streaming TTS. The
+   copied service and integration specifications and required T3 review corrections are in
+   `specs/voice-runtime/`.
+
+Pi integration remains deliberately deferred. The completed thread follow-up, conversation
+management, history search, media validation, observability, Auto Listen, Realtime handoff, and
+Android background-control workstreams stay in the stack; they are not repeated in the remaining
+sequence above.
+
 ## Decisions
 
 - History search reads both ordinary coding-thread messages and durable voice-conversation entries,
