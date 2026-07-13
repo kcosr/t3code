@@ -69,6 +69,34 @@ describe("voiceThreadMode", () => {
     expect(adopted.commands).toEqual([]);
   });
 
+  it("submits the transcript from an adopted handoff recording", () => {
+    const adopted = transition(initialVoiceThreadModeState(), {
+      type: "adopt-recording",
+      target: target(),
+      policy: "auto-submit",
+      playbackRequired: true,
+      recordingId: "handoff-recording",
+    });
+    const token = adopted.state.activeToken!;
+    const transcribing = transition(adopted.state, {
+      type: "recording-completed",
+      token,
+    });
+    const completed = transition(transcribing.state, {
+      type: "transcription-completed",
+      token,
+      transcript: "Continue in this thread",
+    });
+
+    expect(completed.state.phase).toBe("submitting");
+    expect(completed.commands).toContainEqual({
+      type: "submit-transcript",
+      token: completed.state.activeToken,
+      target: target(),
+      transcript: "Continue in this thread",
+    });
+  });
+
   it("arms only after explicit activation and waits for an existing thread turn", () => {
     expect(initialVoiceThreadModeState().phase).toBe("paused");
     const waiting = activate(true);

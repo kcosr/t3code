@@ -527,17 +527,46 @@ export function MasterVoiceProvider(props: {
       });
       setBrowserVisible(false);
       setTranscriptVisible(false);
-      navigation.navigate("Thread", {
-        environmentId: String(controllerEnvironmentId),
-        threadId: event.threadId,
-      });
     };
     const subscription = native.addListener("threadVoiceHandoff", accept);
     void native.getPendingThreadVoiceHandoffAsync().then((event) => {
       if (event !== null) accept(event);
     });
     return () => subscription.remove();
-  }, [controllerEnvironmentId, native, navigation, prepared]);
+  }, [controllerEnvironmentId, native, prepared]);
+
+  useEffect(() => {
+    if (threadVoiceHandoff === null) return;
+    if (
+      props.focus?.environmentId === threadVoiceHandoff.environmentId &&
+      props.focus.projectId === threadVoiceHandoff.projectId &&
+      props.focus.threadId === threadVoiceHandoff.threadId
+    ) {
+      return;
+    }
+
+    let retry: ReturnType<typeof setTimeout> | null = null;
+    let disposed = false;
+    const navigate = () => {
+      if (disposed || Date.now() >= threadVoiceHandoff.expiresAtEpochMillis) return;
+      navigation.navigate("Thread", {
+        environmentId: String(threadVoiceHandoff.environmentId),
+        threadId: String(threadVoiceHandoff.threadId),
+      });
+      retry = setTimeout(navigate, 300);
+    };
+    navigate();
+    return () => {
+      disposed = true;
+      if (retry !== null) clearTimeout(retry);
+    };
+  }, [
+    navigation,
+    props.focus?.environmentId,
+    props.focus?.projectId,
+    props.focus?.threadId,
+    threadVoiceHandoff,
+  ]);
 
   const acknowledgeClientAction = useCallback(
     async (

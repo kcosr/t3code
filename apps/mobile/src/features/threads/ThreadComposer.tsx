@@ -399,7 +399,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     state: autoListenState,
     active: autoListenActive,
     activate: activateAutoListen,
-    adoptRecording: adoptAutoListenRecording,
+    adoptHandoffRecording,
     deactivateForManualDictation: deactivateAutoListenForManualDictation,
     stopToDraft: stopAutoListenToDraft,
     pause: pauseAutoListen,
@@ -448,7 +448,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     void dictation
       .adopt(handoff.recordingId)
       .then(async (adopted) => {
-        if (adopted && handoff.autoRearm) adoptAutoListenRecording(handoff.recordingId);
+        if (adopted && handoff.autoRearm) adoptHandoffRecording(handoff.recordingId);
         await realtimeVoice.settleThreadVoiceHandoff(
           handoff.actionId,
           adopted ? "adopted" : "failed",
@@ -458,7 +458,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       .finally(() => handoffAdoptionsRef.current.delete(handoff.actionId))
       .catch(() => undefined);
   }, [
-    adoptAutoListenRecording,
+    adoptHandoffRecording,
     dictation,
     props.environmentId,
     props.selectedThread.id,

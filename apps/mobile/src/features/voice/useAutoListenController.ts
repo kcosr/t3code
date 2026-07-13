@@ -363,7 +363,7 @@ export function useAutoListenController(input: {
     return next.manualStopToDraft;
   }, [dispatch]);
 
-  const adoptRecording = useCallback(
+  const adoptHandoffRecording = useCallback(
     (recordingId: string) => {
       const current = inputRef.current;
       generationRef.current += 1;
@@ -382,7 +382,7 @@ export function useAutoListenController(input: {
           threadId: current.threadId,
           generation: generationRef.current,
         },
-        policy: current.preferences.autoSubmitEnabled ? "auto-submit" : "review",
+        policy: "auto-submit",
         playbackRequired: current.speech.playbackRequired,
         recordingId,
       });
@@ -669,7 +669,7 @@ export function useAutoListenController(input: {
     state,
     active: state.phase !== "paused",
     activate,
-    adoptRecording,
+    adoptHandoffRecording,
     deactivateForManualDictation,
     stopToDraft,
     pause,
