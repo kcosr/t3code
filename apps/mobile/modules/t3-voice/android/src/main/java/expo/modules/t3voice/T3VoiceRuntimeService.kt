@@ -1401,12 +1401,20 @@ class T3VoiceRuntimeService : Service() {
         if (persistedActive.cancelRequested) {
           T3VoiceBackgroundThreadAuthorityPolicy.cancellationAuthority(persistedActive)
         } else {
-          T3VoiceBackgroundThreadAuthorityPolicy.restore(
+          val restored = T3VoiceBackgroundThreadAuthorityPolicy.restore(
             readinessConfig,
             readinessStore.activeAuthority(),
             persistedActive,
             System.currentTimeMillis(),
-          ) ?: return
+          )
+          if (restored == null) {
+            val loadedGrant = runCatching {
+              T3VoiceRuntimeGrantStore(applicationContext).load()
+            }.getOrNull()
+            revokePersistedThreadOperationLocked(persisted, loadedGrant)
+            return
+          }
+          restored
         }
       val attempt = T3VoiceBackgroundThreadAttempt(authority, persistedActive.claim.clientOperationId)
       backgroundSnapshot = persistedActive.snapshot

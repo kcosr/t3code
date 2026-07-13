@@ -131,6 +131,7 @@ internal object T3VoiceBackgroundThreadAuthorityPolicy {
   ): T3VoiceBackgroundThreadAuthority? {
     val target = "${state.claim.projectId}/${state.claim.threadId}"
     if (!readiness.isEffective() || readiness.mode != T3VoiceReadinessMode.THREAD ||
+      readiness.generation != state.claim.readinessGeneration ||
       !readiness.microphonePermissionGranted || readiness.targetId != target ||
       state.expiresAtEpochMillis <= nowMillis) return null
     val installed = activeAuthority ?: return null

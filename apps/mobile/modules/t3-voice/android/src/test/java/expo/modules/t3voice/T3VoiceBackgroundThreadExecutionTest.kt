@@ -114,6 +114,10 @@ class T3VoiceBackgroundThreadExecutionTest {
       desired, installed, active, NOW)?.runtimeId)
     assertNull(T3VoiceBackgroundThreadAuthorityPolicy.restore(
       desired.copy(targetId = "project-1/other"), installed, active, NOW))
+    assertNull(T3VoiceBackgroundThreadAuthorityPolicy.restore(
+      desired.copy(generation = 5), installed, active, NOW))
+    assertNull(T3VoiceBackgroundThreadAuthorityPolicy.restore(
+      desired, installed, active.copy(expiresAtEpochMillis = NOW), NOW))
   }
 
   @Test fun `background playback retry is bounded`() {
