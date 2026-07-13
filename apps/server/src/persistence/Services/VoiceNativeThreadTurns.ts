@@ -28,6 +28,7 @@ export interface PersistedVoiceNativeThreadTurn {
   readonly autoRearm: boolean;
   readonly phase: VoiceNativeThreadTurnPhase;
   readonly processingLeaseUntil: number | null;
+  readonly processingLeaseToken: string | null;
   readonly processingAttempt: number;
   readonly commandId: CommandId | null;
   readonly messageId: MessageId | null;
@@ -48,6 +49,8 @@ export interface VoiceNativeThreadTurnSpeechSegmentRecord {
   readonly startOffset: number;
   readonly endOffset: number;
   readonly finalSegment: boolean;
+  readonly sourceEventSequence: number;
+  readonly sourceTextSha256: string;
   readonly createdAt: string;
 }
 
@@ -73,7 +76,12 @@ export interface VoiceNativeThreadTurnStoreShape {
     readonly expiresAt: number;
     readonly nowEpochMillis: number;
     readonly now: string;
-  }) => Effect.Effect<PersistedVoiceNativeThreadTurn, PersistenceSqlError>;
+  }) => Effect.Effect<
+    | { readonly status: "claimed"; readonly operation: PersistedVoiceNativeThreadTurn }
+    | { readonly status: "expired"; readonly operation: PersistedVoiceNativeThreadTurn }
+    | { readonly status: "mismatch"; readonly operation: PersistedVoiceNativeThreadTurn },
+    PersistenceSqlError
+  >;
   readonly authorize: (
     operationId: VoiceNativeThreadTurnOperationId,
     tokenHash: string,
@@ -84,24 +92,56 @@ export interface VoiceNativeThreadTurnStoreShape {
   ) => Effect.Effect<PersistedVoiceNativeThreadTurn | undefined, PersistenceSqlError>;
   readonly claimProcessing: (
     operationId: VoiceNativeThreadTurnOperationId,
+    leaseToken: string,
     now: number,
     leaseUntil: number,
     updatedAt: string,
+  ) => Effect.Effect<boolean, PersistenceSqlError>;
+  readonly beginDispatch: (
+    operationId: VoiceNativeThreadTurnOperationId,
+    leaseToken: string,
+    now: number,
+    occurredAt: string,
+  ) => Effect.Effect<boolean, PersistenceSqlError>;
+  readonly acceptDispatch: (input: {
+    readonly operationId: VoiceNativeThreadTurnOperationId;
+    readonly leaseToken: string;
+    readonly occurredAt: string;
+    readonly commandId: CommandId;
+    readonly messageId: MessageId;
+  }) => Effect.Effect<boolean, PersistenceSqlError>;
+  readonly releaseProcessing: (
+    operationId: VoiceNativeThreadTurnOperationId,
+    leaseToken: string,
+    occurredAt: string,
+    failureCode: "transcription-failed" | "dispatch-failed" | "target-unavailable",
+    retryable: boolean,
   ) => Effect.Effect<boolean, PersistenceSqlError>;
   readonly appendEvent: (
     operationId: VoiceNativeThreadTurnOperationId,
     event: VoiceNativeThreadTurnEventWithoutSequence,
     updates?: {
       readonly phase?: VoiceNativeThreadTurnPhase;
-      readonly commandId?: CommandId;
-      readonly messageId?: MessageId;
       readonly turnId?: TurnId | null;
-      readonly speechTerminal?: "completed" | "no-speech" | "failed";
-      readonly dispatchAccepted?: boolean;
-      readonly clearProcessingLease?: boolean;
-      readonly terminal?: boolean;
     },
-  ) => Effect.Effect<VoiceNativeThreadTurnEvent, PersistenceSqlError>;
+  ) => Effect.Effect<VoiceNativeThreadTurnEvent | undefined, PersistenceSqlError>;
+  readonly finalize: (input: {
+    readonly operationId: VoiceNativeThreadTurnOperationId;
+    readonly occurredAt: string;
+    readonly outcome: "completed" | "failed" | "cancelled";
+    readonly speechOutcome?: "completed" | "no-speech" | "failed";
+    readonly failureCode?:
+      | "audio-invalid"
+      | "transcription-failed"
+      | "dispatch-failed"
+      | "target-unavailable"
+      | "turn-failed"
+      | "speech-failed"
+      | "operation-expired";
+    readonly retryable?: boolean;
+    readonly leaseToken?: string;
+    readonly requireUnleased?: boolean;
+  }) => Effect.Effect<boolean, PersistenceSqlError>;
   readonly listEvents: (
     operationId: VoiceNativeThreadTurnOperationId,
     afterSequence: number,
@@ -111,13 +151,32 @@ export interface VoiceNativeThreadTurnStoreShape {
     operationId: VoiceNativeThreadTurnOperationId,
     sequence: number,
   ) => Effect.Effect<boolean, PersistenceSqlError>;
-  readonly putSpeechSegment: (
+  readonly putSpeechSegmentAndEvent: (
     segment: VoiceNativeThreadTurnSpeechSegmentRecord,
-  ) => Effect.Effect<boolean, PersistenceSqlError>;
+  ) => Effect.Effect<"inserted" | "existing" | "mismatch" | "terminal", PersistenceSqlError>;
+  readonly resolveAssistantRevision: (
+    assistantMessageId: MessageId,
+  ) => Effect.Effect<
+    { readonly sourceEventSequence: number; readonly sourceTextSha256: string } | undefined,
+    PersistenceSqlError
+  >;
   readonly getSpeechSegment: (
     operationId: VoiceNativeThreadTurnOperationId,
     segmentIndex: number,
   ) => Effect.Effect<VoiceNativeThreadTurnSpeechSegmentRecord | undefined, PersistenceSqlError>;
+  readonly getSpeechSegmentText: (
+    operationId: VoiceNativeThreadTurnOperationId,
+    segmentIndex: number,
+  ) => Effect.Effect<string | undefined, PersistenceSqlError>;
+  readonly cancel: (
+    operationId: VoiceNativeThreadTurnOperationId,
+    occurredAt: string,
+  ) => Effect.Effect<"cancelled" | "terminal" | "dispatch-committed", PersistenceSqlError>;
+  readonly expireAndPurge: (
+    now: number,
+    occurredAt: string,
+    retentionCutoff: number,
+  ) => Effect.Effect<ReadonlyArray<VoiceNativeThreadTurnOperationId>, PersistenceSqlError>;
   readonly revokeRuntime: (
     authSessionId: AuthSessionId,
     runtimeId: VoiceNativeRuntimeId,

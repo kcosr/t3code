@@ -14,14 +14,12 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 
-import { ServerSettingsService } from "../serverSettings.ts";
 import type { VoiceError } from "./Errors.ts";
 import { VoiceNativeThreadTurnService } from "./Services/VoiceNativeThreadTurnService.ts";
 
 const VOICE_RUNTIME_HEADER = "x-t3-voice-runtime";
 const VOICE_OPERATION_HEADER = "x-t3-voice-operation";
 const JSON_LIMIT = 2_048;
-const BODY_TIMEOUT = "10 seconds";
 const noStore = { "cache-control": "no-store", "x-content-type-options": "nosniff" };
 
 const decodeOperationId = Schema.decodeUnknownEffect(VoiceNativeThreadTurnOperationId);
@@ -38,6 +36,7 @@ const decodeCancelSchema = Schema.decodeUnknownEffect(
 );
 const decodeCancel = (json: string) => decodeCancelSchema(json, { onExcessProperty: "error" });
 const decodeLanguage = Schema.decodeUnknownEffect(VoiceTranscriptionLanguage);
+const decodeEventsQuery = Schema.decodeUnknownEffect(VoiceNativeThreadTurnEventsQuery);
 
 const response = (body: unknown, status = 200) =>
   HttpServerResponse.jsonUnsafe(body, { status, headers: noStore });
@@ -74,23 +73,37 @@ const voiceFailure = (error: VoiceError) => {
   );
 };
 
-const readBounded = (request: HttpServerRequest.HttpServerRequest, maximumBytes: number) => {
+export const readBounded = (
+  request: HttpServerRequest.HttpServerRequest,
+  maximumBytes: number,
+  timeoutSeconds = 10,
+) => {
   const declared = Number(request.headers["content-length"]);
   if (Number.isFinite(declared) && declared > maximumBytes)
     return Effect.fail("too-large" as const);
   return request.stream.pipe(
     Stream.runFoldEffect(
-      () => new Uint8Array(0),
+      () => ({ chunks: [] as Array<Uint8Array>, byteLength: 0 }),
       (observed, chunk) => {
         if (observed.byteLength + chunk.byteLength > maximumBytes)
           return Effect.fail("too-large" as const);
-        const combined = new Uint8Array(observed.byteLength + chunk.byteLength);
-        combined.set(observed);
-        combined.set(chunk, observed.byteLength);
-        return Effect.succeed(combined);
+        observed.chunks.push(chunk);
+        return Effect.succeed({
+          chunks: observed.chunks,
+          byteLength: observed.byteLength + chunk.byteLength,
+        });
       },
     ),
-    Effect.timeout(BODY_TIMEOUT),
+    Effect.map(({ chunks, byteLength }) => {
+      const combined = new Uint8Array(byteLength);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return combined;
+    }),
+    Effect.timeout(`${timeoutSeconds} seconds`),
     Effect.mapError((error) => (error === "too-large" ? error : ("invalid" as const))),
   );
 };
@@ -145,22 +158,25 @@ const audioRoute = HttpRouter.add(
         : yield* decodeLanguage(languageHeader).pipe(Effect.option);
     if (languageHeader !== undefined && Option.isNone(language))
       return invalidRequest("Invalid content language");
-    const settings = yield* (yield* ServerSettingsService).getSettings.pipe(Effect.result);
-    if (Result.isFailure(settings))
-      return response({ code: "voice_operation_failed", retryable: true }, 503);
-    const maximumBytes = settings.success.voice.maxUploadBytes;
-    const audio = yield* readBounded(context.request, maximumBytes).pipe(Effect.result);
-    if (Result.isFailure(audio))
-      return audio.failure === "too-large" ? payloadTooLarge() : invalidRequest();
-    const result = yield* (yield* VoiceNativeThreadTurnService)
-      .uploadAudio(
-        context.token,
-        context.operationId,
-        audio.success,
-        Option.getOrUndefined(language),
-      )
+    const service = yield* VoiceNativeThreadTurnService;
+    const admission = yield* service
+      .beginAudioUpload(context.token, context.operationId)
       .pipe(Effect.result);
-    return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
+    if (Result.isFailure(admission)) return voiceFailure(admission.failure);
+    const upload = yield* Effect.gen(function* () {
+      const audio = yield* readBounded(
+        context.request,
+        admission.success.maximumBytes,
+        admission.success.bodyTimeoutSeconds,
+      );
+      return yield* admission.success.upload(audio, Option.getOrUndefined(language));
+    }).pipe(Effect.ensuring(admission.success.release), Effect.result);
+    if (Result.isFailure(upload)) {
+      if (upload.failure === "too-large") return payloadTooLarge();
+      if (upload.failure === "invalid") return invalidRequest();
+      return voiceFailure(upload.failure);
+    }
+    return response(upload.success);
   }),
 );
 
@@ -171,7 +187,7 @@ const eventsRoute = HttpRouter.add(
     const context = yield* withOperation();
     if (context === undefined) return unauthorized();
     const url = new URL(context.request.url, "http://native.invalid");
-    const query = yield* Schema.decodeUnknownEffect(VoiceNativeThreadTurnEventsQuery)(
+    const query = yield* decodeEventsQuery(
       {
         afterSequence: Number(url.searchParams.get("afterSequence") ?? "0"),
         waitMilliseconds: Number(url.searchParams.get("waitMilliseconds") ?? "0"),
@@ -192,9 +208,14 @@ const acknowledgeRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context === undefined) return unauthorized();
+    const service = yield* VoiceNativeThreadTurnService;
+    const authorized = yield* service
+      .authorizeOperation(context.token, context.operationId)
+      .pipe(Effect.result);
+    if (Result.isFailure(authorized)) return voiceFailure(authorized.failure);
     const input = yield* decodeJson(context.request, decodeAck);
     if (Option.isNone(input)) return invalidRequest();
-    const result = yield* (yield* VoiceNativeThreadTurnService)
+    const result = yield* service
       .acknowledgeEvents(context.token, context.operationId, input.value.acknowledgedSequence)
       .pipe(Effect.result);
     return Result.isFailure(result)
@@ -229,11 +250,14 @@ const cancelRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context === undefined) return unauthorized();
+    const service = yield* VoiceNativeThreadTurnService;
+    const authorized = yield* service
+      .authorizeOperation(context.token, context.operationId)
+      .pipe(Effect.result);
+    if (Result.isFailure(authorized)) return voiceFailure(authorized.failure);
     const input = yield* decodeJson(context.request, decodeCancel);
     if (Option.isNone(input)) return invalidRequest();
-    const result = yield* (yield* VoiceNativeThreadTurnService)
-      .cancel(context.token, context.operationId)
-      .pipe(Effect.result);
+    const result = yield* service.cancel(context.token, context.operationId).pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
 );

@@ -16,6 +16,7 @@ import * as Encoding from "effect/Encoding";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as NodeCrypto from "node:crypto";
@@ -35,6 +36,7 @@ import { inspectVoiceMp4 } from "../Services/VoiceMp4Inspector.ts";
 import {
   boundVoiceByteStream,
   boundVoiceMediaEffect,
+  VOICE_TRANSCRIPTION_OUTPUT_MAX_BYTES,
   VoiceMediaRequestLimiter,
 } from "../Services/VoiceMediaPolicy.ts";
 import { VoiceNativeRuntimeGrantRegistry } from "../Services/VoiceNativeRuntimeGrantRegistry.ts";
@@ -44,6 +46,7 @@ import { VoiceProviderRegistry } from "../Services/VoiceProviderRegistry.ts";
 const OPERATION_TTL_MILLIS = 2 * 60 * 60 * 1_000;
 const PROCESSING_LEASE_MILLIS = 5 * 60 * 1_000;
 const EVENT_PAGE_LIMIT = 100;
+const TERMINAL_RETENTION_MILLIS = 24 * 60 * 60 * 1_000;
 const hashToken = (token: string) => NodeCrypto.createHash("sha256").update(token).digest("hex");
 const deterministicHash = (...values: ReadonlyArray<string>) =>
   NodeCrypto.createHash("sha256").update(values.join("\0")).digest("base64url");
@@ -108,6 +111,13 @@ const make = Effect.gen(function* () {
       ),
     ),
   );
+  const getEnabledVoiceSettings = getVoiceSettings.pipe(
+    Effect.flatMap((settings) =>
+      settings.enabled
+        ? Effect.succeed(settings)
+        : Effect.fail(voiceError("disabled", "thread-turn.settings", "Voice is disabled", false)),
+    ),
+  );
 
   const nowIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
   const repositoryFailure = (operation: string) => (cause: unknown) =>
@@ -166,6 +176,13 @@ const make = Effect.gen(function* () {
       .appendEvent(operationId, event, updates)
       .pipe(Effect.mapError(repositoryFailure("thread-turn.event")));
 
+  const maintain = Effect.fn("VoiceNativeThreadTurnService.maintain")(function* () {
+    const now = yield* Clock.currentTimeMillis;
+    return yield* store
+      .expireAndPurge(now, yield* nowIso, now - TERMINAL_RETENTION_MILLIS)
+      .pipe(Effect.mapError(repositoryFailure("thread-turn.maintenance")));
+  });
+
   const monitorLoop = Effect.fn("VoiceNativeThreadTurnService.monitor")(function* (
     operationId: VoiceNativeThreadTurnOperationId,
   ) {
@@ -177,6 +194,19 @@ const make = Effect.gen(function* () {
     while (true) {
       const operation = yield* load(operationId);
       if (terminalPhase(operation.phase) || operation.messageId === null) return;
+      if (operation.expiresAt <= (yield* Clock.currentTimeMillis)) {
+        yield* store
+          .finalize({
+            operationId,
+            occurredAt: yield* nowIso,
+            outcome: "failed",
+            speechOutcome: "failed",
+            failureCode: "operation-expired",
+            retryable: false,
+          })
+          .pipe(Effect.mapError(repositoryFailure("thread-turn.expire")));
+        return;
+      }
       const [outcome, shell] = yield* Effect.all([
         turnStarts.getOutcomeByMessageId({
           threadId: operation.threadId,
@@ -184,6 +214,19 @@ const make = Effect.gen(function* () {
         }),
         query.getThreadShellById(operation.threadId),
       ]).pipe(Effect.mapError(repositoryFailure("thread-turn.projection")));
+      if (Option.isNone(shell)) {
+        yield* store
+          .finalize({
+            operationId,
+            occurredAt: yield* nowIso,
+            outcome: "failed",
+            speechOutcome: "failed",
+            failureCode: "target-unavailable",
+            retryable: false,
+          })
+          .pipe(Effect.mapError(repositoryFailure("thread-turn.finalize-target")));
+        return;
+      }
       if (Option.isSome(shell)) {
         const nextAttention = shell.value.hasPendingApprovals
           ? ("approval" as const)
@@ -201,6 +244,13 @@ const make = Effect.gen(function* () {
             },
             { phase: "attention-required" },
           );
+        } else if (nextAttention === undefined && attention !== undefined) {
+          attention = undefined;
+          yield* append(
+            operationId,
+            { type: "phase", occurredAt: yield* nowIso, phase: "waiting" },
+            { phase: "waiting" },
+          );
         }
       }
       if (
@@ -212,22 +262,16 @@ const make = Effect.gen(function* () {
         continue;
       }
       if (outcome.value.start.state === "failed" || outcome.value.start.state === "ambiguous") {
-        const occurredAt = yield* nowIso;
-        yield* append(
-          operationId,
-          { type: "failure", occurredAt, code: "turn-failed", retryable: false },
-          { phase: "failed" },
-        );
-        yield* append(
-          operationId,
-          { type: "speech-terminal", occurredAt, outcome: "no-speech" },
-          { speechTerminal: "no-speech" },
-        );
-        yield* append(
-          operationId,
-          { type: "terminal", occurredAt, outcome: "failed" },
-          { terminal: true },
-        );
+        yield* store
+          .finalize({
+            operationId,
+            occurredAt: yield* nowIso,
+            outcome: "failed",
+            speechOutcome: "no-speech",
+            failureCode: "turn-failed",
+            retryable: false,
+          })
+          .pipe(Effect.mapError(repositoryFailure("thread-turn.finalize")));
         return;
       }
       const turn = outcome.value.turn;
@@ -254,21 +298,23 @@ const make = Effect.gen(function* () {
           .pipe(Effect.mapError(repositoryFailure("thread-turn.message")));
         if (Option.isSome(assistant)) {
           const text = assistant.value.text;
+          const previousText = priorText;
           const prefixUpdate = text.startsWith(priorText);
           const delta = prefixUpdate ? text.slice(priorText.length) : "";
           priorText = text;
-          if (!prefixUpdate) revisedNonPrefix = true;
           const terminal = turn.state !== "running";
-          const indexOffset = terminal && revisedNonPrefix ? chunker.nextIndex : 0;
-          if (terminal && revisedNonPrefix) {
-            chunker = initialSpeechChunkerState();
-            emittedOffset = 0;
+          const revision = yield* store
+            .resolveAssistantRevision(assistant.value.messageId)
+            .pipe(Effect.mapError(repositoryFailure("thread-turn.speech-revision")));
+          if (revision === undefined || hashToken(text) !== revision.sourceTextSha256) {
+            priorText = previousText;
+            yield* Effect.sleep("50 millis");
+            continue;
           }
-          const chunked = appendSpeechText(
-            chunker,
-            terminal && revisedNonPrefix ? text : revisedNonPrefix ? "" : delta,
-            terminal,
-          );
+          if (!prefixUpdate) revisedNonPrefix = true;
+          const chunked = revisedNonPrefix
+            ? { state: chunker, segments: [] }
+            : appendSpeechText(chunker, delta, terminal);
           chunker = chunked.state;
           for (const segment of chunked.segments) {
             const startOffset = text.indexOf(segment.text, emittedOffset);
@@ -283,28 +329,25 @@ const make = Effect.gen(function* () {
             emittedOffset = endOffset;
             const occurredAt = yield* nowIso;
             const inserted = yield* store
-              .putSpeechSegment({
+              .putSpeechSegmentAndEvent({
                 operationId,
-                segmentIndex: segment.index + indexOffset,
+                segmentIndex: segment.index,
                 assistantMessageId: assistant.value.messageId,
                 startOffset,
                 endOffset,
                 finalSegment: segment.finalSegment,
+                ...revision,
                 createdAt: occurredAt,
               })
               .pipe(Effect.mapError(repositoryFailure("thread-turn.segment")));
-            if (inserted) {
-              yield* append(
-                operationId,
-                {
-                  type: "speech-ready",
-                  occurredAt,
-                  segmentIndex: segment.index + indexOffset,
-                  finalSegment: segment.finalSegment,
-                },
-                { phase: "speaking" },
+            if (inserted === "mismatch")
+              return yield* voiceError(
+                "invalid-context",
+                "thread-turn.segment-conflict",
+                "Speech segment identity changed",
+                false,
               );
-            }
+            if (inserted === "terminal") return;
           }
         }
       }
@@ -326,28 +369,17 @@ const make = Effect.gen(function* () {
         speechOutcome,
         turnOutcome: terminal,
       });
-      yield* append(
-        operationId,
-        { type: "speech-terminal", occurredAt, outcome: speechOutcome },
-        { speechTerminal: speechOutcome },
-      );
-      if (terminal === "failed")
-        yield* append(
+      yield* store
+        .finalize({
           operationId,
-          { type: "failure", occurredAt, code: "turn-failed", retryable: false },
-          { phase: "failed" },
-        );
-      else
-        yield* append(
-          operationId,
-          { type: "phase", occurredAt, phase: "completed" },
-          { phase: "completed" },
-        );
-      yield* append(
-        operationId,
-        { type: "terminal", occurredAt, outcome: terminal },
-        { terminal: true },
-      );
+          occurredAt,
+          outcome: terminal,
+          speechOutcome,
+          ...(terminal === "failed"
+            ? { failureCode: "turn-failed" as const, retryable: false }
+            : {}),
+        })
+        .pipe(Effect.mapError(repositoryFailure("thread-turn.finalize")));
       return;
     }
   });
@@ -362,13 +394,32 @@ const make = Effect.gen(function* () {
     });
     if (!started) return;
     yield* monitorLoop(operationId).pipe(
+      Effect.catch((cause: unknown) =>
+        Effect.logError("Native thread voice monitor failed", { operationId, cause }).pipe(
+          Effect.andThen(
+            nowIso.pipe(
+              Effect.flatMap((occurredAt) =>
+                store.finalize({
+                  operationId,
+                  occurredAt,
+                  outcome: "failed",
+                  speechOutcome: "failed",
+                  failureCode: "turn-failed",
+                  retryable: true,
+                }),
+              ),
+            ),
+          ),
+          Effect.ignore,
+        ),
+      ),
       Effect.ensuring(Effect.sync(() => activeMonitors.delete(operationId))),
       Effect.forkDetach,
     );
   });
 
   const reconcileOrDispatch = Effect.fn("VoiceNativeThreadTurnService.reconcileOrDispatch")(
-    function* (operation: PersistedVoiceNativeThreadTurn, transcript?: string) {
+    function* (operation: PersistedVoiceNativeThreadTurn, leaseToken: string, transcript?: string) {
       const commandId = CommandId.make(`native-thread-turn:${operation.operationId}`);
       const messageId = MessageId.make(`native-thread-message:${operation.operationId}`);
       const existing = yield* messages
@@ -389,7 +440,7 @@ const make = Effect.gen(function* () {
               onNone: () =>
                 Effect.fail(
                   voiceError(
-                    "invalid-context",
+                    "conversation-not-found",
                     "thread-turn.target",
                     "Thread target is unavailable",
                     false,
@@ -401,9 +452,24 @@ const make = Effect.gen(function* () {
         );
         if (thread.projectId !== operation.projectId)
           return yield* voiceError(
-            "invalid-context",
+            "conversation-not-found",
             "thread-turn.target",
             "Thread target changed",
+            false,
+          );
+        const dispatchCommitted = yield* store
+          .beginDispatch(
+            operation.operationId,
+            leaseToken,
+            yield* Clock.currentTimeMillis,
+            yield* nowIso,
+          )
+          .pipe(Effect.mapError(repositoryFailure("thread-turn.begin-dispatch")));
+        if (!dispatchCommitted)
+          return yield* voiceError(
+            "invalid-phase",
+            "thread-turn.dispatch-fenced",
+            "Operation was cancelled or displaced before dispatch",
             false,
           );
         yield* dispatcher
@@ -429,23 +495,39 @@ const make = Effect.gen(function* () {
             ),
           );
       }
-      yield* append(
-        operation.operationId,
-        {
-          type: "dispatch-correlation",
+      if (Option.isSome(existing)) {
+        const dispatchCommitted = yield* store
+          .beginDispatch(
+            operation.operationId,
+            leaseToken,
+            yield* Clock.currentTimeMillis,
+            yield* nowIso,
+          )
+          .pipe(Effect.mapError(repositoryFailure("thread-turn.begin-dispatch")));
+        if (!dispatchCommitted)
+          return yield* voiceError(
+            "invalid-phase",
+            "thread-turn.dispatch-fenced",
+            "Operation was cancelled or displaced before reconciliation",
+            false,
+          );
+      }
+      const accepted = yield* store
+        .acceptDispatch({
+          operationId: operation.operationId,
+          leaseToken,
           occurredAt: yield* nowIso,
           commandId,
           messageId,
-          turnId: null,
-        },
-        {
-          phase: "waiting",
-          commandId,
-          messageId,
-          dispatchAccepted: true,
-          clearProcessingLease: true,
-        },
-      );
+        })
+        .pipe(Effect.mapError(repositoryFailure("thread-turn.accept-dispatch")));
+      if (!accepted)
+        return yield* voiceError(
+          "invalid-phase",
+          "thread-turn.dispatch-fenced",
+          "Operation lost authority while dispatching",
+          false,
+        );
       yield* Effect.logInfo("Native thread voice dispatch accepted", {
         operationId: operation.operationId,
         commandId,
@@ -458,6 +540,8 @@ const make = Effect.gen(function* () {
   const create: VoiceNativeThreadTurnService["Service"]["create"] = Effect.fn(
     "VoiceNativeThreadTurnService.create",
   )(function* (runtimeToken, input) {
+    yield* getEnabledVoiceSettings;
+    yield* maintain();
     const grant = yield* runtimeGrants.authorize(runtimeToken);
     if (
       grant === undefined ||
@@ -478,7 +562,7 @@ const make = Effect.gen(function* () {
     const operationId = VoiceNativeThreadTurnOperationId.make(
       `native-thread-turn:${deterministicHash(grant.authSessionId, grant.runtimeId, String(grant.generation), input.clientOperationId)}`,
     );
-    const created = yield* store
+    const claim = yield* store
       .claim({
         operationId,
         authSessionId: grant.authSessionId,
@@ -505,6 +589,21 @@ const make = Effect.gen(function* () {
           ),
         ),
       );
+    if (claim.status === "expired")
+      return yield* voiceError(
+        "invalid-phase",
+        "thread-turn.create-expired",
+        "The idempotent operation has expired; use a new client operation id",
+        false,
+      );
+    if (claim.status === "mismatch")
+      return yield* voiceError(
+        "invalid-context",
+        "thread-turn.create-mismatch",
+        "The idempotent operation parameters do not match",
+        false,
+      );
+    const created = claim.operation;
     if (created.dispatchAccepted && !terminalPhase(created.phase))
       yield* ensureMonitor(operationId);
     yield* Effect.logInfo("Native thread voice operation claimed", {
@@ -532,18 +631,7 @@ const make = Effect.gen(function* () {
       yield* ensureMonitor(operationId);
       return { snapshot: snapshot(operation), disposition: "already-dispatched" };
     }
-    const deterministicMessageId = MessageId.make(`native-thread-message:${operation.operationId}`);
-    const reconciledMessage = yield* messages
-      .getByMessageId({ messageId: deterministicMessageId })
-      .pipe(Effect.mapError(repositoryFailure("thread-turn.reconcile")));
-    if (Option.isSome(reconciledMessage)) {
-      yield* reconcileOrDispatch(operation);
-      return {
-        snapshot: snapshot(yield* load(operationId)),
-        disposition: "already-dispatched",
-      };
-    }
-    const settings = yield* getVoiceSettings;
+    const settings = yield* getEnabledVoiceSettings;
     if (bytes.byteLength > settings.maxUploadBytes)
       return yield* voiceError(
         "payload-too-large",
@@ -551,14 +639,33 @@ const make = Effect.gen(function* () {
         "Audio exceeds configured limit",
         false,
       );
-    const validated = yield* inspectVoiceMp4(bytes, settings.maxInputDurationSeconds).pipe(
+    const validation = yield* inspectVoiceMp4(bytes, settings.maxInputDurationSeconds).pipe(
       Effect.mapError((cause) =>
         voiceError("unsupported-media", "thread-turn.audio", cause.reason, false, cause),
       ),
+      Effect.result,
     );
+    if (Result.isFailure(validation)) {
+      yield* store
+        .finalize({
+          operationId,
+          occurredAt: yield* nowIso,
+          outcome: "failed",
+          speechOutcome: "failed",
+          failureCode: "audio-invalid",
+          retryable: false,
+          requireUnleased: true,
+        })
+        .pipe(Effect.mapError(repositoryFailure("thread-turn.finalize-audio")));
+      return yield* validation.failure;
+    }
+    const validated = validation.success;
     const now = yield* Clock.currentTimeMillis;
+    const leaseToken = yield* crypto
+      .randomBytes(32)
+      .pipe(Effect.map(Encoding.encodeBase64Url), Effect.orDie);
     const claimed = yield* store
-      .claimProcessing(operationId, now, now + PROCESSING_LEASE_MILLIS, yield* nowIso)
+      .claimProcessing(operationId, leaseToken, now, now + PROCESSING_LEASE_MILLIS, yield* nowIso)
       .pipe(Effect.mapError(repositoryFailure("thread-turn.processing-lease")));
     if (!claimed)
       return yield* voiceError(
@@ -573,97 +680,103 @@ const make = Effect.gen(function* () {
       { phase: "transcribing" },
     );
     const processing = yield* Effect.gen(function* () {
-      const permit = yield* limiter
-        .acquire(settings.maxConcurrentMediaRequests)
-        .pipe(
-          Effect.mapError((cause) =>
-            voiceError("quota-exceeded", "thread-turn.audio", cause.reason, true, cause),
-          ),
-        );
-      const transcript = yield* Effect.gen(function* () {
-        const provider = yield* providers.resolve("transcription.request");
-        if (provider.transcriber === undefined)
-          return yield* voiceError(
-            "not-configured",
-            "thread-turn.transcribe",
-            "No transcriber is configured",
-            false,
-          );
-        const transcription = provider.transcriber
-          .transcribe({
-            requestId: VoiceRequestId.make(`native-thread-transcript:${operationId}`),
-            bytes,
-            mediaType: validated.mediaType,
-            ...(language === undefined ? {} : { language }),
-          })
-          .pipe(
-            Stream.runFold(
-              () => "",
-              (current, event) => (event.type === "final" ? event.result.text : current),
-            ),
-          );
-        return yield* boundVoiceMediaEffect(
-          transcription,
-          settings.mediaRequestTimeoutSeconds,
-        ).pipe(
-          Effect.flatMap((text) =>
-            text.length === 0
-              ? Effect.fail(
-                  voiceError(
-                    "invalid-context",
-                    "thread-turn.transcribe",
-                    "Transcription produced no speech",
-                    false,
-                  ),
-                )
-              : Effect.succeed(text),
-          ),
-          Effect.mapError((cause) =>
-            isVoiceError(cause)
-              ? cause
-              : voiceError(
-                  "provider-unavailable",
-                  "thread-turn.transcribe",
-                  "Transcription failed",
-                  true,
-                  cause,
-                ),
-          ),
-        );
-      }).pipe(Effect.ensuring(permit.release));
-      yield* append(
-        operationId,
-        { type: "phase", occurredAt: yield* nowIso, phase: "dispatching" },
-        { phase: "dispatching" },
+      const deterministicMessageId = MessageId.make(
+        `native-thread-message:${operation.operationId}`,
       );
-      yield* reconcileOrDispatch(operation, transcript);
+      const reconciledMessage = yield* messages
+        .getByMessageId({ messageId: deterministicMessageId })
+        .pipe(Effect.mapError(repositoryFailure("thread-turn.reconcile")));
+      const transcript = Option.isSome(reconciledMessage)
+        ? undefined
+        : yield* Effect.gen(function* () {
+            const provider = yield* providers.resolve("transcription.request");
+            if (provider.transcriber === undefined)
+              return yield* voiceError(
+                "not-configured",
+                "thread-turn.transcribe",
+                "No transcriber is configured",
+                false,
+              );
+            const transcription = provider.transcriber
+              .transcribe({
+                requestId: VoiceRequestId.make(`native-thread-transcript:${operationId}`),
+                bytes,
+                mediaType: validated.mediaType,
+                ...(language === undefined ? {} : { language }),
+              })
+              .pipe(
+                Stream.runFold(
+                  () => "",
+                  (current, event) => (event.type === "final" ? event.result.text : current),
+                ),
+              );
+            return yield* boundVoiceMediaEffect(
+              transcription,
+              settings.mediaRequestTimeoutSeconds,
+            ).pipe(
+              Effect.flatMap((text) =>
+                new TextEncoder().encode(text).byteLength > VOICE_TRANSCRIPTION_OUTPUT_MAX_BYTES
+                  ? Effect.fail(
+                      voiceError(
+                        "payload-too-large",
+                        "thread-turn.transcript-limit",
+                        "Transcription exceeds the configured output limit",
+                        false,
+                      ),
+                    )
+                  : text.length === 0
+                    ? Effect.fail(
+                        voiceError(
+                          "invalid-context",
+                          "thread-turn.transcribe",
+                          "Transcription produced no speech",
+                          false,
+                        ),
+                      )
+                    : Effect.succeed(text),
+              ),
+              Effect.mapError((cause) =>
+                isVoiceError(cause)
+                  ? cause
+                  : voiceError(
+                      "provider-unavailable",
+                      "thread-turn.transcribe",
+                      "Transcription failed",
+                      true,
+                      cause,
+                    ),
+              ),
+            );
+          });
+      yield* reconcileOrDispatch(operation, leaseToken, transcript);
     }).pipe(Effect.result);
     if (Result.isFailure(processing)) {
       const error = processing.failure;
       const occurredAt = yield* nowIso;
-      const code = error.operation.includes("dispatch")
-        ? ("dispatch-failed" as const)
-        : ("transcription-failed" as const);
-      yield* append(
-        operationId,
-        { type: "failure", occurredAt, code, retryable: error.retryable },
-        {
-          phase: error.retryable ? "created" : "failed",
-          clearProcessingLease: true,
-          ...(error.retryable ? {} : { terminal: true }),
-        },
-      );
+      const code =
+        error.operation === "thread-turn.target"
+          ? ("target-unavailable" as const)
+          : error.operation.startsWith("thread-turn.dispatch") ||
+              error.operation === "thread-turn.begin-dispatch" ||
+              error.operation === "thread-turn.accept-dispatch"
+            ? ("dispatch-failed" as const)
+            : ("transcription-failed" as const);
       if (!error.retryable) {
-        yield* append(
-          operationId,
-          { type: "speech-terminal", occurredAt, outcome: "failed" },
-          { speechTerminal: "failed" },
-        );
-        yield* append(
-          operationId,
-          { type: "terminal", occurredAt, outcome: "failed" },
-          { terminal: true },
-        );
+        yield* store
+          .finalize({
+            operationId,
+            occurredAt,
+            outcome: "failed",
+            speechOutcome: "failed",
+            failureCode: code,
+            retryable: false,
+            leaseToken,
+          })
+          .pipe(Effect.mapError(repositoryFailure("thread-turn.finalize")));
+      } else {
+        yield* store
+          .releaseProcessing(operationId, leaseToken, occurredAt, code, true)
+          .pipe(Effect.mapError(repositoryFailure("thread-turn.release-processing")));
       }
       yield* Effect.logWarning("Native thread voice processing failed", {
         operationId,
@@ -677,9 +790,31 @@ const make = Effect.gen(function* () {
     return { snapshot: snapshot(current), disposition: "processing" };
   });
 
+  const beginAudioUpload: VoiceNativeThreadTurnService["Service"]["beginAudioUpload"] = Effect.fn(
+    "VoiceNativeThreadTurnService.beginAudioUpload",
+  )(function* (operationToken, operationId) {
+    yield* authorize(operationToken, operationId);
+    const settings = yield* getEnabledVoiceSettings;
+    const permit = yield* limiter
+      .acquire(settings.maxConcurrentMediaRequests)
+      .pipe(
+        Effect.mapError((cause) =>
+          voiceError("quota-exceeded", "thread-turn.audio-admission", cause.reason, true, cause),
+        ),
+      );
+    return {
+      maximumBytes: settings.maxUploadBytes,
+      bodyTimeoutSeconds: Math.max(30, settings.maxInputDurationSeconds + 30),
+      upload: (bytes: Uint8Array, language?: string) =>
+        uploadAudio(operationToken, operationId, bytes, language),
+      release: permit.release,
+    };
+  });
+
   const events: VoiceNativeThreadTurnService["Service"]["events"] = Effect.fn(
     "VoiceNativeThreadTurnService.events",
   )(function* (operationToken, operationId, eventQuery) {
+    yield* maintain();
     const operation = yield* authorize(operationToken, operationId);
     if (operation.dispatchAccepted && !terminalPhase(operation.phase))
       yield* ensureMonitor(operationId);
@@ -730,25 +865,24 @@ const make = Effect.gen(function* () {
         "Speech segment was not found",
         false,
       );
-    const assistant = yield* messages
-      .getByMessageId({ messageId: segment.assistantMessageId })
+    const text = yield* store
+      .getSpeechSegmentText(operationId, segmentIndex)
       .pipe(Effect.mapError(repositoryFailure("thread-turn.speech-message")));
-    if (Option.isNone(assistant) || assistant.value.role !== "assistant")
-      return yield* voiceError(
-        "session-not-found",
-        "thread-turn.speech-message",
-        "Canonical assistant message was not found",
-        false,
-      );
-    const text = assistant.value.text.slice(segment.startOffset, segment.endOffset);
-    if (text.length === 0 || segment.endOffset > assistant.value.text.length)
+    if (text === undefined)
       return yield* voiceError(
         "invalid-context",
         "thread-turn.speech-message",
-        "Canonical assistant speech boundary is unavailable",
+        "Immutable assistant speech revision is unavailable",
         false,
       );
-    const settings = yield* getVoiceSettings;
+    const settings = yield* getEnabledVoiceSettings;
+    if (new TextEncoder().encode(text).byteLength > settings.maxSpeechTextBytes)
+      return yield* voiceError(
+        "payload-too-large",
+        "thread-turn.speech-text-limit",
+        "Speech segment exceeds the configured text limit",
+        false,
+      );
     const provider = yield* providers.resolve("speech.streaming");
     if (provider.speechSynthesizer === undefined)
       return yield* voiceError(
@@ -800,21 +934,24 @@ const make = Effect.gen(function* () {
     const operation = yield* authorize(operationToken, operationId);
     if (terminalPhase(operation.phase))
       return { snapshot: snapshot(operation), cancelled: operation.phase === "cancelled" };
-    const occurredAt = yield* nowIso;
-    yield* append(
-      operationId,
-      { type: "phase", occurredAt, phase: "cancelled" },
-      { phase: "cancelled" },
-    );
-    yield* append(
-      operationId,
-      { type: "terminal", occurredAt, outcome: "cancelled" },
-      { terminal: true },
-    );
+    const result = yield* store
+      .cancel(operationId, yield* nowIso)
+      .pipe(Effect.mapError(repositoryFailure("thread-turn.cancel")));
+    if (result === "dispatch-committed")
+      return { snapshot: snapshot(yield* load(operationId)), cancelled: false };
     return { snapshot: snapshot(yield* load(operationId)), cancelled: true };
   });
 
+  yield* maintain().pipe(
+    Effect.ignoreCause({ log: true }),
+    Effect.repeat(Schedule.spaced("1 minute")),
+    Effect.forkScoped,
+  );
+
   return VoiceNativeThreadTurnService.of({
+    authorizeOperation: (operationToken, operationId) =>
+      authorize(operationToken, operationId).pipe(Effect.map(snapshot)),
+    beginAudioUpload,
     create,
     uploadAudio,
     events,
