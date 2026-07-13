@@ -186,6 +186,10 @@
     "./voiceThreadMode": {
       "types": "./src/voiceThreadMode.ts",
       "import": "./src/voiceThreadMode.ts"
+    },
+    "./speechChunker": {
+      "types": "./src/speechChunker.ts",
+      "import": "./src/speechChunker.ts"
     }
   },
   "scripts": {

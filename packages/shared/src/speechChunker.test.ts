@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { appendSpeechText, initialSpeechChunkerState } from "./speechChunker";
+import { appendSpeechText, initialSpeechChunkerState } from "./speechChunker.js";
 
 describe("speechChunker", () => {
   it("emits complete phrases before the text response finishes", () => {

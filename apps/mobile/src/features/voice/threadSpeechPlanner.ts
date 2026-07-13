@@ -3,7 +3,7 @@ import {
   initialSpeechChunkerState,
   type SpeechChunkerState,
   type SpeechTextSegment,
-} from "./speechChunker";
+} from "@t3tools/shared/speechChunker";
 
 export interface AssistantSpeechSnapshot {
   readonly id: string;
