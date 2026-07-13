@@ -8,6 +8,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
 import java.io.File
+import java.net.URI
 import java.util.UUID
 
 internal class T3VoiceRecordingCache(
@@ -54,9 +55,13 @@ internal class T3VoiceRecordingCache(
   }
 
   fun owns(file: File): Boolean {
+    return file.isFile && ownsPath(file)
+  }
+
+  fun ownsPath(file: File): Boolean {
     val canonicalDirectory = directory.canonicalFile
     val canonicalFile = file.canonicalFile
-    return canonicalFile.parentFile == canonicalDirectory && isOwnedFile(canonicalFile)
+    return canonicalFile.parentFile == canonicalDirectory && OWNED_FILENAME.matches(canonicalFile.name)
   }
 
   private fun ensureDirectory() {
@@ -100,6 +105,51 @@ internal data class T3VoiceRecordingResult(
   }
 }
 
+internal class T3VoiceCompletedRecordingRegistry(
+  private val recordingCache: T3VoiceRecordingCache,
+) {
+  private val completed = mutableMapOf<String, File>()
+
+  @Synchronized
+  fun restore(recording: T3VoiceRecordingResult): Boolean {
+    val file = recordingFile(recording.uri) ?: return false
+    if (!recordingCache.owns(file) || file.length() != recording.byteLength) return false
+    val canonicalFile = file.canonicalFile
+    val existing = completed[recording.recordingId]?.canonicalFile
+    if (existing != null && existing != canonicalFile) return false
+    completed[recording.recordingId] = canonicalFile
+    return true
+  }
+
+  @Synchronized
+  fun delete(recordingId: String, uri: String) {
+    val requestedFile = recordingFile(uri) ?: error("Recording URI is invalid.")
+    val canonicalRequested = requestedFile.canonicalFile
+    check(recordingCache.ownsPath(canonicalRequested)) {
+      "Recording file is not a T3 voice cache file."
+    }
+    val ownedFile = completed[recordingId]?.canonicalFile
+    if (ownedFile == null) {
+      check(!canonicalRequested.exists()) { "Recording $recordingId is not owned by T3 voice." }
+      return
+    }
+    check(ownedFile == canonicalRequested) { "Recording URI does not match $recordingId." }
+    check(!canonicalRequested.exists() || canonicalRequested.delete()) {
+      "Recording file could not be deleted."
+    }
+    completed.remove(recordingId)
+  }
+
+  @Synchronized
+  fun protectedFiles(): Set<File> = completed.values.toSet()
+
+  private fun recordingFile(uri: String): File? = runCatching {
+    val parsed = URI(uri)
+    require(parsed.scheme == "file" && parsed.query == null && parsed.fragment == null)
+    File(parsed)
+  }.getOrNull()
+}
+
 internal sealed interface T3VoiceRecordingTermination {
   data class Completed(val recording: T3VoiceRecordingResult, val reason: String) :
     T3VoiceRecordingTermination
@@ -124,20 +174,17 @@ internal class T3VoiceRecorder(
   )
 
   private var active: ActiveRecording? = null
-  private val completed = mutableMapOf<String, File>()
   private val recordingCache = T3VoiceRecordingCache(context.cacheDir)
+  private val completed = T3VoiceCompletedRecordingRegistry(recordingCache)
   private val terminalPolicy = T3VoiceRecordingTerminalPolicy()
   private val terminalCoordinator = T3VoiceRecordingTerminalCoordinator(terminalLock)
   private val endpointThread = HandlerThread("t3-voice-endpoint").apply { start() }
   private val endpointHandler = Handler(endpointThread.looper)
 
-  fun sweepStaleCache(): Int = recordingCache.sweep(completed.values.toSet())
+  fun sweepStaleCache(): Int = recordingCache.sweep(completed.protectedFiles())
 
   @Synchronized
-  fun restoreCompleted(recording: T3VoiceRecordingResult) {
-    val file = Uri.parse(recording.uri).path?.let(::File) ?: return
-    if (file.exists() && recordingCache.owns(file)) completed[recording.recordingId] = file
-  }
+  fun restoreCompleted(recording: T3VoiceRecordingResult): Boolean = completed.restore(recording)
 
   @Synchronized
   fun start(
@@ -210,16 +257,7 @@ internal class T3VoiceRecorder(
 
   @Synchronized
   fun delete(recordingId: String, uri: String) {
-    val ownedFile = completed[recordingId] ?: error("Recording $recordingId is not owned by T3 voice.")
-    val requestedFile = Uri.parse(uri).path?.let(::File) ?: error("Recording URI is invalid.")
-    val canonicalOwned = ownedFile.canonicalFile
-    val canonicalRequested = requestedFile.canonicalFile
-    check(canonicalOwned == canonicalRequested) { "Recording URI does not match $recordingId." }
-    check(recordingCache.owns(canonicalOwned)) {
-      "Recording file is not a T3 voice cache file."
-    }
-    check(!canonicalOwned.exists() || canonicalOwned.delete()) { "Recording file could not be deleted." }
-    completed.remove(recordingId)
+    completed.delete(recordingId, uri)
   }
 
   @Synchronized
@@ -340,7 +378,7 @@ internal class T3VoiceRecorder(
         durationMs = SystemClock.elapsedRealtime() - recording.startedAtMs,
         byteLength = recording.file.length(),
       )
-    synchronized(this) { completed[recording.recordingId] = recording.file }
+    check(completed.restore(result)) { "Completed recording could not be registered." }
     return result
   }
 

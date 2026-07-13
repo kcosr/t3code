@@ -354,9 +354,34 @@ class T3VoiceModule : Module() {
         }
       }
 
+      AsyncFunction("disableBackgroundVoiceReadinessIfIdleAsync") {
+        input: Map<String, Any?>,
+        promise: Promise,
+        ->
+        requireExactKeys(input, setOf("expectedRuntimeId", "expectedGeneration"))
+        val runtimeId = input["expectedRuntimeId"]?.let { requireText(input, "expectedRuntimeId", 128) }
+        val generation = optionalLong(input, "expectedGeneration")
+        withBinder(promise, "voice-readiness-disable-failed") { service, settlement ->
+          settlement.resolve(
+            service.disableBackgroundVoiceReadinessIfIdle(runtimeId, generation)?.let { disabled ->
+              mapOf(
+                "runtimeId" to disabled.runtimeId,
+                "readiness" to readinessBody(disabled.config),
+              )
+            },
+          )
+        }
+      }
+
       AsyncFunction("getPendingBackgroundVoiceRuntimeRevocationAsync") { promise: Promise ->
         withBinder(promise, "voice-runtime-revocation-read-failed") { service, settlement ->
           settlement.resolve(service.pendingRuntimeRevocation()?.let(::runtimeRevocationBody))
+        }
+      }
+
+      AsyncFunction("getBackgroundVoiceOwnershipAsync") { promise: Promise ->
+        withBinder(promise, "voice-ownership-read-failed") { service, settlement ->
+          settlement.resolve(service.backgroundVoiceOwnership())
         }
       }
 

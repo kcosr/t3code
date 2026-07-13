@@ -13,7 +13,9 @@ import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { VoiceNativeControlGrantRepositoryLive } from "../../persistence/Layers/VoiceNativeControlGrants.ts";
+import { VoiceNativeRealtimeStartRepository } from "../../persistence/Services/VoiceNativeRealtimeStarts.ts";
 import { VoiceNativeRuntimeGrantRepositoryLive } from "../../persistence/Layers/VoiceNativeRuntimeGrants.ts";
+import { VoiceNativeRealtimeStartRepositoryLive } from "../../persistence/Layers/VoiceNativeRealtimeStarts.ts";
 import { VoiceNativeThreadTurnStoreLive } from "../../persistence/Layers/VoiceNativeThreadTurns.ts";
 import { runMigrations } from "../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
@@ -25,6 +27,7 @@ const sqlite = NodeSqliteClient.layerMemory();
 const controlRepository = VoiceNativeControlGrantRepositoryLive.pipe(Layer.provide(sqlite));
 const persistence = Layer.mergeAll(
   VoiceNativeRuntimeGrantRepositoryLive.pipe(Layer.provide(sqlite)),
+  VoiceNativeRealtimeStartRepositoryLive.pipe(Layer.provide(sqlite)),
   VoiceNativeThreadTurnStoreLive.pipe(Layer.provide(sqlite)),
   controlRepository,
   VoiceNativeControlGrantRegistryLive.pipe(
@@ -59,9 +62,10 @@ const insertActiveAuthSession = (sessionId = authSessionId) =>
 
 it.effect("hashes, rotates, expires, and auth-fences runtime grants", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 44 });
+    yield* runMigrations({ toMigrationInclusive: 46 });
     yield* insertActiveAuthSession();
     const registry = yield* __testing.make;
+    const realtimeStarts = yield* VoiceNativeRealtimeStartRepository;
     const now = yield* Clock.currentTimeMillis;
     const first = yield* registry.issue({
       authSessionId,
@@ -78,6 +82,17 @@ it.effect("hashes, rotates, expires, and auth-fences runtime grants", () =>
       generation: 1,
       target,
     });
+    yield* realtimeStarts.claim({
+      operationKey: "native-start-generation-1",
+      authSessionId,
+      runtimeId,
+      runtimeGeneration: 1,
+      clientOperationId: "generation-1",
+      conversationId: target.conversation.conversationId,
+      claimExpiresAt: now + 30_000,
+      expiresAt: now + 60_000,
+      now,
+    });
 
     const second = yield* registry.issue({
       authSessionId,
@@ -89,6 +104,11 @@ it.effect("hashes, rotates, expires, and auth-fences runtime grants", () =>
     });
     expect(yield* registry.authorize(first.token)).toBeUndefined();
     expect(yield* registry.authorize(second.token)).toMatchObject({ generation: 2 });
+    const sql = yield* SqlClient.SqlClient;
+    expect(
+      yield* sql`SELECT 1 FROM voice_native_realtime_starts
+        WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`,
+    ).toHaveLength(0);
     expect(
       yield* Effect.flip(
         registry.issue({
@@ -102,14 +122,29 @@ it.effect("hashes, rotates, expires, and auth-fences runtime grants", () =>
       ),
     ).toMatchObject({ reason: "invalid-phase" });
 
+    yield* realtimeStarts.claim({
+      operationKey: "native-start-generation-2",
+      authSessionId,
+      runtimeId,
+      runtimeGeneration: 2,
+      clientOperationId: "generation-2",
+      conversationId: target.conversation.conversationId,
+      claimExpiresAt: now + 30_000,
+      expiresAt: now + 60_000,
+      now,
+    });
     yield* registry.revokeAuthSession(authSessionId);
     expect(yield* registry.authorize(second.token)).toBeUndefined();
+    expect(
+      yield* sql`SELECT 1 FROM voice_native_realtime_starts
+        WHERE auth_session_id = ${authSessionId}`,
+    ).toHaveLength(0);
   }).pipe(Effect.provide(testLayer)),
 );
 
 it.effect("refreshes an identical generation without revoking its child authority", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 44 });
+    yield* runMigrations({ toMigrationInclusive: 46 });
     yield* insertActiveAuthSession();
     const runtimeGrants = yield* __testing.make;
     const childGrants = yield* VoiceNativeControlGrantRegistry;
@@ -166,7 +201,7 @@ it.effect("refreshes an identical generation without revoking its child authorit
 
 it.effect("rejects a stale generation when child authority is issued after rotation", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 44 });
+    yield* runMigrations({ toMigrationInclusive: 46 });
     yield* insertActiveAuthSession();
     const registry = yield* __testing.make;
     const childGrants = yield* VoiceNativeControlGrantRegistry;
@@ -205,7 +240,7 @@ it.effect("rejects a stale generation when child authority is issued after rotat
 
 it.effect("immediately fences an existing child grant when its parent generation changes", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 44 });
+    yield* runMigrations({ toMigrationInclusive: 46 });
     yield* insertActiveAuthSession();
     const runtimeGrants = yield* __testing.make;
     const childGrants = yield* VoiceNativeControlGrantRegistry;
@@ -239,7 +274,7 @@ it.effect("immediately fences an existing child grant when its parent generation
 
 it.effect("rejects a runtime token after durable parent revocation across restart", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 44 });
+    yield* runMigrations({ toMigrationInclusive: 46 });
     yield* insertActiveAuthSession();
     const beforeRestart = yield* __testing.make;
     const now = yield* Clock.currentTimeMillis;
@@ -257,5 +292,27 @@ it.effect("rejects a runtime token after durable parent revocation across restar
 
     const afterRestart = yield* __testing.make;
     expect(yield* afterRestart.authorize(issued.token)).toBeUndefined();
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("reports durable revocation success when derived thread cleanup fails", () =>
+  Effect.gen(function* () {
+    yield* runMigrations({ toMigrationInclusive: 46 });
+    yield* insertActiveAuthSession();
+    const registry = yield* __testing.make;
+    const now = yield* Clock.currentTimeMillis;
+    const issued = yield* registry.issue({
+      authSessionId,
+      runtimeId,
+      generation: 1,
+      grantedScopes: new Set([AuthVoiceUseScope]),
+      target,
+      expiresAt: now + 60_000,
+    });
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`DROP TABLE voice_native_thread_turn_operations`;
+
+    expect(yield* registry.revokeRuntime(authSessionId, runtimeId)).toBe(true);
+    expect(yield* registry.authorize(issued.token)).toBeUndefined();
   }).pipe(Effect.provide(testLayer)),
 );

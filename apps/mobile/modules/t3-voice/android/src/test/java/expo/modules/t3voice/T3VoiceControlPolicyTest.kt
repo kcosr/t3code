@@ -9,6 +9,50 @@ import org.junit.Test
 
 class T3VoiceControlPolicyTest {
   @Test
+  fun `conditional disable accepts only exact or authority-free idle ownership`() {
+    assertTrue(T3VoiceConditionalDisablePolicy.canDisable(null, null, 0, emptyList(), false))
+    assertTrue(T3VoiceConditionalDisablePolicy.canDisable(
+      "runtime-1", 7, 7, listOf("runtime-1" to 7), false))
+    assertFalse(T3VoiceConditionalDisablePolicy.canDisable(
+      null, null, 7, listOf("runtime-1" to 7), false))
+    assertFalse(T3VoiceConditionalDisablePolicy.canDisable(
+      "runtime-1", null, 7, listOf("runtime-1" to 7), false))
+    assertFalse(T3VoiceConditionalDisablePolicy.canDisable(
+      null, 7, 7, emptyList(), false))
+    assertFalse(T3VoiceConditionalDisablePolicy.canDisable(
+      "runtime-2", 7, 7, listOf("runtime-1" to 7), false))
+    assertFalse(T3VoiceConditionalDisablePolicy.canDisable(
+      "runtime-1", 7, 7, listOf("runtime-1" to 7, "runtime-2" to 7), false))
+    assertFalse(T3VoiceConditionalDisablePolicy.canDisable(
+      "runtime-1", 7, 7, listOf("runtime-1" to 7), true))
+  }
+
+  @Test
+  fun `readiness preparation refuses every active native ownership shape`() {
+    assertTrue(T3VoiceBackgroundPreparationPolicy.canPrepare(
+      T3VoiceRuntimePhase.IDLE, false, false, false))
+    assertFalse(T3VoiceBackgroundPreparationPolicy.canPrepare(
+      T3VoiceRuntimePhase.RECORDING, false, false, false))
+    assertFalse(T3VoiceBackgroundPreparationPolicy.canPrepare(
+      T3VoiceRuntimePhase.IDLE, true, false, false))
+    assertFalse(T3VoiceBackgroundPreparationPolicy.canPrepare(
+      T3VoiceRuntimePhase.IDLE, false, true, false))
+    assertFalse(T3VoiceBackgroundPreparationPolicy.canPrepare(
+      T3VoiceRuntimePhase.IDLE, false, false, true))
+  }
+
+  @Test
+  fun `conditional disable refuses durable thread ownership before service restore`() {
+    val startupHasDurableThreadOperation = true
+    assertFalse(T3VoiceConditionalDisablePolicy.canDisable(
+      "runtime-1",
+      7,
+      7,
+      listOf("runtime-1" to 7),
+      nativeVoiceActive = startupHasDurableThreadOperation,
+    ))
+  }
+  @Test
   fun `idle realtime primary starts natively and never falls back to React`() {
     assertEquals(
       T3VoiceControlDecision.START_NATIVE_REALTIME,
@@ -38,6 +82,20 @@ class T3VoiceControlPolicyTest {
         T3VoiceControlCommand.PRIMARY,
         T3VoiceRuntimePhase.IDLE,
         controllerAttached = true,
+        readinessMode = T3VoiceReadinessMode.THREAD,
+      ),
+    )
+  }
+
+  @Test
+  fun `idle thread primary uses native execution when authorized`() {
+    assertEquals(
+      T3VoiceControlDecision.START_NATIVE_THREAD,
+      T3VoiceControlPolicy.decide(
+        T3VoiceControlCommand.PRIMARY,
+        T3VoiceRuntimePhase.IDLE,
+        controllerAttached = false,
+        nativeThreadAvailable = true,
         readinessMode = T3VoiceReadinessMode.THREAD,
       ),
     )

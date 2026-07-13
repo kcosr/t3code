@@ -124,7 +124,10 @@ internal class T3VoiceBackgroundThreadTurnTest {
             request.path.endsWith("/events") -> jsonSuccess(eventsResponse(JSONArray(), 0))
             request.path.endsWith("/events/ack") -> jsonSuccess(acknowledgementResponse())
             request.path.contains("/speech/") ->
-              T3VoiceBackgroundHttpResult.Success(200, "audio/pcm", byteArrayOf(1, 0, 2, 0))
+              T3VoiceBackgroundHttpResult.Success(
+                200, "audio/pcm", byteArrayOf(1, 0, 2, 0),
+                mapOf("x-t3-audio-format" to "s16le;rate=24000;channels=1"),
+              )
             request.path.endsWith("/cancel") -> jsonSuccess(cancelResponse())
             else -> error("Unexpected request: ${request.path}")
           }

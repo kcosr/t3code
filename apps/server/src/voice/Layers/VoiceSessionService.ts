@@ -141,6 +141,10 @@ interface RuntimeSession {
   readonly terminationSignal: Deferred.Deferred<void>;
   readonly toolScope: Scope.Closeable;
   readonly operationMutex: Semaphore.Semaphore;
+  readonly nativeRuntime?: {
+    readonly runtimeId: import("@t3tools/contracts").VoiceNativeRuntimeId;
+    readonly generation: number;
+  };
   readonly terminalAt?: number;
   readonly terminalOrder?: number;
   readonly terminating?: boolean;
@@ -1046,6 +1050,15 @@ const make = Effect.gen(function* () {
     const existingId = (yield* SynchronizedRef.get(runtime)).idempotency.get(idempotencyId);
     if (existingId !== undefined) {
       const existing = yield* requireOwned(ownerAuthSessionId, existingId);
+      if (
+        existing.nativeRuntime?.runtimeId !== principal.nativeRuntime?.runtimeId ||
+        existing.nativeRuntime?.generation !== principal.nativeRuntime?.generation
+      )
+        return yield* sessionError(
+          "authorization-revoked",
+          "session.create",
+          "The idempotent session belongs to different native authority",
+        );
       const token = yield* nativeControlGrants
         .issue({
           authSessionId: ownerAuthSessionId,
@@ -1273,6 +1286,9 @@ const make = Effect.gen(function* () {
         terminationSignal,
         toolScope,
         operationMutex,
+        ...(principal.nativeRuntime === undefined
+          ? {}
+          : { nativeRuntime: principal.nativeRuntime }),
       });
       const idempotency = new Map(current.idempotency);
       idempotency.set(idempotencyId, acquired.lease.sessionId);
@@ -1382,6 +1398,21 @@ const make = Effect.gen(function* () {
 
   const create: VoiceSessionServiceShape["create"] = (principal, input) =>
     lifecycleMutex.withPermits(1)(createUnlocked(principal, input));
+
+  const resumeCreate: VoiceSessionServiceShape["resumeCreate"] = (principal, input, expectedId) =>
+    lifecycleMutex.withPermits(1)(
+      Effect.gen(function* () {
+        const idempotencyId = `${principal.sessionId}:${input.idempotencyKey}`;
+        const existingId = (yield* SynchronizedRef.get(runtime)).idempotency.get(idempotencyId);
+        if (existingId === undefined || existingId !== expectedId)
+          return yield* sessionError(
+            "session-not-found",
+            "session.resume-create",
+            "The original native voice session is no longer resident",
+          );
+        return yield* createUnlocked(principal, input);
+      }),
+    );
 
   const get: VoiceSessionServiceShape["get"] = (owner, sessionId) =>
     requireOwned(owner, sessionId).pipe(Effect.map((session) => session.state));
@@ -1783,6 +1814,23 @@ const make = Effect.gen(function* () {
           },
         );
       }),
+    );
+
+  const revokeNativeRuntime: VoiceSessionServiceShape["revokeNativeRuntime"] = (owner, runtimeId) =>
+    lifecycleMutex.withPermits(1)(
+      Effect.gen(function* () {
+        const owned = Array.from((yield* SynchronizedRef.get(runtime)).sessions.values()).filter(
+          (session) =>
+            session.lease.ownerAuthSessionId === owner &&
+            session.nativeRuntime?.runtimeId === runtimeId &&
+            session.terminalAt === undefined,
+        );
+        yield* Effect.forEach(
+          owned,
+          (session) => endRuntimeSession(session, "ended", { reason: "native-runtime-revoked" }),
+          { discard: true },
+        );
+      }).pipe(Effect.uninterruptible),
     );
 
   const deleteConversation: VoiceSessionServiceShape["deleteConversation"] = (conversationId) =>
@@ -2237,6 +2285,7 @@ const make = Effect.gen(function* () {
 
   return VoiceSessionService.of({
     create,
+    resumeCreate,
     get,
     heartbeat,
     updateFocus,
@@ -2248,6 +2297,7 @@ const make = Effect.gen(function* () {
     listPendingHandoffActions,
     acknowledgeNativeHandoffAction,
     revokeAuthSession,
+    revokeNativeRuntime,
     deleteConversation,
     clearConversationContext,
   });

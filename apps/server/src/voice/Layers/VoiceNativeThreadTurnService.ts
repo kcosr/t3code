@@ -8,6 +8,7 @@ import {
   type VoiceNativeThreadTurnSnapshot,
 } from "@t3tools/contracts";
 import { appendSpeechText, initialSpeechChunkerState } from "@t3tools/shared/speechChunker";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -18,6 +19,7 @@ import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as NodeCrypto from "node:crypto";
 
@@ -97,6 +99,7 @@ const make = Effect.gen(function* () {
   const query = yield* ProjectionSnapshotQuery;
   const messages = yield* ProjectionThreadMessageRepository;
   const turnStarts = yield* ProjectionTurnStartRepository;
+  const serviceScope = yield* Scope.Scope;
   const activeMonitors = new Set<string>();
   const isVoiceError = Schema.is(VoiceError);
   const getVoiceSettings = settingsService.getSettings.pipe(
@@ -207,13 +210,15 @@ const make = Effect.gen(function* () {
           .pipe(Effect.mapError(repositoryFailure("thread-turn.expire")));
         return;
       }
-      const [outcome, shell] = yield* Effect.all([
-        turnStarts.getOutcomeByMessageId({
+      const outcome = yield* turnStarts
+        .getOutcomeByMessageId({
           threadId: operation.threadId,
           messageId: operation.messageId,
-        }),
-        query.getThreadShellById(operation.threadId),
-      ]).pipe(Effect.mapError(repositoryFailure("thread-turn.projection")));
+        })
+        .pipe(Effect.mapError(repositoryFailure("thread-turn.projection")));
+      const shell = yield* query
+        .getThreadShellById(operation.threadId)
+        .pipe(Effect.mapError(repositoryFailure("thread-turn.projection")));
       if (Option.isNone(shell)) {
         yield* store
           .finalize({
@@ -394,27 +399,29 @@ const make = Effect.gen(function* () {
     });
     if (!started) return;
     yield* monitorLoop(operationId).pipe(
-      Effect.catch((cause: unknown) =>
-        Effect.logError("Native thread voice monitor failed", { operationId, cause }).pipe(
-          Effect.andThen(
-            nowIso.pipe(
-              Effect.flatMap((occurredAt) =>
-                store.finalize({
-                  operationId,
-                  occurredAt,
-                  outcome: "failed",
-                  speechOutcome: "failed",
-                  failureCode: "turn-failed",
-                  retryable: true,
-                }),
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.void
+          : Effect.logError("Native thread voice monitor failed", { operationId, cause }).pipe(
+              Effect.andThen(
+                nowIso.pipe(
+                  Effect.flatMap((occurredAt) =>
+                    store.finalize({
+                      operationId,
+                      occurredAt,
+                      outcome: "failed",
+                      speechOutcome: "failed",
+                      failureCode: "turn-failed",
+                      retryable: true,
+                    }),
+                  ),
+                ),
               ),
+              Effect.ignore,
             ),
-          ),
-          Effect.ignore,
-        ),
       ),
       Effect.ensuring(Effect.sync(() => activeMonitors.delete(operationId))),
-      Effect.forkDetach,
+      Effect.forkIn(serviceScope),
     );
   });
 
@@ -562,6 +569,20 @@ const make = Effect.gen(function* () {
     const operationId = VoiceNativeThreadTurnOperationId.make(
       `native-thread-turn:${deterministicHash(grant.authSessionId, grant.runtimeId, String(grant.generation), input.clientOperationId)}`,
     );
+    const currentGrant = yield* runtimeGrants.authorize(runtimeToken);
+    if (
+      currentGrant === undefined ||
+      currentGrant.target.mode !== "thread" ||
+      currentGrant.authSessionId !== grant.authSessionId ||
+      currentGrant.runtimeId !== grant.runtimeId ||
+      currentGrant.generation !== grant.generation
+    )
+      return yield* voiceError(
+        "authorization-revoked",
+        "thread-turn.create-claim",
+        "Runtime credential was revoked before the operation could be claimed",
+        false,
+      );
     const claim = yield* store
       .claim({
         operationId,
@@ -588,6 +609,13 @@ const make = Effect.gen(function* () {
             cause,
           ),
         ),
+      );
+    if (claim.status === "revoked")
+      return yield* voiceError(
+        "authorization-revoked",
+        "thread-turn.create-claim",
+        "Runtime authority changed before the operation could be claimed",
+        false,
       );
     if (claim.status === "expired")
       return yield* voiceError(
@@ -664,92 +692,125 @@ const make = Effect.gen(function* () {
     const leaseToken = yield* crypto
       .randomBytes(32)
       .pipe(Effect.map(Encoding.encodeBase64Url), Effect.orDie);
-    const claimed = yield* store
-      .claimProcessing(operationId, leaseToken, now, now + PROCESSING_LEASE_MILLIS, yield* nowIso)
-      .pipe(Effect.mapError(repositoryFailure("thread-turn.processing-lease")));
-    if (!claimed)
-      return yield* voiceError(
-        "lease-conflict",
-        "thread-turn.audio",
-        "Operation is already processing",
-        true,
-      );
-    yield* append(
-      operationId,
-      { type: "phase", occurredAt: yield* nowIso, phase: "transcribing" },
-      { phase: "transcribing" },
-    );
-    const processing = yield* Effect.gen(function* () {
-      const deterministicMessageId = MessageId.make(
-        `native-thread-message:${operation.operationId}`,
-      );
-      const reconciledMessage = yield* messages
-        .getByMessageId({ messageId: deterministicMessageId })
-        .pipe(Effect.mapError(repositoryFailure("thread-turn.reconcile")));
-      const transcript = Option.isSome(reconciledMessage)
-        ? undefined
-        : yield* Effect.gen(function* () {
-            const provider = yield* providers.resolve("transcription.request");
-            if (provider.transcriber === undefined)
-              return yield* voiceError(
-                "not-configured",
-                "thread-turn.transcribe",
-                "No transcriber is configured",
-                false,
-              );
-            const transcription = provider.transcriber
-              .transcribe({
-                requestId: VoiceRequestId.make(`native-thread-transcript:${operationId}`),
-                bytes,
-                mediaType: validated.mediaType,
-                ...(language === undefined ? {} : { language }),
-              })
-              .pipe(
-                Stream.runFold(
-                  () => "",
-                  (current, event) => (event.type === "final" ? event.result.text : current),
-                ),
-              );
-            return yield* boundVoiceMediaEffect(
-              transcription,
-              settings.mediaRequestTimeoutSeconds,
-            ).pipe(
-              Effect.flatMap((text) =>
-                new TextEncoder().encode(text).byteLength > VOICE_TRANSCRIPTION_OUTPUT_MAX_BYTES
-                  ? Effect.fail(
-                      voiceError(
-                        "payload-too-large",
-                        "thread-turn.transcript-limit",
-                        "Transcription exceeds the configured output limit",
-                        false,
-                      ),
-                    )
-                  : text.length === 0
-                    ? Effect.fail(
-                        voiceError(
-                          "invalid-context",
-                          "thread-turn.transcribe",
-                          "Transcription produced no speech",
-                          false,
-                        ),
-                      )
-                    : Effect.succeed(text),
-              ),
-              Effect.mapError((cause) =>
-                isVoiceError(cause)
-                  ? cause
-                  : voiceError(
-                      "provider-unavailable",
-                      "thread-turn.transcribe",
-                      "Transcription failed",
-                      true,
-                      cause,
-                    ),
-              ),
+    const processing = yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const claimed = yield* store
+          .claimProcessing(
+            operationId,
+            leaseToken,
+            now,
+            now + PROCESSING_LEASE_MILLIS,
+            yield* nowIso,
+          )
+          .pipe(Effect.mapError(repositoryFailure("thread-turn.processing-lease")));
+        if (!claimed)
+          return yield* voiceError(
+            "lease-conflict",
+            "thread-turn.audio",
+            "Operation is already processing",
+            true,
+          );
+        const releaseAbandonedLease = nowIso.pipe(
+          Effect.flatMap((occurredAt) =>
+            store.releaseProcessing(
+              operationId,
+              leaseToken,
+              occurredAt,
+              "transcription-failed",
+              true,
+            ),
+          ),
+          Effect.ignore,
+        );
+        return yield* restore(
+          Effect.gen(function* () {
+            yield* append(
+              operationId,
+              { type: "phase", occurredAt: yield* nowIso, phase: "transcribing" },
+              { phase: "transcribing" },
             );
-          });
-      yield* reconcileOrDispatch(operation, leaseToken, transcript);
-    }).pipe(Effect.result);
+            const deterministicMessageId = MessageId.make(
+              `native-thread-message:${operation.operationId}`,
+            );
+            const reconciledMessage = yield* messages
+              .getByMessageId({ messageId: deterministicMessageId })
+              .pipe(Effect.mapError(repositoryFailure("thread-turn.reconcile")));
+            const transcript = Option.isSome(reconciledMessage)
+              ? undefined
+              : yield* Effect.gen(function* () {
+                  const provider = yield* providers.resolve("transcription.request");
+                  if (provider.transcriber === undefined)
+                    return yield* voiceError(
+                      "not-configured",
+                      "thread-turn.transcribe",
+                      "No transcriber is configured",
+                      false,
+                    );
+                  const transcription = provider.transcriber
+                    .transcribe({
+                      requestId: VoiceRequestId.make(`native-thread-transcript:${operationId}`),
+                      bytes,
+                      mediaType: validated.mediaType,
+                      ...(language === undefined ? {} : { language }),
+                    })
+                    .pipe(
+                      Stream.runFold(
+                        () => "",
+                        (current, event) => (event.type === "final" ? event.result.text : current),
+                      ),
+                    );
+                  return yield* boundVoiceMediaEffect(
+                    transcription,
+                    settings.mediaRequestTimeoutSeconds,
+                  ).pipe(
+                    Effect.flatMap((text) =>
+                      new TextEncoder().encode(text).byteLength >
+                      VOICE_TRANSCRIPTION_OUTPUT_MAX_BYTES
+                        ? Effect.fail(
+                            voiceError(
+                              "payload-too-large",
+                              "thread-turn.transcript-limit",
+                              "Transcription exceeds the configured output limit",
+                              false,
+                            ),
+                          )
+                        : text.length === 0
+                          ? Effect.fail(
+                              voiceError(
+                                "invalid-context",
+                                "thread-turn.transcribe",
+                                "Transcription produced no speech",
+                                false,
+                              ),
+                            )
+                          : Effect.succeed(text),
+                    ),
+                    Effect.mapError((cause) =>
+                      isVoiceError(cause)
+                        ? cause
+                        : voiceError(
+                            "provider-unavailable",
+                            "thread-turn.transcribe",
+                            "Transcription failed",
+                            true,
+                            cause,
+                          ),
+                    ),
+                  );
+                });
+            yield* reconcileOrDispatch(operation, leaseToken, transcript);
+          }).pipe(
+            Effect.onInterrupt(() => releaseAbandonedLease),
+            Effect.catchCause((cause) =>
+              Cause.hasDies(cause)
+                ? releaseAbandonedLease.pipe(Effect.andThen(Effect.failCause(cause)))
+                : Effect.failCause(cause),
+            ),
+            Effect.result,
+          ),
+        );
+      }),
+    );
     if (Result.isFailure(processing)) {
       const error = processing.failure;
       const occurredAt = yield* nowIso;
@@ -815,23 +876,37 @@ const make = Effect.gen(function* () {
     "VoiceNativeThreadTurnService.events",
   )(function* (operationToken, operationId, eventQuery) {
     yield* maintain();
-    const operation = yield* authorize(operationToken, operationId);
-    if (operation.dispatchAccepted && !terminalPhase(operation.phase))
-      yield* ensureMonitor(operationId);
+    const readPage = Effect.fn("VoiceNativeThreadTurnService.readEventPage")(function* () {
+      const page = yield* store
+        .readEventPage(
+          operationId,
+          hashToken(operationToken),
+          yield* Clock.currentTimeMillis,
+          eventQuery.afterSequence,
+          EVENT_PAGE_LIMIT,
+        )
+        .pipe(Effect.mapError(repositoryFailure("thread-turn.events-page")));
+      if (page === undefined)
+        return yield* voiceError(
+          "authorization-revoked",
+          "thread-turn.events-page",
+          "Operation credential is no longer authorized",
+          false,
+        );
+      return page;
+    });
     const started = yield* Clock.currentTimeMillis;
-    let found = yield* store
-      .listEvents(operationId, eventQuery.afterSequence, EVENT_PAGE_LIMIT)
-      .pipe(Effect.mapError(repositoryFailure("thread-turn.events")));
+    let page = yield* readPage();
+    if (page.operation.dispatchAccepted && !terminalPhase(page.operation.phase))
+      yield* ensureMonitor(operationId);
     while (
-      found.length === 0 &&
+      page.events.length === 0 &&
       (yield* Clock.currentTimeMillis) - started < eventQuery.waitMilliseconds
     ) {
       yield* Effect.sleep("100 millis");
-      found = yield* store
-        .listEvents(operationId, eventQuery.afterSequence, EVENT_PAGE_LIMIT)
-        .pipe(Effect.mapError(repositoryFailure("thread-turn.events")));
+      page = yield* readPage();
     }
-    return { snapshot: snapshot(yield* load(operationId)), events: found };
+    return { snapshot: snapshot(page.operation), events: page.events };
   });
 
   const acknowledgeEvents: VoiceNativeThreadTurnService["Service"]["acknowledgeEvents"] = Effect.fn(
@@ -839,9 +914,21 @@ const make = Effect.gen(function* () {
   )(function* (operationToken, operationId, acknowledgedSequence) {
     yield* authorize(operationToken, operationId);
     const accepted = yield* store
-      .acknowledge(operationId, acknowledgedSequence)
+      .acknowledge(
+        operationId,
+        hashToken(operationToken),
+        acknowledgedSequence,
+        yield* Clock.currentTimeMillis,
+      )
       .pipe(Effect.mapError(repositoryFailure("thread-turn.acknowledge")));
-    if (!accepted)
+    if (accepted === "revoked")
+      return yield* voiceError(
+        "authorization-revoked",
+        "thread-turn.acknowledge",
+        "Operation credential is no longer authorized",
+        false,
+      );
+    if (accepted === "invalid")
       return yield* voiceError(
         "invalid-context",
         "thread-turn.acknowledge",
@@ -875,6 +962,7 @@ const make = Effect.gen(function* () {
         "Immutable assistant speech revision is unavailable",
         false,
       );
+    yield* authorize(operationToken, operationId);
     const settings = yield* getEnabledVoiceSettings;
     if (new TextEncoder().encode(text).byteLength > settings.maxSpeechTextBytes)
       return yield* voiceError(
@@ -935,8 +1023,15 @@ const make = Effect.gen(function* () {
     if (terminalPhase(operation.phase))
       return { snapshot: snapshot(operation), cancelled: operation.phase === "cancelled" };
     const result = yield* store
-      .cancel(operationId, yield* nowIso)
+      .cancel(operationId, hashToken(operationToken), yield* nowIso, yield* Clock.currentTimeMillis)
       .pipe(Effect.mapError(repositoryFailure("thread-turn.cancel")));
+    if (result === "revoked")
+      return yield* voiceError(
+        "authorization-revoked",
+        "thread-turn.cancel",
+        "Operation credential is no longer authorized",
+        false,
+      );
     if (result === "dispatch-committed")
       return { snapshot: snapshot(yield* load(operationId)), cancelled: false };
     return { snapshot: snapshot(yield* load(operationId)), cancelled: true };
@@ -949,6 +1044,23 @@ const make = Effect.gen(function* () {
   );
 
   return VoiceNativeThreadTurnService.of({
+    authorizeCreate: (runtimeToken) =>
+      runtimeGrants
+        .authorize(runtimeToken)
+        .pipe(
+          Effect.flatMap((grant) =>
+            grant?.target.mode === "thread"
+              ? Effect.void
+              : Effect.fail(
+                  voiceError(
+                    "authorization-revoked",
+                    "thread-turn.create-authorize",
+                    "Runtime credential is invalid",
+                    false,
+                  ),
+                ),
+          ),
+        ),
     authorizeOperation: (operationToken, operationId) =>
       authorize(operationToken, operationId).pipe(Effect.map(snapshot)),
     beginAudioUpload,

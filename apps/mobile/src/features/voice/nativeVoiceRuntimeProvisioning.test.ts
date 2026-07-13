@@ -13,8 +13,10 @@ import {
   ConflictingNativeVoiceRuntimeProvisioningEpochError,
   InvalidNativeVoiceRuntimeProvisioningResultError,
   NativeVoiceRuntimeProvisioningCoordinator,
+  NativeVoiceRuntimeReplacementDeferredError,
   nativeVoiceRuntimeRefreshAt,
   PendingNativeVoiceRuntimeRevocationOriginError,
+  resolveNativeVoiceRuntimeRevocationEndpoint,
   type NativeVoiceRuntimeProvisioningAdapter,
   StaleNativeVoiceRuntimeProvisioningEpochError,
 } from "./nativeVoiceRuntimeProvisioning";
@@ -124,6 +126,7 @@ function makeNative(input?: {
   readonly inspect?: NativeVoiceRuntimeProvisioningAdapter["inspect"];
   readonly activate?: (attempt: number) => Promise<void>;
   readonly disable?: (attempt: number) => Promise<void>;
+  readonly conditionalDisable?: (attempt: number) => Promise<boolean>;
   readonly prepare?: () => Promise<{
     readonly runtimeId: VoiceNativeRuntimeId;
     readonly readinessGeneration: number;
@@ -134,6 +137,7 @@ function makeNative(input?: {
 }) {
   let activateAttempt = 0;
   let disableAttempt = 0;
+  let conditionalDisableAttempt = 0;
   let authority: "none" | "prepared" | "active" = "none";
   let authorityTargetIdentity: string | null = null;
   let authorityEnvironmentOrigin = "https://termstation";
@@ -219,6 +223,27 @@ function makeNative(input?: {
       );
     },
   );
+  const ownership = vi.fn<NativeVoiceRuntimeProvisioningAdapter["ownership"]>(async () =>
+    authority === "none"
+      ? null
+      : {
+          sequence: 1,
+          active: false,
+          phase: "idle",
+          runtimeId: RUNTIME_ID,
+          readinessGeneration: 7,
+          environmentOrigin: authorityEnvironmentOrigin,
+          mode: "thread",
+          targetId: readiness.targetId,
+          nativeSessionId: null,
+        },
+  );
+  const disableIfIdle = vi.fn<NativeVoiceRuntimeProvisioningAdapter["disableIfIdle"]>(async () => {
+    conditionalDisableAttempt += 1;
+    if ((await input?.conditionalDisable?.(conditionalDisableAttempt)) === false) return false;
+    await disable({ epoch: 0 });
+    return true;
+  });
   return {
     native: {
       inspect,
@@ -227,6 +252,8 @@ function makeNative(input?: {
       beginRefresh,
       installRefresh,
       disable,
+      disableIfIdle,
+      ownership,
       pendingRevocation: pending,
       acknowledgeRevocation: acknowledge,
     } satisfies NativeVoiceRuntimeProvisioningAdapter,
@@ -237,10 +264,248 @@ function makeNative(input?: {
     prepare,
     activate,
     disable,
+    disableIfIdle,
+    ownership,
   };
 }
 
 describe("NativeVoiceRuntimeProvisioningCoordinator", () => {
+  it("finds a non-active prepared client by normalized saved origin", async () => {
+    const first = makeClient();
+    const prepared = { httpBaseUrl: "https://termstation/api" };
+    const makeClientForPrepared = vi.fn(async () => first.client);
+
+    await expect(
+      resolveNativeVoiceRuntimeRevocationEndpoint({
+        environmentOrigin: "https://termstation/path",
+        connections: [
+          { id: "unavailable", httpBaseUrl: "https://termstation/old" },
+          { id: "available", httpBaseUrl: "https://termstation/current" },
+        ],
+        getPrepared: (id) => (id === "available" ? prepared : null),
+        makeClient: makeClientForPrepared,
+      }),
+    ).resolves.toEqual({
+      type: "available",
+      client: first.client,
+      environmentOrigin: "https://termstation",
+    });
+    expect(makeClientForPrepared).toHaveBeenCalledWith(prepared);
+  });
+
+  it("prepares a matching saved origin on demand before creating its client", async () => {
+    const first = makeClient();
+    const prepared = { httpBaseUrl: "https://termstation/api" };
+    const prepare = vi.fn(async () => prepared);
+
+    await expect(
+      resolveNativeVoiceRuntimeRevocationEndpoint({
+        environmentOrigin: "https://termstation",
+        connections: [{ id: "saved", httpBaseUrl: "https://termstation" }],
+        getPrepared: () => null,
+        prepare,
+        makeClient: async () => first.client,
+      }),
+    ).resolves.toEqual({
+      type: "available",
+      client: first.client,
+      environmentOrigin: "https://termstation",
+    });
+    expect(prepare).toHaveBeenCalledWith("saved");
+  });
+
+  it("distinguishes a saved but unavailable origin from a genuinely removed origin", async () => {
+    const makeClientForPrepared = vi.fn();
+    await expect(
+      resolveNativeVoiceRuntimeRevocationEndpoint({
+        environmentOrigin: "https://termstation",
+        connections: [{ id: "saved", httpBaseUrl: "https://termstation" }],
+        getPrepared: () => null,
+        makeClient: makeClientForPrepared,
+      }),
+    ).resolves.toEqual({ type: "unavailable" });
+    await expect(
+      resolveNativeVoiceRuntimeRevocationEndpoint({
+        environmentOrigin: "https://removed.example",
+        connections: [{ id: "saved", httpBaseUrl: "https://termstation" }],
+        getPrepared: () => null,
+        makeClient: makeClientForPrepared,
+      }),
+    ).resolves.toEqual({ type: "absent" });
+    expect(makeClientForPrepared).not.toHaveBeenCalled();
+  });
+
+  it("conditionally disables only after native reports an idle matching owner", async () => {
+    const { native, disableIfIdle } = makeNative({
+      conditionalDisable: (attempt) => Promise.resolve(attempt > 1),
+    });
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
+
+    await expect(coordinator.disableIfIdle(1)).resolves.toBe(false);
+    await expect(coordinator.disableIfIdle(2)).resolves.toBe(true);
+
+    expect(disableIfIdle).toHaveBeenCalledTimes(2);
+  });
+
+  it("drains a cold-start revocation through a matching fallback endpoint", async () => {
+    const first = makeClient();
+    const { native, acknowledge } = makeNative();
+    await new NativeVoiceRuntimeProvisioningCoordinator(native).provision(
+      first.client,
+      provisioningInput(),
+    );
+    const cold = new NativeVoiceRuntimeProvisioningCoordinator(native);
+
+    await expect(
+      cold.disableIfIdle(1, {
+        fallback: {
+          client: first.client,
+          environmentOrigin: "https://termstation",
+        },
+      }),
+    ).resolves.toBe(true);
+
+    expect(first.revoke).toHaveBeenCalledOnce();
+    expect(acknowledge).toHaveBeenCalledOnce();
+  });
+
+  it("revokes through a non-active saved endpoint before retiring the local fence", async () => {
+    const first = makeClient();
+    const second = makeClient();
+    const { native, acknowledge } = makeNative();
+    await new NativeVoiceRuntimeProvisioningCoordinator(native).provision(
+      first.client,
+      provisioningInput(),
+    );
+    const cold = new NativeVoiceRuntimeProvisioningCoordinator(native);
+    const resolveEndpoint = vi.fn(async () => ({
+      type: "available" as const,
+      client: first.client,
+      environmentOrigin: "https://termstation",
+    }));
+
+    await expect(
+      cold.disableIfIdle(1, {
+        resolveEndpoint,
+        retireUnresolvableRevocation: true,
+      }),
+    ).resolves.toBe(true);
+
+    expect(resolveEndpoint).toHaveBeenCalledWith("https://termstation");
+    expect(first.revoke).toHaveBeenCalledOnce();
+    expect(acknowledge).toHaveBeenCalledOnce();
+    await expect(
+      cold.provision(second.client, {
+        ...provisioningInput(2),
+        environmentOrigin: "https://environment-b.example",
+        resolvePendingRevocationEndpoint: resolveEndpoint,
+      }),
+    ).resolves.toMatchObject({ runtimeId: RUNTIME_ID });
+    expect(second.provision).toHaveBeenCalledOnce();
+  });
+
+  it("defers an unavailable saved credential without dropping its local fence", async () => {
+    const first = makeClient();
+    const { native, acknowledge } = makeNative();
+    await new NativeVoiceRuntimeProvisioningCoordinator(native).provision(
+      first.client,
+      provisioningInput(),
+    );
+    const cold = new NativeVoiceRuntimeProvisioningCoordinator(native);
+
+    await expect(
+      cold.disableIfIdle(1, {
+        resolveEndpoint: async () => ({ type: "unavailable" }),
+        retireUnresolvableRevocation: true,
+      }),
+    ).rejects.toMatchObject({
+      name: "NativeVoiceRuntimeReplacementDeferredError",
+      reconciliationKey: "https://termstation",
+    });
+
+    expect(first.revoke).not.toHaveBeenCalled();
+    expect(acknowledge).not.toHaveBeenCalled();
+  });
+
+  it("retries deferred foreign-origin preparation before provisioning the next environment", async () => {
+    const first = makeClient();
+    const second = makeClient();
+    const { native, acknowledge } = makeNative();
+    await new NativeVoiceRuntimeProvisioningCoordinator(native).provision(
+      first.client,
+      provisioningInput(),
+    );
+    const cold = new NativeVoiceRuntimeProvisioningCoordinator(native);
+    await expect(
+      cold.disableIfIdle(1, {
+        resolveEndpoint: async () => ({ type: "unavailable" }),
+        retireUnresolvableRevocation: true,
+      }),
+    ).rejects.toBeInstanceOf(NativeVoiceRuntimeReplacementDeferredError);
+    const input = {
+      ...provisioningInput(2),
+      environmentOrigin: "https://environment-b.example",
+    };
+
+    await expect(
+      cold.provision(second.client, {
+        ...input,
+        resolvePendingRevocationEndpoint: async () => ({ type: "unavailable" }),
+      }),
+    ).rejects.toMatchObject({
+      name: "NativeVoiceRuntimeReplacementDeferredError",
+      reconciliationKey: "https://termstation",
+    });
+    await expect(
+      cold.provision(second.client, {
+        ...input,
+        resolvePendingRevocationEndpoint: async () => ({
+          type: "available",
+          client: first.client,
+          environmentOrigin: "https://termstation",
+        }),
+      }),
+    ).resolves.toMatchObject({ runtimeId: RUNTIME_ID });
+
+    expect(first.revoke).toHaveBeenCalledOnce();
+    expect(acknowledge).toHaveBeenCalledOnce();
+    expect(second.provision).toHaveBeenCalledOnce();
+  });
+
+  it("retires an unresolvable removed-origin fence so another environment can provision", async () => {
+    const first = makeClient();
+    const second = makeClient();
+    const { native, acknowledge } = makeNative();
+    await new NativeVoiceRuntimeProvisioningCoordinator(native).provision(
+      first.client,
+      provisioningInput(),
+    );
+    const cold = new NativeVoiceRuntimeProvisioningCoordinator(native);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await expect(
+      cold.disableIfIdle(1, {
+        resolveEndpoint: async () => ({ type: "absent" }),
+        retireUnresolvableRevocation: true,
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      cold.provision(second.client, {
+        ...provisioningInput(2),
+        environmentOrigin: "https://environment-b.example",
+      }),
+    ).resolves.toMatchObject({ runtimeId: RUNTIME_ID });
+
+    expect(first.revoke).not.toHaveBeenCalled();
+    expect(second.provision).toHaveBeenCalledOnce();
+    expect(acknowledge).toHaveBeenCalledOnce();
+    expect(warning).toHaveBeenCalledWith(
+      "[voice] retiring an unresolvable native runtime revocation",
+      { runtimeId: RUNTIME_ID },
+    );
+    warning.mockRestore();
+  });
+
   it("prepares, provisions, and atomically activates without returning the token", async () => {
     const order: string[] = [];
     const { client, provision } = makeClient({ order });
@@ -412,6 +677,72 @@ describe("NativeVoiceRuntimeProvisioningCoordinator", () => {
     expect(prepare).toHaveBeenCalledTimes(2);
     expect(provision).toHaveBeenCalledTimes(2);
     expect(activate).toHaveBeenCalledTimes(2);
+  });
+
+  it("defers a changed target when atomic native replacement reports a live owner", async () => {
+    const nextTarget = { ...target, threadId: ThreadId.make("thread-2") };
+    const { client, provision, revoke } = makeClient();
+    const { native, prepare, activate, disable } = makeNative({
+      conditionalDisable: async (attempt) => attempt !== 2,
+    });
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
+
+    await coordinator.provision(client, provisioningInput(1));
+    await expect(
+      coordinator.provision(client, {
+        ...provisioningInput(2),
+        readiness: { ...readiness, targetId: "project-1/thread-2" },
+        resolvedTarget: {
+          target: nextTarget,
+          targetIdentity: canonicalNativeVoiceRuntimeTargetIdentity(nextTarget),
+        },
+      }),
+    ).rejects.toBeInstanceOf(NativeVoiceRuntimeReplacementDeferredError);
+
+    expect(disable).toHaveBeenCalledOnce();
+    expect(revoke).not.toHaveBeenCalled();
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(provision).toHaveBeenCalledOnce();
+    expect(activate).toHaveBeenCalledOnce();
+  });
+
+  it("rechecks native media ownership immediately before destructive replacement", async () => {
+    const nextTarget = { ...target, threadId: ThreadId.make("thread-race") };
+    const { client, provision, revoke } = makeClient();
+    const { native, disable } = makeNative({
+      conditionalDisable: async (attempt) => attempt !== 2,
+    });
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
+
+    const active = await coordinator.provision(client, provisioningInput(1));
+    await expect(
+      coordinator.provision(client, {
+        ...provisioningInput(2),
+        readiness: { ...readiness, targetId: "project-1/thread-race" },
+        resolvedTarget: {
+          target: nextTarget,
+          targetIdentity: canonicalNativeVoiceRuntimeTargetIdentity(nextTarget),
+        },
+      }),
+    ).rejects.toBeInstanceOf(NativeVoiceRuntimeReplacementDeferredError);
+
+    expect(active).toBeDefined();
+    expect(disable).toHaveBeenCalledOnce();
+    expect(revoke).not.toHaveBeenCalled();
+    expect(provision).toHaveBeenCalledOnce();
+  });
+
+  it("does not clear unknown native authority when media becomes active during inspection", async () => {
+    const { client, provision } = makeClient();
+    const { native, disable } = makeNative({ conditionalDisable: async () => false });
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native);
+
+    await expect(coordinator.provision(client, provisioningInput())).rejects.toBeInstanceOf(
+      NativeVoiceRuntimeReplacementDeferredError,
+    );
+
+    expect(disable).not.toHaveBeenCalled();
+    expect(provision).not.toHaveBeenCalled();
   });
 
   it("revokes an old environment with its original client before switching", async () => {

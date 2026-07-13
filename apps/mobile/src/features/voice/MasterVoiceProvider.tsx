@@ -35,9 +35,14 @@ import { useNavigation } from "@react-navigation/native";
 import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import { uuidv4 } from "../../lib/uuid";
 import { savePreferencesPatch } from "../../persistence/imperative";
-import { usePreparedConnection } from "../../state/session";
+import {
+  getPreparedConnection,
+  prepareConnectionOnDemand,
+  usePreparedConnection,
+} from "../../state/session";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import { useProjects, useThreadShells } from "../../state/entities";
+import { useSavedRemoteConnections } from "../../state/use-remote-environment-registry";
 import {
   acknowledgeClientActionWithRetry,
   clientActionAcknowledgementInput,
@@ -67,20 +72,28 @@ import {
 } from "./nativeVoiceReadiness";
 import {
   makeNativeVoiceRuntimeProvisioningAdapter,
+  NativeVoiceRuntimeReplacementDeferredError,
   nativeVoiceRuntimeRefreshAt,
   NativeVoiceRuntimeProvisioningCoordinator,
+  resolveNativeVoiceRuntimeRevocationEndpoint,
 } from "./nativeVoiceRuntimeProvisioning";
+import { NativeVoiceReconciliationBackoff } from "./nativeVoiceReconciliationBackoff";
 import { resolveNativeVoiceRuntimeTarget } from "./nativeVoiceRuntimeTarget";
 import { VoiceConversationBrowser, type VoiceConversationClient } from "./VoiceConversationBrowser";
 import {
   continueVoiceConversationSelection,
   durableVoiceConversations,
-  masterVoiceEnvironmentId,
+  masterVoiceControllerEnvironmentId,
   newVoiceConversationSelection,
   nextVoiceThreadTarget,
   reconcileMasterVoiceFocus,
   resumeVoiceConversationSelection,
+  acceptNativeRealtimeOwnerState,
+  restoreMasterVoiceAttachment,
+  shouldRetireUnresolvableNativeVoiceOwner,
+  shouldRevokeUnavailableVoiceEnvironment,
   VoiceFocusUpdateQueue,
+  type NativeRealtimeOwnerState,
   type ActiveMasterVoiceAttachment,
   type MasterVoiceFocus,
 } from "./masterVoiceState";
@@ -90,6 +103,7 @@ import {
   RealtimeServerCleanupCoordinator,
   type RealtimeVoiceControllerSnapshot,
 } from "./realtimeVoiceController";
+import { realtimeVoiceAttachmentStore } from "./realtimeVoiceAttachmentStore";
 
 interface PendingVoiceConfirmation {
   readonly confirmationId: VoiceConfirmationId;
@@ -140,6 +154,7 @@ const INITIAL_SNAPSHOT: RealtimeVoiceControllerSnapshot = {
   session: null,
   native: null,
   error: null,
+  focus: null,
 };
 
 const MasterVoiceContext = createContext<MasterVoiceContextValue | null>(null);
@@ -194,6 +209,7 @@ export function MasterVoiceProvider(props: {
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
   const threadShells = useThreadShells();
   const projects = useProjects();
+  const { isLoadingSavedConnection, savedConnectionsById } = useSavedRemoteConnections();
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
   const [snapshot, setSnapshot] = useState(INITIAL_SNAPSHOT);
   const [attachment, setAttachment] = useState<ActiveMasterVoiceAttachment | null>(null);
@@ -213,6 +229,12 @@ export function MasterVoiceProvider(props: {
   const [nativePermissions, setNativePermissions] = useState({
     microphone: null as boolean | null,
     notification: null as boolean | null,
+  });
+  const [nativeRealtimeOwner, setNativeRealtimeOwner] = useState<NativeRealtimeOwnerState>({
+    checked: false,
+    sequence: -1,
+    sessionId: null,
+    environmentOrigin: null,
   });
   const [readinessRetry, setReadinessRetry] = useState(0);
   const runtimeRef = useRef<MasterVoiceRuntime | null>(null);
@@ -250,6 +272,7 @@ export function MasterVoiceProvider(props: {
   const activeNativeEpochRef = useRef<number | null>(null);
   const resumeRef = useRef<() => Promise<boolean>>(async () => false);
   const readinessAlertVisibleRef = useRef(false);
+  const nativeReconciliationBackoffRef = useRef(new NativeVoiceReconciliationBackoff());
   attachmentRef.current = attachment;
   focusRef.current = props.focus;
   threadShellsRef.current = threadShells;
@@ -290,12 +313,66 @@ export function MasterVoiceProvider(props: {
     savePreferences,
   ]);
 
-  const controllerEnvironmentId = masterVoiceEnvironmentId(
-    attachment?.environmentId ?? null,
-    props.focus,
-    props.environmentId,
+  const resolveNativeRevocationEndpoint = useCallback(
+    (environmentOrigin: string) =>
+      resolveNativeVoiceRuntimeRevocationEndpoint({
+        environmentOrigin,
+        connections: Object.entries(savedConnectionsById).map(([id, connection]) => ({
+          id: id as EnvironmentId,
+          httpBaseUrl: connection.httpBaseUrl,
+        })),
+        getPrepared: getPreparedConnection,
+        prepare: prepareConnectionOnDemand,
+        makeClient: makeMobileVoiceClient,
+      }),
+    [savedConnectionsById],
+  );
+
+  const nativeOwnerEnvironmentId =
+    nativeRealtimeOwner.environmentOrigin === null
+      ? null
+      : ((Object.entries(savedConnectionsById).find(([, connection]) => {
+          try {
+            return new URL(connection.httpBaseUrl).origin === nativeRealtimeOwner.environmentOrigin;
+          } catch {
+            return false;
+          }
+        })?.[0] as EnvironmentId | undefined) ?? null);
+  const nativeOwnerOriginUnavailable = shouldRetireUnresolvableNativeVoiceOwner({
+    nativeOwnerChecked: nativeRealtimeOwner.checked,
+    catalogLoading: isLoadingSavedConnection,
+    environmentOrigin: nativeRealtimeOwner.environmentOrigin,
+    environmentId: nativeOwnerEnvironmentId,
+  });
+  const nativeOwnerOriginPending =
+    nativeRealtimeOwner.sessionId !== null && nativeRealtimeOwner.environmentOrigin === null;
+  const controllerEnvironmentId = masterVoiceControllerEnvironmentId({
+    nativeOwnerChecked: nativeRealtimeOwner.checked,
+    nativeSessionId: nativeRealtimeOwner.sessionId,
+    nativeOwnerEnvironmentId,
+    nativeOwnerFallbackEnvironmentId: availableEnvironmentId,
+    activeEnvironmentId: attachment?.environmentId ?? null,
+    focus: props.focus,
+    fallbackEnvironmentId: props.environmentId,
+  });
+  const nativeReconciliationKey =
+    nativeRealtimeOwner.environmentOrigin ??
+    (controllerEnvironmentId === null
+      ? "native-runtime:unowned"
+      : `environment:${controllerEnvironmentId}`);
+  const scheduleNativeReconciliation = useCallback(
+    (cause: NativeVoiceRuntimeReplacementDeferredError) => {
+      nativeReconciliationBackoffRef.current.schedule(
+        cause.reconciliationKey ?? nativeReconciliationKey,
+        () => setReadinessRetry((current) => current + 1),
+      );
+    },
+    [nativeReconciliationKey],
   );
   const prepared = Option.getOrNull(usePreparedConnection(controllerEnvironmentId));
+  const controllerEnvironmentAvailable =
+    controllerEnvironmentId !== null &&
+    Object.hasOwn(savedConnectionsById, controllerEnvironmentId);
   const nativeReadiness = useMemo(
     () =>
       resolveNativeVoiceReadiness(
@@ -322,8 +399,54 @@ export function MasterVoiceProvider(props: {
   );
 
   useEffect(() => {
+    nativeReconciliationBackoffRef.current.setKey(nativeReconciliationKey);
+  }, [nativeReconciliationKey]);
+
+  useEffect(
+    () => () => {
+      nativeReconciliationBackoffRef.current.reset();
+    },
+    [],
+  );
+
+  useEffect(() => {
     if (native === null) return;
     let disposed = false;
+    const acceptState = (state: Awaited<ReturnType<typeof native.getStateAsync>>) => {
+      setNativeRealtimeOwner((current) =>
+        acceptNativeRealtimeOwnerState(current, {
+          sequence: state.sequence,
+          sessionId: state.activeRealtimeSessionId,
+          environmentOrigin:
+            state.activeRealtimeSessionId === current.sessionId ? current.environmentOrigin : null,
+        }),
+      );
+    };
+    const refreshOwnership = async () => {
+      const [state, ownership, persisted] = await Promise.all([
+        native.getStateAsync(),
+        native.getBackgroundVoiceOwnershipAsync(),
+        realtimeVoiceAttachmentStore.load().catch(() => null),
+      ]);
+      if (disposed) return;
+      const ownershipIsNewest = ownership !== null && ownership.sequence >= state.sequence;
+      const sessionId = ownershipIsNewest
+        ? ownership.nativeSessionId
+        : state.activeRealtimeSessionId;
+      const ownedOrigin =
+        ownershipIsNewest && ownership.nativeSessionId === sessionId
+          ? new URL(ownership.environmentOrigin).origin
+          : null;
+      const persistedOrigin =
+        persisted?.sessionId === sessionId ? persisted.environmentOrigin : null;
+      setNativeRealtimeOwner((current) =>
+        acceptNativeRealtimeOwnerState(current, {
+          sequence: ownershipIsNewest ? ownership.sequence : state.sequence,
+          sessionId,
+          environmentOrigin: ownedOrigin ?? persistedOrigin,
+        }),
+      );
+    };
     const refresh = async () => {
       const [microphone, notification] = await Promise.all([
         native.getMicrophonePermissionAsync(),
@@ -335,6 +458,7 @@ export function MasterVoiceProvider(props: {
           notification: notification.granted,
         });
       }
+      await refreshOwnership();
     };
     void refresh().catch(() => {
       if (!disposed) setNativePermissions({ microphone: null, notification: null });
@@ -342,9 +466,15 @@ export function MasterVoiceProvider(props: {
     const subscription = AppState.addEventListener("change", (state) => {
       if (state === "active") void refresh();
     });
+    const nativeStateSubscription = native.addListener("stateChanged", (state) => {
+      if (disposed) return;
+      acceptState(state);
+      void refreshOwnership().catch(() => undefined);
+    });
     return () => {
       disposed = true;
       subscription.remove();
+      nativeStateSubscription.remove();
     };
   }, [native]);
   const conversationClient: VoiceConversationClient | null =
@@ -585,6 +715,21 @@ export function MasterVoiceProvider(props: {
             }
             if (next.phase !== "active") setAudioRoutePicker(null);
             if (next.phase === "active") {
+              if (attachmentRef.current === null) {
+                setAttachment(
+                  restoreMasterVoiceAttachment({
+                    environmentId: controllerEnvironmentId,
+                    persistedFocus: next.focus,
+                    visibleFocus: focusRef.current,
+                    threadTitle: (threadId) =>
+                      threadShellsRef.current.find(
+                        (thread) =>
+                          thread.environmentId === controllerEnvironmentId &&
+                          thread.id === threadId,
+                      )?.title ?? "Thread",
+                  }),
+                );
+              }
               savePreferences({ voiceMode: "realtime" });
             } else if (next.phase === "idle" || next.phase === "error") {
               savePreferences({ voiceMode: "off" });
@@ -605,13 +750,16 @@ export function MasterVoiceProvider(props: {
               .catch(() => undefined);
           },
         },
-        { cleanupCoordinator },
+        { cleanupCoordinator, attachmentStore: realtimeVoiceAttachmentStore },
       );
       try {
         await controller.reconcileNativeRuntime();
       } catch (cause) {
-        await controller.dispose();
-        throw cause;
+        const activeNativeSessionId = controller.getSnapshot().native?.activeRealtimeSessionId;
+        if (activeNativeSessionId === null || activeNativeSessionId === undefined) {
+          await controller.detach();
+          throw cause;
+        }
       }
       if (disposed) {
         await controller.detach();
@@ -651,6 +799,65 @@ export function MasterVoiceProvider(props: {
     handleSessionEvents,
     native,
     savePreferences,
+  ]);
+
+  useEffect(() => {
+    if (
+      nativeProvisioning === null ||
+      nativeOwnerOriginPending ||
+      (!nativeOwnerOriginUnavailable &&
+        !shouldRevokeUnavailableVoiceEnvironment({
+          nativeOwnerChecked: nativeRealtimeOwner.checked,
+          environmentId: controllerEnvironmentId,
+          catalogLoading: isLoadingSavedConnection,
+          environmentAvailable: controllerEnvironmentAvailable,
+        }))
+    ) {
+      return;
+    }
+    const removedEnvironmentId = controllerEnvironmentId;
+    const provisioningEpoch = ++nativeProvisioningEpochRef.current;
+    let disposed = false;
+    void (async () => {
+      const disabled = await nativeProvisioning.disableIfIdle(provisioningEpoch, {
+        ...(conversationConnection === null
+          ? {}
+          : {
+              fallback: {
+                client: conversationConnection.client,
+                environmentOrigin: conversationConnection.environmentOrigin,
+              },
+            }),
+        resolveEndpoint: resolveNativeRevocationEndpoint,
+        retireUnresolvableRevocation: true,
+      });
+      if (!disabled) return;
+      nativeReconciliationBackoffRef.current.reset();
+      if (
+        removedEnvironmentId === null ||
+        attachmentRef.current?.environmentId === removedEnvironmentId
+      ) {
+        setAttachment(null);
+      }
+    })().catch((cause) => {
+      if (disposed || !(cause instanceof NativeVoiceRuntimeReplacementDeferredError)) return;
+      scheduleNativeReconciliation(cause);
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [
+    controllerEnvironmentAvailable,
+    controllerEnvironmentId,
+    conversationConnection,
+    isLoadingSavedConnection,
+    nativeProvisioning,
+    nativeRealtimeOwner.checked,
+    nativeOwnerOriginUnavailable,
+    nativeOwnerOriginPending,
+    readinessRetry,
+    resolveNativeRevocationEndpoint,
+    scheduleNativeReconciliation,
   ]);
 
   useEffect(() => {
@@ -850,7 +1057,11 @@ export function MasterVoiceProvider(props: {
       nativeProvisioning === null ||
       controllerEnvironmentId === null ||
       conversationConnection === null ||
-      !nativeReadinessInputsReady
+      !nativeReadinessInputsReady ||
+      !nativeRealtimeOwner.checked ||
+      nativeOwnerOriginUnavailable ||
+      (!isLoadingSavedConnection && !controllerEnvironmentAvailable) ||
+      nativeRealtimeOwner.sessionId !== null
     )
       return;
     const readiness = nativeReadiness;
@@ -1034,8 +1245,11 @@ export function MasterVoiceProvider(props: {
             resolvedTarget.target.mode === "realtime" ? "realtime-start" : "thread-turn-start",
           resolvedTarget,
           refreshRequested: nativeGrantRefreshRequestedRef.current,
+          resolvePendingRevocationEndpoint: resolveNativeRevocationEndpoint,
+          retireUnresolvableRevocation: true,
         });
         nativeOperationsRef.current.assertCurrent(epoch);
+        nativeReconciliationBackoffRef.current.reset();
         if (nativeGrantRefreshRequestedRef.current) {
           nativeGrantRefreshRequestedRef.current = false;
           nativeGrantRefreshScheduleRef.current = null;
@@ -1075,6 +1289,10 @@ export function MasterVoiceProvider(props: {
         if (pending !== null) acceptCommand(pending);
       })
       .catch((cause) => {
+        if (cause instanceof NativeVoiceRuntimeReplacementDeferredError) {
+          if (!disposed) scheduleNativeReconciliation(cause);
+          return;
+        }
         if (disposed || readinessAlertVisibleRef.current) return;
         readinessAlertVisibleRef.current = true;
         Alert.alert(
@@ -1152,11 +1370,16 @@ export function MasterVoiceProvider(props: {
     backgroundTargetEnvironmentId,
     backgroundTargetThreadId,
     controllerEnvironmentId,
+    controllerEnvironmentAvailable,
     conversationConnection,
+    isLoadingSavedConnection,
     native,
     nativeProvisioning,
     nativeReadiness,
     nativeReadinessInputsReady,
+    nativeRealtimeOwner.checked,
+    nativeRealtimeOwner.sessionId,
+    nativeOwnerOriginUnavailable,
     navigation,
     prepared,
     preferences?.voiceThreadTarget,
@@ -1164,6 +1387,8 @@ export function MasterVoiceProvider(props: {
     props.focus?.projectId,
     props.focus?.threadId,
     readinessRetry,
+    resolveNativeRevocationEndpoint,
+    scheduleNativeReconciliation,
     savePreferences,
     snapshot.session?.conversationId,
   ]);
@@ -1287,13 +1512,23 @@ export function MasterVoiceProvider(props: {
   );
 
   const stop = useCallback(async () => {
-    if (snapshot.phase === "error") {
+    if (
+      snapshot.phase === "error" &&
+      typeof snapshot.native?.activeRealtimeSessionId !== "string"
+    ) {
       setSnapshot(INITIAL_SNAPSHOT);
       setAttachment(null);
       return;
     }
     await runtimeRef.current?.controller.stop();
-  }, [snapshot.phase]);
+  }, [snapshot.native?.activeRealtimeSessionId, snapshot.phase]);
+
+  const retryAttachment = useCallback(() => {
+    const controller = runtimeRef.current?.controller;
+    if (controller === undefined || typeof snapshot.native?.activeRealtimeSessionId !== "string")
+      return;
+    void controller.reconcileNativeRuntime().catch(() => undefined);
+  }, [snapshot.native?.activeRealtimeSessionId]);
 
   const registerTraditionalAudioInterruption = useCallback(
     (interrupt: () => void | (() => void) | Promise<void | (() => void)>) => {
@@ -1397,6 +1632,7 @@ export function MasterVoiceProvider(props: {
           onResume={resume}
           resumePending={resumePending}
           onHistory={browseHistory}
+          onRetryAttachment={retryAttachment}
           onStop={() => void stop()}
         />
       </View>

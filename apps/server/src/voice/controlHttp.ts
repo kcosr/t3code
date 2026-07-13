@@ -160,16 +160,20 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
           }
           const now = yield* DateTime.now;
           const expiresAt = nativeRuntimeExpiresAt(now, principal.expiresAt);
-          const grant = yield* nativeRuntimeGrants
-            .issue({
+          const grant = yield* Effect.gen(function* () {
+            const issued = yield* nativeRuntimeGrants.issue({
               authSessionId: principal.sessionId,
               runtimeId: args.params.runtimeId,
               generation: args.payload.generation,
               grantedScopes: new Set(principal.scopes),
               target,
               expiresAt: DateTime.toEpochMillis(expiresAt),
-            })
-            .pipe(Effect.catch(failVoiceOperation));
+            });
+            if (!issued.refreshed) {
+              yield* sessions.revokeNativeRuntime(principal.sessionId, args.params.runtimeId);
+            }
+            return issued;
+          }).pipe(Effect.uninterruptible, Effect.catch(failVoiceOperation));
           return {
             token: grant.token,
             runtimeId: args.params.runtimeId,
@@ -184,10 +188,14 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
         Effect.fn("environment.voice.revokeNativeRuntimeGrant")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           const principal = yield* requireEnvironmentScope(AuthVoiceUseScope);
-          const revoked = yield* nativeRuntimeGrants.revokeRuntime(
-            principal.sessionId,
-            args.params.runtimeId,
-          );
+          const revoked = yield* Effect.gen(function* () {
+            const result = yield* nativeRuntimeGrants.revokeRuntime(
+              principal.sessionId,
+              args.params.runtimeId,
+            );
+            yield* sessions.revokeNativeRuntime(principal.sessionId, args.params.runtimeId);
+            return result;
+          }).pipe(Effect.uninterruptible);
           return { runtimeId: args.params.runtimeId, revoked };
         }),
       )

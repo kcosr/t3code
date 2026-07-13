@@ -99,6 +99,70 @@ class T3VoiceRecordingCacheTest {
     assertFalse(cache.owns(wrongName))
   }
 
+  @Test
+  fun processRestartRestoresRecordingForCancelRevocationAndNormalCleanup() {
+    listOf("cancel", "revocation", "normal").forEach { path ->
+      val cache = T3VoiceRecordingCache(cacheRoot)
+      val file = cache.createTempFile().apply { writeText(path) }
+      val recording = T3VoiceRecordingResult(
+        recordingId = "recording-$path",
+        uri = file.toURI().toString(),
+        durationMs = 1_000,
+        byteLength = file.length(),
+      )
+
+      val restartedRegistry = T3VoiceCompletedRecordingRegistry(cache)
+      assertTrue(restartedRegistry.restore(recording))
+      var durableStateCleared = false
+      assertTrue(T3VoiceBackgroundThreadLocalCleanupCoordinator.complete(
+        deleteRecording = {
+          runCatching {
+            restartedRegistry.delete(recording.recordingId, recording.uri)
+          }.isSuccess
+        },
+        clearDurableState = { durableStateCleared = true; true },
+      ))
+      assertTrue(durableStateCleared)
+      assertFalse(file.exists())
+
+      restartedRegistry.delete(recording.recordingId, recording.uri)
+    }
+  }
+
+  @Test
+  fun unregisteredExistingRecordingCannotBeDeleted() {
+    val cache = T3VoiceRecordingCache(cacheRoot)
+    val file = cache.createTempFile().apply { writeText("live") }
+    val registry = T3VoiceCompletedRecordingRegistry(cache)
+
+    assertFalse(runCatching { registry.delete("unknown", file.toURI().toString()) }.isSuccess)
+    assertTrue(file.exists())
+  }
+
+  @Test
+  fun processRestartRejectsMissingPersistedRecording() {
+    val cache = T3VoiceRecordingCache(cacheRoot)
+    val missing = cache.createTempFile()
+    val result = T3VoiceRecordingResult(
+      "recording-missing", missing.toURI().toString(), 1_000, 128,
+    )
+    assertTrue(missing.delete())
+
+    assertFalse(T3VoiceCompletedRecordingRegistry(cache).restore(result))
+  }
+
+  @Test
+  fun processRestartRejectsTruncatedPersistedRecording() {
+    val cache = T3VoiceRecordingCache(cacheRoot)
+    val truncated = cache.createTempFile().apply { writeText("short") }
+    val result = T3VoiceRecordingResult(
+      "recording-truncated", truncated.toURI().toString(), 1_000, truncated.length() + 10,
+    )
+
+    assertFalse(T3VoiceCompletedRecordingRegistry(cache).restore(result))
+    assertTrue(truncated.exists())
+  }
+
   private fun ownedFiles(cache: T3VoiceRecordingCache): Set<File> =
     cache.directory.listFiles().orEmpty().filter(cache::owns).map(File::getCanonicalFile).toSet()
 }

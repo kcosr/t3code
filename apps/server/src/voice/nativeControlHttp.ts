@@ -9,6 +9,7 @@ import {
   type VoiceNativeHeartbeatResult,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -19,15 +20,17 @@ import * as NodeCrypto from "node:crypto";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 
 import { VoiceNativeControlGrantRegistry } from "./Services/VoiceNativeControlGrantRegistry.ts";
+import { VoiceNativeRealtimeStartRepository } from "../persistence/Services/VoiceNativeRealtimeStarts.ts";
 import { VoiceNativeRuntimeGrantRegistry } from "./Services/VoiceNativeRuntimeGrantRegistry.ts";
 import { VoiceSessionService } from "./Services/VoiceSessionService.ts";
-import type { VoiceError } from "./Errors.ts";
+import { VoiceError } from "./Errors.ts";
 
 const VOICE_CONTROL_HEADER = "x-t3-voice-control";
 const VOICE_RUNTIME_HEADER = "x-t3-voice-runtime";
 const MAXIMUM_HEARTBEAT_BODY_BYTES = 256;
 const MAXIMUM_ACTION_ACK_BODY_BYTES = 512;
 const HEARTBEAT_BODY_TIMEOUT = "2 seconds";
+const NATIVE_REALTIME_START_CLAIM_MILLIS = 60_000;
 const decodeSessionId = Schema.decodeUnknownEffect(VoiceSessionId);
 const decodeHeartbeatInputJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(VoiceNativeHeartbeatInput),
@@ -45,6 +48,10 @@ const decodeWebRtcOfferInputJson = Schema.decodeUnknownEffect(
 const decodeLeaseInputJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(VoiceSessionLeaseInput),
 );
+
+export const protectNativeRealtimeStartCriticalSection = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+) => effect.pipe(Effect.uninterruptible);
 
 const unauthorized = () =>
   HttpServerResponse.jsonUnsafe(
@@ -199,39 +206,150 @@ const nativeRealtimeStartRoute = HttpRouter.add(
       current.authSessionId !== grant.authSessionId
     )
       return unauthorized();
-    const idempotencyKey = `native:${grant.runtimeId}:${grant.generation}:${NodeCrypto.createHash(
+    const idempotencyKey = `native:${grant.authSessionId}:${grant.runtimeId}:${grant.generation}:${NodeCrypto.createHash(
       "sha256",
     )
       .update(input.value.clientOperationId)
       .digest("base64url")}`;
     const focus = grant.target.focus;
     const sessions = yield* VoiceSessionService;
-    const result = yield* sessions
-      .create(
-        {
-          sessionId: grant.authSessionId,
-          scopes: grant.grantedScopes,
-          nativeRuntime: { runtimeId: grant.runtimeId, generation: grant.generation },
-        },
-        {
-          mode: "realtime-agent",
-          conversation: {
-            type: "continue",
-            conversationId: grant.target.conversation.conversationId,
-            takeover: false,
-          },
-          ...(focus.type === "none" ? {} : { projectId: focus.projectId }),
-          ...(focus.type === "thread" ? { threadId: focus.threadId } : {}),
-          media: {
-            transports: ["webrtc-sdp-v1"],
-            audioFormats: ["audio/pcm;rate=24000;encoding=s16le;channels=1"],
-            supportsInputRouteSelection: true,
-            supportsOutputRouteSelection: true,
-          },
-          idempotencyKey,
-        },
-      )
+    const principal = {
+      sessionId: grant.authSessionId,
+      scopes: grant.grantedScopes,
+      nativeRuntime: { runtimeId: grant.runtimeId, generation: grant.generation },
+    };
+    const createInput = {
+      mode: "realtime-agent" as const,
+      conversation: {
+        type: "continue" as const,
+        conversationId: grant.target.conversation.conversationId,
+        takeover: false,
+      },
+      ...(focus.type === "none" ? {} : { projectId: focus.projectId }),
+      ...(focus.type === "thread" ? { threadId: focus.threadId } : {}),
+      media: {
+        transports: ["webrtc-sdp-v1" as const],
+        audioFormats: ["audio/pcm;rate=24000;encoding=s16le;channels=1" as const],
+        supportsInputRouteSelection: true,
+        supportsOutputRouteSelection: true,
+      },
+      idempotencyKey,
+    };
+    const starts = yield* VoiceNativeRealtimeStartRepository;
+    const now = yield* Clock.currentTimeMillis;
+    const claim = yield* starts
+      .claim({
+        operationKey: idempotencyKey,
+        authSessionId: grant.authSessionId,
+        runtimeId: grant.runtimeId,
+        runtimeGeneration: grant.generation,
+        clientOperationId: input.value.clientOperationId,
+        conversationId: grant.target.conversation.conversationId,
+        claimExpiresAt: Math.min(grant.expiresAt, now + NATIVE_REALTIME_START_CLAIM_MILLIS),
+        expiresAt: grant.expiresAt,
+        now,
+      })
       .pipe(Effect.result);
+    if (Result.isFailure(claim))
+      return voiceOperationFailure(
+        new VoiceError({
+          reason: "provider-unavailable",
+          operation: "native-realtime-start.claim",
+          detail: "Native Realtime start storage is unavailable",
+          retryable: true,
+          cause: claim.failure,
+        }),
+      );
+    if (claim.success.status === "mismatch")
+      return voiceOperationFailure(
+        new VoiceError({
+          reason: "invalid-phase",
+          operation: "native-realtime-start.claim",
+          detail: "The idempotent native Realtime start cannot be reused",
+          retryable: false,
+        }),
+      );
+    if (claim.success.status === "existing" && claim.success.record.failure !== null)
+      return voiceOperationFailure(new VoiceError(claim.success.record.failure));
+    if (claim.success.status === "existing" && claim.success.record.sessionId === null) {
+      const pending = now <= claim.success.record.claimExpiresAt;
+      return voiceOperationFailure(
+        new VoiceError({
+          reason: pending ? "lease-conflict" : "session-not-found",
+          operation: "native-realtime-start.claim",
+          detail: pending
+            ? "The original native Realtime start is still pending"
+            : "The original native Realtime start did not create a session",
+          retryable: pending,
+        }),
+      );
+    }
+    const existingSessionId =
+      claim.success.status === "existing"
+        ? (claim.success.record.sessionId ?? undefined)
+        : undefined;
+    const result = yield* Effect.gen(function* () {
+      const created = yield* (
+        existingSessionId === undefined
+          ? sessions.create(principal, createInput)
+          : sessions.resumeCreate(principal, createInput, existingSessionId)
+      ).pipe(Effect.result);
+      if (claim.success.status !== "claimed") return created;
+      if (Result.isFailure(created)) {
+        const persisted = yield* starts
+          .fail(
+            idempotencyKey,
+            {
+              reason: created.failure.reason,
+              operation: created.failure.operation,
+              detail: created.failure.detail,
+              retryable: created.failure.retryable,
+            },
+            yield* Clock.currentTimeMillis,
+          )
+          .pipe(Effect.result);
+        if (Result.isSuccess(persisted) && persisted.success) return created;
+        return Result.fail(
+          new VoiceError({
+            reason: "provider-unavailable",
+            operation: "native-realtime-start.fail",
+            detail: "Native Realtime start outcome could not be persisted",
+            retryable: true,
+          }),
+        );
+      }
+      const boundAt = yield* Clock.currentTimeMillis;
+      const bound = yield* starts
+        .bindSession(idempotencyKey, created.success.state.sessionId, boundAt)
+        .pipe(Effect.result);
+      if (Result.isSuccess(bound) && bound.success) return created;
+      yield* sessions
+        .close(
+          grant.authSessionId,
+          created.success.state.sessionId,
+          created.success.state.leaseGeneration,
+        )
+        .pipe(Effect.ignore);
+      const bindFailure = new VoiceError({
+        reason: "provider-unavailable",
+        operation: "native-realtime-start.bind",
+        detail: "Native Realtime start storage is unavailable",
+        retryable: true,
+      });
+      yield* starts
+        .fail(
+          idempotencyKey,
+          {
+            reason: bindFailure.reason,
+            operation: bindFailure.operation,
+            detail: bindFailure.detail,
+            retryable: bindFailure.retryable,
+          },
+          yield* Clock.currentTimeMillis,
+        )
+        .pipe(Effect.ignore);
+      return Result.fail(bindFailure);
+    }).pipe(protectNativeRealtimeStartCriticalSection);
     return Result.isFailure(result)
       ? voiceOperationFailure(result.failure)
       : HttpServerResponse.jsonUnsafe(

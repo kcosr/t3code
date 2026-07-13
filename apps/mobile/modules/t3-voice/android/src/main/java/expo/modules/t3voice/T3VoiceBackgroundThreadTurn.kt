@@ -405,18 +405,33 @@ internal object T3VoiceBackgroundThreadTurnJson {
 
 internal fun interface T3VoiceBackgroundThreadTurnHttp {
   fun execute(request: T3VoiceBackgroundHttpRequest): T3VoiceBackgroundHttpResult
+
+  fun newCall(request: T3VoiceBackgroundHttpRequest): T3VoiceBackgroundThreadRawCall =
+    object : T3VoiceBackgroundThreadRawCall {
+      override fun execute() = this@T3VoiceBackgroundThreadTurnHttp.execute(request)
+      override fun cancel() = Unit
+    }
+}
+
+internal interface T3VoiceBackgroundThreadRawCall {
+  fun execute(): T3VoiceBackgroundHttpResult
+  fun cancel()
+}
+
+internal interface T3VoiceBackgroundThreadCall<out T> {
+  fun execute(): T3VoiceBackgroundThreadTurnResult<T>
+  fun cancel()
 }
 
 internal class T3VoiceBackgroundThreadTurnDelegate(
-  private val http: T3VoiceBackgroundThreadTurnHttp =
-    T3VoiceBackgroundThreadTurnHttp(T3VoiceBackgroundHttpTransport()::execute),
+  private val http: T3VoiceBackgroundThreadTurnHttp = productionHttp(),
 ) {
-  fun create(
+  fun newCreateCall(
     origin: String,
     runtimeGrantToken: String,
     input: T3VoiceBackgroundThreadTurnCreateInput,
-  ): T3VoiceBackgroundThreadTurnResult<T3VoiceBackgroundThreadTurnCreateResult> =
-    json(
+  ): T3VoiceBackgroundThreadCall<T3VoiceBackgroundThreadTurnCreateResult> =
+    jsonCall(
       T3VoiceBackgroundHttpRequest(
         origin = origin,
         path = "/api/voice/native/thread-turns",
@@ -429,14 +444,21 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
       T3VoiceBackgroundThreadTurnJson::decodeCreate,
     )
 
-  fun uploadAudio(
+  fun create(
+    origin: String,
+    runtimeGrantToken: String,
+    input: T3VoiceBackgroundThreadTurnCreateInput,
+  ): T3VoiceBackgroundThreadTurnResult<T3VoiceBackgroundThreadTurnCreateResult> =
+    newCreateCall(origin, runtimeGrantToken, input).execute()
+
+  fun newUploadAudioCall(
     origin: String,
     operationGrantToken: String,
     operationId: String,
     audio: T3VoiceBackgroundRequestBody,
-  ): T3VoiceBackgroundThreadTurnResult<T3VoiceBackgroundThreadTurnAudioResult> {
+  ): T3VoiceBackgroundThreadCall<T3VoiceBackgroundThreadTurnAudioResult> {
     require(audio.contentType == "audio/mp4") { "Native thread turn audio must be audio/mp4." }
-    return json(
+    return jsonCall(
       T3VoiceBackgroundHttpRequest(
         origin = origin,
         path = operationPath(operationId, "audio"),
@@ -450,6 +472,40 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
     )
   }
 
+  fun uploadAudio(
+    origin: String,
+    operationGrantToken: String,
+    operationId: String,
+    audio: T3VoiceBackgroundRequestBody,
+  ): T3VoiceBackgroundThreadTurnResult<T3VoiceBackgroundThreadTurnAudioResult> {
+    require(audio.contentType == "audio/mp4") { "Native thread turn audio must be audio/mp4." }
+    return newUploadAudioCall(origin, operationGrantToken, operationId, audio).execute()
+  }
+
+  fun newEventsCall(
+    origin: String,
+    operationGrantToken: String,
+    operationId: String,
+    afterSequence: Long,
+    waitMilliseconds: Int,
+  ): T3VoiceBackgroundThreadCall<T3VoiceBackgroundThreadTurnEventsResult> {
+    require(afterSequence in 0..MAXIMUM_SAFE_INTEGER && waitMilliseconds in 0..30_000)
+    return jsonCall(
+      T3VoiceBackgroundHttpRequest(
+        origin = origin,
+        path = operationPath(operationId, "events"),
+        method = T3VoiceBackgroundHttpMethod.GET,
+        authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
+        maximumResponseBytes = MAXIMUM_JSON_RESPONSE_BYTES,
+        queryParameters = mapOf(
+          "afterSequence" to afterSequence.toString(),
+          "waitMilliseconds" to waitMilliseconds.toString(),
+        ),
+      ),
+      T3VoiceBackgroundThreadTurnJson::decodeEvents,
+    )
+  }
+
   fun events(
     origin: String,
     operationGrantToken: String,
@@ -458,21 +514,8 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
     waitMilliseconds: Int,
   ): T3VoiceBackgroundThreadTurnResult<T3VoiceBackgroundThreadTurnEventsResult> {
     require(afterSequence in 0..MAXIMUM_SAFE_INTEGER && waitMilliseconds in 0..30_000)
-    return json(
-      T3VoiceBackgroundHttpRequest(
-        origin = origin,
-        path = operationPath(operationId, "events"),
-        method = T3VoiceBackgroundHttpMethod.GET,
-        authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
-        maximumResponseBytes = MAXIMUM_JSON_RESPONSE_BYTES,
-        queryParameters =
-          mapOf(
-            "afterSequence" to afterSequence.toString(),
-            "waitMilliseconds" to waitMilliseconds.toString(),
-          ),
-      ),
-      T3VoiceBackgroundThreadTurnJson::decodeEvents,
-    )
+    return newEventsCall(origin, operationGrantToken, operationId, afterSequence, waitMilliseconds)
+      .execute()
   }
 
   fun acknowledge(
@@ -481,7 +524,15 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
     operationId: String,
     sequence: Long,
   ): T3VoiceBackgroundThreadTurnResult<T3VoiceBackgroundThreadTurnSnapshot> =
-    json(
+    newAcknowledgeCall(origin, operationGrantToken, operationId, sequence).execute()
+
+  fun newAcknowledgeCall(
+    origin: String,
+    operationGrantToken: String,
+    operationId: String,
+    sequence: Long,
+  ): T3VoiceBackgroundThreadCall<T3VoiceBackgroundThreadTurnSnapshot> =
+    jsonCall(
       T3VoiceBackgroundHttpRequest(
         origin = origin,
         path = operationPath(operationId, "events/ack"),
@@ -499,37 +550,33 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
     operationGrantToken: String,
     operationId: String,
     segmentIndex: Int,
-  ): T3VoiceBackgroundThreadTurnResult<ByteArray> {
+  ): T3VoiceBackgroundThreadTurnResult<ByteArray> =
+    newSpeechCall(origin, operationGrantToken, operationId, segmentIndex).execute()
+
+  fun newSpeechCall(
+    origin: String,
+    operationGrantToken: String,
+    operationId: String,
+    segmentIndex: Int,
+  ): T3VoiceBackgroundThreadCall<ByteArray> {
     require(segmentIndex >= 0)
-    return when (
-      val response =
-        http.execute(
-          T3VoiceBackgroundHttpRequest(
-            origin = origin,
-            path = operationPath(operationId, "speech/$segmentIndex"),
-            method = T3VoiceBackgroundHttpMethod.GET,
-            authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
-            maximumResponseBytes = MAXIMUM_PCM_RESPONSE_BYTES,
-          ),
-        )
-    ) {
-      is T3VoiceBackgroundHttpResult.Failure -> response.failure()
-      is T3VoiceBackgroundHttpResult.Success ->
-        try {
-          require(response.contentType?.substringBefore(';')?.trim() == "audio/pcm") {
-            "Invalid native thread speech content type."
-          }
-          require(
-            response.body.isNotEmpty() &&
-              response.body.size <= MAXIMUM_PCM_RESPONSE_BYTES &&
-              response.body.size % 2 == 0,
-          ) {
-            "Invalid native thread speech payload."
-          }
+    return call(T3VoiceBackgroundHttpRequest(
+      origin = origin,
+      path = operationPath(operationId, "speech/$segmentIndex"),
+      method = T3VoiceBackgroundHttpMethod.GET,
+      authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
+      maximumResponseBytes = MAXIMUM_PCM_RESPONSE_BYTES,
+    )) { response ->
+      when (response) {
+        is T3VoiceBackgroundHttpResult.Failure -> response.failure()
+        is T3VoiceBackgroundHttpResult.Success -> try {
+          require(response.contentType?.substringBefore(';')?.trim() == "audio/pcm")
+          require(response.headers["x-t3-audio-format"] == PCM_FORMAT_HEADER)
+          require(response.body.isNotEmpty() && response.body.size <= MAXIMUM_PCM_RESPONSE_BYTES &&
+            response.body.size % 2 == 0)
           T3VoiceBackgroundThreadTurnResult.Success(response.body)
-        } catch (_: RuntimeException) {
-          permanentFailure()
-        }
+        } catch (_: RuntimeException) { permanentFailure() }
+      }
     }
   }
 
@@ -538,7 +585,14 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
     operationGrantToken: String,
     operationId: String,
   ): T3VoiceBackgroundThreadTurnResult<T3VoiceBackgroundThreadTurnCancelResult> =
-    json(
+    newCancelCall(origin, operationGrantToken, operationId).execute()
+
+  fun newCancelCall(
+    origin: String,
+    operationGrantToken: String,
+    operationId: String,
+  ): T3VoiceBackgroundThreadCall<T3VoiceBackgroundThreadTurnCancelResult> =
+    jsonCall(
       T3VoiceBackgroundHttpRequest(
         origin = origin,
         path = operationPath(operationId, "cancel"),
@@ -551,22 +605,29 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
       T3VoiceBackgroundThreadTurnJson::decodeCancel,
     )
 
-  private fun <A> json(
+  private fun <A> jsonCall(
     request: T3VoiceBackgroundHttpRequest,
     decode: (ByteArray) -> A,
-  ): T3VoiceBackgroundThreadTurnResult<A> =
-    when (val response = http.execute(request)) {
+  ): T3VoiceBackgroundThreadCall<A> = call(request) { response ->
+    when (response) {
       is T3VoiceBackgroundHttpResult.Failure -> response.failure()
-      is T3VoiceBackgroundHttpResult.Success ->
-        try {
-          require(response.contentType?.substringBefore(';')?.trim() == "application/json") {
-            "Invalid native thread turn content type."
-          }
-          T3VoiceBackgroundThreadTurnResult.Success(decode(response.body))
-        } catch (_: RuntimeException) {
-          permanentFailure()
-        }
+      is T3VoiceBackgroundHttpResult.Success -> try {
+        require(response.contentType?.substringBefore(';')?.trim() == "application/json")
+        T3VoiceBackgroundThreadTurnResult.Success(decode(response.body))
+      } catch (_: RuntimeException) { permanentFailure() }
     }
+  }
+
+  private fun <A> call(
+    request: T3VoiceBackgroundHttpRequest,
+    transform: (T3VoiceBackgroundHttpResult) -> T3VoiceBackgroundThreadTurnResult<A>,
+  ): T3VoiceBackgroundThreadCall<A> {
+    val raw = http.newCall(request)
+    return object : T3VoiceBackgroundThreadCall<A> {
+      override fun execute() = transform(raw.execute())
+      override fun cancel() = raw.cancel()
+    }
+  }
 
   private fun operationPath(operationId: String, suffix: String): String {
     require(operationId.matches(OPERATION_ID_PATTERN)) { "Invalid native thread operation ID." }
@@ -589,6 +650,20 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
     )
 
   private companion object {
+    fun productionHttp(): T3VoiceBackgroundThreadTurnHttp {
+      val transport = T3VoiceBackgroundHttpTransport()
+      return object : T3VoiceBackgroundThreadTurnHttp {
+        override fun execute(request: T3VoiceBackgroundHttpRequest) = transport.execute(request)
+        override fun newCall(request: T3VoiceBackgroundHttpRequest): T3VoiceBackgroundThreadRawCall {
+          val call = transport.newCall(request)
+          return object : T3VoiceBackgroundThreadRawCall {
+            override fun execute() = call.execute()
+            override fun cancel() = call.cancel()
+          }
+        }
+      }
+    }
+
     const val RUNTIME_AUTHORITY_HEADER = "x-t3-voice-runtime"
     const val OPERATION_AUTHORITY_HEADER = "x-t3-voice-operation"
     const val MAXIMUM_JSON_BYTES = 2_048L
@@ -596,6 +671,7 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
     const val MAXIMUM_AUDIO_BYTES = 64L * 1_024L * 1_024L
     const val MAXIMUM_PCM_RESPONSE_BYTES = 16 * 1_024 * 1_024
     const val MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991L
+    const val PCM_FORMAT_HEADER = "s16le;rate=24000;channels=1"
     val OPERATION_ID_PATTERN = Regex("^[A-Za-z0-9][A-Za-z0-9:._~-]{0,191}$")
     val SUFFIX_PATTERN = Regex("^[A-Za-z0-9][A-Za-z0-9/_-]{0,127}$")
   }

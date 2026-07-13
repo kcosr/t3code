@@ -75,6 +75,9 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
         expiresAt: now + 120_000,
       });
 
+      expect(created.status).toBe("claimed");
+      expect(retried.status).toBe("claimed");
+      if (created.status !== "claimed" || retried.status !== "claimed") return;
       expect(retried.status).toBe("claimed");
       expect(retried.operation.operationId).toBe(created.operation.operationId);
       expect(retried.operation.lastSequence).toBe(1);
@@ -82,6 +85,11 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
       expect(
         yield* store.authorize(operationId, "rotated-operation-token-hash", now),
       ).toMatchObject({ operationId, runtimeGeneration: 3 });
+      expect(yield* store.acknowledge(operationId, claimInput.tokenHash, 1, now)).toBe("revoked");
+      expect(yield* store.cancel(operationId, claimInput.tokenHash, nowIso, now)).toBe("revoked");
+      expect(yield* store.acknowledge(operationId, "rotated-operation-token-hash", 1, now)).toBe(
+        "acknowledged",
+      );
 
       const sql = yield* SqlClient.SqlClient;
       yield* sql`UPDATE voice_native_runtime_grants SET generation = 4
@@ -89,6 +97,19 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
       expect(
         yield* store.authorize(operationId, "rotated-operation-token-hash", now),
       ).toBeUndefined();
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("transactionally rejects a claim after the exact parent generation rotates", () =>
+    Effect.gen(function* () {
+      yield* initialize;
+      const store = yield* VoiceNativeThreadTurnStore;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE voice_native_runtime_grants SET generation = 4
+        WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`;
+
+      expect(yield* store.claim(claimInput)).toEqual({ status: "revoked" });
+      expect(yield* store.get(operationId)).toBeUndefined();
     }).pipe(Effect.provide(testLayer)),
   );
 
@@ -122,10 +143,76 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
       });
       const events = yield* store.listEvents(operationId, 1, 100);
       expect(events.map((event) => event.sequence)).toEqual([2, 3, 4]);
-      expect(yield* store.acknowledge(operationId, 2)).toBe(true);
-      expect(yield* store.acknowledge(operationId, 1)).toBe(true);
-      expect(yield* store.acknowledge(operationId, 5)).toBe(false);
+      expect(yield* store.acknowledge(operationId, claimInput.tokenHash, 2, now)).toBe(
+        "acknowledged",
+      );
+      expect(yield* store.acknowledge(operationId, claimInput.tokenHash, 1, now)).toBe(
+        "acknowledged",
+      );
+      expect(yield* store.acknowledge(operationId, claimInput.tokenHash, 5, now)).toBe("invalid");
       expect((yield* store.get(operationId))?.acknowledgedSequence).toBe(2);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("releases a processing lease and exposes a consistent event page", () =>
+    Effect.gen(function* () {
+      yield* initialize;
+      const store = yield* VoiceNativeThreadTurnStore;
+      yield* store.claim(claimInput);
+      yield* store.claimProcessing(operationId, "lease", now, now + 1_000, nowIso);
+
+      expect(
+        yield* store.releaseProcessing(operationId, "lease", nowIso, "transcription-failed", true),
+      ).toBe(true);
+      expect(yield* store.get(operationId)).toMatchObject({
+        phase: "created",
+        processingLeaseToken: null,
+        processingLeaseUntil: null,
+      });
+      const page = yield* store.readEventPage(operationId, claimInput.tokenHash, now, 0, 100);
+      expect(page).toBeDefined();
+      expect(page?.events.at(-1)).toMatchObject({
+        sequence: page?.operation.lastSequence,
+        type: "failure",
+        retryable: true,
+      });
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("finalizes only the scoped expired active operation before a replacement claim", () =>
+    Effect.gen(function* () {
+      yield* initialize;
+      const store = yield* VoiceNativeThreadTurnStore;
+      yield* store.claim({ ...claimInput, expiresAt: now + 100 });
+      const replacementId = VoiceNativeThreadTurnOperationId.make("replacement-operation");
+
+      const replacement = yield* store.claim({
+        ...claimInput,
+        operationId: replacementId,
+        clientOperationId: "replacement-client-operation",
+        tokenHash: "replacement-operation-token-hash",
+        nowEpochMillis: now + 101,
+        now: "2026-07-13T12:00:00.101Z",
+        expiresAt: now + 60_000,
+      });
+
+      expect(replacement.status).toBe("claimed");
+      expect(yield* store.get(operationId)).toMatchObject({
+        phase: "failed",
+        speechTerminal: "failed",
+      });
+      expect(yield* store.authorize(operationId, claimInput.tokenHash, now + 101)).toMatchObject({
+        phase: "failed",
+      });
+      expect(
+        yield* store.readEventPage(operationId, claimInput.tokenHash, now + 101, 0, 100),
+      ).toMatchObject({ operation: { phase: "failed" } });
+      expect(yield* store.listEvents(operationId, 0, 100)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "failure", code: "operation-expired" }),
+          expect.objectContaining({ type: "terminal", outcome: "failed" }),
+        ]),
+      );
     }).pipe(Effect.provide(testLayer)),
   );
 
@@ -153,7 +240,7 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
         const sql = yield* SqlClient.SqlClient;
         yield* sql`UPDATE voice_native_runtime_grants SET generation = 4
         WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`;
-        expect(yield* store.authorize(operationId, claimInput.tokenHash, now)).toBeDefined();
+        expect(yield* store.authorize(operationId, claimInput.tokenHash, now)).toBeUndefined();
 
         const segment = {
           operationId,
@@ -183,7 +270,7 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
       expect(yield* store.claimProcessing(operationId, "lease", now, now + 1_000, nowIso)).toBe(
         true,
       );
-      expect(yield* store.cancel(operationId, nowIso)).toBe("cancelled");
+      expect(yield* store.cancel(operationId, claimInput.tokenHash, nowIso, now)).toBe("cancelled");
       expect(yield* store.beginDispatch(operationId, "lease", now, nowIso)).toBe(false);
       const operation = yield* store.get(operationId);
       expect(operation).toMatchObject({
@@ -230,7 +317,9 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
         { phase: "transcribing" },
       );
       expect(yield* store.beginDispatch(operationId, "lease", now, nowIso)).toBe(true);
-      expect(yield* store.cancel(operationId, nowIso)).toBe("dispatch-committed");
+      expect(yield* store.cancel(operationId, claimInput.tokenHash, nowIso, now)).toBe(
+        "dispatch-committed",
+      );
       expect(
         yield* store.acceptDispatch({
           operationId,
@@ -264,6 +353,53 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
+  it.effect(
+    "revokes every native child capability when parent cleanup fails without losing accepted work",
+    () =>
+      Effect.gen(function* () {
+        yield* initialize;
+        const store = yield* VoiceNativeThreadTurnStore;
+        const sql = yield* SqlClient.SqlClient;
+        yield* store.claim(claimInput);
+        yield* store.claimProcessing(operationId, "lease", now, now + 1_000, nowIso);
+        yield* store.appendEvent(
+          operationId,
+          { type: "phase", occurredAt: nowIso, phase: "transcribing" },
+          { phase: "transcribing" },
+        );
+        yield* store.beginDispatch(operationId, "lease", now, nowIso);
+        yield* store.acceptDispatch({
+          operationId,
+          leaseToken: "lease",
+          occurredAt: nowIso,
+          commandId: CommandId.make("command"),
+          messageId: MessageId.make("message"),
+        });
+
+        // Simulate the durable parent deletion succeeding while derived-row cleanup fails.
+        yield* sql`DELETE FROM voice_native_runtime_grants
+          WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`;
+
+        expect(yield* store.authorize(operationId, claimInput.tokenHash, now)).toBeUndefined();
+        expect(
+          yield* store.readEventPage(operationId, claimInput.tokenHash, now, 0, 100),
+        ).toBeUndefined();
+        expect(yield* store.acknowledge(operationId, claimInput.tokenHash, 1, now)).toBe("revoked");
+        expect(yield* store.cancel(operationId, claimInput.tokenHash, nowIso, now)).toBe("revoked");
+        expect(yield* store.get(operationId)).toMatchObject({
+          phase: "waiting",
+          dispatchAccepted: true,
+        });
+        expect(
+          yield* store.appendEvent(operationId, {
+            type: "phase",
+            occurredAt: nowIso,
+            phase: "speaking",
+          }),
+        ).toMatchObject({ type: "phase", phase: "speaking" });
+      }).pipe(Effect.provide(testLayer)),
+  );
+
   it.effect("allows a dispatched voice operation to stop without retracting the thread turn", () =>
     Effect.gen(function* () {
       yield* initialize;
@@ -283,7 +419,7 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
         commandId: CommandId.make("command"),
         messageId: MessageId.make("message"),
       });
-      expect(yield* store.cancel(operationId, nowIso)).toBe("cancelled");
+      expect(yield* store.cancel(operationId, claimInput.tokenHash, nowIso, now)).toBe("cancelled");
       expect(yield* store.get(operationId)).toMatchObject({
         phase: "cancelled",
         dispatchAccepted: true,

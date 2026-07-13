@@ -30,6 +30,8 @@ export type {
   T3VoiceBackgroundPreparedReadiness,
   T3VoiceBackgroundReadinessActivateInput,
   T3VoiceBackgroundDisabledReadiness,
+  T3VoiceBackgroundOwnership,
+  T3VoiceBackgroundReadinessDisableIfIdleInput,
   T3VoiceBackgroundReadinessPrepareInput,
   T3VoiceBackgroundRealtimeAnswer,
   T3VoiceBackgroundRealtimeCloseInput,

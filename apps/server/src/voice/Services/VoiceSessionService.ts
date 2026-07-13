@@ -41,6 +41,11 @@ export interface VoiceSessionServiceShape {
     principal: VoiceSessionPrincipal,
     input: VoiceSessionCreateInput,
   ) => Effect.Effect<VoiceSessionCreateResult, VoiceError>;
+  readonly resumeCreate: (
+    principal: VoiceSessionPrincipal,
+    input: VoiceSessionCreateInput,
+    expectedSessionId: VoiceSessionId,
+  ) => Effect.Effect<VoiceSessionCreateResult, VoiceError>;
   readonly get: (
     ownerAuthSessionId: AuthSessionId,
     sessionId: VoiceSessionId,
@@ -72,6 +77,10 @@ export interface VoiceSessionServiceShape {
     waitMilliseconds: number,
   ) => Effect.Effect<VoiceSessionEventsResult, VoiceError>;
   readonly revokeAuthSession: (ownerAuthSessionId: AuthSessionId) => Effect.Effect<void>;
+  readonly revokeNativeRuntime: (
+    ownerAuthSessionId: AuthSessionId,
+    runtimeId: import("@t3tools/contracts").VoiceNativeRuntimeId,
+  ) => Effect.Effect<void>;
   readonly deleteConversation: (
     conversationId: VoiceConversationId,
   ) => Effect.Effect<boolean, VoiceError>;

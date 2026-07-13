@@ -121,6 +121,25 @@ export function masterVoiceEnvironmentId(
   return activeEnvironmentId ?? focus?.environmentId ?? fallbackEnvironmentId;
 }
 
+export function masterVoiceControllerEnvironmentId(input: {
+  readonly nativeOwnerChecked: boolean;
+  readonly nativeSessionId: string | null;
+  readonly nativeOwnerEnvironmentId: EnvironmentId | null;
+  readonly nativeOwnerFallbackEnvironmentId: EnvironmentId | null;
+  readonly activeEnvironmentId: EnvironmentId | null;
+  readonly focus: MasterVoiceFocus | null;
+  readonly fallbackEnvironmentId: EnvironmentId | null;
+}): EnvironmentId | null {
+  if (!input.nativeOwnerChecked) return null;
+  if (input.nativeSessionId !== null)
+    return input.nativeOwnerEnvironmentId ?? input.nativeOwnerFallbackEnvironmentId;
+  return masterVoiceEnvironmentId(
+    input.activeEnvironmentId,
+    input.focus,
+    input.fallbackEnvironmentId,
+  );
+}
+
 export function isSameMasterVoiceFocus(
   left: MasterVoiceFocus | null,
   right: MasterVoiceFocus | null,
@@ -162,4 +181,71 @@ export function reconcileMasterVoiceFocus(
       ? { type: "preserve" }
       : { type: "refresh", attachment: { ...attachment, focus } };
   return { type: "update", attachment: { ...attachment, focus } };
+}
+
+export function shouldRevokeUnavailableVoiceEnvironment(input: {
+  readonly nativeOwnerChecked: boolean;
+  readonly environmentId: EnvironmentId | null;
+  readonly catalogLoading: boolean;
+  readonly environmentAvailable: boolean;
+}): boolean {
+  return (
+    input.nativeOwnerChecked &&
+    !input.catalogLoading &&
+    (input.environmentId === null || !input.environmentAvailable)
+  );
+}
+
+export function shouldRetireUnresolvableNativeVoiceOwner(input: {
+  readonly nativeOwnerChecked: boolean;
+  readonly catalogLoading: boolean;
+  readonly environmentOrigin: string | null;
+  readonly environmentId: EnvironmentId | null;
+}): boolean {
+  return (
+    input.nativeOwnerChecked &&
+    !input.catalogLoading &&
+    input.environmentOrigin !== null &&
+    input.environmentId === null
+  );
+}
+
+export interface NativeRealtimeOwnerState {
+  readonly checked: boolean;
+  readonly sequence: number;
+  readonly sessionId: string | null;
+  readonly environmentOrigin: string | null;
+}
+
+export function acceptNativeRealtimeOwnerState(
+  current: NativeRealtimeOwnerState,
+  next: Omit<NativeRealtimeOwnerState, "checked">,
+): NativeRealtimeOwnerState {
+  return next.sequence < current.sequence ? current : { checked: true, ...next };
+}
+
+export function restoreMasterVoiceAttachment(input: {
+  readonly environmentId: EnvironmentId;
+  readonly persistedFocus: {
+    readonly projectId: ProjectId;
+    readonly threadId: ThreadId;
+  } | null;
+  readonly visibleFocus: MasterVoiceFocus | null;
+  readonly threadTitle: (threadId: ThreadId) => string;
+}): ActiveMasterVoiceAttachment {
+  if (input.persistedFocus !== null) {
+    return {
+      environmentId: input.environmentId,
+      focus: {
+        environmentId: input.environmentId,
+        projectId: input.persistedFocus.projectId,
+        threadId: input.persistedFocus.threadId,
+        threadTitle: input.threadTitle(input.persistedFocus.threadId),
+      },
+    };
+  }
+  return {
+    environmentId: input.environmentId,
+    focus: input.visibleFocus?.environmentId === input.environmentId ? input.visibleFocus : null,
+  };
 }

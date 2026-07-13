@@ -119,9 +119,6 @@ internal data class T3VoiceBackgroundSnapshot(
     require(!speechTerminal || noSpeech || finalSpeechSegment !== null) {
       "Terminal speech requires a final segment or explicit no-speech state."
     }
-    require(finalSpeechSegment === null || speechTerminal) {
-      "A final speech segment must terminate speech."
-    }
     when (mode) {
       T3VoiceBackgroundMode.REALTIME -> {
         require(
@@ -179,8 +176,14 @@ internal data class T3VoiceBackgroundSnapshot(
       ) { "Attention-required state requires its terminal summary." }
     }
     if (phase == T3VoiceBackgroundPhase.FAILED) {
-      require(responseTerminal && terminalSummary == T3VoiceBackgroundTerminalSummary.FAILED_RETRYABLE) {
-        "Recoverable failed state requires a retryable terminal summary."
+      require(
+        responseTerminal && terminalSummary in setOf(
+          T3VoiceBackgroundTerminalSummary.CANCELLED,
+          T3VoiceBackgroundTerminalSummary.FAILED_RETRYABLE,
+          T3VoiceBackgroundTerminalSummary.FAILED_PERMANENT,
+        ),
+      ) {
+        "Failed state requires a failure terminal summary."
       }
     }
   }

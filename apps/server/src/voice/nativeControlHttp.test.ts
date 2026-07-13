@@ -15,11 +15,21 @@ import {
   VoiceSessionId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Ref from "effect/Ref";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
 import * as HttpServer from "effect/unstable/http/HttpServer";
 
-import { voiceNativeControlRoutesLayer } from "./nativeControlHttp.ts";
+import {
+  protectNativeRealtimeStartCriticalSection,
+  voiceNativeControlRoutesLayer,
+} from "./nativeControlHttp.ts";
+import {
+  VoiceNativeRealtimeStartRepository,
+  type PersistedVoiceNativeRealtimeStart,
+} from "../persistence/Services/VoiceNativeRealtimeStarts.ts";
 import { VoiceError } from "./Errors.ts";
 import {
   VoiceNativeControlGrantRegistry,
@@ -33,6 +43,12 @@ const sessionId = VoiceSessionId.make("voice-session-native-http");
 const otherSessionId = VoiceSessionId.make("voice-session-native-http-other");
 const token = "native-control-http-token";
 const expiresAt = Date.parse("2026-07-12T18:00:00.000Z");
+const unusedStartRepositoryMaintenance = {
+  fail: () => Effect.succeed(true),
+  revokeRuntime: () => Effect.void,
+  revokeAuthSession: () => Effect.void,
+  purgeExpired: () => Effect.void,
+};
 
 const grantScope = {
   authSessionId: AuthSessionId.make("native-http-auth"),
@@ -51,7 +67,8 @@ const runWithServer = <A>(
     ) => VoiceNativeControlGrantScope | undefined;
     readonly phase?: "listening" | "ended";
     readonly heartbeatFails?: boolean;
-    readonly createError?: VoiceError;
+    readonly createError?: VoiceError | ((call: number) => VoiceError | undefined);
+    readonly resumeError?: VoiceError;
     readonly offerError?: VoiceError;
     readonly closeError?: VoiceError;
     readonly grants?: VoiceNativeControlGrantRegistry["Service"];
@@ -60,10 +77,43 @@ const runWithServer = <A>(
     readonly onCreate?: Parameters<VoiceSessionService["Service"]["create"]>[1] extends infer Input
       ? (input: Input) => void
       : never;
+    readonly startRepository?: VoiceNativeRealtimeStartRepository["Service"];
+    readonly onResume?: (expectedSessionId: VoiceSessionId) => void;
+    readonly bindFails?: boolean;
+    readonly onRevokeRuntime?: () => void;
   } = {},
 ) => {
   let calls = 0;
   let authorizeCalls = 0;
+  let createCalls = 0;
+  let runtimeRevoked = false;
+  let startRecord: PersistedVoiceNativeRealtimeStart | undefined;
+  const startRepository = VoiceNativeRealtimeStartRepository.of({
+    claim: (input) => {
+      if (startRecord?.failure?.retryable === true && startRecord.sessionId === null) {
+        startRecord = { ...input, sessionId: null, failure: null };
+        return Effect.succeed({ status: "claimed" as const });
+      }
+      if (startRecord !== undefined)
+        return Effect.succeed({ status: "existing" as const, record: startRecord });
+      startRecord = { ...input, sessionId: null, failure: null };
+      return Effect.succeed({ status: "claimed" as const });
+    },
+    bindSession: (_operationKey, boundSessionId) => {
+      if (startRecord === undefined) return Effect.succeed(false);
+      if (options.bindFails) return Effect.succeed(false);
+      startRecord = { ...startRecord, sessionId: boundSessionId };
+      return Effect.succeed(true);
+    },
+    fail: (_operationKey, failure) => {
+      if (startRecord === undefined || startRecord.sessionId !== null) return Effect.succeed(false);
+      startRecord = { ...startRecord, failure };
+      return Effect.succeed(true);
+    },
+    revokeRuntime: () => Effect.void,
+    revokeAuthSession: () => Effect.void,
+    purgeExpired: () => Effect.void,
+  });
   const grants = VoiceNativeControlGrantRegistry.of({
     issue: () => Effect.die("unused"),
     authorize: (candidate) => {
@@ -83,8 +133,13 @@ const runWithServer = <A>(
   });
   const sessions = Layer.mock(VoiceSessionService)({
     create: (_principal, input) => {
+      createCalls += 1;
       options.onCreate?.(input);
-      if (options.createError !== undefined) return Effect.fail(options.createError);
+      const createError =
+        typeof options.createError === "function"
+          ? options.createError(createCalls)
+          : options.createError;
+      if (createError !== undefined) return Effect.fail(createError);
       return Effect.succeed({
         state: {
           sessionId,
@@ -103,6 +158,34 @@ const runWithServer = <A>(
         nativeControlGrant: {
           token,
           sessionId,
+          leaseGeneration: 4,
+          expiresAt: "2026-07-12T18:00:00.000Z",
+          heartbeatIntervalSeconds: 8,
+          failureGraceSeconds: 30,
+        },
+      });
+    },
+    resumeCreate: (_principal, _input, expectedSessionId) => {
+      options.onResume?.(expectedSessionId);
+      if (options.resumeError !== undefined) return Effect.fail(options.resumeError);
+      return Effect.succeed({
+        state: {
+          sessionId: expectedSessionId,
+          conversationId: VoiceConversationId.make("native-http-conversation"),
+          mode: "realtime-agent",
+          phase: "signaling",
+          leaseGeneration: 4,
+          sequence: 0,
+        },
+        transport: {
+          kind: "webrtc-sdp-v1",
+          signalingPath: `/api/voice/sessions/${expectedSessionId}/webrtc-offer`,
+        },
+        expiresAt: "2026-07-12T18:00:00.000Z",
+        heartbeatIntervalSeconds: 8,
+        nativeControlGrant: {
+          token,
+          sessionId: expectedSessionId,
           leaseGeneration: 4,
           expiresAt: "2026-07-12T18:00:00.000Z",
           heartbeatIntervalSeconds: 8,
@@ -172,6 +255,11 @@ const runWithServer = <A>(
         closed: true,
       });
     },
+    revokeNativeRuntime: () =>
+      Effect.sync(() => {
+        runtimeRevoked = true;
+        options.onRevokeRuntime?.();
+      }),
   });
   const serverLayer = HttpRouter.serve(voiceNativeControlRoutesLayer, {
     disableListenLog: true,
@@ -183,13 +271,17 @@ const runWithServer = <A>(
         VoiceNativeRuntimeGrantRegistry,
         VoiceNativeRuntimeGrantRegistry.of({
           issue: () => Effect.die("unused"),
-          authorize: (candidate) => Effect.succeed(options.runtimeAuthorize?.(candidate)),
+          authorize: (candidate) =>
+            Effect.succeed(runtimeRevoked ? undefined : options.runtimeAuthorize?.(candidate)),
           revokeRuntime: () => Effect.succeed(false),
           revokeAuthSession: () => Effect.void,
         }),
       ),
     ),
     Layer.provide(sessions),
+    Layer.provide(
+      Layer.succeed(VoiceNativeRealtimeStartRepository, options.startRepository ?? startRepository),
+    ),
     Layer.provideMerge(
       NodeHttpServer.layer(NodeHttp.createServer, {
         host: "127.0.0.1",
@@ -232,10 +324,153 @@ const expectNoStore = (response: Response) =>
   expect(response.headers.get("cache-control")).toBe("no-store");
 
 describe("native voice control HTTP", () => {
+  const replayConversationId = VoiceConversationId.make("native-http-conversation");
+  const runtimeScopeForReplay: VoiceNativeRuntimeGrantScope = {
+    authSessionId: grantScope.authSessionId,
+    runtimeId: VoiceNativeRuntimeId.make("android-runtime"),
+    generation: 7,
+    grantedScopes: new Set(),
+    target: {
+      mode: "realtime",
+      conversation: {
+        type: "continue",
+        conversationId: replayConversationId,
+      },
+      focus: { type: "none" },
+    },
+    expiresAt: Date.parse("2099-01-01T00:00:00.000Z"),
+  };
+
+  it.effect("reports a recently unbound durable start as pending without creating", () => {
+    let createCalls = 0;
+    const record: PersistedVoiceNativeRealtimeStart = {
+      operationKey: "native:android-runtime:7:ignored",
+      authSessionId: runtimeScopeForReplay.authSessionId,
+      runtimeId: runtimeScopeForReplay.runtimeId,
+      runtimeGeneration: 7,
+      clientOperationId: "ambiguous-start",
+      conversationId: replayConversationId,
+      sessionId: null,
+      failure: null,
+      claimExpiresAt: Number.MAX_SAFE_INTEGER,
+      expiresAt: runtimeScopeForReplay.expiresAt,
+    };
+    const repository = VoiceNativeRealtimeStartRepository.of({
+      ...unusedStartRepositoryMaintenance,
+      claim: () => Effect.succeed({ status: "existing" as const, record }),
+      bindSession: () => Effect.die("unused"),
+    });
+    return runWithServer(
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/voice/native/realtime-sessions`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-t3-voice-runtime": "runtime-token" },
+          body: '{"runtimeId":"android-runtime","generation":7,"clientOperationId":"ambiguous-start"}',
+        });
+        expect(response.status).toBe(409);
+        expect(await response.json()).toMatchObject({ reason: "lease-conflict", retryable: true });
+        expect(createCalls).toBe(0);
+      },
+      {
+        runtimeAuthorize: (candidate) =>
+          candidate === "runtime-token" ? runtimeScopeForReplay : undefined,
+        startRepository: repository,
+        onCreate: () => {
+          createCalls += 1;
+        },
+      },
+    );
+  });
+
+  it.effect("reports an abandoned unbound durable start as no-session without creating", () => {
+    let createCalls = 0;
+    const repository = VoiceNativeRealtimeStartRepository.of({
+      ...unusedStartRepositoryMaintenance,
+      claim: (input) =>
+        Effect.succeed({
+          status: "existing" as const,
+          record: { ...input, sessionId: null, failure: null, claimExpiresAt: -1 },
+        }),
+      bindSession: () => Effect.die("unused"),
+    });
+    return runWithServer(
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/voice/native/realtime-sessions`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-t3-voice-runtime": "runtime-token",
+          },
+          body: '{"runtimeId":"android-runtime","generation":7,"clientOperationId":"abandoned-start"}',
+        });
+        expect(response.status).toBe(404);
+        expect(await response.json()).toMatchObject({
+          reason: "session-not-found",
+          retryable: false,
+        });
+        expect(createCalls).toBe(0);
+      },
+      {
+        runtimeAuthorize: (candidate) =>
+          candidate === "runtime-token" ? runtimeScopeForReplay : undefined,
+        startRepository: repository,
+        onCreate: () => {
+          createCalls += 1;
+        },
+      },
+    );
+  });
+
+  it.effect("does not recreate a bound native start whose session is absent after restart", () => {
+    let createCalls = 0;
+    let resumed: VoiceSessionId | undefined;
+    const priorSessionId = VoiceSessionId.make("prior-native-session");
+    const repository = VoiceNativeRealtimeStartRepository.of({
+      ...unusedStartRepositoryMaintenance,
+      claim: (input) =>
+        Effect.succeed({
+          status: "existing" as const,
+          record: { ...input, sessionId: priorSessionId, failure: null },
+        }),
+      bindSession: () => Effect.die("unused"),
+    });
+    return runWithServer(
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/voice/native/realtime-sessions`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-t3-voice-runtime": "runtime-token" },
+          body: '{"runtimeId":"android-runtime","generation":7,"clientOperationId":"restart-replay"}',
+        });
+        expect(response.status).toBe(404);
+        expect(await response.json()).toMatchObject({ reason: "session-not-found" });
+        expect(resumed).toBe(priorSessionId);
+        expect(createCalls).toBe(0);
+      },
+      {
+        runtimeAuthorize: (candidate) =>
+          candidate === "runtime-token" ? runtimeScopeForReplay : undefined,
+        startRepository: repository,
+        onCreate: () => {
+          createCalls += 1;
+        },
+        onResume: (id) => {
+          resumed = id;
+        },
+        resumeError: new VoiceError({
+          reason: "session-not-found",
+          operation: "session.resume-create",
+          detail: "The original native voice session is no longer resident",
+          retryable: false,
+        }),
+      },
+    );
+  });
+
   it.effect("starts fresh Realtime only for the exact grant-bound conversation and focus", () => {
     const runtimeId = VoiceNativeRuntimeId.make("android-runtime");
     const conversationId = VoiceConversationId.make("grant-bound-conversation");
     const inputs: Array<Parameters<VoiceSessionService["Service"]["create"]>[1]> = [];
+    let resumedSessionId: VoiceSessionId | undefined;
     const runtimeScope: VoiceNativeRuntimeGrantScope = {
       authSessionId: grantScope.authSessionId,
       runtimeId,
@@ -270,17 +505,21 @@ describe("native voice control HTTP", () => {
             },
           });
         }
-        expect(inputs).toHaveLength(2);
+        expect(inputs).toHaveLength(1);
         expect(inputs[0]).toMatchObject({
           conversation: { type: "continue", conversationId, takeover: false },
           projectId: "project-bound",
           threadId: "thread-bound",
         });
-        expect(inputs[1]?.idempotencyKey).toBe(inputs[0]?.idempotencyKey);
+        expect(inputs[0]?.idempotencyKey).toContain(`native:${grantScope.authSessionId}:`);
+        expect(resumedSessionId).toBe(sessionId);
       },
       {
         runtimeAuthorize: (candidate) => (candidate === "runtime-token" ? runtimeScope : undefined),
         onCreate: (input) => inputs.push(input),
+        onResume: (id) => {
+          resumedSessionId = id;
+        },
       },
     );
   });
@@ -352,7 +591,8 @@ describe("native voice control HTTP", () => {
     ),
   );
 
-  it.effect("preserves actionable voice failures after native credentials are authorized", () => {
+  it.effect("retries an authoritative retryable start failure with the same operation", () => {
+    let createCalls = 0;
     const providerError = new VoiceError({
       reason: "provider-unavailable",
       operation: "native-http-test",
@@ -361,21 +601,28 @@ describe("native voice control HTTP", () => {
     });
     return runWithServer(
       async (baseUrl) => {
-        const response = await fetch(`${baseUrl}/api/voice/native/realtime-sessions`, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-t3-voice-runtime": "runtime-token",
-          },
-          body: '{"runtimeId":"android-runtime","generation":7,"clientOperationId":"failed-start"}',
-        });
-        expect(response.status).toBe(503);
-        expect(await response.json()).toEqual({
-          code: "voice_operation_failed",
-          reason: "provider-unavailable",
-          message: "Realtime provider is temporarily unavailable",
-          retryable: true,
-        });
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const response = await fetch(`${baseUrl}/api/voice/native/realtime-sessions`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-t3-voice-runtime": "runtime-token",
+            },
+            body: '{"runtimeId":"android-runtime","generation":7,"clientOperationId":"failed-start"}',
+          });
+          expect(response.status).toBe(attempt === 0 ? 503 : 200);
+          expect(await response.json()).toMatchObject(
+            attempt === 0
+              ? {
+                  code: "voice_operation_failed",
+                  reason: "provider-unavailable",
+                  message: "Realtime provider is temporarily unavailable",
+                  retryable: true,
+                }
+              : { state: { sessionId } },
+          );
+        }
+        expect(createCalls).toBe(2);
       },
       {
         runtimeAuthorize: (candidate) =>
@@ -396,10 +643,71 @@ describe("native voice control HTTP", () => {
                 expiresAt,
               }
             : undefined,
-        createError: providerError,
+        createError: (call) => (call === 1 ? providerError : undefined),
+        onCreate: () => {
+          createCalls += 1;
+        },
       },
     );
   });
+
+  it.effect("closes only the orphaned session when durable binding is rejected", () => {
+    let createCalls = 0;
+    let runtimeRevocations = 0;
+    return runWithServer(
+      async (baseUrl, closeCalls) => {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const response = await fetch(`${baseUrl}/api/voice/native/realtime-sessions`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-t3-voice-runtime": "runtime-token",
+            },
+            body: '{"runtimeId":"android-runtime","generation":7,"clientOperationId":"bind-failure"}',
+          });
+          expect(response.status).toBe(503);
+          expect(await response.json()).toMatchObject({
+            reason: "provider-unavailable",
+            retryable: true,
+          });
+        }
+        expect(createCalls).toBe(2);
+        expect(closeCalls()).toBe(2);
+        expect(runtimeRevocations).toBe(0);
+      },
+      {
+        runtimeAuthorize: (candidate) =>
+          candidate === "runtime-token" ? runtimeScopeForReplay : undefined,
+        bindFails: true,
+        onCreate: () => {
+          createCalls += 1;
+        },
+        onRevokeRuntime: () => {
+          runtimeRevocations += 1;
+        },
+      },
+    );
+  });
+
+  it.effect("finishes the create-to-bind critical section after interruption", () =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const completed = yield* Ref.make(false);
+      const operation = protectNativeRealtimeStartCriticalSection(
+        Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.andThen(Ref.set(completed, true)),
+        ),
+      );
+      const operationFiber = yield* operation.pipe(Effect.forkChild);
+      yield* Deferred.await(started);
+      const interruption = yield* Fiber.interrupt(operationFiber).pipe(Effect.forkChild);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(interruption);
+      expect(yield* Ref.get(completed)).toBe(true);
+    }),
+  );
 
   it.effect(
     "does not collapse authorized signaling or close failures into authentication errors",

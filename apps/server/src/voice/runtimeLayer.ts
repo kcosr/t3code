@@ -13,6 +13,7 @@ import { VoiceToolCallRepositoryLive } from "../persistence/Layers/VoiceToolCall
 import { VoiceHandoffActionRepositoryLive } from "../persistence/Layers/VoiceHandoffActions.ts";
 import { VoiceNativeControlGrantRepositoryLive } from "../persistence/Layers/VoiceNativeControlGrants.ts";
 import { VoiceNativeRuntimeGrantRepositoryLive } from "../persistence/Layers/VoiceNativeRuntimeGrants.ts";
+import { VoiceNativeRealtimeStartRepositoryLive } from "../persistence/Layers/VoiceNativeRealtimeStarts.ts";
 import { VoiceContextCompilerLive } from "./Layers/VoiceContextCompiler.ts";
 import { VoiceSessionServiceLive } from "./Layers/VoiceSessionService.ts";
 import { VoiceSessionLifecycleLive } from "./Layers/VoiceSessionLifecycle.ts";
@@ -109,11 +110,13 @@ const VoiceCoreDependenciesLive = Layer.mergeAll(
   VoiceHandoffActionRepositoryLive,
   VoiceNativeControlGrantRepositoryLive,
   VoiceNativeRuntimeGrantRepositoryLive,
+  VoiceNativeRealtimeStartRepositoryLive,
   VoiceNativeThreadTurnStoreLive,
   VoiceNativeRuntimeGrantRegistryLive.pipe(
     Layer.provide(
       Layer.mergeAll(
         VoiceNativeRuntimeGrantRepositoryLive,
+        VoiceNativeRealtimeStartRepositoryLive,
         VoiceNativeThreadTurnStoreLive,
         VoiceNativeControlGrantRegistryLive.pipe(
           Layer.provide(VoiceNativeControlGrantRepositoryLive),

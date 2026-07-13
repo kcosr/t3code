@@ -27,9 +27,47 @@ internal class T3VoiceBackgroundRealtimeCleanupTest {
   }
 
   @Test
-  fun `only verified terminal outcomes complete cleanup`() {
+  fun `authoritative retryable start failure keeps cleanup fenced until retry succeeds`() {
+    assertEquals(
+      T3VoiceBackgroundRealtimeCleanupDecision.RETRY,
+      T3VoiceBackgroundRealtimeCleanupPolicy.startFailure(
+        T3VoiceBackgroundRealtimeResult.Failure(
+          T3VoiceBackgroundHttpFailureKind.RETRYABLE,
+          503,
+        ),
+      ),
+    )
+    assertFalse(T3VoiceBackgroundRealtimeCleanupPolicy.canStartNewSession(marker(), false))
+    assertEquals(
+      T3VoiceBackgroundRealtimeCleanupDecision.RETRY,
+      T3VoiceBackgroundRealtimeCleanupPolicy.startFailure(
+        T3VoiceBackgroundRealtimeResult.Failure(
+          T3VoiceBackgroundHttpFailureKind.CONFLICT,
+          409,
+        ),
+      ),
+    )
     assertEquals(
       T3VoiceBackgroundRealtimeCleanupDecision.COMPLETE,
+      T3VoiceBackgroundRealtimeCleanupPolicy.startFailure(
+        T3VoiceBackgroundRealtimeResult.Failure(
+          T3VoiceBackgroundHttpFailureKind.PERMANENT,
+          404,
+        ),
+      ),
+    )
+    assertEquals(
+      T3VoiceBackgroundRealtimeCleanupDecision.COMPLETE,
+      T3VoiceBackgroundRealtimeCleanupPolicy.closeResult(
+        T3VoiceBackgroundRealtimeResult.Success(closeResult(closed = true, phase = "ended")),
+      ),
+    )
+  }
+
+  @Test
+  fun `unverifiable terminal outcomes require authority reconciliation`() {
+    assertEquals(
+      T3VoiceBackgroundRealtimeCleanupDecision.BLOCKED,
       T3VoiceBackgroundRealtimeCleanupPolicy.closeResult(
         T3VoiceBackgroundRealtimeResult.Failure(
           T3VoiceBackgroundHttpFailureKind.AUTHORITY_REJECTED,
@@ -66,6 +104,14 @@ internal class T3VoiceBackgroundRealtimeCleanupTest {
       T3VoiceBackgroundRealtimeCleanupPolicy.closeResult(
         T3VoiceBackgroundRealtimeResult.Success(closeResult(closed = true, phase = "ended")),
       ),
+    )
+    val readiness = T3VoiceReadinessConfig(enabled = true, generation = 7)
+    val reconciliation = T3VoiceBackgroundRealtimeReconciliationPolicy.fence(readiness, marker())
+    assertFalse(reconciliation.readiness.enabled)
+    assertEquals(8L, reconciliation.readiness.generation)
+    assertEquals(
+      T3VoicePendingRuntimeRevocation("runtime-1", "https://environment.example.test"),
+      reconciliation.pendingRevocation,
     )
   }
 
@@ -114,6 +160,21 @@ internal class T3VoiceBackgroundRealtimeCleanupTest {
         ),
       ),
     )
+  }
+
+  @Test
+  fun `primary cannot queue a surprise restart and stop clears restore request`() {
+    val restore = T3VoiceBackgroundRealtimeRestartRequest.RESTORE_INTERRUPTED_SESSION
+    assertEquals(
+      restore,
+      T3VoiceBackgroundRealtimeRestartPolicy.afterControl(restore, T3VoiceControlCommand.PRIMARY),
+    )
+    assertEquals(
+      T3VoiceBackgroundRealtimeRestartRequest.NONE,
+      T3VoiceBackgroundRealtimeRestartPolicy.afterControl(restore, T3VoiceControlCommand.STOP),
+    )
+    assertTrue(T3VoiceBackgroundRealtimeRestartPolicy.shouldRestart(restore))
+    assertFalse(T3VoiceBackgroundRealtimeRestartPolicy.shouldRestart(T3VoiceBackgroundRealtimeRestartRequest.NONE))
   }
 
   private fun marker() =

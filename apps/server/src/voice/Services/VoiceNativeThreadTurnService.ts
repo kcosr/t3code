@@ -17,6 +17,7 @@ import type * as Stream from "effect/Stream";
 import type { VoiceError } from "../Errors.ts";
 
 export interface VoiceNativeThreadTurnServiceShape {
+  readonly authorizeCreate: (runtimeToken: string) => Effect.Effect<void, VoiceError>;
   readonly authorizeOperation: (
     operationToken: string,
     operationId: VoiceNativeThreadTurnOperationId,

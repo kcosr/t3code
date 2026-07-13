@@ -85,7 +85,6 @@ internal class T3VoiceBackgroundStateTest {
         transition,
         T3VoiceBackgroundEvent.PlaybackDrained("operation-1", 0),
         T3VoiceBackgroundPhase.PLAYBACK_DRAINED,
-        T3VoiceBackgroundCommand.SCHEDULE_REARM_GUARD,
       )
     transition =
       reduce(
@@ -130,7 +129,23 @@ internal class T3VoiceBackgroundStateTest {
         serverEvent(3, T3VoiceBackgroundServerPhase.COMPLETED),
       )
     assertEquals(T3VoiceBackgroundPhase.PLAYBACK_DRAINED, completed.snapshot.phase)
-    assertTrue(T3VoiceBackgroundCommand.SCHEDULE_REARM_GUARD in completed.commands)
+    assertFalse(T3VoiceBackgroundCommand.SCHEDULE_REARM_GUARD in completed.commands)
+  }
+
+  @Test
+  fun `final segment advertisement waits for explicit speech terminal`() {
+    val advertised = T3VoiceBackgroundReducer.reduce(
+      activeWaitingSnapshot(autoRearm = true),
+      serverEvent(2, T3VoiceBackgroundServerPhase.SPEAKING, speechSegmentIndex = 0,
+        finalSpeechSegment = true, speechTerminal = false),
+    ).snapshot
+    assertEquals(0, advertised.finalSpeechSegment)
+    assertFalse(advertised.speechTerminal)
+    val terminal = T3VoiceBackgroundReducer.reduce(
+      advertised,
+      serverEvent(3, T3VoiceBackgroundServerPhase.SPEAKING, speechTerminal = true),
+    ).snapshot
+    assertTrue(terminal.speechTerminal)
   }
 
   @Test
@@ -226,7 +241,7 @@ internal class T3VoiceBackgroundStateTest {
       )
     assertTrue(completed.snapshot.noSpeech)
     assertEquals(T3VoiceBackgroundPhase.PLAYBACK_DRAINED, completed.snapshot.phase)
-    assertTrue(T3VoiceBackgroundCommand.SCHEDULE_REARM_GUARD in completed.commands)
+    assertFalse(T3VoiceBackgroundCommand.SCHEDULE_REARM_GUARD in completed.commands)
   }
 
   @Test
@@ -253,7 +268,7 @@ internal class T3VoiceBackgroundStateTest {
     assertEquals("operation-1", completed.snapshot.operationId)
     assertTrue(T3VoiceBackgroundCommand.CANCEL_UNDISPATCHED_OPERATION in completed.commands)
     assertTrue(T3VoiceBackgroundCommand.DELETE_RECORDING in completed.commands)
-    assertTrue(T3VoiceBackgroundCommand.SCHEDULE_REARM_GUARD in completed.commands)
+    assertFalse(T3VoiceBackgroundCommand.SCHEDULE_REARM_GUARD in completed.commands)
   }
 
   @Test
@@ -421,7 +436,7 @@ internal class T3VoiceBackgroundStateTest {
   }
 
   @Test
-  fun `server cancellation and permanent failure abandon finalized recording`() {
+  fun `server cancellation and permanent failure retain operation through acknowledgement`() {
     listOf(
       T3VoiceBackgroundServerPhase.CANCELLED,
       T3VoiceBackgroundServerPhase.FAILED_PERMANENT,
@@ -433,13 +448,14 @@ internal class T3VoiceBackgroundStateTest {
           messageId = null,
           turnId = null,
         )
-      val abandoned =
+      val terminal =
         T3VoiceBackgroundReducer.reduce(current, serverEvent(2, terminalPhase))
-      assertEquals(T3VoiceBackgroundPhase.IDLE, abandoned.snapshot.phase)
-      assertTrue(T3VoiceBackgroundCommand.CANCEL_UNDISPATCHED_OPERATION in abandoned.commands)
-      assertTrue(T3VoiceBackgroundCommand.DELETE_RECORDING in abandoned.commands)
-      assertEquals(null, abandoned.snapshot.operationId)
-      assertEquals(null, abandoned.snapshot.recordingId)
+      assertEquals(T3VoiceBackgroundPhase.FAILED, terminal.snapshot.phase)
+      assertTrue(terminal.snapshot.responseTerminal)
+      assertEquals("operation-1", terminal.snapshot.operationId)
+      assertEquals("recording-1", terminal.snapshot.recordingId)
+      assertFalse(T3VoiceBackgroundCommand.CANCEL_UNDISPATCHED_OPERATION in terminal.commands)
+      assertFalse(T3VoiceBackgroundCommand.DELETE_RECORDING in terminal.commands)
     }
   }
 

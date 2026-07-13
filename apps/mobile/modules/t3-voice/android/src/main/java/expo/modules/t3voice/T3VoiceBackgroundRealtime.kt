@@ -263,18 +263,36 @@ internal object T3VoiceBackgroundRealtimeJson {
 
 internal fun interface T3VoiceBackgroundRealtimeHttp {
   fun execute(request: T3VoiceBackgroundHttpRequest): T3VoiceBackgroundHttpResult
+
+  fun newCall(request: T3VoiceBackgroundHttpRequest): T3VoiceBackgroundHttpCall? = null
+}
+
+internal class T3VoiceBackgroundRealtimeCall<T>(
+  private val executeBlock: () -> T3VoiceBackgroundRealtimeResult<T>,
+  private val cancelBlock: () -> Unit,
+) {
+  fun execute(): T3VoiceBackgroundRealtimeResult<T> = executeBlock()
+
+  fun cancel() = cancelBlock()
 }
 
 internal class T3VoiceBackgroundRealtimeDelegate(
   private val http: T3VoiceBackgroundRealtimeHttp =
-    T3VoiceBackgroundRealtimeHttp(T3VoiceBackgroundHttpTransport()::execute),
+    productionHttp(),
 ) {
   fun start(
     origin: String,
     runtimeGrantToken: String,
     input: T3VoiceBackgroundRealtimeStartInput,
   ): T3VoiceBackgroundRealtimeResult<T3VoiceBackgroundRealtimeStartResult> =
-    executeJson(
+    newStartCall(origin, runtimeGrantToken, input).execute()
+
+  fun newStartCall(
+    origin: String,
+    runtimeGrantToken: String,
+    input: T3VoiceBackgroundRealtimeStartInput,
+  ): T3VoiceBackgroundRealtimeCall<T3VoiceBackgroundRealtimeStartResult> =
+    jsonCall(
       T3VoiceBackgroundHttpRequest(
         origin = origin,
         path = "/api/voice/native/realtime-sessions",
@@ -293,7 +311,15 @@ internal class T3VoiceBackgroundRealtimeDelegate(
     start: T3VoiceBackgroundRealtimeStartResult,
     sdp: String,
   ): T3VoiceBackgroundRealtimeResult<T3VoiceBackgroundRealtimeAnswer> =
-    executeJson(
+    newOfferCall(origin, controlGrantToken, start, sdp).execute()
+
+  fun newOfferCall(
+    origin: String,
+    controlGrantToken: String,
+    start: T3VoiceBackgroundRealtimeStartResult,
+    sdp: String,
+  ): T3VoiceBackgroundRealtimeCall<T3VoiceBackgroundRealtimeAnswer> =
+    jsonCall(
       T3VoiceBackgroundHttpRequest(
         origin = origin,
         path = start.signalingPath,
@@ -311,17 +337,18 @@ internal class T3VoiceBackgroundRealtimeDelegate(
         maximumResponseBytes = MAXIMUM_SIGNALING_BYTES.toInt(),
       ),
       T3VoiceBackgroundRealtimeJson::decodeAnswer,
-    ).validate { answer ->
+      validate = { answer ->
       answer.sessionId == start.state.sessionId &&
         answer.leaseGeneration == start.state.leaseGeneration
-    }
+      },
+    )
 
   fun close(
     origin: String,
     controlGrantToken: String,
     start: T3VoiceBackgroundRealtimeStartResult,
   ): T3VoiceBackgroundRealtimeResult<T3VoiceBackgroundRealtimeCloseResult> =
-    executeJson(
+    jsonCall(
       T3VoiceBackgroundHttpRequest(
         origin = origin,
         path = "/api/voice/native/realtime-sessions/${start.state.sessionId}/close",
@@ -332,16 +359,31 @@ internal class T3VoiceBackgroundRealtimeDelegate(
         maximumResponseBytes = MAXIMUM_CLOSE_BYTES.toInt(),
       ),
       T3VoiceBackgroundRealtimeJson::decodeClose,
-    ).validate { result ->
+      validate = { result ->
       result.state.sessionId == start.state.sessionId &&
         result.state.leaseGeneration == start.state.leaseGeneration
-    }
+      },
+    ).execute()
 
-  private fun <T> executeJson(
+  private fun <T> jsonCall(
     request: T3VoiceBackgroundHttpRequest,
     decode: (ByteArray) -> T,
+    validate: (T) -> Boolean = { true },
+  ): T3VoiceBackgroundRealtimeCall<T> {
+    val nativeCall = http.newCall(request)
+    return T3VoiceBackgroundRealtimeCall(
+      executeBlock = {
+        executeJsonResult(nativeCall?.execute() ?: http.execute(request), decode).validate(validate)
+      },
+      cancelBlock = { nativeCall?.cancel() },
+    )
+  }
+
+  private fun <T> executeJsonResult(
+    result: T3VoiceBackgroundHttpResult,
+    decode: (ByteArray) -> T,
   ): T3VoiceBackgroundRealtimeResult<T> =
-    when (val result = http.execute(request)) {
+    when (result) {
       is T3VoiceBackgroundHttpResult.Failure ->
         T3VoiceBackgroundRealtimeResult.Failure(result.kind, result.statusCode)
       is T3VoiceBackgroundHttpResult.Success ->
@@ -357,6 +399,24 @@ internal class T3VoiceBackgroundRealtimeDelegate(
           )
         }
     }
+
+  private companion object {
+    fun productionHttp(): T3VoiceBackgroundRealtimeHttp {
+      val transport = T3VoiceBackgroundHttpTransport()
+      return object : T3VoiceBackgroundRealtimeHttp {
+        override fun execute(request: T3VoiceBackgroundHttpRequest) = transport.execute(request)
+
+        override fun newCall(request: T3VoiceBackgroundHttpRequest) = transport.newCall(request)
+      }
+    }
+
+    const val RUNTIME_AUTHORITY_HEADER = "x-t3-voice-runtime"
+    const val CONTROL_AUTHORITY_HEADER = "x-t3-voice-control"
+    const val MAXIMUM_START_REQUEST_BYTES = 2_048L
+    const val MAXIMUM_START_RESPONSE_BYTES = 16 * 1_024
+    const val MAXIMUM_SIGNALING_BYTES = 128L * 1_024L
+    const val MAXIMUM_CLOSE_BYTES = 16L * 1_024L
+  }
 
   private fun <T> T3VoiceBackgroundRealtimeResult<T>.validate(
     predicate: (T) -> Boolean,
@@ -374,14 +434,6 @@ internal class T3VoiceBackgroundRealtimeDelegate(
   private fun jsonBody(bytes: ByteArray) =
     T3VoiceBackgroundByteArrayBody(bytes, "application/json")
 
-  private companion object {
-    const val RUNTIME_AUTHORITY_HEADER = "x-t3-voice-runtime"
-    const val CONTROL_AUTHORITY_HEADER = "x-t3-voice-control"
-    const val MAXIMUM_START_REQUEST_BYTES = 2_048L
-    const val MAXIMUM_START_RESPONSE_BYTES = 16 * 1_024
-    const val MAXIMUM_SIGNALING_BYTES = 128L * 1_024L
-    const val MAXIMUM_CLOSE_BYTES = 16L * 1_024L
-  }
 }
 
 private fun requireBoundedIdentifier(

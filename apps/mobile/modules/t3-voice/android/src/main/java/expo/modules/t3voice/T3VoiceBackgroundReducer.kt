@@ -212,10 +212,7 @@ internal object T3VoiceBackgroundReducer {
     require(!event.noSpeech || (event.speechTerminal && segment === null && !event.finalSpeechSegment)) {
       "No-speech events must explicitly terminate an empty speech stream."
     }
-    require(!event.finalSpeechSegment || event.speechTerminal) {
-      "Final speech segments must explicitly terminate speech."
-    }
-    require(!event.speechTerminal || event.noSpeech || event.finalSpeechSegment) {
+    require(!event.speechTerminal || event.noSpeech || event.finalSpeechSegment || current.finalSpeechSegment !== null) {
       "Terminal speech events require a final segment or no-speech marker."
     }
     if (segment !== null) {
@@ -276,20 +273,24 @@ internal object T3VoiceBackgroundReducer {
             responseTerminal = true,
             terminalSummary = T3VoiceBackgroundTerminalSummary.ATTENTION_REQUIRED,
           )
-        T3VoiceBackgroundServerPhase.CANCELLED -> {
-          commands += abandonmentCommands(next)
-          idleAfterOperation(next, T3VoiceBackgroundTerminalSummary.CANCELLED)
-        }
+        T3VoiceBackgroundServerPhase.CANCELLED ->
+          next.copy(
+            phase = T3VoiceBackgroundPhase.FAILED,
+            responseTerminal = true,
+            terminalSummary = T3VoiceBackgroundTerminalSummary.CANCELLED,
+          )
         T3VoiceBackgroundServerPhase.FAILED_RETRYABLE ->
           next.copy(
             phase = T3VoiceBackgroundPhase.FAILED,
             responseTerminal = true,
             terminalSummary = T3VoiceBackgroundTerminalSummary.FAILED_RETRYABLE,
           )
-        T3VoiceBackgroundServerPhase.FAILED_PERMANENT -> {
-          commands += abandonmentCommands(next)
-          idleAfterOperation(next, T3VoiceBackgroundTerminalSummary.FAILED_PERMANENT)
-        }
+        T3VoiceBackgroundServerPhase.FAILED_PERMANENT ->
+          next.copy(
+            phase = T3VoiceBackgroundPhase.FAILED,
+            responseTerminal = true,
+            terminalSummary = T3VoiceBackgroundTerminalSummary.FAILED_PERMANENT,
+          )
       }
     if (next.responseTerminal && next.noSpeech && !next.dispatchAcknowledged) {
       commands += T3VoiceBackgroundCommand.CANCEL_UNDISPATCHED_OPERATION
@@ -300,7 +301,6 @@ internal object T3VoiceBackgroundReducer {
     }
     if (next.speechFullyDrained() && next.phase != T3VoiceBackgroundPhase.ATTENTION_REQUIRED) {
       next = next.copy(phase = T3VoiceBackgroundPhase.PLAYBACK_DRAINED)
-      if (next.autoRearm) commands += T3VoiceBackgroundCommand.SCHEDULE_REARM_GUARD
     }
     if (becameDispatched) {
       commands += T3VoiceBackgroundCommand.DELETE_RECORDING
@@ -340,7 +340,6 @@ internal object T3VoiceBackgroundReducer {
     val commands = mutableListOf<T3VoiceBackgroundCommand>()
     if (next.speechFullyDrained()) {
       next = next.copy(phase = T3VoiceBackgroundPhase.PLAYBACK_DRAINED)
-      if (next.autoRearm) commands += T3VoiceBackgroundCommand.SCHEDULE_REARM_GUARD
     }
     return T3VoiceBackgroundTransition(next, commands)
   }
@@ -419,26 +418,6 @@ internal object T3VoiceBackgroundReducer {
       commands.distinct(),
     )
   }
-
-  private fun abandonmentCommands(
-    snapshot: T3VoiceBackgroundSnapshot,
-  ): List<T3VoiceBackgroundCommand> =
-    buildList {
-      if (snapshot.operationId !== null) {
-        add(
-          if (snapshot.dispatchAcknowledged) {
-            T3VoiceBackgroundCommand.DETACH_DISPATCHED_OPERATION
-          } else {
-            T3VoiceBackgroundCommand.CANCEL_UNDISPATCHED_OPERATION
-          },
-        )
-      }
-      if (
-        snapshot.recordingId !== null && snapshot.phase != T3VoiceBackgroundPhase.RECORDING
-      ) {
-        add(T3VoiceBackgroundCommand.DELETE_RECORDING)
-      }
-    }
 
   private fun requireReady(current: T3VoiceBackgroundSnapshot, mode: T3VoiceBackgroundMode) {
     require(current.phase != T3VoiceBackgroundPhase.LOCKED && current.mode == mode)

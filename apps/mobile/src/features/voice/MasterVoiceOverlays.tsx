@@ -201,6 +201,7 @@ export function MasterVoiceCallBar(props: {
   readonly onResume: () => void;
   readonly resumePending: boolean;
   readonly onHistory: () => void;
+  readonly onRetryAttachment: () => void;
   readonly onStop: () => void;
 }) {
   const insets = useSafeAreaInsets();
@@ -285,10 +286,27 @@ export function MasterVoiceCallBar(props: {
           />
         </>
       ) : null}
+      {props.snapshot.phase === "error" &&
+      typeof props.snapshot.native?.activeRealtimeSessionId === "string" ? (
+        <ControlPill
+          icon="arrow.clockwise"
+          label="Retry"
+          accessibilityLabel="Retry voice attachment"
+          onPress={props.onRetryAttachment}
+        />
+      ) : null}
       <ControlPill
-        icon={props.snapshot.phase === "error" ? "xmark" : "stop.fill"}
+        icon={
+          props.snapshot.phase === "error" &&
+          typeof props.snapshot.native?.activeRealtimeSessionId !== "string"
+            ? "xmark"
+            : "stop.fill"
+        }
         accessibilityLabel={
-          props.snapshot.phase === "error" ? "Dismiss voice error" : "End voice session"
+          props.snapshot.phase === "error" &&
+          typeof props.snapshot.native?.activeRealtimeSessionId !== "string"
+            ? "Dismiss voice error"
+            : "End voice session"
         }
         variant="danger"
         onPress={props.onStop}

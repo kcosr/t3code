@@ -525,6 +525,40 @@ internal object T3VoiceDisablePolicy {
   ): Boolean = config.enabled && pending?.readinessGeneration != config.generation
 }
 
+internal object T3VoiceConditionalDisablePolicy {
+  fun canDisable(
+    expectedRuntimeId: String?,
+    expectedGeneration: Long?,
+    readinessGeneration: Long,
+    authorityIdentities: List<Pair<String, Long>>,
+    nativeVoiceActive: Boolean,
+  ): Boolean {
+    if ((expectedRuntimeId == null) != (expectedGeneration == null) || nativeVoiceActive) return false
+    val distinct = authorityIdentities.distinct()
+    if (distinct.size > 1) return false
+    val actual = distinct.singleOrNull()
+    return if (expectedRuntimeId == null) {
+      actual == null
+    } else {
+      actual == (expectedRuntimeId to expectedGeneration) &&
+        readinessGeneration == expectedGeneration
+    }
+  }
+}
+
+internal object T3VoiceBackgroundPreparationPolicy {
+  fun canPrepare(
+    phase: T3VoiceRuntimePhase,
+    realtimeAttemptActive: Boolean,
+    threadAttemptActive: Boolean,
+    realtimeCleanupPending: Boolean,
+  ): Boolean =
+    phase == T3VoiceRuntimePhase.IDLE &&
+      !realtimeAttemptActive &&
+      !threadAttemptActive &&
+      !realtimeCleanupPending
+}
+
 internal object T3VoiceReadinessReconciliationPolicy {
   fun canApply(
     config: T3VoiceReadinessConfig,
@@ -540,6 +574,7 @@ internal enum class T3VoiceControlCommand {
 
 internal enum class T3VoiceControlDecision {
   START_NATIVE_REALTIME,
+  START_NATIVE_THREAD,
   REQUEST_CONTROLLER_START,
   STOP_ACTIVE,
   TOGGLE_REALTIME_MUTE,
@@ -552,6 +587,7 @@ internal object T3VoiceControlPolicy {
     phase: T3VoiceRuntimePhase,
     controllerAttached: Boolean,
     nativeRealtimeAvailable: Boolean = false,
+    nativeThreadAvailable: Boolean = false,
     readinessMode: T3VoiceReadinessMode = T3VoiceReadinessMode.REALTIME,
   ): T3VoiceControlDecision =
     when (command) {
@@ -570,6 +606,8 @@ internal object T3VoiceControlPolicy {
       T3VoiceControlCommand.PRIMARY ->
         if (phase == T3VoiceRuntimePhase.IDLE && nativeRealtimeAvailable) {
           T3VoiceControlDecision.START_NATIVE_REALTIME
+        } else if (phase == T3VoiceRuntimePhase.IDLE && nativeThreadAvailable) {
+          T3VoiceControlDecision.START_NATIVE_THREAD
         } else if (
           phase == T3VoiceRuntimePhase.IDLE &&
             readinessMode == T3VoiceReadinessMode.THREAD &&

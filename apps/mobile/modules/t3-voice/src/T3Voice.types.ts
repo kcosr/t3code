@@ -197,6 +197,23 @@ export interface T3VoiceBackgroundDisabledReadiness {
   readonly readiness: T3VoicePersistedReadinessSnapshot;
 }
 
+export interface T3VoiceBackgroundReadinessDisableIfIdleInput {
+  readonly expectedRuntimeId: string | null;
+  readonly expectedGeneration: number | null;
+}
+
+export interface T3VoiceBackgroundOwnership {
+  readonly sequence: number;
+  readonly active: boolean;
+  readonly phase: T3VoiceRuntimePhase;
+  readonly runtimeId: string | null;
+  readonly readinessGeneration: number;
+  readonly environmentOrigin: string;
+  readonly mode: T3VoiceReadinessMode;
+  readonly targetId: string | null;
+  readonly nativeSessionId: string | null;
+}
+
 export interface T3VoiceBackgroundAuthorityInspectInput {
   readonly readiness: T3VoiceReadinessSnapshot;
   readonly environmentOrigin: string;
@@ -422,6 +439,10 @@ export interface T3VoiceNativeModule {
     input: T3VoiceBackgroundAuthorityInspectInput,
   ) => Promise<T3VoiceBackgroundAuthoritySnapshot | null>;
   readonly disableBackgroundVoiceReadinessAsync: () => Promise<T3VoiceBackgroundDisabledReadiness>;
+  readonly disableBackgroundVoiceReadinessIfIdleAsync: (
+    input: T3VoiceBackgroundReadinessDisableIfIdleInput,
+  ) => Promise<T3VoiceBackgroundDisabledReadiness | null>;
+  readonly getBackgroundVoiceOwnershipAsync: () => Promise<T3VoiceBackgroundOwnership | null>;
   readonly getPendingBackgroundVoiceRuntimeRevocationAsync: () => Promise<T3VoiceBackgroundRuntimeRevocation | null>;
   readonly acknowledgeBackgroundVoiceRuntimeRevocationAsync: (
     input: T3VoiceBackgroundRuntimeRevocation,

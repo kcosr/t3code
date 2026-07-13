@@ -79,7 +79,8 @@ export interface VoiceNativeThreadTurnStoreShape {
   }) => Effect.Effect<
     | { readonly status: "claimed"; readonly operation: PersistedVoiceNativeThreadTurn }
     | { readonly status: "expired"; readonly operation: PersistedVoiceNativeThreadTurn }
-    | { readonly status: "mismatch"; readonly operation: PersistedVoiceNativeThreadTurn },
+    | { readonly status: "mismatch"; readonly operation: PersistedVoiceNativeThreadTurn }
+    | { readonly status: "revoked" },
     PersistenceSqlError
   >;
   readonly authorize: (
@@ -147,10 +148,26 @@ export interface VoiceNativeThreadTurnStoreShape {
     afterSequence: number,
     limit: number,
   ) => Effect.Effect<ReadonlyArray<VoiceNativeThreadTurnEvent>, PersistenceSqlError>;
+  readonly readEventPage: (
+    operationId: VoiceNativeThreadTurnOperationId,
+    tokenHash: string,
+    now: number,
+    afterSequence: number,
+    limit: number,
+  ) => Effect.Effect<
+    | {
+        readonly operation: PersistedVoiceNativeThreadTurn;
+        readonly events: ReadonlyArray<VoiceNativeThreadTurnEvent>;
+      }
+    | undefined,
+    PersistenceSqlError
+  >;
   readonly acknowledge: (
     operationId: VoiceNativeThreadTurnOperationId,
+    tokenHash: string,
     sequence: number,
-  ) => Effect.Effect<boolean, PersistenceSqlError>;
+    now: number,
+  ) => Effect.Effect<"acknowledged" | "invalid" | "revoked", PersistenceSqlError>;
   readonly putSpeechSegmentAndEvent: (
     segment: VoiceNativeThreadTurnSpeechSegmentRecord,
   ) => Effect.Effect<"inserted" | "existing" | "mismatch" | "terminal", PersistenceSqlError>;
@@ -170,8 +187,13 @@ export interface VoiceNativeThreadTurnStoreShape {
   ) => Effect.Effect<string | undefined, PersistenceSqlError>;
   readonly cancel: (
     operationId: VoiceNativeThreadTurnOperationId,
+    tokenHash: string,
     occurredAt: string,
-  ) => Effect.Effect<"cancelled" | "terminal" | "dispatch-committed", PersistenceSqlError>;
+    now: number,
+  ) => Effect.Effect<
+    "cancelled" | "terminal" | "dispatch-committed" | "revoked",
+    PersistenceSqlError
+  >;
   readonly expireAndPurge: (
     now: number,
     occurredAt: string,

@@ -166,6 +166,7 @@ internal sealed interface T3VoiceBackgroundHttpResult {
     val statusCode: Int,
     val contentType: String?,
     val body: ByteArray,
+    val headers: Map<String, String> = emptyMap(),
   ) : T3VoiceBackgroundHttpResult
 
   data class Failure(
@@ -295,6 +296,11 @@ internal class T3VoiceBackgroundHttpCall(
             statusCode,
             connection.contentType?.takeIf { it.length <= 256 && '\r' !in it && '\n' !in it },
             body,
+            listOf("x-t3-audio-format").mapNotNull { name ->
+              connection.getHeaderField(name)?.takeIf {
+                it.length <= 128 && '\r' !in it && '\n' !in it
+              }?.let { name to it }
+            }.toMap(),
           )
         }
       }

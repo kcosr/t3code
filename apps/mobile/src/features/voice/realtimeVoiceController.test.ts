@@ -19,6 +19,10 @@ import {
   RealtimeVoiceController,
   type RealtimeVoiceControllerOptions,
 } from "./realtimeVoiceController";
+import type {
+  RealtimeVoiceAttachmentRecord,
+  RealtimeVoiceAttachmentStore,
+} from "./realtimeVoiceAttachmentStore";
 
 const SESSION_ID = VoiceSessionId.make("voice-session-1");
 const createInput: VoiceSessionCreateInput = {
@@ -56,6 +60,36 @@ const serverSession = {
     heartbeatIntervalSeconds: 8,
     failureGraceSeconds: 30,
   },
+};
+
+const makeAttachmentStore = (initial: RealtimeVoiceAttachmentRecord | null = null) => {
+  let record = initial;
+  return {
+    store: {
+      load: vi.fn(async () => record),
+      replace: vi.fn(async (next) => {
+        record = next;
+      }),
+      update: vi.fn(async (next) => {
+        const current = record;
+        if (
+          current !== null &&
+          (current.sessionId !== next.sessionId || current.ownerId !== next.ownerId)
+        )
+          return false;
+        record = next;
+        return true;
+      }),
+      clear: vi.fn(async (sessionId, ownerId) => {
+        const current = record;
+        if (current === null || current.sessionId !== sessionId || current.ownerId !== ownerId)
+          return false;
+        record = null;
+        return true;
+      }),
+    } satisfies RealtimeVoiceAttachmentStore,
+    current: () => record,
+  };
 };
 
 const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
@@ -145,8 +179,12 @@ const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
     acknowledgeClientAction: vi.fn((_sessionId, actionId) =>
       Effect.succeed({ actionId, outcome: "succeeded" as const }),
     ),
+    decideConfirmation: vi.fn((_sessionId, confirmationId) =>
+      Effect.succeed({ confirmationId, outcome: "approved" as const }),
+    ),
   } as unknown as VoiceHttpClient;
   const snapshots: Array<string> = [];
+  const deliveredEvents: Array<ReadonlyArray<unknown>> = [];
   const routeChanges: Array<string> = [];
   const scheduledCallbacks = new Map<number, () => void>();
   const scheduler = {
@@ -162,6 +200,7 @@ const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
     "https://environment.example.test",
     {
       onSnapshot: (snapshot) => snapshots.push(snapshot.phase),
+      onSessionEvents: (events) => deliveredEvents.push(events),
       onAudioRouteChanged: (event) => routeChanges.push(`${event.reason}:${event.routeId}`),
     },
     { scheduler, ...options },
@@ -192,6 +231,7 @@ const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
   return {
     client,
     controller,
+    deliveredEvents,
     emitNative,
     native,
     runScheduled,
@@ -251,6 +291,80 @@ describe("RealtimeVoiceController", () => {
     expect(client.sessionEvents).toHaveBeenCalledWith(SESSION_ID, 0);
   });
 
+  it("recreates after a crash from the durable consumed cursor and focus", async () => {
+    const attachments = makeAttachmentStore({
+      ownerId: "previous-owner",
+      environmentOrigin: "https://environment.example.test",
+      sessionId: SESSION_ID,
+      afterSequence: 6,
+      focus: {
+        projectId: ProjectId.make("project-persisted"),
+        threadId: ThreadId.make("thread-persisted"),
+      },
+      pendingEvents: [],
+    });
+    const { client, controller, native } = makeHarness({ attachmentStore: attachments.store });
+    vi.mocked(native.getStateAsync).mockResolvedValue({
+      phase: "realtime",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected",
+      realtimeMuted: false,
+      sequence: 8,
+    });
+    vi.mocked(client.getSession).mockReturnValue(
+      Effect.succeed({ ...serverSession.state, sequence: 9 }),
+    );
+
+    await controller.reconcileNativeRuntime();
+    await controller.refreshEvents();
+
+    expect(controller.getSnapshot().focus).toEqual(attachments.current()?.focus);
+    expect(client.sessionEvents).toHaveBeenCalledWith(SESSION_ID, 6);
+    expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
+  });
+
+  it("does not adopt a cursor from another environment or a future server sequence", async () => {
+    for (const record of [
+      {
+        ownerId: "previous-owner",
+        environmentOrigin: "https://other.example.test",
+        sessionId: SESSION_ID,
+        afterSequence: 3,
+        focus: null,
+        pendingEvents: [],
+      },
+      {
+        ownerId: "previous-owner",
+        environmentOrigin: "https://environment.example.test",
+        sessionId: SESSION_ID,
+        afterSequence: 99,
+        focus: null,
+        pendingEvents: [],
+      },
+    ] satisfies ReadonlyArray<RealtimeVoiceAttachmentRecord>) {
+      const attachments = makeAttachmentStore(record);
+      const { client, controller, native } = makeHarness({ attachmentStore: attachments.store });
+      vi.mocked(native.getStateAsync).mockResolvedValue({
+        phase: "realtime",
+        isForeground: true,
+        activeRecordingId: null,
+        activePlaybackId: null,
+        activeRealtimeSessionId: SESSION_ID,
+        realtimeConnectionState: "connected",
+        realtimeMuted: false,
+        sequence: 8,
+      });
+
+      await controller.reconcileNativeRuntime();
+      await controller.refreshEvents();
+
+      expect(client.sessionEvents).toHaveBeenCalledWith(SESSION_ID, 0);
+    }
+  });
+
   it("preserves native media when the server session cannot be authorized", async () => {
     const { client, controller, native } = makeHarness();
     vi.mocked(native.getStateAsync).mockResolvedValueOnce({
@@ -270,6 +384,15 @@ describe("RealtimeVoiceController", () => {
     expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
     expect(client.closeSession).not.toHaveBeenCalled();
     expect(controller.getSnapshot().native?.activeRealtimeSessionId).toBe(SESSION_ID);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "error",
+      error: expect.stringContaining("Could not attach"),
+    });
+
+    await controller.stop();
+
+    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledWith({ nativeSessionId: SESSION_ID });
+    expect(controller.getSnapshot()).toMatchObject({ phase: "idle", session: null });
   });
 
   it("cleans native media only when the server confirms the session is terminal", async () => {
@@ -487,6 +610,65 @@ describe("RealtimeVoiceController", () => {
     expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
     expect(client.closeSession).not.toHaveBeenCalled();
     expect(scheduler.setInterval).not.toHaveBeenCalled();
+  });
+
+  it("does not publish active or restart timers when stop wins a delayed attachment write", async () => {
+    let releaseWrite!: () => void;
+    const writeBlocked = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const attachments = makeAttachmentStore();
+    vi.mocked(attachments.store.replace).mockImplementationOnce(async () => {
+      await writeBlocked;
+    });
+    const { controller, scheduler, snapshots } = makeHarness({
+      attachmentStore: attachments.store,
+    });
+
+    const starting = controller.start(createInput);
+    await vi.waitFor(() => expect(attachments.store.replace).toHaveBeenCalledOnce());
+    const stopping = controller.stop();
+    releaseWrite();
+    await Promise.all([starting, stopping]);
+
+    expect(controller.getSnapshot()).toMatchObject({ phase: "idle", focus: null });
+    expect(snapshots.slice(snapshots.indexOf("stopping"))).not.toContain("active");
+    expect(scheduler.setInterval).not.toHaveBeenCalled();
+  });
+
+  it("does not resurrect an attachment when stop wins a retry race", async () => {
+    const { client, controller, emitNative, native, scheduler } = makeHarness();
+    const nativeActive = {
+      phase: "realtime" as const,
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected" as const,
+      realtimeMuted: false,
+      sequence: 8,
+    };
+    emitNative("stateChanged", nativeActive);
+    let resolveSession!: (state: typeof serverSession.state) => void;
+    const pendingSession = new Promise<typeof serverSession.state>((resolve) => {
+      resolveSession = resolve;
+    });
+    vi.mocked(client.getSession).mockReturnValue(Effect.promise(() => pendingSession));
+
+    const reconciliation = controller.reconcileNativeRuntime();
+    await vi.waitFor(() => expect(client.getSession).toHaveBeenCalledOnce());
+    const stopping = controller.stop();
+    resolveSession(serverSession.state);
+    await Promise.all([reconciliation, stopping]);
+
+    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledWith({ nativeSessionId: SESSION_ID });
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "idle",
+      session: null,
+      native: { activeRealtimeSessionId: null },
+    });
+    expect(scheduler.setInterval).not.toHaveBeenCalled();
+    await expect(controller.setMuted(true)).rejects.toThrow("No Realtime voice session is active");
   });
 
   it("keeps dispose destructive after a prior detach", async () => {
@@ -801,7 +983,8 @@ describe("RealtimeVoiceController", () => {
   });
 
   it("updates focus through the active lease without replacing native media", async () => {
-    const { client, controller, native } = makeHarness();
+    const attachments = makeAttachmentStore();
+    const { client, controller, native } = makeHarness({ attachmentStore: attachments.store });
     await controller.start(createInput);
     const projectId = ProjectId.make("project-2");
     const threadId = ThreadId.make("thread-2");
@@ -814,6 +997,195 @@ describe("RealtimeVoiceController", () => {
     });
     expect(native.stopRealtimeSessionAsync).not.toHaveBeenCalled();
     expect(controller.getSnapshot().session?.sequence).toBe(1);
+    expect(controller.getSnapshot().focus).toEqual({ projectId, threadId });
+    expect(attachments.current()?.focus).toEqual({ projectId, threadId });
+  });
+
+  it("persists the consumed cursor after delivering a server event", async () => {
+    const attachments = makeAttachmentStore();
+    const { client, controller } = makeHarness({ attachmentStore: attachments.store });
+    await controller.start(createInput);
+    vi.mocked(client.sessionEvents).mockReturnValueOnce(
+      Effect.succeed({
+        state: { ...serverSession.state, phase: "listening" as const, sequence: 4 },
+        events: [
+          {
+            sessionId: SESSION_ID,
+            leaseGeneration: 1,
+            sequence: 4,
+            occurredAt: "2026-07-10T22:01:00.000Z" as never,
+            type: "state" as const,
+            phase: "listening" as const,
+          },
+        ],
+      }),
+    );
+
+    await controller.refreshEvents();
+    await controller.detach();
+
+    expect(attachments.current()).toMatchObject({
+      environmentOrigin: "https://environment.example.test",
+      sessionId: SESSION_ID,
+      afterSequence: 4,
+    });
+  });
+
+  it("replays a durably pending client action after a crash past the event cursor", async () => {
+    const attachments = makeAttachmentStore();
+    const first = makeHarness({
+      attachmentStore: attachments.store,
+      attachmentOwnerIdFactory: () => "first-owner",
+    });
+    await first.controller.start(createInput);
+    const action = {
+      sessionId: SESSION_ID,
+      leaseGeneration: 1,
+      sequence: 4,
+      occurredAt: "2026-07-13T04:00:00.000Z" as never,
+      type: "client-action" as const,
+      action: "activate-thread" as const,
+      actionId: "action-1" as never,
+      projectId: ProjectId.make("project-2"),
+      threadId: ThreadId.make("thread-2"),
+      expiresAt: "2099-07-13T04:01:00.000Z" as never,
+    };
+    vi.mocked(first.client.sessionEvents).mockReturnValueOnce(
+      Effect.succeed({
+        state: { ...serverSession.state, sequence: 4 },
+        events: [action],
+      }),
+    );
+
+    await first.controller.refreshEvents();
+    await first.controller.detach();
+
+    expect(attachments.current()).toMatchObject({
+      afterSequence: 4,
+      pendingEvents: [action],
+    });
+
+    const second = makeHarness({
+      attachmentStore: attachments.store,
+      attachmentOwnerIdFactory: () => "second-owner",
+    });
+    vi.mocked(second.native.getStateAsync).mockResolvedValue({
+      phase: "realtime",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected",
+      realtimeMuted: false,
+      sequence: 8,
+    });
+    vi.mocked(second.client.getSession).mockReturnValue(
+      Effect.succeed({ ...serverSession.state, sequence: 4 }),
+    );
+    vi.mocked(second.client.sessionEvents).mockReturnValue(
+      Effect.succeed({ state: { ...serverSession.state, sequence: 4 }, events: [] }),
+    );
+
+    await second.controller.reconcileNativeRuntime();
+    await second.controller.refreshEvents();
+
+    expect(second.client.sessionEvents).toHaveBeenCalledWith(SESSION_ID, 4);
+    expect(second.deliveredEvents.at(-1)).toEqual([action]);
+    await second.controller.acknowledgeClientAction(action.actionId, {
+      action: "activate-thread",
+      outcome: "succeeded",
+    });
+    expect(attachments.current()?.pendingEvents).toEqual([]);
+  });
+
+  it("keeps a confirmation durable until the server accepts the decision", async () => {
+    const attachments = makeAttachmentStore();
+    const { client, controller } = makeHarness({ attachmentStore: attachments.store });
+    await controller.start(createInput);
+    const confirmation = {
+      sessionId: SESSION_ID,
+      leaseGeneration: 1,
+      sequence: 5,
+      occurredAt: "2026-07-13T04:00:00.000Z" as never,
+      type: "confirmation-required" as const,
+      confirmationId: "confirmation-1" as never,
+      toolCallId: "tool-call-1" as never,
+      tool: "archive_thread" as const,
+      summary: "Archive a thread",
+      expiresAt: "2099-07-13T04:01:00.000Z" as never,
+    };
+    vi.mocked(client.sessionEvents).mockReturnValueOnce(
+      Effect.succeed({
+        state: { ...serverSession.state, sequence: 5 },
+        events: [confirmation],
+      }),
+    );
+
+    await controller.refreshEvents();
+    expect(attachments.current()?.pendingEvents).toEqual([confirmation]);
+
+    await controller.decideConfirmation(confirmation.confirmationId, "approve");
+    expect(attachments.current()?.pendingEvents).toEqual([]);
+  });
+
+  it("advances locally, heals persistence, and suppresses replayed events after a failed replace", async () => {
+    const attachments = makeAttachmentStore();
+    vi.mocked(attachments.store.replace).mockRejectedValueOnce(new Error("secure store busy"));
+    const { client, controller, deliveredEvents } = makeHarness({
+      attachmentStore: attachments.store,
+    });
+    await controller.start(createInput);
+    const transcript = {
+      sessionId: SESSION_ID,
+      leaseGeneration: 1,
+      sequence: 4,
+      occurredAt: "2026-07-13T04:00:00.000Z" as never,
+      type: "transcript" as const,
+      role: "assistant" as const,
+      text: "Persist once",
+      final: true,
+    };
+    const confirmation = {
+      sessionId: SESSION_ID,
+      leaseGeneration: 1,
+      sequence: 5,
+      occurredAt: "2026-07-13T04:00:01.000Z" as never,
+      type: "confirmation-required" as const,
+      confirmationId: "confirmation-heal" as never,
+      toolCallId: "tool-call-heal" as never,
+      tool: "archive_thread" as const,
+      summary: "Archive a thread",
+      expiresAt: "2099-07-13T04:01:00.000Z" as never,
+    };
+    const result = Effect.succeed({
+      state: { ...serverSession.state, sequence: 5 },
+      events: [transcript, confirmation],
+    });
+    vi.mocked(client.sessionEvents).mockReturnValue(result);
+
+    await controller.refreshEvents();
+    await controller.refreshEvents();
+
+    expect(client.sessionEvents).toHaveBeenNthCalledWith(1, SESSION_ID, 0);
+    expect(client.sessionEvents).toHaveBeenNthCalledWith(2, SESSION_ID, 5);
+    expect(deliveredEvents).toEqual([[transcript, confirmation]]);
+    expect(attachments.current()).toMatchObject({
+      afterSequence: 5,
+      pendingEvents: [confirmation],
+    });
+  });
+
+  it("clears focus after a normal stop", async () => {
+    const { controller } = makeHarness();
+    await controller.start({
+      ...createInput,
+      projectId: ProjectId.make("project-1"),
+      threadId: ThreadId.make("thread-1"),
+    });
+
+    await controller.stop();
+
+    expect(controller.getSnapshot()).toMatchObject({ phase: "idle", focus: null });
   });
 
   it("closes both sides after repeated control failures", async () => {

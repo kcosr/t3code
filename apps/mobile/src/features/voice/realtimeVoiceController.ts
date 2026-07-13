@@ -24,6 +24,12 @@ import type {
 } from "@t3tools/mobile-voice-native";
 import * as Effect from "effect/Effect";
 
+import type {
+  RealtimeVoiceAttachmentRecord,
+  RealtimeVoiceAttachmentStore,
+  RealtimeVoicePendingEvent,
+} from "./realtimeVoiceAttachmentStore";
+
 export type RealtimeVoiceControllerPhase = "idle" | "starting" | "active" | "stopping" | "error";
 
 export interface RealtimeVoiceControllerSnapshot {
@@ -31,6 +37,7 @@ export interface RealtimeVoiceControllerSnapshot {
   readonly session: VoiceSessionState | null;
   readonly native: T3VoiceRuntimeState | null;
   readonly error: string | null;
+  readonly focus: RealtimeVoiceAttachmentRecord["focus"];
 }
 
 export interface RealtimeVoiceControllerListener {
@@ -40,12 +47,16 @@ export interface RealtimeVoiceControllerListener {
 }
 
 interface ActiveSession {
+  readonly attachmentOwnerId: string;
   readonly sessionId: VoiceSessionState["sessionId"];
   readonly nativeSessionId: string;
   readonly leaseGeneration: number;
   serverState: VoiceSessionState;
   afterSequence: number;
   lastServerError: string | null;
+  focus: RealtimeVoiceAttachmentRecord["focus"];
+  pendingEvents: ReadonlyArray<RealtimeVoicePendingEvent>;
+  deliveredThroughSequence: number;
 }
 
 interface TimerScheduler {
@@ -60,12 +71,17 @@ export interface RealtimeVoiceControllerOptions {
   readonly eventPollIntervalMs?: number;
   readonly serverCleanupTimeoutMs?: number;
   readonly cleanupCoordinator?: RealtimeServerCleanupCoordinator;
+  readonly attachmentStore?: RealtimeVoiceAttachmentStore;
+  readonly attachmentOwnerIdFactory?: () => string;
 }
 
 const defaultScheduler: TimerScheduler = {
   setInterval: (callback, delayMs) => globalThis.setInterval(callback, delayMs),
   clearInterval: (handle) => globalThis.clearInterval(handle as ReturnType<typeof setInterval>),
 };
+
+let nextAttachmentOwner = 0;
+const defaultAttachmentOwnerId = (): string => `react-${Date.now()}-${(nextAttachmentOwner += 1)}`;
 
 const messageFor = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
@@ -241,6 +257,8 @@ export class RealtimeVoiceController {
   private refreshInFlight = false;
   private nativeRuntimeReconciliation: Promise<void> | null = null;
   private readonly cleanupCoordinator: RealtimeServerCleanupCoordinator;
+  private readonly attachmentStore: RealtimeVoiceAttachmentStore | null;
+  private readonly attachmentOwnerIdFactory: () => string;
   private startInFlight: Promise<void> | null = null;
   private detached = false;
   private subscriptionsRemoved = false;
@@ -252,6 +270,7 @@ export class RealtimeVoiceController {
     session: null,
     native: null,
     error: null,
+    focus: null,
   };
 
   constructor(
@@ -266,6 +285,8 @@ export class RealtimeVoiceController {
     this.cleanupCoordinator =
       options.cleanupCoordinator ??
       new RealtimeServerCleanupCoordinator(options.serverCleanupTimeoutMs ?? 10_000);
+    this.attachmentStore = options.attachmentStore ?? null;
+    this.attachmentOwnerIdFactory = options.attachmentOwnerIdFactory ?? defaultAttachmentOwnerId;
     this.subscriptions = [
       native.addListener("stateChanged", (state) => this.handleNativeState(state)),
       native.addListener("runtimeError", (event) => this.handleNativeError(event)),
@@ -331,7 +352,7 @@ export class RealtimeVoiceController {
     if (this.snapshot.phase !== "idle" && this.snapshot.phase !== "error") {
       throw new Error("A Realtime voice session is already starting or active");
     }
-    this.setSnapshot({ phase: "starting", session: null, error: null });
+    this.setSnapshot({ phase: "starting", session: null, error: null, focus: null });
     let serverSession: VoiceSessionCreateResult | null = null;
     let serverState: VoiceSessionState | null = null;
     let nativeSessionId: string | null = null;
@@ -391,21 +412,35 @@ export class RealtimeVoiceController {
       }
 
       const active: ActiveSession = {
+        attachmentOwnerId: this.attachmentOwnerIdFactory(),
         sessionId: serverState.sessionId,
         nativeSessionId,
         leaseGeneration: serverState.leaseGeneration,
         serverState,
         afterSequence: serverState.sequence,
         lastServerError: null,
+        focus:
+          input.projectId === undefined || input.threadId === undefined
+            ? null
+            : { projectId: input.projectId, threadId: input.threadId },
+        pendingEvents: [],
+        deliveredThroughSequence: -1,
       };
       this.startingNativeSessionId = null;
       this.active = active;
+      await this.replaceAttachment(active);
+      if (generation !== this.startGeneration || this.detached) {
+        if (this.active === active) this.active = null;
+        await this.clearAttachment(active.sessionId, active.attachmentOwnerId);
+      }
+      this.ensureCurrentStart(generation);
       this.resetControlFailures();
       this.setSnapshot({
         phase: "active",
         session: active.serverState,
         native: nativeState,
         error: null,
+        focus: active.focus,
       });
       this.startControlTimers();
       return this.snapshot;
@@ -417,6 +452,7 @@ export class RealtimeVoiceController {
         phase: "error",
         session: null,
         error: messageFor(cause),
+        focus: null,
       });
       throw cause;
     }
@@ -430,8 +466,28 @@ export class RealtimeVoiceController {
     const active = this.active;
     this.active = null;
     if (active === null) {
-      this.setSnapshot({ phase: "idle", session: null, error: null });
       await startInFlight;
+      const nativeSessionId = this.snapshot.native?.activeRealtimeSessionId ?? null;
+      if (nativeSessionId === null) {
+        this.setSnapshot({ phase: "idle", session: null, error: null, focus: null });
+        return;
+      }
+      this.setSnapshot({ phase: "stopping", session: null, error: null });
+      await this.native.stopRealtimeSessionAsync({ nativeSessionId }).catch(() => undefined);
+      if (generation !== this.startGeneration) return;
+      const nativeState = await this.native.getStateAsync();
+      if (generation !== this.startGeneration) return;
+      this.setSnapshot({ native: nativeState });
+      if (nativeState.activeRealtimeSessionId !== null) {
+        this.setSnapshot({
+          phase: "error",
+          session: null,
+          error: "The Realtime media session could not be stopped",
+        });
+        return;
+      }
+      await this.clearAttachment(VoiceSessionId.make(nativeSessionId), null);
+      this.setSnapshot({ phase: "idle", session: null, error: null, focus: null });
       return;
     }
     this.setSnapshot({
@@ -457,7 +513,8 @@ export class RealtimeVoiceController {
       });
       return;
     }
-    this.setSnapshot({ phase: "idle", session: null, error: null });
+    this.setSnapshot({ phase: "idle", session: null, error: null, focus: null });
+    await this.clearAttachment(active.sessionId, active.attachmentOwnerId);
   }
 
   async setMuted(muted: boolean): Promise<void> {
@@ -479,7 +536,9 @@ export class RealtimeVoiceController {
     if (this.active !== active)
       throw new Error("Realtime voice session changed during focus update");
     active.serverState = result.state;
-    this.setSnapshot({ session: result.state });
+    active.focus = { projectId, threadId };
+    await this.updateAttachment(active);
+    this.setSnapshot({ session: result.state, focus: active.focus });
   }
 
   getAudioRoutes(): Promise<ReadonlyArray<T3VoiceAudioRoute>> {
@@ -502,7 +561,14 @@ export class RealtimeVoiceController {
     const active = this.requireActive();
     return Effect.runPromise(
       this.client.decideConfirmation(active.sessionId, confirmationId, decision),
-    );
+    ).then(async (result) => {
+      await this.resolvePendingEvent(
+        active,
+        (event) =>
+          event.type === "confirmation-required" && event.confirmationId === confirmationId,
+      );
+      return result;
+    });
   }
 
   acknowledgeClientAction(
@@ -518,7 +584,13 @@ export class RealtimeVoiceController {
         ...input,
         leaseGeneration: active.leaseGeneration,
       }),
-    );
+    ).then(async (result) => {
+      await this.resolvePendingEvent(
+        active,
+        (event) => event.type === "client-action" && event.actionId === actionId,
+      );
+      return result;
+    });
   }
 
   async refreshEvents(): Promise<void> {
@@ -541,13 +613,25 @@ export class RealtimeVoiceController {
         if (this.active !== active) return;
       }
       active.serverState = result.state;
-      active.afterSequence = result.events.reduce(
+      active.pendingEvents = this.mergePendingEvents(active.pendingEvents, result.events);
+      await this.updateAttachment(active);
+      if (this.detached || this.active !== active) return;
+      const nextSequence = result.events.reduce(
         (sequence, event) => Math.max(sequence, event.sequence),
         active.afterSequence,
       );
       this.controlFailures.events = 0;
       this.setSnapshot({ session: result.state });
-      if (result.events.length > 0) this.listener.onSessionEvents?.(result.events);
+      const deliveryEvents = this.eventsForDelivery(active, result.events);
+      if (deliveryEvents.length > 0) {
+        active.deliveredThroughSequence = Math.max(
+          active.deliveredThroughSequence,
+          ...deliveryEvents.map((event) => event.sequence),
+        );
+        this.listener.onSessionEvents?.(deliveryEvents);
+      }
+      active.afterSequence = nextSequence;
+      await this.updateAttachment(active);
       const serverError = result.events.toReversed().find((event) => event.type === "error");
       if (serverError !== undefined) active.lastServerError = serverError.reason;
       const fenced = result.events.some((event) => event.type === "lease-fenced");
@@ -580,6 +664,7 @@ export class RealtimeVoiceController {
     this.clearControlTimers();
     this.removeSubscriptions();
     const reconciliation = this.nativeRuntimeReconciliation;
+    if (this.active !== null) await this.updateAttachment(this.active);
     await Promise.all([
       this.startInFlight ?? Promise.resolve(),
       reconciliation?.catch(() => undefined) ?? Promise.resolve(),
@@ -624,11 +709,13 @@ export class RealtimeVoiceController {
       });
       return;
     }
+    await this.clearAttachment(active.sessionId, active.attachmentOwnerId);
     this.setSnapshot({
       native: nativeState,
       phase: "error",
       session: active.serverState,
       error: message,
+      focus: null,
     });
   }
 
@@ -666,7 +753,9 @@ export class RealtimeVoiceController {
       phase: error === null ? "idle" : "error",
       session: null,
       error,
+      focus: null,
     });
+    void this.clearAttachment(active.sessionId, active.attachmentOwnerId);
     this.beginServerCleanup(active);
   }
 
@@ -694,10 +783,12 @@ export class RealtimeVoiceController {
       });
       return;
     }
+    await this.clearAttachment(active.sessionId, active.attachmentOwnerId);
     this.setSnapshot({
       phase: error === null ? "idle" : "error",
       session: error === null ? null : active.serverState,
       error,
+      focus: null,
     });
   }
 
@@ -723,15 +814,27 @@ export class RealtimeVoiceController {
   }
 
   private async reconcileNativeRuntimeOnce(): Promise<void> {
+    const generation = this.startGeneration;
     const before = await this.native.getStateAsync();
-    if (this.detached) return;
+    if (this.detached || generation !== this.startGeneration) return;
     this.setSnapshot({ native: before });
     const nativeSessionId = before.activeRealtimeSessionId;
     if (nativeSessionId === null) return;
 
     const sessionId = VoiceSessionId.make(nativeSessionId);
-    const state = await Effect.runPromise(this.client.getSession(sessionId));
-    if (this.detached) return;
+    let state: VoiceSessionState;
+    try {
+      state = await Effect.runPromise(this.client.getSession(sessionId));
+    } catch (cause) {
+      this.setSnapshot({
+        phase: "error",
+        session: null,
+        error: `Could not attach to the active Realtime session: ${messageFor(cause)}`,
+        focus: null,
+      });
+      throw cause;
+    }
+    if (this.detached || generation !== this.startGeneration) return;
     if (state.phase === "ended" || state.phase === "error") {
       let stopFailure: unknown = null;
       try {
@@ -744,30 +847,56 @@ export class RealtimeVoiceController {
       if (after.activeRealtimeSessionId !== null) {
         throw stopFailure ?? new Error("The stale Realtime media session could not be stopped");
       }
+      await this.clearAttachment(sessionId, null);
       return;
     }
 
     const after = await this.native.getStateAsync();
-    if (this.detached) return;
+    if (this.detached || generation !== this.startGeneration) return;
     this.setSnapshot({ native: after });
     if (after.activeRealtimeSessionId === null) return;
     if (after.activeRealtimeSessionId !== nativeSessionId) {
       throw new Error("The native Realtime session changed during attachment");
     }
 
+    const persisted = await this.loadAttachment(sessionId, state.leaseGeneration, state.sequence);
+    if (this.detached || generation !== this.startGeneration) return;
     const active: ActiveSession = {
+      attachmentOwnerId: this.attachmentOwnerIdFactory(),
       sessionId: state.sessionId,
       nativeSessionId,
       leaseGeneration: state.leaseGeneration,
       serverState: state,
-      // Native may have received server events while React was suspended. Replaying from the
-      // beginning avoids creating an observation gap during attachment.
-      afterSequence: 0,
+      // No record means native started while React was absent, so replay from the beginning.
+      afterSequence: persisted?.afterSequence ?? 0,
       lastServerError: null,
+      focus: persisted?.focus ?? null,
+      pendingEvents: persisted?.pendingEvents ?? [],
+      deliveredThroughSequence: -1,
     };
+    await this.replaceAttachment(active);
+    if (this.detached || generation !== this.startGeneration) {
+      await this.clearAttachment(active.sessionId, active.attachmentOwnerId);
+      return;
+    }
+    const confirmed = await this.native.getStateAsync();
+    if (
+      this.detached ||
+      generation !== this.startGeneration ||
+      confirmed.activeRealtimeSessionId !== nativeSessionId
+    ) {
+      await this.clearAttachment(active.sessionId, active.attachmentOwnerId);
+      return;
+    }
     this.active = active;
     this.resetControlFailures();
-    this.setSnapshot({ phase: "active", session: state, native: after, error: null });
+    this.setSnapshot({
+      phase: "active",
+      session: state,
+      native: confirmed,
+      error: null,
+      focus: active.focus,
+    });
     this.startControlTimers();
   }
 
@@ -795,5 +924,122 @@ export class RealtimeVoiceController {
   private setSnapshot(update: Partial<RealtimeVoiceControllerSnapshot>) {
     this.snapshot = { ...this.snapshot, ...update };
     if (!this.detached) this.listener.onSnapshot(this.snapshot);
+  }
+
+  private async loadAttachment(
+    sessionId: VoiceSessionId,
+    leaseGeneration: number,
+    maximumSequence: number,
+  ): Promise<RealtimeVoiceAttachmentRecord | null> {
+    if (this.attachmentStore === null) return null;
+    try {
+      const record = await this.attachmentStore.load();
+      if (
+        record === null ||
+        record.environmentOrigin !== new URL(this.environmentOrigin).origin ||
+        record.sessionId !== sessionId ||
+        record.afterSequence > maximumSequence
+      ) {
+        return null;
+      }
+      return {
+        ...record,
+        pendingEvents: record.pendingEvents.filter(
+          (event) => event.leaseGeneration === leaseGeneration && event.sequence <= maximumSequence,
+        ),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private attachmentRecord(active: ActiveSession): RealtimeVoiceAttachmentRecord {
+    return {
+      ownerId: active.attachmentOwnerId,
+      environmentOrigin: new URL(this.environmentOrigin).origin,
+      sessionId: active.sessionId,
+      afterSequence: active.afterSequence,
+      focus: active.focus,
+      pendingEvents: active.pendingEvents,
+    };
+  }
+
+  private async replaceAttachment(active: ActiveSession): Promise<boolean> {
+    if (this.attachmentStore === null) return true;
+    return this.attachmentStore
+      .replace(this.attachmentRecord(active))
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  private async updateAttachment(active: ActiveSession): Promise<boolean> {
+    if (this.attachmentStore === null) return true;
+    return this.attachmentStore.update(this.attachmentRecord(active)).catch(() => false);
+  }
+
+  private async clearAttachment(sessionId: VoiceSessionId, ownerId: string | null): Promise<void> {
+    if (ownerId === null) {
+      const persisted = await this.attachmentStore?.load().catch(() => null);
+      if (persisted?.sessionId !== sessionId) return;
+      ownerId = persisted.ownerId;
+    }
+    await this.attachmentStore?.clear(sessionId, ownerId).catch(() => undefined);
+  }
+
+  private mergePendingEvents(
+    current: ReadonlyArray<RealtimeVoicePendingEvent>,
+    events: ReadonlyArray<VoiceSessionEvent>,
+  ): ReadonlyArray<RealtimeVoicePendingEvent> {
+    const now = Date.now();
+    const next = new Map(
+      current
+        .filter((event) => Date.parse(event.expiresAt) > now)
+        .map((event) => [this.pendingEventKey(event), event]),
+    );
+    for (const event of events) {
+      if (event.type === "confirmation-required" && Date.parse(event.expiresAt) > now) {
+        next.set(this.pendingEventKey(event), event);
+      } else if (
+        event.type === "client-action" &&
+        event.action === "activate-thread" &&
+        Date.parse(event.expiresAt) > now
+      ) {
+        next.set(this.pendingEventKey(event), event);
+      } else if (event.type === "tool") {
+        for (const [key, pending] of next) {
+          if (pending.type === "confirmation-required" && pending.toolCallId === event.toolCallId) {
+            next.delete(key);
+          }
+        }
+      } else if (event.type === "lease-fenced") {
+        next.clear();
+      }
+    }
+    return [...next.values()].sort((left, right) => left.sequence - right.sequence);
+  }
+
+  private eventsForDelivery(
+    active: ActiveSession,
+    events: ReadonlyArray<VoiceSessionEvent>,
+  ): ReadonlyArray<VoiceSessionEvent> {
+    const sequences = new Set(events.map((event) => event.sequence));
+    return [...active.pendingEvents.filter((event) => !sequences.has(event.sequence)), ...events]
+      .filter((event) => event.sequence > active.deliveredThroughSequence)
+      .sort((left, right) => left.sequence - right.sequence);
+  }
+
+  private pendingEventKey(event: RealtimeVoicePendingEvent): string {
+    return event.type === "confirmation-required"
+      ? `confirmation:${event.confirmationId}`
+      : `action:${event.actionId}`;
+  }
+
+  private async resolvePendingEvent(
+    active: ActiveSession,
+    matches: (event: RealtimeVoicePendingEvent) => boolean,
+  ): Promise<void> {
+    if (this.active !== active) return;
+    active.pendingEvents = active.pendingEvents.filter((event) => !matches(event));
+    await this.updateAttachment(active);
   }
 }

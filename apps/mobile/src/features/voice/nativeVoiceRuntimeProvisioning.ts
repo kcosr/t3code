@@ -3,6 +3,7 @@ import { VoiceNativeRuntimeId, type VoiceNativeRuntimeTarget } from "@t3tools/co
 import type {
   T3VoiceBackgroundAuthoritySnapshot,
   T3VoiceBackgroundGrantOperation,
+  T3VoiceBackgroundOwnership,
   T3VoiceBackgroundRuntimeGrantInput,
   T3VoiceBackgroundRuntimeRevocation,
   T3VoiceNativeModule,
@@ -63,6 +64,12 @@ export interface NativeVoiceRuntimeProvisioningAdapter {
   readonly disable: (input: {
     readonly epoch: number;
   }) => Promise<{ readonly runtimeId: VoiceNativeRuntimeId | null }>;
+  /** Atomically disables only the exact idle authority observed by React. */
+  readonly disableIfIdle: (input: {
+    readonly expectedRuntimeId: VoiceNativeRuntimeId | null;
+    readonly expectedGeneration: number | null;
+  }) => Promise<boolean>;
+  readonly ownership: () => Promise<T3VoiceBackgroundOwnership | null>;
   readonly pendingRevocation: () => Promise<T3VoiceBackgroundRuntimeRevocation | null>;
   readonly acknowledgeRevocation: (input: T3VoiceBackgroundRuntimeRevocation) => Promise<void>;
 }
@@ -74,6 +81,10 @@ export interface NativeVoiceRuntimeProvisioningInput {
   readonly operation: T3VoiceBackgroundGrantOperation;
   readonly resolvedTarget: ResolvedNativeVoiceRuntimeTarget;
   readonly refreshRequested?: boolean;
+  readonly resolvePendingRevocationEndpoint?: (
+    environmentOrigin: string,
+  ) => Promise<NativeVoiceRuntimeRevocationEndpointResolution>;
+  readonly retireUnresolvableRevocation?: boolean;
 }
 
 export function makeNativeVoiceRuntimeProvisioningAdapter(
@@ -141,6 +152,20 @@ export function makeNativeVoiceRuntimeProvisioningAdapter(
           disabled.runtimeId === null ? null : VoiceNativeRuntimeId.make(disabled.runtimeId),
       };
     },
+    disableIfIdle: async (input) => {
+      const expected =
+        input.expectedRuntimeId === null && prepared !== null
+          ? {
+              expectedRuntimeId: prepared.runtimeId,
+              expectedGeneration: prepared.generation,
+            }
+          : input;
+      const disabled = await native.disableBackgroundVoiceReadinessIfIdleAsync(expected);
+      if (disabled === null) return false;
+      prepared = null;
+      return true;
+    },
+    ownership: () => native.getBackgroundVoiceOwnershipAsync(),
     pendingRevocation: () => native.getPendingBackgroundVoiceRuntimeRevocationAsync(),
     acknowledgeRevocation: (input) =>
       native.acknowledgeBackgroundVoiceRuntimeRevocationAsync(input),
@@ -151,6 +176,51 @@ export interface NativeVoiceRuntimeProvisioningResult {
   readonly runtimeId: VoiceNativeRuntimeId;
   readonly readinessGeneration: number;
   readonly expiresAt: string;
+}
+
+export type NativeVoiceRuntimeRevocationEndpointResolution =
+  | {
+      readonly type: "available";
+      readonly client: NativeRuntimeGrantClient;
+      readonly environmentOrigin: string;
+    }
+  | { readonly type: "unavailable" }
+  | { readonly type: "absent" };
+
+export async function resolveNativeVoiceRuntimeRevocationEndpoint<
+  ConnectionId,
+  Prepared extends { readonly httpBaseUrl: string },
+>(input: {
+  readonly environmentOrigin: string;
+  readonly connections: ReadonlyArray<{
+    readonly id: ConnectionId;
+    readonly httpBaseUrl: string;
+  }>;
+  readonly getPrepared: (id: ConnectionId) => Prepared | null;
+  readonly prepare?: (id: ConnectionId) => Promise<Prepared | null>;
+  readonly makeClient: (prepared: Prepared) => Promise<NativeRuntimeGrantClient>;
+}): Promise<NativeVoiceRuntimeRevocationEndpointResolution> {
+  const expectedOrigin = new URL(input.environmentOrigin).origin;
+  let matchingSavedConnection = false;
+  for (const connection of input.connections) {
+    let connectionOrigin: string;
+    try {
+      connectionOrigin = new URL(connection.httpBaseUrl).origin;
+    } catch {
+      continue;
+    }
+    if (connectionOrigin !== expectedOrigin) continue;
+    matchingSavedConnection = true;
+    const prepared =
+      input.getPrepared(connection.id) ?? (await input.prepare?.(connection.id)) ?? null;
+    if (prepared === null || new URL(prepared.httpBaseUrl).origin !== expectedOrigin) continue;
+    return {
+      type: "available",
+      client: await input.makeClient(prepared),
+      environmentOrigin: expectedOrigin,
+    };
+  }
+  return { type: matchingSavedConnection ? "unavailable" : "absent" };
 }
 
 export class StaleNativeVoiceRuntimeProvisioningEpochError extends Error {
@@ -188,6 +258,14 @@ export class PendingNativeVoiceRuntimeRevocationOriginError extends Error {
     readonly requestedOrigin: string,
   ) {
     super("A pending native voice authority belongs to a different environment.");
+  }
+}
+
+export class NativeVoiceRuntimeReplacementDeferredError extends Error {
+  readonly name = "NativeVoiceRuntimeReplacementDeferredError";
+
+  constructor(readonly reconciliationKey: string | null = null) {
+    super("Native Realtime media became active before authority replacement.");
   }
 }
 
@@ -290,14 +368,16 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
         (this.active.intent !== intent ||
           this.active.environmentOrigin !== new URL(input.environmentOrigin).origin)
       ) {
+        if (!(await this.disableForReplacement(input, this.active.result))) {
+          throw new NativeVoiceRuntimeReplacementDeferredError();
+        }
         const previous = this.active;
-        await this.native.disable({ epoch: input.epoch });
         await this.drainPendingRevocation(previous.client, previous.environmentOrigin);
         this.active = null;
         nativeAuthorityCleared = true;
         this.assertCurrent(input.epoch);
       }
-      await this.drainPendingRevocation(client, input.environmentOrigin);
+      await this.reconcilePendingRevocationBeforeProvision(client, input);
       this.assertCurrent(input.epoch);
 
       const expectedIdentity = canonicalNativeVoiceRuntimeTargetIdentity(
@@ -330,7 +410,9 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
       }
 
       if (adopted === null && !nativeAuthorityCleared) {
-        await this.native.disable({ epoch: input.epoch });
+        if (!(await this.disableForReplacement(input, null))) {
+          throw new NativeVoiceRuntimeReplacementDeferredError();
+        }
         await this.drainPendingRevocation(client, input.environmentOrigin);
         this.assertCurrent(input.epoch);
       }
@@ -384,14 +466,21 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
       } catch (cause) {
         if (!this.isCurrent(input.epoch)) {
           if (this.currentIntent !== intent) {
-            await this.native.disable({ epoch: input.epoch });
-            await this.drainPendingRevocation(client, input.environmentOrigin);
+            if (await this.disableObservedIdle(input.environmentOrigin, null)) {
+              await this.drainPendingRevocation(client, input.environmentOrigin);
+            }
           }
           throw new StaleNativeVoiceRuntimeProvisioningEpochError(input.epoch, this.currentEpoch);
         }
         if (cause instanceof InvalidNativeVoiceRuntimeProvisioningResultError) {
-          await this.native.disable({ epoch: input.epoch });
+          if (!(await this.disableForReplacement(input, null))) {
+            throw new NativeVoiceRuntimeReplacementDeferredError();
+          }
           await this.drainPendingRevocation(client, input.environmentOrigin);
+        }
+        const ownership = await this.native.ownership().catch(() => null);
+        if (ownership?.active === true || (ownership !== null && ownership.phase !== "idle")) {
+          throw new NativeVoiceRuntimeReplacementDeferredError();
         }
         throw cause;
       }
@@ -425,6 +514,94 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
       await this.drainPendingRevocation(endpoint.client, endpoint.environmentOrigin);
       this.active = null;
     });
+  }
+
+  disableIfIdle(
+    epoch: number,
+    options?: {
+      readonly fallback?: {
+        readonly client: NativeRuntimeGrantClient;
+        readonly environmentOrigin: string;
+      };
+      readonly resolveEndpoint?: (
+        environmentOrigin: string,
+      ) => Promise<NativeVoiceRuntimeRevocationEndpointResolution>;
+      readonly retireUnresolvableRevocation?: boolean;
+    },
+  ): Promise<boolean> {
+    this.acceptEpoch(epoch, "disable");
+    return this.enqueue(async () => {
+      this.assertCurrent(epoch);
+      if ((await this.native.pendingRevocation()) !== null) {
+        await this.reconcilePendingDisableRevocation(options);
+        this.active = null;
+        return true;
+      }
+      const ownership = await this.native.ownership();
+      this.assertCurrent(epoch);
+      if (ownership?.active === true || (ownership !== null && ownership.phase !== "idle")) {
+        return false;
+      }
+      const disabled = await this.native.disableIfIdle({
+        expectedRuntimeId:
+          ownership?.runtimeId === null || ownership?.runtimeId === undefined
+            ? null
+            : VoiceNativeRuntimeId.make(ownership.runtimeId),
+        expectedGeneration: ownership?.readinessGeneration ?? null,
+      });
+      this.assertCurrent(epoch);
+      if (!disabled) return false;
+      await this.reconcilePendingDisableRevocation(options);
+      this.active = null;
+      return true;
+    });
+  }
+
+  private async reconcilePendingDisableRevocation(options?: {
+    readonly fallback?: {
+      readonly client: NativeRuntimeGrantClient;
+      readonly environmentOrigin: string;
+    };
+    readonly resolveEndpoint?: (
+      environmentOrigin: string,
+    ) => Promise<NativeVoiceRuntimeRevocationEndpointResolution>;
+    readonly retireUnresolvableRevocation?: boolean;
+  }): Promise<void> {
+    const pending = await this.native.pendingRevocation();
+    if (pending !== null) {
+      const endpoints = [
+        ...(this.active === null ? [] : [this.active]),
+        ...(options?.fallback === undefined ? [] : [options.fallback]),
+      ];
+      let endpoint = endpoints.find(
+        (candidate) => new URL(candidate.environmentOrigin).origin === pending.environmentOrigin,
+      );
+      const resolved =
+        endpoint === undefined && options?.resolveEndpoint !== undefined
+          ? await options.resolveEndpoint(pending.environmentOrigin)
+          : null;
+      if (resolved?.type === "available") endpoint = resolved;
+      if (endpoint !== undefined) {
+        await this.drainPendingRevocation(endpoint.client, endpoint.environmentOrigin);
+      } else if (resolved?.type === "unavailable") {
+        throw new NativeVoiceRuntimeReplacementDeferredError(pending.environmentOrigin);
+      } else if (
+        options?.retireUnresolvableRevocation === true &&
+        (options.resolveEndpoint === undefined || resolved?.type === "absent")
+      ) {
+        console.warn("[voice] retiring an unresolvable native runtime revocation", {
+          runtimeId: pending.runtimeId,
+        });
+        await this.native.acknowledgeRevocation(pending);
+      } else {
+        const observedOrigin =
+          this.active?.environmentOrigin ?? options?.fallback?.environmentOrigin;
+        throw new PendingNativeVoiceRuntimeRevocationOriginError(
+          pending.environmentOrigin,
+          observedOrigin === undefined ? "unknown" : new URL(observedOrigin).origin,
+        );
+      }
+    }
   }
 
   private acceptEpoch(epoch: number, intent: string): void {
@@ -479,6 +656,38 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
     await this.native.acknowledgeRevocation(pending);
   }
 
+  private async reconcilePendingRevocationBeforeProvision(
+    client: NativeRuntimeGrantClient,
+    input: NativeVoiceRuntimeProvisioningInput,
+  ): Promise<void> {
+    const pending = await this.native.pendingRevocation();
+    if (pending === null) return;
+    const requestedOrigin = new URL(input.environmentOrigin).origin;
+    if (pending.environmentOrigin === requestedOrigin) {
+      await this.drainPendingRevocation(client, requestedOrigin);
+      return;
+    }
+    const resolved = await input.resolvePendingRevocationEndpoint?.(pending.environmentOrigin);
+    if (resolved?.type === "available") {
+      await this.drainPendingRevocation(resolved.client, resolved.environmentOrigin);
+      return;
+    }
+    if (resolved?.type === "unavailable") {
+      throw new NativeVoiceRuntimeReplacementDeferredError(pending.environmentOrigin);
+    }
+    if (resolved?.type === "absent" && input.retireUnresolvableRevocation === true) {
+      console.warn("[voice] retiring an unresolvable native runtime revocation", {
+        runtimeId: pending.runtimeId,
+      });
+      await this.native.acknowledgeRevocation(pending);
+      return;
+    }
+    throw new PendingNativeVoiceRuntimeRevocationOriginError(
+      pending.environmentOrigin,
+      requestedOrigin,
+    );
+  }
+
   private async issueGrant(
     client: NativeRuntimeGrantClient,
     input: NativeVoiceRuntimeProvisioningInput,
@@ -499,6 +708,46 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
       throw new InvalidNativeVoiceRuntimeProvisioningResultError();
     }
     return grant;
+  }
+
+  private async disableForReplacement(
+    input: NativeVoiceRuntimeProvisioningInput,
+    known: NativeVoiceRuntimeProvisioningResult | null,
+  ): Promise<boolean> {
+    const ownership = await this.native.ownership();
+    this.assertCurrent(input.epoch);
+    const inputOrigin = new URL(input.environmentOrigin).origin;
+    if (known === null && ownership !== null && ownership.environmentOrigin !== inputOrigin) {
+      throw new PendingNativeVoiceRuntimeRevocationOriginError(
+        ownership.environmentOrigin,
+        inputOrigin,
+      );
+    }
+    return this.native.disableIfIdle({
+      expectedRuntimeId:
+        known?.runtimeId ??
+        (ownership?.runtimeId === null || ownership?.runtimeId === undefined
+          ? null
+          : VoiceNativeRuntimeId.make(ownership.runtimeId)),
+      expectedGeneration: known?.readinessGeneration ?? ownership?.readinessGeneration ?? null,
+    });
+  }
+
+  private async disableObservedIdle(
+    environmentOrigin: string,
+    known: NativeVoiceRuntimeProvisioningResult | null,
+  ): Promise<boolean> {
+    const ownership = await this.native.ownership();
+    const inputOrigin = new URL(environmentOrigin).origin;
+    if (ownership !== null && ownership.environmentOrigin !== inputOrigin) return false;
+    return this.native.disableIfIdle({
+      expectedRuntimeId:
+        known?.runtimeId ??
+        (ownership?.runtimeId === null || ownership?.runtimeId === undefined
+          ? null
+          : VoiceNativeRuntimeId.make(ownership.runtimeId)),
+      expectedGeneration: known?.readinessGeneration ?? ownership?.readinessGeneration ?? null,
+    });
   }
 
   private resultFromSnapshot(

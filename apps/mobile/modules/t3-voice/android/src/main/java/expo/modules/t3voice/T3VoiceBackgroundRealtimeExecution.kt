@@ -6,9 +6,18 @@ internal data class T3VoiceBackgroundRealtimeAuthority(
   val runtimeId: String,
   val readinessGeneration: Long,
   val environmentOrigin: String,
-  val runtimeGrantToken: String,
   val conversationId: String,
 )
+
+internal data class T3VoiceBackgroundRealtimeAuthorization(
+  val authority: T3VoiceBackgroundRealtimeAuthority,
+  val runtimeGrantToken: String,
+) {
+  val runtimeId get() = authority.runtimeId
+  val readinessGeneration get() = authority.readinessGeneration
+  val environmentOrigin get() = authority.environmentOrigin
+  val conversationId get() = authority.conversationId
+}
 
 internal object T3VoiceBackgroundRealtimeAuthorityPolicy {
   fun validate(
@@ -16,7 +25,7 @@ internal object T3VoiceBackgroundRealtimeAuthorityPolicy {
     loadedGrant: T3VoiceRuntimeGrantLoadResult,
     expectedTargetIdentityDigest: String,
     nowMillis: Long,
-  ): T3VoiceBackgroundRealtimeAuthority? {
+  ): T3VoiceBackgroundRealtimeAuthorization? {
     if (
       !readiness.isEffective() ||
         readiness.mode != T3VoiceReadinessMode.REALTIME ||
@@ -35,14 +44,23 @@ internal object T3VoiceBackgroundRealtimeAuthorityPolicy {
     ) {
       return null
     }
-    return T3VoiceBackgroundRealtimeAuthority(
-      runtimeId = metadata.runtimeId,
-      readinessGeneration = metadata.readinessGeneration,
-      environmentOrigin = T3VoiceBackgroundOriginPolicy.normalize(metadata.environmentOrigin),
+    return T3VoiceBackgroundRealtimeAuthorization(
+      authority =
+        T3VoiceBackgroundRealtimeAuthority(
+          runtimeId = metadata.runtimeId,
+          readinessGeneration = metadata.readinessGeneration,
+          environmentOrigin = T3VoiceBackgroundOriginPolicy.normalize(metadata.environmentOrigin),
+          conversationId = conversationId,
+        ),
       runtimeGrantToken = grant.token,
-      conversationId = conversationId,
     )
   }
+
+  fun validateStartedSession(
+    authorization: T3VoiceBackgroundRealtimeAuthorization,
+    result: T3VoiceBackgroundRealtimeStartResult,
+    nowMillis: Long,
+  ): Boolean = validateStartedSession(authorization.authority, result, nowMillis)
 
   fun validateStartedSession(
     authority: T3VoiceBackgroundRealtimeAuthority,
@@ -88,8 +106,15 @@ internal data class T3VoiceBackgroundRealtimeAttempt(
   val authority: T3VoiceBackgroundRealtimeAuthority,
   val diagnosticGeneration: Long,
   var serverSession: T3VoiceBackgroundRealtimeStartResult? = null,
+  var activeCall: T3VoiceBackgroundRealtimeCall<*>? = null,
   var future: Future<*>? = null,
-)
+) {
+  constructor(
+    operationId: String,
+    authorization: T3VoiceBackgroundRealtimeAuthorization,
+    diagnosticGeneration: Long,
+  ) : this(operationId, authorization.authority, diagnosticGeneration)
+}
 
 internal object T3VoiceBackgroundRealtimeAttemptPolicy {
   fun owns(
@@ -144,6 +169,22 @@ internal enum class T3VoiceBackgroundRealtimeCleanupDecision {
   COMPLETE,
   RETRY,
   BLOCKED,
+}
+
+internal enum class T3VoiceBackgroundRealtimeRestartRequest {
+  NONE,
+  RESTORE_INTERRUPTED_SESSION,
+}
+
+internal object T3VoiceBackgroundRealtimeRestartPolicy {
+  fun afterControl(
+    current: T3VoiceBackgroundRealtimeRestartRequest,
+    command: T3VoiceControlCommand,
+  ): T3VoiceBackgroundRealtimeRestartRequest =
+    if (command == T3VoiceControlCommand.STOP) T3VoiceBackgroundRealtimeRestartRequest.NONE else current
+
+  fun shouldRestart(request: T3VoiceBackgroundRealtimeRestartRequest): Boolean =
+    request == T3VoiceBackgroundRealtimeRestartRequest.RESTORE_INTERRUPTED_SESSION
 }
 
 internal object T3VoiceBackgroundRealtimeCleanupPolicy {
@@ -202,7 +243,7 @@ internal object T3VoiceBackgroundRealtimeCleanupPolicy {
   ): T3VoiceBackgroundRealtimeCleanupDecision =
     when (failure.kind) {
       T3VoiceBackgroundHttpFailureKind.AUTHORITY_REJECTED ->
-        T3VoiceBackgroundRealtimeCleanupDecision.COMPLETE
+        T3VoiceBackgroundRealtimeCleanupDecision.BLOCKED
       T3VoiceBackgroundHttpFailureKind.PERMANENT ->
         if (failure.statusCode == 404 || failure.statusCode == 410) {
           T3VoiceBackgroundRealtimeCleanupDecision.COMPLETE
@@ -217,4 +258,20 @@ internal object T3VoiceBackgroundRealtimeCleanupPolicy {
 
   private const val INITIAL_RETRY_MILLIS = 250L
   private const val MAXIMUM_RETRY_MILLIS = 10_000L
+}
+
+internal data class T3VoiceBackgroundRealtimeReconciliation(
+  val readiness: T3VoiceReadinessConfig,
+  val pendingRevocation: T3VoicePendingRuntimeRevocation,
+)
+
+internal object T3VoiceBackgroundRealtimeReconciliationPolicy {
+  fun fence(
+    readiness: T3VoiceReadinessConfig,
+    marker: T3VoiceBackgroundRealtimeCleanupMarker,
+  ): T3VoiceBackgroundRealtimeReconciliation =
+    T3VoiceBackgroundRealtimeReconciliation(
+      readiness.copy(enabled = false, generation = readiness.generation + 1),
+      T3VoicePendingRuntimeRevocation(marker.runtimeId, marker.environmentOrigin),
+    )
 }

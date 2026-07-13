@@ -134,11 +134,12 @@ const createRoute = HttpRouter.add(
     const request = yield* HttpServerRequest.HttpServerRequest;
     const token = request.headers[VOICE_RUNTIME_HEADER];
     if (token === undefined) return unauthorized();
+    const service = yield* VoiceNativeThreadTurnService;
+    const authorized = yield* service.authorizeCreate(token).pipe(Effect.result);
+    if (Result.isFailure(authorized)) return voiceFailure(authorized.failure);
     const input = yield* decodeJson(request, decodeCreate);
     if (Option.isNone(input)) return invalidRequest();
-    const result = yield* (yield* VoiceNativeThreadTurnService)
-      .create(token, input.value)
-      .pipe(Effect.result);
+    const result = yield* service.create(token, input.value).pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
 );

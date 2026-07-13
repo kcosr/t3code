@@ -6,6 +6,7 @@ import * as Layer from "effect/Layer";
 import * as NodeCrypto from "node:crypto";
 
 import { VoiceNativeRuntimeGrantRepository } from "../../persistence/Services/VoiceNativeRuntimeGrants.ts";
+import { VoiceNativeRealtimeStartRepository } from "../../persistence/Services/VoiceNativeRealtimeStarts.ts";
 import { VoiceNativeThreadTurnStore } from "../../persistence/Services/VoiceNativeThreadTurns.ts";
 import { VoiceError } from "../Errors.ts";
 import { VoiceNativeControlGrantRegistry } from "../Services/VoiceNativeControlGrantRegistry.ts";
@@ -17,6 +18,7 @@ import {
 const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const repository = yield* VoiceNativeRuntimeGrantRepository;
+  const realtimeStarts = yield* VoiceNativeRealtimeStartRepository;
   const childGrants = yield* VoiceNativeControlGrantRegistry;
   const threadTurns = yield* VoiceNativeThreadTurnStore;
   const hash = (token: string) => NodeCrypto.createHash("sha256").update(token).digest("hex");
@@ -48,7 +50,19 @@ const make = Effect.gen(function* () {
         });
       }
       if (replacement === "issued") {
-        yield* childGrants.revokeRuntime(scope.authSessionId, scope.runtimeId);
+        yield* Effect.all(
+          [
+            childGrants.revokeRuntime(scope.authSessionId, scope.runtimeId),
+            realtimeStarts.revokeRuntime(scope.authSessionId, scope.runtimeId).pipe(Effect.orDie),
+          ],
+          { discard: true },
+        ).pipe(
+          Effect.catchCause(() =>
+            Effect.logWarning("Could not purge derived native voice control grants", {
+              runtimeId: scope.runtimeId,
+            }),
+          ),
+        );
       }
       return { token, refreshed: replacement === "refreshed" };
     });
@@ -72,17 +86,33 @@ const make = Effect.gen(function* () {
             };
       }),
     revokeRuntime: (authSessionId, runtimeId) =>
-      Effect.all([
-        repository.revokeRuntime(authSessionId, runtimeId).pipe(Effect.orDie),
-        childGrants.revokeRuntime(authSessionId, runtimeId),
-        threadTurns.revokeRuntime(authSessionId, runtimeId).pipe(Effect.orDie),
-      ]).pipe(Effect.map(([revoked]) => revoked)),
+      Effect.gen(function* () {
+        const revoked = yield* repository
+          .revokeRuntime(authSessionId, runtimeId)
+          .pipe(Effect.orDie);
+        yield* Effect.all(
+          [
+            childGrants.revokeRuntime(authSessionId, runtimeId),
+            threadTurns.revokeRuntime(authSessionId, runtimeId).pipe(Effect.orDie),
+            realtimeStarts.revokeRuntime(authSessionId, runtimeId).pipe(Effect.orDie),
+          ],
+          { discard: true },
+        ).pipe(
+          Effect.catchCause(() =>
+            Effect.logWarning("Could not purge derived native voice runtime authority", {
+              runtimeId,
+            }),
+          ),
+        );
+        return revoked;
+      }),
     revokeAuthSession: (authSessionId) =>
       Effect.all(
         [
           repository.revokeAuthSession(authSessionId).pipe(Effect.orDie),
           childGrants.revokeAuthSession(authSessionId),
           threadTurns.revokeAuthSession(authSessionId).pipe(Effect.orDie),
+          realtimeStarts.revokeAuthSession(authSessionId).pipe(Effect.orDie),
         ],
         { discard: true },
       ),

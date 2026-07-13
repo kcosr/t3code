@@ -28,6 +28,7 @@ import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -61,6 +62,7 @@ import { VoiceContextCompilerLive } from "./VoiceContextCompiler.ts";
 import { VoiceSessionServiceLive } from "./VoiceSessionService.ts";
 
 const conversationId = VoiceConversationId.make("conversation-test");
+const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 const summary: VoiceConversationSummary = {
   conversationId,
   retention: "ephemeral",
@@ -604,6 +606,68 @@ it.effect("releases a newly created session when runtime-fenced child issuance i
   }),
 );
 
+it.effect("terminates every live session owned by an exact revoked native runtime", () =>
+  Effect.gen(function* () {
+    const terminated = yield* Ref.make(0);
+    const provider: VoiceProviderAdapter = {
+      id: "fake-native-runtime-revocation",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Effect.succeed({
+            answer: {
+              sessionId: request.sessionId,
+              leaseGeneration: request.leaseGeneration,
+              sdp: "fake-answer",
+            },
+            events: Stream.never,
+            updateContext: () => Effect.void,
+            submitToolOutput: () => Effect.void,
+            completeTerminalToolCall: () => Effect.void,
+            terminate: Ref.update(terminated, (count) => count + 1),
+          }),
+      },
+    };
+    const test = yield* makeLayer(provider, undefined, {
+      enabled: true,
+      maxConcurrentSessions: 2,
+    });
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("native-revoke-owner");
+      const revokedRuntimeId = VoiceNativeRuntimeId.make("native-revoke-runtime");
+      const revoked = yield* sessions.create(
+        {
+          ...principal(owner),
+          nativeRuntime: { runtimeId: revokedRuntimeId, generation: 3 },
+        },
+        input(false, "native-revoke-session"),
+      );
+      yield* sessions.offer(owner, revoked.state.sessionId, {
+        sessionId: revoked.state.sessionId,
+        leaseGeneration: revoked.state.leaseGeneration,
+        sdp: "fake-offer",
+      });
+
+      yield* sessions.revokeNativeRuntime(owner, revokedRuntimeId);
+
+      expect((yield* sessions.get(owner, revoked.state.sessionId)).phase).toBe("ended");
+      expect(yield* Ref.get(terminated)).toBe(1);
+      const replay = yield* sessions
+        .resumeCreate(
+          {
+            ...principal(owner),
+            nativeRuntime: { runtimeId: revokedRuntimeId, generation: 3 },
+          },
+          input(false, "native-revoke-session"),
+          revoked.state.sessionId,
+        )
+        .pipe(Effect.flip);
+      expect(replay).toMatchObject({ reason: "session-not-found" });
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
 it.effect(
   "negotiates, normalizes events, journals final transcripts, and closes exactly once",
   () =>
@@ -732,8 +796,8 @@ it.effect(
           providerAttached: true,
           providerActivityObserved: true,
         });
-        expect(JSON.stringify(diagnostics)).not.toContain("show threads");
-        expect(JSON.stringify(diagnostics)).not.toContain("fake-offer");
+        expect(encodeJson(diagnostics)).not.toContain("show threads");
+        expect(encodeJson(diagnostics)).not.toContain("fake-offer");
       }).pipe(
         Effect.provide(test.layer),
         Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
