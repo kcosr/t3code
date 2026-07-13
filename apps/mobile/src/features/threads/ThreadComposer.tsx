@@ -411,6 +411,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   useEffect(() => {
     const command = realtimeVoice.nativeThreadCommand;
     if (
+      command === null ||
       !shouldStartNativeThreadCommand({
         captureReady: dictation.available,
         command,
