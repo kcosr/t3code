@@ -112,7 +112,11 @@ internal class T3VoiceCuePlayer(
         ActiveCue(
           generation,
           cue,
-          T3VoiceCuePcm.synthesize(sampleRate, cue),
+          T3VoiceCuePcm.withStartupPreRoll(
+            sampleRate,
+            T3VoiceCuePcm.synthesize(sampleRate, cue),
+            STARTUP_PRE_ROLL_MS,
+          ),
           clock.elapsedRealtime() + timeoutMs,
           completion,
         )
@@ -170,6 +174,7 @@ internal class T3VoiceCuePlayer(
       cue.output = output
     }
     try {
+      output.play()
       var offset = 0
       while (offset < cue.pcm.size && isCurrent(cue)) {
         val written = output.write(cue.pcm, offset, cue.pcm.size - offset)
@@ -177,7 +182,6 @@ internal class T3VoiceCuePlayer(
         offset += written
       }
       if (!isCurrent(cue)) return
-      output.play()
       synchronized(lock) {
         if (active !== cue || cue.output !== output || cue.terminalClaimed.get()) return
         cue.attemptTasks += scheduler.schedule(coldStartCheckMs) { checkColdStart(cue, output) }
@@ -271,6 +275,7 @@ internal class T3VoiceCuePlayer(
 
   private companion object {
     const val SAMPLE_RATE = 48_000
+    const val STARTUP_PRE_ROLL_MS = 512
     const val COLD_START_CHECK_MS = 220L
     const val DRAIN_POLL_MS = 10L
     const val TIMEOUT_MS = 1_500L
@@ -314,10 +319,27 @@ internal object T3VoiceCuePcm {
     }
     return pcm
   }
+
+  fun withStartupPreRoll(sampleRate: Int, pcm: ByteArray, durationMs: Int): ByteArray {
+    require(sampleRate > 0)
+    require(durationMs >= 0)
+    if (durationMs == 0) return pcm
+    val silenceBytes = sampleRate * durationMs / 1_000 * Short.SIZE_BYTES
+    return ByteArray(silenceBytes + pcm.size).also { output ->
+      pcm.copyInto(output, destinationOffset = silenceBytes)
+    }
+  }
 }
 
 private object AndroidCueOutputFactory : T3VoiceCueOutputFactory {
   override fun create(sampleRate: Int, byteCount: Int): T3VoiceCueOutput {
+    val minimumBufferSize =
+      AudioTrack.getMinBufferSize(
+        sampleRate,
+        AudioFormat.CHANNEL_OUT_MONO,
+        AudioFormat.ENCODING_PCM_16BIT,
+      )
+    check(minimumBufferSize > 0) { "Cue AudioTrack buffer sizing failed." }
     val track =
       AudioTrack.Builder()
         .setAudioAttributes(
@@ -333,8 +355,8 @@ private object AndroidCueOutputFactory : T3VoiceCueOutputFactory {
             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
             .build(),
         )
-        .setTransferMode(AudioTrack.MODE_STATIC)
-        .setBufferSizeInBytes(byteCount)
+        .setTransferMode(AudioTrack.MODE_STREAM)
+        .setBufferSizeInBytes(maxOf(minimumBufferSize, byteCount))
         .build()
     check(track.state == AudioTrack.STATE_INITIALIZED) { "Cue AudioTrack initialization failed." }
     return object : T3VoiceCueOutput {

@@ -21,6 +21,20 @@ class T3VoiceCuePlayerTest {
   }
 
   @Test
+  fun `prepends startup silence without changing cue samples`() {
+    val cue = T3VoiceCuePcm.synthesize(48_000, T3VoiceCue.ENDED)
+    val withPreRoll = T3VoiceCuePcm.withStartupPreRoll(48_000, cue, 512)
+    val silenceSamples = 48_000 * 512 / 1_000
+
+    assertEquals((silenceSamples * 2) + cue.size, withPreRoll.size)
+    assertEquals(0, sample(withPreRoll, silenceSamples - 1))
+    assertEquals(
+      sample(cue, 48_000 * 30 / 1_000),
+      sample(withPreRoll, silenceSamples + 48_000 * 30 / 1_000),
+    )
+  }
+
+  @Test
   fun `claims drained exactly once after the playback head reaches written frames`() {
     val output = FakeOutput()
     val fixture = Fixture(outputs = ArrayDeque(listOf(output)))
@@ -32,6 +46,7 @@ class T3VoiceCuePlayerTest {
       completions += it
     })
     fixture.worker.runAll()
+    assertEquals(1, output.playCount)
     output.head = output.written / 2L
     fixture.scheduler.runNext(DRAIN_DELAY)
     fixture.scheduler.runAllIncludingCancelled()
