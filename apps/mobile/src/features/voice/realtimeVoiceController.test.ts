@@ -1,5 +1,7 @@
 import type { VoiceHttpClient } from "@t3tools/client-runtime/voice";
 import {
+  EnvironmentAuthInvalidError,
+  EnvironmentVoiceOperationError,
   ProjectId,
   ThreadId,
   VoiceConversationId,
@@ -552,7 +554,13 @@ describe("RealtimeVoiceController", () => {
     const cleanupCoordinator = new RealtimeServerCleanupCoordinator(5);
     const { client, controller } = makeHarness({ cleanupCoordinator });
     vi.mocked(client.closeSession).mockReturnValue(
-      Effect.fail({ _tag: "EnvironmentAuthInvalidError" }),
+      Effect.fail(
+        new EnvironmentAuthInvalidError({
+          code: "auth_invalid",
+          reason: "invalid_credential",
+          traceId: "trace-auth-invalid",
+        }),
+      ),
     );
     await controller.start(createInput);
 
@@ -570,7 +578,15 @@ describe("RealtimeVoiceController", () => {
     const cleanupCoordinator = new RealtimeServerCleanupCoordinator(5);
     const { client, controller } = makeHarness({ cleanupCoordinator });
     vi.mocked(client.closeSession).mockReturnValue(
-      Effect.fail({ _tag: "EnvironmentVoiceOperationError", retryable: false }),
+      Effect.fail(
+        new EnvironmentVoiceOperationError({
+          code: "voice_operation_failed",
+          reason: "invalid-phase",
+          message: "The cleanup cannot be retried.",
+          retryable: false,
+          traceId: "trace-cleanup-terminal",
+        }),
+      ),
     );
     await controller.start(createInput);
 
@@ -588,7 +604,15 @@ describe("RealtimeVoiceController", () => {
     const { client, controller } = makeHarness({ cleanupCoordinator });
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     vi.mocked(client.closeSession).mockReturnValue(
-      Effect.fail({ _tag: "EnvironmentVoiceOperationError", retryable: true }),
+      Effect.fail(
+        new EnvironmentVoiceOperationError({
+          code: "voice_operation_failed",
+          reason: "provider-unavailable",
+          message: "The cleanup can be retried.",
+          retryable: true,
+          traceId: "trace-cleanup-retryable",
+        }),
+      ),
     );
     await controller.start(createInput);
 
