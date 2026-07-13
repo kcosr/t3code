@@ -104,13 +104,18 @@ captures and retains the finalized M4A until T3 acknowledges deterministic messa
 
 ```text
 POST /api/voice/native/thread-turns
+PUT  /api/voice/native/thread-turns/:operationId/audio
 GET  /api/voice/native/thread-turns/:operationId/events
 GET  /api/voice/native/thread-turns/:operationId/speech/:segmentIndex
 POST /api/voice/native/thread-turns/:operationId/cancel
 ```
 
-The upload accepts only the operation ID, runtime ID, generation, bounded audio, media type, and
-optional language. Project, thread, preset, and Auto Rearm come exclusively from the runtime grant.
+The first request accepts only the runtime ID, generation, and a client operation ID. It claims the
+operation idempotently and returns a child operation token before any audio transfer. Retrying the
+same create request returns the existing operation and rotates its child token; the server stores
+only the current token hash. The upload request then accepts only bounded audio, media type, and
+optional language under that child token. Project, thread, preset, and Auto Rearm come exclusively
+from the runtime grant.
 
 ### Server flow
 
