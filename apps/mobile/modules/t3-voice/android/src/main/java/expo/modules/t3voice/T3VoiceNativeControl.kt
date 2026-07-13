@@ -147,17 +147,22 @@ internal object T3VoiceNativeControlOriginPolicy {
   fun handoffActionsUrl(origin: String): String = endpointUrl(origin, "/api/voice/native/handoff-actions")
 
   fun handoffAcknowledgementUrl(origin: String, actionId: String): String =
-    endpointUrl(
-      origin,
-      "/api/voice/native/handoff-actions/${URLEncoder.encode(actionId, Charsets.UTF_8.name())}/ack",
-    )
+    originRoot(origin) +
+      "/api/voice/native/handoff-actions/${encodedPathSegment(actionId)}/ack"
 
   private fun endpointUrl(origin: String, path: String): String {
+    return URI(originRoot(origin) + path).toASCIIString()
+  }
+
+  private fun originRoot(origin: String): String {
     val uri = URI(origin)
     require(uri.scheme.equals("https", ignoreCase = true)) { "Native voice control requires HTTPS." }
     require(!uri.host.isNullOrBlank() && uri.userInfo == null) { "Invalid native control origin." }
-    return URI("https", null, uri.host, uri.port, path, null, null).toASCIIString()
+    return URI("https", null, uri.host, uri.port, null, null, null).toASCIIString()
   }
+
+  private fun encodedPathSegment(value: String): String =
+    URLEncoder.encode(value, Charsets.UTF_8.name()).replace("+", "%20")
 }
 
 internal data class T3VoiceNativeHandoffAction(

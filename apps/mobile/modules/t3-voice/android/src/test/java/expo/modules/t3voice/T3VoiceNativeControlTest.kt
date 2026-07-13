@@ -137,6 +137,17 @@ class T3VoiceNativeControlTest {
       "https://example.test:8443/api/voice/sessions/session-1/native-heartbeat",
       T3VoiceNativeControlOriginPolicy.heartbeatUrl("https://example.test:8443", "session-1"),
     )
+    assertEquals(
+      "https://termstation/api/voice/native/handoff-actions",
+      T3VoiceNativeControlOriginPolicy.handoffActionsUrl("https://termstation/ignored"),
+    )
+    assertEquals(
+      "https://termstation/api/voice/native/handoff-actions/voice-client-action%3Aconversation%3Acall_1/ack",
+      T3VoiceNativeControlOriginPolicy.handoffAcknowledgementUrl(
+        "https://termstation/ignored",
+        "voice-client-action:conversation:call_1",
+      ),
+    )
     runCatching {
       T3VoiceNativeControlOriginPolicy.heartbeatUrl("http://termstation", "session-1")
     }.onSuccess { throw AssertionError("Cleartext origins must be rejected.") }
