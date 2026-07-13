@@ -7,6 +7,8 @@ import type {
   VoiceClientActionAckInput,
   VoiceClientActionAckResult,
   VoiceClientActionId,
+  VoiceNativeHandoffAction,
+  VoiceNativeHandoffActionAckInput,
   VoiceConversationClearContextResult,
   VoiceConversationId,
   VoiceSessionCloseResult,
@@ -85,6 +87,19 @@ export interface VoiceSessionServiceShape {
     sessionId: VoiceSessionId,
     actionId: VoiceClientActionId,
     input: VoiceClientActionAckInput,
+  ) => Effect.Effect<VoiceClientActionAckResult, VoiceError>;
+  readonly listPendingHandoffActions: (
+    ownerAuthSessionId: AuthSessionId,
+    sessionId: VoiceSessionId,
+    leaseGeneration: number,
+    limit: number,
+  ) => Effect.Effect<ReadonlyArray<VoiceNativeHandoffAction>, VoiceError>;
+  readonly acknowledgeNativeHandoffAction: (
+    ownerAuthSessionId: AuthSessionId,
+    sessionId: VoiceSessionId,
+    leaseGeneration: number,
+    actionId: VoiceClientActionId,
+    input: VoiceNativeHandoffActionAckInput,
   ) => Effect.Effect<VoiceClientActionAckResult, VoiceError>;
 }
 

@@ -13,6 +13,8 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -60,6 +62,9 @@ class T3VoiceRuntimeService : Service() {
 
     val playbackTermination: StateFlow<T3VoiceRuntimeEvent.PlaybackTerminated?>
       get() = T3VoiceStateStore.playbackTermination
+
+    val threadVoiceHandoff: StateFlow<T3VoiceRuntimeEvent.ThreadVoiceHandoff?>
+      get() = T3VoiceStateStore.threadVoiceHandoff
 
     fun startRecording(
       recordingId: String,
@@ -110,6 +115,24 @@ class T3VoiceRuntimeService : Service() {
 
     fun acknowledgeRecordingTermination(recordingId: String) {
       T3VoiceStateStore.clearRecordingTermination(recordingId)
+    }
+
+    fun pendingRecordingTermination(): Map<String, Any?>? =
+      T3VoiceStateStore.recordingTermination.value?.toEventBody()
+
+    fun pendingThreadVoiceHandoff(): Map<String, Any>? =
+      T3VoiceStateStore.pendingThreadVoiceHandoff()?.toEventBody()
+
+    fun acknowledgeThreadVoiceHandoff(actionId: String) {
+      T3VoiceStateStore.clearThreadVoiceHandoff(actionId)
+    }
+
+    fun armThreadVoiceHandoff(nativeSessionId: String) {
+      synchronized(operationLock) {
+        if (handoffEligibleSessionId != nativeSessionId) return
+        awaitingHandoffAction = true
+        nativeHandoffPoller.beginTerminalWindow()
+      }
     }
 
     fun startPlayback(playbackId: String, sampleRate: Int, channelCount: Int) {
@@ -186,7 +209,12 @@ class T3VoiceRuntimeService : Service() {
             expectedSessionId = nativeSessionId,
             activeSessionId = T3VoiceStateStore.state.value.activeRealtimeSessionId,
             startControl = {
+              awaitingHandoffAction = false
               nativeControlHeartbeat.start(environmentOrigin, nativeControlGrant)
+              handoffEligibleSessionId = nativeSessionId
+              handoffEligibleLeaseGeneration = nativeControlGrant.leaseGeneration
+              handoffEnvironmentOrigin = environmentOrigin
+              nativeHandoffPoller.start(environmentOrigin, nativeControlGrant)
             },
             keepServiceStarted = {
               keepServiceStarted(ACTION_START_REALTIME, nativeSessionId)
@@ -194,6 +222,11 @@ class T3VoiceRuntimeService : Service() {
           )
         } catch (cause: Throwable) {
           nativeControlHeartbeat.stop()
+          nativeHandoffPoller.stop()
+          handoffEligibleSessionId = null
+          handoffEligibleLeaseGeneration = null
+          handoffEnvironmentOrigin = null
+          awaitingHandoffAction = false
           runCatching { realtime.stop(nativeSessionId) }
           T3VoiceStateStore.releaseRealtimeClaim(nativeSessionId)
           stopRuntimeForegroundLocked()
@@ -243,6 +276,11 @@ class T3VoiceRuntimeService : Service() {
   private val operationLock = foregroundReleaseCoordinator.lock
   private var recordingOwner: T3VoiceOperationOwner? = null
   private var playbackOwner: T3VoiceOperationOwner? = null
+  private var handoffInProgress = false
+  private var handoffEligibleSessionId: String? = null
+  private var handoffEligibleLeaseGeneration: Long? = null
+  private var handoffEnvironmentOrigin: String? = null
+  private var awaitingHandoffAction = false
   private lateinit var recorder: T3VoiceRecorder
   private lateinit var player: T3VoicePcmPlayer
   private lateinit var playbackAudioFocus: T3VoicePlaybackAudioFocus
@@ -253,7 +291,11 @@ class T3VoiceRuntimeService : Service() {
         synchronized(operationLock) {
           if (T3VoiceStateStore.state.value.activeRealtimeSessionId == sessionId) {
             when (termination) {
-              T3VoiceNativeControlTermination.SESSION_ENDED -> realtime.stop(sessionId)
+              T3VoiceNativeControlTermination.SESSION_ENDED -> {
+                awaitingHandoffAction = handoffEligibleSessionId == sessionId
+                nativeHandoffPoller.beginTerminalWindow()
+                realtime.stop(sessionId)
+              }
               T3VoiceNativeControlTermination.CONTROL_REJECTED ->
                 realtime.failNativeControl(sessionId, retryable = false)
               T3VoiceNativeControlTermination.TRANSIENT_FAILURE ->
@@ -263,6 +305,25 @@ class T3VoiceRuntimeService : Service() {
         }
       }
     }
+  private val nativeHandoffPoller =
+    T3VoiceNativeHandoffPoller(
+      execute = { action -> executeNativeHandoff(action) },
+      onSettled = { sessionId ->
+        mainHandler.post {
+          synchronized(operationLock) {
+            if (handoffEligibleSessionId == sessionId) {
+              clearHandoffEligibilityLocked()
+              if (
+                T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE &&
+                  T3VoiceStateStore.state.value.isForeground
+              ) {
+                stopRuntimeForegroundLocked()
+              }
+            }
+          }
+        }
+      },
+    )
   private val realtimeDelegate =
     lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
       T3VoiceWebRtcSession(
@@ -307,7 +368,7 @@ class T3VoiceRuntimeService : Service() {
               )
             if (terminated) {
               nativeControlHeartbeat.stop()
-              stopRuntimeForegroundLocked()
+              if (!handoffInProgress && !awaitingHandoffAction) stopRuntimeForegroundLocked()
               T3VoiceDiagnostics.record(
                 diagnosticGeneration,
                 T3VoiceDiagnosticCategory.LIFECYCLE,
@@ -502,12 +563,14 @@ class T3VoiceRuntimeService : Service() {
         )
       }
       nativeControlHeartbeat.stop()
+      nativeHandoffPoller.stop()
     }
     recorder.release()
     player.release()
     playbackAudioFocus.stop()
     if (realtimeDelegate.isInitialized()) realtime.release()
     nativeControlHeartbeat.destroy()
+    nativeHandoffPoller.destroy()
     T3VoiceStateStore.setInactive()
     super.onDestroy()
   }
@@ -558,6 +621,8 @@ class T3VoiceRuntimeService : Service() {
 
   private fun stopActiveOperationLocked() {
     val state = T3VoiceStateStore.state.value
+    nativeHandoffPoller.stop()
+    clearHandoffEligibilityLocked()
     recordingOwner?.takeIf { it.id == state.activeRecordingId }?.let { owner ->
       runCatching { recorder.cancel(owner.id) }
       terminateRecordingLocked(
@@ -585,6 +650,97 @@ class T3VoiceRuntimeService : Service() {
       if (!stopped) T3VoiceStateStore.releaseRealtimeClaim(it)
     }
     stopRuntimeForegroundLocked()
+  }
+
+  private fun executeNativeHandoff(action: T3VoiceNativeHandoffAction): T3VoiceNativeHandoffOutcome {
+    val completed = CountDownLatch(1)
+    var outcome: T3VoiceNativeHandoffOutcome =
+      T3VoiceNativeHandoffOutcome.Failed("recognition-start", "operation-timeout")
+    mainHandler.post {
+      try {
+        outcome = synchronized(operationLock) { executeNativeHandoffLocked(action) }
+      } catch (_: Throwable) {
+        outcome = T3VoiceNativeHandoffOutcome.Failed("recognition-start", "runtime-unavailable")
+      } finally {
+        completed.countDown()
+      }
+    }
+    if (!completed.await(HANDOFF_COMMAND_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) {
+      return T3VoiceNativeHandoffOutcome.Failed("recognition-start", "operation-timeout")
+    }
+    return outcome
+  }
+
+  private fun clearHandoffEligibilityLocked() {
+    handoffEligibleSessionId = null
+    handoffEligibleLeaseGeneration = null
+    handoffEnvironmentOrigin = null
+    awaitingHandoffAction = false
+  }
+
+  private fun executeNativeHandoffLocked(action: T3VoiceNativeHandoffAction): T3VoiceNativeHandoffOutcome {
+    val state = T3VoiceStateStore.state.value
+    val recordingId = T3VoiceNativeHandoffPolicy.recordingId(action.actionId)
+    if (!T3VoiceNativeHandoffPolicy.matchesGrant(
+        action,
+        handoffEligibleSessionId,
+        handoffEligibleLeaseGeneration,
+      )) {
+      return T3VoiceNativeHandoffOutcome.Failed("target-resolution", "target-unavailable")
+    }
+    if (state.phase == T3VoiceRuntimePhase.RECORDING && state.activeRecordingId == recordingId) {
+      emitThreadVoiceHandoff(action, recordingId)
+      return T3VoiceNativeHandoffOutcome.Listening
+    }
+    if (
+      state.activeRealtimeSessionId != action.sessionId && state.phase != T3VoiceRuntimePhase.IDLE
+    ) {
+      return T3VoiceNativeHandoffOutcome.Failed("target-resolution", "target-unavailable")
+    }
+    handoffInProgress = true
+    return try {
+      nativeControlHeartbeat.stop()
+      val released =
+        if (state.activeRealtimeSessionId == action.sessionId) realtime.stop(action.sessionId) else true
+      if (!released || T3VoiceStateStore.state.value.phase != T3VoiceRuntimePhase.IDLE) {
+        return T3VoiceNativeHandoffOutcome.Failed("realtime-release", "realtime-release-failed")
+      }
+      val owner = T3VoiceStateStore.claimRecording(recordingId)
+        ?: return T3VoiceNativeHandoffOutcome.Failed("recognition-start", "runtime-unavailable")
+      recordingOwner = owner
+      try {
+        ensureRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        recorder.start(recordingId, T3VoiceEndpointDetectionConfig())
+        keepServiceStarted(ACTION_START_RECORDING, recordingId)
+      } catch (_: SecurityException) {
+        releaseRecordingLocked(owner, stopForeground = false)
+        return T3VoiceNativeHandoffOutcome.Failed("recognition-start", "permission-denied")
+      } catch (_: Throwable) {
+        releaseRecordingLocked(owner, stopForeground = false)
+        return T3VoiceNativeHandoffOutcome.Failed("recognition-start", "microphone-unavailable")
+      }
+      emitThreadVoiceHandoff(action, recordingId)
+      T3VoiceNativeHandoffOutcome.Listening
+    } finally {
+      handoffInProgress = false
+      awaitingHandoffAction = false
+      if (T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) stopRuntimeForegroundLocked()
+    }
+  }
+
+  private fun emitThreadVoiceHandoff(action: T3VoiceNativeHandoffAction, recordingId: String) {
+    val environmentOrigin = handoffEnvironmentOrigin ?: return
+    T3VoiceStateStore.publishThreadVoiceHandoff(
+      T3VoiceRuntimeEvent.ThreadVoiceHandoff(
+        actionId = action.actionId,
+        projectId = action.projectId,
+        threadId = action.threadId,
+        recordingId = recordingId,
+        autoRearm = action.autoRearm,
+        environmentOrigin = environmentOrigin,
+        expiresAtEpochMillis = action.expiresAtEpochMillis,
+      ),
+    )
   }
 
   private fun requireRecordingOwner(recordingId: String): T3VoiceOperationOwner =
@@ -718,6 +874,7 @@ class T3VoiceRuntimeService : Service() {
     private const val ACTION_START_PLAYBACK = "expo.modules.t3voice.action.START_PLAYBACK"
     private const val ACTION_START_REALTIME = "expo.modules.t3voice.action.START_REALTIME"
     private const val EXTRA_OPERATION_ID = "operationId"
+    private const val HANDOFF_COMMAND_TIMEOUT_MILLIS = 5_000L
 
     fun requestStop(context: Context) {
       start(context, ACTION_STOP, null)

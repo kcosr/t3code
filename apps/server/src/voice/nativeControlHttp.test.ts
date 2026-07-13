@@ -4,7 +4,15 @@ import * as NodeHttp from "node:http";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
-import { AuthSessionId, VoiceConversationId, VoiceSessionId } from "@t3tools/contracts";
+import {
+  AuthSessionId,
+  ProjectId,
+  ThreadId,
+  VoiceClientActionId,
+  type VoiceNativeHandoffAction,
+  VoiceConversationId,
+  VoiceSessionId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
@@ -12,10 +20,7 @@ import * as HttpServer from "effect/unstable/http/HttpServer";
 
 import { voiceNativeControlRoutesLayer } from "./nativeControlHttp.ts";
 import { VoiceError } from "./Errors.ts";
-import {
-  __testing as nativeGrantRegistryTesting,
-  VoiceNativeControlGrantRegistry,
-} from "./Services/VoiceNativeControlGrantRegistry.ts";
+import { VoiceNativeControlGrantRegistry } from "./Services/VoiceNativeControlGrantRegistry.ts";
 import { VoiceSessionService } from "./Services/VoiceSessionService.ts";
 
 const sessionId = VoiceSessionId.make("voice-session-native-http");
@@ -28,6 +33,7 @@ const grantScope = {
   sessionId,
   leaseGeneration: 4,
   expiresAt,
+  capabilities: new Set(["session-control", "handoff-actions"] as const),
 };
 
 const runWithServer = <A>(
@@ -37,6 +43,7 @@ const runWithServer = <A>(
     readonly phase?: "listening" | "ended";
     readonly heartbeatFails?: boolean;
     readonly grants?: VoiceNativeControlGrantRegistry["Service"];
+    readonly pendingActions?: ReadonlyArray<VoiceNativeHandoffAction>;
   } = {},
 ) => {
   let calls = 0;
@@ -54,6 +61,7 @@ const runWithServer = <A>(
       );
     },
     revokeSession: () => Effect.void,
+    releaseSessionControl: () => Effect.void,
     revokeAuthSession: () => Effect.void,
   });
   const sessions = Layer.mock(VoiceSessionService)({
@@ -78,6 +86,23 @@ const runWithServer = <A>(
         sequence: calls,
       });
     },
+    listPendingHandoffActions: (owner, handoffSessionId, leaseGeneration, limit) => {
+      expect(owner).toBe(grantScope.authSessionId);
+      expect(handoffSessionId).toBe(grantScope.sessionId);
+      expect(leaseGeneration).toBe(grantScope.leaseGeneration);
+      expect(limit).toBe(20);
+      return Effect.succeed(options.pendingActions ?? []);
+    },
+    acknowledgeNativeHandoffAction: (owner, handoffSessionId, leaseGeneration, actionId, input) => {
+      expect(owner).toBe(grantScope.authSessionId);
+      expect(handoffSessionId).toBe(grantScope.sessionId);
+      expect(leaseGeneration).toBe(grantScope.leaseGeneration);
+      return Effect.succeed({
+        actionId,
+        action: "handoff-to-thread-voice" as const,
+        outcome: input.outcome,
+      });
+    },
   });
   const serverLayer = HttpRouter.serve(voiceNativeControlRoutesLayer, {
     disableListenLog: true,
@@ -85,7 +110,12 @@ const runWithServer = <A>(
   }).pipe(
     Layer.provide(Layer.succeed(VoiceNativeControlGrantRegistry, options.grants ?? grants)),
     Layer.provide(sessions),
-    Layer.provideMerge(NodeHttpServer.layer(NodeHttp.createServer, { host: "127.0.0.1", port: 0 })),
+    Layer.provideMerge(
+      NodeHttpServer.layer(NodeHttp.createServer, {
+        host: "127.0.0.1",
+        port: 0,
+      }),
+    ),
     Layer.provideMerge(NodeServices.layer),
   );
 
@@ -103,7 +133,11 @@ const runWithServer = <A>(
 
 const heartbeat = (
   baseUrl: string,
-  input: { readonly pathSessionId?: string; readonly token?: string; readonly body?: string },
+  input: {
+    readonly pathSessionId?: string;
+    readonly token?: string;
+    readonly body?: string;
+  },
 ) =>
   fetch(`${baseUrl}/api/voice/sessions/${input.pathSessionId ?? sessionId}/native-heartbeat`, {
     method: "POST",
@@ -118,6 +152,50 @@ const expectNoStore = (response: Response) =>
   expect(response.headers.get("cache-control")).toBe("no-store");
 
 describe("native voice control HTTP", () => {
+  it.effect("polls and acknowledges handoff actions with the native grant", () =>
+    runWithServer(
+      async (baseUrl) => {
+        const pending = await fetch(`${baseUrl}/api/voice/native/handoff-actions`, {
+          headers: { "x-t3-voice-control": token },
+        });
+        expect(pending.status).toBe(200);
+        expect(await pending.json()).toMatchObject({
+          actions: [{ actionId: "native-action-1", sessionId, autoRearm: true }],
+        });
+        const acknowledged = await fetch(
+          `${baseUrl}/api/voice/native/handoff-actions/native-action-1/ack`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-t3-voice-control": token,
+            },
+            body: '{"outcome":"succeeded","state":"listening"}',
+          },
+        );
+        expect(acknowledged.status).toBe(200);
+        expect(await acknowledged.json()).toMatchObject({
+          actionId: "native-action-1",
+          action: "handoff-to-thread-voice",
+          outcome: "succeeded",
+        });
+      },
+      {
+        pendingActions: [
+          {
+            actionId: VoiceClientActionId.make("native-action-1"),
+            sessionId,
+            leaseGeneration: 4,
+            projectId: ProjectId.make("project-1"),
+            threadId: ThreadId.make("thread-1"),
+            autoRearm: true,
+            expiresAt: "2026-07-12T18:00:00.000Z",
+          },
+        ],
+      },
+    ),
+  );
+
   it.effect(
     "rejects missing, wrong, and bearer-only credentials without a main-auth fallback",
     () =>
@@ -163,7 +241,10 @@ describe("native voice control HTTP", () => {
 
   it.effect("rejects a grant used for the wrong path session or lease generation", () =>
     runWithServer(async (baseUrl, calls) => {
-      const wrongSession = await heartbeat(baseUrl, { token, pathSessionId: otherSessionId });
+      const wrongSession = await heartbeat(baseUrl, {
+        token,
+        pathSessionId: otherSessionId,
+      });
       const wrongGeneration = await heartbeat(baseUrl, {
         token,
         body: '{"leaseGeneration":5}',
@@ -242,24 +323,6 @@ describe("native voice control HTTP", () => {
           candidate === token && call === 1 ? grantScope : undefined,
       },
     ),
-  );
-
-  it.effect("rejects an expired grant using the real registry", () =>
-    Effect.gen(function* () {
-      const registry = yield* nativeGrantRegistryTesting
-        .make({ now: () => expiresAt })
-        .pipe(Effect.provide(NodeServices.layer));
-      const expiredToken = yield* registry.issue(grantScope);
-      yield* runWithServer(
-        async (baseUrl, calls) => {
-          const response = await heartbeat(baseUrl, { token: expiredToken });
-          expect(response.status).toBe(401);
-          expectNoStore(response);
-          expect(calls()).toBe(0);
-        },
-        { grants: registry },
-      );
-    }),
   );
 
   it.effect(

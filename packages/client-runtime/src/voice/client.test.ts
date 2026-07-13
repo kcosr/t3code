@@ -242,6 +242,7 @@ describe("makeVoiceHttpClient", () => {
         if (url.includes("/client-actions/")) {
           return jsonResponse({
             actionId: CLIENT_ACTION_ID,
+            action: "activate-thread",
             outcome: "succeeded",
           });
         }
@@ -267,6 +268,14 @@ describe("makeVoiceHttpClient", () => {
             },
             expiresAt: "2026-07-10T20:55:00.000Z",
             heartbeatIntervalSeconds: 10,
+            nativeControlGrant: {
+              token: "native-control-token",
+              sessionId: SESSION_ID,
+              leaseGeneration: 1,
+              expiresAt: "2026-07-10T20:55:00.000Z",
+              heartbeatIntervalSeconds: 10,
+              failureGraceSeconds: 30,
+            },
           });
         }
         return jsonResponse(sessionState);
@@ -301,6 +310,7 @@ describe("makeVoiceHttpClient", () => {
       const events = yield* client.sessionEvents(SESSION_ID, 4);
       const clientAction = yield* client.acknowledgeClientAction(SESSION_ID, CLIENT_ACTION_ID, {
         leaseGeneration: 1,
+        action: "activate-thread",
         outcome: "succeeded",
       });
       const confirmation = yield* client.decideConfirmation(SESSION_ID, CONFIRMATION_ID, "approve");
@@ -333,7 +343,59 @@ describe("makeVoiceHttpClient", () => {
         clientActionBody instanceof Uint8Array
           ? new TextDecoder().decode(clientActionBody)
           : clientActionBody,
-      ).toBe('{"leaseGeneration":1,"outcome":"succeeded"}');
+      ).toBe('{"leaseGeneration":1,"action":"activate-thread","outcome":"succeeded"}');
+    }),
+  );
+
+  it.effect("uses the native control grant for durable handoff poll and acknowledgement", () =>
+    Effect.gen(function* () {
+      const requests: Array<{
+        readonly url: string;
+        readonly init?: RequestInit;
+      }> = [];
+      const client = makeVoiceHttpClient({
+        prepared: preparedConnection({ _tag: "Bearer", token: "main-token" }),
+        fetch: (async (url: string | URL | Request, init?: RequestInit) => {
+          requests.push({ url: String(url), init });
+          return String(url).endsWith("/ack")
+            ? jsonResponse({
+                actionId: CLIENT_ACTION_ID,
+                action: "handoff-to-thread-voice",
+                outcome: "succeeded",
+              })
+            : jsonResponse({
+                actions: [
+                  {
+                    actionId: CLIENT_ACTION_ID,
+                    sessionId: SESSION_ID,
+                    leaseGeneration: 1,
+                    projectId: PROJECT_ID,
+                    threadId: THREAD_ID,
+                    autoRearm: true,
+                    expiresAt: "2026-07-10T20:55:00.000Z",
+                  },
+                ],
+              });
+        }) as typeof fetch,
+      });
+
+      const pending = yield* client.listNativeHandoffActions("native-token");
+      const acknowledged = yield* client.acknowledgeNativeHandoffAction(
+        "native-token",
+        CLIENT_ACTION_ID,
+        { outcome: "succeeded", state: "listening" },
+      );
+
+      expect(pending.actions).toHaveLength(1);
+      expect(acknowledged.action).toBe("handoff-to-thread-voice");
+      expect(requests.map((request) => request.init?.headers)).toEqual([
+        { "x-t3-voice-control": "native-token" },
+        {
+          "x-t3-voice-control": "native-token",
+          "content-type": "application/json",
+        },
+      ]);
+      expect(requests[1]?.init?.body).toBe('{"outcome":"succeeded","state":"listening"}');
     }),
   );
 

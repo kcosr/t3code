@@ -612,6 +612,61 @@ it.effect("waits for acknowledged thread activation and deduplicates the client 
   }),
 );
 
+it.effect("accepts a terminal thread-voice handoff and durably deduplicates its action", () =>
+  Effect.gen(function* () {
+    const test = yield* makeTest();
+    yield* Effect.gen(function* () {
+      const tools = yield* VoiceToolExecutor;
+      const input = call(
+        "handoff_to_thread_voice",
+        encodeJson({ projectId, threadId }),
+        "handoff-one",
+      );
+
+      const result = yield* tools.invoke(input);
+      expect(result.type).toBe("terminal-completed");
+      if (result.type !== "terminal-completed") return;
+      expect(result.terminalAction).toMatchObject({
+        projectId,
+        threadId,
+        autoRearm: true,
+      });
+      expect(decodeJson(result.output)).toEqual({
+        status: "accepted",
+        actionId: result.terminalAction.actionId,
+        projectId,
+        threadId,
+        autoRearm: true,
+      });
+
+      const duplicate = yield* tools.invoke(input);
+      expect(duplicate).toEqual(result);
+      expect(yield* Ref.get(test.durableCalls)).toHaveLength(1);
+      expect(yield* Ref.get(test.journal)).toHaveLength(2);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("rejects a terminal handoff whose thread belongs to another project", () =>
+  Effect.gen(function* () {
+    const otherProjectId = ProjectId.make("project-other");
+    const test = yield* makeTest("durable", {
+      thread: { ...thread, projectId: otherProjectId },
+    });
+    yield* Effect.gen(function* () {
+      const result = yield* (yield* VoiceToolExecutor).invoke(
+        call(
+          "handoff_to_thread_voice",
+          encodeJson({ projectId, threadId }),
+          "handoff-project-mismatch",
+        ),
+      );
+      expect(result.type === "completed" && result.outcome).toBe("failed");
+      expect(yield* Ref.get(test.durableCalls)).toHaveLength(1);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
 it.effect("binds history search to the current conversation and requires every source scope", () =>
   Effect.gen(function* () {
     const test = yield* makeTest();

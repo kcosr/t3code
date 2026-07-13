@@ -2,6 +2,8 @@ import {
   VoiceTranscriptionStreamEvent,
   VoiceSpeechRequest,
   VoiceTranscriptionMetadata,
+  VoiceNativeHandoffActionListResult,
+  VoiceClientActionAckResult,
   type ProjectId,
   type ThreadId,
   type VoiceConfirmationDecision,
@@ -9,7 +11,6 @@ import {
   type VoiceConfirmationResult,
   type VoiceCapabilities,
   type VoiceClientActionAckInput,
-  type VoiceClientActionAckResult,
   type VoiceClientActionId,
   type VoiceConversationClearContextResult,
   type VoiceConversationClearContextInput,
@@ -24,6 +25,8 @@ import {
   type VoiceConversationUpdateInput,
   type VoiceMediaTicket,
   type VoiceMediaTicketRequest,
+  type VoiceNativeHandoffActionAckInput,
+  type VoiceNativeHandoffActionListResult as VoiceNativeHandoffActionListResultType,
   type VoiceSessionCloseResult,
   type VoiceSessionCreateInput,
   type VoiceSessionCreateResult,
@@ -67,9 +70,11 @@ const encodeTranscriptionMetadata = Schema.encodeSync(
   Schema.fromJsonString(VoiceTranscriptionMetadata),
 );
 const encodeSpeechRequest = Schema.encodeSync(Schema.fromJsonString(VoiceSpeechRequest));
+const decodeNativeHandoffActions = Schema.decodeUnknownEffect(VoiceNativeHandoffActionListResult);
+const decodeNativeHandoffActionAck = Schema.decodeUnknownEffect(VoiceClientActionAckResult);
 
 export class VoiceHttpResponseError extends Data.TaggedError("VoiceHttpResponseError")<{
-  readonly method: "POST";
+  readonly method: "GET" | "POST";
   readonly requestUrl: string;
   readonly status: number;
 }> {
@@ -117,6 +122,18 @@ export class VoiceUriUploadUnavailableError extends Data.TaggedError(
     return `No native URI uploader is configured for ${this.requestUrl}.`;
   }
 }
+
+export class VoiceNativeControlDecodeError extends Data.TaggedError(
+  "VoiceNativeControlDecodeError",
+)<{
+  readonly requestUrl: string;
+  readonly cause: unknown;
+}> {}
+
+export type VoiceNativeControlRequestError =
+  | RemoteEnvironmentRequestError
+  | VoiceHttpResponseError
+  | VoiceNativeControlDecodeError;
 
 export type VoiceMediaStreamError =
   | RemoteEnvironmentRequestError
@@ -202,6 +219,14 @@ export interface VoiceHttpClient {
     actionId: VoiceClientActionId,
     input: VoiceClientActionAckInput,
   ) => Effect.Effect<VoiceClientActionAckResult, RemoteEnvironmentRequestError>;
+  readonly listNativeHandoffActions: (
+    nativeControlToken: string,
+  ) => Effect.Effect<VoiceNativeHandoffActionListResultType, VoiceNativeControlRequestError>;
+  readonly acknowledgeNativeHandoffAction: (
+    nativeControlToken: string,
+    actionId: VoiceClientActionId,
+    input: VoiceNativeHandoffActionAckInput,
+  ) => Effect.Effect<VoiceClientActionAckResult, VoiceNativeControlRequestError>;
   readonly capabilities: () => Effect.Effect<VoiceCapabilities, RemoteEnvironmentRequestError>;
   readonly createConversation: (
     input: VoiceConversationCreateInput,
@@ -430,6 +455,62 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
       timeoutMs,
       ...request,
     });
+  const nativeControl = <A>(request: {
+    readonly method: "GET" | "POST";
+    readonly pathname: string;
+    readonly token: string;
+    readonly body?: unknown;
+    readonly decode: (value: unknown) => Effect.Effect<A, unknown>;
+  }): Effect.Effect<A, VoiceNativeControlRequestError> => {
+    const requestUrl = environmentEndpointUrl(input.prepared.httpBaseUrl, request.pathname);
+    return executeEnvironmentHttpRequest(
+      requestUrl,
+      timeoutMs,
+      Effect.tryPromise({
+        try: (signal) =>
+          input.fetch(requestUrl, {
+            method: request.method,
+            headers: {
+              "x-t3-voice-control": request.token,
+              ...(request.body === undefined ? {} : { "content-type": "application/json" }),
+            },
+            ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
+            signal,
+          }),
+        catch: (cause) =>
+          new RemoteEnvironmentAuthFetchError({
+            message: `Failed to fetch native voice control endpoint ${requestUrl}.`,
+            cause,
+          }),
+      }),
+    ).pipe(
+      Effect.flatMap((response): Effect.Effect<A, VoiceNativeControlRequestError> => {
+        if (!response.ok) {
+          return Effect.fail(
+            new VoiceHttpResponseError({
+              method: request.method,
+              requestUrl,
+              status: response.status,
+            }),
+          );
+        }
+        return Effect.tryPromise({
+          try: () => response.json(),
+          catch: (cause) => new VoiceNativeControlDecodeError({ requestUrl, cause }),
+        }).pipe(
+          Effect.flatMap((value) =>
+            request
+              .decode(value)
+              .pipe(
+                Effect.mapError(
+                  (cause) => new VoiceNativeControlDecodeError({ requestUrl, cause }),
+                ),
+              ),
+          ),
+        );
+      }),
+    );
+  };
 
   return {
     createSession: (payload) =>
@@ -519,11 +600,38 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
         method: "POST",
         pathname: `/api/voice/sessions/${sessionId}/client-actions/${actionId}/ack`,
         run: (client, headers) =>
-          client.voice.acknowledgeVoiceClientAction({
-            headers,
-            params: { sessionId, actionId },
-            payload,
-          }),
+          payload.action === "activate-thread"
+            ? client.voice.acknowledgeVoiceClientAction({
+                headers,
+                params: { sessionId, actionId },
+                payload,
+              })
+            : payload.outcome === "succeeded"
+              ? client.voice.acknowledgeVoiceClientAction({
+                  headers,
+                  params: { sessionId, actionId },
+                  payload,
+                })
+              : client.voice.acknowledgeVoiceClientAction({
+                  headers,
+                  params: { sessionId, actionId },
+                  payload,
+                }),
+      }),
+    listNativeHandoffActions: (nativeControlToken) =>
+      nativeControl({
+        method: "GET",
+        pathname: "/api/voice/native/handoff-actions",
+        token: nativeControlToken,
+        decode: decodeNativeHandoffActions,
+      }),
+    acknowledgeNativeHandoffAction: (nativeControlToken, actionId, payload) =>
+      nativeControl({
+        method: "POST",
+        pathname: `/api/voice/native/handoff-actions/${actionId}/ack`,
+        token: nativeControlToken,
+        body: payload,
+        decode: decodeNativeHandoffActionAck,
       }),
     decideConfirmation: (sessionId, confirmationId, decision) =>
       control({

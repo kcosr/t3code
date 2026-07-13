@@ -47,6 +47,23 @@ export interface VoiceToolCompletedResult {
   readonly submitOutput: boolean;
 }
 
+export interface VoiceToolTerminalResult {
+  readonly type: "terminal-completed";
+  readonly toolCallId: VoiceToolCallId;
+  readonly providerFunctionCallId: string;
+  readonly tool: "handoff_to_thread_voice";
+  readonly outcome: "succeeded";
+  readonly output: string;
+  readonly terminalAction: {
+    readonly actionId: VoiceClientActionId;
+    readonly projectId: ProjectId;
+    readonly threadId: ThreadId;
+    readonly autoRearm: true;
+  };
+}
+
+export type VoiceToolExecutionResult = VoiceToolCompletedResult | VoiceToolTerminalResult;
+
 export interface VoiceToolConfirmationResult {
   readonly type: "confirmation-required";
   readonly confirmationId: VoiceConfirmationId;
@@ -58,7 +75,7 @@ export interface VoiceToolConfirmationResult {
   readonly newlyCreated: boolean;
 }
 
-export type VoiceToolInvokeResult = VoiceToolCompletedResult | VoiceToolConfirmationResult;
+export type VoiceToolInvokeResult = VoiceToolExecutionResult | VoiceToolConfirmationResult;
 
 export interface VoiceToolExecutorShape {
   readonly invoke: (input: VoiceToolCallInput) => Effect.Effect<VoiceToolInvokeResult, VoiceError>;

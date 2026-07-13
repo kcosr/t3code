@@ -132,6 +132,16 @@ export interface T3VoiceRealtimeTerminatedEvent {
   readonly retryable: boolean;
 }
 
+export interface T3VoiceThreadVoiceHandoffEvent {
+  readonly actionId: string;
+  readonly projectId: string;
+  readonly threadId: string;
+  readonly recordingId: string;
+  readonly autoRearm: boolean;
+  readonly environmentOrigin: string;
+  readonly expiresAtEpochMillis: number;
+}
+
 export interface T3VoiceRealtimeIdentifier {
   readonly nativeSessionId: string;
 }
@@ -241,6 +251,10 @@ export interface T3VoiceNativeModule {
       eventName: "realtimeTerminated",
       listener: (event: T3VoiceRealtimeTerminatedEvent) => void,
     ): T3VoiceEventSubscription;
+    (
+      eventName: "threadVoiceHandoff",
+      listener: (event: T3VoiceThreadVoiceHandoffEvent) => void,
+    ): T3VoiceEventSubscription;
   };
   readonly getMediaCapabilitiesAsync: () => Promise<T3VoiceMediaCapabilities>;
   readonly getStateAsync: () => Promise<T3VoiceRuntimeState>;
@@ -259,6 +273,12 @@ export interface T3VoiceNativeModule {
   readonly acknowledgeRecordingTerminationAsync: (
     input: T3VoiceRecordingIdentifier,
   ) => Promise<void>;
+  readonly getPendingRecordingTerminationAsync: () => Promise<T3VoiceRecordingTerminatedEvent | null>;
+  readonly getPendingThreadVoiceHandoffAsync: () => Promise<T3VoiceThreadVoiceHandoffEvent | null>;
+  readonly acknowledgeThreadVoiceHandoffAsync: (input: {
+    readonly actionId: string;
+  }) => Promise<void>;
+  readonly armThreadVoiceHandoffAsync: (input: T3VoiceRealtimeIdentifier) => Promise<void>;
   readonly startPlaybackAsync: (input: T3VoicePlaybackInput) => Promise<void>;
   readonly enqueuePlaybackChunkAsync: (input: T3VoicePlaybackChunkInput) => Promise<void>;
   readonly finishPlaybackAsync: (input: T3VoicePlaybackFinishInput) => Promise<void>;

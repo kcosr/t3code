@@ -9,6 +9,8 @@ import { ProjectionThreadMessageRepositoryLive } from "../persistence/Layers/Pro
 import { ProjectionTurnRepositoryLive } from "../persistence/Layers/ProjectionTurns.ts";
 import { ProjectionTurnStartRepositoryLive } from "../persistence/Layers/ProjectionTurnStarts.ts";
 import { VoiceToolCallRepositoryLive } from "../persistence/Layers/VoiceToolCalls.ts";
+import { VoiceHandoffActionRepositoryLive } from "../persistence/Layers/VoiceHandoffActions.ts";
+import { VoiceNativeControlGrantRepositoryLive } from "../persistence/Layers/VoiceNativeControlGrants.ts";
 import { VoiceContextCompilerLive } from "./Layers/VoiceContextCompiler.ts";
 import { VoiceSessionServiceLive } from "./Layers/VoiceSessionService.ts";
 import { VoiceSessionLifecycleLive } from "./Layers/VoiceSessionLifecycle.ts";
@@ -96,7 +98,9 @@ const VoiceSessionDependenciesLive = Layer.mergeAll(
 const VoiceCoreDependenciesLive = Layer.mergeAll(
   VoiceSessionDependenciesLive,
   VoiceMediaTicketRegistryLive,
-  VoiceNativeControlGrantRegistryLive,
+  VoiceNativeControlGrantRegistryLive.pipe(Layer.provide(VoiceNativeControlGrantRepositoryLive)),
+  VoiceHandoffActionRepositoryLive,
+  VoiceNativeControlGrantRepositoryLive,
 );
 
 const VoiceSessionServiceConfiguredLive = VoiceSessionServiceLive.pipe(

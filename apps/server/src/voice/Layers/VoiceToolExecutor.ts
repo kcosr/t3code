@@ -62,6 +62,7 @@ import {
   VoiceToolExecutor,
   type VoiceToolCallInput,
   type VoiceToolCompletedResult,
+  type VoiceToolExecutionResult,
   type VoiceToolExecutorShape,
   type VoiceToolInvokeResult,
 } from "../Services/VoiceToolExecutor.ts";
@@ -82,6 +83,15 @@ const ListThreadsArguments = Schema.Struct({
   limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
 });
 const ThreadArguments = Schema.Struct({ threadId: ThreadId });
+const HandoffToThreadVoiceArguments = Schema.Struct({ projectId: ProjectId, threadId: ThreadId });
+const HandoffToThreadVoiceOutput = Schema.Struct({
+  status: Schema.Literal("accepted"),
+  actionId: VoiceClientActionId,
+  projectId: ProjectId,
+  threadId: ThreadId,
+  autoRearm: Schema.Literal(true),
+});
+const decodeHandoffToThreadVoiceOutput = Schema.decodeUnknownSync(HandoffToThreadVoiceOutput);
 const GetThreadMessagesArguments = Schema.Struct({
   threadId: ThreadId,
   limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
@@ -187,6 +197,7 @@ type ReadVoiceTool = Extract<
   | "search_history"
   | "read_history"
   | "activate_thread"
+  | "handoff_to_thread_voice"
 >;
 type MutationVoiceTool = Exclude<VoiceToolName, ReadVoiceTool>;
 type HistoryVoiceTool = Extract<VoiceToolName, "search_history" | "read_history">;
@@ -200,6 +211,7 @@ const VOICE_TOOL_ACCESS = {
   search_history: "history-read",
   read_history: "history-read",
   activate_thread: "orchestration-read",
+  handoff_to_thread_voice: "orchestration-read",
   create_thread: "orchestration-operate",
   send_thread_message: "orchestration-operate",
   interrupt_thread: "orchestration-operate",
@@ -241,14 +253,14 @@ interface PendingCall {
 interface CompletedCall {
   readonly type: "completed";
   readonly sessionId: VoiceSessionId;
-  readonly result: VoiceToolCompletedResult;
+  readonly result: VoiceToolExecutionResult;
   readonly completedAtMillis: number;
 }
 
 interface ExecutingReadCall {
   readonly type: "executing-read";
   readonly sessionId: VoiceSessionId;
-  readonly completion: Deferred.Deferred<VoiceToolCompletedResult, VoiceError>;
+  readonly completion: Deferred.Deferred<VoiceToolExecutionResult, VoiceError>;
 }
 
 type CallState = PendingCall | CompletedCall | ExecutingReadCall;
@@ -461,7 +473,7 @@ const make = Effect.gen(function* () {
 
   const durableResultOutput = (
     input: VoiceToolCallInput,
-    result: VoiceToolCompletedResult,
+    result: VoiceToolExecutionResult,
   ): string =>
     isHistoryToolName(input.name)
       ? jsonOutput({
@@ -501,6 +513,42 @@ const make = Effect.gen(function* () {
         }),
       ),
     );
+
+  const terminalHandoff = Effect.fn("VoiceToolExecutor.terminalHandoff")(function* (
+    input: VoiceToolCallInput,
+  ) {
+    const args = yield* parseArguments(HandoffToThreadVoiceArguments, input);
+    const thread = yield* requireThread(args.threadId);
+    if (thread.projectId !== args.projectId) {
+      return yield* voiceError(
+        "invalid-phase",
+        "tool.thread",
+        "Thread does not belong to the requested project",
+      );
+    }
+    const actionId = VoiceClientActionId.make(deterministicId("voice-client-action", input));
+    const output = jsonOutput({
+      status: "accepted",
+      actionId,
+      projectId: args.projectId,
+      threadId: args.threadId,
+      autoRearm: true,
+    });
+    return {
+      type: "terminal-completed",
+      toolCallId: input.toolCallId,
+      providerFunctionCallId: input.providerFunctionCallId,
+      tool: "handoff_to_thread_voice",
+      outcome: "succeeded",
+      output,
+      terminalAction: {
+        actionId,
+        projectId: args.projectId,
+        threadId: args.threadId,
+        autoRearm: true,
+      },
+    } satisfies VoiceToolExecutionResult;
+  });
 
   const prepareMutation = Effect.fn("VoiceToolExecutor.prepareMutation")(function* (
     input: VoiceToolCallInput,
@@ -605,7 +653,7 @@ const make = Effect.gen(function* () {
 
   const executeRead = Effect.fn("VoiceToolExecutor.executeRead")(function* (
     input: VoiceToolCallInput,
-    tool: ReadVoiceTool,
+    tool: Exclude<ReadVoiceTool, "handoff_to_thread_voice">,
   ) {
     switch (tool) {
       case "list_projects": {
@@ -892,18 +940,41 @@ const make = Effect.gen(function* () {
   const completedFromDurable = (
     call: DurableVoiceToolCall,
     submitOutput: boolean,
-  ): VoiceToolCompletedResult => ({
-    type: "completed",
-    toolCallId: call.toolCallId,
-    providerFunctionCallId: call.providerFunctionCallId,
-    tool: isVoiceToolName(call.toolName) ? call.toolName : "unknown",
-    outcome:
-      call.status === "requested" || call.status === "pending-confirmation"
-        ? "failed"
-        : call.status,
-    output: call.resultOutput ?? jsonOutput({ error: "Voice tool result was unavailable" }),
-    submitOutput,
-  });
+  ): VoiceToolExecutionResult => {
+    if (
+      call.toolName === "handoff_to_thread_voice" &&
+      call.status === "succeeded" &&
+      call.resultOutput !== null
+    ) {
+      const value = decodeHandoffToThreadVoiceOutput(decodeJson(call.resultOutput));
+      return {
+        type: "terminal-completed",
+        toolCallId: call.toolCallId,
+        providerFunctionCallId: call.providerFunctionCallId,
+        tool: "handoff_to_thread_voice",
+        outcome: "succeeded",
+        output: call.resultOutput,
+        terminalAction: {
+          actionId: value.actionId,
+          projectId: value.projectId,
+          threadId: value.threadId,
+          autoRearm: true,
+        },
+      };
+    }
+    return {
+      type: "completed",
+      toolCallId: call.toolCallId,
+      providerFunctionCallId: call.providerFunctionCallId,
+      tool: isVoiceToolName(call.toolName) ? call.toolName : "unknown",
+      outcome:
+        call.status === "requested" || call.status === "pending-confirmation"
+          ? "failed"
+          : call.status,
+      output: call.resultOutput ?? jsonOutput({ error: "Voice tool result was unavailable" }),
+      submitOutput,
+    };
+  };
 
   const pendingFromDurable = (
     call: DurableVoiceToolCall,
@@ -957,7 +1028,7 @@ const make = Effect.gen(function* () {
 
   const persistCompleted = (
     input: VoiceToolCallInput,
-    result: VoiceToolCompletedResult,
+    result: VoiceToolExecutionResult,
     updatedAt: string,
   ) =>
     conversations.get(input.conversationId).pipe(
@@ -1099,11 +1170,11 @@ const make = Effect.gen(function* () {
             readonly action: "execute-read";
             readonly key: string;
             readonly tool: ReadVoiceTool;
-            readonly completion: Deferred.Deferred<VoiceToolCompletedResult, VoiceError>;
+            readonly completion: Deferred.Deferred<VoiceToolExecutionResult, VoiceError>;
           }
         | {
             readonly action: "await-read";
-            readonly completion: Deferred.Deferred<VoiceToolCompletedResult, VoiceError>;
+            readonly completion: Deferred.Deferred<VoiceToolExecutionResult, VoiceError>;
           };
 
       const resolution = yield* SynchronizedRef.modifyEffect<
@@ -1116,7 +1187,12 @@ const make = Effect.gen(function* () {
         const key = callKey(input.conversationId, input.toolCallId);
         const existing = current.calls.get(key);
         if (existing?.type === "completed") {
-          return Effect.succeed([{ ...existing.result, submitOutput: false }, current] as const);
+          return Effect.succeed([
+            existing.result.type === "completed"
+              ? { ...existing.result, submitOutput: false }
+              : existing.result,
+            current,
+          ] as const);
         }
         if (existing?.type === "pending") {
           return Effect.succeed([
@@ -1222,7 +1298,7 @@ const make = Effect.gen(function* () {
           const tool = decodedRequestedTool.value;
           const readTool = isReadTool(tool);
           if (readTool) {
-            const completion = yield* Deferred.make<VoiceToolCompletedResult, VoiceError>();
+            const completion = yield* Deferred.make<VoiceToolExecutionResult, VoiceError>();
             return [
               {
                 action: "execute-read",
@@ -1361,27 +1437,49 @@ const make = Effect.gen(function* () {
 
       if (!("action" in resolution)) return resolution;
       if (resolution.action === "await-read") {
-        return yield* Deferred.await(resolution.completion).pipe(
-          Effect.map((result) => ({ ...result, submitOutput: false })),
-        );
+        const result = yield* Deferred.await(resolution.completion);
+        return result.type === "completed" ? { ...result, submitOutput: false } : result;
       }
 
       const execution = Effect.gen(function* () {
         yield* appendJournal(input, "requested");
-        const output = yield* executeRead(input, resolution.tool).pipe(
-          Effect.match({
-            onFailure: (cause) =>
-              jsonOutput({
-                error: cause instanceof Error ? cause.message : "Invalid tool arguments",
-              }),
-            onSuccess: (value) => value,
-          }),
-        );
-        const outcome = output.startsWith('{"error"')
-          ? ("failed" as const)
-          : ("succeeded" as const);
-        const result = completed(input, resolution.tool, outcome, output);
-        yield* appendJournal(input, outcome, output);
+        const result: VoiceToolExecutionResult =
+          resolution.tool === "handoff_to_thread_voice"
+            ? yield* terminalHandoff(input).pipe(
+                Effect.catch((cause) =>
+                  Effect.succeed(
+                    completed(
+                      input,
+                      resolution.tool,
+                      "failed",
+                      jsonOutput({
+                        error: cause instanceof Error ? cause.message : "Invalid tool arguments",
+                      }),
+                    ),
+                  ),
+                ),
+              )
+            : yield* executeRead(input, resolution.tool).pipe(
+                Effect.match({
+                  onFailure: (cause) =>
+                    completed(
+                      input,
+                      resolution.tool,
+                      "failed",
+                      jsonOutput({
+                        error: cause instanceof Error ? cause.message : "Invalid tool arguments",
+                      }),
+                    ),
+                  onSuccess: (output) =>
+                    completed(
+                      input,
+                      resolution.tool,
+                      output.startsWith('{"error"') ? "failed" : "succeeded",
+                      output,
+                    ),
+                }),
+              );
+        yield* appendJournal(input, result.outcome, result.output);
         yield* persistCompleted(input, result, requestedAt);
         return result;
       });

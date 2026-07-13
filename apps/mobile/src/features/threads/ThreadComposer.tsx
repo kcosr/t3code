@@ -393,12 +393,39 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     state: autoListenState,
     active: autoListenActive,
     activate: activateAutoListen,
+    adoptRecording: adoptAutoListenRecording,
     deactivateForManualDictation: deactivateAutoListenForManualDictation,
     stopToDraft: stopAutoListenToDraft,
     pause: pauseAutoListen,
     submitReview: submitAutoListenReview,
   } = autoListen;
   const autoListenAlertCycleRef = useRef(0);
+
+  useEffect(() => {
+    const handoff = realtimeVoice.threadVoiceHandoff;
+    if (
+      handoff === null ||
+      handoff.environmentId !== props.environmentId ||
+      handoff.threadId !== props.selectedThread.id
+    ) {
+      return;
+    }
+    let disposed = false;
+    void dictation.adopt(handoff.recordingId).then((adopted) => {
+      if (disposed) return;
+      if (adopted && handoff.autoRearm) adoptAutoListenRecording(handoff.recordingId);
+      realtimeVoice.consumeThreadVoiceHandoff(handoff.actionId);
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [
+    adoptAutoListenRecording,
+    dictation,
+    props.environmentId,
+    props.selectedThread.id,
+    realtimeVoice,
+  ]);
 
   useEffect(() => {
     if (

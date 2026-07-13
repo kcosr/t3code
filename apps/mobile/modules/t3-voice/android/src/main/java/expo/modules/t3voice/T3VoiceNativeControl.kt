@@ -6,6 +6,7 @@ import java.io.FilterInputStream
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.net.URI
+import java.net.URLEncoder
 import java.time.Instant
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -129,6 +130,256 @@ internal object T3VoiceNativeControlOriginPolicy {
       null,
       null,
     ).toASCIIString()
+  }
+
+  fun handoffActionsUrl(origin: String): String = endpointUrl(origin, "/api/voice/native/handoff-actions")
+
+  fun handoffAcknowledgementUrl(origin: String, actionId: String): String =
+    endpointUrl(
+      origin,
+      "/api/voice/native/handoff-actions/${URLEncoder.encode(actionId, Charsets.UTF_8.name())}/ack",
+    )
+
+  private fun endpointUrl(origin: String, path: String): String {
+    val uri = URI(origin)
+    require(uri.scheme.equals("https", ignoreCase = true)) { "Native voice control requires HTTPS." }
+    require(!uri.host.isNullOrBlank() && uri.userInfo == null) { "Invalid native control origin." }
+    return URI("https", null, uri.host, uri.port, path, null, null).toASCIIString()
+  }
+}
+
+internal data class T3VoiceNativeHandoffAction(
+  val actionId: String,
+  val sessionId: String,
+  val leaseGeneration: Long,
+  val projectId: String,
+  val threadId: String,
+  val autoRearm: Boolean,
+  val expiresAtEpochMillis: Long,
+)
+
+internal sealed interface T3VoiceNativeHandoffOutcome {
+  data object Listening : T3VoiceNativeHandoffOutcome
+  data class Failed(val stage: String, val reason: String) : T3VoiceNativeHandoffOutcome
+}
+
+internal object T3VoiceNativeHandoffPolicy {
+  fun recordingId(actionId: String) = "voice-handoff-$actionId"
+
+  fun matchesGrant(action: T3VoiceNativeHandoffAction, sessionId: String?, leaseGeneration: Long?): Boolean =
+    action.sessionId == sessionId && action.leaseGeneration == leaseGeneration
+
+  fun shouldExecute(action: T3VoiceNativeHandoffAction, nowMillis: Long, handled: Set<String>): Boolean =
+    action.actionId !in handled && nowMillis < action.expiresAtEpochMillis
+}
+
+internal interface T3VoiceNativeHandoffTransport {
+  fun poll(url: String, token: String): T3VoiceNativeHandoffPollResult
+  fun acknowledge(url: String, token: String, outcome: T3VoiceNativeHandoffOutcome): Boolean
+}
+
+internal sealed interface T3VoiceNativeHandoffPollResult {
+  data class Actions(val actions: List<T3VoiceNativeHandoffAction>) : T3VoiceNativeHandoffPollResult
+  data object ControlRejected : T3VoiceNativeHandoffPollResult
+  data object TransientFailure : T3VoiceNativeHandoffPollResult
+}
+
+internal class T3VoiceHttpsNativeHandoffTransport : T3VoiceNativeHandoffTransport {
+  override fun poll(url: String, token: String): T3VoiceNativeHandoffPollResult =
+    request(url, token, "GET", null, resetResponseCode = true) { input -> parseActions(input) }
+      ?.let(T3VoiceNativeHandoffPollResult::Actions)
+      ?: lastResponseCode.takeIf { it == 401 || it == 403 }
+        ?.let { T3VoiceNativeHandoffPollResult.ControlRejected }
+      ?: T3VoiceNativeHandoffPollResult.TransientFailure
+
+  @Volatile private var lastResponseCode = 0
+
+  override fun acknowledge(
+    url: String,
+    token: String,
+    outcome: T3VoiceNativeHandoffOutcome,
+  ): Boolean =
+    request(url, token, "POST", acknowledgementBody(outcome)) { true } ?: false
+
+  private fun <T> request(
+    url: String,
+    token: String,
+    method: String,
+    body: String?,
+    resetResponseCode: Boolean = false,
+    parse: (InputStream) -> T,
+  ): T? {
+    if (resetResponseCode) lastResponseCode = 0
+    val connection = URI(url).toURL().openConnection() as HttpsURLConnection
+    return try {
+      connection.requestMethod = method
+      connection.instanceFollowRedirects = false
+      connection.connectTimeout = 5_000
+      connection.readTimeout = 5_000
+      connection.setRequestProperty("x-t3-voice-control", token)
+      if (body != null) {
+        connection.doOutput = true
+        connection.setRequestProperty("content-type", "application/json")
+        connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+      }
+      lastResponseCode = connection.responseCode
+      if (lastResponseCode !in 200..299) {
+        runCatching { connection.errorStream?.use { it.readNBytes(4_096) } }
+        null
+      } else {
+        connection.inputStream.use(parse)
+      }
+    } catch (_: Exception) {
+      null
+    } finally {
+      connection.disconnect()
+    }
+  }
+
+  private fun parseActions(input: InputStream): List<T3VoiceNativeHandoffAction> {
+    val actions = mutableListOf<T3VoiceNativeHandoffAction>()
+    JsonReader(InputStreamReader(input, Charsets.UTF_8)).use { reader ->
+      reader.beginObject()
+      check(reader.nextName() == "actions")
+      reader.beginArray()
+      while (reader.hasNext()) actions += parseAction(reader)
+      reader.endArray()
+      reader.endObject()
+      check(reader.peek() == JsonToken.END_DOCUMENT)
+    }
+    return actions
+  }
+
+  private fun parseAction(reader: JsonReader): T3VoiceNativeHandoffAction {
+    val values = mutableMapOf<String, Any>()
+    reader.beginObject()
+    while (reader.hasNext()) {
+      val name = reader.nextName()
+      check(name in ACTION_FIELDS && name !in values)
+      values[name] = if (name == "leaseGeneration") reader.nextLong() else if (name == "autoRearm") reader.nextBoolean() else reader.nextString()
+    }
+    reader.endObject()
+    check(values.keys == ACTION_FIELDS)
+    return T3VoiceNativeHandoffAction(
+      actionId = values.getValue("actionId") as String,
+      sessionId = values.getValue("sessionId") as String,
+      leaseGeneration = values.getValue("leaseGeneration") as Long,
+      projectId = values.getValue("projectId") as String,
+      threadId = values.getValue("threadId") as String,
+      autoRearm = values.getValue("autoRearm") as Boolean,
+      expiresAtEpochMillis = Instant.parse(values.getValue("expiresAt") as String).toEpochMilli(),
+    )
+  }
+
+  private fun acknowledgementBody(outcome: T3VoiceNativeHandoffOutcome): String =
+    when (outcome) {
+      T3VoiceNativeHandoffOutcome.Listening -> "{\"outcome\":\"succeeded\",\"state\":\"listening\"}"
+      is T3VoiceNativeHandoffOutcome.Failed ->
+        "{\"outcome\":\"failed\",\"stage\":\"${outcome.stage}\",\"reason\":\"${outcome.reason}\"}"
+    }
+
+  private companion object {
+    val ACTION_FIELDS = setOf("actionId", "sessionId", "leaseGeneration", "projectId", "threadId", "autoRearm", "expiresAt")
+  }
+}
+
+internal class T3VoiceNativeHandoffPoller(
+  private val transport: T3VoiceNativeHandoffTransport = T3VoiceHttpsNativeHandoffTransport(),
+  private val clockMillis: () -> Long = System::currentTimeMillis,
+  private val executor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor(),
+  private val execute: (T3VoiceNativeHandoffAction) -> T3VoiceNativeHandoffOutcome,
+  private val onSettled: (String) -> Unit,
+) {
+  private val lock = Any()
+  private val handled = mutableSetOf<String>()
+  private val outcomes = mutableMapOf<String, T3VoiceNativeHandoffOutcome>()
+  private var origin: String? = null
+  private var grant: T3VoiceNativeControlGrant? = null
+  private var scheduled: ScheduledFuture<*>? = null
+  private var actionDeadlineMillis: Long? = null
+
+  fun start(nextOrigin: String, nextGrant: T3VoiceNativeControlGrant) = synchronized(lock) {
+    T3VoiceNativeControlOriginPolicy.handoffActionsUrl(nextOrigin)
+    stopLocked()
+    origin = nextOrigin
+    grant = nextGrant
+    actionDeadlineMillis = null
+    scheduled = executor.scheduleWithFixedDelay({ runCatching { poll() } }, 0, 500, TimeUnit.MILLISECONDS)
+  }
+
+  fun stop() = synchronized(lock) { stopLocked() }
+  fun beginTerminalWindow() = synchronized(lock) {
+    if (grant != null && actionDeadlineMillis == null) {
+      actionDeadlineMillis = clockMillis() + TERMINAL_ACTION_WINDOW_MILLIS
+    }
+  }
+  fun destroy() { stop(); executor.shutdownNow() }
+
+  private fun poll() {
+    val currentOrigin: String
+    val currentGrant: T3VoiceNativeControlGrant
+    synchronized(lock) {
+      currentOrigin = origin ?: return
+      currentGrant = grant ?: return
+      val now = clockMillis()
+      if (now >= currentGrant.expiresAtEpochMillis || actionDeadlineMillis?.let { now >= it } == true) {
+        stopLocked()
+        onSettled(currentGrant.sessionId)
+        return
+      }
+    }
+    val pollResult = transport.poll(T3VoiceNativeControlOriginPolicy.handoffActionsUrl(currentOrigin), currentGrant.token)
+    if (pollResult == T3VoiceNativeHandoffPollResult.ControlRejected) {
+      synchronized(lock) { stopLocked() }
+      onSettled(currentGrant.sessionId)
+      return
+    }
+    val actions = (pollResult as? T3VoiceNativeHandoffPollResult.Actions)?.actions ?: return
+    actions.forEach { action ->
+      val outcome = synchronized(lock) {
+        if (grant !== currentGrant) return@forEach
+        outcomes[action.actionId]
+      } ?: run {
+        val executeNow = synchronized(lock) {
+          T3VoiceNativeHandoffPolicy.shouldExecute(action, clockMillis(), handled).also {
+            if (it) handled += action.actionId
+          }
+        }
+        if (!executeNow) return@forEach
+        runCatching { execute(action) }
+          .getOrElse {
+            T3VoiceNativeHandoffOutcome.Failed("recognition-start", "runtime-unavailable")
+          }
+          .also { synchronized(lock) { outcomes[action.actionId] = it } }
+      }
+      val acknowledged = transport.acknowledge(
+        T3VoiceNativeControlOriginPolicy.handoffAcknowledgementUrl(currentOrigin, action.actionId),
+        currentGrant.token,
+        outcome,
+      )
+      if (acknowledged) {
+        synchronized(lock) {
+          outcomes.remove(action.actionId)
+          stopLocked()
+        }
+        onSettled(currentGrant.sessionId)
+        return
+      }
+    }
+  }
+
+  private fun stopLocked() {
+    scheduled?.cancel(true)
+    scheduled = null
+    origin = null
+    grant = null
+    handled.clear()
+    outcomes.clear()
+    actionDeadlineMillis = null
+  }
+
+  private companion object {
+    const val TERMINAL_ACTION_WINDOW_MILLIS = 10_000L
   }
 }
 

@@ -6,6 +6,7 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 
 import { VoiceError } from "../../Errors.ts";
@@ -19,6 +20,7 @@ import { __testing } from "./OpenAiVoiceProvider.ts";
 
 const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
+const decodeJsonEffect = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
 
 it("normalizes stable semantic transcript identities and rejects unidentified finals", () => {
   const parse = (value: unknown) =>
@@ -297,7 +299,7 @@ it.effect("streams PCM speech bytes and maps the server-owned voice preset", () 
   Effect.gen(function* () {
     let requestBody = "";
     const httpClient = HttpClient.make((request) =>
-      Effect.gen(function* () {
+      Effect.sync(() => {
         if (request.body._tag === "Uint8Array") {
           requestBody = new TextDecoder().decode(request.body.body);
         }
@@ -327,9 +329,7 @@ it.effect("streams PCM speech bytes and maps the server-owned voice preset", () 
       .pipe(Stream.runCollect);
 
     expect(Array.from(bytes).flatMap((chunk) => Array.from(chunk))).toEqual([1, 2, 3, 4]);
-    const decodedRequestBody = yield* Schema.decodeUnknownEffect(Schema.UnknownFromJsonString)(
-      requestBody,
-    );
+    const decodedRequestBody = yield* decodeJsonEffect(requestBody);
     expect(decodedRequestBody).toMatchObject({
       model: __testing.speechModel,
       voice: "marin",
@@ -547,6 +547,7 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       "search_history",
       "read_history",
       "activate_thread",
+      "handoff_to_thread_voice",
       "create_thread",
       "send_thread_message",
     ]);
@@ -949,6 +950,197 @@ it.effect("waits for an acknowledged live context update on the sideband event s
     yield* Fiber.interrupt(eventFiber);
     yield* session.terminate;
   }),
+);
+
+it.effect(
+  "acknowledges a terminal tool output, cancels an active response, and prevents continuation",
+  () =>
+    Effect.gen(function* () {
+      const queueReady = yield* Deferred.make<Queue.Queue<OpenAiRealtimeSocketEvent>>();
+      const terminalOutputSent = yield* Deferred.make<void>();
+      const sent: Array<string> = [];
+      const httpClient = HttpClient.make((request) =>
+        Effect.succeed(
+          HttpClientResponse.fromWeb(
+            request,
+            request.url.endsWith("/hangup")
+              ? new Response(null, { status: 200 })
+              : new Response("answer-sdp", {
+                  status: 201,
+                  headers: { location: "/v1/realtime/calls/rtc_terminal" },
+                }),
+          ),
+        ),
+      );
+      const socket = OpenAiRealtimeSocket.of({
+        connect: () =>
+          Effect.gen(function* () {
+            const queue = yield* Queue.unbounded<OpenAiRealtimeSocketEvent>();
+            yield* Deferred.succeed(queueReady, queue);
+            return {
+              events: Stream.fromQueue(queue),
+              receive: Queue.take(queue),
+              send: (data: string) =>
+                Effect.sync(() => {
+                  sent.push(data);
+                  return decodeJson(data) as { readonly event_id?: string };
+                }).pipe(
+                  Effect.flatMap((message) =>
+                    message.event_id === "t3_terminal_output_terminal_item"
+                      ? Deferred.succeed(terminalOutputSent, undefined)
+                      : Effect.void,
+                  ),
+                ),
+              close: Effect.void,
+            } satisfies OpenAiRealtimeSocketConnection;
+          }),
+      });
+      const provider = yield* __testing.make.pipe(
+        Effect.provideService(HttpClient.HttpClient, httpClient),
+        Effect.provideService(VoiceCredentialStore, credentialStore(Option.some("sk-test"))),
+        Effect.provideService(OpenAiRealtimeSocket, socket),
+      );
+      const session = yield* provider.realtime!.negotiate({
+        sessionId: "voice-session-terminal" as never,
+        leaseGeneration: 1,
+        offer: {
+          sessionId: "voice-session-terminal" as never,
+          leaseGeneration: 1,
+          sdp: "offer-sdp",
+        },
+        instructions: "test",
+        continuationContext: [],
+      });
+      const eventFiber = yield* session.events.pipe(Stream.runDrain, Effect.forkScoped);
+      const queue = yield* Deferred.await(queueReady);
+      yield* Queue.offer(queue, {
+        type: "message",
+        data: encodeJson({
+          type: "response.created",
+          response: { id: "response-active" },
+        }),
+      });
+      yield* Effect.yieldNow;
+
+      const completing = yield* session
+        .completeTerminalToolCall({
+          providerFunctionCallId: "call_handoff",
+          output: '{"status":"accepted"}',
+          itemId: "terminal_item",
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(terminalOutputSent);
+      yield* Queue.offer(queue, {
+        type: "message",
+        data: encodeJson({
+          type: "response.done",
+          response: { id: "response-active", output: [] },
+        }),
+      });
+      yield* Effect.yieldNow;
+      yield* Queue.offer(queue, {
+        type: "message",
+        data: encodeJson({
+          type: "conversation.item.created",
+          item: { id: "terminal_item" },
+        }),
+      });
+      yield* Fiber.join(completing);
+
+      const messages = sent.map((message) => decodeJson(message));
+      expect(messages).toEqual([
+        {
+          type: "response.cancel",
+          event_id: "t3_terminal_cancel_terminal_item",
+        },
+        {
+          type: "conversation.item.create",
+          event_id: "t3_terminal_output_terminal_item",
+          item: {
+            id: "terminal_item",
+            type: "function_call_output",
+            call_id: "call_handoff",
+            output: '{"status":"accepted"}',
+          },
+        },
+      ]);
+      expect(messages).not.toContainEqual({ type: "response.create" });
+
+      const error = yield* session
+        .submitToolOutput({ providerFunctionCallId: "call_late", output: "{}" })
+        .pipe(Effect.flip);
+      expect(error.detail).toBe("OpenAI Realtime session already accepted a terminal tool output");
+      expect(sent.map((message) => decodeJson(message))).not.toContainEqual({
+        type: "response.create",
+      });
+      yield* Fiber.interrupt(eventFiber);
+      yield* session.terminate;
+    }),
+);
+
+it.effect("fails a terminal tool output when OpenAI does not acknowledge it", () =>
+  Effect.gen(function* () {
+    const sent: Array<string> = [];
+    const provider = yield* __testing.make.pipe(
+      Effect.provideService(
+        HttpClient.HttpClient,
+        HttpClient.make((request) =>
+          Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              request.url.endsWith("/hangup")
+                ? new Response(null, { status: 200 })
+                : new Response("answer-sdp", {
+                    status: 201,
+                    headers: {
+                      location: "/v1/realtime/calls/rtc_terminal_timeout",
+                    },
+                  }),
+            ),
+          ),
+        ),
+      ),
+      Effect.provideService(VoiceCredentialStore, credentialStore(Option.some("sk-test"))),
+      Effect.provideService(OpenAiRealtimeSocket, realtimeSocket([], sent)),
+    );
+    const session = yield* provider.realtime!.negotiate({
+      sessionId: "voice-session-terminal-timeout" as never,
+      leaseGeneration: 1,
+      offer: {
+        sessionId: "voice-session-terminal-timeout" as never,
+        leaseGeneration: 1,
+        sdp: "offer-sdp",
+      },
+      instructions: "test",
+      continuationContext: [],
+    });
+    const eventFiber = yield* session.events.pipe(Stream.runDrain, Effect.forkScoped);
+    const completing = yield* session
+      .completeTerminalToolCall({
+        providerFunctionCallId: "call_handoff_timeout",
+        output: '{"status":"accepted"}',
+        itemId: "terminal_timeout_item",
+      })
+      .pipe(Effect.forkScoped);
+    yield* TestClock.adjust("10 seconds");
+    const error = yield* Fiber.join(completing).pipe(Effect.flip);
+
+    expect(error.detail).toBe("OpenAI did not acknowledge the terminal tool output");
+    expect(sent.map((message) => decodeJson(message))).toEqual([
+      {
+        type: "conversation.item.create",
+        event_id: "t3_terminal_output_terminal_timeout_item",
+        item: {
+          id: "terminal_timeout_item",
+          type: "function_call_output",
+          call_id: "call_handoff_timeout",
+          output: '{"status":"accepted"}',
+        },
+      },
+    ]);
+    yield* Fiber.interrupt(eventFiber);
+    yield* session.terminate;
+  }).pipe(Effect.provide(TestClock.layer())),
 );
 
 it.effect("hangs up the provider call when sideband attachment fails", () =>

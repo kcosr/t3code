@@ -56,6 +56,10 @@ export interface RealtimeToolOutput {
   readonly output: string;
 }
 
+export interface RealtimeTerminalToolOutput extends RealtimeToolOutput {
+  readonly itemId: string;
+}
+
 export type RealtimeProviderEvent =
   | {
       readonly type: "activity";
@@ -92,6 +96,9 @@ export interface RealtimeProviderSession {
   readonly events: Stream.Stream<RealtimeProviderEvent, VoiceError>;
   readonly updateContext: (item: RealtimeContextItem) => Effect.Effect<void, VoiceError>;
   readonly submitToolOutput: (output: RealtimeToolOutput) => Effect.Effect<void, VoiceError>;
+  readonly completeTerminalToolCall: (
+    output: RealtimeTerminalToolOutput,
+  ) => Effect.Effect<void, VoiceError>;
   readonly terminate: Effect.Effect<void, VoiceError>;
 }
 

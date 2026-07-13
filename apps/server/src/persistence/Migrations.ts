@@ -53,6 +53,8 @@ import Migration0037 from "./Migrations/037_VoiceToolCallContextEpoch.ts";
 import Migration0038 from "./Migrations/038_VoiceConversationLastCallAt.ts";
 import Migration0039 from "./Migrations/039_ThreadMessageHistorySearch.ts";
 import Migration0040 from "./Migrations/040_VoiceEntryHistorySearch.ts";
+import Migration0041 from "./Migrations/041_VoiceHandoffActions.ts";
+import Migration0042 from "./Migrations/042_VoiceNativeControlGrants.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -105,6 +107,8 @@ export const migrationEntries = [
   [38, "VoiceConversationLastCallAt", Migration0038],
   [39, "ThreadMessageHistorySearch", Migration0039],
   [40, "VoiceEntryHistorySearch", Migration0040],
+  [41, "VoiceHandoffActions", Migration0041],
+  [42, "VoiceNativeControlGrants", Migration0042],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>
@@ -144,9 +148,13 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
       ? "Running all migrations..."
       : `Running migrations 1 through ${toMigrationInclusive}...`,
   );
-  const executedMigrations = yield* run({ loader: makeMigrationLoader(toMigrationInclusive) });
+  const executedMigrations = yield* run({
+    loader: makeMigrationLoader(toMigrationInclusive),
+  });
   yield* Effect.log("Migrations ran successfully").pipe(
-    Effect.annotateLogs({ migrations: executedMigrations.map(([id, name]) => `${id}_${name}`) }),
+    Effect.annotateLogs({
+      migrations: executedMigrations.map(([id, name]) => `${id}_${name}`),
+    }),
   );
   return executedMigrations;
 });

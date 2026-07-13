@@ -81,6 +81,13 @@ export type VoiceThreadModeEvent =
       readonly playbackRequired: boolean;
       readonly threadBusy: boolean;
     }
+  | {
+      readonly type: "adopt-recording";
+      readonly target: VoiceThreadModeTarget;
+      readonly policy: VoiceThreadModePolicy;
+      readonly playbackRequired: boolean;
+      readonly recordingId: string;
+    }
   | { readonly type: "pause"; readonly reason: VoiceThreadModePauseReason }
   | {
       readonly type: "target-changed";
@@ -335,6 +342,24 @@ export function transitionVoiceThreadMode(
       return {
         state: next.state,
         commands: [...(state.phase === "paused" ? [] : cleanupCommands(state)), ...next.commands],
+      };
+    }
+    case "adopt-recording": {
+      const cycle = state.cycle + 1;
+      const operation = state.nextOperation + 1;
+      return {
+        state: {
+          ...initialVoiceThreadModeState(),
+          phase: "listening",
+          target: event.target,
+          policy: event.policy,
+          playbackRequired: event.playbackRequired,
+          cycle,
+          nextOperation: operation,
+          activeToken: { targetGeneration: event.target.generation, cycle, operation },
+          recordingId: event.recordingId,
+        },
+        commands: state.phase === "paused" ? [] : cleanupCommands(state),
       };
     }
     case "pause":

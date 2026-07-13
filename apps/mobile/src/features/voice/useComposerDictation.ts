@@ -298,6 +298,31 @@ export function useComposerDictation(input: {
     }
   }, [native]);
 
+  const adopt = useCallback(
+    async (recordingId: string): Promise<boolean> => {
+      if (native === null || prepared === null || recordingIdRef.current !== null) return false;
+      const runtime = await native.getStateAsync();
+      const generation = ++operationGenerationRef.current;
+      if (runtime.phase !== "recording" || runtime.activeRecordingId !== recordingId) {
+        const terminal = await native.getPendingRecordingTerminationAsync();
+        if (terminal?.recordingId !== recordingId) return false;
+        if (terminal.outcome !== "completed") {
+          await native.acknowledgeRecordingTerminationAsync({ recordingId }).catch(() => undefined);
+          return false;
+        }
+        setError(null);
+        setPhase("transcribing");
+        void transcribeCompletedRecording(terminal.recording, generation, draftRef.current);
+        return true;
+      }
+      recordingIdRef.current = recordingId;
+      setError(null);
+      setPhase("recording");
+      return true;
+    },
+    [native, prepared, transcribeCompletedRecording],
+  );
+
   useEffect(() => {
     if (native === null) return;
     const subscription = native.addListener("recordingTerminated", (event) => {
@@ -396,5 +421,6 @@ export function useComposerDictation(input: {
     stop,
     cancel,
     cancelForRealtime,
+    adopt,
   };
 }

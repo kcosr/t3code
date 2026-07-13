@@ -8,6 +8,8 @@ import {
   VoiceConversationUpdateInput,
   VoiceMediaTicketRequest,
   VoiceNativeControlGrant,
+  VoiceNativeHandoffActionAckInput,
+  VoiceNativeHandoffActionListResult,
   VoiceNativeHeartbeatInput,
   VoiceNativeHeartbeatResult,
   VoiceSpeechRequest,
@@ -174,10 +176,19 @@ describe("voice contracts", () => {
     expect(
       decodeUnknownSync(VoiceClientActionAckInput)({
         leaseGeneration: 2,
+        action: "activate-thread",
         outcome: "failed",
         message: "Navigation was unavailable",
       }),
     ).toMatchObject({ outcome: "failed" });
+    expect(
+      decodeUnknownSync(VoiceClientActionAckInput)({
+        leaseGeneration: 2,
+        action: "handoff-to-thread-voice",
+        outcome: "succeeded",
+        state: "listening",
+      }),
+    ).toMatchObject({ action: "handoff-to-thread-voice", state: "listening" });
   });
 
   it("preserves partial transcript boundaries and normalizes final transcripts", () => {
@@ -321,8 +332,11 @@ describe("voice contracts", () => {
       finalSegment: true,
     };
     expect(
-      decodeUnknownSync(VoiceSpeechRequest)({ ...base, text: "x".repeat(8 * 1024), preset: "warm" })
-        .preset,
+      decodeUnknownSync(VoiceSpeechRequest)({
+        ...base,
+        text: "x".repeat(8 * 1024),
+        preset: "warm",
+      }).preset,
     ).toBe("warm");
     expect(() =>
       decodeUnknownSync(VoiceSpeechRequest)({
@@ -339,7 +353,11 @@ describe("voice contracts", () => {
       }),
     ).toThrow();
     expect(() =>
-      decodeUnknownSync(VoiceSpeechRequest)({ ...base, text: "hello", preset: "unknown" }),
+      decodeUnknownSync(VoiceSpeechRequest)({
+        ...base,
+        text: "hello",
+        preset: "unknown",
+      }),
     ).toThrow();
   });
 
@@ -349,7 +367,10 @@ describe("voice contracts", () => {
         operation: "speech-stream",
         requestId: "voice-request-ticket",
       }),
-    ).toEqual({ operation: "speech-stream", requestId: "voice-request-ticket" });
+    ).toEqual({
+      operation: "speech-stream",
+      requestId: "voice-request-ticket",
+    });
     expect(() =>
       decodeUnknownSync(VoiceMediaTicketRequest)({
         operation: "speech-stream",
@@ -375,7 +396,10 @@ describe("voice contracts", () => {
     };
     expect(decodeUnknownSync(VoiceNativeControlGrant)(grant)).toEqual(grant);
     expect(() =>
-      decodeUnknownSync(VoiceNativeControlGrant)({ ...grant, token: "x".repeat(129) }),
+      decodeUnknownSync(VoiceNativeControlGrant)({
+        ...grant,
+        token: "x".repeat(129),
+      }),
     ).toThrow();
     expect(decodeUnknownSync(VoiceNativeHeartbeatInput)({ leaseGeneration: 2 })).toEqual({
       leaseGeneration: 2,
@@ -414,5 +438,38 @@ describe("voice contracts", () => {
     ] as const) {
       expect(() => decodeUnknownSync(schema)(value, { onExcessProperty: "error" })).toThrow();
     }
+  });
+
+  it("decodes native handoff polling and acknowledgement shapes", () => {
+    const result = {
+      actions: [
+        {
+          actionId: "voice-client-action-1",
+          sessionId: "voice-session-1",
+          leaseGeneration: 2,
+          projectId: "project-1",
+          threadId: "thread-1",
+          autoRearm: true,
+          expiresAt: "2026-07-12T18:00:00.000Z",
+        },
+      ],
+    };
+    expect(decodeUnknownSync(VoiceNativeHandoffActionListResult)(result)).toEqual(result);
+    expect(
+      decodeUnknownSync(VoiceNativeHandoffActionAckInput)({
+        outcome: "succeeded",
+        state: "listening",
+      }),
+    ).toEqual({ outcome: "succeeded", state: "listening" });
+    expect(() =>
+      decodeUnknownSync(VoiceNativeHandoffActionAckInput)(
+        {
+          outcome: "succeeded",
+          state: "listening",
+          leaseGeneration: 2,
+        },
+        { onExcessProperty: "error" },
+      ),
+    ).toThrow();
   });
 });

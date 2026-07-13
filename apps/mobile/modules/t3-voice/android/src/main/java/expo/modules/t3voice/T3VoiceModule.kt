@@ -32,6 +32,7 @@ class T3VoiceModule : Module() {
   private var recordingTerminationCollection: Job? = null
   private var playbackTerminationCollection: Job? = null
   private var realtimeTerminationCollection: Job? = null
+  private var threadVoiceHandoffCollection: Job? = null
   private var rebindScheduled = false
   private var rebindAttemptedSinceConnection = false
 
@@ -106,6 +107,7 @@ class T3VoiceModule : Module() {
                   sendEvent(AUDIO_ROUTE_CHANGED_EVENT, event.toEventBody())
                 is T3VoiceRuntimeEvent.RealtimeTerminated ->
                   sendEvent(REALTIME_TERMINATED_EVENT, event.toEventBody())
+                is T3VoiceRuntimeEvent.ThreadVoiceHandoff -> Unit
               }
             }
           }
@@ -128,6 +130,13 @@ class T3VoiceModule : Module() {
           appContext.mainQueue.launch {
             connectedBinder.realtimeTermination.collectLatest { event ->
               if (event != null) sendEvent(REALTIME_TERMINATED_EVENT, event.toEventBody())
+            }
+          }
+        threadVoiceHandoffCollection?.cancel()
+        threadVoiceHandoffCollection =
+          appContext.mainQueue.launch {
+            connectedBinder.threadVoiceHandoff.collectLatest { event ->
+              if (event != null) sendEvent(THREAD_VOICE_HANDOFF_EVENT, event.toEventBody())
             }
           }
       }
@@ -165,10 +174,11 @@ class T3VoiceModule : Module() {
         RUNTIME_ERROR_EVENT,
         AUDIO_ROUTE_CHANGED_EVENT,
         REALTIME_TERMINATED_EVENT,
+        THREAD_VOICE_HANDOFF_EVENT,
       )
 
       Constants(
-        "nativeRevision" to 8,
+        "nativeRevision" to 9,
       )
 
       OnCreate {
@@ -367,6 +377,32 @@ class T3VoiceModule : Module() {
       AsyncFunction("getPendingPlaybackTerminationAsync") { promise: Promise ->
         withBinder(promise, "playback-termination-read-failed") { voice, result ->
           result.resolve(voice.pendingPlaybackTermination())
+        }
+      }
+
+      AsyncFunction("getPendingRecordingTerminationAsync") { promise: Promise ->
+        withBinder(promise, "recording-termination-query-failed") { voice, result ->
+          result.resolve(voice.pendingRecordingTermination())
+        }
+      }
+
+      AsyncFunction("getPendingThreadVoiceHandoffAsync") { promise: Promise ->
+        withBinder(promise, "thread-voice-handoff-query-failed") { voice, result ->
+          result.resolve(voice.pendingThreadVoiceHandoff())
+        }
+      }
+
+      AsyncFunction("acknowledgeThreadVoiceHandoffAsync") { input: Map<String, String>, promise: Promise ->
+        withBinder(promise, "thread-voice-handoff-acknowledgement-failed") { voice, result ->
+          voice.acknowledgeThreadVoiceHandoff(requireIdentifier(input, "actionId"))
+          result.resolve()
+        }
+      }
+
+      AsyncFunction("armThreadVoiceHandoffAsync") { input: Map<String, String>, promise: Promise ->
+        withBinder(promise, "thread-voice-handoff-arm-failed") { voice, result ->
+          voice.armThreadVoiceHandoff(requireIdentifier(input, "nativeSessionId"))
+          result.resolve()
         }
       }
 
@@ -735,6 +771,8 @@ class T3VoiceModule : Module() {
     eventCollection = null
     realtimeTerminationCollection?.cancel()
     realtimeTerminationCollection = null
+    threadVoiceHandoffCollection?.cancel()
+    threadVoiceHandoffCollection = null
     recordingTerminationCollection?.cancel()
     recordingTerminationCollection = null
     playbackTerminationCollection?.cancel()
@@ -760,6 +798,7 @@ class T3VoiceModule : Module() {
     private const val RUNTIME_ERROR_EVENT = "runtimeError"
     private const val AUDIO_ROUTE_CHANGED_EVENT = "audioRouteChanged"
     private const val REALTIME_TERMINATED_EVENT = "realtimeTerminated"
+    private const val THREAD_VOICE_HANDOFF_EVENT = "threadVoiceHandoff"
     private const val BINDER_CONNECTION_TIMEOUT_MS = 5_000L
   }
 }

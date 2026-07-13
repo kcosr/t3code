@@ -17,6 +17,9 @@ class T3VoiceStateStoreTest {
     T3VoiceStateStore.playbackTermination.value?.let {
       T3VoiceStateStore.clearPlaybackTermination(it.playbackId)
     }
+    T3VoiceStateStore.threadVoiceHandoff.value?.let {
+      T3VoiceStateStore.clearThreadVoiceHandoff(it.actionId)
+    }
     T3VoiceStateStore.setInactive()
     T3VoiceStateStore.setServiceReady()
   }
@@ -31,6 +34,80 @@ class T3VoiceStateStoreTest {
     assertTrue(T3VoiceStateStore.claimRealtime("session-a"))
     assertFalse(T3VoiceStateStore.claimRealtime("session-b"))
     assertEquals("session-a", T3VoiceStateStore.state.value.activeRealtimeSessionId)
+  }
+
+  @Test
+  fun threadVoiceHandoffRemainsReplayableUntilAcknowledged() {
+    val event =
+      T3VoiceRuntimeEvent.ThreadVoiceHandoff(
+        actionId = "action-1",
+        projectId = "project-1",
+        threadId = "thread-1",
+        recordingId = "recording-1",
+        autoRearm = true,
+        environmentOrigin = "https://termstation",
+        expiresAtEpochMillis = 2_000,
+      )
+    val owner = checkNotNull(T3VoiceStateStore.claimRecording(event.recordingId))
+    T3VoiceStateStore.publishThreadVoiceHandoff(event)
+    assertEquals(event, T3VoiceStateStore.pendingThreadVoiceHandoff())
+    T3VoiceStateStore.clearThreadVoiceHandoff("other-action")
+    assertEquals(event, T3VoiceStateStore.threadVoiceHandoff.value)
+    T3VoiceStateStore.clearThreadVoiceHandoff(event.actionId)
+    assertNull(T3VoiceStateStore.threadVoiceHandoff.value)
+    assertTrue(T3VoiceStateStore.releaseRecording(owner))
+  }
+
+  @Test
+  fun handoffLifetimeFollowsItsRecordingInsteadOfTheServerActionDeadline() {
+    val event =
+      T3VoiceRuntimeEvent.ThreadVoiceHandoff(
+        actionId = "expired-action",
+        projectId = "project-1",
+        threadId = "thread-1",
+        recordingId = "recording-1",
+        autoRearm = true,
+        environmentOrigin = "https://termstation",
+        expiresAtEpochMillis = 2_000,
+      )
+    val owner = checkNotNull(T3VoiceStateStore.claimRecording(event.recordingId))
+    T3VoiceStateStore.publishThreadVoiceHandoff(event)
+
+    assertEquals(event, T3VoiceStateStore.pendingThreadVoiceHandoff())
+    assertTrue(T3VoiceStateStore.releaseRecording(owner))
+    assertNull(T3VoiceStateStore.pendingThreadVoiceHandoff())
+    assertNull(T3VoiceStateStore.threadVoiceHandoff.value)
+  }
+
+  @Test
+  fun completedRecordingKeepsHandoffReplayableUntilReactConsumesIt() {
+    val event =
+      T3VoiceRuntimeEvent.ThreadVoiceHandoff(
+        actionId = "completed-action",
+        projectId = "project-1",
+        threadId = "thread-1",
+        recordingId = "recording-1",
+        autoRearm = true,
+        environmentOrigin = "https://termstation",
+        expiresAtEpochMillis = 2_000,
+      )
+    val owner = checkNotNull(T3VoiceStateStore.claimRecording(event.recordingId))
+    T3VoiceStateStore.publishThreadVoiceHandoff(event)
+    assertTrue(
+      T3VoiceStateStore.terminateRecording(
+        owner,
+        T3VoiceRuntimeEvent.RecordingTerminated(
+          recordingId = event.recordingId,
+          recording = null,
+          outcome = "completed",
+          reason = "speech-ended",
+        ),
+      ),
+    )
+
+    assertEquals(event, T3VoiceStateStore.pendingThreadVoiceHandoff())
+    T3VoiceStateStore.clearRecordingTermination(event.recordingId)
+    assertNull(T3VoiceStateStore.pendingThreadVoiceHandoff())
   }
 
   @Test

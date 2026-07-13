@@ -44,6 +44,7 @@ const SPEECH_MODEL = "gpt-4o-mini-tts";
 const REALTIME_MODEL = "gpt-realtime-2.1";
 const CONTEXT_REPLAY_TIMEOUT = "30 seconds";
 const CONTEXT_UPDATE_TIMEOUT = "10 seconds";
+const TERMINAL_TOOL_OUTPUT_TIMEOUT = "10 seconds";
 const VOICE_PRESETS: Readonly<Record<string, string>> = {
   default: "marin",
   warm: "cedar",
@@ -292,6 +293,21 @@ const REALTIME_TOOLS = [
       type: "object",
       properties: { threadId: { type: "string" } },
       required: ["threadId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "handoff_to_thread_voice",
+    description:
+      "Terminally end this Realtime interaction and start auto-rearming traditional voice capture for the selected T3 thread. Call this as the final action only when the user asks to switch to standard thread voice. Do not speak before or after calling it unless clarification is required.",
+    parameters: {
+      type: "object",
+      properties: {
+        projectId: { type: "string" },
+        threadId: { type: "string" },
+      },
+      required: ["projectId", "threadId"],
       additionalProperties: false,
     },
   },
@@ -1013,6 +1029,9 @@ const make = Effect.gen(function* () {
         activeResponse: false,
         pendingFunctionCalls: new Set<string>(),
         continuationNeeded: false,
+        terminal: false,
+        terminalToolCallId: null as string | null,
+        terminalItemId: null as string | null,
       });
       const requestContinuationIfReady = Effect.fn(
         "OpenAiVoiceProvider.requestContinuationIfReady",
@@ -1020,6 +1039,7 @@ const make = Effect.gen(function* () {
         const state = yield* Ref.get(continuationState);
         if (
           state.activeResponse ||
+          state.terminal ||
           state.pendingFunctionCalls.size > 0 ||
           !state.continuationNeeded
         ) {
@@ -1125,7 +1145,10 @@ const make = Effect.gen(function* () {
         }
         const record = decodeRealtimeRecord(event.data);
         if (record === undefined) return;
-        if (record.type === "conversation.item.done") {
+        if (
+          record.type === "conversation.item.done" ||
+          record.type === "conversation.item.created"
+        ) {
           const item = record.item;
           const itemId =
             typeof item === "object" &&
@@ -1258,6 +1281,13 @@ const make = Effect.gen(function* () {
           continuationMutex.withPermits(1)(
             Effect.gen(function* () {
               const submitted = yield* Ref.get(submittedToolOutputs);
+              const state = yield* Ref.get(continuationState);
+              if (state.terminal) {
+                return yield* contextUpdateError(
+                  "OpenAI Realtime session already accepted a terminal tool output",
+                  { retryable: false },
+                );
+              }
               if (submitted.has(output.providerFunctionCallId)) {
                 yield* requestContinuationIfReady();
                 return;
@@ -1289,6 +1319,99 @@ const make = Effect.gen(function* () {
               yield* requestContinuationIfReady();
             }),
           ),
+        completeTerminalToolCall: (output) =>
+          Effect.gen(function* () {
+            const pending = yield* continuationMutex.withPermits(1)(
+              Effect.gen(function* () {
+                const submitted = yield* Ref.get(submittedToolOutputs);
+                const state = yield* Ref.get(continuationState);
+                if (submitted.has(output.providerFunctionCallId) && state.terminal) return;
+                if (state.terminal) {
+                  if (
+                    state.terminalToolCallId !== output.providerFunctionCallId ||
+                    state.terminalItemId !== output.itemId
+                  ) {
+                    return yield* contextUpdateError(
+                      "OpenAI Realtime session already accepted a different terminal tool output",
+                    );
+                  }
+                  const existing = (yield* SynchronizedRef.get(pendingContextUpdates)).get(
+                    output.itemId,
+                  );
+                  if (existing === undefined) {
+                    return yield* contextUpdateError(
+                      "OpenAI Realtime terminal tool output is no longer pending",
+                    );
+                  }
+                  return existing.completion;
+                }
+
+                yield* Ref.set(continuationState, {
+                  ...state,
+                  terminal: true,
+                  terminalToolCallId: output.providerFunctionCallId,
+                  terminalItemId: output.itemId,
+                  continuationNeeded: false,
+                  pendingFunctionCalls: new Set<string>(),
+                });
+                if (state.activeResponse) {
+                  yield* sideband.send(
+                    encodeJson({
+                      type: "response.cancel",
+                      event_id: `t3_terminal_cancel_${output.itemId}`,
+                    }),
+                  );
+                }
+
+                const eventId = `t3_terminal_output_${output.itemId}`;
+                const completion = yield* Deferred.make<void, VoiceError>();
+                yield* SynchronizedRef.update(pendingContextUpdates, (current) => {
+                  const next = new Map(current);
+                  next.set(output.itemId, { eventId, completion });
+                  return next;
+                });
+                yield* sideband.send(
+                  encodeJson({
+                    type: "conversation.item.create",
+                    event_id: eventId,
+                    item: {
+                      id: output.itemId,
+                      type: "function_call_output",
+                      call_id: output.providerFunctionCallId,
+                      output: output.output,
+                    },
+                  }),
+                );
+                return completion;
+              }),
+            );
+            if (pending === undefined) return;
+            yield* Deferred.await(pending).pipe(
+              Effect.timeoutOption(TERMINAL_TOOL_OUTPUT_TIMEOUT),
+              Effect.flatMap(
+                Option.match({
+                  onNone: () =>
+                    Effect.fail(
+                      contextUpdateError("OpenAI did not acknowledge the terminal tool output"),
+                    ),
+                  onSome: Effect.succeed,
+                }),
+              ),
+              Effect.tap(() =>
+                Ref.update(submittedToolOutputs, (current) =>
+                  new Set(current).add(output.providerFunctionCallId),
+                ),
+              ),
+              Effect.ensuring(
+                SynchronizedRef.update(pendingContextUpdates, (current) => {
+                  if (!current.has(output.itemId)) return current;
+                  const next = new Map(current);
+                  next.delete(output.itemId);
+                  return next;
+                }),
+              ),
+            );
+          }),
         terminate,
       };
     }),

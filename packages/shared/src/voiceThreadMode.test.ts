@@ -52,6 +52,23 @@ const listening = (): {
 };
 
 describe("voiceThreadMode", () => {
+  it("adopts an already-listening native recording without issuing a start command", () => {
+    const adopted = transition(initialVoiceThreadModeState(), {
+      type: "adopt-recording",
+      target: target(),
+      policy: "auto-submit",
+      playbackRequired: true,
+      recordingId: "handoff-recording",
+    });
+    expect(adopted.state).toMatchObject({
+      phase: "listening",
+      recordingId: "handoff-recording",
+      policy: "auto-submit",
+    });
+    expect(adopted.state.activeToken).not.toBeNull();
+    expect(adopted.commands).toEqual([]);
+  });
+
   it("arms only after explicit activation and waits for an existing thread turn", () => {
     expect(initialVoiceThreadModeState().phase).toBe("paused");
     const waiting = activate(true);

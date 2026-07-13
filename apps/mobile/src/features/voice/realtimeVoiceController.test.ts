@@ -103,6 +103,7 @@ const makeHarness = (options: RealtimeVoiceControllerOptions = {}) => {
       };
       return true;
     }),
+    armThreadVoiceHandoffAsync: vi.fn(async () => undefined),
     setRealtimeMutedAsync: vi.fn(async () => undefined),
     getAudioRoutesAsync: vi.fn(async () => []),
     setAudioRouteAsync: vi.fn(async () => []),
@@ -969,6 +970,78 @@ describe("RealtimeVoiceController", () => {
     });
     expect(native.stopRealtimeSessionAsync).toHaveBeenCalledTimes(1);
     expect(client.closeSession).not.toHaveBeenCalled();
+  });
+
+  it("arms native handoff ownership before stopping terminal Realtime media", async () => {
+    const { client, controller, native } = makeHarness();
+    await controller.start(createInput);
+    const order: string[] = [];
+    vi.mocked(native.armThreadVoiceHandoffAsync).mockImplementation(async () => {
+      order.push("arm");
+    });
+    vi.mocked(native.stopRealtimeSessionAsync).mockImplementation(async () => {
+      order.push("stop");
+      return true;
+    });
+    vi.mocked(client.sessionEvents).mockReturnValue(
+      Effect.succeed({
+        state: { ...serverSession.state, phase: "ended" as const, sequence: 1 },
+        events: [
+          {
+            sessionId: SESSION_ID,
+            leaseGeneration: 1,
+            sequence: 1,
+            occurredAt: "2026-07-10T22:01:00.000Z",
+            type: "client-action",
+            action: "handoff-to-thread-voice",
+            actionId: "action-1",
+            projectId: "project-1",
+            threadId: "thread-1",
+            autoRearm: true,
+            expiresAt: "2026-07-10T22:01:30.000Z",
+          } as never,
+        ],
+      }),
+    );
+
+    await controller.refreshEvents();
+
+    expect(native.armThreadVoiceHandoffAsync).toHaveBeenCalledWith({
+      nativeSessionId: SESSION_ID,
+    });
+    expect(order).toEqual(["arm", "stop"]);
+  });
+
+  it("still completes terminal cleanup when native handoff arming loses a binder race", async () => {
+    const { client, controller, native } = makeHarness();
+    await controller.start(createInput);
+    vi.mocked(native.armThreadVoiceHandoffAsync).mockRejectedValueOnce(new Error("binder gone"));
+    vi.mocked(client.sessionEvents).mockReturnValue(
+      Effect.succeed({
+        state: { ...serverSession.state, phase: "ended" as const, sequence: 1 },
+        events: [
+          {
+            sessionId: SESSION_ID,
+            leaseGeneration: 1,
+            sequence: 1,
+            occurredAt: "2026-07-10T22:01:00.000Z",
+            type: "client-action",
+            action: "handoff-to-thread-voice",
+            actionId: "action-1",
+            projectId: "project-1",
+            threadId: "thread-1",
+            autoRearm: true,
+            expiresAt: "2026-07-10T22:01:30.000Z",
+          } as never,
+        ],
+      }),
+    );
+
+    await controller.refreshEvents();
+
+    expect(controller.getSnapshot().phase).toBe("idle");
+    expect(native.stopRealtimeSessionAsync).toHaveBeenCalledTimes(1);
+    expect(client.sessionEvents).toHaveBeenCalledTimes(1);
   });
 
   it("coalesces duplicate native terminal events during asynchronous cleanup", async () => {

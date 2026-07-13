@@ -363,6 +363,33 @@ export function useAutoListenController(input: {
     return next.manualStopToDraft;
   }, [dispatch]);
 
+  const adoptRecording = useCallback(
+    (recordingId: string) => {
+      const current = inputRef.current;
+      generationRef.current += 1;
+      savePreferences({
+        voiceMode: "thread",
+        voiceThreadTarget: {
+          environmentId: current.environmentId,
+          threadId: current.threadId,
+          generation: generationRef.current,
+        },
+      });
+      dispatch({
+        type: "adopt-recording",
+        target: {
+          environmentId: current.environmentId,
+          threadId: current.threadId,
+          generation: generationRef.current,
+        },
+        policy: current.preferences.autoSubmitEnabled ? "auto-submit" : "review",
+        playbackRequired: current.speech.playbackRequired,
+        recordingId,
+      });
+    },
+    [dispatch, savePreferences],
+  );
+
   const activate = useCallback(
     async (enableIfDisabled = false) => {
       const current = inputRef.current;
@@ -642,6 +669,7 @@ export function useAutoListenController(input: {
     state,
     active: state.phase !== "paused",
     activate,
+    adoptRecording,
     deactivateForManualDictation,
     stopToDraft,
     pause,

@@ -501,7 +501,10 @@ export class RealtimeVoiceController {
 
   acknowledgeClientAction(
     actionId: VoiceClientActionId,
-    input: Omit<VoiceClientActionAckInput, "leaseGeneration">,
+    input: Omit<
+      Extract<VoiceClientActionAckInput, { readonly action: "activate-thread" }>,
+      "leaseGeneration"
+    >,
   ): Promise<VoiceClientActionAckResult> {
     const active = this.requireActive();
     return Effect.runPromise(
@@ -521,6 +524,15 @@ export class RealtimeVoiceController {
         this.client.sessionEvents(active.sessionId, active.afterSequence),
       );
       if (this.active !== active) return;
+      const terminalHandoff = result.events.some(
+        (event) => event.type === "client-action" && event.action === "handoff-to-thread-voice",
+      );
+      if (terminalHandoff) {
+        await this.native
+          .armThreadVoiceHandoffAsync({ nativeSessionId: active.nativeSessionId })
+          .catch(() => undefined);
+        if (this.active !== active) return;
+      }
       active.serverState = result.state;
       active.afterSequence = result.events.reduce(
         (sequence, event) => Math.max(sequence, event.sequence),

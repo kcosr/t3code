@@ -369,6 +369,7 @@ export const VoiceToolName = Schema.Literals([
   "search_history",
   "read_history",
   "activate_thread",
+  "handoff_to_thread_voice",
   "create_thread",
   "send_thread_message",
   "interrupt_thread",
@@ -432,6 +433,16 @@ export const VoiceSessionEvent = Schema.Union([
   Schema.Struct({
     ...VoiceEventBase,
     type: Schema.Literal("client-action"),
+    action: Schema.Literal("handoff-to-thread-voice"),
+    actionId: VoiceClientActionId,
+    projectId: ProjectId,
+    threadId: ThreadId,
+    autoRearm: Schema.Boolean,
+    expiresAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    ...VoiceEventBase,
+    type: Schema.Literal("client-action"),
     action: Schema.Literal("activate-thread"),
     actionId: VoiceClientActionId,
     projectId: ProjectId,
@@ -466,18 +477,83 @@ export type VoiceSessionEventsResult = typeof VoiceSessionEventsResult.Type;
 export const VoiceClientActionOutcome = Schema.Literals(["succeeded", "failed"]);
 export type VoiceClientActionOutcome = typeof VoiceClientActionOutcome.Type;
 
-export const VoiceClientActionAckInput = Schema.Struct({
-  leaseGeneration: PositiveInt,
-  outcome: VoiceClientActionOutcome,
-  message: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(512))),
-});
+export const VoiceHandoffFailureStage = Schema.Literals([
+  "target-resolution",
+  "realtime-release",
+  "audio-focus",
+  "recognition-start",
+]);
+export type VoiceHandoffFailureStage = typeof VoiceHandoffFailureStage.Type;
+
+export const VoiceHandoffFailureReason = Schema.Literals([
+  "target-unavailable",
+  "realtime-release-failed",
+  "audio-focus-unavailable",
+  "microphone-unavailable",
+  "permission-denied",
+  "runtime-unavailable",
+  "operation-timeout",
+]);
+export type VoiceHandoffFailureReason = typeof VoiceHandoffFailureReason.Type;
+
+export const VoiceClientActionAckInput = Schema.Union([
+  Schema.Struct({
+    leaseGeneration: PositiveInt,
+    action: Schema.Literal("activate-thread"),
+    outcome: VoiceClientActionOutcome,
+    message: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(512))),
+  }),
+  Schema.Struct({
+    leaseGeneration: PositiveInt,
+    action: Schema.Literal("handoff-to-thread-voice"),
+    outcome: Schema.Literal("succeeded"),
+    state: Schema.Literal("listening"),
+  }),
+  Schema.Struct({
+    leaseGeneration: PositiveInt,
+    action: Schema.Literal("handoff-to-thread-voice"),
+    outcome: Schema.Literal("failed"),
+    stage: VoiceHandoffFailureStage,
+    reason: VoiceHandoffFailureReason,
+  }),
+]);
 export type VoiceClientActionAckInput = typeof VoiceClientActionAckInput.Type;
 
 export const VoiceClientActionAckResult = Schema.Struct({
   actionId: VoiceClientActionId,
+  action: Schema.Literals(["activate-thread", "handoff-to-thread-voice"]),
   outcome: VoiceClientActionOutcome,
 });
 export type VoiceClientActionAckResult = typeof VoiceClientActionAckResult.Type;
+
+export const VoiceNativeHandoffAction = Schema.Struct({
+  actionId: VoiceClientActionId,
+  sessionId: VoiceSessionId,
+  leaseGeneration: PositiveInt,
+  projectId: ProjectId,
+  threadId: ThreadId,
+  autoRearm: Schema.Boolean,
+  expiresAt: IsoDateTime,
+});
+export type VoiceNativeHandoffAction = typeof VoiceNativeHandoffAction.Type;
+
+export const VoiceNativeHandoffActionListResult = Schema.Struct({
+  actions: Schema.Array(VoiceNativeHandoffAction),
+});
+export type VoiceNativeHandoffActionListResult = typeof VoiceNativeHandoffActionListResult.Type;
+
+export const VoiceNativeHandoffActionAckInput = Schema.Union([
+  Schema.Struct({
+    outcome: Schema.Literal("succeeded"),
+    state: Schema.Literal("listening"),
+  }),
+  Schema.Struct({
+    outcome: Schema.Literal("failed"),
+    stage: VoiceHandoffFailureStage,
+    reason: VoiceHandoffFailureReason,
+  }),
+]);
+export type VoiceNativeHandoffActionAckInput = typeof VoiceNativeHandoffActionAckInput.Type;
 
 export const VoiceConfirmationDecision = Schema.Literals(["approve", "reject"]);
 export type VoiceConfirmationDecision = typeof VoiceConfirmationDecision.Type;

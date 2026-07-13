@@ -37,7 +37,9 @@ describe("client action acknowledgement", () => {
       errorMessage: (cause) => (cause instanceof Error ? cause.message : String(cause)),
     });
 
-    expect(acknowledgements).toEqual([{ outcome: "failed", message: "navigation unavailable" }]);
+    expect(acknowledgements).toEqual([
+      { action: "activate-thread", outcome: "failed", message: "navigation unavailable" },
+    ]);
   });
 
   it("does not reverse a navigation acknowledgement when later focus sync fails", async () => {
@@ -55,7 +57,7 @@ describe("client action acknowledgement", () => {
       }),
     ).rejects.toThrow("focus unavailable");
 
-    expect(acknowledgements).toEqual([{ outcome: "succeeded" }]);
+    expect(acknowledgements).toEqual([{ action: "activate-thread", outcome: "succeeded" }]);
   });
 
   it("attempts once when the server deadline is already past on the client clock", async () => {
@@ -65,7 +67,7 @@ describe("client action acknowledgement", () => {
       acknowledgeClientActionWithRetry({
         expiresAtMillis: 900,
         acknowledge,
-        input: { outcome: "succeeded" },
+        input: { action: "activate-thread", outcome: "succeeded" },
         shouldContinue: () => true,
         now: () => 1_000,
       }),
@@ -84,7 +86,7 @@ describe("client action acknowledgement", () => {
       acknowledgeClientActionWithRetry({
         expiresAtMillis: 2_000,
         acknowledge,
-        input: { outcome: "failed" },
+        input: { action: "activate-thread", outcome: "failed" },
         shouldContinue: () => true,
         now: () => 1_000,
         sleep,
@@ -95,8 +97,12 @@ describe("client action acknowledgement", () => {
   });
 
   it("does not send blank failure messages", () => {
-    expect(clientActionAcknowledgementInput("failed", "  ")).toEqual({ outcome: "failed" });
+    expect(clientActionAcknowledgementInput("failed", "  ")).toEqual({
+      action: "activate-thread",
+      outcome: "failed",
+    });
     expect(clientActionAcknowledgementInput("failed", "  navigation failed  ")).toEqual({
+      action: "activate-thread",
       outcome: "failed",
       message: "navigation failed",
     });

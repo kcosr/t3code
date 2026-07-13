@@ -33,6 +33,14 @@ import * as TestClock from "effect/testing/TestClock";
 import { layerTest as serverSettingsLayerTest } from "../../serverSettings.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import type { VoiceConversationJournalEntry } from "../../persistence/Services/VoiceConversations.ts";
+import {
+  type DurableVoiceHandoffAction,
+  VoiceHandoffActionRepository,
+} from "../../persistence/Services/VoiceHandoffActions.ts";
+import {
+  type PersistedVoiceNativeControlGrant,
+  VoiceNativeControlGrantRepository,
+} from "../../persistence/Services/VoiceNativeControlGrants.ts";
 import { VoiceError } from "../Errors.ts";
 import { VoiceConversationService } from "../Services/VoiceConversationService.ts";
 import type { RealtimeProviderSession, VoiceProviderAdapter } from "../Services/VoiceProvider.ts";
@@ -104,6 +112,10 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
   const appended = yield* Ref.make<Array<VoiceConversationJournalEntry>>([]);
   const conversationEpoch = yield* Ref.make(1);
   const callStarts = yield* Ref.make(0);
+  const handoffActions = yield* Ref.make(new Map<string, DurableVoiceHandoffAction>());
+  const nativeControlGrantRecords = yield* Ref.make(
+    new Map<string, PersistedVoiceNativeControlGrant>(),
+  );
   const contextClears = yield* Ref.make(
     new Map<string, { activeEpoch: number; clearedAt: string }>(),
   );
@@ -178,20 +190,168 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
     appendContextIdempotent: (entry) =>
       append(entry.entryId, entry.expectedEpoch, entry.kind, entry.payload),
   });
+  const nativeControlGrantRepository = VoiceNativeControlGrantRepository.of({
+    insert: (grant, now) =>
+      Ref.update(nativeControlGrantRecords, (records) => {
+        const active = new Map([...records].filter(([, record]) => record.expiresAt > now));
+        return active.set(grant.tokenHash, grant);
+      }),
+    findActive: (tokenHash, now) =>
+      Ref.modify(nativeControlGrantRecords, (records) => {
+        const active = new Map([...records].filter(([, record]) => record.expiresAt > now));
+        return [active.get(tokenHash), active] as const;
+      }),
+    releaseSessionControl: (sessionId) =>
+      Ref.update(
+        nativeControlGrantRecords,
+        (records) =>
+          new Map(
+            [...records].map(([tokenHash, record]) => [
+              tokenHash,
+              record.sessionId === sessionId
+                ? { ...record, capabilities: new Set(["handoff-actions" as const]) }
+                : record,
+            ]),
+          ),
+      ),
+    revokeSession: (sessionId) =>
+      Ref.update(
+        nativeControlGrantRecords,
+        (records) => new Map([...records].filter(([, record]) => record.sessionId !== sessionId)),
+      ),
+    revokeAuthSession: (authSessionId) =>
+      Ref.update(
+        nativeControlGrantRecords,
+        (records) =>
+          new Map([...records].filter(([, record]) => record.authSessionId !== authSessionId)),
+      ),
+  });
+  const nativeControlGrantRepositoryLayer = Layer.succeed(
+    VoiceNativeControlGrantRepository,
+    nativeControlGrantRepository,
+  );
   const dependencies = Layer.mergeAll(
     Layer.succeed(VoiceConversationService, conversations),
     VoiceContextCompilerLive,
     voiceProviderRegistryLayer([provider], new Map([["agent.realtime", provider.id]])),
     VoiceSessionRegistryLive.pipe(Layer.provide(NodeServices.layer)),
     VoiceMediaTicketRegistryLive.pipe(Layer.provide(NodeServices.layer)),
-    VoiceNativeControlGrantRegistryLive.pipe(Layer.provide(NodeServices.layer)),
+    VoiceNativeControlGrantRegistryLive.pipe(
+      Layer.provideMerge(Layer.merge(NodeServices.layer, nativeControlGrantRepositoryLayer)),
+    ),
     serverSettingsLayerTest({ voice: voiceSettings }),
     Layer.succeed(VoiceToolExecutor, toolExecutor),
+    Layer.succeed(
+      VoiceHandoffActionRepository,
+      VoiceHandoffActionRepository.of({
+        create: (action) => {
+          const durable: DurableVoiceHandoffAction = {
+            ...action,
+            status: "prepared" as const,
+            outcome: null,
+            outcomeState: null,
+            outcomeStage: null,
+            outcomeReason: null,
+            updatedAt: action.createdAt,
+            settledAt: null,
+          };
+          return Ref.update(handoffActions, (actions) =>
+            new Map(actions).set(action.actionId, durable),
+          ).pipe(Effect.as(durable));
+        },
+        get: (actionId) =>
+          Ref.get(handoffActions).pipe(
+            Effect.map((actions) => Option.fromUndefinedOr(actions.get(actionId))),
+          ),
+        activate: ({ actionId, activatedAt, expiresAt }) =>
+          Ref.modify(handoffActions, (actions) => {
+            const action = actions.get(actionId);
+            if (action === undefined) throw new Error("missing test handoff action");
+            const activated: DurableVoiceHandoffAction = {
+              ...action,
+              status: "pending",
+              updatedAt: activatedAt,
+              expiresAt,
+            };
+            return [activated, new Map(actions).set(actionId, activated)] as const;
+          }),
+        listPending: ({ authSessionId, realtimeSessionId, realtimeGeneration, now, limit }) =>
+          Ref.get(handoffActions).pipe(
+            Effect.map((actions) =>
+              [...actions.values()]
+                .filter(
+                  (action) =>
+                    action.authSessionId === authSessionId &&
+                    action.realtimeSessionId === realtimeSessionId &&
+                    action.realtimeGeneration === realtimeGeneration &&
+                    action.status === "pending" &&
+                    action.expiresAt > now,
+                )
+                .slice(0, limit),
+            ),
+          ),
+        acknowledge: ({ actionId, authSessionId, result, acknowledgedAt }) =>
+          Effect.gen(function* () {
+            const action = (yield* Ref.get(handoffActions)).get(actionId);
+            if (action === undefined || action.authSessionId !== authSessionId) {
+              return yield* Effect.die("invalid test handoff acknowledgement");
+            }
+            if (action.status === "expired") return action;
+            if (action.status === "pending" && action.expiresAt <= acknowledgedAt) {
+              const expired: DurableVoiceHandoffAction = {
+                ...action,
+                status: "expired",
+                outcome: "failed",
+                outcomeState: null,
+                outcomeStage: "recognition-start",
+                outcomeReason: "operation-timeout",
+                updatedAt: acknowledgedAt,
+                settledAt: acknowledgedAt,
+              };
+              yield* Ref.update(handoffActions, (actions) =>
+                new Map(actions).set(actionId, expired),
+              );
+              return expired;
+            }
+            const settled: DurableVoiceHandoffAction = {
+              ...action,
+              status: "settled",
+              ...result,
+              updatedAt: acknowledgedAt,
+              settledAt: acknowledgedAt,
+            };
+            yield* Ref.update(handoffActions, (actions) => new Map(actions).set(actionId, settled));
+            return settled;
+          }),
+        expire: ({ now }) =>
+          Ref.modify(handoffActions, (actions) => {
+            const expired = [...actions.values()]
+              .filter((action) => action.status === "pending" && action.expiresAt <= now)
+              .map(
+                (action): DurableVoiceHandoffAction => ({
+                  ...action,
+                  status: "expired",
+                  outcome: "failed",
+                  outcomeState: null,
+                  outcomeStage: "recognition-start",
+                  outcomeReason: "operation-timeout",
+                  updatedAt: now,
+                  settledAt: now,
+                }),
+              );
+            const updated = new Map(actions);
+            for (const action of expired) updated.set(action.actionId, action);
+            return [expired, updated] as const;
+          }),
+      }),
+    ),
     Layer.mock(ProjectionSnapshotQuery)(projection),
   );
   return {
     appended,
     callStarts,
+    handoffActions,
+    nativeControlGrantRecords,
     layer: VoiceSessionServiceLive.pipe(Layer.provideMerge(dependencies)),
   };
 });
@@ -224,6 +384,7 @@ const makeActivateThreadFixture = Effect.fn("test.makeActivateThreadFixture")(fu
           }),
           updateContext: () => Effect.void,
           submitToolOutput: ({ output }) => Ref.update(outputs, (all) => [...all, output]),
+          completeTerminalToolCall: () => Effect.void,
           terminate: Effect.void,
         }),
     },
@@ -253,10 +414,105 @@ const makeActivateThreadFixture = Effect.fn("test.makeActivateThreadFixture")(fu
     expire: () => Effect.succeed(undefined),
     discardSession: () => Effect.void,
   });
-  return { actionId, executor, invocationStarted, outputs, projectId, provider, threadId };
+  return {
+    actionId,
+    executor,
+    invocationStarted,
+    outputs,
+    projectId,
+    provider,
+    threadId,
+  };
 });
 
-it.effect("returns the same native grant when an idempotent create result is replayed", () =>
+const makeTerminalHandoffFixture = Effect.fn("test.makeTerminalHandoffFixture")(function* (
+  suffix: string,
+  terminalFailure = false,
+) {
+  const actionId = VoiceClientActionId.make(`handoff-action-${suffix}`);
+  const projectId = ProjectId.make(`handoff-project-${suffix}`);
+  const threadId = ThreadId.make(`handoff-thread-${suffix}`);
+  const providerFunctionCallId = `handoff-call-${suffix}`;
+  const terminalOutput = yield* Deferred.make<void>();
+  const terminalOutputRelease = yield* Deferred.make<void>();
+  const terminated = yield* Ref.make(0);
+  const provider: VoiceProviderAdapter = {
+    id: `fake-handoff-tool-${suffix}`,
+    capabilities: new Set(["agent.realtime"]),
+    realtime: {
+      negotiate: (request) =>
+        Effect.succeed({
+          answer: {
+            sessionId: request.sessionId,
+            leaseGeneration: request.leaseGeneration,
+            sdp: "fake-answer",
+          },
+          events: Stream.make({
+            type: "function-call" as const,
+            providerFunctionCallId,
+            name: "handoff_to_thread_voice",
+            argumentsJson: JSON.stringify({ projectId, threadId }),
+          }),
+          updateContext: () => Effect.void,
+          submitToolOutput: () => Effect.die("terminal handoff used ordinary tool output"),
+          completeTerminalToolCall: () =>
+            Deferred.succeed(terminalOutput, undefined).pipe(
+              Effect.andThen(Deferred.await(terminalOutputRelease)),
+              Effect.andThen(
+                terminalFailure
+                  ? Effect.fail(
+                      new VoiceError({
+                        reason: "provider-unavailable",
+                        operation: "test.terminal-output",
+                        detail: "terminal output failed",
+                        retryable: true,
+                      }),
+                    )
+                  : Effect.void,
+              ),
+            ),
+          terminate: Ref.update(terminated, (count) => count + 1),
+        }),
+    },
+  };
+  const executor = VoiceToolExecutor.of({
+    invoke: (toolCall) =>
+      Effect.succeed({
+        type: "terminal-completed" as const,
+        toolCallId: VoiceToolCallId.make(toolCall.providerFunctionCallId),
+        providerFunctionCallId: toolCall.providerFunctionCallId,
+        tool: "handoff_to_thread_voice" as const,
+        outcome: "succeeded" as const,
+        output: JSON.stringify({
+          status: "accepted",
+          actionId,
+          projectId,
+          threadId,
+        }),
+        terminalAction: {
+          actionId,
+          projectId,
+          threadId,
+          autoRearm: true as const,
+        },
+      }),
+    decide: () => Effect.die("unused"),
+    expire: () => Effect.succeed(undefined),
+    discardSession: () => Effect.void,
+  });
+  return {
+    actionId,
+    executor,
+    projectId,
+    provider,
+    terminalOutput,
+    terminalOutputRelease,
+    terminated,
+    threadId,
+  };
+});
+
+it.effect("rotates the native grant when an idempotent create result is replayed", () =>
   Effect.gen(function* () {
     const provider: VoiceProviderAdapter = {
       id: "fake-idempotent-native-grant",
@@ -272,7 +528,7 @@ it.effect("returns the same native grant when an idempotent create result is rep
       const replay = yield* sessions.create(principal(owner), input(false, "idempotent-native"));
 
       expect(replay.state.sessionId).toBe(first.state.sessionId);
-      expect(replay.nativeControlGrant.token).toBe(first.nativeControlGrant.token);
+      expect(replay.nativeControlGrant.token).not.toBe(first.nativeControlGrant.token);
       expect(yield* grants.authorize(first.nativeControlGrant.token)).toMatchObject({
         authSessionId: owner,
         sessionId: first.state.sessionId,
@@ -323,6 +579,7 @@ it.effect(
                 ]),
                 updateContext: () => Effect.void,
                 submitToolOutput: () => Effect.void,
+                completeTerminalToolCall: () => Effect.void,
                 terminate: Ref.update(terminated, (count) => count + 1),
               }),
             ),
@@ -455,6 +712,7 @@ it.effect("validates, acknowledges, and journals realtime focus changes in order
                   Effect.andThen(Deferred.await(acknowledgeFocusUpdate)),
                 ),
               submitToolOutput: () => Effect.void,
+              completeTerminalToolCall: () => Effect.void,
               terminate: Effect.void,
             }),
           ),
@@ -559,6 +817,7 @@ it.effect("does not let a blocked focus acknowledgement delay hang-up", () =>
                 Effect.onInterrupt(() => Deferred.succeed(focusUpdateInterrupted, undefined)),
               ),
             submitToolOutput: () => Effect.void,
+            completeTerminalToolCall: () => Effect.void,
             terminate: Deferred.succeed(providerTerminated, undefined),
           }),
       },
@@ -627,6 +886,7 @@ it.effect("completes focus journal failure cleanup outside the cancelled update"
             events: Stream.empty,
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
+            completeTerminalToolCall: () => Effect.void,
             terminate: Deferred.succeed(terminationStarted, undefined).pipe(
               Effect.andThen(Deferred.await(releaseTermination)),
               Effect.ensuring(Deferred.succeed(terminationCompleted, undefined)),
@@ -786,6 +1046,7 @@ it.effect("continues a stopped conversation with facts from the prior call", () 
                       ]),
                 updateContext: () => Effect.void,
                 submitToolOutput: () => Effect.void,
+                completeTerminalToolCall: () => Effect.void,
                 terminate: Effect.void,
               } satisfies RealtimeProviderSession;
             }),
@@ -872,6 +1133,7 @@ it.effect("takeover fences an in-flight negotiation and terminates its late prov
         events: Stream.empty,
         updateContext: () => Effect.void,
         submitToolOutput: () => Effect.void,
+        completeTerminalToolCall: () => Effect.void,
         terminate: Ref.update(terminated, (count) => count + 1),
       });
       const error = yield* Fiber.join(offering);
@@ -903,6 +1165,7 @@ it.effect("serializes duplicate offers so only one provider session is negotiate
               events: Stream.empty,
               updateContext: () => Effect.void,
               submitToolOutput: () => Effect.void,
+              completeTerminalToolCall: () => Effect.void,
               terminate: Effect.void,
             } satisfies RealtimeProviderSession),
           ),
@@ -995,6 +1258,7 @@ it.effect("takeover terminates a provider that negotiates while displaced cleanu
         events: Stream.empty,
         updateContext: () => Effect.void,
         submitToolOutput: () => Effect.void,
+        completeTerminalToolCall: () => Effect.void,
         terminate: Ref.update(terminated, (count) => count + 1),
       });
 
@@ -1074,6 +1338,7 @@ it.effect("rejects a heartbeat while session termination is in progress", () =>
             events: Stream.empty,
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
+            completeTerminalToolCall: () => Effect.void,
             terminate: Deferred.succeed(terminationStarted, undefined).pipe(
               Effect.andThen(Deferred.await(terminationRelease)),
             ),
@@ -1152,6 +1417,7 @@ it.effect.each(["listening", "speaking"] as const)(
               events: Stream.make({ type: "activity" as const, activity }),
               updateContext: () => Effect.void,
               submitToolOutput: () => Effect.void,
+              completeTerminalToolCall: () => Effect.void,
               terminate: Effect.void,
             }),
         },
@@ -1196,6 +1462,7 @@ it.effect("expires a negotiated session until provider media activity is observe
             events: Stream.never,
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
+            completeTerminalToolCall: () => Effect.void,
             terminate: Effect.void,
           }),
       },
@@ -1236,9 +1503,13 @@ it.effect("ends an active provider session at the absolute duration limit", () =
               leaseGeneration: request.leaseGeneration,
               sdp: "answer",
             },
-            events: Stream.make({ type: "activity" as const, activity: "listening" as const }),
+            events: Stream.make({
+              type: "activity" as const,
+              activity: "listening" as const,
+            }),
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
+            completeTerminalToolCall: () => Effect.void,
             terminate: Effect.void,
           }),
       },
@@ -1297,6 +1568,7 @@ it.effect("ends an active session when the provider transport closes", () =>
             ]),
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
+            completeTerminalToolCall: () => Effect.void,
             terminate: Effect.void,
           }),
       },
@@ -1350,6 +1622,7 @@ it.effect("publishes confirmations and submits decided tool output to the provid
             }),
             updateContext: () => Effect.void,
             submitToolOutput: (output) => Ref.update(outputs, (all) => [...all, output]),
+            completeTerminalToolCall: () => Effect.void,
             terminate: Effect.void,
           }),
       },
@@ -1451,6 +1724,7 @@ it.effect("continues handling provider events while a history search is blocked"
             ]),
             updateContext: () => Effect.void,
             submitToolOutput: ({ output }) => Ref.update(outputs, (all) => [...all, output]),
+            completeTerminalToolCall: () => Effect.void,
             terminate: Effect.void,
           }),
       },
@@ -1529,13 +1803,18 @@ it.effect("withholds activate-thread output until the owning client acknowledges
           AuthSessionId.make("wrong-activate-owner"),
           created.state.sessionId,
           fixture.actionId,
-          { leaseGeneration: created.state.leaseGeneration, outcome: "succeeded" },
+          {
+            leaseGeneration: created.state.leaseGeneration,
+            action: "activate-thread",
+            outcome: "succeeded",
+          },
         )
         .pipe(Effect.flip);
       expect(wrongOwner.reason).toBe("authorization-revoked");
       const staleLease = yield* sessions
         .acknowledgeClientAction(owner, created.state.sessionId, fixture.actionId, {
           leaseGeneration: created.state.leaseGeneration + 1,
+          action: "activate-thread",
           outcome: "succeeded",
         })
         .pipe(Effect.flip);
@@ -1547,6 +1826,7 @@ it.effect("withholds activate-thread output until the owning client acknowledges
         fixture.actionId,
         {
           leaseGeneration: created.state.leaseGeneration,
+          action: "activate-thread",
           outcome: "succeeded",
         },
       );
@@ -1561,6 +1841,7 @@ it.effect("withholds activate-thread output until the owning client acknowledges
         fixture.actionId,
         {
           leaseGeneration: created.state.leaseGeneration,
+          action: "activate-thread",
           outcome: "succeeded",
         },
       );
@@ -1568,6 +1849,7 @@ it.effect("withholds activate-thread output until the owning client acknowledges
       const conflict = yield* sessions
         .acknowledgeClientAction(owner, created.state.sessionId, fixture.actionId, {
           leaseGeneration: created.state.leaseGeneration,
+          action: "activate-thread",
           outcome: "failed",
           message: "wrong result",
         })
@@ -1577,10 +1859,245 @@ it.effect("withholds activate-thread output until the owning client acknowledges
       const afterClose = yield* sessions
         .acknowledgeClientAction(owner, created.state.sessionId, fixture.actionId, {
           leaseGeneration: created.state.leaseGeneration,
+          action: "activate-thread",
           outcome: "succeeded",
         })
         .pipe(Effect.flip);
       expect(afterClose.reason).toBe("invalid-phase");
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("persists and acknowledges a terminal handoff after realtime teardown", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeTerminalHandoffFixture("success");
+    const test = yield* makeLayer(fixture.provider, fixture.executor);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("handoff-owner");
+      const created = yield* sessions.create(principal(owner), input(false, "handoff-tool"));
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      yield* Deferred.await(fixture.terminalOutput);
+      expect((yield* Ref.get(test.handoffActions)).get(fixture.actionId)?.status).toBe("prepared");
+      yield* Deferred.succeed(fixture.terminalOutputRelease, undefined);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("1 millis");
+
+      const pending = (yield* Ref.get(test.handoffActions)).get(fixture.actionId);
+      expect(pending).toMatchObject({
+        status: "pending",
+        realtimeSessionId: created.state.sessionId,
+        projectId: fixture.projectId,
+        threadId: fixture.threadId,
+      });
+      const wrongLease = yield* sessions
+        .acknowledgeNativeHandoffAction(
+          owner,
+          created.state.sessionId,
+          created.state.leaseGeneration + 1,
+          fixture.actionId,
+          { outcome: "succeeded", state: "listening" },
+        )
+        .pipe(Effect.flip);
+      expect(wrongLease.reason).toBe("authorization-revoked");
+      const acknowledgement = yield* sessions.acknowledgeNativeHandoffAction(
+        owner,
+        created.state.sessionId,
+        created.state.leaseGeneration,
+        fixture.actionId,
+        {
+          outcome: "succeeded",
+          state: "listening",
+        },
+      );
+      expect(acknowledgement).toEqual({
+        actionId: fixture.actionId,
+        action: "handoff-to-thread-voice",
+        outcome: "succeeded",
+      });
+      expect(yield* Ref.get(fixture.terminated)).toBe(1);
+      expect(yield* Ref.get(test.appended)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "call-boundary" }),
+          expect.objectContaining({ kind: "device-handoff" }),
+        ]),
+      );
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect(
+  "retains only handoff authority when teardown races terminal provider acknowledgement",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeTerminalHandoffFixture("teardown-race");
+      const test = yield* makeLayer(fixture.provider, fixture.executor);
+      yield* Effect.gen(function* () {
+        const sessions = yield* VoiceSessionService;
+        const owner = AuthSessionId.make("handoff-teardown-owner");
+        const created = yield* sessions.create(
+          principal(owner),
+          input(false, "handoff-teardown-race"),
+        );
+        yield* sessions.offer(owner, created.state.sessionId, {
+          sessionId: created.state.sessionId,
+          leaseGeneration: created.state.leaseGeneration,
+          sdp: "offer",
+        });
+        yield* Deferred.await(fixture.terminalOutput);
+
+        yield* sessions.close(owner, created.state.sessionId, created.state.leaseGeneration);
+
+        const retained = [...(yield* Ref.get(test.nativeControlGrantRecords)).values()].filter(
+          (grant) => grant.sessionId === created.state.sessionId,
+        );
+        expect(retained.length).toBeGreaterThan(0);
+        expect(retained.every((grant) => !grant.capabilities.has("session-control"))).toBe(true);
+        expect(retained.every((grant) => grant.capabilities.has("handoff-actions"))).toBe(true);
+        yield* Deferred.succeed(fixture.terminalOutputRelease, undefined);
+      }).pipe(Effect.provide(test.layer));
+    }),
+);
+
+it.effect("revokes retained native authority when a terminal handoff expires", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeTerminalHandoffFixture("expiry");
+    const test = yield* makeLayer(fixture.provider, fixture.executor);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("handoff-expiry-owner");
+      const created = yield* sessions.create(principal(owner), input(false, "handoff-expiry"));
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      yield* Deferred.await(fixture.terminalOutput);
+      yield* Deferred.succeed(fixture.terminalOutputRelease, undefined);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("31 seconds");
+
+      expect((yield* Ref.get(test.handoffActions)).get(fixture.actionId)).toMatchObject({
+        status: "expired",
+        outcome: "failed",
+        outcomeStage: "recognition-start",
+        outcomeReason: "operation-timeout",
+      });
+      expect(
+        [...(yield* Ref.get(test.nativeControlGrantRecords)).values()].some(
+          (grant) => grant.sessionId === created.state.sessionId,
+        ),
+      ).toBe(false);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("journals and revokes a handoff that expires during native acknowledgement", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeTerminalHandoffFixture("late-ack-expiry");
+    const test = yield* makeLayer(fixture.provider, fixture.executor);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("handoff-late-ack-owner");
+      const created = yield* sessions.create(principal(owner), input(false, "handoff-late-ack"));
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      yield* Deferred.await(fixture.terminalOutput);
+      yield* Deferred.succeed(fixture.terminalOutputRelease, undefined);
+      yield* Effect.yieldNow;
+      yield* Ref.update(test.handoffActions, (actions) => {
+        const action = actions.get(fixture.actionId);
+        if (action === undefined) throw new Error("missing late acknowledgement action");
+        return new Map(actions).set(fixture.actionId, {
+          ...action,
+          expiresAt: "1970-01-01T00:00:00.000Z",
+        });
+      });
+
+      const acknowledge = () =>
+        sessions
+          .acknowledgeNativeHandoffAction(
+            owner,
+            created.state.sessionId,
+            created.state.leaseGeneration,
+            fixture.actionId,
+            { outcome: "succeeded", state: "listening" },
+          )
+          .pipe(Effect.flip);
+      expect((yield* acknowledge()).reason).toBe("invalid-phase");
+      expect((yield* Ref.get(test.handoffActions)).get(fixture.actionId)).toMatchObject({
+        status: "expired",
+        outcomeStage: "recognition-start",
+        outcomeReason: "operation-timeout",
+      });
+      expect(
+        [...(yield* Ref.get(test.nativeControlGrantRecords)).values()].some(
+          (grant) => grant.sessionId === created.state.sessionId,
+        ),
+      ).toBe(false);
+      expect(
+        (yield* Ref.get(test.appended)).filter((entry) => entry.kind === "device-handoff"),
+      ).toHaveLength(1);
+
+      expect((yield* acknowledge()).reason).toBe("invalid-phase");
+      expect(
+        (yield* Ref.get(test.appended)).filter((entry) => entry.kind === "device-handoff"),
+      ).toHaveLength(1);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("records a failed durable handoff when terminal provider output is rejected", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeTerminalHandoffFixture("provider-failure", true);
+    const test = yield* makeLayer(fixture.provider, fixture.executor);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("handoff-failure-owner");
+      const created = yield* sessions.create(
+        principal(owner),
+        input(false, "handoff-provider-failure"),
+      );
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      yield* Deferred.await(fixture.terminalOutput);
+      expect((yield* Ref.get(test.handoffActions)).get(fixture.actionId)?.status).toBe("prepared");
+      yield* Deferred.succeed(fixture.terminalOutputRelease, undefined);
+      yield* TestClock.adjust("1 millis");
+
+      expect((yield* Ref.get(test.handoffActions)).get(fixture.actionId)).toMatchObject({
+        status: "settled",
+        outcome: "failed",
+        outcomeStage: "realtime-release",
+        outcomeReason: "realtime-release-failed",
+      });
+      expect(
+        [...(yield* Ref.get(test.nativeControlGrantRecords)).values()].some(
+          (grant) => grant.sessionId === created.state.sessionId,
+        ),
+      ).toBe(false);
+      expect(yield* Ref.get(test.appended)).toEqual(
+        expect.arrayContaining([expect.objectContaining({ kind: "device-handoff" })]),
+      );
+      const snapshot = yield* sessions.events(owner, created.state.sessionId, 0, 0);
+      expect(snapshot.events).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "client-action",
+            action: "handoff-to-thread-voice",
+          }),
+        ]),
+      );
     }).pipe(Effect.provide(test.layer));
   }),
 );
@@ -1602,6 +2119,7 @@ it.effect("submits a failed activate-thread result when client navigation fails"
       yield* sessions.events(owner, created.state.sessionId, 2, 1_000);
       yield* sessions.acknowledgeClientAction(owner, created.state.sessionId, fixture.actionId, {
         leaseGeneration: created.state.leaseGeneration,
+        action: "activate-thread",
         outcome: "failed",
         message: "Navigation failed",
       });
@@ -1639,6 +2157,7 @@ it.effect("times out activate-thread and rejects a late acknowledgement", () =>
       const late = yield* sessions
         .acknowledgeClientAction(owner, created.state.sessionId, fixture.actionId, {
           leaseGeneration: created.state.leaseGeneration,
+          action: "activate-thread",
           outcome: "succeeded",
         })
         .pipe(Effect.flip);
@@ -1669,6 +2188,7 @@ it.effect("cancels a pending activate-thread result when the session closes", ()
       const late = yield* sessions
         .acknowledgeClientAction(owner, created.state.sessionId, fixture.actionId, {
           leaseGeneration: created.state.leaseGeneration,
+          action: "activate-thread",
           outcome: "succeeded",
         })
         .pipe(Effect.flip);
@@ -1702,6 +2222,7 @@ it.effect("interrupts a blocked thread-turn wait and fences its output when the 
             }),
             updateContext: () => Effect.void,
             submitToolOutput: ({ output }) => Ref.update(outputs, (all) => [...all, output]),
+            completeTerminalToolCall: () => Effect.void,
             terminate: Effect.void,
           }),
       },
@@ -1832,6 +2353,7 @@ it.effect("revokes provider sessions and media tickets with their auth session",
             events: Stream.empty,
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
+            completeTerminalToolCall: () => Effect.void,
             terminate: Ref.update(terminated, (count) => count + 1),
           }),
       },
@@ -1881,6 +2403,7 @@ it.effect("terminates an active call before clearing or deleting its conversatio
             events: Stream.empty,
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
+            completeTerminalToolCall: () => Effect.void,
             terminate: Ref.update(terminated, (count) => count + 1),
           }),
       },
@@ -1957,6 +2480,7 @@ const resetRaceProvider = (
         events: Stream.empty,
         updateContext: () => Effect.void,
         submitToolOutput: () => Effect.void,
+        completeTerminalToolCall: () => Effect.void,
         terminate: Deferred.succeed(terminationStarted, undefined).pipe(
           Effect.andThen(Deferred.await(releaseTermination)),
         ),
@@ -1996,6 +2520,7 @@ const immediateResetProvider = (
         events: Stream.empty,
         updateContext: () => Effect.void,
         submitToolOutput: () => Ref.update(outputs, (count) => count + 1),
+        completeTerminalToolCall: () => Effect.void,
         terminate: Ref.update(terminations, (count) => count + 1),
       }),
   },

@@ -2,6 +2,7 @@ const INITIAL_RETRY_DELAY_MILLIS = 250;
 const MAX_RETRY_DELAY_MILLIS = 1_000;
 
 export interface ClientActionAcknowledgementInput {
+  readonly action: "activate-thread";
   readonly outcome: "succeeded" | "failed";
   readonly message?: string;
 }
@@ -12,6 +13,7 @@ export const clientActionAcknowledgementInput = (
 ): ClientActionAcknowledgementInput => {
   const trimmedMessage = message?.trim();
   return {
+    action: "activate-thread",
     outcome,
     ...(trimmedMessage ? { message: trimmedMessage.slice(0, 240) } : {}),
   };

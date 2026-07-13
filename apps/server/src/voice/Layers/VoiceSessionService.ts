@@ -1,16 +1,23 @@
-import { VoiceClientActionId, VoiceConversationEntryId, VoiceToolCallId } from "@t3tools/contracts";
+import {
+  VoiceClientActionId,
+  VoiceConversationEntryId,
+  VoiceConversationId,
+  ProjectId,
+  VoiceSessionId,
+  ThreadId,
+  VoiceToolCallId,
+} from "@t3tools/contracts";
 import * as NodeCrypto from "node:crypto";
 import type {
   AuthEnvironmentScope,
   AuthSessionId,
-  ProjectId,
-  ThreadId,
   VoiceCapability,
   VoiceConfirmationId,
   VoiceSessionCreateInput,
   VoiceSessionEvent,
-  VoiceSessionId,
+  VoiceSessionPhase,
   VoiceSessionState,
+  VoiceNativeHandoffAction,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Clock from "effect/Clock";
@@ -26,6 +33,7 @@ import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import { VoiceError } from "../Errors.ts";
+import { VoiceHandoffActionRepository } from "../../persistence/Services/VoiceHandoffActions.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { voiceFocusContextItem } from "./VoiceContextCompiler.ts";
@@ -53,6 +61,7 @@ const SESSION_DURATION_SECONDS = 55 * 60;
 const MAX_BUFFERED_EVENTS = 512;
 const MAX_RETAINED_TERMINAL_SESSIONS = 128;
 const CLIENT_ACTION_TIMEOUT_MILLIS = 5_000;
+const HANDOFF_ACTION_TIMEOUT_MILLIS = 30_000;
 const INSTRUCTIONS = [
   "You are the T3 voice agent. Be concise and use only the supplied T3 tools. Proactively tell the user what you are about to do only when you will call send_thread_message and then synchronously wait for that agent turn with wait_for_thread_turn; do not preannounce other tool operations.",
   "Prior conversation items are the user's actual history from this same ongoing conversation: use them as memory, preserve continuity across calls and devices, and never claim that you cannot remember information present in that history.",
@@ -66,6 +75,7 @@ const BACKGROUND_VOICE_TOOLS = new Set([
   "search_history",
   "read_history",
   "activate_thread",
+  "handoff_to_thread_voice",
 ]);
 
 interface ClientActionResolution {
@@ -134,6 +144,8 @@ interface RuntimeSession {
   readonly terminalAt?: number;
   readonly terminalOrder?: number;
   readonly terminating?: boolean;
+  readonly terminalHandoffClaimed?: boolean;
+  readonly terminalHandoffReady?: boolean;
   readonly providerSession?: RealtimeProviderSession;
   readonly eventFiber?: Fiber.Fiber<void, never>;
   readonly heartbeatFiber?: Fiber.Fiber<void, never>;
@@ -167,6 +179,7 @@ const make = Effect.gen(function* () {
   const compiler = yield* VoiceContextCompiler;
   const providers = yield* VoiceProviderRegistry;
   const tools = yield* VoiceToolExecutor;
+  const handoffActions = yield* VoiceHandoffActionRepository;
   const settingsService = yield* ServerSettingsService;
   const tickets = yield* VoiceMediaTicketRegistry;
   const nativeControlGrants = yield* VoiceNativeControlGrantRegistry;
@@ -505,7 +518,9 @@ const make = Effect.gen(function* () {
     yield* emit(session.lease, { type: "state", phase });
     const current = (yield* SynchronizedRef.get(runtime)).sessions.get(session.lease.sessionId);
     yield* terminateProvider(current ?? session, options);
-    yield* nativeControlGrants.revokeSession(session.lease.sessionId);
+    yield* terminationSnapshot.terminalHandoffClaimed
+      ? nativeControlGrants.releaseSessionControl(session.lease.sessionId)
+      : nativeControlGrants.revokeSession(session.lease.sessionId);
     yield* registry.release(session.lease);
     yield* SynchronizedRef.update(runtime, (current) => {
       const idempotency = new Map(current.idempotency);
@@ -645,6 +660,193 @@ const make = Effect.gen(function* () {
     }
   });
 
+  const persistHandoffOutcome = Effect.fn("VoiceSessionService.persistHandoffOutcome")(function* (
+    action: import("../../persistence/Services/VoiceHandoffActions.ts").DurableVoiceHandoffAction,
+  ) {
+    if (action.outcome === null) return;
+    yield* conversations.appendContextIdempotent({
+      entryId: VoiceConversationEntryId.make(`voice-handoff:${action.actionId}:outcome`),
+      conversationId: VoiceConversationId.make(action.conversationId),
+      expectedEpoch: action.contextEpoch,
+      kind: "device-handoff",
+      payload: {
+        actionId: action.actionId,
+        targetThreadId: action.threadId,
+        outcome: action.outcome,
+        ...(action.outcomeState === null ? {} : { state: action.outcomeState }),
+        ...(action.outcomeStage === null ? {} : { stage: action.outcomeStage }),
+        ...(action.outcomeReason === null ? {} : { reason: action.outcomeReason }),
+      },
+    });
+  });
+
+  const scheduleHandoffExpiry = Effect.fn("VoiceSessionService.scheduleHandoffExpiry")(function* (
+    expiresAtMillis: number,
+  ) {
+    const now = yield* Clock.currentTimeMillis;
+    yield* Effect.sleep(`${Math.max(0, expiresAtMillis - now)} millis`);
+    const expiredAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+    const expired = yield* handoffActions.expire({ now: expiredAt });
+    yield* Effect.forEach(expired, persistHandoffOutcome, { discard: true });
+    yield* Effect.forEach(
+      new Set(expired.map((action) => action.realtimeSessionId)),
+      (sessionId) => nativeControlGrants.revokeSession(VoiceSessionId.make(sessionId)),
+      { discard: true },
+    );
+  });
+
+  const submitTerminalHandoff = Effect.fn("VoiceSessionService.submitTerminalHandoff")(function* (
+    lease: VoiceSessionLease,
+    providerSession: RealtimeProviderSession,
+    result: Extract<
+      import("../Services/VoiceToolExecutor.ts").VoiceToolInvokeResult,
+      { readonly type: "terminal-completed" }
+    >,
+  ) {
+    const claimed = yield* mutateSession<boolean>(lease.sessionId, (session) => {
+      if (session.terminalHandoffClaimed || session.terminating || session.terminalAt !== undefined)
+        return [false, session] as const;
+      return [true, { ...session, terminalHandoffClaimed: true }] as const;
+    });
+    if (Option.isNone(claimed) || !claimed.value) return;
+
+    const itemHash = NodeCrypto.createHash("sha256")
+      .update(`${lease.conversationId}\0${result.toolCallId}`)
+      .digest("base64url")
+      .slice(0, 32);
+    const createdAtMillis = yield* Clock.currentTimeMillis;
+    const createdAt = DateTime.formatIso(DateTime.makeUnsafe(createdAtMillis));
+    const preparedExpiresAt = DateTime.formatIso(
+      DateTime.makeUnsafe(createdAtMillis + HANDOFF_ACTION_TIMEOUT_MILLIS),
+    );
+    const action = yield* handoffActions
+      .create({
+        actionId: result.terminalAction.actionId,
+        authSessionId: lease.ownerAuthSessionId,
+        realtimeSessionId: lease.sessionId,
+        realtimeGeneration: lease.generation,
+        conversationId: lease.conversationId,
+        contextEpoch: lease.contextEpoch,
+        projectId: result.terminalAction.projectId,
+        threadId: result.terminalAction.threadId,
+        autoRearm: result.terminalAction.autoRearm,
+        createdAt,
+        expiresAt: preparedExpiresAt,
+      })
+      .pipe(
+        Effect.mapError(
+          (cause) =>
+            new VoiceError({
+              reason: "provider-unavailable",
+              operation: "session.handoff.create",
+              detail: "Voice handoff action could not be persisted",
+              retryable: true,
+              cause,
+            }),
+        ),
+        Effect.tapError(() => nativeControlGrants.revokeSession(lease.sessionId)),
+      );
+    yield* providerSession
+      .completeTerminalToolCall({
+        providerFunctionCallId: result.providerFunctionCallId,
+        output: result.output,
+        itemId: `t3handoff_${itemHash}`,
+      })
+      .pipe(
+        Effect.tapError(() =>
+          Effect.all([
+            handoffActions
+              .acknowledge({
+                actionId: action.actionId,
+                authSessionId: action.authSessionId,
+                result: {
+                  outcome: "failed",
+                  outcomeState: null,
+                  outcomeStage: "realtime-release",
+                  outcomeReason: "realtime-release-failed",
+                },
+                acknowledgedAt: createdAt,
+              })
+              .pipe(Effect.flatMap(persistHandoffOutcome)),
+            nativeControlGrants.revokeSession(lease.sessionId),
+          ]).pipe(Effect.ignore),
+        ),
+      );
+    const activatedAtMillis = yield* Clock.currentTimeMillis;
+    const activatedAt = DateTime.formatIso(DateTime.makeUnsafe(activatedAtMillis));
+    const expiresAtMillis = activatedAtMillis + HANDOFF_ACTION_TIMEOUT_MILLIS;
+    const expiresAt = DateTime.formatIso(DateTime.makeUnsafe(expiresAtMillis));
+    // Reserve the handoff capability before publishing the action. Teardown may
+    // race this transition, and must retain the narrowly scoped polling grant.
+    yield* Effect.gen(function* () {
+      yield* mutateSession(lease.sessionId, (session) => [
+        undefined,
+        { ...session, terminalHandoffReady: true },
+      ]);
+      yield* handoffActions.activate({
+        actionId: action.actionId,
+        activatedAt,
+        expiresAt,
+      });
+    }).pipe(
+      Effect.uninterruptible,
+      Effect.mapError(
+        (cause) =>
+          new VoiceError({
+            reason: "provider-unavailable",
+            operation: "session.handoff.activate",
+            detail: "Voice handoff action could not be activated",
+            retryable: true,
+            cause,
+          }),
+      ),
+      Effect.tapError(() =>
+        Effect.all([
+          mutateSession(lease.sessionId, (session) => [
+            undefined,
+            { ...session, terminalHandoffReady: false },
+          ]),
+          nativeControlGrants.revokeSession(lease.sessionId),
+        ]).pipe(Effect.ignore),
+      ),
+    );
+    yield* emit(lease, {
+      type: "tool",
+      toolCallId: result.toolCallId,
+      tool: result.tool,
+      outcome: result.outcome,
+    });
+    yield* emit(lease, {
+      type: "client-action",
+      action: "handoff-to-thread-voice",
+      actionId: result.terminalAction.actionId,
+      projectId: result.terminalAction.projectId,
+      threadId: result.terminalAction.threadId,
+      autoRearm: true,
+      expiresAt,
+    });
+    yield* conversations.appendContextIdempotent({
+      entryId: VoiceConversationEntryId.make(
+        `voice-handoff:${result.terminalAction.actionId}:boundary`,
+      ),
+      conversationId: lease.conversationId,
+      expectedEpoch: lease.contextEpoch,
+      kind: "call-boundary",
+      payload: {
+        reason: "handed-off-to-thread-voice",
+        targetThreadId: result.terminalAction.threadId,
+        handedOffAt: activatedAt,
+      },
+    });
+    yield* scheduleHandoffExpiry(expiresAtMillis).pipe(Effect.forkIn(serviceScope));
+    const current = (yield* SynchronizedRef.get(runtime)).sessions.get(lease.sessionId);
+    if (current !== undefined) {
+      yield* endRuntimeSession(current, "ended", {
+        reason: "handed-off-to-thread-voice",
+      }).pipe(Effect.forkIn(serviceScope));
+    }
+  });
+
   const scheduleConfirmationExpiry = Effect.fn("VoiceSessionService.scheduleConfirmationExpiry")(
     function* (
       lease: VoiceSessionLease,
@@ -682,10 +884,9 @@ const make = Effect.gen(function* () {
         { ...current, providerActivityObserved: true },
       ]);
     }
-    const grantedScopes = (yield* SynchronizedRef.get(runtime)).sessions.get(
-      lease.sessionId,
-    )?.grantedScopes;
-    if (grantedScopes === undefined) return;
+    const runtimeSession = (yield* SynchronizedRef.get(runtime)).sessions.get(lease.sessionId);
+    if (runtimeSession === undefined || runtimeSession.terminalHandoffClaimed) return;
+    const grantedScopes = runtimeSession.grantedScopes;
     switch (event.type) {
       case "activity":
         if (
@@ -741,7 +942,9 @@ const make = Effect.gen(function* () {
             Effect.flatMap((result) =>
               result.type === "completed"
                 ? submitCompletedTool(lease, providerSession, result)
-                : Effect.void,
+                : result.type === "terminal-completed"
+                  ? submitTerminalHandoff(lease, providerSession, result)
+                  : Effect.void,
             ),
             Effect.catch((error) =>
               Effect.gen(function* () {
@@ -752,9 +955,9 @@ const make = Effect.gen(function* () {
                 });
                 const current = (yield* SynchronizedRef.get(runtime)).sessions.get(lease.sessionId);
                 if (current !== undefined) {
-                  yield* endRuntimeSession(current, "error", { reason: "tool-failed" }).pipe(
-                    Effect.forkIn(serviceScope),
-                  );
+                  yield* endRuntimeSession(current, "error", {
+                    reason: "tool-failed",
+                  }).pipe(Effect.forkIn(serviceScope));
                 }
               }),
             ),
@@ -765,6 +968,10 @@ const make = Effect.gen(function* () {
         const result = yield* invocation;
         if (result.type === "completed") {
           yield* submitCompletedTool(lease, providerSession, result);
+          return;
+        }
+        if (result.type === "terminal-completed") {
+          yield* submitTerminalHandoff(lease, providerSession, result);
           return;
         }
         if (result.newlyCreated) {
@@ -844,6 +1051,7 @@ const make = Effect.gen(function* () {
         sessionId: existing.lease.sessionId,
         leaseGeneration: existing.lease.generation,
         expiresAt: Date.parse(existing.expiresAt),
+        capabilities: new Set(["session-control", "handoff-actions"]),
       });
       return {
         state: existing.state,
@@ -1108,6 +1316,7 @@ const make = Effect.gen(function* () {
       sessionId: acquired.lease.sessionId,
       leaseGeneration: acquired.lease.generation,
       expiresAt: Date.parse(expiresAt),
+      capabilities: new Set(["session-control", "handoff-actions"]),
     });
     return {
       state,
@@ -1290,7 +1499,9 @@ const make = Effect.gen(function* () {
   )(function* (owner, sessionId, generation) {
     const session = yield* requireOwned(owner, sessionId, generation);
     if (session.state.phase === "ended") return { state: session.state, closed: false };
-    const closed = yield* endRuntimeSession(session, "ended", { reason: "client-request" });
+    const closed = yield* endRuntimeSession(session, "ended", {
+      reason: "client-request",
+    });
     const ended = yield* SynchronizedRef.get(runtime).pipe(
       Effect.map((state) => state.sessions.get(sessionId)!),
     );
@@ -1540,7 +1751,10 @@ const make = Effect.gen(function* () {
         );
         yield* Effect.forEach(
           matching,
-          (session) => endRuntimeSession(session, "ended", { reason: "conversation-deleted" }),
+          (session) =>
+            endRuntimeSession(session, "ended", {
+              reason: "conversation-deleted",
+            }),
           { discard: true },
         );
         const deleted = yield* conversations.delete(conversationId);
@@ -1568,7 +1782,10 @@ const make = Effect.gen(function* () {
         );
         yield* Effect.forEach(
           matching,
-          (session) => endRuntimeSession(session, "ended", { reason: "conversation-cleared" }),
+          (session) =>
+            endRuntimeSession(session, "ended", {
+              reason: "conversation-cleared",
+            }),
           { discard: true },
         );
         return cleared;
@@ -1666,6 +1883,72 @@ const make = Effect.gen(function* () {
   const acknowledgeClientAction: VoiceSessionServiceShape["acknowledgeClientAction"] = Effect.fn(
     "VoiceSessionService.acknowledgeClientAction",
   )(function* (owner, sessionId, actionId, input) {
+    if (input.action === "handoff-to-thread-voice") {
+      const existing = yield* handoffActions
+        .get(actionId)
+        .pipe(
+          Effect.mapError(() =>
+            sessionError(
+              "provider-unavailable",
+              "session.client-action",
+              "Voice handoff action could not be loaded",
+              true,
+            ),
+          ),
+        );
+      if (
+        Option.isNone(existing) ||
+        existing.value.authSessionId !== owner ||
+        existing.value.realtimeSessionId !== sessionId ||
+        existing.value.realtimeGeneration !== input.leaseGeneration
+      ) {
+        return yield* sessionError(
+          "authorization-revoked",
+          "session.client-action",
+          "Voice handoff action ownership changed",
+        );
+      }
+      const acknowledgedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+      const settled = yield* handoffActions
+        .acknowledge({
+          actionId,
+          authSessionId: owner,
+          result:
+            input.outcome === "succeeded"
+              ? {
+                  outcome: "succeeded",
+                  outcomeState: input.state,
+                  outcomeStage: null,
+                  outcomeReason: null,
+                }
+              : {
+                  outcome: "failed",
+                  outcomeState: null,
+                  outcomeStage: input.stage,
+                  outcomeReason: input.reason,
+                },
+          acknowledgedAt,
+        })
+        .pipe(
+          Effect.mapError(() =>
+            sessionError(
+              "invalid-phase",
+              "session.client-action",
+              "Voice handoff action could not be acknowledged",
+            ),
+          ),
+        );
+      yield* persistHandoffOutcome(settled);
+      if (settled.status === "expired") {
+        yield* nativeControlGrants.revokeSession(VoiceSessionId.make(settled.realtimeSessionId));
+        return yield* sessionError(
+          "invalid-phase",
+          "session.client-action",
+          "Voice handoff action has expired",
+        );
+      }
+      return { actionId, action: input.action, outcome: input.outcome };
+    }
     const owned = yield* requireOwned(owner, sessionId, input.leaseGeneration);
     if (
       owned.state.phase === "ending" ||
@@ -1803,10 +2086,111 @@ const make = Effect.gen(function* () {
         if (selected.completion !== null) {
           yield* Deferred.succeed(selected.completion, resolution).pipe(Effect.ignore);
         }
-        return { actionId, outcome: resolution.outcome };
+        return {
+          actionId,
+          action: input.action,
+          outcome: resolution.outcome,
+        };
       }),
     );
   });
+
+  const listPendingHandoffActions: VoiceSessionServiceShape["listPendingHandoffActions"] =
+    Effect.fn("VoiceSessionService.listPendingHandoffActions")(
+      function* (owner, sessionId, leaseGeneration, limit) {
+        const now = DateTime.formatIso(DateTime.makeUnsafe(yield* Clock.currentTimeMillis));
+        const expired = yield* handoffActions
+          .expire({ now })
+          .pipe(
+            Effect.mapError(() =>
+              sessionError(
+                "provider-unavailable",
+                "session.client-action",
+                "Could not expire pending voice handoff actions",
+                true,
+              ),
+            ),
+          );
+        yield* Effect.forEach(expired, persistHandoffOutcome, {
+          discard: true,
+        });
+        yield* Effect.forEach(
+          new Set(expired.map((action) => action.realtimeSessionId)),
+          (expiredSessionId) =>
+            nativeControlGrants.revokeSession(VoiceSessionId.make(expiredSessionId)),
+          { discard: true },
+        );
+        const pending = yield* handoffActions
+          .listPending({
+            authSessionId: owner,
+            realtimeSessionId: sessionId,
+            realtimeGeneration: leaseGeneration,
+            now,
+            limit,
+          })
+          .pipe(
+            Effect.mapError(() =>
+              sessionError(
+                "provider-unavailable",
+                "session.client-action",
+                "Could not list pending voice handoff actions",
+                true,
+              ),
+            ),
+          );
+        return pending.map(
+          (action): VoiceNativeHandoffAction => ({
+            actionId: VoiceClientActionId.make(action.actionId),
+            sessionId: VoiceSessionId.make(action.realtimeSessionId),
+            leaseGeneration: action.realtimeGeneration,
+            projectId: ProjectId.make(action.projectId),
+            threadId: ThreadId.make(action.threadId),
+            autoRearm: action.autoRearm,
+            expiresAt: action.expiresAt,
+          }),
+        );
+      },
+    );
+
+  const acknowledgeNativeHandoffAction: VoiceSessionServiceShape["acknowledgeNativeHandoffAction"] =
+    Effect.fn("VoiceSessionService.acknowledgeNativeHandoffAction")(
+      function* (owner, sessionId, leaseGeneration, actionId, input) {
+        const action = yield* handoffActions
+          .get(actionId)
+          .pipe(
+            Effect.mapError(() =>
+              sessionError(
+                "provider-unavailable",
+                "session.client-action",
+                "Could not load the voice handoff action",
+                true,
+              ),
+            ),
+          );
+        if (
+          Option.isNone(action) ||
+          action.value.authSessionId !== owner ||
+          action.value.realtimeSessionId !== sessionId ||
+          action.value.realtimeGeneration !== leaseGeneration
+        ) {
+          return yield* sessionError(
+            "authorization-revoked",
+            "session.client-action",
+            "Voice handoff action is not owned by this client",
+          );
+        }
+        return yield* acknowledgeClientAction(
+          owner,
+          VoiceSessionId.make(action.value.realtimeSessionId),
+          actionId,
+          {
+            leaseGeneration: action.value.realtimeGeneration,
+            action: "handoff-to-thread-voice",
+            ...input,
+          },
+        );
+      },
+    );
 
   return VoiceSessionService.of({
     create,
@@ -1818,6 +2202,8 @@ const make = Effect.gen(function* () {
     events,
     confirm,
     acknowledgeClientAction,
+    listPendingHandoffActions,
+    acknowledgeNativeHandoffAction,
     revokeAuthSession,
     deleteConversation,
     clearConversationContext,

@@ -25,6 +25,7 @@ export type {
   T3VoiceRealtimeOffer,
   T3VoiceRealtimePrepareInput,
   T3VoiceRealtimeTerminatedEvent,
+  T3VoiceThreadVoiceHandoffEvent,
   T3VoiceRuntimeErrorEvent,
   T3VoiceRuntimePhase,
   T3VoiceRuntimeState,
