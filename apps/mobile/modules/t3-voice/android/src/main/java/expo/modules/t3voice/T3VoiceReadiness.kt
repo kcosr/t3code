@@ -26,7 +26,26 @@ internal data class T3VoiceReadinessConfig(
 
   fun samePayload(other: T3VoiceReadinessConfig): Boolean =
     copy(generation = 0) == other.copy(generation = 0)
+
+  fun sameReservationPayload(other: T3VoiceReadinessConfig): Boolean =
+    copy(
+      enabled = false,
+      microphonePermissionGranted = false,
+      notificationPermissionGranted = false,
+      generation = 0,
+    ) ==
+      other.copy(
+        enabled = false,
+        microphonePermissionGranted = false,
+        notificationPermissionGranted = false,
+        generation = 0,
+      )
 }
+
+internal data class T3VoicePreparedReadiness(
+  val config: T3VoiceReadinessConfig,
+  val runtimeId: String,
+)
 
 internal class T3VoiceReadinessStore(context: Context) {
   private val preferences =
@@ -50,14 +69,41 @@ internal class T3VoiceReadinessStore(context: Context) {
     )
 
   fun write(config: T3VoiceReadinessConfig) {
-    preferences.edit()
-      .putBoolean(KEY_ENABLED, config.enabled)
-      .putString(KEY_MODE, config.mode.name)
-      .putString(KEY_TARGET_ID, config.targetId)
-      .putString(KEY_AUDIO_ROUTE_ID, config.audioRouteId)
-      .putBoolean(KEY_AUTO_REARM, config.autoRearm)
-      .putLong(KEY_GENERATION, config.generation)
-      .apply()
+    check(
+      preferences.edit()
+        .putBoolean(KEY_ENABLED, config.enabled)
+        .putString(KEY_MODE, config.mode.name)
+        .putString(KEY_TARGET_ID, config.targetId)
+        .putString(KEY_AUDIO_ROUTE_ID, config.audioRouteId)
+        .putBoolean(KEY_AUTO_REARM, config.autoRearm)
+        .putLong(KEY_GENERATION, config.generation)
+        .remove(KEY_PREPARED)
+        .remove(KEY_PREPARED_RUNTIME_ID)
+        .commit(),
+    ) { "Could not persist voice readiness." }
+  }
+
+  fun prepared(): T3VoicePreparedReadiness? {
+    if (!preferences.getBoolean(KEY_PREPARED, false)) return null
+    val runtimeId = preferences.getString(KEY_PREPARED_RUNTIME_ID, null) ?: return null
+    return T3VoicePreparedReadiness(read().copy(enabled = true), runtimeId)
+  }
+
+  fun writePrepared(config: T3VoiceReadinessConfig, runtimeId: String) {
+    require(config.enabled && config.generation > 0)
+    require(runtimeId.isNotBlank() && runtimeId.length <= 128)
+    check(
+      preferences.edit()
+        .putBoolean(KEY_ENABLED, false)
+        .putString(KEY_MODE, config.mode.name)
+        .putString(KEY_TARGET_ID, config.targetId)
+        .putString(KEY_AUDIO_ROUTE_ID, config.audioRouteId)
+        .putBoolean(KEY_AUTO_REARM, config.autoRearm)
+        .putLong(KEY_GENERATION, config.generation)
+        .putBoolean(KEY_PREPARED, true)
+        .putString(KEY_PREPARED_RUNTIME_ID, runtimeId)
+        .commit(),
+    ) { "Could not reserve voice readiness." }
   }
 
   fun pendingDisabled(): T3VoiceRuntimeEvent.ReadinessDisabled? {
@@ -76,6 +122,8 @@ internal class T3VoiceReadinessStore(context: Context) {
       .putBoolean(KEY_AUTO_REARM, config.autoRearm)
       .putLong(KEY_GENERATION, config.generation)
       .putLong(KEY_PENDING_DISABLED_GENERATION, config.generation)
+      .remove(KEY_PREPARED)
+      .remove(KEY_PREPARED_RUNTIME_ID)
       .apply()
   }
 
@@ -94,6 +142,46 @@ internal class T3VoiceReadinessStore(context: Context) {
     private const val KEY_AUTO_REARM = "auto_rearm"
     private const val KEY_GENERATION = "generation"
     private const val KEY_PENDING_DISABLED_GENERATION = "pending_disabled_generation"
+    private const val KEY_PREPARED = "prepared"
+    private const val KEY_PREPARED_RUNTIME_ID = "prepared_runtime_id"
+  }
+}
+
+internal object T3VoiceReadinessReservationPolicy {
+  fun reserve(
+    current: T3VoiceReadinessConfig,
+    prepared: T3VoicePreparedReadiness?,
+    desired: T3VoiceReadinessConfig,
+    proposedRuntimeId: String,
+  ): T3VoicePreparedReadiness {
+    require(desired.enabled) { "Prepared voice readiness must be enabled." }
+    require(proposedRuntimeId.isNotBlank() && proposedRuntimeId.length <= 128)
+    if (prepared != null && prepared.config.sameReservationPayload(desired)) {
+      return prepared.copy(
+        config = desired.copy(enabled = false, generation = prepared.config.generation),
+      )
+    }
+    val nextGeneration = maxOf(current.generation, prepared?.config?.generation ?: 0) + 1
+    return T3VoicePreparedReadiness(
+      desired.copy(enabled = false, generation = nextGeneration),
+      proposedRuntimeId,
+    )
+  }
+
+  fun requireActivation(
+    locked: T3VoiceReadinessConfig,
+    prepared: T3VoicePreparedReadiness?,
+    desired: T3VoiceReadinessConfig,
+    expectedGeneration: Long,
+  ): T3VoiceReadinessConfig {
+    require(desired.enabled && expectedGeneration > 0)
+    val reserved = requireNotNull(prepared) { "Voice readiness has not been prepared." }
+    require(
+      locked.generation == expectedGeneration &&
+        reserved.config.generation == expectedGeneration &&
+        reserved.config.sameReservationPayload(desired),
+    ) { "Voice readiness reservation is stale." }
+    return desired.copy(generation = expectedGeneration)
   }
 }
 

@@ -158,6 +158,75 @@ export interface T3VoicePersistedReadinessSnapshot extends T3VoiceReadinessSnaps
   readonly generation: number;
 }
 
+export type T3VoiceBackgroundGrantOperation = "realtime-start" | "thread-turn-start";
+
+/** Sensitive provisioning input. Native code hashes targetIdentity before persisting metadata. */
+export interface T3VoiceBackgroundRuntimeGrantInput {
+  readonly runtimeId: string;
+  readonly readinessGeneration: number;
+  readonly environmentOrigin: string;
+  readonly operation: T3VoiceBackgroundGrantOperation;
+  readonly targetIdentity: string;
+  readonly expiresAtEpochMillis: number;
+  readonly token: string;
+}
+
+export interface T3VoiceBackgroundReadinessPrepareInput {
+  readonly readiness: T3VoiceReadinessSnapshot;
+  readonly runtimeId: string;
+}
+
+export interface T3VoiceBackgroundPreparedReadiness {
+  readonly runtimeId: string;
+  readonly readiness: T3VoicePersistedReadinessSnapshot;
+}
+
+export interface T3VoiceBackgroundReadinessActivateInput {
+  readonly readiness: T3VoiceReadinessSnapshot;
+  readonly expectedGeneration: number;
+  readonly grant: T3VoiceBackgroundRuntimeGrantInput;
+}
+
+export type T3VoiceBackgroundExecutionPhase =
+  | "disabled"
+  | "ready"
+  | "starting"
+  | "active"
+  | "retrying"
+  | "attention-required";
+
+/** Curated state suitable for React events and diagnostics; never contains credentials or media. */
+export interface T3VoiceBackgroundExecutionSnapshot {
+  readonly readinessGeneration: number;
+  readonly mode: T3VoiceReadinessMode;
+  readonly phase: T3VoiceBackgroundExecutionPhase;
+  readonly activeSessionId: string | null;
+  readonly retryable: boolean;
+}
+
+export interface T3VoiceBackgroundRealtimeStartInput {
+  readonly runtimeId: string;
+  readonly generation: number;
+  readonly clientOperationId: string;
+}
+
+/** Internal signaling DTO. SDP must not be copied into background state, events, or diagnostics. */
+export interface T3VoiceBackgroundRealtimeOfferInput {
+  readonly sessionId: string;
+  readonly leaseGeneration: number;
+  readonly sdp: string;
+}
+
+export interface T3VoiceBackgroundRealtimeAnswer {
+  readonly sessionId: string;
+  readonly leaseGeneration: number;
+  readonly sdp: string;
+}
+
+export interface T3VoiceBackgroundRealtimeCloseInput {
+  readonly leaseGeneration: number;
+}
+
 export interface T3VoiceControllerRegistration {
   readonly controllerGeneration: number;
 }
@@ -298,6 +367,16 @@ export interface T3VoiceNativeModule {
   };
   readonly getMediaCapabilitiesAsync: () => Promise<T3VoiceMediaCapabilities>;
   readonly getStateAsync: () => Promise<T3VoiceRuntimeState>;
+  readonly provisionBackgroundRuntimeGrantAsync: (
+    input: T3VoiceBackgroundRuntimeGrantInput,
+  ) => Promise<void>;
+  readonly clearBackgroundRuntimeGrantAsync: () => Promise<void>;
+  readonly prepareBackgroundVoiceReadinessAsync: (
+    input: T3VoiceBackgroundReadinessPrepareInput,
+  ) => Promise<T3VoiceBackgroundPreparedReadiness>;
+  readonly activateBackgroundVoiceReadinessAsync: (
+    input: T3VoiceBackgroundReadinessActivateInput,
+  ) => Promise<T3VoicePersistedReadinessSnapshot>;
   readonly getMicrophonePermissionAsync: () => Promise<PermissionResponse>;
   readonly requestMicrophonePermissionAsync: () => Promise<PermissionResponse>;
   readonly getNotificationPermissionAsync: () => Promise<PermissionResponse>;

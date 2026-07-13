@@ -80,18 +80,7 @@ class T3VoiceRuntimeService : Service() {
         check(T3VoiceReadinessReconciliationPolicy.canApply(config, readinessStore.pendingDisabled())) {
           "A notification disable must be acknowledged before readiness can be enabled."
         }
-        val verified =
-          config.copy(
-            microphonePermissionGranted =
-              config.microphonePermissionGranted && hasPermission(Manifest.permission.RECORD_AUDIO),
-            notificationPermissionGranted =
-              config.notificationPermissionGranted &&
-                (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-                  hasPermission(Manifest.permission.POST_NOTIFICATIONS)),
-          )
-        require(!verified.enabled || verified.mode != T3VoiceReadinessMode.THREAD || verified.targetId != null) {
-          "Thread readiness requires a target."
-        }
+        val verified = verifyReadiness(config)
         if (readinessConfig.samePayload(verified)) return@synchronized readinessConfig
         val next = verified.copy(generation = readinessConfig.generation + 1)
         readinessConfig = next
@@ -100,6 +89,82 @@ class T3VoiceRuntimeService : Service() {
         reconcileReadinessLocked()
         if (next.isEffective()) keepReadinessServiceStarted()
         next
+      }
+
+    fun prepareBackgroundVoiceReadiness(
+      desired: T3VoiceReadinessConfig,
+      proposedRuntimeId: String,
+    ): T3VoicePreparedReadiness =
+      synchronized(operationLock) {
+        val verified = verifyReadiness(desired)
+        val grantStore = T3VoiceRuntimeGrantStore(applicationContext)
+        check(
+          T3VoiceReadinessReconciliationPolicy.canApply(
+            verified,
+            readinessStore.pendingDisabled(),
+          ),
+        ) { "A notification disable must be acknowledged before readiness can be prepared." }
+        val prepared =
+          T3VoiceReadinessReservationPolicy.reserve(
+            readinessConfig,
+            readinessStore.prepared(),
+            verified,
+            grantStore.validatedRuntimeId() ?: proposedRuntimeId,
+          )
+        if (
+          readinessConfig.generation == prepared.config.generation &&
+            readinessStore.prepared()?.let {
+              it.runtimeId == prepared.runtimeId && it.config.sameReservationPayload(verified)
+            } == true
+        ) {
+          return@synchronized prepared
+        }
+        readinessStore.writePrepared(prepared.config.copy(enabled = true), prepared.runtimeId)
+        readinessConfig = prepared.config
+        controllerCommands.invalidateReadiness()
+        reconcileReadinessLocked()
+        grantStore.clear(deleteKey = true)
+        prepared
+      }
+
+    fun activateBackgroundVoiceReadiness(
+      desired: T3VoiceReadinessConfig,
+      expectedGeneration: Long,
+      grant: T3VoiceRuntimeGrant,
+    ): T3VoiceReadinessConfig =
+      synchronized(operationLock) {
+        check(
+          T3VoiceReadinessReconciliationPolicy.canApply(
+            desired,
+            readinessStore.pendingDisabled(),
+          ),
+        ) { "A notification disable must be acknowledged before readiness can be activated." }
+        val activated =
+          T3VoiceReadinessReservationPolicy.requireActivation(
+            readinessConfig,
+            readinessStore.prepared(),
+            verifyReadiness(desired),
+            expectedGeneration,
+          )
+        require(grant.metadata.readinessGeneration == expectedGeneration) {
+          "Runtime grant generation does not match voice readiness."
+        }
+        require(readinessStore.prepared()?.runtimeId == grant.metadata.runtimeId) {
+          "Runtime grant identity does not match voice readiness."
+        }
+        val grantStore = T3VoiceRuntimeGrantStore(applicationContext)
+        grantStore.provision(grant)
+        try {
+          readinessStore.write(activated)
+        } catch (cause: Throwable) {
+          runCatching { grantStore.clear(deleteKey = true) }
+          throw cause
+        }
+        readinessConfig = activated
+        controllerCommands.invalidateReadiness()
+        reconcileReadinessLocked()
+        if (activated.isEffective()) keepReadinessServiceStarted()
+        activated
       }
 
     fun registerVoiceController(generation: Long) {
@@ -464,6 +529,22 @@ class T3VoiceRuntimeService : Service() {
     }
   private val realtime: T3VoiceWebRtcSession
     get() = realtimeDelegate.value
+
+  private fun verifyReadiness(config: T3VoiceReadinessConfig): T3VoiceReadinessConfig {
+    val verified =
+      config.copy(
+        microphonePermissionGranted =
+          config.microphonePermissionGranted && hasPermission(Manifest.permission.RECORD_AUDIO),
+        notificationPermissionGranted =
+          config.notificationPermissionGranted &&
+            (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+              hasPermission(Manifest.permission.POST_NOTIFICATIONS)),
+      )
+    require(!verified.enabled || verified.mode != T3VoiceReadinessMode.THREAD || verified.targetId != null) {
+      "Thread readiness requires a target."
+    }
+    return verified
+  }
 
   override fun onCreate() {
     super.onCreate()

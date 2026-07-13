@@ -191,7 +191,7 @@ class T3VoiceModule : Module() {
       )
 
       Constants(
-        "nativeRevision" to 10,
+        "nativeRevision" to 11,
       )
 
       OnCreate {
@@ -243,68 +243,68 @@ class T3VoiceModule : Module() {
         T3VoiceStateStore.state.value.toEventBody()
       }
 
-      AsyncFunction("setReadinessSnapshotAsync") { input: Map<String, Any?>, promise: Promise ->
-        requireExactKeys(
-          input,
-          setOf(
-            "enabled",
-            "mode",
-            "targetId",
-            "audioRouteId",
-            "autoRearm",
-            "microphonePermissionGranted",
-            "notificationPermissionGranted",
-          ),
-        )
-        val enabled = input["enabled"] as? Boolean
-          ?: throw IllegalArgumentException("enabled must be a boolean.")
-        val mode =
-          when (input["mode"] as? String) {
-            "realtime" -> T3VoiceReadinessMode.REALTIME
-            "thread" -> T3VoiceReadinessMode.THREAD
-            else -> throw IllegalArgumentException("mode must be realtime or thread.")
-          }
-        val targetId =
-          when (val value = input["targetId"]) {
-            null -> null
-            is String -> value.takeIf(String::isNotBlank)
-              ?: throw IllegalArgumentException("targetId must not be blank.")
-            else -> throw IllegalArgumentException("targetId must be a string or null.")
-          }
-        val audioRouteId = input["audioRouteId"] as? String
-          ?: throw IllegalArgumentException("audioRouteId must be a string.")
-        require(audioRouteId.isNotBlank()) { "audioRouteId must not be blank." }
-        val autoRearm = input["autoRearm"] as? Boolean
-          ?: throw IllegalArgumentException("autoRearm must be a boolean.")
-        val microphonePermissionGranted = input["microphonePermissionGranted"] as? Boolean
-          ?: throw IllegalArgumentException("microphonePermissionGranted must be a boolean.")
-        val notificationPermissionGranted = input["notificationPermissionGranted"] as? Boolean
-          ?: throw IllegalArgumentException("notificationPermissionGranted must be a boolean.")
-        withBinder(promise, "voice-readiness-update-failed") { service, settlement ->
-          val snapshot =
-            service.setReadinessSnapshot(
-              T3VoiceReadinessConfig(
-                enabled,
-                mode,
-                targetId,
-                audioRouteId,
-                autoRearm,
-                microphonePermissionGranted,
-                notificationPermissionGranted,
-              ),
-            )
+      AsyncFunction("provisionBackgroundRuntimeGrantAsync") { input: Map<String, Any?> ->
+        T3VoiceRuntimeGrantStore(requireReactContext()).provision(parseRuntimeGrant(input))
+      }
+
+      AsyncFunction("clearBackgroundRuntimeGrantAsync") {
+        T3VoiceRuntimeGrantStore(requireReactContext()).clear(deleteKey = true)
+      }
+
+      AsyncFunction("prepareBackgroundVoiceReadinessAsync") {
+        input: Map<String, Any?>,
+        promise: Promise,
+        ->
+        requireExactKeys(input, setOf("readiness", "runtimeId"))
+        val readinessInput =
+          input["readiness"] as? Map<*, *>
+            ?: throw IllegalArgumentException("readiness must be an object.")
+        @Suppress("UNCHECKED_CAST")
+        val readiness = parseReadinessConfig(readinessInput as Map<String, Any?>)
+        val runtimeId = requireText(input, "runtimeId", 128)
+        withBinder(promise, "voice-readiness-prepare-failed") { service, settlement ->
+          val prepared = service.prepareBackgroundVoiceReadiness(readiness, runtimeId)
           settlement.resolve(
             mapOf(
-              "enabled" to snapshot.enabled,
-              "mode" to snapshot.mode.name.lowercase(),
-              "targetId" to snapshot.targetId,
-              "audioRouteId" to snapshot.audioRouteId,
-              "autoRearm" to snapshot.autoRearm,
-              "microphonePermissionGranted" to snapshot.microphonePermissionGranted,
-              "notificationPermissionGranted" to snapshot.notificationPermissionGranted,
-              "generation" to snapshot.generation.toDouble(),
+              "runtimeId" to prepared.runtimeId,
+              "readiness" to readinessBody(prepared.config),
             ),
           )
+        }
+      }
+
+      AsyncFunction("activateBackgroundVoiceReadinessAsync") {
+        input: Map<String, Any?>,
+        promise: Promise,
+        ->
+        requireExactKeys(input, setOf("readiness", "expectedGeneration", "grant"))
+        val readinessInput =
+          input["readiness"] as? Map<*, *>
+            ?: throw IllegalArgumentException("readiness must be an object.")
+        val grantInput =
+          input["grant"] as? Map<*, *>
+            ?: throw IllegalArgumentException("grant must be an object.")
+        @Suppress("UNCHECKED_CAST")
+        val readiness = parseReadinessConfig(readinessInput as Map<String, Any?>)
+        @Suppress("UNCHECKED_CAST")
+        val grant = parseRuntimeGrant(grantInput as Map<String, Any?>)
+        val expectedGeneration = requireLong(input, "expectedGeneration")
+        withBinder(promise, "voice-readiness-activate-failed") { service, settlement ->
+          settlement.resolve(
+            readinessBody(
+              service.activateBackgroundVoiceReadiness(
+                readiness,
+                expectedGeneration,
+                grant,
+              ),
+            ),
+          )
+        }
+      }
+
+      AsyncFunction("setReadinessSnapshotAsync") { input: Map<String, Any?>, promise: Promise ->
+        withBinder(promise, "voice-readiness-update-failed") { service, settlement ->
+          settlement.resolve(readinessBody(service.setReadinessSnapshot(parseReadinessConfig(input))))
         }
       }
 
@@ -878,6 +878,76 @@ class T3VoiceModule : Module() {
     return requireText(input, key, T3VoiceBridgeValidation.MAXIMUM_IDENTIFIER_LENGTH)
   }
 
+  private fun requireReactContext(): Context =
+    appContext.reactContext ?: error("The T3 voice React context is unavailable.")
+
+  private fun parseReadinessConfig(input: Map<String, Any?>): T3VoiceReadinessConfig {
+    requireExactKeys(input, READINESS_FIELDS)
+    val enabled = input["enabled"] as? Boolean
+      ?: throw IllegalArgumentException("enabled must be a boolean.")
+    val mode =
+      when (input["mode"] as? String) {
+        "realtime" -> T3VoiceReadinessMode.REALTIME
+        "thread" -> T3VoiceReadinessMode.THREAD
+        else -> throw IllegalArgumentException("mode must be realtime or thread.")
+      }
+    val targetId =
+      when (val value = input["targetId"]) {
+        null -> null
+        is String -> value.takeIf(String::isNotBlank)
+          ?: throw IllegalArgumentException("targetId must not be blank.")
+        else -> throw IllegalArgumentException("targetId must be a string or null.")
+      }
+    val audioRouteId = input["audioRouteId"] as? String
+      ?: throw IllegalArgumentException("audioRouteId must be a string.")
+    require(audioRouteId.isNotBlank()) { "audioRouteId must not be blank." }
+    return T3VoiceReadinessConfig(
+      enabled = enabled,
+      mode = mode,
+      targetId = targetId,
+      audioRouteId = audioRouteId,
+      autoRearm = input["autoRearm"] as? Boolean
+        ?: throw IllegalArgumentException("autoRearm must be a boolean."),
+      microphonePermissionGranted = input["microphonePermissionGranted"] as? Boolean
+        ?: throw IllegalArgumentException("microphonePermissionGranted must be a boolean."),
+      notificationPermissionGranted = input["notificationPermissionGranted"] as? Boolean
+        ?: throw IllegalArgumentException("notificationPermissionGranted must be a boolean."),
+    )
+  }
+
+  private fun parseRuntimeGrant(input: Map<String, Any?>): T3VoiceRuntimeGrant {
+    requireExactKeys(input, RUNTIME_GRANT_FIELDS)
+    val targetIdentityDigest =
+      T3VoiceRuntimeTargetIdentity.digest(
+        requireText(input, "targetIdentity", MAXIMUM_TARGET_IDENTITY_LENGTH),
+      )
+    return T3VoiceRuntimeGrant(
+      metadata =
+        T3VoiceRuntimeGrantMetadata(
+          runtimeId = requireText(input, "runtimeId", 128),
+          readinessGeneration = requireLong(input, "readinessGeneration"),
+          environmentOrigin = requireText(input, "environmentOrigin", 2_048),
+          operation =
+            T3VoiceRuntimeGrantOperation.fromWireValue(requireText(input, "operation", 64)),
+          targetIdentityDigest = targetIdentityDigest,
+          expiresAtEpochMillis = requireLong(input, "expiresAtEpochMillis"),
+        ),
+      token = requireText(input, "token", 128),
+    )
+  }
+
+  private fun readinessBody(snapshot: T3VoiceReadinessConfig): Map<String, Any?> =
+    mapOf(
+      "enabled" to snapshot.enabled,
+      "mode" to snapshot.mode.name.lowercase(),
+      "targetId" to snapshot.targetId,
+      "audioRouteId" to snapshot.audioRouteId,
+      "autoRearm" to snapshot.autoRearm,
+      "microphonePermissionGranted" to snapshot.microphonePermissionGranted,
+      "notificationPermissionGranted" to snapshot.notificationPermissionGranted,
+      "generation" to snapshot.generation.toDouble(),
+    )
+
   private fun requireInt(input: Map<String, Any>, key: String): Int {
     return T3VoiceBridgeValidation.requireInt(input, key)
   }
@@ -951,5 +1021,26 @@ class T3VoiceModule : Module() {
     private const val VOICE_COMMAND_EVENT = "voiceCommand"
     private const val READINESS_DISABLED_EVENT = "readinessDisabled"
     private const val BINDER_CONNECTION_TIMEOUT_MS = 5_000L
+    private const val MAXIMUM_TARGET_IDENTITY_LENGTH = 4_096
+    private val READINESS_FIELDS =
+      setOf(
+        "enabled",
+        "mode",
+        "targetId",
+        "audioRouteId",
+        "autoRearm",
+        "microphonePermissionGranted",
+        "notificationPermissionGranted",
+      )
+    private val RUNTIME_GRANT_FIELDS =
+      setOf(
+        "runtimeId",
+        "readinessGeneration",
+        "environmentOrigin",
+        "operation",
+        "targetIdentity",
+        "expiresAtEpochMillis",
+        "token",
+      )
   }
 }

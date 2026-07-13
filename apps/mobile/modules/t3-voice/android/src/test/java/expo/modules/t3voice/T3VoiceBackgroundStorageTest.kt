@@ -18,6 +18,7 @@ internal class T3VoiceBackgroundStorageTest {
     store.provision(grant)
 
     assertTrue(storage.values.values.filterNotNull().none { "runtime-secret-token" in it })
+    assertTrue(storage.values.values.filterNotNull().none { "thread:project-1:thread-1" in it })
     assertEquals(T3VoiceRuntimeGrantLoadResult.Available(grant), store.load())
   }
 
@@ -33,6 +34,17 @@ internal class T3VoiceBackgroundStorageTest {
   }
 
   @Test
+  fun `target identity digest tampering locks the grant`() {
+    val storage = MemoryBackgroundStorage()
+    val store = T3VoiceRuntimeGrantStore(storage, TestGrantCipher(), clockMillis = { 1_000 })
+    store.provision(runtimeGrant(generation = 7, token = "runtime-secret-token"))
+    val targetDigestKey = storage.values.keys.single { it.endsWith("target_identity_sha256") }
+    storage.values[targetDigestKey] = "0".repeat(64)
+
+    assertEquals(T3VoiceRuntimeGrantLoadResult.Locked, store.load())
+  }
+
+  @Test
   fun `expired grants do not authorize work`() {
     val storage = MemoryBackgroundStorage()
     val store = T3VoiceRuntimeGrantStore(storage, TestGrantCipher(), clockMillis = { 20_000 })
@@ -40,6 +52,18 @@ internal class T3VoiceBackgroundStorageTest {
     store.provision(grant)
 
     assertEquals(T3VoiceRuntimeGrantLoadResult.Expired(grant.metadata), store.load())
+    assertEquals("native-runtime-1", store.validatedRuntimeId())
+  }
+
+  @Test
+  fun `validated runtime identity is unavailable when authenticated metadata is corrupt`() {
+    val storage = MemoryBackgroundStorage()
+    val store = T3VoiceRuntimeGrantStore(storage, TestGrantCipher(), clockMillis = { 1_000 })
+    store.provision(runtimeGrant(generation = 7, token = "runtime-secret-token"))
+    val runtimeKey = storage.values.keys.single { it.endsWith("runtime_id") }
+    storage.values[runtimeKey] = "tampered-runtime"
+
+    assertEquals(null, store.validatedRuntimeId())
   }
 
   @Test
@@ -61,9 +85,32 @@ internal class T3VoiceBackgroundStorageTest {
       )
     assertThrows(IllegalArgumentException::class.java) { store.provision(changedAuthority) }
     assertThrows(IllegalArgumentException::class.java) {
+      store.provision(
+        runtimeGrant(
+          generation = 7,
+          token = "wrong-target",
+          targetIdentity = "thread:project-1:thread-2",
+        ),
+      )
+    }
+    assertThrows(IllegalArgumentException::class.java) {
       store.provision(runtimeGrant(generation = 6, token = "stale-token"))
     }
-    store.provision(runtimeGrant(generation = 8, token = "replacement-token"))
+    store.provision(
+      runtimeGrant(
+        generation = 8,
+        token = "replacement-token",
+        targetIdentity = "thread:project-1:thread-2",
+      ),
+    )
+    assertTrue(
+      store.loadForTarget("thread:project-1:thread-1") is
+        T3VoiceRuntimeGrantLoadResult.TargetReplaced,
+    )
+    assertTrue(
+      store.loadForTarget("thread:project-1:thread-2") is
+        T3VoiceRuntimeGrantLoadResult.Available,
+    )
     assertEquals(
       "replacement-token",
       (store.load() as T3VoiceRuntimeGrantLoadResult.Available).grant.token,
@@ -101,10 +148,25 @@ internal class T3VoiceBackgroundStorageTest {
     }
   }
 
+  @Test
+  fun `target identity is hashed natively and bounded`() {
+    assertEquals(
+      "98b2fd1dda06a51b7afbe90a9da4e4dd6b1fa8a7271b410a3725bdbe3fd28d16",
+      T3VoiceRuntimeTargetIdentity.digest("thread:project-1:thread-1"),
+    )
+    assertThrows(IllegalArgumentException::class.java) {
+      T3VoiceRuntimeTargetIdentity.digest(" ")
+    }
+    assertThrows(IllegalArgumentException::class.java) {
+      T3VoiceRuntimeTargetIdentity.digest("a".repeat(4_097))
+    }
+  }
+
   private fun runtimeGrant(
     generation: Long,
     token: String,
     expiresAt: Long = 30_000,
+    targetIdentity: String = "thread:project-1:thread-1",
   ) =
     T3VoiceRuntimeGrant(
       metadata =
@@ -113,6 +175,7 @@ internal class T3VoiceBackgroundStorageTest {
           readinessGeneration = generation,
           environmentOrigin = "https://environment.example.test",
           operation = T3VoiceRuntimeGrantOperation.THREAD_TURN_START,
+          targetIdentityDigest = T3VoiceRuntimeTargetIdentity.digest(targetIdentity),
           expiresAtEpochMillis = expiresAt,
         ),
       token = token,

@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -136,12 +137,16 @@ internal data class T3VoiceRuntimeGrantMetadata(
   val readinessGeneration: Long,
   val environmentOrigin: String,
   val operation: T3VoiceRuntimeGrantOperation,
+  val targetIdentityDigest: String,
   val expiresAtEpochMillis: Long,
 ) {
   init {
     require(runtimeId.isNotBlank() && runtimeId.length <= 128) { "Invalid native runtime ID." }
     require(readinessGeneration > 0) { "Invalid readiness generation." }
     T3VoiceBackgroundOriginPolicy.normalize(environmentOrigin)
+    require(targetIdentityDigest.matches(SHA256_HEX_PATTERN)) {
+      "Invalid background voice target identity digest."
+    }
     require(expiresAtEpochMillis > 0) { "Invalid runtime grant expiry." }
   }
 
@@ -152,12 +157,29 @@ internal data class T3VoiceRuntimeGrantMetadata(
       readinessGeneration.toString(),
       T3VoiceBackgroundOriginPolicy.normalize(environmentOrigin),
       operation.wireValue,
+      targetIdentityDigest,
       expiresAtEpochMillis.toString(),
     ).joinToString("\n").toByteArray(StandardCharsets.UTF_8)
 
   private companion object {
-    const val STORAGE_VERSION = "t3-voice-runtime-grant-v1"
+    const val STORAGE_VERSION = "t3-voice-runtime-grant-v2"
+    val SHA256_HEX_PATTERN = Regex("^[0-9a-f]{64}$")
   }
+}
+
+internal object T3VoiceRuntimeTargetIdentity {
+  fun digest(targetIdentity: String): String {
+    require(
+      targetIdentity.isNotBlank() &&
+        targetIdentity.length <= MAXIMUM_TARGET_IDENTITY_LENGTH &&
+        targetIdentity.none { it == '\u0000' },
+    ) { "Invalid background voice target identity." }
+    return MessageDigest.getInstance("SHA-256")
+      .digest(targetIdentity.toByteArray(StandardCharsets.UTF_8))
+      .joinToString(separator = "") { byte -> "%02x".format(byte.toInt() and 0xff) }
+  }
+
+  private const val MAXIMUM_TARGET_IDENTITY_LENGTH = 4_096
 }
 
 internal data class T3VoiceRuntimeGrant(
@@ -171,6 +193,8 @@ internal sealed interface T3VoiceRuntimeGrantLoadResult {
   data class Available(val grant: T3VoiceRuntimeGrant) : T3VoiceRuntimeGrantLoadResult
 
   data class Expired(val metadata: T3VoiceRuntimeGrantMetadata) : T3VoiceRuntimeGrantLoadResult
+
+  data class TargetReplaced(val grant: T3VoiceRuntimeGrant) : T3VoiceRuntimeGrantLoadResult
 
   data object Locked : T3VoiceRuntimeGrantLoadResult
 }
@@ -196,7 +220,8 @@ internal class T3VoiceRuntimeGrantStore(
           grant.metadata.runtimeId == previous.metadata.runtimeId &&
           T3VoiceBackgroundOriginPolicy.normalize(grant.metadata.environmentOrigin) ==
           T3VoiceBackgroundOriginPolicy.normalize(previous.metadata.environmentOrigin) &&
-          grant.metadata.operation == previous.metadata.operation
+          grant.metadata.operation == previous.metadata.operation &&
+          grant.metadata.targetIdentityDigest == previous.metadata.targetIdentityDigest
       require(
         grant.metadata.readinessGeneration > previous.metadata.readinessGeneration ||
           sameAuthority,
@@ -218,6 +243,7 @@ internal class T3VoiceRuntimeGrantStore(
           KEY_ENVIRONMENT_ORIGIN to
             T3VoiceBackgroundOriginPolicy.normalize(grant.metadata.environmentOrigin),
           KEY_OPERATION to grant.metadata.operation.wireValue,
+          KEY_TARGET_IDENTITY_DIGEST to grant.metadata.targetIdentityDigest,
           KEY_EXPIRES_AT to grant.metadata.expiresAtEpochMillis.toString(),
           KEY_INITIALIZATION_VECTOR to encode(encrypted.initializationVector),
           KEY_CIPHERTEXT to encode(encrypted.ciphertext),
@@ -238,6 +264,31 @@ internal class T3VoiceRuntimeGrantStore(
   }
 
   @Synchronized
+  fun loadForTarget(targetIdentity: String): T3VoiceRuntimeGrantLoadResult {
+    val loaded = load()
+    if (loaded !is T3VoiceRuntimeGrantLoadResult.Available) return loaded
+    return if (
+      loaded.grant.metadata.targetIdentityDigest ==
+        T3VoiceRuntimeTargetIdentity.digest(targetIdentity)
+    ) {
+      loaded
+    } else {
+      T3VoiceRuntimeGrantLoadResult.TargetReplaced(loaded.grant)
+    }
+  }
+
+  @Synchronized
+  fun validatedRuntimeId(): String? =
+    when (val loaded = load()) {
+      is T3VoiceRuntimeGrantLoadResult.Available -> loaded.grant.metadata.runtimeId
+      is T3VoiceRuntimeGrantLoadResult.Expired -> loaded.metadata.runtimeId
+      T3VoiceRuntimeGrantLoadResult.Locked,
+      T3VoiceRuntimeGrantLoadResult.Missing,
+      is T3VoiceRuntimeGrantLoadResult.TargetReplaced,
+      -> null
+    }
+
+  @Synchronized
   fun clear(deleteKey: Boolean = false) {
     check(storage.clear(ALL_KEYS)) { "Could not clear the background voice grant." }
     if (deleteKey) cipher.deleteKey()
@@ -255,6 +306,7 @@ internal class T3VoiceRuntimeGrantStore(
           environmentOrigin = present.getValue(KEY_ENVIRONMENT_ORIGIN)!!,
           operation =
             T3VoiceRuntimeGrantOperation.fromWireValue(present.getValue(KEY_OPERATION)!!),
+          targetIdentityDigest = present.getValue(KEY_TARGET_IDENTITY_DIGEST)!!,
           expiresAtEpochMillis = present.getValue(KEY_EXPIRES_AT)!!.toLong(),
         )
       val plaintext =
@@ -297,6 +349,7 @@ internal class T3VoiceRuntimeGrantStore(
     const val KEY_READINESS_GENERATION = "runtime_grant_readiness_generation"
     const val KEY_ENVIRONMENT_ORIGIN = "runtime_grant_environment_origin"
     const val KEY_OPERATION = "runtime_grant_operation"
+    const val KEY_TARGET_IDENTITY_DIGEST = "runtime_grant_target_identity_sha256"
     const val KEY_EXPIRES_AT = "runtime_grant_expires_at"
     const val KEY_INITIALIZATION_VECTOR = "runtime_grant_iv"
     const val KEY_CIPHERTEXT = "runtime_grant_ciphertext"
@@ -306,6 +359,7 @@ internal class T3VoiceRuntimeGrantStore(
         KEY_READINESS_GENERATION,
         KEY_ENVIRONMENT_ORIGIN,
         KEY_OPERATION,
+        KEY_TARGET_IDENTITY_DIGEST,
         KEY_EXPIRES_AT,
         KEY_INITIALIZATION_VECTOR,
         KEY_CIPHERTEXT,
