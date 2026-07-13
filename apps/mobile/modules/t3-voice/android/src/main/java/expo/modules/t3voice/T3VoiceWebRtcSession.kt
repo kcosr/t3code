@@ -2,6 +2,7 @@ package expo.modules.t3voice
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioFormat
 import android.media.MediaRecorder
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
@@ -30,6 +31,12 @@ internal interface T3VoiceWebRtcResultCallback<T> {
   fun onFailure(code: String, message: String, cause: Throwable? = null)
 }
 
+internal enum class T3VoiceRealtimePlayoutDrainOutcome {
+  DRAINED,
+  TIMED_OUT,
+  SESSION_ENDED,
+}
+
 internal class T3VoiceWebRtcSession(
   context: Context,
   private val onStateChanged: (String, String, Boolean, Boolean) -> Unit,
@@ -42,6 +49,7 @@ internal class T3VoiceWebRtcSession(
     val diagnosticGeneration: Long,
     var audioRouteId: String,
     val audioOwner: T3VoiceRealtimeAudioOwnerPolicy.Owner,
+    val playoutMonitor: T3VoiceRealtimePlayoutMonitor,
     val audioDeviceModule: JavaAudioDeviceModule,
     val peerConnectionFactory: PeerConnectionFactory,
     val timeoutOwner: T3VoiceRealtimeConnectionTimeoutPolicy.Owner,
@@ -60,7 +68,15 @@ internal class T3VoiceWebRtcSession(
     var connectingTimeout: ScheduledFuture<*>? = null,
     var disconnectedTimeout: ScheduledFuture<*>? = null,
     var audioRouterGeneration: Long? = null,
+    var playoutDrain: PlayoutDrain? = null,
     val resourcesReleased: AtomicBoolean = AtomicBoolean(false),
+  )
+
+  private data class PlayoutDrain(
+    val policy: T3VoiceRealtimePlayoutDrainPolicy,
+    val onComplete: (T3VoiceRealtimePlayoutDrainOutcome) -> Unit,
+    var sample: ScheduledFuture<*>? = null,
+    var timeout: ScheduledFuture<*>? = null,
   )
 
   private data class PreparedPeer(
@@ -70,6 +86,7 @@ internal class T3VoiceWebRtcSession(
     val audioTrack: AudioTrack,
     val peerConnection: PeerConnection,
     val dataChannel: DataChannel,
+    val playoutMonitor: T3VoiceRealtimePlayoutMonitor,
   )
 
   private val applicationContext = context.applicationContext
@@ -101,6 +118,7 @@ internal class T3VoiceWebRtcSession(
     var audioTrack: AudioTrack? = null
     var peerConnection: PeerConnection? = null
     var dataChannel: DataChannel? = null
+    val playoutMonitor = T3VoiceRealtimePlayoutMonitor()
     try {
       audioDeviceModule =
         JavaAudioDeviceModule.builder(applicationContext)
@@ -119,6 +137,7 @@ internal class T3VoiceWebRtcSession(
           )
           .setAudioRecordErrorCallback(AudioRecordErrorCallback(audioOwner))
           .setAudioTrackErrorCallback(AudioTrackErrorCallback(audioOwner))
+          .setPlaybackSamplesReadyCallback(PlaybackSamplesReadyCallback(playoutMonitor))
           .createAudioDeviceModule()
       peerConnectionFactory =
         PeerConnectionFactory.builder()
@@ -151,6 +170,7 @@ internal class T3VoiceWebRtcSession(
         audioTrack,
         peerConnection,
         dataChannel,
+        playoutMonitor,
       )
     } catch (cause: Throwable) {
       releasePeerResources(
@@ -197,6 +217,7 @@ internal class T3VoiceWebRtcSession(
             diagnosticGeneration = diagnosticGeneration,
             audioRouteId = audioRouteId,
             audioOwner = audioOwner,
+            playoutMonitor = prepared.playoutMonitor,
             audioDeviceModule = prepared.audioDeviceModule,
             peerConnectionFactory = prepared.peerConnectionFactory,
             timeoutOwner = connectionTimeouts.activate(sessionId),
@@ -362,6 +383,64 @@ internal class T3VoiceWebRtcSession(
       }
     }
     return routes()
+  }
+
+  fun drainPlayout(
+    sessionId: String,
+    onComplete: (T3VoiceRealtimePlayoutDrainOutcome) -> Unit,
+  ) {
+    val (session, connectionState, captureState) =
+      synchronized(lock) {
+        val current = requireActive(sessionId)
+        check(current.playoutDrain == null) { "Realtime playout is already draining." }
+        current.captureState = T3VoiceCapturePolicy.setInputReady(current.captureState, false)
+        applyCaptureState(current)
+        val drain =
+          PlayoutDrain(
+            policy = T3VoiceRealtimePlayoutDrainPolicy(System.nanoTime() / 1_000_000),
+            onComplete = onComplete,
+          )
+        current.playoutDrain = drain
+        drain.timeout =
+          scheduler.schedule(
+            { completePlayoutDrain(current, T3VoiceRealtimePlayoutDrainOutcome.TIMED_OUT) },
+            T3VoiceRealtimePlayoutDrainPolicy.MAXIMUM_MILLIS,
+            TimeUnit.MILLISECONDS,
+          )
+        T3VoiceDiagnostics.record(
+          current.diagnosticGeneration,
+          T3VoiceDiagnosticCategory.LIFECYCLE,
+          T3VoiceDiagnosticCode.HANDOFF_DRAIN_STARTED,
+        )
+        Triple(current, connectionStateFor(current), current.captureState)
+      }
+    onStateChanged(
+      sessionId,
+      connectionState,
+      captureState.userMuted,
+      captureState.inputReady,
+    )
+    samplePlayoutDrain(session)
+  }
+
+  fun cancelPlayoutDrain(sessionId: String) {
+    val drain =
+      synchronized(lock) {
+        active?.takeIf { it.sessionId == sessionId }?.let { session ->
+          session.playoutDrain.also { session.playoutDrain = null }
+        }
+      }
+    if (drain != null) {
+      drain.sample?.cancel(false)
+      drain.timeout?.cancel(false)
+      T3VoiceDiagnostics.record(
+        synchronized(lock) {
+          active?.takeIf { it.sessionId == sessionId }?.diagnosticGeneration ?: 0
+        },
+        T3VoiceDiagnosticCategory.LIFECYCLE,
+        T3VoiceDiagnosticCode.HANDOFF_DRAIN_INTERRUPTED,
+      )
+    }
   }
 
   fun stop(sessionId: String): Boolean {
@@ -798,6 +877,7 @@ internal class T3VoiceWebRtcSession(
 
   private fun releaseSession(session: ActiveSession) {
     if (!session.resourcesReleased.compareAndSet(false, true)) return
+    completePlayoutDrain(session, T3VoiceRealtimePlayoutDrainOutcome.SESSION_ENDED)
     session.offerTimeout?.cancel(false)
     session.offerTimeout = null
     cancelConnectionTimeouts(session)
@@ -811,6 +891,63 @@ internal class T3VoiceWebRtcSession(
       session.peerConnection,
       session.dataChannel,
     )
+  }
+
+  private fun samplePlayoutDrain(session: ActiveSession) {
+    val shouldSample = synchronized(lock) { active === session && session.playoutDrain != null }
+    if (!shouldSample) return
+    observePlayoutDrain(session)
+  }
+
+  private fun observePlayoutDrain(session: ActiveSession) {
+    val nowMillis = System.nanoTime() / 1_000_000
+    val decision =
+      synchronized(lock) {
+        if (active !== session) return
+        val drain = session.playoutDrain ?: return
+        drain.policy.observe(nowMillis, session.playoutMonitor.lastAudibleAtMillis())
+      }
+    when (decision) {
+      T3VoiceRealtimePlayoutDrainDecision.DRAINED ->
+        completePlayoutDrain(session, T3VoiceRealtimePlayoutDrainOutcome.DRAINED)
+      T3VoiceRealtimePlayoutDrainDecision.TIMED_OUT ->
+        completePlayoutDrain(session, T3VoiceRealtimePlayoutDrainOutcome.TIMED_OUT)
+      T3VoiceRealtimePlayoutDrainDecision.WAIT ->
+        synchronized(lock) {
+          if (active === session) {
+            session.playoutDrain?.sample =
+              scheduler.schedule(
+                { samplePlayoutDrain(session) },
+                T3VoiceRealtimePlayoutDrainPolicy.SAMPLE_MILLIS,
+                TimeUnit.MILLISECONDS,
+              )
+          }
+        }
+    }
+  }
+
+  private fun completePlayoutDrain(
+    session: ActiveSession,
+    outcome: T3VoiceRealtimePlayoutDrainOutcome,
+  ) {
+    val drain =
+      synchronized(lock) {
+        session.playoutDrain.also { session.playoutDrain = null }
+      } ?: return
+    drain.sample?.cancel(false)
+    drain.timeout?.cancel(false)
+    T3VoiceDiagnostics.record(
+      session.diagnosticGeneration,
+      T3VoiceDiagnosticCategory.LIFECYCLE,
+      when (outcome) {
+        T3VoiceRealtimePlayoutDrainOutcome.DRAINED -> T3VoiceDiagnosticCode.HANDOFF_DRAINED
+        T3VoiceRealtimePlayoutDrainOutcome.TIMED_OUT ->
+          T3VoiceDiagnosticCode.HANDOFF_DRAIN_TIMED_OUT
+        T3VoiceRealtimePlayoutDrainOutcome.SESSION_ENDED ->
+          T3VoiceDiagnosticCode.HANDOFF_DRAIN_INTERRUPTED
+      },
+    )
+    runCatching { drain.onComplete(outcome) }
   }
 
   private fun releasePreparedPeer(prepared: PreparedPeer) =
@@ -1043,6 +1180,15 @@ internal class T3VoiceWebRtcSession(
 
     override fun onWebRtcAudioTrackError(message: String?) =
       reportAudioError(owner, "realtime-playout", message)
+  }
+
+  private class PlaybackSamplesReadyCallback(
+    private val monitor: T3VoiceRealtimePlayoutMonitor,
+  ) : JavaAudioDeviceModule.PlaybackSamplesReadyCallback {
+    override fun onWebRtcAudioTrackSamplesReady(samples: JavaAudioDeviceModule.AudioSamples) {
+      if (samples.audioFormat != AudioFormat.ENCODING_PCM_16BIT) return
+      monitor.observePcm16LittleEndian(samples.data, System.nanoTime() / 1_000_000)
+    }
   }
 
   private fun reportAudioError(

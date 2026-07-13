@@ -863,6 +863,9 @@ class T3VoiceRuntimeService : Service() {
           if (serviceDestroyed) return@post
           synchronized(operationLock) {
             if (handoffEligibleSessionId == sessionId) {
+              if (T3VoiceStateStore.state.value.activeRealtimeSessionId == sessionId) {
+                runCatching { realtime.stop(sessionId) }
+              }
               backgroundRealtimeAttempt?.takeIf {
                 it.serverSession?.state?.sessionId == sessionId
               }?.let {
@@ -3367,6 +3370,7 @@ class T3VoiceRuntimeService : Service() {
               T3VoiceNativeHandoffPolicy.recordingId(action.actionId),
               "handoff-timeout",
             )
+            abortNativeHandoffRealtimeLocked(action)
             handoffInProgress = false
             awaitingHandoffAction = false
             if (T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
@@ -3441,44 +3445,85 @@ class T3VoiceRuntimeService : Service() {
       return
     }
     handoffInProgress = true
+    awaitingHandoffAction = true
     try {
       nativeControlHeartbeat.stop()
-      val released =
-        if (state.activeRealtimeSessionId == action.sessionId) realtime.stop(action.sessionId) else true
-      if (!released || T3VoiceStateStore.state.value.phase != T3VoiceRuntimePhase.IDLE) {
+      if (state.activeRealtimeSessionId == action.sessionId) {
+        realtime.drainPlayout(action.sessionId) {
+          mainHandler.post {
+            if (!serviceDestroyed) synchronized(operationLock) {
+              if (
+                handoffInProgress &&
+                  T3VoiceNativeHandoffPolicy.matchesGrant(
+                    action,
+                    handoffEligibleSessionId,
+                    handoffEligibleLeaseGeneration,
+                  )
+              ) {
+                continueNativeHandoffAfterDrainLocked(action, recordingId, finish)
+              }
+            }
+          }
+        }
+      } else {
+        continueNativeHandoffAfterDrainLocked(action, recordingId, finish)
+      }
+    } catch (_: Throwable) {
+      abortNativeHandoffRealtimeLocked(action)
+      finish(T3VoiceNativeHandoffOutcome.Failed("recognition-start", "runtime-unavailable"))
+    }
+  }
+
+  private fun abortNativeHandoffRealtimeLocked(action: T3VoiceNativeHandoffAction) {
+    realtime.cancelPlayoutDrain(action.sessionId)
+    if (T3VoiceStateStore.state.value.activeRealtimeSessionId == action.sessionId) {
+      runCatching { realtime.stop(action.sessionId) }
+    }
+  }
+
+  private fun continueNativeHandoffAfterDrainLocked(
+    action: T3VoiceNativeHandoffAction,
+    recordingId: String,
+    finish: (T3VoiceNativeHandoffOutcome) -> Boolean,
+  ) {
+    val activeRealtimeSessionId = T3VoiceStateStore.state.value.activeRealtimeSessionId
+    if (activeRealtimeSessionId != null) {
+      if (activeRealtimeSessionId != action.sessionId || !realtime.stop(action.sessionId)) {
         finish(T3VoiceNativeHandoffOutcome.Failed("realtime-release", "realtime-release-failed"))
         return
       }
-      val owner = T3VoiceStateStore.claimRecording(recordingId)
-      if (owner == null) {
-        finish(T3VoiceNativeHandoffOutcome.Failed("recognition-start", "runtime-unavailable"))
-        return
-      }
-      recordingOwner = owner
-      try {
-        scheduleRecordingStartLocked(
-          owner,
-          T3VoiceEndpointDetectionConfig(),
-          onStarted = {
-            if (finish(T3VoiceNativeHandoffOutcome.Listening)) {
-              emitThreadVoiceHandoff(action, recordingId)
-            } else {
-              cancelNativeHandoffRecordingLocked(recordingId, "handoff-timeout")
-            }
-          },
-          onFailure = {
-            finish(T3VoiceNativeHandoffOutcome.Failed("recognition-start", "microphone-unavailable"))
-          },
-        )
-      } catch (_: SecurityException) {
-        releaseRecordingLocked(owner, stopForeground = false)
-        finish(T3VoiceNativeHandoffOutcome.Failed("recognition-start", "permission-denied"))
-      } catch (_: Throwable) {
-        releaseRecordingLocked(owner, stopForeground = false)
-        finish(T3VoiceNativeHandoffOutcome.Failed("recognition-start", "microphone-unavailable"))
-      }
-    } catch (_: Throwable) {
+    }
+    if (T3VoiceStateStore.state.value.phase != T3VoiceRuntimePhase.IDLE) {
+      finish(T3VoiceNativeHandoffOutcome.Failed("realtime-release", "realtime-release-failed"))
+      return
+    }
+    val owner = T3VoiceStateStore.claimRecording(recordingId)
+    if (owner == null) {
       finish(T3VoiceNativeHandoffOutcome.Failed("recognition-start", "runtime-unavailable"))
+      return
+    }
+    recordingOwner = owner
+    try {
+      scheduleRecordingStartLocked(
+        owner,
+        T3VoiceEndpointDetectionConfig(),
+        onStarted = {
+          if (finish(T3VoiceNativeHandoffOutcome.Listening)) {
+            emitThreadVoiceHandoff(action, recordingId)
+          } else {
+            cancelNativeHandoffRecordingLocked(recordingId, "handoff-timeout")
+          }
+        },
+        onFailure = {
+          finish(T3VoiceNativeHandoffOutcome.Failed("recognition-start", "microphone-unavailable"))
+        },
+      )
+    } catch (_: SecurityException) {
+      releaseRecordingLocked(owner, stopForeground = false)
+      finish(T3VoiceNativeHandoffOutcome.Failed("recognition-start", "permission-denied"))
+    } catch (_: Throwable) {
+      releaseRecordingLocked(owner, stopForeground = false)
+      finish(T3VoiceNativeHandoffOutcome.Failed("recognition-start", "microphone-unavailable"))
     }
   }
 

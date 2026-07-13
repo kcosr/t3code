@@ -62,6 +62,7 @@ const MAX_BUFFERED_EVENTS = 512;
 const MAX_RETAINED_TERMINAL_SESSIONS = 128;
 const CLIENT_ACTION_TIMEOUT_MILLIS = 5_000;
 const HANDOFF_ACTION_TIMEOUT_MILLIS = 30_000;
+const HANDOFF_PROVIDER_DRAIN_MILLIS = 3_000;
 const INSTRUCTIONS = [
   "You are the T3 voice agent. Be concise and use only the supplied T3 tools. Proactively tell the user what you are about to do only when you will call send_thread_message and then synchronously wait for that agent turn with wait_for_thread_turn; do not preannounce other tool operations.",
   "Prior conversation items are the user's actual history from this same ongoing conversation: use them as memory, preserve continuity across calls and devices, and never claim that you cannot remember information present in that history.",
@@ -547,6 +548,26 @@ const make = Effect.gen(function* () {
     return true;
   });
 
+  const endHandoffProviderSession = Effect.fn("VoiceSessionService.endHandoffProviderSession")(
+    function* (sessionId: VoiceSessionId) {
+      const current = (yield* SynchronizedRef.get(runtime)).sessions.get(sessionId);
+      if (current === undefined || !current.terminalHandoffClaimed) return false;
+      return yield* endRuntimeSession(current, "ended", {
+        reason: "handed-off-to-thread-voice",
+      });
+    },
+  );
+
+  const scheduleHandoffProviderTermination = Effect.fn(
+    "VoiceSessionService.scheduleHandoffProviderTermination",
+  )(function* (sessionId: VoiceSessionId, activatedAtMillis: number) {
+    const now = yield* Clock.currentTimeMillis;
+    yield* Effect.sleep(
+      `${Math.max(0, activatedAtMillis + HANDOFF_PROVIDER_DRAIN_MILLIS - now)} millis`,
+    );
+    yield* endHandoffProviderSession(sessionId);
+  });
+
   yield* Effect.addFinalizer(() =>
     SynchronizedRef.get(runtime).pipe(
       Effect.flatMap((state) =>
@@ -814,6 +835,12 @@ const make = Effect.gen(function* () {
         ]).pipe(Effect.ignore),
       ),
     );
+    // Once activation is durable, its expiry and bounded provider teardown must
+    // exist even if publishing the client event or journaling the boundary fails.
+    yield* scheduleHandoffExpiry(expiresAtMillis).pipe(Effect.forkIn(serviceScope));
+    yield* scheduleHandoffProviderTermination(lease.sessionId, activatedAtMillis).pipe(
+      Effect.forkIn(serviceScope),
+    );
     yield* emit(lease, {
       type: "tool",
       toolCallId: result.toolCallId,
@@ -842,13 +869,6 @@ const make = Effect.gen(function* () {
         handedOffAt: activatedAt,
       },
     });
-    yield* scheduleHandoffExpiry(expiresAtMillis).pipe(Effect.forkIn(serviceScope));
-    const current = (yield* SynchronizedRef.get(runtime)).sessions.get(lease.sessionId);
-    if (current !== undefined) {
-      yield* endRuntimeSession(current, "ended", {
-        reason: "handed-off-to-thread-voice",
-      }).pipe(Effect.forkIn(serviceScope));
-    }
   });
 
   const scheduleConfirmationExpiry = Effect.fn("VoiceSessionService.scheduleConfirmationExpiry")(
@@ -2030,8 +2050,11 @@ const make = Effect.gen(function* () {
           ),
         );
       yield* persistHandoffOutcome(settled);
+      yield* nativeControlGrants.revokeSession(VoiceSessionId.make(settled.realtimeSessionId));
+      yield* endHandoffProviderSession(VoiceSessionId.make(settled.realtimeSessionId)).pipe(
+        Effect.forkIn(serviceScope),
+      );
       if (settled.status === "expired") {
-        yield* nativeControlGrants.revokeSession(VoiceSessionId.make(settled.realtimeSessionId));
         return yield* sessionError(
           "invalid-phase",
           "session.client-action",

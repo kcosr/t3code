@@ -1994,7 +1994,7 @@ it.effect("withholds activate-thread output until the owning client acknowledges
   }),
 );
 
-it.effect("persists and acknowledges a terminal handoff after realtime teardown", () =>
+it.effect("keeps provider media alive until a terminal handoff is acknowledged", () =>
   Effect.gen(function* () {
     const fixture = yield* makeTerminalHandoffFixture("success");
     const test = yield* makeLayer(fixture.provider, fixture.executor);
@@ -2023,6 +2023,7 @@ it.effect("persists and acknowledges a terminal handoff after realtime teardown"
         projectId: fixture.projectId,
         threadId: fixture.threadId,
       });
+      expect(yield* Ref.get(fixture.terminated)).toBe(0);
       const wrongLease = yield* sessions
         .acknowledgeNativeHandoffAction(
           owner,
@@ -2048,13 +2049,89 @@ it.effect("persists and acknowledges a terminal handoff after realtime teardown"
         action: "handoff-to-thread-voice",
         outcome: "succeeded",
       });
+      yield* Effect.yieldNow;
       expect(yield* Ref.get(fixture.terminated)).toBe(1);
+      expect(
+        [...(yield* Ref.get(test.nativeControlGrantRecords)).values()].some(
+          (grant) => grant.sessionId === created.state.sessionId,
+        ),
+      ).toBe(false);
       expect(yield* Ref.get(test.appended)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ kind: "call-boundary" }),
           expect.objectContaining({ kind: "device-handoff" }),
         ]),
       );
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("bounds terminal handoff provider drainage when the client does not acknowledge", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeTerminalHandoffFixture("drain-timeout");
+    const test = yield* makeLayer(fixture.provider, fixture.executor);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("handoff-drain-timeout-owner");
+      const created = yield* sessions.create(
+        principal(owner),
+        input(false, "handoff-drain-timeout"),
+      );
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      yield* Deferred.await(fixture.terminalOutput);
+      yield* Deferred.succeed(fixture.terminalOutputRelease, undefined);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("2999 millis");
+      expect(yield* Ref.get(fixture.terminated)).toBe(0);
+
+      yield* TestClock.adjust("1 millis");
+      expect(yield* Ref.get(fixture.terminated)).toBe(1);
+      expect((yield* Ref.get(test.handoffActions)).get(fixture.actionId)?.status).toBe("pending");
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("acknowledgement wins immediately before the provider drain deadline", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeTerminalHandoffFixture("drain-deadline-ack");
+    const test = yield* makeLayer(fixture.provider, fixture.executor);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("handoff-drain-deadline-owner");
+      const created = yield* sessions.create(
+        principal(owner),
+        input(false, "handoff-drain-deadline"),
+      );
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      yield* Deferred.await(fixture.terminalOutput);
+      yield* Deferred.succeed(fixture.terminalOutputRelease, undefined);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("2999 millis");
+
+      yield* sessions.acknowledgeNativeHandoffAction(
+        owner,
+        created.state.sessionId,
+        created.state.leaseGeneration,
+        fixture.actionId,
+        { outcome: "succeeded", state: "listening" },
+      );
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("1 millis");
+
+      expect(yield* Ref.get(fixture.terminated)).toBe(1);
+      expect(
+        [...(yield* Ref.get(test.nativeControlGrantRecords)).values()].some(
+          (grant) => grant.sessionId === created.state.sessionId,
+        ),
+      ).toBe(false);
     }).pipe(Effect.provide(test.layer));
   }),
 );

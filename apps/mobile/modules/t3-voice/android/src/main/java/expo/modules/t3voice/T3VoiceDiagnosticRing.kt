@@ -53,6 +53,10 @@ internal enum class T3VoiceDiagnosticCode {
   CUE_CANCELLED,
   CUE_FAILED,
   CUE_TIMED_OUT,
+  HANDOFF_DRAIN_STARTED,
+  HANDOFF_DRAINED,
+  HANDOFF_DRAIN_TIMED_OUT,
+  HANDOFF_DRAIN_INTERRUPTED,
 }
 
 internal data class T3VoiceDiagnosticEntry(
