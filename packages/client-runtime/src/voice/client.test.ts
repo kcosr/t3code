@@ -7,6 +7,7 @@ import {
   VoiceConfirmationId,
   VoiceConversationId,
   VoiceMediaTicketId,
+  VoiceNativeRuntimeId,
   VoicePlaybackId,
   VoiceRequestId,
   VoiceSessionId,
@@ -29,6 +30,7 @@ const PLAYBACK_ID = VoicePlaybackId.make("playback-1");
 const SESSION_ID = VoiceSessionId.make("voice-session-1");
 const CONFIRMATION_ID = VoiceConfirmationId.make("confirmation-1");
 const CLIENT_ACTION_ID = VoiceClientActionId.make("client-action-1");
+const NATIVE_RUNTIME_ID = VoiceNativeRuntimeId.make("native-runtime-1");
 const PROJECT_ID = ProjectId.make("project-1");
 const THREAD_ID = ThreadId.make("thread-1");
 
@@ -65,6 +67,116 @@ const jsonResponse = (value: unknown): Response =>
   });
 
 describe("makeVoiceHttpClient", () => {
+  it.effect("provisions and revokes native runtime authority through the typed API", () =>
+    Effect.gen(function* () {
+      const requests: Array<{
+        readonly url: string;
+        readonly method: string;
+        readonly body: BodyInit | null | undefined;
+      }> = [];
+      const fetch: typeof globalThis.fetch = async (resource, init) => {
+        const url = String(resource);
+        const method = init?.method ?? "GET";
+        requests.push({ url, method, body: init?.body });
+        return method === "DELETE"
+          ? jsonResponse({ runtimeId: NATIVE_RUNTIME_ID, revoked: true })
+          : jsonResponse({
+              token: "narrow-runtime-token",
+              runtimeId: NATIVE_RUNTIME_ID,
+              generation: 3,
+              target: {
+                mode: "thread",
+                projectId: PROJECT_ID,
+                threadId: THREAD_ID,
+                speechPreset: "default",
+                autoRearm: true,
+              },
+              expiresAt: "2026-08-10T20:00:00.000Z",
+            });
+      };
+      const client = makeVoiceHttpClient({
+        prepared: preparedConnection({ _tag: "Bearer", token: "voice-token" }),
+        fetch,
+      });
+
+      const grant = yield* client.provisionNativeRuntimeGrant(NATIVE_RUNTIME_ID, {
+        generation: 3,
+        target: {
+          mode: "thread",
+          projectId: PROJECT_ID,
+          threadId: THREAD_ID,
+          speechPreset: "default",
+          autoRearm: true,
+        },
+      });
+      const revoked = yield* client.revokeNativeRuntimeGrant(NATIVE_RUNTIME_ID);
+
+      expect(grant.token).toBe("narrow-runtime-token");
+      expect(revoked).toEqual({ runtimeId: NATIVE_RUNTIME_ID, revoked: true });
+      expect(requests.map(({ url, method }) => `${method} ${url}`)).toEqual([
+        `PUT https://environment.example.test/api/voice/native-runtimes/${NATIVE_RUNTIME_ID}/grant`,
+        `DELETE https://environment.example.test/api/voice/native-runtimes/${NATIVE_RUNTIME_ID}/grant`,
+      ]);
+      const provisionBody = requests[0]?.body;
+      expect(
+        provisionBody instanceof Uint8Array
+          ? new TextDecoder().decode(provisionBody)
+          : provisionBody,
+      ).toBe(
+        '{"generation":3,"target":{"mode":"thread","projectId":"project-1","threadId":"thread-1","speechPreset":"default","autoRearm":true}}',
+      );
+    }),
+  );
+
+  it.effect("signs native runtime provisioning with the exact PUT URL", () =>
+    Effect.gen(function* () {
+      const proofs: Array<{ readonly method: string; readonly url: string }> = [];
+      const signer = ManagedRelayDpopSigner.of({
+        thumbprint: Effect.succeed("thumbprint"),
+        createProof: (input) => {
+          proofs.push({ method: input.method, url: input.url });
+          return Effect.succeed("signed-proof");
+        },
+      });
+      const client = makeVoiceHttpClient({
+        prepared: preparedConnection({ _tag: "Dpop", accessToken: "dpop-token" }),
+        signer,
+        fetch: async () =>
+          jsonResponse({
+            token: "narrow-runtime-token",
+            runtimeId: NATIVE_RUNTIME_ID,
+            generation: 3,
+            target: {
+              mode: "thread",
+              projectId: PROJECT_ID,
+              threadId: THREAD_ID,
+              speechPreset: "default",
+              autoRearm: false,
+            },
+            expiresAt: "2026-08-10T20:00:00.000Z",
+          }),
+      });
+
+      yield* client.provisionNativeRuntimeGrant(NATIVE_RUNTIME_ID, {
+        generation: 3,
+        target: {
+          mode: "thread",
+          projectId: PROJECT_ID,
+          threadId: THREAD_ID,
+          speechPreset: "default",
+          autoRearm: false,
+        },
+      });
+
+      expect(proofs).toEqual([
+        {
+          method: "PUT",
+          url: `https://environment.example.test/api/voice/native-runtimes/${NATIVE_RUNTIME_ID}/grant`,
+        },
+      ]);
+    }),
+  );
+
   it.effect("uses credentialed cookies for local typed control requests", () =>
     Effect.gen(function* () {
       const requests: Array<{
@@ -356,7 +468,7 @@ describe("makeVoiceHttpClient", () => {
       const client = makeVoiceHttpClient({
         prepared: preparedConnection({ _tag: "Bearer", token: "main-token" }),
         fetch: (async (url: string | URL | Request, init?: RequestInit) => {
-          requests.push({ url: String(url), init });
+          requests.push({ url: String(url), ...(init === undefined ? {} : { init }) });
           return String(url).endsWith("/ack")
             ? jsonResponse({
                 actionId: CLIENT_ACTION_ID,

@@ -25,6 +25,10 @@ import {
   type VoiceConversationUpdateInput,
   type VoiceMediaTicket,
   type VoiceMediaTicketRequest,
+  type VoiceNativeRuntimeGrant,
+  type VoiceNativeRuntimeGrantProvisionInput,
+  type VoiceNativeRuntimeGrantRevocationResult,
+  type VoiceNativeRuntimeId,
   type VoiceNativeHandoffActionAckInput,
   type VoiceNativeHandoffActionListResult as VoiceNativeHandoffActionListResultType,
   type VoiceSessionCloseResult,
@@ -72,6 +76,7 @@ const encodeTranscriptionMetadata = Schema.encodeSync(
 const encodeSpeechRequest = Schema.encodeSync(Schema.fromJsonString(VoiceSpeechRequest));
 const decodeNativeHandoffActions = Schema.decodeUnknownEffect(VoiceNativeHandoffActionListResult);
 const decodeNativeHandoffActionAck = Schema.decodeUnknownEffect(VoiceClientActionAckResult);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 
 export class VoiceHttpResponseError extends Data.TaggedError("VoiceHttpResponseError")<{
   readonly method: "GET" | "POST";
@@ -181,6 +186,13 @@ export interface VoiceSpeechInput {
 }
 
 export interface VoiceHttpClient {
+  readonly provisionNativeRuntimeGrant: (
+    runtimeId: VoiceNativeRuntimeId,
+    input: VoiceNativeRuntimeGrantProvisionInput,
+  ) => Effect.Effect<VoiceNativeRuntimeGrant, RemoteEnvironmentRequestError>;
+  readonly revokeNativeRuntimeGrant: (
+    runtimeId: VoiceNativeRuntimeId,
+  ) => Effect.Effect<VoiceNativeRuntimeGrantRevocationResult, RemoteEnvironmentRequestError>;
   readonly createSession: (
     input: VoiceSessionCreateInput,
   ) => Effect.Effect<VoiceSessionCreateResult, RemoteEnvironmentRequestError>;
@@ -277,7 +289,7 @@ const controlRequest = <A, E>(input: {
   readonly prepared: PreparedConnection;
   readonly signer: Option.Option<ManagedRelayDpopSigner["Service"]>;
   readonly fetch: typeof globalThis.fetch;
-  readonly method: "GET" | "POST" | "PATCH" | "DELETE";
+  readonly method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   readonly pathname: string;
   readonly search?: string;
   readonly timeoutMs: number;
@@ -440,7 +452,7 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
   const timeoutMs = input.timeoutMs ?? DEFAULT_VOICE_HTTP_TIMEOUT_MS;
   const mediaTimeoutMs = input.timeoutMs ?? DEFAULT_VOICE_MEDIA_TIMEOUT_MS;
   const control = <A, E>(request: {
-    readonly method: "GET" | "POST" | "PATCH" | "DELETE";
+    readonly method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
     readonly pathname: string;
     readonly search?: string;
     readonly run: (
@@ -460,7 +472,7 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
     readonly pathname: string;
     readonly token: string;
     readonly body?: unknown;
-    readonly decode: (value: unknown) => Effect.Effect<A, unknown>;
+    readonly decode: (value: unknown) => Effect.Effect<A, Schema.SchemaError>;
   }): Effect.Effect<A, VoiceNativeControlRequestError> => {
     const requestUrl = environmentEndpointUrl(input.prepared.httpBaseUrl, request.pathname);
     return executeEnvironmentHttpRequest(
@@ -474,7 +486,7 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
               "x-t3-voice-control": request.token,
               ...(request.body === undefined ? {} : { "content-type": "application/json" }),
             },
-            ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
+            ...(request.body === undefined ? {} : { body: encodeUnknownJson(request.body) }),
             signal,
           }),
         catch: (cause) =>
@@ -513,6 +525,27 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
   };
 
   return {
+    provisionNativeRuntimeGrant: (runtimeId, payload) =>
+      control({
+        method: "PUT",
+        pathname: `/api/voice/native-runtimes/${runtimeId}/grant`,
+        run: (client, headers) =>
+          client.voice.provisionNativeVoiceRuntimeGrant({
+            headers,
+            params: { runtimeId },
+            payload,
+          }),
+      }),
+    revokeNativeRuntimeGrant: (runtimeId) =>
+      control({
+        method: "DELETE",
+        pathname: `/api/voice/native-runtimes/${runtimeId}/grant`,
+        run: (client, headers) =>
+          client.voice.revokeNativeVoiceRuntimeGrant({
+            headers,
+            params: { runtimeId },
+          }),
+      }),
     createSession: (payload) =>
       control({
         method: "POST",
