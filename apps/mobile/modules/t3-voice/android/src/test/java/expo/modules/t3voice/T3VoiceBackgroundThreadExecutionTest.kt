@@ -481,7 +481,7 @@ class T3VoiceBackgroundThreadExecutionTest {
       T3VoiceRuntimePhase.IDLE, false, false, false))
   }
 
-  @Test fun `cancellation authority does not depend on the currently selected mode`() {
+  @Test fun `cancellation authority survives mode change and process recovery`() {
     val targetDigest = T3VoiceRuntimeTargetIdentity.digest("project-1/thread-1")
     val claim = T3VoiceBackgroundThreadClaim(
       "runtime-1", 4, "https://example.test", "project-1", "thread-1", "client-1",
@@ -504,17 +504,20 @@ class T3VoiceBackgroundThreadExecutionTest {
     )
     val authorization = T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
       T3VoiceRuntimeGrantLoadResult.Available(grant(targetDigest)),
-      T3VoicePreparedReadiness(
-        readiness(), "runtime-1", "https://example.test",
-        T3VoiceRuntimeGrantOperation.THREAD_TURN_START, targetDigest,
-      ),
       claim,
       NOW,
     )
     assertEquals("secret", requireNotNull(authorization).runtimeGrantToken)
     assertNull(T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
-      T3VoiceRuntimeGrantLoadResult.Available(grant(targetDigest)),
-      null,
+      T3VoiceRuntimeGrantLoadResult.Missing,
+      claim,
+      NOW,
+    ))
+    val wrongOrigin = grant(targetDigest).copy(
+      metadata = grant(targetDigest).metadata.copy(environmentOrigin = "https://other.test"),
+    )
+    assertNull(T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
+      T3VoiceRuntimeGrantLoadResult.Available(wrongOrigin),
       claim,
       NOW,
     ))

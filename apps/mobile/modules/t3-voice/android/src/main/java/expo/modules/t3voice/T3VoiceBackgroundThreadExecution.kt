@@ -82,26 +82,18 @@ internal object T3VoiceBackgroundThreadAuthorityPolicy {
 
   fun validatePreparedCancellation(
     loadedGrant: T3VoiceRuntimeGrantLoadResult,
-    activeAuthority: T3VoicePreparedReadiness?,
     claim: T3VoiceBackgroundThreadClaim,
     nowMillis: Long,
   ): T3VoiceBackgroundThreadAuthorization? {
-    val installed = activeAuthority ?: return null
     val grant = (loadedGrant as? T3VoiceRuntimeGrantLoadResult.Available)?.grant ?: return null
     val target = "${claim.projectId}/${claim.threadId}"
     if (
-      installed.runtimeId != claim.runtimeId ||
-        installed.config.generation != claim.readinessGeneration ||
-        T3VoiceBackgroundOriginPolicy.normalize(installed.environmentOrigin) !=
-          T3VoiceBackgroundOriginPolicy.normalize(claim.environmentOrigin) ||
-        installed.operation != T3VoiceRuntimeGrantOperation.THREAD_TURN_START ||
-        installed.targetIdentityDigest != T3VoiceRuntimeTargetIdentity.digest(target) ||
-        grant.metadata.runtimeId != claim.runtimeId ||
+      grant.metadata.runtimeId != claim.runtimeId ||
         grant.metadata.readinessGeneration != claim.readinessGeneration ||
         T3VoiceBackgroundOriginPolicy.normalize(grant.metadata.environmentOrigin) !=
           T3VoiceBackgroundOriginPolicy.normalize(claim.environmentOrigin) ||
         grant.metadata.operation != T3VoiceRuntimeGrantOperation.THREAD_TURN_START ||
-        grant.metadata.targetIdentityDigest != installed.targetIdentityDigest ||
+        grant.metadata.targetIdentityDigest != T3VoiceRuntimeTargetIdentity.digest(target) ||
         grant.metadata.expiresAtEpochMillis <= nowMillis
     ) return null
     return T3VoiceBackgroundThreadAuthorization(
@@ -111,7 +103,7 @@ internal object T3VoiceBackgroundThreadAuthorityPolicy {
         T3VoiceBackgroundOriginPolicy.normalize(claim.environmentOrigin),
         claim.projectId,
         claim.threadId,
-        installed.config.autoRearm,
+        false,
       ),
       grant.token,
     )

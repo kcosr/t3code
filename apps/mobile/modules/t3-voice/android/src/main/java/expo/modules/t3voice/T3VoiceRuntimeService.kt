@@ -1464,7 +1464,6 @@ class T3VoiceRuntimeService : Service() {
         T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
           runCatching { T3VoiceRuntimeGrantStore(applicationContext).load() }.getOrNull()
             ?: return,
-          readinessStore.activeAuthority(),
           prepared.claim,
           System.currentTimeMillis(),
         ) ?: return
