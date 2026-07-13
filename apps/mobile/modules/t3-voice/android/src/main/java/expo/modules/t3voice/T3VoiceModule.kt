@@ -243,14 +243,6 @@ class T3VoiceModule : Module() {
         T3VoiceStateStore.state.value.toEventBody()
       }
 
-      AsyncFunction("provisionBackgroundRuntimeGrantAsync") { input: Map<String, Any?> ->
-        T3VoiceRuntimeGrantStore(requireReactContext()).provision(parseRuntimeGrant(input))
-      }
-
-      AsyncFunction("clearBackgroundRuntimeGrantAsync") {
-        T3VoiceRuntimeGrantStore(requireReactContext()).clear(deleteKey = true)
-      }
-
       AsyncFunction("prepareBackgroundVoiceReadinessAsync") {
         input: Map<String, Any?>,
         promise: Promise,
@@ -297,6 +289,18 @@ class T3VoiceModule : Module() {
                 expectedGeneration,
                 grant,
               ),
+            ),
+          )
+        }
+      }
+
+      AsyncFunction("disableBackgroundVoiceReadinessAsync") { promise: Promise ->
+        withBinder(promise, "voice-readiness-disable-failed") { service, settlement ->
+          val disabled = service.disableBackgroundVoiceReadiness()
+          settlement.resolve(
+            mapOf(
+              "runtimeId" to disabled.runtimeId,
+              "readiness" to readinessBody(disabled.config),
             ),
           )
         }
@@ -877,9 +881,6 @@ class T3VoiceModule : Module() {
   private fun requireIdentifier(input: Map<String, *>, key: String): String {
     return requireText(input, key, T3VoiceBridgeValidation.MAXIMUM_IDENTIFIER_LENGTH)
   }
-
-  private fun requireReactContext(): Context =
-    appContext.reactContext ?: error("The T3 voice React context is unavailable.")
 
   private fun parseReadinessConfig(input: Map<String, Any?>): T3VoiceReadinessConfig {
     requireExactKeys(input, READINESS_FIELDS)

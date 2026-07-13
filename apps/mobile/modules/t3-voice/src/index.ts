@@ -25,6 +25,7 @@ export type {
   T3VoiceBackgroundGrantOperation,
   T3VoiceBackgroundPreparedReadiness,
   T3VoiceBackgroundReadinessActivateInput,
+  T3VoiceBackgroundDisabledReadiness,
   T3VoiceBackgroundReadinessPrepareInput,
   T3VoiceBackgroundRealtimeAnswer,
   T3VoiceBackgroundRealtimeCloseInput,

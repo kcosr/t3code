@@ -167,6 +167,24 @@ class T3VoiceRuntimeService : Service() {
         activated
       }
 
+    fun disableBackgroundVoiceReadiness(): T3VoiceDisabledReadiness =
+      synchronized(operationLock) {
+        val grantStore = T3VoiceRuntimeGrantStore(applicationContext)
+        val runtimeId = grantStore.validatedRuntimeId()
+        val next =
+          if (!readinessConfig.enabled && readinessStore.prepared() === null) {
+            readinessConfig
+          } else {
+            readinessConfig.copy(enabled = false, generation = readinessConfig.generation + 1)
+          }
+        readinessStore.write(next)
+        readinessConfig = next
+        controllerCommands.invalidateReadiness()
+        stopActiveOperationLocked()
+        grantStore.clear(deleteKey = true)
+        T3VoiceDisabledReadiness(next, runtimeId)
+      }
+
     fun registerVoiceController(generation: Long) {
       synchronized(operationLock) {
         controllerCommands.register(generation)

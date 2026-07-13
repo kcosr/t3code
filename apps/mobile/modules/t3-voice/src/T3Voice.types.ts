@@ -187,6 +187,11 @@ export interface T3VoiceBackgroundReadinessActivateInput {
   readonly grant: T3VoiceBackgroundRuntimeGrantInput;
 }
 
+export interface T3VoiceBackgroundDisabledReadiness {
+  readonly runtimeId: string | null;
+  readonly readiness: T3VoicePersistedReadinessSnapshot;
+}
+
 export type T3VoiceBackgroundExecutionPhase =
   | "disabled"
   | "ready"
@@ -367,16 +372,13 @@ export interface T3VoiceNativeModule {
   };
   readonly getMediaCapabilitiesAsync: () => Promise<T3VoiceMediaCapabilities>;
   readonly getStateAsync: () => Promise<T3VoiceRuntimeState>;
-  readonly provisionBackgroundRuntimeGrantAsync: (
-    input: T3VoiceBackgroundRuntimeGrantInput,
-  ) => Promise<void>;
-  readonly clearBackgroundRuntimeGrantAsync: () => Promise<void>;
   readonly prepareBackgroundVoiceReadinessAsync: (
     input: T3VoiceBackgroundReadinessPrepareInput,
   ) => Promise<T3VoiceBackgroundPreparedReadiness>;
   readonly activateBackgroundVoiceReadinessAsync: (
     input: T3VoiceBackgroundReadinessActivateInput,
   ) => Promise<T3VoicePersistedReadinessSnapshot>;
+  readonly disableBackgroundVoiceReadinessAsync: () => Promise<T3VoiceBackgroundDisabledReadiness>;
   readonly getMicrophonePermissionAsync: () => Promise<PermissionResponse>;
   readonly requestMicrophonePermissionAsync: () => Promise<PermissionResponse>;
   readonly getNotificationPermissionAsync: () => Promise<PermissionResponse>;

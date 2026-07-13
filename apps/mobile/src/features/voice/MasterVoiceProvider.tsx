@@ -64,6 +64,11 @@ import {
   resolveNativeVoiceReadiness,
   scheduleNativeVoiceCommandFailure,
 } from "./nativeVoiceReadiness";
+import {
+  makeNativeVoiceRuntimeProvisioningAdapter,
+  NativeVoiceRuntimeProvisioningCoordinator,
+} from "./nativeVoiceRuntimeProvisioning";
+import { resolveNativeVoiceRuntimeTarget } from "./nativeVoiceRuntimeTarget";
 import { VoiceConversationBrowser, type VoiceConversationClient } from "./VoiceConversationBrowser";
 import {
   continueVoiceConversationSelection,
@@ -208,6 +213,11 @@ export function MasterVoiceProvider(props: {
   });
   const [readinessRetry, setReadinessRetry] = useState(0);
   const runtimeRef = useRef<MasterVoiceRuntime | null>(null);
+  const nativeProvisioningEpochRef = useRef(0);
+  const priorNativeProvisioningRef = useRef<{
+    readonly environmentId: EnvironmentId;
+    readonly coordinator: NativeVoiceRuntimeProvisioningCoordinator;
+  } | null>(null);
   const cleanupCoordinatorsRef = useRef(new Map<EnvironmentId, RealtimeServerCleanupCoordinator>());
   const controllerHandoffsRef = useRef(new Map<EnvironmentId, RealtimeControllerHandoff>());
   const startInFlightRef = useRef(false);
@@ -333,6 +343,31 @@ export function MasterVoiceProvider(props: {
     conversationConnection?.environmentId === controllerEnvironmentId
       ? conversationConnection.client
       : null;
+  const nativeProvisioning = useMemo(() => {
+    if (native === null || conversationConnection === null) return null;
+    return new NativeVoiceRuntimeProvisioningCoordinator(
+      conversationConnection.client,
+      makeNativeVoiceRuntimeProvisioningAdapter(native, uuidv4),
+    );
+  }, [conversationConnection, native]);
+
+  useEffect(() => {
+    if (nativeProvisioning === null || controllerEnvironmentId === null) return;
+    const previous = priorNativeProvisioningRef.current;
+    priorNativeProvisioningRef.current = {
+      environmentId: controllerEnvironmentId,
+      coordinator: nativeProvisioning,
+    };
+    if (
+      previous === null ||
+      (previous.environmentId === controllerEnvironmentId &&
+        previous.coordinator === nativeProvisioning)
+    ) {
+      return;
+    }
+    const epoch = ++nativeProvisioningEpochRef.current;
+    void previous.coordinator.disable(epoch).catch(() => undefined);
+  }, [controllerEnvironmentId, nativeProvisioning]);
 
   useEffect(() => {
     if (native === null || prepared === null || controllerEnvironmentId === null) return;
@@ -818,11 +853,12 @@ export function MasterVoiceProvider(props: {
   resumeRef.current = resume;
 
   useEffect(() => {
-    if (native === null) return;
+    if (native === null || nativeProvisioning === null || controllerEnvironmentId === null) return;
     const readiness = nativeReadiness;
     let disposed = false;
     let registeredGeneration: number | null = null;
     const epoch = nativeOperationsRef.current.begin();
+    const provisioningEpoch = ++nativeProvisioningEpochRef.current;
     activeNativeEpochRef.current = epoch;
 
     const completeCommand = (event: T3VoiceCommandEvent, outcome: "success" | "failure") =>
@@ -961,12 +997,42 @@ export function MasterVoiceProvider(props: {
         nativeOperationsRef.current.assertCurrent(epoch);
         const readinessToPersist =
           pendingDisable === null ? readiness : { ...readiness, enabled: false };
-        const persistedReadiness = await native.setReadinessSnapshotAsync(readinessToPersist);
+        if (!readinessToPersist.enabled || prepared === null) {
+          await nativeProvisioning.disable(provisioningEpoch);
+          nativeOperationsRef.current.assertCurrent(epoch);
+          return;
+        }
+        const resolvedTarget = await resolveNativeVoiceRuntimeTarget({
+          client: conversationConnection!.client,
+          mode: readinessToPersist.mode,
+          environmentId: controllerEnvironmentId,
+          activeConversationId: snapshot.session?.conversationId ?? null,
+          focus: props.focus,
+          threadTarget: preferences?.voiceThreadTarget,
+          threads: threadShellsRef.current,
+          autoRearm: readinessToPersist.autoRearm,
+        });
         nativeOperationsRef.current.assertCurrent(epoch);
-        nativeReadinessGenerationRef.current = persistedReadiness.generation;
-        if (disposed || !readinessToPersist.enabled || prepared === null) return;
+        const exactReadiness = {
+          ...readinessToPersist,
+          targetId:
+            resolvedTarget.target.mode === "realtime"
+              ? String(resolvedTarget.target.conversation.conversationId)
+              : `${controllerEnvironmentId}/${resolvedTarget.target.threadId}`,
+        };
+        const provisioned = await nativeProvisioning.provision({
+          epoch: provisioningEpoch,
+          readiness: exactReadiness,
+          environmentOrigin: new URL(prepared.httpBaseUrl).origin,
+          operation:
+            resolvedTarget.target.mode === "realtime" ? "realtime-start" : "thread-turn-start",
+          resolvedTarget,
+        });
+        nativeOperationsRef.current.assertCurrent(epoch);
+        nativeReadinessGenerationRef.current = provisioned.readinessGeneration;
+        if (disposed) return;
         const generation = nativeControllerGenerationRef.current.register(
-          persistedReadiness.generation,
+          provisioned.readinessGeneration,
         );
         registeredGeneration = generation;
         await native.registerVoiceControllerAsync({ controllerGeneration: generation });
@@ -1050,11 +1116,15 @@ export function MasterVoiceProvider(props: {
     backgroundTargetThreadId,
     controllerEnvironmentId,
     native,
+    nativeProvisioning,
     nativeReadiness,
     navigation,
     prepared,
+    preferences?.voiceThreadTarget,
+    props.focus,
     readinessRetry,
     savePreferences,
+    snapshot.session?.conversationId,
   ]);
 
   const completeNativeThreadCommand = useCallback(

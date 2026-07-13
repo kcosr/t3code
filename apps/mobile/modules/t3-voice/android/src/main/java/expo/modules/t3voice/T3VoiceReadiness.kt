@@ -47,6 +47,11 @@ internal data class T3VoicePreparedReadiness(
   val runtimeId: String,
 )
 
+internal data class T3VoiceDisabledReadiness(
+  val config: T3VoiceReadinessConfig,
+  val runtimeId: String?,
+)
+
 internal class T3VoiceReadinessStore(context: Context) {
   private val preferences =
     context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
