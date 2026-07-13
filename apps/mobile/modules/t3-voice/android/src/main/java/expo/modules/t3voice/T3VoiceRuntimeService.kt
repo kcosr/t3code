@@ -1156,7 +1156,7 @@ class T3VoiceRuntimeService : Service() {
     )) {
       T3VoiceBackgroundThreadStoredStateDecision.NONE -> return false
       T3VoiceBackgroundThreadStoredStateDecision.RESTORE -> return true
-      T3VoiceBackgroundThreadStoredStateDecision.CANCEL_UNSTARTED -> {
+      T3VoiceBackgroundThreadStoredStateDecision.CANCEL_UNDISPATCHED -> {
         val active = (loaded as T3VoiceBackgroundThreadOperationLoadResult.Available)
           .state as T3VoiceBackgroundThreadOperationState.Active
         backgroundThreadOperationStore.writeActive(

@@ -437,20 +437,19 @@ class T3VoiceBackgroundThreadExecutionTest {
     assertEquals(T3VoiceBackgroundThreadStoredStateDecision.REVOKE,
       T3VoiceBackgroundThreadStoredStatePolicy.decide(
         T3VoiceBackgroundThreadOperationLoadResult.Locked, true, NOW))
-    assertEquals(T3VoiceBackgroundThreadStoredStateDecision.CANCEL_UNSTARTED,
+    assertEquals(T3VoiceBackgroundThreadStoredStateDecision.CANCEL_UNDISPATCHED,
       T3VoiceBackgroundThreadStoredStatePolicy.decide(
         T3VoiceBackgroundThreadOperationLoadResult.Available(active.copy(
           expiresAtEpochMillis = NOW + 10_000,
           snapshot = active.snapshot.copy(
-            phase = T3VoiceBackgroundPhase.IDLE,
-            operationId = null,
-            operationGeneration = null,
+            phase = T3VoiceBackgroundPhase.TRANSCRIBING,
           ),
         )), true, NOW))
     assertEquals(T3VoiceBackgroundThreadStoredStateDecision.RESTORE,
       T3VoiceBackgroundThreadStoredStatePolicy.decide(
         T3VoiceBackgroundThreadOperationLoadResult.Available(active.copy(
           expiresAtEpochMillis = NOW + 10_000,
+          snapshot = active.snapshot.copy(dispatchAcknowledged = true),
         )), true, NOW))
     assertEquals(T3VoiceBackgroundThreadStoredStateDecision.RESTORE,
       T3VoiceBackgroundThreadStoredStatePolicy.decide(
