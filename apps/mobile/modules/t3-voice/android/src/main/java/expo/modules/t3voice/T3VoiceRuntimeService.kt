@@ -63,6 +63,10 @@ private data class T3VoicePendingRecordingStart(
   val onFailure: MutableList<() -> Unit>,
 )
 
+internal class T3VoiceRecordingNotStartedException : IllegalStateException(
+  "The recording stopped before microphone capture began.",
+)
+
 class T3VoiceRuntimeService : Service() {
   internal inner class VoiceBinder : Binder() {
     val state: StateFlow<T3VoiceRuntimeState>
@@ -583,7 +587,7 @@ class T3VoiceRuntimeService : Service() {
         val owner = requireRecordingOwner(recordingId)
         cancelPendingRecordingStartLocked(owner)?.let {
           releaseRecordingLocked(owner)
-          error("The recording stopped before microphone capture began.")
+          throw T3VoiceRecordingNotStartedException()
         }
         try {
           recorder.stop(recordingId).toResultBody()
@@ -3387,12 +3391,15 @@ class T3VoiceRuntimeService : Service() {
     complete: (T3VoiceNativeHandoffOutcome) -> Boolean,
   ) {
     val finish = { outcome: T3VoiceNativeHandoffOutcome ->
-      handoffInProgress = false
-      awaitingHandoffAction = false
-      if (T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
-        stopRuntimeForegroundLocked()
+      val won = complete(outcome)
+      if (won) {
+        handoffInProgress = false
+        awaitingHandoffAction = false
+        if (T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
+          stopRuntimeForegroundLocked()
+        }
       }
-      complete(outcome)
+      won
     }
     val state = T3VoiceStateStore.state.value
     val recordingId = T3VoiceNativeHandoffPolicy.recordingId(action.actionId)
@@ -3414,7 +3421,13 @@ class T3VoiceRuntimeService : Service() {
       if (pending == null) {
         finish(T3VoiceNativeHandoffOutcome.Failed("recognition-start", "runtime-unavailable"))
       } else {
-        pending.onStarted += { finish(T3VoiceNativeHandoffOutcome.Listening) }
+        pending.onStarted.clear()
+        pending.onFailure.clear()
+        pending.onStarted += {
+          if (finish(T3VoiceNativeHandoffOutcome.Listening)) {
+            emitThreadVoiceHandoff(action, recordingId)
+          }
+        }
         pending.onFailure += {
           finish(T3VoiceNativeHandoffOutcome.Failed("recognition-start", "microphone-unavailable"))
         }

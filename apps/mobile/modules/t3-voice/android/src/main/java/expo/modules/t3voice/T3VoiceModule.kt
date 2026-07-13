@@ -589,7 +589,11 @@ class T3VoiceModule : Module() {
 
       AsyncFunction("stopRecordingAsync") { input: Map<String, String>, promise: Promise ->
         withBinder(promise, "recording-stop-failed") { voice, result ->
-          result.resolve(voice.stopRecording(requireIdentifier(input, "recordingId")))
+          try {
+            result.resolve(voice.stopRecording(requireIdentifier(input, "recordingId")))
+          } catch (cause: T3VoiceRecordingNotStartedException) {
+            result.reject("recording-not-started", cause.message ?: "Recording was cancelled.", cause)
+          }
         }
       }
 

@@ -280,6 +280,7 @@ export function MasterVoiceProvider(props: {
   nativeThreadCommandRef.current = nativeThreadCommand;
 
   const preferences = Option.getOrNull(AsyncResult.value(preferencesResult));
+  const voiceCuesEnabled = preferences === null ? null : preferences.voiceCuesEnabled !== false;
   const nativeReadinessInputsReady =
     preferences !== null &&
     nativePermissions.microphone !== null &&
@@ -287,11 +288,9 @@ export function MasterVoiceProvider(props: {
   const preferredAudioRouteId = preferences?.voiceAudioRouteId ?? null;
 
   useEffect(() => {
-    if (native === null || preferences === null) return;
-    void native
-      .setVoiceCuesEnabledAsync({ enabled: preferences.voiceCuesEnabled !== false })
-      .catch(() => undefined);
-  }, [native, preferences?.voiceCuesEnabled]);
+    if (native === null || voiceCuesEnabled === null) return;
+    void native.setVoiceCuesEnabledAsync({ enabled: voiceCuesEnabled }).catch(() => undefined);
+  }, [native, voiceCuesEnabled]);
   const preferredAudioRouteIdRef = useRef(preferredAudioRouteId);
   preferredAudioRouteIdRef.current = preferredAudioRouteId;
 

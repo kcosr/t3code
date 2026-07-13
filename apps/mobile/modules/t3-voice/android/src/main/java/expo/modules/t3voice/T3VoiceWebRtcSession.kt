@@ -40,7 +40,7 @@ internal class T3VoiceWebRtcSession(
   private data class ActiveSession(
     val sessionId: String,
     val diagnosticGeneration: Long,
-    val audioRouteId: String,
+    var audioRouteId: String,
     val audioOwner: T3VoiceRealtimeAudioOwnerPolicy.Owner,
     val audioDeviceModule: JavaAudioDeviceModule,
     val peerConnectionFactory: PeerConnectionFactory,
@@ -347,13 +347,20 @@ internal class T3VoiceWebRtcSession(
   fun routes(): List<Map<String, Any>> = audioRouter.routes().map(T3VoiceAudioRoute::toResultBody)
 
   fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>> {
-    val routerGeneration =
+    val (session, routerGeneration) =
       synchronized(lock) {
-        checkNotNull(requireActive(sessionId).audioRouterGeneration) {
+        val session = requireActive(sessionId)
+        val generation = checkNotNull(session.audioRouterGeneration) {
           "The Realtime audio route owner is unavailable."
         }
+        session to generation
       }
     audioRouter.select(routeId, routerGeneration)
+    synchronized(lock) {
+      if (active === session && session.audioRouterGeneration == routerGeneration) {
+        session.audioRouteId = routeId
+      }
+    }
     return routes()
   }
 
@@ -388,7 +395,7 @@ internal class T3VoiceWebRtcSession(
       T3VoiceDiagnosticCategory.LIFECYCLE,
       T3VoiceDiagnosticCode.MEDIA_RELEASED,
     )
-    audioRouter.stop()
+    session.audioRouterGeneration?.let(audioRouter::stop)
     if (terminalLatch.claim(sessionId)) {
       T3VoiceDiagnostics.record(
         session.diagnosticGeneration,
@@ -506,21 +513,42 @@ internal class T3VoiceWebRtcSession(
       return
     }
     if (state == PeerConnection.PeerConnectionState.CONNECTED) {
+      val session = synchronized(lock) {
+        active?.takeIf { it.sessionId == sessionId }
+      } ?: return
       val routeSetup =
         runCatching {
-          synchronized(lock) {
-            val session = active?.takeIf { it.sessionId == sessionId } ?: return
-            val routerStart = audioRouter.start()
+          if (synchronized(lock) { active === session && session.audioRouterGeneration == null }) {
+            val routerStart = audioRouter.start(sessionId)
             check(routerStart.transition.state != T3VoiceAudioFocusState.TERMINATED) {
               "Android denied Realtime audio focus."
             }
-            runCatching { audioRouter.select(session.audioRouteId, routerStart.ownerGeneration) }
-              .onFailure {
-                audioRouter.select(T3VoiceAudioRouteKind.SYSTEM.id, routerStart.ownerGeneration)
-              }
-            session.audioRouterGeneration = routerStart.ownerGeneration
-            session.peerConnection.setAudioPlayout(true)
+            var adopted = false
+            try {
+              runCatching { audioRouter.select(session.audioRouteId, routerStart.ownerGeneration) }
+                .onFailure {
+                  audioRouter.select(T3VoiceAudioRouteKind.SYSTEM.id, routerStart.ownerGeneration)
+                }
+              adopted =
+                synchronized(lock) {
+                  if (active === session) {
+                    session.audioRouterGeneration = routerStart.ownerGeneration
+                    true
+                  } else {
+                    false
+                  }
+                }
+              check(adopted) { "Realtime session changed during audio route setup." }
+            } finally {
+              if (!adopted) audioRouter.stop(routerStart.ownerGeneration)
+            }
           }
+          val shouldPlay =
+            synchronized(lock) {
+              check(active === session) { "Realtime session changed before playout setup." }
+              !session.captureState.focusSuspended
+            }
+          session.peerConnection.setAudioPlayout(shouldPlay)
         }
       if (routeSetup.isFailure) {
         fail(
@@ -750,7 +778,7 @@ internal class T3VoiceWebRtcSession(
       T3VoiceDiagnosticCategory.LIFECYCLE,
       T3VoiceDiagnosticCode.MEDIA_RELEASED,
     )
-    audioRouter.stop()
+    session.audioRouterGeneration?.let(audioRouter::stop)
     if (terminalLatch.claim(session.sessionId)) {
       T3VoiceDiagnostics.record(
         session.diagnosticGeneration,

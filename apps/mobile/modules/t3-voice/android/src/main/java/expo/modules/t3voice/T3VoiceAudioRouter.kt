@@ -40,22 +40,28 @@ internal class T3VoiceAudioRouter(
   private var selectedRoute = T3VoiceAudioRouteKind.SYSTEM
   private var deviceCallbackRegistered = false
   private var active = false
+  private var activeOwnerId: String? = null
   private var generation = 0L
   private var activeGeneration: Long? = null
   private var focusChangeListener: AudioManager.OnAudioFocusChangeListener? = null
   private var deviceCallback: AudioDeviceCallback? = null
 
   @Synchronized
-  fun start(): T3VoiceAudioRouterStartResult {
+  fun start(ownerId: String): T3VoiceAudioRouterStartResult {
+    require(ownerId.isNotBlank()) { "Audio route owner must be non-empty." }
     if (active) {
-      return T3VoiceAudioRouterStartResult(
-        transition = T3VoiceAudioFocusTransition(focusState, emptyList()),
-        ownerGeneration = checkNotNull(activeGeneration),
-      )
+      if (activeOwnerId == ownerId) {
+        return T3VoiceAudioRouterStartResult(
+          transition = T3VoiceAudioFocusTransition(focusState, emptyList()),
+          ownerGeneration = checkNotNull(activeGeneration),
+        )
+      }
+      releaseAudioOwnership()
     }
     val ownerGeneration = T3VoiceDiagnostics.nextGeneration()
     generation = ownerGeneration
     activeGeneration = ownerGeneration
+    activeOwnerId = ownerId
     recordDiagnostic(T3VoiceDiagnosticCategory.LIFECYCLE, T3VoiceDiagnosticCode.STARTED)
     focusChangeListener =
       AudioManager.OnAudioFocusChangeListener { change ->
@@ -89,17 +95,20 @@ internal class T3VoiceAudioRouter(
   }
 
   @Synchronized
-  fun stop() {
-    if (!active) return
+  fun stop(ownerGeneration: Long? = null): Boolean {
+    if (!active) return false
+    if (ownerGeneration != null && activeGeneration != ownerGeneration) return false
     recordDiagnostic(T3VoiceDiagnosticCategory.LIFECYCLE, T3VoiceDiagnosticCode.STOPPED)
     unregisterDeviceCallback()
     active = false
     activeGeneration = null
+    activeOwnerId = null
     focusState = T3VoiceAudioFocusState.TERMINATED
     selectedRoute = T3VoiceAudioRouteKind.SYSTEM
     runCatching(::clearSelectedRoute)
     runCatching(::abandonFocus)
     runCatching { audioManager.mode = AudioManager.MODE_NORMAL }
+    return true
   }
 
   @Synchronized
@@ -319,6 +328,7 @@ internal class T3VoiceAudioRouter(
     if (!active) return
     active = false
     activeGeneration = null
+    activeOwnerId = null
     unregisterDeviceCallback()
     selectedRoute = T3VoiceAudioRouteKind.SYSTEM
     runCatching(::clearSelectedRoute)

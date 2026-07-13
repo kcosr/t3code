@@ -47,6 +47,7 @@ class T3VoiceCuePlayerTest {
     })
     fixture.worker.runAll()
     assertEquals(1, output.playCount)
+    assertEquals(listOf("output:play", "output:write"), output.events.take(2))
     output.head = output.written / 2L
     fixture.scheduler.runNext(DRAIN_DELAY)
     fixture.scheduler.runAllIncludingCancelled()
@@ -87,8 +88,8 @@ class T3VoiceCuePlayerTest {
     fixture.worker.runAll()
     fixture.scheduler.runNext(COLD_START_DELAY)
     fixture.worker.runAll()
-    clock.now = TIMEOUT
-    fixture.scheduler.runNext(TIMEOUT)
+    clock.now = READY_TIMEOUT
+    fixture.scheduler.runNext(READY_TIMEOUT)
     fixture.worker.runAll()
 
     assertEquals(listOf(T3VoiceCueOutcome.TIMED_OUT), completions.map { it.outcome })
@@ -108,6 +109,21 @@ class T3VoiceCuePlayerTest {
     assertEquals(1, completions.size)
     assertEquals(7L, completions.single().generation)
     assertEquals(T3VoiceCueOutcome.CANCELLED, completions.single().outcome)
+  }
+
+  @Test
+  fun `replacement releases the prior stream before starting the next one`() {
+    val events = mutableListOf<String>()
+    val first = FakeOutput(label = "first", events = events)
+    val second = FakeOutput(label = "second", events = events)
+    val fixture = Fixture(outputs = ArrayDeque(listOf(first, second)))
+
+    fixture.player.play(T3VoiceCue.READY, 20) {}
+    fixture.worker.runAll()
+    fixture.player.play(T3VoiceCue.ENDED, 21) {}
+    fixture.worker.runAll()
+
+    assertTrue(events.indexOf("first:release") < events.indexOf("second:play"))
   }
 
   @Test
@@ -186,7 +202,11 @@ class T3VoiceCuePlayerTest {
       )
   }
 
-  private class FakeOutput(private val writeResult: Int? = null) : T3VoiceCueOutput {
+  private class FakeOutput(
+    private val writeResult: Int? = null,
+    private val label: String = "output",
+    val events: MutableList<String> = mutableListOf(),
+  ) : T3VoiceCueOutput {
     var head = 0L
     var written = 0
     var playCount = 0
@@ -196,16 +216,19 @@ class T3VoiceCuePlayerTest {
       get() = head
 
     override fun write(pcm: ByteArray, offset: Int, length: Int): Int {
+      events += "$label:write"
       val result = writeResult ?: length
       if (result > 0) written += result
       return result
     }
 
     override fun play() {
+      events += "$label:play"
       playCount += 1
     }
 
     override fun release(flush: Boolean) {
+      events += "$label:release"
       releaseFlushes += flush
     }
   }
@@ -259,5 +282,6 @@ class T3VoiceCuePlayerTest {
     const val COLD_START_DELAY = 220L
     const val DRAIN_DELAY = 10L
     const val TIMEOUT = 1_500L
+    const val READY_TIMEOUT = 2_354L
   }
 }

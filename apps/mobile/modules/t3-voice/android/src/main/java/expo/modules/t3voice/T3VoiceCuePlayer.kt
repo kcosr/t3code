@@ -108,20 +108,23 @@ internal class T3VoiceCuePlayer(
       if (released || generation <= highestGeneration) return false
       highestGeneration = generation
       replaced = active
+      val pcm =
+        T3VoiceCuePcm.withStartupPreRoll(
+          sampleRate,
+          T3VoiceCuePcm.synthesize(sampleRate, cue),
+          STARTUP_PRE_ROLL_MS,
+        )
+      val cueTimeoutMs = timeoutFor(pcm)
       next =
         ActiveCue(
           generation,
           cue,
-          T3VoiceCuePcm.withStartupPreRoll(
-            sampleRate,
-            T3VoiceCuePcm.synthesize(sampleRate, cue),
-            STARTUP_PRE_ROLL_MS,
-          ),
-          clock.elapsedRealtime() + timeoutMs,
+          pcm,
+          clock.elapsedRealtime() + cueTimeoutMs,
           completion,
         )
       active = next
-      next.timeoutTask = scheduler.schedule(timeoutMs) { checkTimeout(next) }
+      next.timeoutTask = scheduler.schedule(cueTimeoutMs) { checkTimeout(next) }
     }
     recordDiagnostic(
       generation,
@@ -273,12 +276,22 @@ internal class T3VoiceCuePlayer(
   private fun ownsLocked(cue: ActiveCue, output: T3VoiceCueOutput): Boolean =
     active === cue && cue.output === output && !cue.terminalClaimed.get()
 
+  private fun timeoutFor(pcm: ByteArray): Long {
+    val audioDurationMs =
+      (pcm.size / Short.SIZE_BYTES).toLong() * TimeUnit.SECONDS.toMillis(1) / sampleRate
+    return maxOf(
+      timeoutMs,
+      audioDurationMs * (MAX_REPLAY_ATTEMPTS + 1) + REPLAY_STARTUP_ALLOWANCE_MS,
+    )
+  }
+
   private companion object {
     const val SAMPLE_RATE = 48_000
     const val STARTUP_PRE_ROLL_MS = 512
     const val COLD_START_CHECK_MS = 220L
     const val DRAIN_POLL_MS = 10L
     const val TIMEOUT_MS = 1_500L
+    const val REPLAY_STARTUP_ALLOWANCE_MS = 750L
     const val MAX_REPLAY_ATTEMPTS = 1
   }
 }
@@ -358,7 +371,10 @@ private object AndroidCueOutputFactory : T3VoiceCueOutputFactory {
         .setTransferMode(AudioTrack.MODE_STREAM)
         .setBufferSizeInBytes(maxOf(minimumBufferSize, byteCount))
         .build()
-    check(track.state == AudioTrack.STATE_INITIALIZED) { "Cue AudioTrack initialization failed." }
+    if (track.state != AudioTrack.STATE_INITIALIZED) {
+      track.release()
+      error("Cue AudioTrack initialization failed.")
+    }
     return object : T3VoiceCueOutput {
       override val playbackHeadPosition: Long
         get() = track.playbackHeadPosition.toLong() and 0xffff_ffffL
@@ -382,7 +398,7 @@ private object AndroidCueClock : T3VoiceCueClock {
 }
 
 private object AndroidCueWorker : T3VoiceCueWorker {
-  private val executor: ExecutorService = Executors.newCachedThreadPool()
+  private val executor: ExecutorService = Executors.newSingleThreadExecutor()
 
   override fun execute(action: () -> Unit) {
     executor.execute(action)

@@ -22,6 +22,7 @@ import {
 import { canStartComposerDictation } from "./dictationAdmission";
 import { releaseRecordingForRealtime } from "./traditionalAudioHandoff";
 import type { ResolvedVoicePreferences } from "./voicePreferences";
+import { isNativeVoiceErrorCode } from "./nativeVoiceError";
 
 export type ComposerDictationPhase = "idle" | "recording" | "transcribing";
 
@@ -250,7 +251,12 @@ export function useComposerDictation(input: {
       await transcribeCompletedRecording(completedRecording, generation, draftAtStop);
       return true;
     } catch (cause) {
-      if (operationGenerationRef.current === generation) setError(errorMessage(cause));
+      if (
+        operationGenerationRef.current === generation &&
+        !isNativeVoiceErrorCode(cause, "recording-not-started")
+      ) {
+        setError(errorMessage(cause));
+      }
       return false;
     } finally {
       if (stoppingRecordingIdRef.current === recordingId) stoppingRecordingIdRef.current = null;
