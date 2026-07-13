@@ -54,6 +54,10 @@ export const VoiceNativeRuntimeId = TrimmedNonEmptyString.check(Schema.isMaxLeng
   Schema.brand("VoiceNativeRuntimeId"),
 );
 export type VoiceNativeRuntimeId = typeof VoiceNativeRuntimeId.Type;
+export const VoiceNativeThreadTurnOperationId = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(192),
+).pipe(Schema.brand("VoiceNativeThreadTurnOperationId"));
+export type VoiceNativeThreadTurnOperationId = typeof VoiceNativeThreadTurnOperationId.Type;
 export const VoiceSessionId = makeEntityId("VoiceSessionId");
 export type VoiceSessionId = typeof VoiceSessionId.Type;
 export const VoiceRequestId = makeEntityId("VoiceRequestId");

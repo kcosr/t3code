@@ -14,6 +14,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { VoiceNativeControlGrantRepositoryLive } from "../../persistence/Layers/VoiceNativeControlGrants.ts";
 import { VoiceNativeRuntimeGrantRepositoryLive } from "../../persistence/Layers/VoiceNativeRuntimeGrants.ts";
+import { VoiceNativeThreadTurnStoreLive } from "../../persistence/Layers/VoiceNativeThreadTurns.ts";
 import { runMigrations } from "../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import { VoiceNativeControlGrantRegistryLive } from "../Services/VoiceNativeControlGrantRegistry.ts";
@@ -24,6 +25,7 @@ const sqlite = NodeSqliteClient.layerMemory();
 const controlRepository = VoiceNativeControlGrantRepositoryLive.pipe(Layer.provide(sqlite));
 const persistence = Layer.mergeAll(
   VoiceNativeRuntimeGrantRepositoryLive.pipe(Layer.provide(sqlite)),
+  VoiceNativeThreadTurnStoreLive.pipe(Layer.provide(sqlite)),
   controlRepository,
   VoiceNativeControlGrantRegistryLive.pipe(
     Layer.provide(controlRepository),
@@ -57,7 +59,7 @@ const insertActiveAuthSession = (sessionId = authSessionId) =>
 
 it.effect("hashes, rotates, expires, and auth-fences runtime grants", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 43 });
+    yield* runMigrations({ toMigrationInclusive: 44 });
     yield* insertActiveAuthSession();
     const registry = yield* __testing.make;
     const now = yield* Clock.currentTimeMillis;
@@ -107,7 +109,7 @@ it.effect("hashes, rotates, expires, and auth-fences runtime grants", () =>
 
 it.effect("refreshes an identical generation without revoking its child authority", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 43 });
+    yield* runMigrations({ toMigrationInclusive: 44 });
     yield* insertActiveAuthSession();
     const runtimeGrants = yield* __testing.make;
     const childGrants = yield* VoiceNativeControlGrantRegistry;
@@ -164,7 +166,7 @@ it.effect("refreshes an identical generation without revoking its child authorit
 
 it.effect("rejects a stale generation when child authority is issued after rotation", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 43 });
+    yield* runMigrations({ toMigrationInclusive: 44 });
     yield* insertActiveAuthSession();
     const registry = yield* __testing.make;
     const childGrants = yield* VoiceNativeControlGrantRegistry;
@@ -203,7 +205,7 @@ it.effect("rejects a stale generation when child authority is issued after rotat
 
 it.effect("immediately fences an existing child grant when its parent generation changes", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 43 });
+    yield* runMigrations({ toMigrationInclusive: 44 });
     yield* insertActiveAuthSession();
     const runtimeGrants = yield* __testing.make;
     const childGrants = yield* VoiceNativeControlGrantRegistry;
@@ -237,7 +239,7 @@ it.effect("immediately fences an existing child grant when its parent generation
 
 it.effect("rejects a runtime token after durable parent revocation across restart", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 43 });
+    yield* runMigrations({ toMigrationInclusive: 44 });
     yield* insertActiveAuthSession();
     const beforeRestart = yield* __testing.make;
     const now = yield* Clock.currentTimeMillis;

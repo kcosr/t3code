@@ -8,6 +8,7 @@ import { VoiceConversationRepositoryLive } from "../persistence/Layers/VoiceConv
 import { ProjectionThreadMessageRepositoryLive } from "../persistence/Layers/ProjectionThreadMessages.ts";
 import { ProjectionTurnRepositoryLive } from "../persistence/Layers/ProjectionTurns.ts";
 import { ProjectionTurnStartRepositoryLive } from "../persistence/Layers/ProjectionTurnStarts.ts";
+import { VoiceNativeThreadTurnStoreLive } from "../persistence/Layers/VoiceNativeThreadTurns.ts";
 import { VoiceToolCallRepositoryLive } from "../persistence/Layers/VoiceToolCalls.ts";
 import { VoiceHandoffActionRepositoryLive } from "../persistence/Layers/VoiceHandoffActions.ts";
 import { VoiceNativeControlGrantRepositoryLive } from "../persistence/Layers/VoiceNativeControlGrants.ts";
@@ -23,6 +24,10 @@ import {
 import { VoiceMediaTicketRegistryLive } from "./Services/VoiceMediaTicketRegistry.ts";
 import { VoiceNativeControlGrantRegistryLive } from "./Services/VoiceNativeControlGrantRegistry.ts";
 import { VoiceNativeRuntimeGrantRegistryLive } from "./Layers/VoiceNativeRuntimeGrantRegistry.ts";
+import { VoiceNativeThreadTurnServiceLive } from "./Layers/VoiceNativeThreadTurnService.ts";
+import { OrchestrationProjectionSnapshotQueryLive } from "../orchestration/Layers/ProjectionSnapshotQuery.ts";
+import { VoiceMediaRequestLimiterLive } from "./Services/VoiceMediaPolicy.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import { VoiceSessionRegistryLive } from "./Services/VoiceSessionRegistry.ts";
 import {
   makeVoiceProviderRegistry,
@@ -104,16 +109,32 @@ const VoiceCoreDependenciesLive = Layer.mergeAll(
   VoiceHandoffActionRepositoryLive,
   VoiceNativeControlGrantRepositoryLive,
   VoiceNativeRuntimeGrantRepositoryLive,
+  VoiceNativeThreadTurnStoreLive,
   VoiceNativeRuntimeGrantRegistryLive.pipe(
     Layer.provide(
       Layer.mergeAll(
         VoiceNativeRuntimeGrantRepositoryLive,
+        VoiceNativeThreadTurnStoreLive,
         VoiceNativeControlGrantRegistryLive.pipe(
           Layer.provide(VoiceNativeControlGrantRepositoryLive),
         ),
       ),
     ),
   ),
+);
+
+const VoiceNativeThreadTurnDependenciesLive = Layer.mergeAll(
+  VoiceCoreDependenciesLive,
+  VoiceNativeThreadTurnStoreLive,
+  VoiceMediaRequestLimiterLive,
+  ServerSettings.layer,
+  ProjectionThreadMessageRepositoryLive,
+  ProjectionTurnRepositoryLive,
+  ProjectionTurnStartRepositoryLive.pipe(Layer.provide(ProjectionTurnRepositoryLive)),
+).pipe(Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive));
+
+const VoiceNativeThreadTurnServiceConfiguredLive = VoiceNativeThreadTurnServiceLive.pipe(
+  Layer.provide(VoiceNativeThreadTurnDependenciesLive),
 );
 
 const VoiceSessionServiceConfiguredLive = VoiceSessionServiceLive.pipe(
@@ -128,4 +149,5 @@ export const VoiceRuntimeLive = Layer.mergeAll(
   VoiceSessionServiceConfiguredLive,
   VoiceCoreDependenciesLive,
   VoiceLifecycleConfiguredLive,
+  VoiceNativeThreadTurnServiceConfiguredLive,
 );

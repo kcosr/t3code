@@ -9,5 +9,6 @@ export const httpHeaderRedactionLayer = Layer.effect(
     "dpop",
     "x-t3-voice-control",
     "x-t3-voice-runtime",
+    "x-t3-voice-operation",
   ]),
 );

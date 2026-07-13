@@ -14,6 +14,7 @@ describe("HTTP observability", () => {
       expect(names).toContain("dpop");
       expect(names).toContain("x-t3-voice-control");
       expect(names).toContain("x-t3-voice-runtime");
+      expect(names).toContain("x-t3-voice-operation");
     }).pipe(Effect.provide(httpHeaderRedactionLayer)),
   );
 });

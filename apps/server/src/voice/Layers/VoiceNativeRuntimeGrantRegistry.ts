@@ -6,6 +6,7 @@ import * as Layer from "effect/Layer";
 import * as NodeCrypto from "node:crypto";
 
 import { VoiceNativeRuntimeGrantRepository } from "../../persistence/Services/VoiceNativeRuntimeGrants.ts";
+import { VoiceNativeThreadTurnStore } from "../../persistence/Services/VoiceNativeThreadTurns.ts";
 import { VoiceError } from "../Errors.ts";
 import { VoiceNativeControlGrantRegistry } from "../Services/VoiceNativeControlGrantRegistry.ts";
 import {
@@ -17,6 +18,7 @@ const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const repository = yield* VoiceNativeRuntimeGrantRepository;
   const childGrants = yield* VoiceNativeControlGrantRegistry;
+  const threadTurns = yield* VoiceNativeThreadTurnStore;
   const hash = (token: string) => NodeCrypto.createHash("sha256").update(token).digest("hex");
 
   const issue: VoiceNativeRuntimeGrantRegistryShape["issue"] = (scope) =>
@@ -73,12 +75,14 @@ const make = Effect.gen(function* () {
       Effect.all([
         repository.revokeRuntime(authSessionId, runtimeId).pipe(Effect.orDie),
         childGrants.revokeRuntime(authSessionId, runtimeId),
+        threadTurns.revokeRuntime(authSessionId, runtimeId).pipe(Effect.orDie),
       ]).pipe(Effect.map(([revoked]) => revoked)),
     revokeAuthSession: (authSessionId) =>
       Effect.all(
         [
           repository.revokeAuthSession(authSessionId).pipe(Effect.orDie),
           childGrants.revokeAuthSession(authSessionId),
+          threadTurns.revokeAuthSession(authSessionId).pipe(Effect.orDie),
         ],
         { discard: true },
       ),

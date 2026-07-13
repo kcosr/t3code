@@ -17,6 +17,10 @@ import {
   VoiceNativeRuntimeGrantProvisionInput,
   VoiceNativeRuntimeGrantRevocationResult,
   VoiceNativeRuntimeTarget,
+  VoiceNativeThreadTurnCreateInput,
+  VoiceNativeThreadTurnEventsAckInput,
+  VoiceNativeThreadTurnEventsQuery,
+  VoiceNativeThreadTurnEvent,
   VoiceSpeechRequest,
   VoiceSessionCreateInput,
   VoiceSessionCreateResult,
@@ -76,6 +80,39 @@ describe("voice contracts", () => {
         { onExcessProperty: "error" },
       ),
     ).toThrow();
+  });
+
+  it("strictly round-trips native thread turn inputs and sanitized events", () => {
+    const values = [
+      [
+        VoiceNativeThreadTurnCreateInput,
+        { runtimeId: "android-main", generation: 3, clientOperationId: "turn-1" },
+      ],
+      [VoiceNativeThreadTurnEventsQuery, { afterSequence: 2, waitMilliseconds: 10_000 }],
+      [VoiceNativeThreadTurnEventsAckInput, { acknowledgedSequence: 4 }],
+      [
+        VoiceNativeThreadTurnEvent,
+        {
+          type: "speech-ready",
+          sequence: 5,
+          occurredAt: "2026-07-13T12:00:00.000Z",
+          segmentIndex: 1,
+          finalSegment: false,
+        },
+      ],
+    ] as const;
+    for (const [schema, value] of values) {
+      const decoded = decodeUnknownSync(schema)(value, { onExcessProperty: "error" });
+      expect(decodeUnknownSync(schema)(encodeSync(schema)(decoded))).toEqual(decoded);
+      expect(() =>
+        decodeUnknownSync(schema)(
+          { ...value, transcript: "must not be journaled" },
+          {
+            onExcessProperty: "error",
+          },
+        ),
+      ).toThrow();
+    }
   });
 
   it("decodes a provider-neutral realtime session request", () => {
