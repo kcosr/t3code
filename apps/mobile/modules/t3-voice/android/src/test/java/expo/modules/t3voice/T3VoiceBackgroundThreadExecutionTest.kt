@@ -419,7 +419,7 @@ class T3VoiceBackgroundThreadExecutionTest {
     ) { false })
   }
 
-  @Test fun `expired active and locked operation states require reconciliation`() {
+  @Test fun `stored operation recovery distinguishes unstarted active work`() {
     val claim = T3VoiceBackgroundThreadClaim(
       "runtime-1", 4, "https://example.test", "project-1", "thread-1", "client-1",
     )
@@ -437,6 +437,21 @@ class T3VoiceBackgroundThreadExecutionTest {
     assertEquals(T3VoiceBackgroundThreadStoredStateDecision.REVOKE,
       T3VoiceBackgroundThreadStoredStatePolicy.decide(
         T3VoiceBackgroundThreadOperationLoadResult.Locked, true, NOW))
+    assertEquals(T3VoiceBackgroundThreadStoredStateDecision.CANCEL_UNSTARTED,
+      T3VoiceBackgroundThreadStoredStatePolicy.decide(
+        T3VoiceBackgroundThreadOperationLoadResult.Available(active.copy(
+          expiresAtEpochMillis = NOW + 10_000,
+          snapshot = active.snapshot.copy(
+            phase = T3VoiceBackgroundPhase.IDLE,
+            operationId = null,
+            operationGeneration = null,
+          ),
+        )), true, NOW))
+    assertEquals(T3VoiceBackgroundThreadStoredStateDecision.RESTORE,
+      T3VoiceBackgroundThreadStoredStatePolicy.decide(
+        T3VoiceBackgroundThreadOperationLoadResult.Available(active.copy(
+          expiresAtEpochMillis = NOW + 10_000,
+        )), true, NOW))
     assertEquals(T3VoiceBackgroundThreadStoredStateDecision.RESTORE,
       T3VoiceBackgroundThreadStoredStatePolicy.decide(
         T3VoiceBackgroundThreadOperationLoadResult.Available(

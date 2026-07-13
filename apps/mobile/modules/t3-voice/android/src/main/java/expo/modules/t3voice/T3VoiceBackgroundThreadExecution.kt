@@ -281,6 +281,7 @@ internal object T3VoiceBackgroundThreadRecordingRecovery {
 internal enum class T3VoiceBackgroundThreadStoredStateDecision {
   NONE,
   RESTORE,
+  CANCEL_UNSTARTED,
   REVOKE,
 }
 
@@ -298,6 +299,12 @@ internal object T3VoiceBackgroundThreadStoredStatePolicy {
       is T3VoiceBackgroundThreadOperationState.Active ->
         if (state.expiresAtEpochMillis <= nowMillis) {
           T3VoiceBackgroundThreadStoredStateDecision.REVOKE
+        } else if (
+          state.snapshot.phase == T3VoiceBackgroundPhase.IDLE &&
+            !state.snapshot.dispatchAcknowledged &&
+            state.recording == null
+        ) {
+          T3VoiceBackgroundThreadStoredStateDecision.CANCEL_UNSTARTED
         } else {
           T3VoiceBackgroundThreadStoredStateDecision.RESTORE
         }
