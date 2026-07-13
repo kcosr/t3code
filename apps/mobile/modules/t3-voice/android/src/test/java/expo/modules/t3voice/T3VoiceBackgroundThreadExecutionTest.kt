@@ -60,6 +60,39 @@ class T3VoiceBackgroundThreadExecutionTest {
     assertEquals(30_000L, T3VoiceBackgroundThreadRetryPolicy.delayMillis(100))
   }
 
+  @Test fun `thread attempt loses ownership when readiness changes`() {
+    val current = readiness()
+    val authority = requireNotNull(
+      T3VoiceBackgroundThreadAuthorityPolicy.validate(
+        current,
+        T3VoiceRuntimeGrantLoadResult.Available(grant()),
+        DIGEST,
+        NOW,
+      ),
+    ).authority
+    val attempt = T3VoiceBackgroundThreadAttempt(authority, "client-1")
+
+    assertTrue(T3VoiceBackgroundThreadAttemptPolicy.owns(attempt, current))
+    assertFalse(
+      T3VoiceBackgroundThreadAttemptPolicy.owns(
+        attempt,
+        current.copy(mode = T3VoiceReadinessMode.REALTIME),
+      ),
+    )
+    assertFalse(
+      T3VoiceBackgroundThreadAttemptPolicy.owns(
+        attempt,
+        current.copy(targetId = "project-1/thread-2"),
+      ),
+    )
+    assertFalse(
+      T3VoiceBackgroundThreadAttemptPolicy.owns(
+        attempt,
+        current.copy(generation = current.generation + 1),
+      ),
+    )
+  }
+
   @Test fun `active child authority restores without retaining parent grant`() {
     val desired = readiness()
     val installed = T3VoicePreparedReadiness(

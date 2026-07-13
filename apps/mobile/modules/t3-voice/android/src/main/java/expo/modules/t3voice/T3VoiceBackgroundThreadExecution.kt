@@ -170,6 +170,19 @@ internal data class T3VoiceBackgroundThreadAttempt(
   @Synchronized fun hasActiveCall(): Boolean = activeCall != null || cancellationCall != null
 }
 
+internal object T3VoiceBackgroundThreadAttemptPolicy {
+  fun owns(
+    attempt: T3VoiceBackgroundThreadAttempt,
+    readiness: T3VoiceReadinessConfig,
+  ): Boolean =
+    readiness.isEffective() &&
+      readiness.mode == T3VoiceReadinessMode.THREAD &&
+      readiness.generation == attempt.authority.readinessGeneration &&
+      readiness.targetId ==
+        "${attempt.authority.selectedProjectId}/${attempt.authority.selectedThreadId}" &&
+      readiness.autoRearm == attempt.authority.autoRearm
+}
+
 internal object T3VoiceBackgroundThreadRetryPolicy {
   fun delayMillis(failures: Int): Long {
     require(failures >= 1)

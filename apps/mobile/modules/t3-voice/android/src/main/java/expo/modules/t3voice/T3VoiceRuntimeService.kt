@@ -86,6 +86,7 @@ class T3VoiceRuntimeService : Service() {
         val verified = verifyReadiness(config)
         if (readinessConfig.samePayload(verified)) return@synchronized readinessConfig
         val next = verified.copy(generation = readinessConfig.generation + 1)
+        fenceBackgroundThreadForReadinessLocked(next)
         fenceBackgroundRealtimeForReadinessLocked(next)
         readinessConfig = next
         readinessStore.write(next)
@@ -152,6 +153,7 @@ class T3VoiceRuntimeService : Service() {
           return@synchronized prepared
         }
         readinessStore.writePrepared(prepared.copy(config = prepared.config.copy(enabled = true)))
+        fenceBackgroundThreadForReadinessLocked(prepared.config)
         fenceBackgroundRealtimeForReadinessLocked(prepared.config)
         readinessConfig = prepared.config
         controllerCommands.invalidateReadiness()
@@ -765,6 +767,7 @@ class T3VoiceRuntimeService : Service() {
   private var backgroundRealtimeCleanupInFlight = false
   private var backgroundRealtimeCleanupFailures = 0
   private var backgroundRealtimeRestartRequest = T3VoiceBackgroundRealtimeRestartRequest.NONE
+  private var startAfterThreadCancellation: T3VoiceBackgroundThreadAttempt? = null
   @Volatile private var serviceDestroyed = false
   private val backgroundRealtimeIo: ExecutorService = Executors.newSingleThreadExecutor()
   private val backgroundThreadCancellationIo: ExecutorService = Executors.newSingleThreadExecutor()
@@ -2056,6 +2059,8 @@ class T3VoiceRuntimeService : Service() {
   private fun fenceBackgroundThreadForReconciliationLocked(
     attempt: T3VoiceBackgroundThreadAttempt,
   ) {
+    if (startAfterThreadCancellation === attempt) startAfterThreadCancellation = null
+    stopBackgroundThreadAudioLocked(attempt, "reconciliation-required")
     attempt.cancelAllCalls()
     attempt.stopped = true
     attempt.detached = true
@@ -2138,7 +2143,7 @@ class T3VoiceRuntimeService : Service() {
         }.getOrDefault(false)
       },
       stopSnapshot = { applyBackgroundEventLocked(T3VoiceBackgroundEvent.Stop) },
-      reconcileForeground = ::stopRuntimeForegroundLocked,
+      reconcileForeground = {},
     )
     if (!completed) {
       backgroundThreadAttempt = attempt
@@ -2149,6 +2154,23 @@ class T3VoiceRuntimeService : Service() {
         recoverable = true,
       ))
       fenceBackgroundThreadForReconciliationLocked(attempt)
+    } else {
+      reconcileAfterBackgroundThreadStopLocked(attempt)
+    }
+  }
+
+  private fun reconcileAfterBackgroundThreadStopLocked(
+    attempt: T3VoiceBackgroundThreadAttempt,
+  ) {
+    val shouldStart = startAfterThreadCancellation === attempt
+    if (shouldStart) startAfterThreadCancellation = null
+    if (T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
+      stopRuntimeForegroundLocked()
+      if (shouldStart && !serviceDestroyed) {
+        executeControlCommandLocked(T3VoiceControlCommand.PRIMARY)
+      }
+    } else {
+      updateNativeControlSurfacesLocked()
     }
   }
 
@@ -2196,7 +2218,7 @@ class T3VoiceRuntimeService : Service() {
               attempt.stopped = true
               backgroundThreadAttempt = null
               applyBackgroundEventLocked(T3VoiceBackgroundEvent.Stop)
-              stopRuntimeForegroundLocked()
+              reconcileAfterBackgroundThreadStopLocked(attempt)
             }
             T3VoiceBackgroundThreadCancelDecision.RETRY -> {
               attempt.retryFailures += 1
@@ -2239,6 +2261,14 @@ class T3VoiceRuntimeService : Service() {
       val stopped = runCatching { realtime.stop(sessionId) }.getOrDefault(false)
       if (!stopped) T3VoiceStateStore.releaseRealtimeClaim(sessionId)
     }
+  }
+
+  private fun fenceBackgroundThreadForReadinessLocked(next: T3VoiceReadinessConfig) {
+    val attempt = backgroundThreadAttempt ?: return
+    if (T3VoiceBackgroundThreadAttemptPolicy.owns(attempt, next)) return
+    if (startAfterThreadCancellation === attempt) startAfterThreadCancellation = null
+    stopBackgroundThreadAudioLocked(attempt, "readiness-changed")
+    stopBackgroundThreadLocked(cancelServer = true)
   }
 
   private fun startBackgroundRealtimeLocked() {
@@ -2763,8 +2793,10 @@ class T3VoiceRuntimeService : Service() {
     val restart = T3VoiceBackgroundRealtimeRestartPolicy.shouldRestart(backgroundRealtimeRestartRequest)
     backgroundRealtimeRestartRequest = T3VoiceBackgroundRealtimeRestartRequest.NONE
     if (restart && !serviceDestroyed) startBackgroundRealtimeLocked()
-    else if (!readinessConfig.isEffective() && T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
+    else if (T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
       stopRuntimeForegroundLocked()
+    } else {
+      updateNativeControlSurfacesLocked()
     }
   }
 
@@ -2860,6 +2892,7 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun executeControlCommandLocked(command: T3VoiceControlCommand) {
+    if (command == T3VoiceControlCommand.STOP) startAfterThreadCancellation = null
     backgroundRealtimeRestartRequest =
       T3VoiceBackgroundRealtimeRestartPolicy.afterControl(backgroundRealtimeRestartRequest, command)
     if (
@@ -2867,6 +2900,8 @@ class T3VoiceRuntimeService : Service() {
         T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE &&
         (command == T3VoiceControlCommand.PRIMARY || command == T3VoiceControlCommand.STOP)
     ) {
+      startAfterThreadCancellation =
+        backgroundThreadAttempt?.takeIf { command == T3VoiceControlCommand.PRIMARY }
       stopBackgroundThreadLocked(cancelServer = true)
       stopRuntimeForegroundLocked()
       updateNativeControlSurfacesLocked()
@@ -2912,12 +2947,30 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun stopActiveOperationLocked() {
+    startAfterThreadCancellation = null
     val state = T3VoiceStateStore.state.value
     stopBackgroundThreadLocked(cancelServer = true)
     abandonBackgroundRealtimeLocked(backgroundRealtimeAttempt, closeServer = true)
     nativeHandoffPoller.stop()
     clearHandoffEligibilityLocked()
-    recordingOwner?.takeIf { it.id == state.activeRecordingId }?.let { owner ->
+    stopTraditionalAudioLocked(state, "notification-stop")
+    state.activeRealtimeSessionId?.let {
+      nativeControlHeartbeat.stop()
+      val stopped = runCatching { realtime.stop(it) }.getOrDefault(false)
+      if (!stopped) T3VoiceStateStore.releaseRealtimeClaim(it)
+    }
+    stopRuntimeForegroundLocked()
+  }
+
+  private fun stopTraditionalAudioLocked(
+    state: T3VoiceRuntimeState,
+    recordingReason: String,
+    ownsRecording: (String) -> Boolean = { true },
+    ownsPlayback: (String) -> Boolean = { true },
+  ) {
+    recordingOwner?.takeIf {
+      it.id == state.activeRecordingId && ownsRecording(it.id)
+    }?.let { owner ->
       runCatching { recorder.cancel(owner.id) }
       terminateRecordingLocked(
         owner,
@@ -2925,12 +2978,14 @@ class T3VoiceRuntimeService : Service() {
           recordingId = owner.id,
           recording = null,
           outcome = "cancelled",
-          reason = "notification-stop",
+          reason = recordingReason,
         ),
         stopForeground = false,
       )
     }
-    playbackOwner?.takeIf { it.id == state.activePlaybackId }?.let { owner ->
+    playbackOwner?.takeIf {
+      it.id == state.activePlaybackId && ownsPlayback(it.id)
+    }?.let { owner ->
       runCatching { player.cancel(owner.id) }
       terminatePlaybackLocked(
         owner,
@@ -2938,12 +2993,19 @@ class T3VoiceRuntimeService : Service() {
         stopForeground = false,
       )
     }
-    state.activeRealtimeSessionId?.let {
-      nativeControlHeartbeat.stop()
-      val stopped = runCatching { realtime.stop(it) }.getOrDefault(false)
-      if (!stopped) T3VoiceStateStore.releaseRealtimeClaim(it)
-    }
-    stopRuntimeForegroundLocked()
+  }
+
+  private fun stopBackgroundThreadAudioLocked(
+    attempt: T3VoiceBackgroundThreadAttempt,
+    recordingReason: String,
+  ) {
+    val operationId = attempt.operationId ?: return
+    stopTraditionalAudioLocked(
+      T3VoiceStateStore.state.value,
+      recordingReason,
+      ownsRecording = { it == operationId },
+      ownsPlayback = { it.startsWith("thread-playback:$operationId:") },
+    )
   }
 
   private fun executeNativeHandoff(action: T3VoiceNativeHandoffAction): T3VoiceNativeHandoffOutcome {
