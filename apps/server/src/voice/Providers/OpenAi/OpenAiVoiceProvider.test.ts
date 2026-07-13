@@ -187,6 +187,23 @@ it("reports provider failures without logging provider messages or transcript co
   expect(JSON.stringify(transportDiagnostic)).not.toContain(privateMessage);
 });
 
+it("reports provider context removals without item IDs or content", () => {
+  const diagnostic = __testing.realtimeDiagnostic({
+    type: "message",
+    data: encodeJson({
+      type: "conversation.item.deleted",
+      item_id: "provider-private-item-id",
+      transcript: "private transcript content",
+    }),
+  });
+  expect(diagnostic).toEqual({
+    message: "OpenAI Realtime context item removed",
+    annotations: { providerEventType: "conversation.item.deleted" },
+  });
+  expect(JSON.stringify(diagnostic)).not.toContain("provider-private-item-id");
+  expect(JSON.stringify(diagnostic)).not.toContain("private transcript content");
+});
+
 it("distinguishes normal and abnormal Realtime sideband closes", () => {
   for (const code of [1000, 1001, 1005]) {
     expect(__testing.parseRealtimeEvent({ type: "closed", code, reason: "done" })).toEqual([
@@ -519,7 +536,11 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
     expect(sessionConfig).toMatchObject({
       type: "realtime",
       model: __testing.realtimeModel,
-      truncation: "disabled",
+      truncation: {
+        type: "retention_ratio",
+        retention_ratio: 0.8,
+        token_limits: { post_instructions: 80_000 },
+      },
       tool_choice: "auto",
       audio: {
         input: {

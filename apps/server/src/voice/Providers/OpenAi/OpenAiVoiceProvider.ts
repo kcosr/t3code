@@ -42,6 +42,8 @@ const OPENAI_API_ORIGIN = "https://api.openai.com";
 const TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
 const SPEECH_MODEL = "gpt-4o-mini-tts";
 const REALTIME_MODEL = "gpt-realtime-2.1";
+const REALTIME_POST_INSTRUCTIONS_TOKEN_LIMIT = 80_000;
+const REALTIME_RETENTION_RATIO = 0.8;
 const CONTEXT_REPLAY_TIMEOUT = "30 seconds";
 const CONTEXT_UPDATE_TIMEOUT = "10 seconds";
 const TERMINAL_TOOL_OUTPUT_TIMEOUT = "10 seconds";
@@ -403,6 +405,18 @@ const realtimeDiagnostic = (
     };
   }
   const record = decodeRealtimeRecord(event.data);
+  if (
+    record?.type === "conversation.item.deleted" ||
+    record?.type === "conversation.item.truncated"
+  ) {
+    return {
+      message: "OpenAI Realtime context item removed",
+      annotations: {
+        ...correlation,
+        providerEventType: record.type,
+      },
+    };
+  }
   if (record?.type !== "error") return undefined;
   const error =
     typeof record.error === "object" && record.error !== null
@@ -448,6 +462,12 @@ const completedFunctionCall = (
 
 const isBenignRealtimeClose = (event: OpenAiRealtimeSocketEvent): boolean =>
   event.type === "closed" && (event.code === 1000 || event.code === 1001 || event.code === 1005);
+
+const isContextRemovalEvent = (event: OpenAiRealtimeSocketEvent): boolean => {
+  if (event.type !== "message") return false;
+  const type = decodeRealtimeRecord(event.data)?.type;
+  return type === "conversation.item.deleted" || type === "conversation.item.truncated";
+};
 
 const parseRealtimeEvent = (
   event: OpenAiRealtimeSocketEvent,
@@ -610,7 +630,13 @@ const providerSessionConfig = (instructions: string) => ({
   model: REALTIME_MODEL,
   output_modalities: ["audio"],
   instructions,
-  truncation: "disabled",
+  truncation: {
+    type: "retention_ratio",
+    retention_ratio: REALTIME_RETENTION_RATIO,
+    token_limits: {
+      post_instructions: REALTIME_POST_INSTRUCTIONS_TOKEN_LIMIT,
+    },
+  },
   audio: {
     input: {
       format: { type: "audio/pcm", rate: 24_000 },
@@ -908,6 +934,9 @@ const make = Effect.gen(function* () {
         sessionId: input.sessionId,
         leaseGeneration: input.leaseGeneration,
         durationMs: Math.max(0, providerCallCompletedAt - providerCallStartedAt),
+        truncationType: "retention_ratio",
+        truncationRetentionRatio: REALTIME_RETENTION_RATIO,
+        truncationPostInstructionsTokenLimit: REALTIME_POST_INSTRUCTIONS_TOKEN_LIMIT,
       });
       const sessionScope = yield* Scope.make("sequential");
       const sidebandStartedAt = yield* Clock.currentTimeMillis;
@@ -1100,7 +1129,7 @@ const make = Effect.gen(function* () {
             leaseGeneration: input.leaseGeneration,
           });
           if (diagnostic === undefined) return;
-          yield* isBenignRealtimeClose(event)
+          yield* isBenignRealtimeClose(event) || isContextRemovalEvent(event)
             ? Effect.logInfo(diagnostic.message, diagnostic.annotations)
             : Effect.logWarning(diagnostic.message, diagnostic.annotations);
         },
