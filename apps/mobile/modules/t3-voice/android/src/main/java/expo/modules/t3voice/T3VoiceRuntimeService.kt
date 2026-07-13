@@ -1538,7 +1538,19 @@ class T3VoiceRuntimeService : Service() {
         T3VoiceBackgroundHttpFailureKind.CONFLICT,
         T3VoiceBackgroundHttpFailureKind.CANCELLED,
       )
-      if (retryable) {
+      if (T3VoiceBackgroundThreadPreparedCancellationPolicy.shouldFenceCreateFailure(
+          attempt.cancelRequested,
+          attempt.operationId,
+          retryable,
+        )) {
+        T3VoiceStateStore.emit(T3VoiceRuntimeEvent.RuntimeError(
+          operation = "background-thread",
+          code = "native-thread-cancel-recovery-rejected",
+          message = "Background thread voice requires authorization reconciliation.",
+          recoverable = true,
+        ))
+        fenceBackgroundThreadForReconciliationLocked(attempt)
+      } else if (retryable) {
         attempt.retryFailures += 1
         releaseWakeLockForBackgroundBackoffLocked()
         mainHandler.postDelayed({
@@ -2133,9 +2145,12 @@ class T3VoiceRuntimeService : Service() {
         cancelRequested = true,
       )
       attempt.cancelActiveCall()
-      val runtimeGrant = T3VoiceRuntimeGrantStore(applicationContext).load()
-      val token = T3VoiceBackgroundThreadPreparedCancellationPolicy.runtimeGrantToken(runtimeGrant)
-      if (token == null) {
+      val authorization = T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
+        T3VoiceRuntimeGrantStore(applicationContext).load(),
+        prepared.claim,
+        System.currentTimeMillis(),
+      )
+      if (authorization == null) {
         T3VoiceStateStore.emit(T3VoiceRuntimeEvent.RuntimeError(
           operation = "background-thread",
           code = "native-thread-cancel-authorization-unavailable",
@@ -2145,7 +2160,7 @@ class T3VoiceRuntimeService : Service() {
         fenceBackgroundThreadForReconciliationLocked(attempt)
       } else {
         applyBackgroundEventLocked(T3VoiceBackgroundEvent.Stop)
-        createBackgroundThreadOperation(attempt, token)
+        createBackgroundThreadOperation(attempt, authorization.runtimeGrantToken)
       }
       return
     }

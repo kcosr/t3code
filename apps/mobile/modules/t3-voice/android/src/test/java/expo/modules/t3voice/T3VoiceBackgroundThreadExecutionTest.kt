@@ -325,19 +325,19 @@ class T3VoiceBackgroundThreadExecutionTest {
     assertEquals(listOf("state"), order)
   }
 
-  @Test fun `prepared cancellation reconciles missing and locked runtime grants`() {
-    assertNull(T3VoiceBackgroundThreadPreparedCancellationPolicy.runtimeGrantToken(
-      T3VoiceRuntimeGrantLoadResult.Missing,
+  @Test fun `prepared cancellation fences terminal create failures`() {
+    assertTrue(T3VoiceBackgroundThreadPreparedCancellationPolicy.shouldFenceCreateFailure(
+      cancelRequested = true, operationId = null, retryable = false,
     ))
-    assertNull(T3VoiceBackgroundThreadPreparedCancellationPolicy.runtimeGrantToken(
-      T3VoiceRuntimeGrantLoadResult.Locked,
+    assertFalse(T3VoiceBackgroundThreadPreparedCancellationPolicy.shouldFenceCreateFailure(
+      cancelRequested = true, operationId = null, retryable = true,
     ))
-    assertEquals(
-      "secret",
-      T3VoiceBackgroundThreadPreparedCancellationPolicy.runtimeGrantToken(
-        T3VoiceRuntimeGrantLoadResult.Available(grant()),
-      ),
-    )
+    assertFalse(T3VoiceBackgroundThreadPreparedCancellationPolicy.shouldFenceCreateFailure(
+      cancelRequested = false, operationId = null, retryable = false,
+    ))
+    assertFalse(T3VoiceBackgroundThreadPreparedCancellationPolicy.shouldFenceCreateFailure(
+      cancelRequested = true, operationId = "operation-1", retryable = false,
+    ))
   }
 
   @Test fun `stop cancels upload or poll without cancelling independent server cleanup`() {
@@ -538,6 +538,14 @@ class T3VoiceBackgroundThreadExecutionTest {
     )
     assertNull(T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
       T3VoiceRuntimeGrantLoadResult.Available(wrongOrigin),
+      claim,
+      NOW,
+    ))
+    val expired = grant(targetDigest).copy(
+      metadata = grant(targetDigest).metadata.copy(expiresAtEpochMillis = NOW),
+    )
+    assertNull(T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
+      T3VoiceRuntimeGrantLoadResult.Available(expired),
       claim,
       NOW,
     ))

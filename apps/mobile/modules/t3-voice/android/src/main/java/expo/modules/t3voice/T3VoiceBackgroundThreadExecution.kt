@@ -299,8 +299,11 @@ internal object T3VoiceBackgroundThreadLocalStopCoordinator {
 }
 
 internal object T3VoiceBackgroundThreadPreparedCancellationPolicy {
-  fun runtimeGrantToken(loaded: T3VoiceRuntimeGrantLoadResult): String? =
-    (loaded as? T3VoiceRuntimeGrantLoadResult.Available)?.grant?.token
+  fun shouldFenceCreateFailure(
+    cancelRequested: Boolean,
+    operationId: String?,
+    retryable: Boolean,
+  ): Boolean = cancelRequested && operationId == null && !retryable
 }
 
 internal object T3VoiceBackgroundThreadRearmPolicy {
