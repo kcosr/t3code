@@ -14,6 +14,7 @@ import {
   reconcilePendingNativeReadinessDisable,
   resolveNativeVoiceReadiness,
   scheduleNativeVoiceCommandFailure,
+  shouldStartNativeThreadCommand,
 } from "./nativeVoiceReadiness";
 
 describe("native voice readiness", () => {
@@ -390,5 +391,45 @@ describe("native voice readiness", () => {
     await vi.waitFor(() => expect(complete).toHaveBeenCalledOnce());
 
     expect(complete).toHaveBeenCalledWith("command-2", "failure");
+  });
+
+  it("withholds a matching thread command until capture is ready", () => {
+    const command = { environmentId: "environment-1", threadId: "thread-1" };
+    expect(
+      shouldStartNativeThreadCommand({
+        captureReady: false,
+        command,
+        environmentId: "environment-1",
+        threadId: "thread-1",
+      }),
+    ).toBe(false);
+    expect(
+      shouldStartNativeThreadCommand({
+        captureReady: true,
+        command,
+        environmentId: "environment-1",
+        threadId: "thread-1",
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects a ready thread command for another target", () => {
+    const command = { environmentId: "environment-1", threadId: "thread-1" };
+    expect(
+      shouldStartNativeThreadCommand({
+        captureReady: true,
+        command,
+        environmentId: "environment-2",
+        threadId: "thread-1",
+      }),
+    ).toBe(false);
+    expect(
+      shouldStartNativeThreadCommand({
+        captureReady: true,
+        command,
+        environmentId: "environment-1",
+        threadId: "thread-2",
+      }),
+    ).toBe(false);
   });
 });

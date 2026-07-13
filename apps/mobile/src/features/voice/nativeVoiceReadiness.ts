@@ -284,6 +284,23 @@ export class NativeThreadCommandActivationCoordinator {
   }
 }
 
+export function shouldStartNativeThreadCommand(input: {
+  readonly captureReady: boolean;
+  readonly command: {
+    readonly environmentId: string;
+    readonly threadId: string;
+  } | null;
+  readonly environmentId: string;
+  readonly threadId: string;
+}): boolean {
+  return (
+    input.captureReady &&
+    input.command !== null &&
+    input.command.environmentId === input.environmentId &&
+    input.command.threadId === input.threadId
+  );
+}
+
 export function scheduleNativeVoiceCommandFailure(
   commandId: string,
   timeoutMs: number,

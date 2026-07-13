@@ -79,7 +79,10 @@ import {
 import { useMasterVoice } from "../voice/MasterVoiceProvider";
 import { resolveVoicePreferences } from "../voice/voicePreferences";
 import { useAutoListenController } from "../voice/useAutoListenController";
-import { NativeThreadCommandActivationCoordinator } from "../voice/nativeVoiceReadiness";
+import {
+  NativeThreadCommandActivationCoordinator,
+  shouldStartNativeThreadCommand,
+} from "../voice/nativeVoiceReadiness";
 
 /**
  * Height of the collapsed composer (pill + vertical padding, excluding safe-area inset).
@@ -408,10 +411,12 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   useEffect(() => {
     const command = realtimeVoice.nativeThreadCommand;
     if (
-      command === null ||
-      !dictation.available ||
-      command.environmentId !== props.environmentId ||
-      command.threadId !== props.selectedThread.id
+      !shouldStartNativeThreadCommand({
+        captureReady: dictation.available,
+        command,
+        environmentId: props.environmentId,
+        threadId: props.selectedThread.id,
+      })
     ) {
       return;
     }
