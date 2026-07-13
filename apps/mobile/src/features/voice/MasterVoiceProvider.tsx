@@ -13,6 +13,7 @@ import type { VoiceHttpClient } from "@t3tools/client-runtime/voice";
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import type {
   T3VoiceAudioRoute,
+  T3VoiceCommandEvent,
   T3VoiceThreadVoiceHandoffEvent,
 } from "@t3tools/mobile-voice-native";
 import * as Effect from "effect/Effect";
@@ -28,14 +29,15 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Alert, View } from "react-native";
+import { Alert, AppState, View } from "react-native";
 import { useNavigation } from "@react-navigation/native";
 
 import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import { uuidv4 } from "../../lib/uuid";
+import { savePreferencesPatch } from "../../persistence/imperative";
 import { usePreparedConnection } from "../../state/session";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
-import { useThreadShells } from "../../state/entities";
+import { useProjects, useThreadShells } from "../../state/entities";
 import {
   acknowledgeClientActionWithRetry,
   clientActionAcknowledgementInput,
@@ -49,6 +51,17 @@ import {
   type VoiceAudioRoutePickerState,
 } from "./MasterVoiceOverlays";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
+import {
+  completeNativeVoiceCommandAttempt,
+  isNextNativeReadinessGeneration,
+  NativeVoiceCommandCompletionGate,
+  NativeVoiceCommandDeduplicator,
+  NativeVoiceControllerGeneration,
+  NativeVoiceOperationEpoch,
+  reconcilePendingNativeReadinessDisable,
+  resolveNativeVoiceReadiness,
+  scheduleNativeVoiceCommandFailure,
+} from "./nativeVoiceReadiness";
 import { VoiceConversationBrowser, type VoiceConversationClient } from "./VoiceConversationBrowser";
 import {
   continueVoiceConversationSelection,
@@ -99,6 +112,16 @@ interface MasterVoiceContextValue {
       })
     | null;
   readonly consumeThreadVoiceHandoff: (actionId: string) => void;
+  readonly nativeThreadCommand:
+    | (T3VoiceCommandEvent & {
+        readonly environmentId: EnvironmentId;
+        readonly threadId: ThreadId;
+      })
+    | null;
+  readonly completeNativeThreadCommand: (
+    commandId: string,
+    outcome: "success" | "failure",
+  ) => Promise<void>;
 }
 
 const INITIAL_SNAPSHOT: RealtimeVoiceControllerSnapshot = {
@@ -159,6 +182,7 @@ export function MasterVoiceProvider(props: {
   const native = getT3VoiceNativeModule();
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
   const threadShells = useThreadShells();
+  const projects = useProjects();
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
   const [snapshot, setSnapshot] = useState(INITIAL_SNAPSHOT);
   const [attachment, setAttachment] = useState<ActiveMasterVoiceAttachment | null>(null);
@@ -171,8 +195,15 @@ export function MasterVoiceProvider(props: {
   const [resumePending, setResumePending] = useState(false);
   const [threadVoiceHandoff, setThreadVoiceHandoff] =
     useState<MasterVoiceContextValue["threadVoiceHandoff"]>(null);
+  const [nativeThreadCommand, setNativeThreadCommand] =
+    useState<MasterVoiceContextValue["nativeThreadCommand"]>(null);
   const [transcript, setTranscript] = useState<ReadonlyArray<MasterVoiceTranscriptTurn>>([]);
   const [confirmations, setConfirmations] = useState<ReadonlyArray<PendingVoiceConfirmation>>([]);
+  const [nativePermissions, setNativePermissions] = useState({
+    microphone: false,
+    notification: false,
+  });
+  const [readinessRetry, setReadinessRetry] = useState(0);
   const runtimeRef = useRef<MasterVoiceRuntime | null>(null);
   const cleanupCoordinatorsRef = useRef(new Map<EnvironmentId, RealtimeServerCleanupCoordinator>());
   const controllerHandoffsRef = useRef(new Map<EnvironmentId, RealtimeControllerHandoff>());
@@ -189,14 +220,44 @@ export function MasterVoiceProvider(props: {
   const traditionalAudioInterruptionsRef = useRef(
     new Set<() => void | (() => void) | Promise<void | (() => void)>>(),
   );
+  const nativeControllerGenerationRef = useRef(new NativeVoiceControllerGeneration());
+  const nativeReadinessGenerationRef = useRef<number | null>(null);
+  const nativeOperationsRef = useRef(new NativeVoiceOperationEpoch());
+  const nativeCommandsRef = useRef(new NativeVoiceCommandDeduplicator());
+  const nativeThreadCompletionsRef = useRef(new NativeVoiceCommandCompletionGate());
+  const nativeThreadCommandRef = useRef<MasterVoiceContextValue["nativeThreadCommand"]>(null);
+  const nativeThreadTimeoutsRef = useRef(new Map<string, () => void>());
+  const completeNativeThreadCommandRef = useRef<
+    (commandId: string, outcome: "success" | "failure") => Promise<void>
+  >(async () => undefined);
+  const activeNativeEpochRef = useRef<number | null>(null);
+  const resumeRef = useRef<() => Promise<boolean>>(async () => false);
+  const readinessAlertVisibleRef = useRef(false);
   attachmentRef.current = attachment;
   focusRef.current = props.focus;
   threadShellsRef.current = threadShells;
+  nativeThreadCommandRef.current = nativeThreadCommand;
 
   const preferences = Option.getOrNull(AsyncResult.value(preferencesResult));
   const preferredAudioRouteId = preferences?.voiceAudioRouteId ?? null;
   const preferredAudioRouteIdRef = useRef(preferredAudioRouteId);
   preferredAudioRouteIdRef.current = preferredAudioRouteId;
+
+  const backgroundTargetEnvironmentId = preferences?.voiceThreadTarget?.environmentId ?? null;
+  const backgroundTargetThreadId = preferences?.voiceThreadTarget?.threadId ?? null;
+  const backgroundThreadTargetValid =
+    backgroundTargetEnvironmentId !== null &&
+    backgroundTargetThreadId !== null &&
+    threadShells.some(
+      (thread) =>
+        String(thread.environmentId) === backgroundTargetEnvironmentId &&
+        String(thread.id) === backgroundTargetThreadId &&
+        thread.archivedAt === null &&
+        projects.some(
+          (project) =>
+            project.environmentId === thread.environmentId && project.id === thread.projectId,
+        ),
+    );
 
   const controllerEnvironmentId = masterVoiceEnvironmentId(
     attachment?.environmentId ?? null,
@@ -204,6 +265,57 @@ export function MasterVoiceProvider(props: {
     props.environmentId,
   );
   const prepared = Option.getOrNull(usePreparedConnection(controllerEnvironmentId));
+  const nativeReadiness = useMemo(
+    () =>
+      resolveNativeVoiceReadiness(
+        preferences,
+        controllerEnvironmentId === null ? null : String(controllerEnvironmentId),
+        {
+          microphonePermissionGranted: nativePermissions.microphone,
+          notificationPermissionGranted: nativePermissions.notification,
+          threadTargetValid: backgroundThreadTargetValid,
+        },
+      ),
+    [
+      backgroundTargetEnvironmentId,
+      backgroundTargetThreadId,
+      controllerEnvironmentId,
+      preferences?.voiceAudioRouteId,
+      preferences?.voiceAutoListenEnabled,
+      preferences?.voiceBackgroundControlsEnabled,
+      preferences?.voiceBackgroundDefaultMode,
+      nativePermissions.microphone,
+      nativePermissions.notification,
+      backgroundThreadTargetValid,
+    ],
+  );
+
+  useEffect(() => {
+    if (native === null) return;
+    let disposed = false;
+    const refresh = async () => {
+      const [microphone, notification] = await Promise.all([
+        native.getMicrophonePermissionAsync(),
+        native.getNotificationPermissionAsync(),
+      ]);
+      if (!disposed) {
+        setNativePermissions({
+          microphone: microphone.granted,
+          notification: notification.granted,
+        });
+      }
+    };
+    void refresh().catch(() => {
+      if (!disposed) setNativePermissions({ microphone: false, notification: false });
+    });
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state === "active") void refresh();
+    });
+    return () => {
+      disposed = true;
+      subscription.remove();
+    };
+  }, [native]);
   const conversationClient: VoiceConversationClient | null =
     conversationConnection?.environmentId === controllerEnvironmentId
       ? conversationConnection.client
@@ -659,7 +771,7 @@ export function MasterVoiceProvider(props: {
     [interruptTraditionalAudio, props.focus],
   );
 
-  const resume = useCallback(() => {
+  const resume = useCallback(async (): Promise<boolean> => {
     const runtime = runtimeRef.current;
     if (
       resumeInFlightRef.current ||
@@ -667,27 +779,277 @@ export function MasterVoiceProvider(props: {
       snapshot.phase !== "idle" ||
       runtime === null
     )
-      return;
+      return false;
     resumeInFlightRef.current = true;
     startInFlightRef.current = true;
     setResumePending(true);
-    void interruptTraditionalAudio()
-      .then(async (releaseTraditionalAudio) => {
-        try {
-          const selection = await loadResumeSelection(runtime.client);
-          await start(selection, false, releaseTraditionalAudio, true);
-        } catch (cause) {
-          releaseTraditionalAudio();
-          throw cause;
-        }
-      })
-      .catch((cause) => Alert.alert("Voice conversation unavailable", errorMessage(cause)))
-      .finally(() => {
-        startInFlightRef.current = false;
-        resumeInFlightRef.current = false;
-        setResumePending(false);
-      });
+    try {
+      const releaseTraditionalAudio = await interruptTraditionalAudio();
+      try {
+        const selection = await loadResumeSelection(runtime.client);
+        await start(selection, false, releaseTraditionalAudio, true);
+        return runtime.controller.getSnapshot().phase === "active";
+      } catch (cause) {
+        releaseTraditionalAudio();
+        throw cause;
+      }
+    } catch (cause) {
+      Alert.alert("Voice conversation unavailable", errorMessage(cause));
+      return false;
+    } finally {
+      startInFlightRef.current = false;
+      resumeInFlightRef.current = false;
+      setResumePending(false);
+    }
   }, [interruptTraditionalAudio, snapshot.phase, start]);
+  resumeRef.current = resume;
+
+  useEffect(() => {
+    if (native === null) return;
+    const readiness = nativeReadiness;
+    let disposed = false;
+    let registeredGeneration: number | null = null;
+    const epoch = nativeOperationsRef.current.begin();
+    activeNativeEpochRef.current = epoch;
+
+    const completeCommand = async (event: T3VoiceCommandEvent, outcome: "success" | "failure") => {
+      try {
+        await nativeOperationsRef.current.run(epoch, () =>
+          native.completeVoiceCommandAsync({
+            commandId: event.commandId,
+            controllerGeneration: event.controllerGeneration,
+            outcome,
+          }),
+        );
+      } finally {
+        nativeCommandsRef.current.release(event.commandId);
+      }
+    };
+
+    const acceptCommand = (event: T3VoiceCommandEvent) => {
+      if (
+        disposed ||
+        !nativeOperationsRef.current.isCurrent(epoch) ||
+        !nativeControllerGenerationRef.current.accepts(event) ||
+        !nativeCommandsRef.current.claim(event.commandId)
+      )
+        return;
+      if (readiness.mode === "realtime") {
+        const runtime = runtimeRef.current;
+        if (runtime === null || runtime.controller.getSnapshot().phase !== "idle") {
+          void completeCommand(event, "failure");
+          return;
+        }
+        void completeNativeVoiceCommandAttempt(event, resumeRef.current, (input) =>
+          completeCommand(event, input.outcome),
+        ).catch(() => undefined);
+        return;
+      }
+      if (
+        backgroundTargetEnvironmentId === null ||
+        backgroundTargetThreadId === null ||
+        controllerEnvironmentId === null ||
+        backgroundTargetEnvironmentId !== String(controllerEnvironmentId)
+      ) {
+        void completeCommand(event, "failure");
+        return;
+      }
+      const command = {
+        ...event,
+        environmentId: controllerEnvironmentId,
+        threadId: ThreadId.make(backgroundTargetThreadId),
+      };
+      try {
+        nativeThreadCommandRef.current = command;
+        nativeThreadCompletionsRef.current.begin(command.commandId);
+        nativeThreadTimeoutsRef.current.set(
+          command.commandId,
+          scheduleNativeVoiceCommandFailure(command.commandId, 10_000, (commandId) => {
+            void completeNativeThreadCommandRef.current(commandId, "failure");
+          }),
+        );
+        setNativeThreadCommand(command);
+        navigation.navigate("Thread", {
+          environmentId: backgroundTargetEnvironmentId,
+          threadId: backgroundTargetThreadId,
+        });
+      } catch {
+        void completeNativeThreadCommandRef.current(event.commandId, "failure");
+      }
+    };
+    const subscription = native.addListener("voiceCommand", acceptCommand);
+    const disabledSubscription = native.addListener("readinessDisabled", (event) => {
+      if (!nativeOperationsRef.current.isCurrent(epoch)) return;
+      const currentGeneration = nativeReadinessGenerationRef.current;
+      if (!isNextNativeReadinessGeneration(currentGeneration, event.readinessGeneration)) {
+        return;
+      }
+      void nativeOperationsRef.current
+        .run(epoch, async () => {
+          await savePreferencesPatch({ voiceBackgroundControlsEnabled: false });
+          nativeOperationsRef.current.assertCurrent(epoch);
+          savePreferences({ voiceBackgroundControlsEnabled: false });
+          nativeReadinessGenerationRef.current = event.readinessGeneration;
+          await native.acknowledgeReadinessDisabledAsync({
+            readinessGeneration: event.readinessGeneration,
+          });
+        })
+        .catch((cause) => {
+          if (disposed || readinessAlertVisibleRef.current) return;
+          readinessAlertVisibleRef.current = true;
+          Alert.alert(
+            "Background voice controls not disabled",
+            `The preference could not be saved. ${errorMessage(cause)}`,
+            [
+              {
+                text: "Retry",
+                onPress: () => {
+                  readinessAlertVisibleRef.current = false;
+                  setReadinessRetry((current) => current + 1);
+                },
+              },
+            ],
+            { cancelable: false },
+          );
+        });
+    });
+
+    void nativeOperationsRef.current
+      .run(epoch, async () => {
+        const pendingDisable = await reconcilePendingNativeReadinessDisable({
+          getPending: () => native.getPendingReadinessDisabledAsync(),
+          persistDisabled: async (event) => {
+            await savePreferencesPatch({ voiceBackgroundControlsEnabled: false });
+            nativeOperationsRef.current.assertCurrent(epoch);
+            nativeReadinessGenerationRef.current = event.readinessGeneration;
+            savePreferences({ voiceBackgroundControlsEnabled: false });
+          },
+          acknowledge: (event) =>
+            native.acknowledgeReadinessDisabledAsync({
+              readinessGeneration: event.readinessGeneration,
+            }),
+        });
+        nativeOperationsRef.current.assertCurrent(epoch);
+        const readinessToPersist =
+          pendingDisable === null ? readiness : { ...readiness, enabled: false };
+        const persistedReadiness = await native.setReadinessSnapshotAsync(readinessToPersist);
+        nativeOperationsRef.current.assertCurrent(epoch);
+        nativeReadinessGenerationRef.current = persistedReadiness.generation;
+        if (disposed || !readinessToPersist.enabled || prepared === null) return;
+        const generation = nativeControllerGenerationRef.current.register(
+          persistedReadiness.generation,
+        );
+        registeredGeneration = generation;
+        await native.registerVoiceControllerAsync({ controllerGeneration: generation });
+        nativeOperationsRef.current.assertCurrent(epoch);
+        const pending = await native.getPendingVoiceCommandAsync();
+        nativeOperationsRef.current.assertCurrent(epoch);
+        if (pending !== null) acceptCommand(pending);
+      })
+      .catch((cause) => {
+        if (disposed || readinessAlertVisibleRef.current) return;
+        readinessAlertVisibleRef.current = true;
+        Alert.alert(
+          "Background voice controls unavailable",
+          errorMessage(cause),
+          [
+            {
+              text: "Disable",
+              style: "destructive",
+              onPress: () => {
+                readinessAlertVisibleRef.current = false;
+                savePreferences({ voiceBackgroundControlsEnabled: false });
+              },
+            },
+            {
+              text: "Retry",
+              onPress: () => {
+                readinessAlertVisibleRef.current = false;
+                setReadinessRetry((current) => current + 1);
+              },
+            },
+          ],
+          { cancelable: false },
+        );
+      });
+
+    return () => {
+      disposed = true;
+      const pendingThreadCommand = nativeThreadCommandRef.current;
+      if (
+        pendingThreadCommand !== null &&
+        nativeThreadCompletionsRef.current.claim(pendingThreadCommand.commandId)
+      ) {
+        nativeThreadTimeoutsRef.current.get(pendingThreadCommand.commandId)?.();
+        nativeThreadTimeoutsRef.current.delete(pendingThreadCommand.commandId);
+        nativeThreadCommandRef.current = null;
+        setNativeThreadCommand((current) =>
+          current?.commandId === pendingThreadCommand.commandId ? null : current,
+        );
+        void native
+          .completeVoiceCommandAsync({
+            commandId: pendingThreadCommand.commandId,
+            controllerGeneration: pendingThreadCommand.controllerGeneration,
+            outcome: "failure",
+          })
+          .finally(() => nativeCommandsRef.current.release(pendingThreadCommand.commandId));
+      }
+      nativeOperationsRef.current.invalidate(epoch);
+      nativeCommandsRef.current.clear();
+      nativeThreadCompletionsRef.current.clear();
+      for (const cancel of nativeThreadTimeoutsRef.current.values()) cancel();
+      nativeThreadTimeoutsRef.current.clear();
+      nativeThreadCommandRef.current = null;
+      if (activeNativeEpochRef.current === epoch) activeNativeEpochRef.current = null;
+      subscription.remove();
+      disabledSubscription.remove();
+      setNativeThreadCommand(null);
+      if (registeredGeneration === null) return;
+      nativeControllerGenerationRef.current.invalidate(registeredGeneration);
+      void nativeOperationsRef.current.runCleanup(() =>
+        native.unregisterVoiceControllerAsync({
+          controllerGeneration: registeredGeneration!,
+        }),
+      );
+    };
+  }, [
+    backgroundTargetEnvironmentId,
+    backgroundTargetThreadId,
+    controllerEnvironmentId,
+    native,
+    nativeReadiness,
+    navigation,
+    prepared,
+    readinessRetry,
+    savePreferences,
+  ]);
+
+  const completeNativeThreadCommand = useCallback(
+    async (commandId: string, outcome: "success" | "failure") => {
+      const command = nativeThreadCommandRef.current;
+      if (
+        native === null ||
+        command?.commandId !== commandId ||
+        !nativeThreadCompletionsRef.current.claim(commandId)
+      )
+        return;
+      nativeThreadTimeoutsRef.current.get(commandId)?.();
+      nativeThreadTimeoutsRef.current.delete(commandId);
+      nativeThreadCommandRef.current = null;
+      setNativeThreadCommand((current) => (current?.commandId === commandId ? null : current));
+      try {
+        await native.completeVoiceCommandAsync({
+          commandId,
+          controllerGeneration: command.controllerGeneration,
+          outcome,
+        });
+      } finally {
+        nativeCommandsRef.current.release(commandId);
+      }
+    },
+    [native],
+  );
+  completeNativeThreadCommandRef.current = completeNativeThreadCommand;
 
   const browseHistory = useCallback(() => {
     if (
@@ -857,12 +1219,22 @@ export function MasterVoiceProvider(props: {
       stop,
       registerTraditionalAudioInterruption,
       threadVoiceHandoff,
+      nativeThreadCommand,
+      completeNativeThreadCommand,
       consumeThreadVoiceHandoff: (actionId) => {
         setThreadVoiceHandoff((current) => (current?.actionId === actionId ? null : current));
         void native?.acknowledgeThreadVoiceHandoffAsync({ actionId });
       },
     }),
-    [native, registerTraditionalAudioInterruption, snapshot.phase, stop, threadVoiceHandoff],
+    [
+      completeNativeThreadCommand,
+      native,
+      nativeThreadCommand,
+      registerTraditionalAudioInterruption,
+      snapshot.phase,
+      stop,
+      threadVoiceHandoff,
+    ],
   );
 
   return (

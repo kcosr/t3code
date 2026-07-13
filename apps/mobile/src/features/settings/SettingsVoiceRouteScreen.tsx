@@ -8,6 +8,7 @@ import { Alert, Linking, Platform, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
+import { useProjects, useThreadShells } from "../../state/entities";
 import {
   resolveVoicePreferences,
   VOICE_END_SILENCE_MAX_MS,
@@ -40,13 +41,31 @@ export function SettingsVoiceRouteScreen() {
   const insets = useSafeAreaInsets();
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
+  const threadShells = useThreadShells();
+  const projects = useProjects();
   const ready = AsyncResult.isSuccess(preferencesResult);
   const stored = ready ? preferencesResult.value : {};
   const voice = resolveVoicePreferences(stored);
+  const backgroundControlsEnabled = stored.voiceBackgroundControlsEnabled === true;
+  const backgroundDefaultMode = stored.voiceBackgroundDefaultMode ?? "realtime";
+  const target = stored.voiceThreadTarget;
+  const backgroundThreadTargetValid =
+    target != null &&
+    threadShells.some(
+      (thread) =>
+        String(thread.environmentId) === target.environmentId &&
+        String(thread.id) === target.threadId &&
+        thread.archivedAt === null &&
+        projects.some(
+          (project) =>
+            project.environmentId === thread.environmentId && project.id === thread.projectId,
+        ),
+    );
   const noSpeechEnabled = voice.noSpeechTimeoutMs !== null;
   const [notificationPermission, setNotificationPermission] = useState<
     "checking" | "granted" | "denied" | "open-settings" | "unavailable"
   >("checking");
+  const [microphonePermissionGranted, setMicrophonePermissionGranted] = useState(false);
   const refreshNotificationPermission = useCallback(async () => {
     if (Platform.OS !== "android") {
       setNotificationPermission("unavailable");
@@ -58,7 +77,11 @@ export function SettingsVoiceRouteScreen() {
       return;
     }
     try {
-      const permission = await native.getNotificationPermissionAsync();
+      const [permission, microphone] = await Promise.all([
+        native.getNotificationPermissionAsync(),
+        native.getMicrophonePermissionAsync(),
+      ]);
+      setMicrophonePermissionGranted(microphone.granted);
       setNotificationPermission(
         permission.granted ? "granted" : permission.canAskAgain ? "denied" : "open-settings",
       );
@@ -85,6 +108,35 @@ export function SettingsVoiceRouteScreen() {
       );
     } catch {
       setNotificationPermission("unavailable");
+    }
+  };
+  const setBackgroundControlsEnabled = async (enabled: boolean) => {
+    if (!enabled) {
+      savePreferences({ voiceBackgroundControlsEnabled: false });
+      return;
+    }
+    const native = getT3VoiceNativeModule();
+    if (native === null) return;
+    try {
+      const microphone = microphonePermissionGranted
+        ? await native.getMicrophonePermissionAsync()
+        : await native.requestMicrophonePermissionAsync();
+      const notification =
+        notificationPermission === "granted"
+          ? await native.getNotificationPermissionAsync()
+          : await native.requestNotificationPermissionAsync();
+      setMicrophonePermissionGranted(microphone.granted);
+      setNotificationPermission(notification.granted ? "granted" : "denied");
+      if (!microphone.granted || !notification.granted) {
+        Alert.alert(
+          "Permissions required",
+          "Background voice controls need microphone and notification access.",
+        );
+        return;
+      }
+      savePreferences({ voiceBackgroundControlsEnabled: true });
+    } catch {
+      Alert.alert("Background voice controls unavailable", "Permissions could not be verified.");
     }
   };
   const copyDiagnostics = async () => {
@@ -147,6 +199,54 @@ export function SettingsVoiceRouteScreen() {
             onValueChange={(value) => savePreferences({ threadSpeechEnabled: value })}
           />
         </SettingsSection>
+
+        {Platform.OS === "android" ? (
+          <SettingsSection title="Background controls">
+            <SettingsSwitchRow
+              disabled={!ready}
+              icon="headphones"
+              label="Background voice controls"
+              value={backgroundControlsEnabled}
+              onValueChange={(value) => void setBackgroundControlsEnabled(value)}
+            />
+            <SettingsRow
+              disabled={!ready || !backgroundControlsEnabled}
+              icon="waveform.circle"
+              label="Default voice mode"
+              value={
+                backgroundDefaultMode === "realtime"
+                  ? "Realtime"
+                  : backgroundThreadTargetValid
+                    ? "Active thread"
+                    : "Active thread unavailable"
+              }
+              onPress={() =>
+                Alert.alert(
+                  "Default voice mode",
+                  backgroundThreadTargetValid
+                    ? undefined
+                    : "Use Auto Listen in a thread before selecting Active thread.",
+                  [
+                    {
+                      text: "Realtime",
+                      onPress: () => savePreferences({ voiceBackgroundDefaultMode: "realtime" }),
+                    },
+                    ...(backgroundThreadTargetValid
+                      ? [
+                          {
+                            text: "Active thread",
+                            onPress: () =>
+                              savePreferences({ voiceBackgroundDefaultMode: "thread" as const }),
+                          },
+                        ]
+                      : []),
+                    { text: "Cancel", style: "cancel" },
+                  ],
+                )
+              }
+            />
+          </SettingsSection>
+        ) : null}
 
         <SettingsSection title="Listening">
           <SettingsStepperRow

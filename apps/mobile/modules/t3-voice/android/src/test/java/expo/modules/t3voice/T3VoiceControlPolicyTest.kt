@@ -1,0 +1,245 @@
+package expo.modules.t3voice
+
+import android.view.KeyEvent
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class T3VoiceControlPolicyTest {
+  @Test
+  fun `idle primary requires an attached controller`() {
+    assertEquals(
+      T3VoiceControlDecision.REQUEST_CONTROLLER_START,
+      T3VoiceControlPolicy.decide(
+        T3VoiceControlCommand.PRIMARY,
+        T3VoiceRuntimePhase.IDLE,
+        controllerAttached = true,
+      ),
+    )
+    assertEquals(
+      T3VoiceControlDecision.IGNORE,
+      T3VoiceControlPolicy.decide(
+        T3VoiceControlCommand.PRIMARY,
+        T3VoiceRuntimePhase.IDLE,
+        controllerAttached = false,
+      ),
+    )
+  }
+
+  @Test
+  fun `primary stops every active operation`() {
+    listOf(
+      T3VoiceRuntimePhase.RECORDING,
+      T3VoiceRuntimePhase.PLAYING,
+      T3VoiceRuntimePhase.REALTIME,
+    ).forEach { phase ->
+      assertEquals(
+        T3VoiceControlDecision.STOP_ACTIVE,
+        T3VoiceControlPolicy.decide(
+          T3VoiceControlCommand.PRIMARY,
+          phase,
+          controllerAttached = false,
+        ),
+      )
+    }
+  }
+
+  @Test
+  fun `media buttons accept one down event only`() {
+    assertEquals(
+      T3VoiceControlCommand.PRIMARY,
+      T3VoiceControlPolicy.mediaButtonCommand(
+        KeyEvent.ACTION_DOWN,
+        0,
+        KeyEvent.KEYCODE_HEADSETHOOK,
+      ),
+    )
+    assertEquals(
+      null,
+      T3VoiceControlPolicy.mediaButtonCommand(
+        KeyEvent.ACTION_DOWN,
+        1,
+        KeyEvent.KEYCODE_HEADSETHOOK,
+      ),
+    )
+    assertEquals(
+      null,
+      T3VoiceControlPolicy.mediaButtonCommand(
+        KeyEvent.ACTION_UP,
+        0,
+        KeyEvent.KEYCODE_HEADSETHOOK,
+      ),
+    )
+    assertEquals(
+      null,
+      T3VoiceControlPolicy.mediaButtonCommand(
+        KeyEvent.ACTION_DOWN,
+        0,
+        KeyEvent.KEYCODE_VOLUME_UP,
+      ),
+    )
+  }
+
+  @Test
+  fun `pause and stop media keys never map to start`() {
+    listOf(KeyEvent.KEYCODE_MEDIA_PAUSE, KeyEvent.KEYCODE_MEDIA_STOP).forEach { keyCode ->
+      val command = T3VoiceControlPolicy.mediaButtonCommand(KeyEvent.ACTION_DOWN, 0, keyCode)
+      assertEquals(T3VoiceControlCommand.STOP, command)
+      assertEquals(
+        T3VoiceControlDecision.IGNORE,
+        T3VoiceControlPolicy.decide(
+          requireNotNull(command),
+          T3VoiceRuntimePhase.IDLE,
+          controllerAttached = true,
+        ),
+      )
+    }
+  }
+
+  @Test
+  fun `play style media keys map to primary`() {
+    listOf(
+      KeyEvent.KEYCODE_MEDIA_PLAY,
+      KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+      KeyEvent.KEYCODE_HEADSETHOOK,
+    ).forEach { keyCode ->
+      assertEquals(
+        T3VoiceControlCommand.PRIMARY,
+        T3VoiceControlPolicy.mediaButtonCommand(KeyEvent.ACTION_DOWN, 0, keyCode),
+      )
+    }
+  }
+
+  @Test
+  fun `readiness lifecycle gates sticky service on notification permission`() {
+    val denied = T3VoiceReadinessConfig(enabled = true, notificationPermissionGranted = false)
+    val granted = denied.copy(notificationPermissionGranted = true)
+    assertFalse(T3VoiceForegroundLifecyclePolicy.shouldRemainStarted(denied))
+    assertTrue(T3VoiceForegroundLifecyclePolicy.shouldRemainStarted(granted))
+    assertEquals(
+      android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+      T3VoiceForegroundLifecyclePolicy.readinessServiceTypes(granted, false),
+    )
+    val permitted = granted.copy(microphonePermissionGranted = true)
+    assertTrue(T3VoiceForegroundLifecyclePolicy.readinessServiceTypes(permitted, true) != 0)
+    val mediaOnly = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+    assertEquals(
+      T3VoiceForegroundLifecyclePolicy.readinessServiceTypes(permitted, true),
+      T3VoiceForegroundLifecyclePolicy.activeServiceTypes(mediaOnly, permitted, true),
+    )
+  }
+
+  @Test
+  fun `reconciliation preserves active operation service types`() {
+    val ready =
+      T3VoiceReadinessConfig(
+        enabled = true,
+        microphonePermissionGranted = true,
+        notificationPermissionGranted = true,
+      )
+    val microphone = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+    val media = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+    assertEquals(
+      microphone or media,
+      T3VoiceForegroundLifecyclePolicy.reconciledServiceTypes(
+        T3VoiceRuntimePhase.RECORDING,
+        ready,
+        false,
+      ),
+    )
+    assertEquals(
+      microphone or media,
+      T3VoiceForegroundLifecyclePolicy.reconciledServiceTypes(
+        T3VoiceRuntimePhase.REALTIME,
+        ready,
+        false,
+      ),
+    )
+    assertEquals(
+      microphone or media,
+      T3VoiceForegroundLifecyclePolicy.reconciledServiceTypes(
+        T3VoiceRuntimePhase.PLAYING,
+        ready,
+        true,
+      ),
+    )
+  }
+
+  @Test
+  fun `foreground type validation accepts only nonzero declared subsets`() {
+    val microphone = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+    val media = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+    assertEquals(microphone, T3VoiceForegroundLifecyclePolicy.requireDeclaredNonzero(microphone))
+    assertEquals(media, T3VoiceForegroundLifecyclePolicy.requireDeclaredNonzero(media))
+    assertEquals(
+      microphone or media,
+      T3VoiceForegroundLifecyclePolicy.requireDeclaredNonzero(microphone or media),
+    )
+    assertThrows(IllegalArgumentException::class.java) {
+      T3VoiceForegroundLifecyclePolicy.requireDeclaredNonzero(0)
+    }
+    assertThrows(IllegalArgumentException::class.java) {
+      T3VoiceForegroundLifecyclePolicy.requireDeclaredNonzero(1 shl 30)
+    }
+  }
+
+  @Test
+  fun `repeated disable does not create a new generation`() {
+    val enabled = T3VoiceReadinessConfig(enabled = true, generation = 8)
+    assertTrue(T3VoiceDisablePolicy.shouldCreatePendingDisable(enabled, null))
+    val disabled = enabled.copy(enabled = false, generation = 9)
+    val pending = T3VoiceRuntimeEvent.ReadinessDisabled(9, "notification")
+    assertFalse(T3VoiceDisablePolicy.shouldCreatePendingDisable(disabled, pending))
+    assertFalse(T3VoiceDisablePolicy.shouldCreatePendingDisable(disabled, null))
+  }
+
+  @Test
+  fun `sticky restart readiness remains locked and media only`() {
+    val restored =
+      T3VoiceReadinessConfig(
+        enabled = true,
+        microphonePermissionGranted = true,
+        notificationPermissionGranted = true,
+      )
+    assertTrue(T3VoiceForegroundLifecyclePolicy.shouldRemainStarted(restored))
+    assertEquals(
+      android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+      T3VoiceForegroundLifecyclePolicy.reconciledServiceTypes(
+        T3VoiceRuntimePhase.IDLE,
+        restored,
+        controllerAttached = false,
+      ),
+    )
+  }
+
+  @Test
+  fun `readiness payload equality ignores generation only`() {
+    val first =
+      T3VoiceReadinessConfig(
+        enabled = true,
+        notificationPermissionGranted = true,
+        generation = 4,
+      )
+    assertTrue(first.samePayload(first.copy(generation = 9)))
+    assertFalse(first.samePayload(first.copy(autoRearm = true, generation = 9)))
+  }
+
+  @Test
+  fun `pending notification disable fences stale re-enable`() {
+    val pending = T3VoiceRuntimeEvent.ReadinessDisabled(4, "notification")
+    assertFalse(
+      T3VoiceReadinessReconciliationPolicy.canApply(
+        T3VoiceReadinessConfig(enabled = true),
+        pending,
+      ),
+    )
+    assertTrue(
+      T3VoiceReadinessReconciliationPolicy.canApply(
+        T3VoiceReadinessConfig(enabled = false),
+        pending,
+      ),
+    )
+  }
+}

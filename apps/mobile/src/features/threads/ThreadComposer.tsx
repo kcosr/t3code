@@ -78,6 +78,7 @@ import {
 import { useMasterVoice } from "../voice/MasterVoiceProvider";
 import { resolveVoicePreferences } from "../voice/voicePreferences";
 import { useAutoListenController } from "../voice/useAutoListenController";
+import { NativeThreadCommandActivationCoordinator } from "../voice/nativeVoiceReadiness";
 
 /**
  * Height of the collapsed composer (pill + vertical padding, excluding safe-area inset).
@@ -400,6 +401,23 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     submitReview: submitAutoListenReview,
   } = autoListen;
   const autoListenAlertCycleRef = useRef(0);
+  const nativeThreadActivationRef = useRef(new NativeThreadCommandActivationCoordinator());
+
+  useEffect(() => {
+    const command = realtimeVoice.nativeThreadCommand;
+    if (
+      command === null ||
+      command.environmentId !== props.environmentId ||
+      command.threadId !== props.selectedThread.id
+    ) {
+      return;
+    }
+    nativeThreadActivationRef.current.start(
+      command.commandId,
+      () => activateAutoListen(true),
+      realtimeVoice.completeNativeThreadCommand,
+    );
+  }, [props.environmentId, props.selectedThread.id, realtimeVoice.nativeThreadCommand]);
 
   useEffect(() => {
     const handoff = realtimeVoice.threadVoiceHandoff;

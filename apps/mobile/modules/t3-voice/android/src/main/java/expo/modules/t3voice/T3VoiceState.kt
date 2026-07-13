@@ -152,6 +152,17 @@ internal sealed interface T3VoiceRuntimeEvent {
         "expiresAtEpochMillis" to expiresAtEpochMillis,
       )
   }
+
+  data class ReadinessDisabled(
+    val readinessGeneration: Long,
+    val reason: String,
+  ) : T3VoiceRuntimeEvent {
+    override fun toEventBody(): Map<String, Any> =
+      mapOf(
+        "readinessGeneration" to readinessGeneration.toDouble(),
+        "reason" to reason,
+      )
+  }
 }
 
 internal object T3VoiceStateStore {

@@ -33,8 +33,10 @@ class T3VoiceModule : Module() {
   private var playbackTerminationCollection: Job? = null
   private var realtimeTerminationCollection: Job? = null
   private var threadVoiceHandoffCollection: Job? = null
+  private var voiceCommandCollection: Job? = null
   private var rebindScheduled = false
   private var rebindAttemptedSinceConnection = false
+  private var registeredControllerGeneration: Long? = null
 
   private class PendingBinderOperation(
     val promise: Promise,
@@ -108,6 +110,8 @@ class T3VoiceModule : Module() {
                 is T3VoiceRuntimeEvent.RealtimeTerminated ->
                   sendEvent(REALTIME_TERMINATED_EVENT, event.toEventBody())
                 is T3VoiceRuntimeEvent.ThreadVoiceHandoff -> Unit
+                is T3VoiceRuntimeEvent.ReadinessDisabled ->
+                  sendEvent(READINESS_DISABLED_EVENT, event.toEventBody())
               }
             }
           }
@@ -137,6 +141,13 @@ class T3VoiceModule : Module() {
           appContext.mainQueue.launch {
             connectedBinder.threadVoiceHandoff.collectLatest { event ->
               if (event != null) sendEvent(THREAD_VOICE_HANDOFF_EVENT, event.toEventBody())
+            }
+          }
+        voiceCommandCollection?.cancel()
+        voiceCommandCollection =
+          appContext.mainQueue.launch {
+            connectedBinder.voiceCommands.collectLatest { command ->
+              if (command != null) sendEvent(VOICE_COMMAND_EVENT, command.toEventBody())
             }
           }
       }
@@ -175,10 +186,12 @@ class T3VoiceModule : Module() {
         AUDIO_ROUTE_CHANGED_EVENT,
         REALTIME_TERMINATED_EVENT,
         THREAD_VOICE_HANDOFF_EVENT,
+        VOICE_COMMAND_EVENT,
+        READINESS_DISABLED_EVENT,
       )
 
       Constants(
-        "nativeRevision" to 9,
+        "nativeRevision" to 10,
       )
 
       OnCreate {
@@ -196,6 +209,11 @@ class T3VoiceModule : Module() {
         destroyed = true
         cancelCollections()
         val context = appContext.reactContext
+        val connectedBinder = binder
+        registeredControllerGeneration?.let { generation ->
+          connectedBinder?.unregisterVoiceController(generation)
+        }
+        registeredControllerGeneration = null
         val pending = synchronized(binderLock) { pendingBinderOperations.destroy() }
         pending.forEach { entry ->
           rejectPendingOperation(
@@ -223,6 +241,135 @@ class T3VoiceModule : Module() {
 
       AsyncFunction("getStateAsync") {
         T3VoiceStateStore.state.value.toEventBody()
+      }
+
+      AsyncFunction("setReadinessSnapshotAsync") { input: Map<String, Any?>, promise: Promise ->
+        requireExactKeys(
+          input,
+          setOf(
+            "enabled",
+            "mode",
+            "targetId",
+            "audioRouteId",
+            "autoRearm",
+            "microphonePermissionGranted",
+            "notificationPermissionGranted",
+          ),
+        )
+        val enabled = input["enabled"] as? Boolean
+          ?: throw IllegalArgumentException("enabled must be a boolean.")
+        val mode =
+          when (input["mode"] as? String) {
+            "realtime" -> T3VoiceReadinessMode.REALTIME
+            "thread" -> T3VoiceReadinessMode.THREAD
+            else -> throw IllegalArgumentException("mode must be realtime or thread.")
+          }
+        val targetId =
+          when (val value = input["targetId"]) {
+            null -> null
+            is String -> value.takeIf(String::isNotBlank)
+              ?: throw IllegalArgumentException("targetId must not be blank.")
+            else -> throw IllegalArgumentException("targetId must be a string or null.")
+          }
+        val audioRouteId = input["audioRouteId"] as? String
+          ?: throw IllegalArgumentException("audioRouteId must be a string.")
+        require(audioRouteId.isNotBlank()) { "audioRouteId must not be blank." }
+        val autoRearm = input["autoRearm"] as? Boolean
+          ?: throw IllegalArgumentException("autoRearm must be a boolean.")
+        val microphonePermissionGranted = input["microphonePermissionGranted"] as? Boolean
+          ?: throw IllegalArgumentException("microphonePermissionGranted must be a boolean.")
+        val notificationPermissionGranted = input["notificationPermissionGranted"] as? Boolean
+          ?: throw IllegalArgumentException("notificationPermissionGranted must be a boolean.")
+        withBinder(promise, "voice-readiness-update-failed") { service, settlement ->
+          val snapshot =
+            service.setReadinessSnapshot(
+              T3VoiceReadinessConfig(
+                enabled,
+                mode,
+                targetId,
+                audioRouteId,
+                autoRearm,
+                microphonePermissionGranted,
+                notificationPermissionGranted,
+              ),
+            )
+          settlement.resolve(
+            mapOf(
+              "enabled" to snapshot.enabled,
+              "mode" to snapshot.mode.name.lowercase(),
+              "targetId" to snapshot.targetId,
+              "audioRouteId" to snapshot.audioRouteId,
+              "autoRearm" to snapshot.autoRearm,
+              "microphonePermissionGranted" to snapshot.microphonePermissionGranted,
+              "notificationPermissionGranted" to snapshot.notificationPermissionGranted,
+              "generation" to snapshot.generation.toDouble(),
+            ),
+          )
+        }
+      }
+
+      AsyncFunction("registerVoiceControllerAsync") { input: Map<String, Any>, promise: Promise ->
+        requireExactKeys(input, setOf("controllerGeneration"))
+        val generation = requireLong(input, "controllerGeneration")
+        withBinder(promise, "voice-controller-registration-failed") { service, settlement ->
+          service.registerVoiceController(generation)
+          registeredControllerGeneration = generation
+          settlement.resolve()
+        }
+      }
+
+      AsyncFunction("unregisterVoiceControllerAsync") { input: Map<String, Any>, promise: Promise ->
+        requireExactKeys(input, setOf("controllerGeneration"))
+        val generation = requireLong(input, "controllerGeneration")
+        withBinder(promise, "voice-controller-unregistration-failed") { service, settlement ->
+          service.unregisterVoiceController(generation)
+          if (registeredControllerGeneration == generation) registeredControllerGeneration = null
+          settlement.resolve()
+        }
+      }
+
+      AsyncFunction("getPendingVoiceCommandAsync") { promise: Promise ->
+        withBinder(promise, "voice-command-read-failed") { service, settlement ->
+          settlement.resolve(service.pendingVoiceCommand())
+        }
+      }
+
+      AsyncFunction("getPendingReadinessDisabledAsync") { promise: Promise ->
+        withBinder(promise, "readiness-disabled-read-failed") { service, settlement ->
+          settlement.resolve(service.pendingReadinessDisabled())
+        }
+      }
+
+      AsyncFunction("acknowledgeReadinessDisabledAsync") {
+        input: Map<String, Any>, promise: Promise ->
+        requireExactKeys(input, setOf("readinessGeneration"))
+        val generation = requireLong(input, "readinessGeneration")
+        withBinder(promise, "readiness-disabled-acknowledgement-failed") {
+          service,
+          settlement,
+          ->
+          check(service.acknowledgeReadinessDisabled(generation)) {
+            "The readiness-disabled event is stale."
+          }
+          settlement.resolve()
+        }
+      }
+
+      AsyncFunction("completeVoiceCommandAsync") { input: Map<String, Any>, promise: Promise ->
+        requireExactKeys(input, setOf("commandId", "controllerGeneration", "outcome"))
+        val commandId = requireIdentifier(input, "commandId")
+        val generation = requireLong(input, "controllerGeneration")
+        val outcome = input["outcome"] as? String
+          ?: throw IllegalArgumentException("outcome must be success or failure.")
+        require(outcome == "success" || outcome == "failure") {
+          "outcome must be success or failure."
+        }
+        withBinder(promise, "voice-command-completion-failed") { service, settlement ->
+          check(service.completeVoiceCommand(commandId, generation, outcome)) {
+            "The voice command is stale or owned by another controller."
+          }
+          settlement.resolve()
+        }
       }
 
       AsyncFunction("getMicrophonePermissionAsync") { promise: Promise ->
@@ -773,6 +920,8 @@ class T3VoiceModule : Module() {
     realtimeTerminationCollection = null
     threadVoiceHandoffCollection?.cancel()
     threadVoiceHandoffCollection = null
+    voiceCommandCollection?.cancel()
+    voiceCommandCollection = null
     recordingTerminationCollection?.cancel()
     recordingTerminationCollection = null
     playbackTerminationCollection?.cancel()
@@ -799,6 +948,8 @@ class T3VoiceModule : Module() {
     private const val AUDIO_ROUTE_CHANGED_EVENT = "audioRouteChanged"
     private const val REALTIME_TERMINATED_EVENT = "realtimeTerminated"
     private const val THREAD_VOICE_HANDOFF_EVENT = "threadVoiceHandoff"
+    private const val VOICE_COMMAND_EVENT = "voiceCommand"
+    private const val READINESS_DISABLED_EVENT = "readinessDisabled"
     private const val BINDER_CONNECTION_TIMEOUT_MS = 5_000L
   }
 }
