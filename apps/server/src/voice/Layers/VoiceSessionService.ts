@@ -713,7 +713,7 @@ const make = Effect.gen(function* () {
     const itemHash = NodeCrypto.createHash("sha256")
       .update(`${lease.conversationId}\0${result.toolCallId}`)
       .digest("base64url")
-      .slice(0, 32);
+      .slice(0, 28);
     const createdAtMillis = yield* Clock.currentTimeMillis;
     const createdAt = DateTime.formatIso(DateTime.makeUnsafe(createdAtMillis));
     const preparedExpiresAt = DateTime.formatIso(
@@ -750,7 +750,7 @@ const make = Effect.gen(function* () {
       .completeTerminalToolCall({
         providerFunctionCallId: result.providerFunctionCallId,
         output: result.output,
-        itemId: `t3handoff_${itemHash}`,
+        itemId: `t3h_${itemHash}`,
       })
       .pipe(
         Effect.tapError(() =>

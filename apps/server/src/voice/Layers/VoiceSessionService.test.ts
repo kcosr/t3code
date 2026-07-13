@@ -435,6 +435,9 @@ const makeTerminalHandoffFixture = Effect.fn("test.makeTerminalHandoffFixture")(
   const providerFunctionCallId = `handoff-call-${suffix}`;
   const terminalOutput = yield* Deferred.make<void>();
   const terminalOutputRelease = yield* Deferred.make<void>();
+  const terminalOutputRequest = yield* Ref.make<
+    Parameters<RealtimeProviderSession["completeTerminalToolCall"]>[0] | null
+  >(null);
   const terminated = yield* Ref.make(0);
   const provider: VoiceProviderAdapter = {
     id: `fake-handoff-tool-${suffix}`,
@@ -455,8 +458,9 @@ const makeTerminalHandoffFixture = Effect.fn("test.makeTerminalHandoffFixture")(
           }),
           updateContext: () => Effect.void,
           submitToolOutput: () => Effect.die("terminal handoff used ordinary tool output"),
-          completeTerminalToolCall: () =>
-            Deferred.succeed(terminalOutput, undefined).pipe(
+          completeTerminalToolCall: (request) =>
+            Ref.set(terminalOutputRequest, request).pipe(
+              Effect.andThen(Deferred.succeed(terminalOutput, undefined)),
               Effect.andThen(Deferred.await(terminalOutputRelease)),
               Effect.andThen(
                 terminalFailure
@@ -506,6 +510,7 @@ const makeTerminalHandoffFixture = Effect.fn("test.makeTerminalHandoffFixture")(
     projectId,
     provider,
     terminalOutput,
+    terminalOutputRequest,
     terminalOutputRelease,
     terminated,
     threadId,
@@ -1882,6 +1887,9 @@ it.effect("persists and acknowledges a terminal handoff after realtime teardown"
         sdp: "offer",
       });
       yield* Deferred.await(fixture.terminalOutput);
+      const providerOutput = yield* Ref.get(fixture.terminalOutputRequest);
+      expect(providerOutput?.itemId).toMatch(/^t3h_[A-Za-z0-9_-]{28}$/);
+      expect(providerOutput?.itemId.length).toBe(32);
       expect((yield* Ref.get(test.handoffActions)).get(fixture.actionId)?.status).toBe("prepared");
       yield* Deferred.succeed(fixture.terminalOutputRelease, undefined);
       yield* Effect.yieldNow;
