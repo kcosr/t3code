@@ -136,7 +136,7 @@ export function isSameMasterVoiceFocus(
 }
 
 export function nextVoiceThreadTarget(
-  current: PersistedVoiceThreadTarget | undefined,
+  current: PersistedVoiceThreadTarget | null | undefined,
   focus: MasterVoiceFocus | null,
 ): PersistedVoiceThreadTarget | null {
   if (focus === null) return null;

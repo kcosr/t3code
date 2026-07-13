@@ -5,6 +5,7 @@ import {
   NativeVoiceCommandDeduplicator,
   NativeVoiceCommandCompletionGate,
   NativeVoiceForegroundCommandGate,
+  completeNativeVoiceCommandSafely,
   NativeThreadCommandActivationCoordinator,
   NativeVoiceOperationEpoch,
   completeNativeVoiceCommandAttempt,
@@ -284,6 +285,32 @@ describe("native voice readiness", () => {
     expect(dispatch).toHaveBeenCalledWith("command-1");
     gate.dispose();
     vi.useRealTimers();
+  });
+
+  it("dispatches realtime commands immediately while React is backgrounded", () => {
+    vi.useFakeTimers();
+    const dispatch = vi.fn();
+    const gate = new NativeVoiceForegroundCommandGate(300, dispatch);
+
+    gate.enqueue("realtime-command", "realtime");
+
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(dispatch).toHaveBeenCalledWith("realtime-command");
+    vi.runAllTimers();
+    expect(dispatch).toHaveBeenCalledOnce();
+    gate.dispose();
+    vi.useRealTimers();
+  });
+
+  it("settles stale native completions without an unhandled rejection", async () => {
+    const settled = vi.fn();
+
+    await expect(
+      completeNativeVoiceCommandSafely(async () => {
+        throw new Error("stale controller generation");
+      }, settled),
+    ).resolves.toBeUndefined();
+    expect(settled).toHaveBeenCalledOnce();
   });
 
   it("does not dispatch a queued command after controller disposal", () => {

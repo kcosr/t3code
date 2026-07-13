@@ -68,6 +68,7 @@ import { useComposerPathSearch } from "../../state/use-composer-path-search";
 import { mobilePreferencesAtom } from "../../state/preferences";
 import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerCommandPopover";
 import { useComposerDictation } from "../voice/useComposerDictation";
+import { shouldShowAutoListenPauseAlert } from "../voice/autoListenPausePresentation";
 import {
   activateAutoListenWithAudioHandoff,
   dictationResumeTransition,
@@ -454,16 +455,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     }
     autoListenAlertCycleRef.current = autoListenState.cycle;
     const reason = autoListenState.pauseReason;
-    if (
-      reason === null ||
-      reason === "user" ||
-      reason === "disabled" ||
-      reason === "target-changed" ||
-      reason === "realtime-active" ||
-      reason === "lifecycle"
-    ) {
-      return;
-    }
+    if (!shouldShowAutoListenPauseAlert(reason)) return;
     Alert.alert("Auto Listen paused", autoListenPauseMessage(reason));
   }, [autoListenState]);
 

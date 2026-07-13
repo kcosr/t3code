@@ -37,6 +37,11 @@ describe("voice thread target", () => {
       threadId: focus.threadId,
       generation: 1,
     });
+    expect(nextVoiceThreadTarget(null, focus)).toEqual({
+      environmentId,
+      threadId: focus.threadId,
+      generation: 1,
+    });
     expect(
       nextVoiceThreadTarget(
         { environmentId: "previous", threadId: "previous", generation: 8 },

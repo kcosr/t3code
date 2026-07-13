@@ -104,6 +104,19 @@ export async function completeNativeVoiceCommandAttempt(
   return outcome;
 }
 
+export async function completeNativeVoiceCommandSafely(
+  complete: () => Promise<void>,
+  settled: () => void,
+): Promise<void> {
+  try {
+    await complete();
+  } catch {
+    // The native controller may already be fenced or gone during a deadline or teardown.
+  } finally {
+    settled();
+  }
+}
+
 export function isNextNativeReadinessGeneration(
   currentGeneration: number | null,
   eventGeneration: number,
@@ -209,8 +222,12 @@ export class NativeVoiceForegroundCommandGate<A> {
     private readonly dispatch: (command: A) => void,
   ) {}
 
-  enqueue(command: A): void {
+  enqueue(command: A, mode: "realtime" | "thread" = "thread"): void {
     if (this.disposed) return;
+    if (mode === "realtime") {
+      this.dispatch(command);
+      return;
+    }
     this.pending = command;
     this.scheduleDispatch();
   }

@@ -53,6 +53,7 @@ import {
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
 import {
   completeNativeVoiceCommandAttempt,
+  completeNativeVoiceCommandSafely,
   isNextNativeReadinessGeneration,
   NativeVoiceCommandCompletionGate,
   NativeVoiceCommandDeduplicator,
@@ -824,19 +825,18 @@ export function MasterVoiceProvider(props: {
     const epoch = nativeOperationsRef.current.begin();
     activeNativeEpochRef.current = epoch;
 
-    const completeCommand = async (event: T3VoiceCommandEvent, outcome: "success" | "failure") => {
-      try {
-        await nativeOperationsRef.current.run(epoch, () =>
-          native.completeVoiceCommandAsync({
-            commandId: event.commandId,
-            controllerGeneration: event.controllerGeneration,
-            outcome,
-          }),
-        );
-      } finally {
-        nativeCommandsRef.current.release(event.commandId);
-      }
-    };
+    const completeCommand = (event: T3VoiceCommandEvent, outcome: "success" | "failure") =>
+      completeNativeVoiceCommandSafely(
+        () =>
+          nativeOperationsRef.current.run(epoch, () =>
+            native.completeVoiceCommandAsync({
+              commandId: event.commandId,
+              controllerGeneration: event.controllerGeneration,
+              outcome,
+            }),
+          ),
+        () => nativeCommandsRef.current.release(event.commandId),
+      );
 
     const runCommand = (event: T3VoiceCommandEvent) => {
       if (
@@ -901,7 +901,7 @@ export function MasterVoiceProvider(props: {
         !nativeCommandsRef.current.claim(event.commandId)
       )
         return;
-      foregroundCommands.enqueue(event);
+      foregroundCommands.enqueue(event, readiness.mode);
     };
     const subscription = native.addListener("voiceCommand", acceptCommand);
     const appStateSubscription = AppState.addEventListener("change", (state) => {
@@ -1016,13 +1016,15 @@ export function MasterVoiceProvider(props: {
         setNativeThreadCommand((current) =>
           current?.commandId === pendingThreadCommand.commandId ? null : current,
         );
-        void native
-          .completeVoiceCommandAsync({
-            commandId: pendingThreadCommand.commandId,
-            controllerGeneration: pendingThreadCommand.controllerGeneration,
-            outcome: "failure",
-          })
-          .finally(() => nativeCommandsRef.current.release(pendingThreadCommand.commandId));
+        void completeNativeVoiceCommandSafely(
+          () =>
+            native.completeVoiceCommandAsync({
+              commandId: pendingThreadCommand.commandId,
+              controllerGeneration: pendingThreadCommand.controllerGeneration,
+              outcome: "failure",
+            }),
+          () => nativeCommandsRef.current.release(pendingThreadCommand.commandId),
+        );
       }
       nativeOperationsRef.current.invalidate(epoch);
       nativeCommandsRef.current.clear();
@@ -1068,15 +1070,15 @@ export function MasterVoiceProvider(props: {
       nativeThreadTimeoutsRef.current.delete(commandId);
       nativeThreadCommandRef.current = null;
       setNativeThreadCommand((current) => (current?.commandId === commandId ? null : current));
-      try {
-        await native.completeVoiceCommandAsync({
-          commandId,
-          controllerGeneration: command.controllerGeneration,
-          outcome,
-        });
-      } finally {
-        nativeCommandsRef.current.release(commandId);
-      }
+      await completeNativeVoiceCommandSafely(
+        () =>
+          native.completeVoiceCommandAsync({
+            commandId,
+            controllerGeneration: command.controllerGeneration,
+            outcome,
+          }),
+        () => nativeCommandsRef.current.release(commandId),
+      );
     },
     [native],
   );
