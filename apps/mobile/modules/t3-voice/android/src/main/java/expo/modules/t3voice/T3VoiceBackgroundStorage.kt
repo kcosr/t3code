@@ -191,10 +191,16 @@ internal class T3VoiceRuntimeGrantStore(
     val existing = loadIgnoringExpiry()
     if (existing is T3VoiceRuntimeGrantLoadResult.Available) {
       val previous = existing.grant
+      val sameAuthority =
+        grant.metadata.readinessGeneration == previous.metadata.readinessGeneration &&
+          grant.metadata.runtimeId == previous.metadata.runtimeId &&
+          T3VoiceBackgroundOriginPolicy.normalize(grant.metadata.environmentOrigin) ==
+          T3VoiceBackgroundOriginPolicy.normalize(previous.metadata.environmentOrigin) &&
+          grant.metadata.operation == previous.metadata.operation
       require(
         grant.metadata.readinessGeneration > previous.metadata.readinessGeneration ||
-          (grant.metadata == previous.metadata && grant.token == previous.token),
-      ) { "Background voice grant generations must increase." }
+          sameAuthority,
+      ) { "Background voice grant generation or authority is stale." }
       if (grant.metadata == previous.metadata && grant.token == previous.token) return
     }
     val encrypted =

@@ -43,15 +43,25 @@ internal class T3VoiceBackgroundStorageTest {
   }
 
   @Test
-  fun `grant rotation requires a newer readiness generation`() {
+  fun `credential refresh preserves authority while target changes require a new generation`() {
     val store =
       T3VoiceRuntimeGrantStore(MemoryBackgroundStorage(), TestGrantCipher(), clockMillis = { 1_000 })
     val first = runtimeGrant(generation = 7, token = "first-token")
     store.provision(first)
     store.provision(first)
 
+    store.provision(runtimeGrant(generation = 7, token = "refreshed-token", expiresAt = 40_000))
+    assertEquals(
+      "refreshed-token",
+      (store.load() as T3VoiceRuntimeGrantLoadResult.Available).grant.token,
+    )
+    val changedAuthority =
+      runtimeGrant(generation = 7, token = "wrong-authority").copy(
+        metadata = first.metadata.copy(operation = T3VoiceRuntimeGrantOperation.REALTIME_START),
+      )
+    assertThrows(IllegalArgumentException::class.java) { store.provision(changedAuthority) }
     assertThrows(IllegalArgumentException::class.java) {
-      store.provision(runtimeGrant(generation = 7, token = "replacement-token"))
+      store.provision(runtimeGrant(generation = 6, token = "stale-token"))
     }
     store.provision(runtimeGrant(generation = 8, token = "replacement-token"))
     assertEquals(
