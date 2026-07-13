@@ -581,7 +581,29 @@ internal enum class T3VoiceControlDecision {
   IGNORE,
 }
 
+internal enum class T3VoicePendingControlDecision {
+  IGNORE,
+  CANCEL,
+  NOT_APPLICABLE,
+}
+
 internal object T3VoiceControlPolicy {
+  fun pendingStartDecision(
+    command: T3VoiceControlCommand,
+    phase: T3VoiceRuntimePhase,
+    attemptActive: Boolean,
+  ): T3VoicePendingControlDecision {
+    if (!attemptActive || phase != T3VoiceRuntimePhase.IDLE) {
+      return T3VoicePendingControlDecision.NOT_APPLICABLE
+    }
+    return when (command) {
+      T3VoiceControlCommand.PRIMARY,
+      T3VoiceControlCommand.TOGGLE_MUTE,
+      -> T3VoicePendingControlDecision.IGNORE
+      T3VoiceControlCommand.STOP -> T3VoicePendingControlDecision.CANCEL
+    }
+  }
+
   fun decide(
     command: T3VoiceControlCommand,
     phase: T3VoiceRuntimePhase,
@@ -638,4 +660,11 @@ internal object T3VoiceControlPolicy {
       else -> null
     }
   }
+
+  fun consumesMediaButton(keyCode: Int): Boolean =
+    keyCode == KeyEvent.KEYCODE_MEDIA_PLAY ||
+      keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
+      keyCode == KeyEvent.KEYCODE_HEADSETHOOK ||
+      keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE ||
+      keyCode == KeyEvent.KEYCODE_MEDIA_STOP
 }

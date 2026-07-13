@@ -153,6 +153,36 @@ class T3VoiceControlPolicyTest {
         KeyEvent.KEYCODE_VOLUME_UP,
       ),
     )
+    assertTrue(T3VoiceControlPolicy.consumesMediaButton(KeyEvent.KEYCODE_HEADSETHOOK))
+    assertFalse(T3VoiceControlPolicy.consumesMediaButton(KeyEvent.KEYCODE_VOLUME_UP))
+  }
+
+  @Test
+  fun `primary is idempotent while a native thread start is pending`() {
+    assertEquals(
+      T3VoicePendingControlDecision.IGNORE,
+      T3VoiceControlPolicy.pendingStartDecision(
+        T3VoiceControlCommand.PRIMARY,
+        T3VoiceRuntimePhase.IDLE,
+        attemptActive = true,
+      ),
+    )
+    assertEquals(
+      T3VoicePendingControlDecision.CANCEL,
+      T3VoiceControlPolicy.pendingStartDecision(
+        T3VoiceControlCommand.STOP,
+        T3VoiceRuntimePhase.IDLE,
+        attemptActive = true,
+      ),
+    )
+    assertEquals(
+      T3VoicePendingControlDecision.NOT_APPLICABLE,
+      T3VoiceControlPolicy.pendingStartDecision(
+        T3VoiceControlCommand.PRIMARY,
+        T3VoiceRuntimePhase.RECORDING,
+        attemptActive = true,
+      ),
+    )
   }
 
   @Test

@@ -362,6 +362,26 @@ class T3VoiceBackgroundThreadExecutionTest {
     assertTrue(attempt.finishCancellationCall(cleanup))
   }
 
+  @Test fun `prepared cancellation can recover the operation credential after execution stops`() {
+    val attempt = T3VoiceBackgroundThreadAttempt(
+      T3VoiceBackgroundThreadAuthority(
+        "runtime-1", 4, "https://example.test", "project-1", "thread-1", true,
+      ),
+      "client-1",
+      cancelRequested = true,
+    )
+    val recovery = FakeCall()
+
+    assertTrue(attempt.beginCall(recovery, allowCancellationRecovery = true))
+    assertTrue(attempt.hasActiveCall())
+    assertTrue(attempt.finishCall(recovery))
+
+    attempt.stopped = true
+    val rejected = FakeCall()
+    assertFalse(attempt.beginCall(rejected, allowCancellationRecovery = true))
+    assertTrue(rejected.cancelled)
+  }
+
   @Test fun `revocation fence is cleared last and survives derived cleanup crash`() {
     val order = mutableListOf<String>()
     assertFalse(T3VoiceRevocationAcknowledgementCoordinator.run(

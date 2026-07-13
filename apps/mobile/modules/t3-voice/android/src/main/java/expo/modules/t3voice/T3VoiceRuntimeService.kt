@@ -766,7 +766,6 @@ class T3VoiceRuntimeService : Service() {
   private var backgroundRealtimeCleanupInFlight = false
   private var backgroundRealtimeCleanupFailures = 0
   private var backgroundRealtimeRestartRequest = T3VoiceBackgroundRealtimeRestartRequest.NONE
-  private var startAfterThreadCancellation: T3VoiceBackgroundThreadAttempt? = null
   @Volatile private var serviceDestroyed = false
   private val backgroundRealtimeIo: ExecutorService = Executors.newSingleThreadExecutor()
   private val backgroundThreadCancellationIo: ExecutorService = Executors.newSingleThreadExecutor()
@@ -2086,14 +2085,12 @@ class T3VoiceRuntimeService : Service() {
       fenceBackgroundThreadForReconciliationLocked(attempt)
       return
     }
-    attempt.stopped = true
     stopBackgroundThreadLocked(cancelServer = true)
   }
 
   private fun fenceBackgroundThreadForReconciliationLocked(
     attempt: T3VoiceBackgroundThreadAttempt,
   ) {
-    if (startAfterThreadCancellation === attempt) startAfterThreadCancellation = null
     stopBackgroundThreadAudioLocked(attempt, "reconciliation-required")
     attempt.cancelAllCalls()
     attempt.stopped = true
@@ -2196,13 +2193,8 @@ class T3VoiceRuntimeService : Service() {
   private fun reconcileAfterBackgroundThreadStopLocked(
     attempt: T3VoiceBackgroundThreadAttempt,
   ) {
-    val shouldStart = startAfterThreadCancellation === attempt
-    if (shouldStart) startAfterThreadCancellation = null
     if (T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
       stopRuntimeForegroundLocked()
-      if (shouldStart && !serviceDestroyed) {
-        executeControlCommandLocked(T3VoiceControlCommand.PRIMARY)
-      }
     } else {
       updateNativeControlSurfacesLocked()
     }
@@ -2300,7 +2292,6 @@ class T3VoiceRuntimeService : Service() {
   private fun fenceBackgroundThreadForReadinessLocked(next: T3VoiceReadinessConfig) {
     val attempt = backgroundThreadAttempt ?: return
     if (T3VoiceBackgroundThreadAttemptPolicy.owns(attempt, next)) return
-    if (startAfterThreadCancellation === attempt) startAfterThreadCancellation = null
     stopBackgroundThreadAudioLocked(attempt, "readiness-changed")
     stopBackgroundThreadLocked(cancelServer = true)
   }
@@ -2926,30 +2917,41 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun executeControlCommandLocked(command: T3VoiceControlCommand) {
-    if (command == T3VoiceControlCommand.STOP) startAfterThreadCancellation = null
     backgroundRealtimeRestartRequest =
       T3VoiceBackgroundRealtimeRestartPolicy.afterControl(backgroundRealtimeRestartRequest, command)
-    if (
-      backgroundThreadAttempt != null &&
-        T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE &&
-        (command == T3VoiceControlCommand.PRIMARY || command == T3VoiceControlCommand.STOP)
-    ) {
-      startAfterThreadCancellation =
-        backgroundThreadAttempt?.takeIf { command == T3VoiceControlCommand.PRIMARY }
-      stopBackgroundThreadLocked(cancelServer = true)
-      stopRuntimeForegroundLocked()
-      updateNativeControlSurfacesLocked()
-      return
+    when (T3VoiceControlPolicy.pendingStartDecision(
+        command,
+        T3VoiceStateStore.state.value.phase,
+        backgroundThreadAttempt != null,
+      )) {
+      T3VoicePendingControlDecision.IGNORE -> {
+        updateNativeControlSurfacesLocked()
+        return
+      }
+      T3VoicePendingControlDecision.CANCEL -> {
+        stopBackgroundThreadLocked(cancelServer = true)
+        stopRuntimeForegroundLocked()
+        updateNativeControlSurfacesLocked()
+        return
+      }
+      T3VoicePendingControlDecision.NOT_APPLICABLE -> Unit
     }
-    if (
-      backgroundRealtimeAttempt != null &&
-        T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE &&
-        (command == T3VoiceControlCommand.PRIMARY || command == T3VoiceControlCommand.STOP)
-    ) {
-      abandonBackgroundRealtimeLocked(backgroundRealtimeAttempt, closeServer = true)
-      stopRuntimeForegroundLocked()
-      updateNativeControlSurfacesLocked()
-      return
+    when (T3VoiceControlPolicy.pendingStartDecision(
+        command,
+        T3VoiceStateStore.state.value.phase,
+        backgroundRealtimeAttempt != null,
+      )) {
+      T3VoicePendingControlDecision.IGNORE -> {
+        updateNativeControlSurfacesLocked()
+        return
+      }
+      T3VoicePendingControlDecision.CANCEL -> {
+        abandonBackgroundRealtimeLocked(backgroundRealtimeAttempt, closeServer = true)
+        stopRuntimeForegroundLocked()
+        updateNativeControlSurfacesLocked()
+        return
+      }
+      T3VoicePendingControlDecision.NOT_APPLICABLE -> Unit
     }
     val nativeRealtimeAvailable = nativeRealtimeAuthorityLocked() != null
     val nativeThreadAvailable = nativeThreadAuthorityLocked() != null
@@ -2981,7 +2983,6 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun stopActiveOperationLocked() {
-    startAfterThreadCancellation = null
     val state = T3VoiceStateStore.state.value
     stopBackgroundThreadLocked(cancelServer = true)
     abandonBackgroundRealtimeLocked(backgroundRealtimeAttempt, closeServer = true)
@@ -3325,7 +3326,9 @@ class T3VoiceRuntimeService : Service() {
                 event.action,
                 event.repeatCount,
                 event.keyCode,
-              ) ?: return false
+              )
+            if (!T3VoiceControlPolicy.consumesMediaButton(event.keyCode)) return false
+            if (command == null) return true
             mainHandler.post {
               if (serviceDestroyed) return@post
               synchronized(operationLock) {
@@ -3406,8 +3409,9 @@ class T3VoiceRuntimeService : Service() {
     val active = nativeControlSurfaceActiveLocked(state)
     val controllerAttached = controllerCommands.isAttached()
     val canStart =
-      nativeRealtimeAuthorityLocked() != null ||
-        nativeThreadAuthorityLocked() != null
+      backgroundRealtimeAttempt == null &&
+        backgroundThreadAttempt == null &&
+        (nativeRealtimeAuthorityLocked() != null || nativeThreadAuthorityLocked() != null)
     val primaryIntent =
       PendingIntent.getService(
         this,
