@@ -1393,9 +1393,17 @@ class T3VoiceRuntimeService : Service() {
     val persistedActive = (persisted as? T3VoiceBackgroundThreadOperationLoadResult.Available)
       ?.state as? T3VoiceBackgroundThreadOperationState.Active
     if (persistedActive != null) {
-      val authority = T3VoiceBackgroundThreadAuthorityPolicy.restore(
-        readinessConfig, readinessStore.activeAuthority(), persistedActive, System.currentTimeMillis(),
-      ) ?: return
+      val authority =
+        if (persistedActive.cancelRequested) {
+          T3VoiceBackgroundThreadAuthorityPolicy.cancellationAuthority(persistedActive)
+        } else {
+          T3VoiceBackgroundThreadAuthorityPolicy.restore(
+            readinessConfig,
+            readinessStore.activeAuthority(),
+            persistedActive,
+            System.currentTimeMillis(),
+          ) ?: return
+        }
       val attempt = T3VoiceBackgroundThreadAttempt(authority, persistedActive.claim.clientOperationId)
       backgroundSnapshot = persistedActive.snapshot
       backgroundSnapshotStore.write(persistedActive.snapshot)
@@ -1449,7 +1457,20 @@ class T3VoiceRuntimeService : Service() {
       }
       return
     }
-    val authorization = nativeThreadAuthorityLocked() ?: return
+    val prepared = (persisted as? T3VoiceBackgroundThreadOperationLoadResult.Available)
+      ?.state as? T3VoiceBackgroundThreadOperationState.Prepared
+    val authorization =
+      if (prepared?.cancelRequested == true) {
+        T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
+          runCatching { T3VoiceRuntimeGrantStore(applicationContext).load() }.getOrNull()
+            ?: return,
+          readinessStore.activeAuthority(),
+          prepared.claim,
+          System.currentTimeMillis(),
+        ) ?: return
+      } else {
+        nativeThreadAuthorityLocked() ?: return
+      }
     val authority = authorization.authority
     val claim = when (persisted) {
       T3VoiceBackgroundThreadOperationLoadResult.Missing ->
@@ -1469,9 +1490,7 @@ class T3VoiceRuntimeService : Service() {
       T3VoiceBackgroundThreadOperationLoadResult.Locked -> return
     }
     val attempt = T3VoiceBackgroundThreadAttempt(authority, claim.clientOperationId)
-    attempt.cancelRequested =
-      ((persisted as? T3VoiceBackgroundThreadOperationLoadResult.Available)?.state as?
-        T3VoiceBackgroundThreadOperationState.Prepared)?.cancelRequested == true
+    attempt.cancelRequested = prepared?.cancelRequested == true
     attempt.detached = attempt.cancelRequested
     backgroundThreadAttempt = attempt
     ensureRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
