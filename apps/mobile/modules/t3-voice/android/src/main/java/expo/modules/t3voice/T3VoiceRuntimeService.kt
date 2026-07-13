@@ -346,8 +346,7 @@ class T3VoiceRuntimeService : Service() {
           authority.config.generation != readinessConfig.generation)) return@synchronized null
       mapOf(
         "sequence" to state.sequence.toDouble(),
-        "active" to (state.activeRealtimeSessionId != null || backgroundRealtimeAttempt != null ||
-          backgroundThreadAttempt != null),
+        "active" to nativeControlSurfaceActiveLocked(state),
         "phase" to state.phase.name.lowercase(),
         "runtimeId" to authority?.runtimeId,
         "readinessGeneration" to readinessConfig.generation.toDouble(),
@@ -1156,6 +1155,15 @@ class T3VoiceRuntimeService : Service() {
     )) {
       T3VoiceBackgroundThreadStoredStateDecision.NONE -> return false
       T3VoiceBackgroundThreadStoredStateDecision.RESTORE -> return true
+      T3VoiceBackgroundThreadStoredStateDecision.CANCEL_PREPARED -> {
+        val prepared = (loaded as T3VoiceBackgroundThreadOperationLoadResult.Available)
+          .state as T3VoiceBackgroundThreadOperationState.Prepared
+        backgroundThreadOperationStore.writePrepared(
+          prepared.claim,
+          cancelRequested = true,
+        )
+        return true
+      }
       T3VoiceBackgroundThreadStoredStateDecision.CANCEL_UNDISPATCHED -> {
         val active = (loaded as T3VoiceBackgroundThreadOperationLoadResult.Available)
           .state as T3VoiceBackgroundThreadOperationState.Active
@@ -3336,12 +3344,7 @@ class T3VoiceRuntimeService : Service() {
   private fun updateNativeControlSurfacesLocked() {
     val session = mediaSession ?: return
     val state = T3VoiceStateStore.state.value
-    val active =
-      backgroundRealtimeAttempt != null ||
-        backgroundThreadAttempt != null ||
-        backgroundRealtimeCleanup !== null ||
-        backgroundRealtimeCleanupLocked ||
-        (state.phase != T3VoiceRuntimePhase.IDLE && state.phase != T3VoiceRuntimePhase.INACTIVE)
+    val active = nativeControlSurfaceActiveLocked(state)
     session.setPlaybackState(
       PlaybackState.Builder()
         .setActions(
@@ -3382,12 +3385,7 @@ class T3VoiceRuntimeService : Service() {
   @Suppress("DEPRECATION")
   private fun buildNotification(): Notification {
     val state = T3VoiceStateStore.state.value
-    val active =
-      backgroundRealtimeAttempt != null ||
-        backgroundThreadAttempt != null ||
-        backgroundRealtimeCleanup !== null ||
-        backgroundRealtimeCleanupLocked ||
-        (state.phase != T3VoiceRuntimePhase.IDLE && state.phase != T3VoiceRuntimePhase.INACTIVE)
+    val active = nativeControlSurfaceActiveLocked(state)
     val controllerAttached = controllerCommands.isAttached()
     val canStart =
       nativeRealtimeAuthorityLocked() != null ||
@@ -3472,6 +3470,16 @@ class T3VoiceRuntimeService : Service() {
       builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disable", disableReadinessIntent)
     }
     return builder.build()
+  }
+
+  private fun nativeControlSurfaceActiveLocked(state: T3VoiceRuntimeState): Boolean {
+    val threadAttempt = backgroundThreadAttempt
+    return T3VoiceNativeControlSurfacePolicy.isActive(
+      phase = state.phase,
+      realtimeAttemptActive = backgroundRealtimeAttempt != null,
+      threadAttemptActive = threadAttempt != null,
+      threadCancellationOnly = threadAttempt?.cancelRequested == true,
+    )
   }
 
   companion object {

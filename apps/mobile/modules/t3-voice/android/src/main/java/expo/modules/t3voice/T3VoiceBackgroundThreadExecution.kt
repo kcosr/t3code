@@ -281,6 +281,7 @@ internal object T3VoiceBackgroundThreadRecordingRecovery {
 internal enum class T3VoiceBackgroundThreadStoredStateDecision {
   NONE,
   RESTORE,
+  CANCEL_PREPARED,
   CANCEL_UNDISPATCHED,
   REVOKE,
 }
@@ -306,12 +307,24 @@ internal object T3VoiceBackgroundThreadStoredStatePolicy {
         }
       is T3VoiceBackgroundThreadOperationState.Prepared ->
         if (parentGrantAvailable) {
-          T3VoiceBackgroundThreadStoredStateDecision.RESTORE
+          T3VoiceBackgroundThreadStoredStateDecision.CANCEL_PREPARED
         } else {
           T3VoiceBackgroundThreadStoredStateDecision.REVOKE
         }
     }
   }
+}
+
+internal object T3VoiceNativeControlSurfacePolicy {
+  fun isActive(
+    phase: T3VoiceRuntimePhase,
+    realtimeAttemptActive: Boolean,
+    threadAttemptActive: Boolean,
+    threadCancellationOnly: Boolean,
+  ): Boolean =
+    realtimeAttemptActive ||
+      (threadAttemptActive && !threadCancellationOnly) ||
+      (phase != T3VoiceRuntimePhase.IDLE && phase != T3VoiceRuntimePhase.INACTIVE)
 }
 
 internal object T3VoiceBackgroundThreadEventBatchPolicy {

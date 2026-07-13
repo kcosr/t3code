@@ -451,16 +451,34 @@ class T3VoiceBackgroundThreadExecutionTest {
           expiresAtEpochMillis = NOW + 10_000,
           snapshot = active.snapshot.copy(dispatchAcknowledged = true),
         )), true, NOW))
-    assertEquals(T3VoiceBackgroundThreadStoredStateDecision.RESTORE,
+    assertEquals(T3VoiceBackgroundThreadStoredStateDecision.CANCEL_PREPARED,
       T3VoiceBackgroundThreadStoredStatePolicy.decide(
         T3VoiceBackgroundThreadOperationLoadResult.Available(
           T3VoiceBackgroundThreadOperationState.Prepared(claim, cancelRequested = true)),
+        true, NOW))
+    assertEquals(T3VoiceBackgroundThreadStoredStateDecision.CANCEL_PREPARED,
+      T3VoiceBackgroundThreadStoredStatePolicy.decide(
+        T3VoiceBackgroundThreadOperationLoadResult.Available(
+          T3VoiceBackgroundThreadOperationState.Prepared(claim)),
         true, NOW))
     assertEquals(T3VoiceBackgroundThreadStoredStateDecision.REVOKE,
       T3VoiceBackgroundThreadStoredStatePolicy.decide(
         T3VoiceBackgroundThreadOperationLoadResult.Available(
           T3VoiceBackgroundThreadOperationState.Prepared(claim, cancelRequested = true)),
         false, NOW))
+  }
+
+  @Test fun `native control surfaces ignore cancellation-only reconciliation`() {
+    assertFalse(T3VoiceNativeControlSurfacePolicy.isActive(
+      T3VoiceRuntimePhase.IDLE, false, true, true))
+    assertTrue(T3VoiceNativeControlSurfacePolicy.isActive(
+      T3VoiceRuntimePhase.IDLE, false, true, false))
+    assertTrue(T3VoiceNativeControlSurfacePolicy.isActive(
+      T3VoiceRuntimePhase.IDLE, true, false, false))
+    assertTrue(T3VoiceNativeControlSurfacePolicy.isActive(
+      T3VoiceRuntimePhase.RECORDING, false, false, false))
+    assertFalse(T3VoiceNativeControlSurfacePolicy.isActive(
+      T3VoiceRuntimePhase.IDLE, false, false, false))
   }
 
   private fun readiness() = T3VoiceReadinessConfig(
