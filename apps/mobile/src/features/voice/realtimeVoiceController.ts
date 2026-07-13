@@ -349,6 +349,7 @@ export class RealtimeVoiceController {
     const generation = ++this.startGeneration;
     await this.reconcileNativeRuntime();
     this.ensureCurrentStart(generation);
+    if (this.snapshot.phase === "active") return this.snapshot;
     if (this.snapshot.phase !== "idle" && this.snapshot.phase !== "error") {
       throw new Error("A Realtime voice session is already starting or active");
     }
@@ -658,6 +659,7 @@ export class RealtimeVoiceController {
 
   async detach(): Promise<void> {
     if (this.detached) return;
+    const preserveActiveSnapshot = this.active !== null;
     this.detached = true;
     this.startGeneration += 1;
     this.startingNativeSessionId = null;
@@ -669,6 +671,9 @@ export class RealtimeVoiceController {
       this.startInFlight ?? Promise.resolve(),
       reconciliation?.catch(() => undefined) ?? Promise.resolve(),
     ]);
+    if (!preserveActiveSnapshot && this.active === null) {
+      this.setSnapshot({ phase: "idle", session: null, error: null, focus: null });
+    }
   }
 
   private startControlTimers() {
@@ -820,6 +825,7 @@ export class RealtimeVoiceController {
     this.setSnapshot({ native: before });
     const nativeSessionId = before.activeRealtimeSessionId;
     if (nativeSessionId === null) return;
+    this.setSnapshot({ phase: "starting", session: null, error: null, focus: null });
 
     const sessionId = VoiceSessionId.make(nativeSessionId);
     let state: VoiceSessionState;
@@ -843,18 +849,22 @@ export class RealtimeVoiceController {
         stopFailure = cause;
       }
       const after = await this.native.getStateAsync();
-      this.setSnapshot({ native: after });
       if (after.activeRealtimeSessionId !== null) {
+        this.setSnapshot({ native: after });
         throw stopFailure ?? new Error("The stale Realtime media session could not be stopped");
       }
       await this.clearAttachment(sessionId, null);
+      this.setSnapshot({ native: after, phase: "idle", session: null, error: null, focus: null });
       return;
     }
 
     const after = await this.native.getStateAsync();
     if (this.detached || generation !== this.startGeneration) return;
     this.setSnapshot({ native: after });
-    if (after.activeRealtimeSessionId === null) return;
+    if (after.activeRealtimeSessionId === null) {
+      this.setSnapshot({ phase: "idle", session: null, error: null, focus: null });
+      return;
+    }
     if (after.activeRealtimeSessionId !== nativeSessionId) {
       throw new Error("The native Realtime session changed during attachment");
     }

@@ -422,13 +422,13 @@ export function MasterVoiceProvider(props: {
         }),
       );
     };
-    const refreshOwnership = async () => {
+    const refreshOwnership = async (): Promise<string | null> => {
       const [state, ownership, persisted] = await Promise.all([
         native.getStateAsync(),
         native.getBackgroundVoiceOwnershipAsync(),
         realtimeVoiceAttachmentStore.load().catch(() => null),
       ]);
-      if (disposed) return;
+      if (disposed) return null;
       const ownershipIsNewest = ownership !== null && ownership.sequence >= state.sequence;
       const sessionId = ownershipIsNewest
         ? ownership.nativeSessionId
@@ -446,6 +446,15 @@ export function MasterVoiceProvider(props: {
           environmentOrigin: ownedOrigin ?? persistedOrigin,
         }),
       );
+      return sessionId;
+    };
+    const reconcileForegroundRuntime = async (nativeSessionId: string | null) => {
+      if (nativeSessionId === null || disposed) return;
+      const runtime = runtimeRef.current;
+      if (runtime === null) return;
+      const phase = runtime.controller.getSnapshot().phase;
+      if (phase === "active" || phase === "starting" || phase === "stopping") return;
+      await runtime.controller.reconcileNativeRuntime();
     };
     const refresh = async () => {
       const [microphone, notification] = await Promise.all([
@@ -458,18 +467,22 @@ export function MasterVoiceProvider(props: {
           notification: notification.granted,
         });
       }
-      await refreshOwnership();
+      return refreshOwnership();
     };
-    void refresh().catch(() => {
-      if (!disposed) setNativePermissions({ microphone: null, notification: null });
-    });
+    const refreshAndReconcile = () =>
+      refresh()
+        .then((sessionId) => reconcileForegroundRuntime(sessionId).catch(() => undefined))
+        .catch(() => {
+          if (!disposed) setNativePermissions({ microphone: null, notification: null });
+        });
+    void refreshAndReconcile();
     const subscription = AppState.addEventListener("change", (state) => {
-      if (state === "active") void refresh();
+      if (state === "active") void refreshAndReconcile();
     });
     const nativeStateSubscription = native.addListener("stateChanged", (state) => {
       if (disposed) return;
       acceptState(state);
-      void refreshOwnership().catch(() => undefined);
+      void refreshOwnership().then(reconcileForegroundRuntime).catch(() => undefined);
     });
     return () => {
       disposed = true;

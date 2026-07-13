@@ -291,6 +291,25 @@ describe("RealtimeVoiceController", () => {
     expect(client.sessionEvents).toHaveBeenCalledWith(SESSION_ID, 0);
   });
 
+  it("treats Resume during native adoption as an idempotent active session", async () => {
+    const { client, controller, native } = makeHarness();
+    vi.mocked(native.getStateAsync).mockResolvedValue({
+      phase: "realtime",
+      isForeground: true,
+      activeRecordingId: null,
+      activePlaybackId: null,
+      activeRealtimeSessionId: SESSION_ID,
+      realtimeConnectionState: "connected",
+      realtimeMuted: false,
+      sequence: 8,
+    });
+
+    await expect(controller.start(createInput)).resolves.toMatchObject({ phase: "active" });
+
+    expect(client.getSession).toHaveBeenCalledWith(SESSION_ID);
+    expect(client.createSession).not.toHaveBeenCalled();
+  });
+
   it("recreates after a crash from the durable consumed cursor and focus", async () => {
     const attachments = makeAttachmentStore({
       ownerId: "previous-owner",
@@ -602,6 +621,10 @@ describe("RealtimeVoiceController", () => {
 
     const reconciliation = controller.reconcileNativeRuntime();
     await vi.waitFor(() => expect(client.getSession).toHaveBeenCalledTimes(1));
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "starting",
+      native: { activeRealtimeSessionId: SESSION_ID },
+    });
     const detachment = controller.detach();
     resolveSession(serverSession.state);
     await Promise.all([reconciliation, detachment]);
