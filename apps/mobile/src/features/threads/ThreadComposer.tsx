@@ -368,6 +368,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const dictationWasActiveRef = useRef(false);
   const traditionalAudioTransitionLockRef = useRef({ active: false });
   const canStartAutoListen =
+    dictation.available &&
     props.draftMessage.trim().length === 0 &&
     props.draftAttachments.length === 0 &&
     !props.interactionRequired;
@@ -408,6 +409,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     const command = realtimeVoice.nativeThreadCommand;
     if (
       command === null ||
+      !dictation.available ||
       command.environmentId !== props.environmentId ||
       command.threadId !== props.selectedThread.id
     ) {
@@ -418,7 +420,12 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       () => activateAutoListen(true),
       realtimeVoice.completeNativeThreadCommand,
     );
-  }, [props.environmentId, props.selectedThread.id, realtimeVoice.nativeThreadCommand]);
+  }, [
+    dictation.available,
+    props.environmentId,
+    props.selectedThread.id,
+    realtimeVoice.nativeThreadCommand,
+  ]);
 
   useEffect(() => {
     const handoff = realtimeVoice.threadVoiceHandoff;

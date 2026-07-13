@@ -1,4 +1,4 @@
-import type { VoiceThreadModePauseReason } from "./voiceThreadModeStateMachine";
+import type { VoiceThreadModePauseReason } from "@t3tools/shared/voiceThreadMode";
 
 const SILENT_PAUSE_REASONS = new Set<VoiceThreadModePauseReason>([
   "user",
