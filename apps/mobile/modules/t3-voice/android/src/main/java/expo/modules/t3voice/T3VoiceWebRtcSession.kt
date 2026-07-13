@@ -353,6 +353,7 @@ internal class T3VoiceWebRtcSession(
     val update =
       synchronized(lock) {
         val session = requireActive(sessionId)
+        if (ready && session.playoutDrain != null) return@synchronized null
         if (ready) {
           check(session.peerConnection.connectionState() == PeerConnection.PeerConnectionState.CONNECTED) {
             "Realtime input cannot become ready before the peer is connected."
@@ -361,7 +362,7 @@ internal class T3VoiceWebRtcSession(
         session.captureState = T3VoiceCapturePolicy.setInputReady(session.captureState, ready)
         applyCaptureState(session)
         Triple(connectionStateFor(session), session.captureState.userMuted, session.captureState.inputReady)
-      }
+      } ?: return
     onStateChanged(sessionId, update.first, update.second, update.third)
   }
 

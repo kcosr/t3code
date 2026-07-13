@@ -26,9 +26,10 @@ class T3VoiceRealtimePlayoutDrainPolicyTest {
   fun `a delayed first playout sample starts a fresh silence window`() {
     val policy = T3VoiceRealtimePlayoutDrainPolicy(startedAtMillis = 0)
 
-    assertEquals(T3VoiceRealtimePlayoutDrainDecision.WAIT, policy.observe(300, 300))
-    assertEquals(T3VoiceRealtimePlayoutDrainDecision.WAIT, policy.observe(699, 300))
-    assertEquals(T3VoiceRealtimePlayoutDrainDecision.DRAINED, policy.observe(700, 300))
+    assertEquals(T3VoiceRealtimePlayoutDrainDecision.WAIT, policy.observe(399, null))
+    assertEquals(T3VoiceRealtimePlayoutDrainDecision.WAIT, policy.observe(500, 450))
+    assertEquals(T3VoiceRealtimePlayoutDrainDecision.WAIT, policy.observe(849, 450))
+    assertEquals(T3VoiceRealtimePlayoutDrainDecision.DRAINED, policy.observe(850, 450))
   }
 
   @Test

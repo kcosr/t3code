@@ -980,7 +980,8 @@ class T3VoiceRuntimeService : Service() {
   private fun beginRealtimeReadyCueLocked(sessionId: String) {
     val state = T3VoiceStateStore.state.value
     if (
-      state.activeRealtimeSessionId != sessionId ||
+      handoffInProgress ||
+        state.activeRealtimeSessionId != sessionId ||
         state.realtimeConnectionState != "connected" ||
         state.realtimeInputReady
     ) return
@@ -1003,7 +1004,8 @@ class T3VoiceRuntimeService : Service() {
     realtimeReadyCue = null
     val state = T3VoiceStateStore.state.value
     if (
-      state.activeRealtimeSessionId != sessionId ||
+      handoffInProgress ||
+        state.activeRealtimeSessionId != sessionId ||
         state.realtimeConnectionState != "connected"
     ) return
     runCatching { realtime.setInputReady(sessionId, true) }
@@ -3447,6 +3449,7 @@ class T3VoiceRuntimeService : Service() {
     handoffInProgress = true
     awaitingHandoffAction = true
     try {
+      cancelRealtimeReadyCueLocked(action.sessionId)
       nativeControlHeartbeat.stop()
       if (state.activeRealtimeSessionId == action.sessionId) {
         realtime.drainPlayout(action.sessionId) {
@@ -3945,7 +3948,7 @@ class T3VoiceRuntimeService : Service() {
     private const val ACTION_START_PLAYBACK = "expo.modules.t3voice.action.START_PLAYBACK"
     private const val ACTION_START_REALTIME = "expo.modules.t3voice.action.START_REALTIME"
     private const val EXTRA_OPERATION_ID = "operationId"
-    private const val HANDOFF_COMMAND_TIMEOUT_MILLIS = 5_000L
+    private const val HANDOFF_COMMAND_TIMEOUT_MILLIS = 8_000L
     fun requestStop(context: Context) {
       start(context, ACTION_STOP, null)
     }
