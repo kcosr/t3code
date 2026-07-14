@@ -2528,7 +2528,23 @@ class T3VoiceRuntimeService : Service() {
       operationSnapshot,
       pendingReceipt = runtimeThreadReceipt(created.snapshot),
     )
-    runtimeThreadOperationStore.writeActive(active)
+    val activePersisted = runCatching {
+      runtimeThreadOperationStore.writeActive(active)
+    }.isSuccess
+    if (!activePersisted) {
+      attempt.cancelRequested = true
+      attempt.detached = true
+      runCatching {
+        runtimeThreadOperationStore.writePrepared(active.claim, cancelRequested = true)
+      }
+      T3VoiceDiagnostics.record(
+        0,
+        T3VoiceDiagnosticCategory.TERMINAL,
+        T3VoiceDiagnosticCode.THREAD_RECONCILIATION_REQUIRED,
+      )
+      cancelRuntimeThreadOperation(attempt)
+      return
+    }
     if (!materializeRuntimeThreadReceiptLocked(attempt)) {
       runtimeThreadAttempt = null
       scheduleRuntimeThreadRestoreLocked()

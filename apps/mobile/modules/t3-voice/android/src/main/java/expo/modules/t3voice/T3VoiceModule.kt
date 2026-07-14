@@ -14,7 +14,6 @@ import java.time.Instant
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.atomic.AtomicInteger
 import expo.modules.interfaces.permissions.Permissions
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
@@ -30,13 +29,9 @@ class T3VoiceModule : Module() {
   @Volatile private var destroyed = false
   private val binderLock = Any()
   private val mainHandler = Handler(Looper.getMainLooper())
-  private val binderWorkerIndex = AtomicInteger()
   private val binderOperationExecutor: ExecutorService =
-    Executors.newFixedThreadPool(BINDER_OPERATION_WORKERS) { runnable ->
-      Thread(
-        runnable,
-        "t3-voice-binder-${binderWorkerIndex.incrementAndGet()}",
-      ).apply { isDaemon = true }
+    Executors.newSingleThreadExecutor { runnable ->
+      Thread(runnable, "t3-voice-binder").apply { isDaemon = true }
     }
   private val pendingBinderOperations = T3VoiceBinderOperationRegistry<PendingBinderOperation>()
   private val bindingRealtimeOwner = T3VoiceBindingRealtimeOwnerPolicy()
@@ -1433,7 +1428,6 @@ class T3VoiceModule : Module() {
     private const val VOICE_RUNTIME_WAKE_EVENT = "voiceRuntimeWake"
     private const val BINDER_CONNECTION_TIMEOUT_MS = 5_000L
     private const val MAXIMUM_TARGET_IDENTITY_LENGTH = 4_096
-    private const val BINDER_OPERATION_WORKERS = 4
     private val READINESS_FIELDS =
       setOf(
         "enabled",
