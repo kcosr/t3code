@@ -95,11 +95,7 @@ class T3VoiceBackgroundThreadExecutionTest {
 
   @Test fun `active child authority restores without retaining parent grant`() {
     val desired = readiness()
-    val installed = T3VoicePreparedReadiness(
-      desired.copy(generation = 4), "runtime-1", "https://example.test",
-      T3VoiceRuntimeGrantOperation.THREAD_TURN_START,
-      T3VoiceRuntimeTargetIdentity.digest("project-1/thread-1"),
-    )
+    val installed = activeAuthority()
     val active = T3VoiceBackgroundThreadOperationState.Active(
       T3VoiceBackgroundThreadClaim("runtime-1", 4, "https://example.test",
         "project-1", "thread-1", "client-1"),
@@ -114,6 +110,8 @@ class T3VoiceBackgroundThreadExecutionTest {
       desired, installed, active, NOW)?.runtimeId)
     assertNull(T3VoiceBackgroundThreadAuthorityPolicy.restore(
       desired.copy(targetId = "project-1/other"), installed, active, NOW))
+    assertNull(T3VoiceBackgroundThreadAuthorityPolicy.restore(
+      desired, activeAuthority(targetId = "project-2/thread-1"), active, NOW))
     assertNull(T3VoiceBackgroundThreadAuthorityPolicy.restore(
       desired.copy(generation = 5), installed, active, NOW))
     assertNull(T3VoiceBackgroundThreadAuthorityPolicy.restore(
@@ -506,7 +504,7 @@ class T3VoiceBackgroundThreadExecutionTest {
   }
 
   @Test fun `cancellation authority survives mode change and process recovery`() {
-    val targetDigest = T3VoiceRuntimeTargetIdentity.digest("project-1/thread-1")
+    val targetDigest = DIGEST
     val claim = T3VoiceBackgroundThreadClaim(
       "runtime-1", 4, "https://example.test", "project-1", "thread-1", "client-1",
     )
@@ -528,12 +526,14 @@ class T3VoiceBackgroundThreadExecutionTest {
     )
     val authorization = T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
       T3VoiceRuntimeGrantLoadResult.Available(grant(targetDigest)),
+      activeAuthority(targetDigest),
       claim,
       NOW,
     )
     assertEquals("secret", requireNotNull(authorization).runtimeGrantToken)
     assertNull(T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
       T3VoiceRuntimeGrantLoadResult.Missing,
+      activeAuthority(targetDigest),
       claim,
       NOW,
     ))
@@ -542,13 +542,21 @@ class T3VoiceBackgroundThreadExecutionTest {
     )
     assertNull(T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
       T3VoiceRuntimeGrantLoadResult.Available(wrongOrigin),
+      activeAuthority(targetDigest),
       claim,
       NOW,
     ))
     assertNull(T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
       T3VoiceRuntimeGrantLoadResult.Available(
-        grant(T3VoiceRuntimeTargetIdentity.digest("project-1/thread-2")),
+        grant("b".repeat(64)),
       ),
+      activeAuthority(targetDigest),
+      claim,
+      NOW,
+    ))
+    assertNull(T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
+      T3VoiceRuntimeGrantLoadResult.Available(grant(targetDigest)),
+      activeAuthority(targetDigest, targetId = "project-2/thread-1"),
       claim,
       NOW,
     ))
@@ -557,6 +565,7 @@ class T3VoiceBackgroundThreadExecutionTest {
     )
     assertNull(T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
       T3VoiceRuntimeGrantLoadResult.Available(expired),
+      activeAuthority(targetDigest),
       claim,
       NOW,
     ))
@@ -570,6 +579,13 @@ class T3VoiceBackgroundThreadExecutionTest {
   private fun grant(targetIdentityDigest: String = DIGEST) = T3VoiceRuntimeGrant(
     T3VoiceRuntimeGrantMetadata("runtime-1", 4, "https://example.test",
       T3VoiceRuntimeGrantOperation.THREAD_TURN_START, targetIdentityDigest, NOW + 60_000), "secret")
+  private fun activeAuthority(
+    targetIdentityDigest: String = DIGEST,
+    targetId: String = "project-1/thread-1",
+  ) = T3VoicePreparedReadiness(
+    readiness().copy(targetId = targetId), "runtime-1", "https://example.test",
+    T3VoiceRuntimeGrantOperation.THREAD_TURN_START, targetIdentityDigest,
+  )
   private fun snapshot(phase: String, last: Long, ack: Long, dispatched: Boolean) =
     T3VoiceBackgroundThreadTurnSnapshot("operation-1", "runtime-1", 4, "project-1", "thread-1",
       "default", true, phase, "message-1", "turn-1", last, ack, null, dispatched, NOW + 50_000)

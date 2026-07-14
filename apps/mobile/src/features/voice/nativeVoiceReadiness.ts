@@ -19,7 +19,7 @@ export const disabledNativeVoiceReadiness = (): T3VoiceReadinessSnapshot => ({
 export interface NativeVoiceReadinessContext {
   readonly microphonePermissionGranted: boolean;
   readonly notificationPermissionGranted: boolean;
-  readonly threadTargetValid: boolean;
+  readonly threadTargetProjectId: string | null;
 }
 
 export function resolveNativeVoiceReadiness(
@@ -34,8 +34,10 @@ export function resolveNativeVoiceReadiness(
   const mode = preferences.voiceBackgroundDefaultMode ?? "realtime";
   const target = preferences.voiceThreadTarget;
   const targetId =
-    mode === "thread" && context.threadTargetValid && target?.environmentId === environmentId
-      ? `${target.environmentId}/${target.threadId}`
+    mode === "thread" &&
+    context.threadTargetProjectId !== null &&
+    target?.environmentId === environmentId
+      ? `${context.threadTargetProjectId}/${target.threadId}`
       : null;
 
   return {

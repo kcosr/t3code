@@ -10,6 +10,7 @@ import {
 import * as Effect from "effect/Effect";
 
 import {
+  nativeVoiceRuntimeReadinessTargetId,
   NativeVoiceRuntimeTargetUnavailableError,
   resolveNativeVoiceRuntimeTarget,
 } from "./nativeVoiceRuntimeTarget";
@@ -80,6 +81,7 @@ describe("resolveNativeVoiceRuntimeTarget", () => {
     expect(result.targetIdentity).toBe(
       '{"mode":"realtime","conversation":{"type":"continue","conversationId":"conversation-1"},"focus":{"type":"thread","projectId":"project-1","threadId":"thread-1"}}',
     );
+    expect(nativeVoiceRuntimeReadinessTargetId(result.target)).toBe("conversation-1");
     expect(voice.creates()).toBe(0);
   });
 
@@ -154,6 +156,10 @@ describe("resolveNativeVoiceRuntimeTarget", () => {
       speechPreset: "default",
       autoRearm: true,
     });
+    expect(nativeVoiceRuntimeReadinessTargetId(result.target)).toBe("project-1/thread-1");
+    expect(nativeVoiceRuntimeReadinessTargetId(result.target)).not.toContain(
+      String(ENVIRONMENT_ID),
+    );
   });
 
   it("rejects an archived or missing thread target", async () => {

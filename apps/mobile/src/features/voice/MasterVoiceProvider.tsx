@@ -78,7 +78,10 @@ import {
   resolveNativeVoiceRuntimeRevocationEndpoint,
 } from "./nativeVoiceRuntimeProvisioning";
 import { NativeVoiceReconciliationBackoff } from "./nativeVoiceReconciliationBackoff";
-import { resolveNativeVoiceRuntimeTarget } from "./nativeVoiceRuntimeTarget";
+import {
+  nativeVoiceRuntimeReadinessTargetId,
+  resolveNativeVoiceRuntimeTarget,
+} from "./nativeVoiceRuntimeTarget";
 import { VoiceConversationBrowser, type VoiceConversationClient } from "./VoiceConversationBrowser";
 import {
   continueVoiceConversationSelection,
@@ -310,19 +313,19 @@ export function MasterVoiceProvider(props: {
 
   const backgroundTargetEnvironmentId = preferences?.voiceThreadTarget?.environmentId ?? null;
   const backgroundTargetThreadId = preferences?.voiceThreadTarget?.threadId ?? null;
-  const backgroundThreadTargetValid =
-    backgroundTargetEnvironmentId !== null &&
-    backgroundTargetThreadId !== null &&
-    threadShells.some(
-      (thread) =>
-        String(thread.environmentId) === backgroundTargetEnvironmentId &&
-        String(thread.id) === backgroundTargetThreadId &&
-        thread.archivedAt === null &&
-        projects.some(
-          (project) =>
-            project.environmentId === thread.environmentId && project.id === thread.projectId,
-        ),
-    );
+  const backgroundThreadTargetProjectId =
+    backgroundTargetEnvironmentId !== null && backgroundTargetThreadId !== null
+      ? (threadShells.find(
+          (thread) =>
+            String(thread.environmentId) === backgroundTargetEnvironmentId &&
+            String(thread.id) === backgroundTargetThreadId &&
+            thread.archivedAt === null &&
+            projects.some(
+              (project) =>
+                project.environmentId === thread.environmentId && project.id === thread.projectId,
+            ),
+        )?.projectId ?? null)
+      : null;
 
   useEffect(() => {
     const target = nextVoiceThreadTarget(preferences?.voiceThreadTarget, props.focus);
@@ -399,7 +402,7 @@ export function MasterVoiceProvider(props: {
         {
           microphonePermissionGranted: nativePermissions.microphone === true,
           notificationPermissionGranted: nativePermissions.notification === true,
-          threadTargetValid: backgroundThreadTargetValid,
+          threadTargetProjectId: backgroundThreadTargetProjectId,
         },
       ),
     [
@@ -412,7 +415,7 @@ export function MasterVoiceProvider(props: {
       preferences?.voiceBackgroundDefaultMode,
       nativePermissions.microphone,
       nativePermissions.notification,
-      backgroundThreadTargetValid,
+      backgroundThreadTargetProjectId,
     ],
   );
 
@@ -1427,10 +1430,7 @@ export function MasterVoiceProvider(props: {
         nativeOperationsRef.current.assertCurrent(epoch);
         const exactReadiness = {
           ...readinessToPersist,
-          targetId:
-            resolvedTarget.target.mode === "realtime"
-              ? String(resolvedTarget.target.conversation.conversationId)
-              : `${controllerEnvironmentId}/${resolvedTarget.target.threadId}`,
+          targetId: nativeVoiceRuntimeReadinessTargetId(resolvedTarget.target),
         };
         const provisioned = await nativeProvisioning.provision(conversationConnection.client, {
           epoch: provisioningEpoch,

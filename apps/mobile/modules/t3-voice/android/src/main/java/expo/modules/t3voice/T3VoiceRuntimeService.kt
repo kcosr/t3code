@@ -1507,6 +1507,7 @@ class T3VoiceRuntimeService : Service() {
       preparedClaim != null &&
         T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
           grant ?: T3VoiceRuntimeGrantLoadResult.Missing,
+          readinessStore.activeAuthority(),
           preparedClaim,
           now,
         ) != null
@@ -1845,6 +1846,7 @@ class T3VoiceRuntimeService : Service() {
       if (prepared?.cancelRequested == true) {
         T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
           loadedGrant ?: T3VoiceRuntimeGrantLoadResult.Missing,
+          readinessStore.activeAuthority(),
           prepared.claim,
           System.currentTimeMillis(),
         ) ?: run {
@@ -2538,6 +2540,7 @@ class T3VoiceRuntimeService : Service() {
       attempt.cancelActiveCall()
       val authorization = T3VoiceBackgroundThreadAuthorityPolicy.validatePreparedCancellation(
         T3VoiceRuntimeGrantStore(applicationContext).load(),
+        readinessStore.activeAuthority(),
         prepared.claim,
         System.currentTimeMillis(),
       )

@@ -42,6 +42,12 @@ export interface ResolvedNativeVoiceRuntimeTarget {
   readonly targetIdentity: string;
 }
 
+export function nativeVoiceRuntimeReadinessTargetId(target: VoiceNativeRuntimeTargetType): string {
+  return target.mode === "realtime"
+    ? String(target.conversation.conversationId)
+    : `${target.projectId}/${target.threadId}`;
+}
+
 async function newestDurableConversation(
   client: NativeRuntimeTargetClient,
 ): Promise<VoiceConversationSummary | null> {

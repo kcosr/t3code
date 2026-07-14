@@ -23,7 +23,7 @@ describe("native voice readiness", () => {
       resolveNativeVoiceReadiness({}, "environment-1", {
         microphonePermissionGranted: true,
         notificationPermissionGranted: true,
-        threadTargetValid: false,
+        threadTargetProjectId: null,
       }),
     ).toEqual(disabledNativeVoiceReadiness());
   });
@@ -41,7 +41,7 @@ describe("native voice readiness", () => {
         {
           microphonePermissionGranted: true,
           notificationPermissionGranted: true,
-          threadTargetValid: false,
+          threadTargetProjectId: null,
         },
       ),
     ).toEqual({
@@ -71,10 +71,32 @@ describe("native voice readiness", () => {
         {
           microphonePermissionGranted: true,
           notificationPermissionGranted: true,
-          threadTargetValid: false,
+          threadTargetProjectId: null,
         },
       ),
     ).toMatchObject({ enabled: false, mode: "thread", targetId: null });
+  });
+
+  it("uses the resolved project rather than the environment in a thread target", () => {
+    expect(
+      resolveNativeVoiceReadiness(
+        {
+          voiceBackgroundControlsEnabled: true,
+          voiceBackgroundDefaultMode: "thread",
+          voiceThreadTarget: {
+            environmentId: "environment-1",
+            threadId: "thread-1",
+            generation: 1,
+          },
+        },
+        "environment-1",
+        {
+          microphonePermissionGranted: true,
+          notificationPermissionGranted: true,
+          threadTargetProjectId: "project-9",
+        },
+      ),
+    ).toMatchObject({ enabled: true, mode: "thread", targetId: "project-9/thread-1" });
   });
 
   it("keeps opted-in readiness disabled when either permission is revoked", () => {
@@ -88,7 +110,7 @@ describe("native voice readiness", () => {
         {
           microphonePermissionGranted: true,
           notificationPermissionGranted: false,
-          threadTargetValid: false,
+          threadTargetProjectId: null,
         },
       ),
     ).toMatchObject({
