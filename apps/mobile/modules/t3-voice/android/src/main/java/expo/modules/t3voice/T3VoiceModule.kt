@@ -30,6 +30,14 @@ class T3VoiceModule : Module() {
   // Android media APIs require a Looper even though Binder work must stay off the main thread.
   private val binderOperationThread = HandlerThread("t3-voice-binder").apply { start() }
   private val binderOperationHandler = Handler(binderOperationThread.looper)
+  // Stop commands must be able to cancel a synchronous start that is blocked on its Binder lane.
+  private val binderInterruptThread = HandlerThread("t3-voice-binder-interrupt").apply { start() }
+  private val binderInterruptHandler = Handler(binderInterruptThread.looper)
+  private val binderOperationDispatcher =
+    T3VoiceBinderOperationDispatcher(
+      orderedPost = binderOperationHandler::post,
+      interruptPost = binderInterruptHandler::post,
+    )
   private val pendingBinderOperations = T3VoiceBinderOperationRegistry<PendingBinderOperation>()
   private val bindingRealtimeOwner = T3VoiceBindingRealtimeOwnerPolicy()
   private var stateCollection: Job? = null
@@ -46,6 +54,7 @@ class T3VoiceModule : Module() {
   private class PendingBinderOperation(
     val promise: Promise,
     val errorCode: String,
+    val lane: T3VoiceBinderOperationLane,
     val operation: (T3VoiceRuntimeService.VoiceBinder, BinderSettlement) -> Unit,
   ) {
     lateinit var ticket: T3VoiceBinderOperationRegistry.Ticket
@@ -235,7 +244,9 @@ class T3VoiceModule : Module() {
         synchronized(binderLock) { binder = null }
         serviceBound = false
         binderOperationHandler.removeCallbacksAndMessages(null)
+        binderInterruptHandler.removeCallbacksAndMessages(null)
         binderOperationThread.quitSafely()
+        binderInterruptThread.quitSafely()
       }
 
       AsyncFunction("getMediaCapabilitiesAsync") {
@@ -402,7 +413,11 @@ class T3VoiceModule : Module() {
 
       AsyncFunction("dispatchVoiceRuntimeAsync") { input: Map<String, Any?>, promise: Promise ->
         val command = VoiceRuntimeBridge.parseCommand(input)
-        withBinder(promise, "voice-runtime-command-failed") { service, settlement ->
+        withBinder(
+          promise,
+          "voice-runtime-command-failed",
+          T3VoiceBinderOperationLanePolicy.forCommand(command),
+        ) { service, settlement ->
           settlement.resolve(
             VoiceRuntimeBridge.receiptBody(service.dispatchVoiceRuntime(command)),
           )
@@ -947,13 +962,21 @@ class T3VoiceModule : Module() {
       }
 
       AsyncFunction("stopRealtimeSessionAsync") { input: Map<String, String>, promise: Promise ->
-        withBinder(promise, "realtime-stop-failed") { voice, result ->
+        withBinder(
+          promise,
+          "realtime-stop-failed",
+          T3VoiceBinderOperationLane.INTERRUPT,
+        ) { voice, result ->
           result.resolve(voice.stopRealtimeSession(requireIdentifier(input, "nativeSessionId")))
         }
       }
 
       AsyncFunction("drainAndStopRealtimeSessionAsync") { input: Map<String, String>, promise: Promise ->
-        withBinder(promise, "realtime-drained-stop-failed") { voice, result ->
+        withBinder(
+          promise,
+          "realtime-drained-stop-failed",
+          T3VoiceBinderOperationLane.INTERRUPT,
+        ) { voice, result ->
           voice.drainAndStopRealtimeSession(requireIdentifier(input, "nativeSessionId"))
           result.resolve()
         }
@@ -1084,9 +1107,10 @@ class T3VoiceModule : Module() {
   private fun withBinder(
     promise: Promise,
     errorCode: String,
+    lane: T3VoiceBinderOperationLane = T3VoiceBinderOperationLane.ORDERED,
     operation: (T3VoiceRuntimeService.VoiceBinder, BinderSettlement) -> Unit,
   ) {
-    val pending = PendingBinderOperation(promise, errorCode, operation)
+    val pending = PendingBinderOperation(promise, errorCode, lane, operation)
     var dispatch: T3VoiceBinderOperationRegistry.Dispatch<PendingBinderOperation>? = null
     var connectedBinder: T3VoiceRuntimeService.VoiceBinder? = null
     var unavailableMessage: String? = null
@@ -1140,7 +1164,7 @@ class T3VoiceModule : Module() {
     dispatch: T3VoiceBinderOperationRegistry.Dispatch<PendingBinderOperation>,
   ) {
     val pending = dispatch.value
-    val accepted = binderOperationHandler.post {
+    val accepted = binderOperationDispatcher.post(pending.lane) {
       val active = synchronized(binderLock) {
         pendingBinderOperations.isActive(dispatch.ticket, dispatch.binderGeneration)
       }
@@ -1296,6 +1320,7 @@ class T3VoiceModule : Module() {
     val input = inspection.preparation
     return authorityReservationBody(input) + mapOf(
       "state" to inspection.state,
+      "readiness" to readinessBody(inspection.readiness),
       "refreshCredentialHash" to inspection.refreshCredentialHash,
       "issuedAt" to inspection.issuedAtEpochMillis?.let { java.time.Instant.ofEpochMilli(it).toString() },
       "expiresAt" to inspection.expiresAtEpochMillis?.let { java.time.Instant.ofEpochMilli(it).toString() },
@@ -1440,5 +1465,29 @@ class T3VoiceModule : Module() {
       "expectedCurrentGeneration", "generation", "targetDigest", "target", "operation",
       "environmentOrigin",
     )
+  }
+}
+
+internal enum class T3VoiceBinderOperationLane { ORDERED, INTERRUPT }
+
+internal object T3VoiceBinderOperationLanePolicy {
+  fun forCommand(command: VoiceRuntimeNativeCommand): T3VoiceBinderOperationLane =
+    if (command is VoiceRuntimeNativeCommand.StopMode) {
+      T3VoiceBinderOperationLane.INTERRUPT
+    } else {
+      T3VoiceBinderOperationLane.ORDERED
+    }
+}
+
+internal class T3VoiceBinderOperationDispatcher(
+  private val orderedPost: (Runnable) -> Boolean,
+  private val interruptPost: (Runnable) -> Boolean,
+) {
+  fun post(lane: T3VoiceBinderOperationLane, operation: () -> Unit): Boolean {
+    val runnable = Runnable(operation)
+    return when (lane) {
+      T3VoiceBinderOperationLane.ORDERED -> orderedPost(runnable)
+      T3VoiceBinderOperationLane.INTERRUPT -> interruptPost(runnable)
+    }
   }
 }

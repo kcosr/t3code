@@ -225,6 +225,7 @@ export interface T3VoiceRuntimeAuthorityPrepared {
   readonly operation: T3VoiceRuntimeGrantOperation;
   readonly environmentOrigin: string;
   readonly readinessEnabled: boolean;
+  readonly readiness: T3VoicePersistedReadinessSnapshot;
   readonly refreshCredentialHash: string | null;
 }
 
@@ -240,6 +241,7 @@ export interface T3VoiceRuntimeAuthorityActive {
   readonly operation: T3VoiceRuntimeGrantOperation;
   readonly environmentOrigin: string;
   readonly readinessEnabled: boolean;
+  readonly readiness: T3VoicePersistedReadinessSnapshot;
   readonly issuedAt: string;
   readonly expiresAt: string;
   readonly refreshRotationCounter: number;

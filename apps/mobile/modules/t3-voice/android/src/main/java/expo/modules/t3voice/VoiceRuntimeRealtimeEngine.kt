@@ -132,6 +132,7 @@ internal data class VoiceRuntimeRealtimeFinalization(
   val fence: VoiceRuntimeRealtimeFence,
   val sourceTarget: VoiceRuntimeTarget.Realtime,
   val sourceEnvironmentOrigin: String,
+  val sourceAuthorityExpiresAtEpochMillis: Long,
   val rootCommandId: String,
   val session: VoiceRuntimeRealtimeStartResult,
   val closeOperationId: String,
@@ -154,11 +155,18 @@ internal data class VoiceRuntimeRealtimeFinalization(
 
   fun acceptsUpdate(next: VoiceRuntimeRealtimeFinalization): Boolean = copy(
     stage = next.stage,
+    outcome = next.outcome,
+    reason = next.reason,
     attemptCount = next.attemptCount,
     lastFailureCode = next.lastFailureCode,
     lastFailureRetryable = next.lastFailureRetryable,
     terminalPublication = next.terminalPublication,
-  ) == next && next.stage.ordinal >= stage.ordinal && next.attemptCount >= attemptCount
+  ) == next && next.stage.ordinal >= stage.ordinal && next.attemptCount >= attemptCount &&
+    ((next.outcome == outcome && next.reason == reason) ||
+      (stage != VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING &&
+        next.stage == VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING &&
+        next.outcome == VoiceRuntimeRealtimeTerminalOutcome.FAILED &&
+        next.reason == next.lastFailureCode && !next.lastFailureRetryable))
 }
 
 internal sealed interface VoiceRuntimeRealtimeFinalizationResult {
@@ -185,6 +193,7 @@ internal interface VoiceRuntimeRealtimeCheckpointRepository {
   fun saveFinalization(finalization: VoiceRuntimeRealtimeFinalization)
   fun clearFinalization(fence: VoiceRuntimeRealtimeFence, sessionId: String)
   fun publishTerminal(summary: VoiceRuntimeRealtimeTerminalSummary)
+  fun hasTerminalCapacity(fence: VoiceRuntimeRealtimeFence, nowEpochMillis: Long): Boolean
   fun terminals(nowEpochMillis: Long): List<VoiceRuntimeRealtimeTerminalSummary>
   fun acknowledgeTerminal(key: VoiceRuntimeRetainedRecordKey.RealtimeTerminal): Boolean
 }
@@ -242,9 +251,19 @@ internal class VoiceRuntimeMemoryRealtimeCheckpointRepository :
       it.identity.runtimeId == summary.identity.runtimeId && it.modeSessionId == summary.modeSessionId
     }
     if (terminalValues.size >= MAXIMUM_TERMINALS) {
-      terminalValues.remove(terminalValues.minWithOrNull(TERMINAL_ORDER)!!)
+      throw VoiceRuntimeRetentionCapacityException("Realtime terminal", MAXIMUM_TERMINALS)
     }
     terminalValues += summary
+  }
+
+  override fun hasTerminalCapacity(
+    fence: VoiceRuntimeRealtimeFence,
+    nowEpochMillis: Long,
+  ): Boolean {
+    terminalValues.removeAll { it.expiresAtEpochMillis <= nowEpochMillis }
+    return terminalValues.any {
+      it.identity == fence.identity && it.modeSessionId == fence.modeSessionId
+    } || terminalValues.size < MAXIMUM_TERMINALS
   }
 
   override fun terminals(nowEpochMillis: Long): List<VoiceRuntimeRealtimeTerminalSummary> {
@@ -257,11 +276,6 @@ internal class VoiceRuntimeMemoryRealtimeCheckpointRepository :
 
   private companion object {
     const val MAXIMUM_TERMINALS = 64
-    val TERMINAL_ORDER = compareBy<VoiceRuntimeRealtimeTerminalSummary>(
-      { it.terminalAtEpochMillis },
-      { it.identity.runtimeId },
-      { it.modeSessionId },
-    )
   }
 }
 
@@ -507,6 +521,13 @@ internal class VoiceRuntimeRealtimeEngine(
           } else {
             VoiceRuntimeRealtimeCommandResult.Rejected("owner-conflict")
           },
+        )
+      }
+      if (!repository.hasTerminalCapacity(fence, now())) {
+        return recordCommand(
+          commandId,
+          fingerprint,
+          VoiceRuntimeRealtimeCommandResult.Rejected("realtime-terminal-retention-full"),
         )
       }
       update(
@@ -846,8 +867,17 @@ internal class VoiceRuntimeRealtimeEngine(
   ): VoiceRuntimeRealtimeFinalizationResult {
     var current = initial
     while (true) {
-      if (finalizationCredentialExpired(current)) {
-        return abandonFinalization(current, "finalization-credential-expired")
+      if (current.stage == VoiceRuntimeRealtimeFinalizationStage.HANDOFF_COMMIT_PENDING &&
+        transitionCredentialExpired(current)) {
+        current = failHandoffAndAdvanceToSourceClose(
+          current,
+          "handoff-transition-credential-expired",
+        )
+        continue
+      }
+      if (current.stage == VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING &&
+        sourceCloseCredentialExpired(current)) {
+        return abandonFinalization(current, "source-close-credential-expired")
       }
       when (current.stage) {
         VoiceRuntimeRealtimeFinalizationStage.HANDOFF_COMMIT_PENDING -> {
@@ -858,7 +888,10 @@ internal class VoiceRuntimeRealtimeEngine(
             return failFinalization(current, "handoff-commit-exception", true)
           }
           if (result is VoiceRuntimeRealtimeRemoteResult.Failure) {
-            if (!result.retryable) return abandonFinalization(current, result.code)
+            if (!result.retryable) {
+              current = failHandoffAndAdvanceToSourceClose(current, result.code)
+              continue
+            }
             return failFinalization(current, result.code, result.retryable)
           }
           current = advanceFinalization(
@@ -870,6 +903,13 @@ internal class VoiceRuntimeRealtimeEngine(
           val exchange = requireNotNull(current.handoffExchange)
           val activated = runCatching { handoff.activate(exchange) }.getOrDefault(false)
           if (!activated) {
+            if (transitionCredentialExpired(current)) {
+              current = failHandoffAndAdvanceToSourceClose(
+                current,
+                "handoff-transition-credential-expired",
+              )
+              continue
+            }
             return failFinalization(current, "handoff-activation-failed", true)
           }
           current = advanceFinalization(
@@ -964,14 +1004,29 @@ internal class VoiceRuntimeRealtimeEngine(
     return VoiceRuntimeRealtimeFinalizationResult.Completed(summary)
   }
 
-  private fun finalizationCredentialExpired(
+  private fun transitionCredentialExpired(
     finalization: VoiceRuntimeRealtimeFinalization,
-  ): Boolean = when (finalization.stage) {
-    VoiceRuntimeRealtimeFinalizationStage.HANDOFF_COMMIT_PENDING,
-    VoiceRuntimeRealtimeFinalizationStage.HANDOFF_ACTIVATION_PENDING,
-    -> requireNotNull(finalization.handoffExchange).transitionGrant.expiresAtEpochMillis <= now()
-    VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING ->
-      finalization.session.controlGrant.expiresAtEpochMillis <= now()
+  ): Boolean = requireNotNull(finalization.handoffExchange)
+    .transitionGrant.expiresAtEpochMillis <= now()
+
+  private fun sourceCloseCredentialExpired(
+    finalization: VoiceRuntimeRealtimeFinalization,
+  ): Boolean = finalization.session.controlGrant.expiresAtEpochMillis <= now()
+
+  private fun failHandoffAndAdvanceToSourceClose(
+    current: VoiceRuntimeRealtimeFinalization,
+    code: String,
+  ): VoiceRuntimeRealtimeFinalization {
+    val failed = current.copy(
+      stage = VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING,
+      outcome = VoiceRuntimeRealtimeTerminalOutcome.FAILED,
+      reason = code,
+      attemptCount = current.attemptCount + 1,
+      lastFailureCode = code,
+      lastFailureRetryable = false,
+    )
+    repository.saveFinalization(failed)
+    return failed
   }
 
   private fun recordFinalizationFailure(
@@ -1306,6 +1361,7 @@ internal class VoiceRuntimeRealtimeEngine(
       fence = current.fence,
       sourceTarget = current.target,
       sourceEnvironmentOrigin = authority.environmentOrigin,
+      sourceAuthorityExpiresAtEpochMillis = authority.expiresAtEpochMillis,
       rootCommandId = current.rootCommandId,
       session = session,
       closeOperationId = closeOperationId,
@@ -1332,6 +1388,7 @@ internal class VoiceRuntimeRealtimeEngine(
       fence = fence,
       sourceTarget = authority.target,
       sourceEnvironmentOrigin = authority.environmentOrigin,
+      sourceAuthorityExpiresAtEpochMillis = authority.expiresAtEpochMillis,
       rootCommandId = rootCommandId,
       session = session,
       closeOperationId = "$rootCommandId.close.cancelled",

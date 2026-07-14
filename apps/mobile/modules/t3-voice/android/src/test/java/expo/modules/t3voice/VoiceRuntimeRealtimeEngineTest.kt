@@ -62,6 +62,37 @@ internal class VoiceRuntimeRealtimeEngineTest {
   }
 
   @Test
+  fun `start rejects before remote work when terminal retention is full`() {
+    val retained = VoiceRuntimeMemoryRealtimeCheckpointRepository()
+    repeat(64) { index ->
+      retained.publishTerminal(
+        VoiceRuntimeRealtimeTerminalSummary(
+          identity = VoiceRuntimeIdentity("retained-$index", "instance-$index", 1),
+          modeSessionId = "retained-mode-$index",
+          environmentId = "environment-1",
+          conversationId = "conversation-$index",
+          sessionId = "session-$index",
+          outcome = VoiceRuntimeRealtimeTerminalOutcome.COMPLETED,
+          reason = "completed",
+          lastConnectedAtEpochMillis = now - 200,
+          terminalAtEpochMillis = now - 100,
+          serverCleanupPending = false,
+          expiresAtEpochMillis = now + 60_000,
+        ),
+      )
+    }
+    repository = retained
+    val engine = engine()
+
+    assertEquals(
+      VoiceRuntimeRealtimeCommandResult.Rejected("realtime-terminal-retention-full"),
+      engine.start("start-1", fence),
+    )
+    assertEquals(0, server.startCount)
+    assertNull(repository.load())
+  }
+
+  @Test
   fun `blocked action poll does not delay offer or snapshot`() {
     val engine = engine()
     assertTrue(engine.start("start-1", fence) is VoiceRuntimeRealtimeCommandResult.Accepted)
@@ -640,8 +671,13 @@ internal class VoiceRuntimeRealtimeEngineTest {
 
     assertTrue(result is VoiceRuntimeRealtimeFinalizationResult.Completed)
     assertEquals(commitCount, server.commitCount)
+    assertEquals(1, server.closeCount)
     assertFalse(handoff.activated)
     assertNull(repository.loadFinalization())
+    val terminal = repository.terminals(now).single()
+    assertEquals(VoiceRuntimeRealtimeTerminalOutcome.FAILED, terminal.outcome)
+    assertEquals("handoff-transition-credential-expired", terminal.reason)
+    assertFalse(terminal.serverCleanupPending)
   }
 
   @Test
@@ -796,10 +832,11 @@ internal class VoiceRuntimeRealtimeEngineTest {
     assertFalse(engine.isOperational())
     assertNull(repository.loadFinalization())
     assertFalse(handoff.activated)
+    assertEquals(1, server.closeCount)
     val terminal = repository.terminals(now).single()
     assertEquals(VoiceRuntimeRealtimeTerminalOutcome.FAILED, terminal.outcome)
     assertEquals("handoff-commit-failed", terminal.reason)
-    assertTrue(terminal.serverCleanupPending)
+    assertFalse(terminal.serverCleanupPending)
   }
 
   @Test

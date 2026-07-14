@@ -391,7 +391,7 @@ class T3VoiceRuntimeService : Service() {
       if (!T3VoiceConditionalDisablePolicy.canDisable(
           expectedRuntimeId,
           expectedGeneration,
-          readinessConfig.generation,
+          voiceRuntimeController.snapshot().identity.generation,
           identities,
           voiceRuntimeRealtimeEngine?.snapshot() != null || runtimeThreadAttempt != null ||
             durableThreadOwnership ||
@@ -404,10 +404,11 @@ class T3VoiceRuntimeService : Service() {
         VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
         val prepared = readinessStore.prepared()
         val activeAuthority = readinessStore.activeAuthority()
+        val persistedAuthority = voiceRuntimeAuthorityStore.loadForRefresh()
         val priorPending = readinessStore.pendingRuntimeRevocation()
         val revocation =
             priorPending
-            ?: voiceRuntimeAuthorityStore.loadForRefresh()?.let {
+            ?: persistedAuthority?.let {
               T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin)
             }
             ?: prepared?.let {
@@ -416,18 +417,24 @@ class T3VoiceRuntimeService : Service() {
             ?: activeAuthority?.let {
               T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin)
             }
-        val next =
-          if (!readinessConfig.enabled && readinessStore.prepared() === null) {
-            readinessConfig
-          } else {
-            readinessConfig.copy(enabled = false, generation = readinessConfig.generation + 1)
-          }
+        val canonical = voiceRuntimeController.snapshot()
+        val next = T3VoiceCanonicalReadinessPolicy.disabled(
+          readinessConfig,
+          canonical.identity.generation,
+        )
         readinessStore.writeDisabledForRuntimeRevocation(next, revocation)
         readinessConfig = next
+        canonicalPreparedAuthority = null
         controllerCommands.invalidateReadiness()
         stopActiveOperationLocked()
-        val identity = voiceRuntimeController.snapshot().identity
-        runCatching { voiceRuntimeController.clearAuthority("disable-${UUID.randomUUID()}", identity) }
+        if (canonical.target != null) {
+          runCatching {
+            voiceRuntimeController.clearAuthority(
+              "disable-${UUID.randomUUID()}",
+              canonical.identity,
+            )
+          }
+        }
         voiceRuntimeAuthorityStore.clear()
         clearIdleRealtimeEngineLocked()
         return T3VoiceDisabledReadiness(next, revocation?.runtimeId)
@@ -439,19 +446,22 @@ class T3VoiceRuntimeService : Service() {
     fun runtimeVoiceOwnership(): Map<String, Any?>? = synchronized(operationLock) {
       val state = T3VoiceStateStore.state.value
       val authority = readinessStore.activeAuthority()
+      val canonicalFence = T3VoiceRuntimeOwnershipPolicy.canonicalFence(
+        readinessConfig,
+        authority,
+        voiceRuntimeAuthorityStore.loadForRefresh(),
+      )
       val activeRealtimeOrigin = handoffEnvironmentOrigin?.takeIf {
         state.activeRealtimeSessionId != null
       }
-      if (activeRealtimeOrigin == null &&
-        (authority == null || !readinessConfig.enabled ||
-          authority.config.generation != readinessConfig.generation)) return@synchronized null
+      if (activeRealtimeOrigin == null && canonicalFence == null) return@synchronized null
       mapOf(
         "sequence" to state.sequence.toDouble(),
         "active" to runtimeControlSurfaceActiveLocked(state),
         "phase" to state.phase.name.lowercase(),
-        "runtimeId" to authority?.runtimeId,
-        "generation" to readinessConfig.generation.toDouble(),
-        "environmentOrigin" to (activeRealtimeOrigin ?: authority?.environmentOrigin),
+        "runtimeId" to canonicalFence?.runtimeId,
+        "generation" to (canonicalFence?.generation ?: readinessConfig.generation).toDouble(),
+        "environmentOrigin" to (activeRealtimeOrigin ?: canonicalFence?.environmentOrigin),
         "mode" to if (activeRealtimeOrigin != null) "realtime" else readinessConfig.mode.name.lowercase(),
         "targetId" to readinessConfig.targetId,
         "nativeSessionId" to state.activeRealtimeSessionId,
@@ -919,6 +929,7 @@ class T3VoiceRuntimeService : Service() {
       val controllerCheckpoint = voiceRuntimeController.checkpointCanonicalInstall()
       val readinessCheckpoint = readinessStore.checkpoint()
       val priorReadinessConfig = readinessConfig
+      val priorCanonicalPreparedAuthority = canonicalPreparedAuthority
       val slotFence = voiceRuntimeRealtimeEngineSlot.fence()
       val realtimeAuthority = (authority.target as? VoiceRuntimeTarget.Realtime)?.let { target ->
         VoiceRuntimeRealtimeAuthority(
@@ -965,6 +976,20 @@ class T3VoiceRuntimeService : Service() {
               prepared.targetIdentityDigest == persisted.targetDigest)
             readinessStore.writeActivated(prepared.config, prepared)
             readinessConfig = prepared.config
+            canonicalPreparedAuthority = null
+          } else {
+            val prepared = requireNotNull(canonicalPreparedAuthority)
+            require(
+              !prepared.config.enabled &&
+                prepared.runtimeId == persisted.runtimeId &&
+                prepared.config.generation == persisted.generation &&
+                prepared.environmentOrigin == persisted.environmentOrigin &&
+                prepared.operation == persisted.target.grantOperation() &&
+                prepared.targetIdentityDigest == persisted.targetDigest
+            )
+            readinessStore.write(prepared.config)
+            readinessConfig = prepared.config
+            canonicalPreparedAuthority = null
           }
           installation?.let(voiceRuntimeRealtimeEngineSlot::complete)
           installationCompleted = true
@@ -984,6 +1009,7 @@ class T3VoiceRuntimeService : Service() {
         runCatching { readinessStore.restore(readinessCheckpoint) }
           .onFailure(cause::addSuppressed)
         readinessConfig = priorReadinessConfig
+        canonicalPreparedAuthority = priorCanonicalPreparedAuthority
         if (!controllerRestored) {
           enterCanonicalRecoveryRequiredLocked("configure-controller-rollback")
         }
@@ -1047,7 +1073,8 @@ class T3VoiceRuntimeService : Service() {
           persisted.readinessEnabled,
         )
         return@synchronized VoiceRuntimeAuthorityInspection(
-          "active", input, null, persisted.issuedAtEpochMillis, persisted.expiresAtEpochMillis,
+          "active", input, readinessConfig, null,
+          persisted.issuedAtEpochMillis, persisted.expiresAtEpochMillis,
           persisted.refreshRotationCounter,
         )
       }
@@ -1072,7 +1099,7 @@ class T3VoiceRuntimeService : Service() {
         true,
       )
       VoiceRuntimeAuthorityInspection(
-        "prepared", input, prepared.credentialHash, null, null, null,
+        "prepared", input, readinessPrepared.config, prepared.credentialHash, null, null, null,
       )
     }
 
@@ -1771,20 +1798,27 @@ class T3VoiceRuntimeService : Service() {
     }.getOrNull()
     canonicalInstalled?.authority?.let { canonical ->
       val reconciled = runCatching {
-        when (val decision = VoiceRuntimeCommittedReadinessPolicy.reconcile(
-            canonical,
-            readinessStore.prepared(),
-            readinessStore.activeAuthority(),
-          )) {
-          VoiceRuntimeCommittedReadinessDecision.NotRequired -> Unit
-          is VoiceRuntimeCommittedReadinessDecision.Current ->
-            readinessConfig = verifyReadiness(decision.authority.config)
-          is VoiceRuntimeCommittedReadinessDecision.Promote -> {
-            readinessStore.writeActivated(decision.authority.config, decision.authority)
-            readinessConfig = verifyReadiness(decision.authority.config)
+        if (!canonical.readinessEnabled) {
+          val aligned = T3VoiceCanonicalReadinessPolicy.transient(readinessConfig, canonical)
+          readinessStore.write(aligned)
+          readinessConfig = verifyReadiness(aligned)
+        } else {
+          when (val decision = VoiceRuntimeCommittedReadinessPolicy.reconcile(
+              canonical,
+              readinessStore.prepared(),
+              readinessStore.activeAuthority(),
+            )) {
+            VoiceRuntimeCommittedReadinessDecision.NotRequired ->
+              error("Persistent readiness reconciliation was not required.")
+            is VoiceRuntimeCommittedReadinessDecision.Current ->
+              readinessConfig = verifyReadiness(decision.authority.config)
+            is VoiceRuntimeCommittedReadinessDecision.Promote -> {
+              readinessStore.writeActivated(decision.authority.config, decision.authority)
+              readinessConfig = verifyReadiness(decision.authority.config)
+            }
+            VoiceRuntimeCommittedReadinessDecision.Mismatch ->
+              error("Canonical authority and readiness state do not match.")
           }
-          VoiceRuntimeCommittedReadinessDecision.Mismatch ->
-            error("Canonical authority and readiness state do not match.")
         }
       }.isSuccess
       if (!reconciled) {
@@ -3647,7 +3681,10 @@ class T3VoiceRuntimeService : Service() {
       attempt.authority.runtimeId,
       attempt.authority.environmentOrigin,
     )
-    val disabled = readinessConfig.copy(enabled = false, generation = readinessConfig.generation + 1)
+    val disabled = T3VoiceCanonicalReadinessPolicy.disabled(
+      readinessConfig,
+      voiceRuntimeController.snapshot().identity.generation,
+    )
     readinessStore.writeDisabledForRuntimeRevocation(disabled, pending)
     readinessConfig = disabled
     voiceRuntimeAuthorityStore.clear()
@@ -4048,6 +4085,13 @@ class T3VoiceRuntimeService : Service() {
     )
     voiceRuntimeRealtimeEngineSlot.commit(installation)
     voiceRuntimeRealtimeEngineSlot.complete(installation)
+    checkpoint?.takeIf { recovered ->
+      voiceRuntimeController.snapshot().target == recovered.target
+    }?.let { recovered ->
+      check(voiceRuntimeController.recoverRealtimePresentationContext(recovered)) {
+        "Recovered Realtime presentation context does not match canonical authority."
+      }
+    }
     recoverRealtimeEngineLocked(
       engine,
       T3VoiceRecoveredRealtimeAuthorityPolicy.recoveryIdentity(

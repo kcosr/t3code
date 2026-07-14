@@ -152,6 +152,7 @@ internal class T3VoiceRuntimeServiceRecoveryTest {
       fence = checkpoint.fence,
       sourceTarget = checkpoint.target,
       sourceEnvironmentOrigin = "https://environment.example.test",
+      sourceAuthorityExpiresAtEpochMillis = 10_000,
       rootCommandId = checkpoint.rootCommandId,
       session = VoiceRuntimeRealtimeStartResult(
         VoiceRuntimeRealtimeSessionState(

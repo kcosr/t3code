@@ -362,9 +362,7 @@ internal class VoiceRuntimeActiveThreadController(
     )) {
       "Voice runtime retention scope is unavailable."
     }
-    presentationActions.replace(
-      retained.actions(now()).filter { it.identity == identity }.map { it.action },
-    )
+    presentationActions.replace(emptyList())
     lastRealtimeSession = null
     projectedRealtimeTerminals.clear()
     appendState("authority-configured") {
@@ -379,6 +377,31 @@ internal class VoiceRuntimeActiveThreadController(
       )
     }
     return journal.snapshot
+  }
+
+  @Synchronized
+  fun recoverRealtimePresentationContext(
+    checkpoint: VoiceRuntimeRealtimeCheckpoint,
+  ): Boolean {
+    val target = journal.snapshot.target as? VoiceRuntimeTarget.Realtime ?: return false
+    val sourceIdentity = checkpoint.fence.identity
+    if (checkpoint.target != target ||
+      sourceIdentity.runtimeId != identity.runtimeId ||
+      sourceIdentity.generation != identity.generation) return false
+    val scope = VoiceRuntimeRetentionScope.RecoveredRealtime(
+      target.environmentId,
+      checkpoint.fence,
+    )
+    if (retained.activateScope(identity, scope, now()) == null) return false
+    lastRealtimeSession = VoiceRuntimeObservedRealtimeSession(
+      identity,
+      checkpoint.fence.modeSessionId,
+      target.conversationId,
+    )
+    presentationActions.replace(
+      retained.actions(now()).filter(::actionMatchesCurrentContext).map { it.action },
+    )
+    return true
   }
 
   @Synchronized

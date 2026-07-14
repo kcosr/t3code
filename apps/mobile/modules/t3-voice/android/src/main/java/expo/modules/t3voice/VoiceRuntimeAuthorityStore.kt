@@ -74,6 +74,7 @@ internal data class VoiceRuntimeAuthorityPreparationResult(
 internal data class VoiceRuntimeAuthorityInspection(
   val state: String,
   val preparation: VoiceRuntimeAuthorityPreparation,
+  val readiness: T3VoiceReadinessConfig,
   val refreshCredentialHash: String?,
   val issuedAtEpochMillis: Long?,
   val expiresAtEpochMillis: Long?,

@@ -26,12 +26,19 @@ import { Alert, AppState, View } from "react-native";
 import { useNavigation } from "@react-navigation/native";
 
 import { uuidv4 } from "../../lib/uuid";
+import { savePreferencesPatch } from "../../persistence/imperative";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import { useThreadShells } from "../../state/entities";
 import { appAtomRegistry } from "../../state/atom-registry";
 import { environmentThreadDetails } from "../../state/threads";
-import { prepareConnectionOnDemand, usePreparedConnection } from "../../state/session";
+import {
+  getPreparedConnection,
+  prepareConnectionOnDemand,
+  usePreparedConnection,
+} from "../../state/session";
+import { useSavedRemoteConnections } from "../../state/use-remote-environment-registry";
 import { androidVoiceRuntimeFactory } from "./androidVoiceRuntime";
+import { autonomousNativeVoiceReadinessAction } from "./autonomousNativeVoiceReadiness";
 import {
   canonicalVoiceViewModel,
   voiceMuteIntent,
@@ -43,8 +50,13 @@ import { MasterVoiceContext, type AutonomousMasterVoiceContextValue } from "./Ma
 import { CanonicalMasterVoiceCallBar, VoiceAudioRoutePicker } from "./MasterVoiceOverlays";
 import {
   makeNativeVoiceRuntimeProvisioningAdapter,
+  NativeVoiceRuntimeReplacementDeferredError,
   NativeVoiceRuntimeProvisioningCoordinator,
+  resolveNativeVoiceRuntimeRevocationEndpoint,
+  StaleNativeVoiceRuntimeProvisioningEpochError,
 } from "./nativeVoiceRuntimeProvisioning";
+import { NativeVoiceReconciliationBackoff } from "./nativeVoiceReconciliationBackoff";
+import { reconcilePendingNativeReadinessDisable } from "./nativeVoiceReadiness";
 import {
   nativeVoiceRuntimeReadinessTargetId,
   resolveNativeVoiceRuntimeTarget,
@@ -186,6 +198,7 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
   const preferences = AsyncResult.isSuccess(preferencesResult) ? preferencesResult.value : null;
+  const { savedConnectionsById } = useSavedRemoteConnections();
   const threadShells = useThreadShells();
   const environmentId = props.focus?.environmentId ?? props.environmentId;
   const preparedOption = usePreparedConnection(environmentId);
@@ -200,12 +213,14 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
     readonly error: string | null;
   }>({ pendingLabel: null, error: null });
   const [rebasePendingCount, setRebasePendingCount] = useState(0);
+  const [readinessRetry, setReadinessRetry] = useState(0);
   const commandEpochRef = useRef(0);
   const presentationWaitScopeRef = useRef(new VoicePresentationGenerationWaitScope());
   const focusDispatchRef = useRef<string | null>(null);
   const provisioningRef = useRef<NativeVoiceRuntimeProvisioningCoordinator | null>(null);
   const provisioningEpochRef = useRef(0);
   const provisioningQueueRef = useRef(Promise.resolve());
+  const readinessReconciliationBackoffRef = useRef(new NativeVoiceReconciliationBackoff());
   const requestedConversationIdRef = useRef<VoiceConversationId | null>(null);
   const presentedConfirmationActionIdsRef = useRef(new Set<string>());
   const latestRef = useRef({
@@ -223,6 +238,21 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
     }),
   );
 
+  const resolveNativeRevocationEndpoint = useCallback(
+    (environmentOrigin: string) =>
+      resolveNativeVoiceRuntimeRevocationEndpoint({
+        environmentOrigin,
+        connections: Object.entries(savedConnectionsById).map(([id, connection]) => ({
+          id: id as EnvironmentId,
+          httpBaseUrl: connection.httpBaseUrl,
+        })),
+        getPrepared: getPreparedConnection,
+        prepare: prepareConnectionOnDemand,
+        makeClient: makeMobileVoiceClient,
+      }),
+    [savedConnectionsById],
+  );
+
   useEffect(() => {
     if (presentationWaitScopeRef.current.disposed) {
       presentationWaitScopeRef.current = new VoicePresentationGenerationWaitScope();
@@ -235,6 +265,20 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
       commandEpochRef.current += 1;
     };
   }, []);
+
+  useEffect(
+    () => () => {
+      readinessReconciliationBackoffRef.current.cancel();
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const subscription = native.addListener("readinessDisabled", () => {
+      setReadinessRetry((current) => current + 1);
+    });
+    return () => subscription.remove();
+  }, [native]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", setApplicationState);
@@ -346,6 +390,8 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
           readiness,
           environmentOrigin: new URL(connection.httpBaseUrl).origin,
           resolvedTarget: target,
+          resolvePendingRevocationEndpoint: resolveNativeRevocationEndpoint,
+          retireUnresolvableRevocation: true,
         });
         lifecycle.throwIfDisposed();
         const snapshot = await native.getVoiceRuntimeSnapshotAsync();
@@ -358,8 +404,197 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
       provisioningQueueRef.current = operation.catch(() => undefined);
       return operation.then(() => result);
     },
-    [native, runtimeSnapshot?.target],
+    [native, resolveNativeRevocationEndpoint, runtimeSnapshot?.target],
   );
+
+  useEffect(() => {
+    let disposed = false;
+    const operation = provisioningQueueRef.current.then(async () => {
+      if (disposed) return;
+      const latest = latestRef.current;
+
+      const pendingDisable = await reconcilePendingNativeReadinessDisable({
+        getPending: () => native.getPendingReadinessDisabledAsync(),
+        persistDisabled: async () => {
+          await savePreferencesPatch({ voiceNotificationControlsEnabled: false });
+          savePreferences({ voiceNotificationControlsEnabled: false });
+        },
+        acknowledge: (event) =>
+          native.acknowledgeReadinessDisabledAsync({
+            readinessGeneration: event.readinessGeneration,
+          }),
+      });
+      if (disposed || pendingDisable !== null) {
+        readinessReconciliationBackoffRef.current.reset();
+        return;
+      }
+      if (latest.preferences === null) return;
+
+      const runtime = await native.getVoiceRuntimeSnapshotAsync();
+      if (disposed || runtime.operation.kind !== "none") {
+        readinessReconciliationBackoffRef.current.reset();
+        return;
+      }
+
+      const controlsRequested = latest.preferences.voiceNotificationControlsEnabled === true;
+      if (!controlsRequested) {
+        const [authority, pendingRevocation] = await Promise.all([
+          native.inspectVoiceRuntimeAuthorityAsync(),
+          native.getPendingVoiceRuntimeAuthorityRevocationAsync(),
+        ]);
+        if (disposed) return;
+        const action = autonomousNativeVoiceReadinessAction({
+          authority,
+          operationActive: false,
+          revocationPending: pendingRevocation !== null,
+          resolvedTarget: null,
+        });
+        if (action === "disable") {
+          provisioningEpochRef.current += 1;
+          const disabled = await provisioningRef.current!.disableIfIdle(
+            provisioningEpochRef.current,
+            {
+              resolveEndpoint: resolveNativeRevocationEndpoint,
+              retireUnresolvableRevocation: true,
+            },
+          );
+          if (!disabled) {
+            throw new NativeVoiceRuntimeReplacementDeferredError(authority?.environmentOrigin);
+          }
+        }
+        readinessReconciliationBackoffRef.current.reset();
+        return;
+      }
+      if (latest.environmentId === null) {
+        readinessReconciliationBackoffRef.current.reset();
+        return;
+      }
+
+      const connection = latest.prepared ?? (await prepareConnectionOnDemand(latest.environmentId));
+      if (disposed) return;
+      if (connection === null) {
+        throw new Error("The voice environment is temporarily unavailable.");
+      }
+
+      const [client, microphone, notification, authority] = await Promise.all([
+        makeMobileVoiceClient(connection),
+        native.getMicrophonePermissionAsync(),
+        native.getNotificationPermissionAsync(),
+        native.inspectVoiceRuntimeAuthorityAsync(),
+      ]);
+      if (disposed) return;
+
+      const controlsEnabled = microphone.granted && notification.granted;
+      const resolvedPreferences = resolveVoicePreferences(latest.preferences);
+      const defaultMode = latest.preferences.voiceNotificationDefaultMode ?? "realtime";
+      const commonTarget = {
+        client,
+        environmentId: latest.environmentId,
+        activeConversationId:
+          runtime.target?.mode === "realtime" ? runtime.target.conversationId : null,
+        focus: latest.focus,
+        threadTarget: latest.preferences.voiceThreadTarget,
+        threads: latest.threadShells,
+        autoRearm: resolvedPreferences.autoListenEnabled,
+      } as const;
+      const target = !controlsEnabled
+        ? null
+        : defaultMode === "thread"
+          ? await resolveNativeVoiceRuntimeTarget({
+              ...commonTarget,
+              mode: "thread",
+              endpointPolicy: {
+                endSilenceMs: resolvedPreferences.endSilenceMs,
+                noSpeechTimeoutMs: resolvedPreferences.noSpeechTimeoutMs,
+                maximumUtteranceMs: resolvedPreferences.maximumUtteranceMs,
+              },
+              speechEnabled: true,
+              rearmGuardMs: resolvedPreferences.postPlaybackGuardMs,
+            })
+          : await resolveNativeVoiceRuntimeTarget({ ...commonTarget, mode: "realtime" });
+      if (disposed) return;
+
+      const action = autonomousNativeVoiceReadinessAction({
+        authority,
+        operationActive: false,
+        resolvedTarget: target,
+      });
+      if (action === "none") {
+        readinessReconciliationBackoffRef.current.reset();
+        return;
+      }
+
+      provisioningEpochRef.current += 1;
+      const epoch = provisioningEpochRef.current;
+      if (action === "disable") {
+        const disabled = await provisioningRef.current!.disableIfIdle(epoch, {
+          fallback: { client, environmentOrigin: new URL(connection.httpBaseUrl).origin },
+          resolveEndpoint: resolveNativeRevocationEndpoint,
+          retireUnresolvableRevocation: true,
+        });
+        if (!disabled) {
+          throw new NativeVoiceRuntimeReplacementDeferredError(authority?.environmentOrigin);
+        }
+        readinessReconciliationBackoffRef.current.reset();
+        return;
+      }
+      if (target === null) return;
+
+      await provisioningRef.current!.provision(client, {
+        epoch,
+        readiness: {
+          enabled: true,
+          mode: target.target.mode,
+          targetId: nativeVoiceRuntimeReadinessTargetId(target.target),
+          audioRouteId: latest.preferences.voiceAudioRouteId ?? "system",
+          autoRearm: resolvedPreferences.autoListenEnabled,
+          microphonePermissionGranted: true,
+          notificationPermissionGranted: true,
+        },
+        environmentOrigin: new URL(connection.httpBaseUrl).origin,
+        resolvedTarget: target,
+        resolvePendingRevocationEndpoint: resolveNativeRevocationEndpoint,
+        retireUnresolvableRevocation: true,
+      });
+      readinessReconciliationBackoffRef.current.reset();
+    });
+    provisioningQueueRef.current = operation.catch(() => undefined);
+    void operation.catch((cause: unknown) => {
+      if (disposed || cause instanceof StaleNativeVoiceRuntimeProvisioningEpochError) return;
+      console.warn("[voice] native readiness reconciliation failed", {
+        error: errorMessage(cause),
+      });
+      const fallbackKey =
+        environmentId === null ? "native-runtime:unowned" : `environment:${environmentId}`;
+      readinessReconciliationBackoffRef.current.schedule(
+        cause instanceof NativeVoiceRuntimeReplacementDeferredError
+          ? (cause.reconciliationKey ?? fallbackKey)
+          : fallbackKey,
+        () => setReadinessRetry((current) => current + 1),
+      );
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [
+    native,
+    prepared,
+    preferences?.voiceAudioRouteId,
+    preferences?.voiceAutoListenEnabled,
+    preferences?.voiceEndSilenceMs,
+    preferences?.voiceMaximumUtteranceMs,
+    preferences?.voiceNoSpeechTimeoutMs,
+    preferences?.voiceNotificationControlsEnabled,
+    preferences?.voiceNotificationDefaultMode,
+    preferences?.voicePostPlaybackGuardMs,
+    preferences?.voiceThreadTarget,
+    readinessRetry,
+    resolveNativeRevocationEndpoint,
+    savePreferences,
+    environmentId,
+    runtimeSnapshot?.operation.kind,
+    threadShells,
+  ]);
 
   const dispatch = useCallback(async (request: VoiceRuntimeCommandRequest): Promise<void> => {
     const lifecycle = presentationWaitScopeRef.current;

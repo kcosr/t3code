@@ -565,7 +565,7 @@ class VoiceRuntimeActiveThreadControllerTest {
   }
 
   @Test
-  fun processRestorationRebindsPendingRealtimePresentationActionsBeforeCheckpointRecovery() {
+  fun processRestorationSurfacesOnlyExactRecoveredRealtimePresentationContext() {
     val retained = VoiceRuntimeMemoryJournalRepository(now = { now })
     val realtimeTarget = VoiceRuntimeTarget.Realtime("environment", "conversation")
     val oldIdentity = VoiceRuntimeIdentity("runtime", "old-instance", 1)
@@ -581,7 +581,10 @@ class VoiceRuntimeActiveThreadControllerTest {
       realtimeTarget,
       "old-process",
     )
-    oldController.observeRealtime(VoiceRuntimeRealtimeCheckpoint(
+    val navigateAction = VoiceRuntimeRealtimeAction.NavigateThread(
+      1, now, "navigate", "project", "thread", 5_000,
+    )
+    val recoveredCheckpoint = VoiceRuntimeRealtimeCheckpoint(
       VoiceRuntimeRealtimeFence(oldIdentity, "mode"),
       realtimeTarget,
       "start",
@@ -589,13 +592,13 @@ class VoiceRuntimeActiveThreadControllerTest {
       "session",
       1,
       VoiceRuntimeRealtimeControlGrant("control", 5_000, 15, 30),
-    ))
+      pendingAction = navigateAction,
+    )
+    oldController.observeRealtime(recoveredCheckpoint)
     val oldFence = VoiceRuntimeRealtimeFence(oldIdentity, "mode")
     assertEquals(VoiceRuntimeRetentionWriteResult.INSERTED, oldController.publishRealtimePresentationAction(
       oldFence,
-      VoiceRuntimeRealtimeAction.NavigateThread(
-        1, now, "navigate", "project", "thread", 5_000,
-      ),
+      navigateAction,
     ))
     assertEquals(VoiceRuntimeRetentionWriteResult.INSERTED, oldController.publishRealtimePresentationAction(
       oldFence,
@@ -603,6 +606,16 @@ class VoiceRuntimeActiveThreadControllerTest {
         2, now, "confirm", "confirmation", "tool-call", "send_message", "Send", 5_000,
       ),
     ))
+    assertEquals(
+      VoiceRuntimeRetentionWriteResult.INSERTED,
+      retained.publishAction(VoiceRuntimeRetainedPresentationAction(
+        oldIdentity,
+        "unrelated-mode",
+        VoiceRuntimePresentationAction.NavigateThread(
+          "unrelated", "other-project", "other-thread", 5_000,
+        ),
+      )),
+    )
 
     val newIdentity = VoiceRuntimeIdentity("runtime", "new-instance", 1)
     val restored = VoiceRuntimeActiveThreadController(
@@ -615,19 +628,18 @@ class VoiceRuntimeActiveThreadControllerTest {
       realtimeTarget,
       "new-process",
     )
-    assertEquals(setOf(newIdentity), retained.actions(now).map { it.identity }.toSet())
-    restored.observeRealtime(VoiceRuntimeRealtimeCheckpoint(
-      VoiceRuntimeRealtimeFence(newIdentity, "mode"),
-      realtimeTarget,
-      "start",
-      VoiceRealtimePhase.CONNECTED,
-      "session",
-      1,
-      VoiceRuntimeRealtimeControlGrant("control", 5_000, 15, 30),
-    ))
     val lease = restored.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
+    assertTrue(
+      (restored.deliver(lease, null) as VoiceRuntimeDelivery.Rebase).presentationActions.isEmpty(),
+    )
+    assertEquals(setOf(oldIdentity), retained.actions(now).map { it.identity }.toSet())
+
+    assertTrue(restored.recoverRealtimePresentationContext(recoveredCheckpoint))
     val rebase = restored.deliver(lease, null) as VoiceRuntimeDelivery.Rebase
     assertEquals(setOf("navigate", "confirm"), rebase.presentationActions.map { it.actionId }.toSet())
+    assertEquals(setOf(newIdentity), retained.actions(now).map { it.identity }.toSet())
+    assertEquals(setOf("mode"), retained.actions(now).map { it.modeSessionId }.toSet())
+    assertTrue(restored.snapshot().operation is VoiceRuntimeOperation.None)
   }
 
   @Test
@@ -718,6 +730,76 @@ class VoiceRuntimeActiveThreadControllerTest {
       VoiceRuntimeRetainedRecordKey.ThreadReceipt(oldIdentity, "old-mode", "old-client"),
     )
     assertTrue((local.deliver(lease, null) as VoiceRuntimeDelivery.Rebase).threadReceipts.isEmpty())
+  }
+
+  @Test
+  fun environmentSwitchScopesReceiptDeliveryAndAcknowledgementWithoutDeletingRecords() {
+    val retained = VoiceRuntimeMemoryJournalRepository(now = { now })
+    val local = VoiceRuntimeActiveThreadController(
+      "runtime", "instance", { now }, { installed }, execution, retained = retained,
+    )
+    val firstTarget = target()
+    val firstDigest = local.targetDigest(firstTarget)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, firstDigest, "token", 5_000)
+    local.configureAuthority(reservation(firstDigest), firstTarget, "environment-1")
+    val firstIdentity = local.snapshot().identity
+    val firstReceipt = VoiceRuntimeThreadReceipt(
+      firstIdentity, "mode-1", "client-1", "operation-1", "environment", "project", "thread",
+      "message-1", "turn-1", emptyList(), null, null, null, null, emptyList(),
+      "completed", "completed", 1_000, 5_000,
+    )
+    val secondReceipt = firstReceipt.copy(
+      modeSessionId = "mode-2",
+      turnClientOperationId = "client-2",
+      environmentId = "environment-2",
+      projectId = "project-2",
+      threadId = "thread-2",
+    )
+    local.publishThreadReceipt(firstReceipt)
+    retained.publishReceipt(secondReceipt)
+
+    val secondTarget = firstTarget.copy(
+      environmentId = "environment-2",
+      projectId = "project-2",
+      threadId = "thread-2",
+    )
+    val secondDigest = local.targetDigest(secondTarget)
+    val secondIdentity = firstIdentity.copy(generation = 2)
+    val secondReservation = VoiceRuntimeAuthorityReservation(
+      secondIdentity, "environment-2", 1, secondDigest, "token-2", 1_000, 5_000,
+    )
+    installed = VoiceRuntimeInstalledAuthority("runtime", 2, secondDigest, "token-2", 5_000)
+    local.configureAuthority(secondReservation, secondTarget, "environment-2")
+    val lease = local.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
+    assertEquals(
+      listOf(secondReceipt),
+      (local.deliver(lease, null) as VoiceRuntimeDelivery.Rebase).threadReceipts,
+    )
+    expectThrows<VoiceRuntimeFenceException> {
+      local.acknowledgeRetainedRecord(
+        secondIdentity,
+        VoiceRuntimeRetainedRecordKey.ThreadReceipt(firstIdentity, "mode-1", "client-1"),
+      )
+    }
+    assertEquals(
+      firstReceipt,
+      retained.receipt(
+        VoiceRuntimeRetainedRecordKey.ThreadReceipt(firstIdentity, "mode-1", "client-1"),
+        now,
+      ),
+    )
+
+    val thirdIdentity = firstIdentity.copy(generation = 3)
+    val thirdReservation = VoiceRuntimeAuthorityReservation(
+      thirdIdentity, "environment-1-again", 2, firstDigest, "token-3", 1_000, 5_000,
+    )
+    installed = VoiceRuntimeInstalledAuthority("runtime", 3, firstDigest, "token-3", 5_000)
+    local.configureAuthority(thirdReservation, firstTarget, "environment-1-again")
+    val restoredLease = local.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
+    assertEquals(
+      listOf(firstReceipt),
+      (local.deliver(restoredLease, null) as VoiceRuntimeDelivery.Rebase).threadReceipts,
+    )
   }
 
   @Test

@@ -92,11 +92,9 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     check(existing == null || existing == finalization) {
       "A different Realtime finalization is already pending."
     }
-    val reservedTerminals = reserveTerminalSlot(loadTerminals())
     check(storage.put(mapOf(
       KEY_CHECKPOINT to null,
       KEY_FINALIZATION to encodeFinalization(finalization),
-      KEY_TERMINALS to encodeTerminals(reservedTerminals),
     ))) { "Could not atomically install Realtime finalization." }
   }
 
@@ -132,12 +130,10 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     val candidates = current.filterNot {
         it.identity == summary.identity && it.modeSessionId == summary.modeSessionId
       }
-    val admitted = if (candidates.size >= terminalCapacity) {
-      candidates - requireNotNull(candidates.minWithOrNull(TERMINAL_ORDER))
-    } else {
-      candidates
+    if (candidates.size >= terminalCapacity) {
+      throw VoiceRuntimeRetentionCapacityException("Realtime terminal", terminalCapacity)
     }
-    val next = admitted
+    val next = candidates
       .plus(summary)
       .sortedWith(
         compareBy<VoiceRuntimeRealtimeTerminalSummary>(
@@ -146,8 +142,18 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
           { it.modeSessionId },
         ),
       )
-      .takeLast(terminalCapacity)
     writeTerminals(next)
+  }
+
+  @Synchronized
+  override fun hasTerminalCapacity(
+    fence: VoiceRuntimeRealtimeFence,
+    nowEpochMillis: Long,
+  ): Boolean {
+    val live = terminals(nowEpochMillis)
+    return live.any {
+      it.identity == fence.identity && it.modeSessionId == fence.modeSessionId
+    } || live.size < terminalCapacity
   }
 
   @Synchronized
@@ -259,6 +265,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     .put("fence", encodeFence(finalization.fence))
     .put("sourceTarget", encodeRealtimeTarget(finalization.sourceTarget))
     .put("sourceEnvironmentOrigin", finalization.sourceEnvironmentOrigin)
+    .put("sourceAuthorityExpiresAtEpochMillis", finalization.sourceAuthorityExpiresAtEpochMillis)
     .put("rootCommandId", finalization.rootCommandId)
     .put("session", encodeSession(finalization.session))
     .put("closeOperationId", finalization.closeOperationId)
@@ -285,6 +292,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       fence = decodeFence(value.getJSONObject("fence")),
       sourceTarget = decodeRealtimeTarget(value.getJSONObject("sourceTarget")),
       sourceEnvironmentOrigin = value.getString("sourceEnvironmentOrigin"),
+      sourceAuthorityExpiresAtEpochMillis = value.exactLong("sourceAuthorityExpiresAtEpochMillis"),
       rootCommandId = value.getString("rootCommandId"),
       session = decodeSession(value.getJSONObject("session")),
       closeOperationId = value.getString("closeOperationId"),
@@ -625,6 +633,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     requireIdentifier(finalization.sourceTarget.conversationId, "conversation ID")
     require(VoiceRuntimeOriginPolicy.normalize(finalization.sourceEnvironmentOrigin) ==
       finalization.sourceEnvironmentOrigin) { "Realtime finalization origin is not canonical." }
+    require(finalization.sourceAuthorityExpiresAtEpochMillis > 0)
     requireIdentifier(finalization.rootCommandId, "root command ID")
     requireIdentifier(finalization.closeOperationId, "close operation ID")
     require(finalization.reason.isNotBlank() && finalization.reason.length <= MAXIMUM_REASON_LENGTH)
@@ -755,12 +764,6 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     }
   }
 
-  private fun reserveTerminalSlot(
-    summaries: List<VoiceRuntimeRealtimeTerminalSummary>,
-  ): List<VoiceRuntimeRealtimeTerminalSummary> = summaries
-    .sortedWith(TERMINAL_ORDER)
-    .takeLast((terminalCapacity - 1).coerceAtLeast(0))
-
   private fun encodeTerminals(summaries: List<VoiceRuntimeRealtimeTerminalSummary>): String? {
     require(summaries.size <= terminalCapacity)
     if (summaries.isEmpty()) return null
@@ -873,7 +876,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     val FENCE_FIELDS = setOf("runtimeId", "runtimeInstanceId", "generation", "modeSessionId")
     val FINALIZATION_FIELDS = setOf(
       "version", "fence", "sourceTarget", "sourceEnvironmentOrigin",
-      "rootCommandId", "session", "closeOperationId",
+      "sourceAuthorityExpiresAtEpochMillis", "rootCommandId", "session", "closeOperationId",
       "outcome", "reason", "lastConnectedAtEpochMillis", "handoffExchange", "stage",
       "attemptCount", "lastFailureCode", "lastFailureRetryable", "terminalPublication",
     )
@@ -917,11 +920,6 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       "conversationId",
       "sessionId", "outcome", "reason", "lastConnectedAtEpochMillis",
       "terminalAtEpochMillis", "serverCleanupPending", "expiresAtEpochMillis",
-    )
-    val TERMINAL_ORDER = compareBy<VoiceRuntimeRealtimeTerminalSummary>(
-      { it.terminalAtEpochMillis },
-      { it.identity.runtimeId },
-      { it.modeSessionId },
     )
   }
 }

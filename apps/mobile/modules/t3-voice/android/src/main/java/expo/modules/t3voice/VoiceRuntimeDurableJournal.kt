@@ -83,6 +83,11 @@ internal sealed interface VoiceRuntimeRetentionScope {
   data class Realtime(
     override val environmentId: String,
   ) : VoiceRuntimeRetentionScope
+
+  data class RecoveredRealtime(
+    override val environmentId: String,
+    val sourceFence: VoiceRuntimeRealtimeFence,
+  ) : VoiceRuntimeRetentionScope
 }
 
 internal data class VoiceRuntimeRetentionCheckpoint(
@@ -335,8 +340,7 @@ internal class VoiceRuntimeDurableJournalRepository(
     val currentReceipts = receiptValues().filter { it.expiresAtEpochMillis > nowEpochMillis }
     val receipts = currentReceipts.filter {
       it.identity.runtimeId == identity.runtimeId &&
-        it.identity.generation <= identity.generation &&
-        it.environmentId == scope.environmentId
+        it.identity.generation <= identity.generation
     }
     val currentActions = actionValues().filter { it.action.expiresAtEpochMillis > nowEpochMillis }
     val scopedActions = scopeActions(currentActions, identity, scope)
@@ -677,8 +681,7 @@ internal class VoiceRuntimeMemoryJournalRepository(
     val currentReceipts = receiptValues.values.filter { it.expiresAtEpochMillis > nowEpochMillis }
     val receipts = currentReceipts.filter {
       it.identity.runtimeId == identity.runtimeId &&
-        it.identity.generation <= identity.generation &&
-        it.environmentId == scope.environmentId
+        it.identity.generation <= identity.generation
     }
     val currentActions = actionValues.values.filter { it.action.expiresAtEpochMillis > nowEpochMillis }
     val scopedActions = scopeActions(currentActions, identity, scope)
@@ -757,15 +760,24 @@ private fun scopeActions(
   current.forEach { retained ->
     val sameGeneration = retained.identity.runtimeId == identity.runtimeId &&
       retained.identity.generation == identity.generation
-    val keep = sameGeneration && when (scope) {
+    val realtimeAction = retained.action is VoiceRuntimePresentationAction.NavigateThread ||
+      retained.action is VoiceRuntimePresentationAction.RealtimeConfirmationRequired
+    val keep = when (scope) {
       is VoiceRuntimeRetentionScope.Thread ->
-        retained.action is VoiceRuntimePresentationAction.ReviewDraft
-      is VoiceRuntimeRetentionScope.Realtime ->
-        retained.action is VoiceRuntimePresentationAction.NavigateThread ||
-          retained.action is VoiceRuntimePresentationAction.RealtimeConfirmationRequired
+        sameGeneration && retained.action is VoiceRuntimePresentationAction.ReviewDraft
+      is VoiceRuntimeRetentionScope.Realtime -> sameGeneration && realtimeAction
+      is VoiceRuntimeRetentionScope.RecoveredRealtime ->
+        sameGeneration && realtimeAction && retained.modeSessionId == scope.sourceFence.modeSessionId &&
+          (retained.identity == scope.sourceFence.identity || retained.identity == identity)
     }
     if (!keep) return@forEach
-    val reboundAction = if (retained.identity == identity) retained else {
+    val rebind = when (scope) {
+      is VoiceRuntimeRetentionScope.Realtime -> false
+      is VoiceRuntimeRetentionScope.Thread,
+      is VoiceRuntimeRetentionScope.RecoveredRealtime,
+      -> true
+    }
+    val reboundAction = if (!rebind || retained.identity == identity) retained else {
       rebound += 1
       retained.rebind(identity)
     }

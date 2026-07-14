@@ -308,12 +308,25 @@ function authorityMatches(
   authority: T3VoiceRuntimeAuthoritySnapshot,
   input: NativeVoiceRuntimeProvisioningInput,
   targetDigest: VoiceRuntimeTargetDigest,
+  nowEpochMillis: number,
 ): boolean {
   return (
     authority.environmentOrigin === new URL(input.environmentOrigin).origin &&
     authority.operation === grantOperationForTarget(input.resolvedTarget.target) &&
     authority.targetDigest === targetDigest &&
-    authority.readinessEnabled === input.readiness.enabled
+    authority.readinessEnabled === input.readiness.enabled &&
+    authority.readiness.enabled === input.readiness.enabled &&
+    authority.readiness.mode === input.readiness.mode &&
+    authority.readiness.targetId === input.readiness.targetId &&
+    authority.readiness.audioRouteId === input.readiness.audioRouteId &&
+    authority.readiness.autoRearm === input.readiness.autoRearm &&
+    authority.readiness.microphonePermissionGranted ===
+      input.readiness.microphonePermissionGranted &&
+    authority.readiness.notificationPermissionGranted ===
+      input.readiness.notificationPermissionGranted &&
+    (authority.state === "prepared" ||
+      (Number.isFinite(Date.parse(authority.expiresAt)) &&
+        Date.parse(authority.expiresAt) > nowEpochMillis))
   );
 }
 
@@ -334,7 +347,10 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
     readonly result: NativeVoiceRuntimeProvisioningResult;
   } | null = null;
 
-  constructor(private readonly native: NativeVoiceRuntimeProvisioningAdapter) {}
+  constructor(
+    private readonly native: NativeVoiceRuntimeProvisioningAdapter,
+    private readonly now: () => number = Date.now,
+  ) {}
 
   provision(
     client: NativeRuntimeGrantClient,
@@ -367,7 +383,9 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
       );
       const inspected = await this.native.inspect();
       const adopted =
-        inspected !== null && authorityMatches(inspected, input, targetDigest) ? inspected : null;
+        inspected !== null && authorityMatches(inspected, input, targetDigest, this.now())
+          ? inspected
+          : null;
       this.assertCurrent(input.epoch);
       if (adopted?.state === "active") {
         const result = this.resultFromSnapshot(adopted);
@@ -759,7 +777,8 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
       !Number.isSafeInteger(grant.refreshRotationCounter) ||
       grant.refreshRotationCounter < 0 ||
       !Number.isFinite(Date.parse(grant.issuedAt)) ||
-      !Number.isFinite(Date.parse(grant.expiresAt))
+      !Number.isFinite(Date.parse(grant.expiresAt)) ||
+      Date.parse(grant.expiresAt) <= this.now()
     ) {
       throw new InvalidNativeVoiceRuntimeProvisioningResultError();
     }

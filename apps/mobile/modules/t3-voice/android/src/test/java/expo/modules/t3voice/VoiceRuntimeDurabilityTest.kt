@@ -228,7 +228,7 @@ internal class VoiceRuntimeDurabilityTest {
   }
 
   @Test
-  fun `thread scope retains unacknowledged receipts through prior generations and only rebinds review actions`() {
+  fun `thread scope retains live same-runtime receipts across generations and environments`() {
     val storage = MemoryStore()
     val repository = VoiceRuntimeDurableJournalRepository(storage, now = { 1_000 })
     val oldInstance = VoiceRuntimeIdentity("runtime-1", "old-instance", 4)
@@ -261,7 +261,7 @@ internal class VoiceRuntimeDurabilityTest {
     listOf(review, navigate, priorConfirmation).forEach(repository::publishAction)
 
     assertEquals(
-      VoiceRuntimeRetentionScopeResult(receiptsRetired = 2, actionsRetired = 2, actionsRebound = 1),
+      VoiceRuntimeRetentionScopeResult(receiptsRetired = 1, actionsRetired = 2, actionsRebound = 1),
       repository.activateScope(
         newInstance, VoiceRuntimeRetentionScope.Thread("environment-1"), 1_000,
       ),
@@ -276,6 +276,11 @@ internal class VoiceRuntimeDurabilityTest {
       restarted.receipts(newInstance, "environment-1", 1_000)
         .sortedBy { it.turnClientOperationId },
     )
+    assertEquals(
+      listOf(receipt(4, 2_000).copy(environmentId = "other-environment")),
+      restarted.receipts(newInstance, "other-environment", 1_000),
+    )
+    assertEquals(3, restarted.checkpoint()?.receipts?.size)
     val recovered = restarted.actions(1_000).single()
     assertEquals(newInstance, recovered.identity)
     assertTrue(recovered.action is VoiceRuntimePresentationAction.ReviewDraft)
@@ -284,6 +289,37 @@ internal class VoiceRuntimeDurabilityTest {
       (recovered.action as VoiceRuntimePresentationAction.ReviewDraft).artifact.identity,
     )
     assertEquals(VoiceRuntimeRetentionAdmission.AVAILABLE, restarted.actionCapacity(1_000))
+  }
+
+  @Test
+  fun `environment switching cannot evict live receipts or bypass capacity`() {
+    val storage = MemoryStore()
+    val repository = VoiceRuntimeDurableJournalRepository(
+      storage,
+      now = { 1_000 },
+      receiptCapacity = 2,
+    )
+    val identity = VoiceRuntimeIdentity("runtime-1", "instance-1", 4)
+    val first = receipt(1, 5_000).copy(environmentId = "environment-1")
+    val second = receipt(2, 5_000).copy(environmentId = "environment-2")
+    assertEquals(VoiceRuntimeRetentionWriteResult.INSERTED, repository.publishReceipt(first))
+    assertEquals(VoiceRuntimeRetentionWriteResult.INSERTED, repository.publishReceipt(second))
+
+    assertEquals(
+      VoiceRuntimeRetentionScopeResult(0, 0, 0),
+      repository.activateScope(
+        identity,
+        VoiceRuntimeRetentionScope.Thread("environment-2"),
+        1_000,
+      ),
+    )
+    assertEquals(listOf(second), repository.receipts(identity, "environment-2", 1_000))
+    assertEquals(listOf(first), repository.receipts(identity, "environment-1", 1_000))
+    assertEquals(
+      VoiceRuntimeRetentionAdmission.FULL,
+      repository.receiptAdmission(receipt(3, 5_000).retentionKeyForTest(), 1_000),
+    )
+    assertEquals(2, VoiceRuntimeDurableJournalRepository(storage).checkpoint()?.receipts?.size)
   }
 
   @Test
@@ -308,6 +344,57 @@ internal class VoiceRuntimeDurabilityTest {
       repository.receipts(current, "environment-1", 1_000),
     )
     assertTrue(repository.actions(1_000).isEmpty())
+  }
+
+  @Test
+  fun `recovered realtime scope rebinds only the exact persisted fence and mode`() {
+    val storage = MemoryStore()
+    val repository = VoiceRuntimeDurableJournalRepository(storage, now = { 1_000 })
+    val oldIdentity = VoiceRuntimeIdentity("runtime-1", "old-instance", 4)
+    val currentIdentity = VoiceRuntimeIdentity("runtime-1", "new-instance", 4)
+    val exact = retainedAction(
+      VoiceRuntimePresentationAction.NavigateThread(
+        "navigate-exact", "project-1", "thread-1", 5_000,
+      ),
+      oldIdentity,
+      "mode-exact",
+    )
+    val unrelatedMode = retainedAction(
+      VoiceRuntimePresentationAction.RealtimeConfirmationRequired(
+        "confirm-unrelated", "confirmation-1", "tool-call-1", "send_message", "Send", 5_000,
+      ),
+      oldIdentity,
+      "mode-unrelated",
+    )
+    repository.publishAction(exact)
+    repository.publishAction(unrelatedMode)
+
+    assertEquals(
+      VoiceRuntimeRetentionScopeResult(0, 0, 0),
+      repository.activateScope(
+        currentIdentity,
+        VoiceRuntimeRetentionScope.Realtime("environment-1"),
+        1_000,
+      ),
+    )
+    assertEquals(setOf(oldIdentity), repository.actions(1_000).map { it.identity }.toSet())
+
+    val restarted = VoiceRuntimeDurableJournalRepository(storage, now = { 1_000 })
+    assertEquals(
+      VoiceRuntimeRetentionScopeResult(0, 1, 1),
+      restarted.activateScope(
+        currentIdentity,
+        VoiceRuntimeRetentionScope.RecoveredRealtime(
+          "environment-1",
+          VoiceRuntimeRealtimeFence(oldIdentity, "mode-exact"),
+        ),
+        1_000,
+      ),
+    )
+    assertEquals(
+      listOf(exact.copy(identity = currentIdentity)),
+      VoiceRuntimeDurableJournalRepository(storage, now = { 1_000 }).actions(1_000),
+    )
   }
 
   @Test

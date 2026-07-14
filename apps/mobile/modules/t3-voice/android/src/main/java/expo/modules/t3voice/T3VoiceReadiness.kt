@@ -418,6 +418,74 @@ internal object T3VoiceReadinessReservationPolicy {
   }
 }
 
+internal object T3VoiceCanonicalReadinessPolicy {
+  fun disabled(
+    current: T3VoiceReadinessConfig,
+    canonicalGeneration: Long,
+  ): T3VoiceReadinessConfig {
+    require(canonicalGeneration >= 0)
+    return current.copy(enabled = false, generation = canonicalGeneration)
+  }
+
+  fun transient(
+    current: T3VoiceReadinessConfig,
+    authority: VoiceRuntimePersistedAuthority,
+  ): T3VoiceReadinessConfig {
+    require(!authority.readinessEnabled)
+    val target = authority.target
+    return current.copy(
+      enabled = false,
+      mode = when (target) {
+        is VoiceRuntimeTarget.Realtime -> T3VoiceReadinessMode.REALTIME
+        is VoiceRuntimeTarget.Thread -> T3VoiceReadinessMode.THREAD
+      },
+      targetId = when (target) {
+        is VoiceRuntimeTarget.Realtime -> target.conversationId
+        is VoiceRuntimeTarget.Thread -> "${target.projectId}/${target.threadId}"
+      },
+      generation = authority.generation,
+    )
+  }
+}
+
+internal data class T3VoiceRuntimeOwnershipFence(
+  val runtimeId: String,
+  val generation: Long,
+  val environmentOrigin: String,
+)
+
+internal object T3VoiceRuntimeOwnershipPolicy {
+  fun canonicalFence(
+    readiness: T3VoiceReadinessConfig,
+    activeReadiness: T3VoicePreparedReadiness?,
+    persistedAuthority: VoiceRuntimePersistedAuthority?,
+  ): T3VoiceRuntimeOwnershipFence? {
+    if (
+      activeReadiness != null &&
+        readiness.enabled &&
+        activeReadiness.config.generation == readiness.generation
+    ) {
+      return T3VoiceRuntimeOwnershipFence(
+        activeReadiness.runtimeId,
+        readiness.generation,
+        activeReadiness.environmentOrigin,
+      )
+    }
+    if (
+      persistedAuthority != null &&
+        !persistedAuthority.readinessEnabled &&
+        persistedAuthority.generation == readiness.generation
+    ) {
+      return T3VoiceRuntimeOwnershipFence(
+        persistedAuthority.runtimeId,
+        persistedAuthority.generation,
+        persistedAuthority.environmentOrigin,
+      )
+    }
+    return null
+  }
+}
+
 internal data class T3VoicePendingCommand(
   val commandId: String,
   val command: String,
@@ -561,7 +629,7 @@ internal object T3VoiceConditionalDisablePolicy {
   fun canDisable(
     expectedRuntimeId: String?,
     expectedGeneration: Long?,
-    readinessGeneration: Long,
+    canonicalGeneration: Long,
     authorityIdentities: List<Pair<String, Long>>,
     nativeVoiceActive: Boolean,
   ): Boolean {
@@ -573,7 +641,7 @@ internal object T3VoiceConditionalDisablePolicy {
       actual == null
     } else {
       actual == (expectedRuntimeId to expectedGeneration) &&
-        readinessGeneration == expectedGeneration
+        canonicalGeneration == expectedGeneration
     }
   }
 }

@@ -81,7 +81,10 @@ type ThreadVoiceRuntimeGrant = Extract<
   { readonly operation: "thread-turn-start" }
 >;
 
-function grant(prepared: NativeVoiceRuntimeReservation): ThreadVoiceRuntimeGrant {
+function grant(
+  prepared: NativeVoiceRuntimeReservation,
+  expiresAt = "2099-08-14T12:00:00.000Z",
+): ThreadVoiceRuntimeGrant {
   return {
     token: "runtime-token",
     runtimeId: prepared.runtimeId,
@@ -93,7 +96,7 @@ function grant(prepared: NativeVoiceRuntimeReservation): ThreadVoiceRuntimeGrant
     readinessEnabled: true,
     refreshRotationCounter: 0,
     issuedAt: "2026-07-14T12:00:00.000Z",
-    expiresAt: "2026-08-14T12:00:00.000Z",
+    expiresAt,
   };
 }
 
@@ -128,6 +131,7 @@ function makeNative(prepared: NativeVoiceRuntimeReservation) {
       operation: "thread-turn-start" as const,
       environmentOrigin: ENVIRONMENT_ORIGIN,
       readinessEnabled: true,
+      readiness: { ...readiness, generation: prepared.generation },
     };
     if (authority === "prepared") {
       return { ...base, state: "prepared" as const, refreshCredentialHash: REFRESH_HASH };
@@ -164,7 +168,7 @@ function makeNative(prepared: NativeVoiceRuntimeReservation) {
       return { runtimeId: RUNTIME_ID };
     },
     disableIfIdle: async () => {
-      if (authority === "active") {
+      if (authority !== "none") {
         pendingRevocation = { runtimeId: RUNTIME_ID, environmentOrigin: ENVIRONMENT_ORIGIN };
       }
       authority = "none";
@@ -314,6 +318,50 @@ describe("NativeVoiceRuntimeProvisioningCoordinator", () => {
       generation: 1,
     });
     expect(second.provision).not.toHaveBeenCalled();
+  });
+
+  it("replaces and revokes an expired matching authority instead of adopting it", async () => {
+    const prepared = await reservation();
+    const { native, prepare } = makeNative(prepared);
+    const first = makeClient({
+      provision: async (candidate) => grant(candidate, "2026-07-14T12:01:00.000Z"),
+    });
+    const initial = new NativeVoiceRuntimeProvisioningCoordinator(native, () =>
+      Date.parse("2026-07-14T12:00:00.000Z"),
+    );
+    await initial.provision(first.client, provisioningInput(1));
+
+    const replacement = makeClient();
+    const restored = new NativeVoiceRuntimeProvisioningCoordinator(native, () =>
+      Date.parse("2026-07-14T12:02:00.000Z"),
+    );
+    await expect(restored.provision(replacement.client, provisioningInput(2))).resolves.toEqual({
+      runtimeId: RUNTIME_ID,
+      generation: 1,
+    });
+
+    expect(first.revoke).not.toHaveBeenCalled();
+    expect(replacement.revoke).toHaveBeenCalledWith(RUNTIME_ID);
+    expect(replacement.provision).toHaveBeenCalledOnce();
+    expect(prepare).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects and revokes a newly issued expired authority", async () => {
+    const prepared = await reservation();
+    const { native, activate } = makeNative(prepared);
+    const issued = makeClient({
+      provision: async (candidate) => grant(candidate, "2026-07-14T11:59:59.000Z"),
+    });
+    const coordinator = new NativeVoiceRuntimeProvisioningCoordinator(native, () =>
+      Date.parse("2026-07-14T12:00:00.000Z"),
+    );
+
+    await expect(coordinator.provision(issued.client, provisioningInput(1))).rejects.toThrow(
+      "The native voice runtime grant did not match the prepared readiness state.",
+    );
+
+    expect(activate).not.toHaveBeenCalled();
+    expect(issued.revoke).toHaveBeenCalledWith(RUNTIME_ID);
   });
 
   it("revokes disabled authority through the canonical runtime API", async () => {
