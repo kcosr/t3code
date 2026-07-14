@@ -21,16 +21,9 @@ export function dictationTerminationOwnership(input: {
   return "orphaned";
 }
 
-export async function cleanupOrphanedRecordingTermination(
+export async function discardOrphanedRecordingTerminationIfUnowned(
   native: T3VoiceNativeModule,
   event: T3VoiceRecordingTerminatedEvent,
-): Promise<void> {
-  if (event.outcome === "completed") {
-    await native.deleteRecordingAsync({
-      recordingId: event.recordingId,
-      uri: event.recording.uri,
-    });
-    return;
-  }
-  await native.acknowledgeRecordingTerminationAsync({ recordingId: event.recordingId });
+): Promise<boolean> {
+  return native.discardUnownedRecordingTerminationAsync({ recordingId: event.recordingId });
 }

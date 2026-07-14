@@ -622,6 +622,15 @@ class T3VoiceModule : Module() {
         }
       }
 
+      AsyncFunction("discardUnownedRecordingTerminationAsync") {
+        input: Map<String, String>, promise: Promise ->
+        withBinder(promise, "recording-orphan-discard-failed") { voice, result ->
+          result.resolve(
+            voice.discardUnownedRecordingTermination(requireIdentifier(input, "recordingId")),
+          )
+        }
+      }
+
       AsyncFunction("startPlaybackAsync") { input: Map<String, Any>, promise: Promise ->
         val playbackId = requireIdentifier(input, "playbackId")
         val sampleRate = requireInt(input, "sampleRate")

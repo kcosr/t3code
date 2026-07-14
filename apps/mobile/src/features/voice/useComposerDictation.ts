@@ -16,7 +16,7 @@ import {
 import { useVoiceCapabilityDescriptor } from "./useVoiceCapabilityAvailability";
 import { validateRecordingAgainstCapability } from "./dictationPolicy";
 import {
-  cleanupOrphanedRecordingTermination,
+  discardOrphanedRecordingTerminationIfUnowned,
   dictationTerminationOwnership,
 } from "./dictationTermination";
 import { canStartComposerDictation } from "./dictationAdmission";
@@ -339,7 +339,7 @@ export function useComposerDictation(input: {
         transcribingRecordingId: transcribingRecordingIdRef.current,
       });
       if (ownership === "orphaned") {
-        void cleanupOrphanedRecordingTermination(native, event).catch(() => undefined);
+        void discardOrphanedRecordingTerminationIfUnowned(native, event).catch(() => undefined);
         return;
       }
       if (ownership === "transcribing") {

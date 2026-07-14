@@ -260,6 +260,7 @@ export function MasterVoiceProvider(props: {
     new Map<string, Extract<VoiceSessionEvent, { readonly type: "client-action" }>>(),
   );
   const acceptedThreadVoiceHandoffIdRef = useRef<string | null>(null);
+  const settledThreadVoiceHandoffIdRef = useRef<string | null>(null);
   const traditionalAudioInterruptionsRef = useRef(
     new Set<() => void | (() => void) | Promise<void | (() => void)>>(),
   );
@@ -516,9 +517,16 @@ export function MasterVoiceProvider(props: {
 
   useEffect(() => {
     if (native === null || prepared === null || controllerEnvironmentId === null) return;
+    let disposed = false;
     const accept = (event: T3VoiceThreadVoiceHandoffEvent) => {
+      if (disposed) return;
       if (event.environmentOrigin !== new URL(prepared.httpBaseUrl).origin) return;
-      if (acceptedThreadVoiceHandoffIdRef.current === event.actionId) return;
+      if (
+        acceptedThreadVoiceHandoffIdRef.current === event.actionId ||
+        settledThreadVoiceHandoffIdRef.current === event.actionId
+      ) {
+        return;
+      }
       acceptedThreadVoiceHandoffIdRef.current = event.actionId;
       setThreadVoiceHandoff({
         ...event,
@@ -529,10 +537,22 @@ export function MasterVoiceProvider(props: {
       setTranscriptVisible(false);
     };
     const subscription = native.addListener("threadVoiceHandoff", accept);
-    void native.getPendingThreadVoiceHandoffAsync().then((event) => {
-      if (event !== null) accept(event);
+    const loadPending = () =>
+      native
+        .getPendingThreadVoiceHandoffAsync()
+        .then((event) => {
+          if (!disposed && event !== null) accept(event);
+        })
+        .catch(() => undefined);
+    void loadPending();
+    const appStateSubscription = AppState.addEventListener("change", (state) => {
+      if (state === "active") void loadPending();
     });
-    return () => subscription.remove();
+    return () => {
+      disposed = true;
+      subscription.remove();
+      appStateSubscription.remove();
+    };
   }, [controllerEnvironmentId, native, prepared]);
 
   useEffect(() => {
@@ -548,7 +568,7 @@ export function MasterVoiceProvider(props: {
     let retry: ReturnType<typeof setTimeout> | null = null;
     let disposed = false;
     const navigate = () => {
-      if (disposed || Date.now() >= threadVoiceHandoff.expiresAtEpochMillis) return;
+      if (disposed) return;
       navigation.navigate("Thread", {
         environmentId: String(threadVoiceHandoff.environmentId),
         threadId: String(threadVoiceHandoff.threadId),
@@ -1662,6 +1682,7 @@ export function MasterVoiceProvider(props: {
       settleThreadVoiceHandoff: async (actionId, outcome) => {
         if (native === null) throw new Error("The native voice runtime is unavailable");
         await native.acknowledgeThreadVoiceHandoffAsync({ actionId, outcome });
+        settledThreadVoiceHandoffIdRef.current = actionId;
         setThreadVoiceHandoff((current) => (current?.actionId === actionId ? null : current));
         if (acceptedThreadVoiceHandoffIdRef.current === actionId) {
           acceptedThreadVoiceHandoffIdRef.current = null;

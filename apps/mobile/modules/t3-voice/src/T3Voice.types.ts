@@ -476,6 +476,9 @@ export interface T3VoiceNativeModule {
   readonly acknowledgeRecordingTerminationAsync: (
     input: T3VoiceRecordingIdentifier,
   ) => Promise<void>;
+  readonly discardUnownedRecordingTerminationAsync: (
+    input: T3VoiceRecordingIdentifier,
+  ) => Promise<boolean>;
   readonly getPendingRecordingTerminationAsync: () => Promise<T3VoiceRecordingTerminatedEvent | null>;
   readonly getPendingThreadVoiceHandoffAsync: () => Promise<T3VoiceThreadVoiceHandoffEvent | null>;
   readonly acknowledgeThreadVoiceHandoffAsync: (input: {

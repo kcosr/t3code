@@ -445,16 +445,26 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     }
     if (handoffAdoptionsRef.current.has(handoff.actionId)) return;
     handoffAdoptionsRef.current.add(handoff.actionId);
-    void dictation
-      .adopt(handoff.recordingId)
-      .then(async (adopted) => {
-        if (adopted && handoff.autoRearm) adoptHandoffRecording(handoff.recordingId);
-        await realtimeVoice.settleThreadVoiceHandoff(
-          handoff.actionId,
-          adopted ? "adopted" : "failed",
-        );
-      })
-      .catch(() => realtimeVoice.settleThreadVoiceHandoff(handoff.actionId, "failed"))
+    void (async () => {
+      let adopted = false;
+      try {
+        adopted = await dictation.adopt(handoff.recordingId);
+      } catch {
+        await realtimeVoice.settleThreadVoiceHandoff(handoff.actionId, "failed");
+        return;
+      }
+      if (!adopted) {
+        await realtimeVoice.settleThreadVoiceHandoff(handoff.actionId, "failed");
+        return;
+      }
+      try {
+        if (handoff.autoRearm) adoptHandoffRecording(handoff.recordingId);
+      } finally {
+        await realtimeVoice
+          .settleThreadVoiceHandoff(handoff.actionId, "adopted")
+          .catch(() => undefined);
+      }
+    })()
       .finally(() => handoffAdoptionsRef.current.delete(handoff.actionId))
       .catch(() => undefined);
   }, [

@@ -6,7 +6,7 @@ import type {
 } from "@t3tools/mobile-voice-native";
 import { validateRecordingAgainstCapability } from "./dictationPolicy";
 import {
-  cleanupOrphanedRecordingTermination,
+  discardOrphanedRecordingTerminationIfUnowned,
   dictationTerminationOwnership,
 } from "./dictationTermination";
 
@@ -65,55 +65,22 @@ describe("orphaned dictation termination cleanup", () => {
     ).toBe("orphaned");
   });
 
-  it("deletes retained completed audio", async () => {
+  it("delegates orphan ownership cleanup atomically to native", async () => {
     const calls: Array<unknown> = [];
     const native = {
-      deleteRecordingAsync: async (input: unknown) => {
-        calls.push(["delete", input]);
-      },
-      acknowledgeRecordingTerminationAsync: async (input: unknown) => {
-        calls.push(["acknowledge", input]);
-      },
-    } as unknown as T3VoiceNativeModule;
-    const event: T3VoiceRecordingTerminatedEvent = {
-      recordingId: "recording-a",
-      recording: {
-        recordingId: "recording-a",
-        uri: "file:///recording-a.m4a",
-        mimeType: "audio/mp4",
-        durationMs: 1_000,
-        byteLength: 4_096,
-      },
-      outcome: "completed",
-      reason: "speech-ended",
-    };
-
-    await cleanupOrphanedRecordingTermination(native, event);
-
-    expect(calls).toEqual([
-      ["delete", { recordingId: "recording-a", uri: "file:///recording-a.m4a" }],
-    ]);
-  });
-
-  it.each(["cancelled", "failed"] as const)("acknowledges %s outcomes", async (outcome) => {
-    const calls: Array<unknown> = [];
-    const native = {
-      deleteRecordingAsync: async (input: unknown) => {
-        calls.push(["delete", input]);
-      },
-      acknowledgeRecordingTerminationAsync: async (input: unknown) => {
-        calls.push(["acknowledge", input]);
+      discardUnownedRecordingTerminationAsync: async (input: unknown) => {
+        calls.push(input);
+        return false;
       },
     } as unknown as T3VoiceNativeModule;
     const event = {
       recordingId: "recording-a",
       recording: null,
-      outcome,
-      reason: outcome === "cancelled" ? "no-speech" : "finalization-failed",
+      outcome: "cancelled",
+      reason: "no-speech",
     } as T3VoiceRecordingTerminatedEvent;
 
-    await cleanupOrphanedRecordingTermination(native, event);
-
-    expect(calls).toEqual([["acknowledge", { recordingId: "recording-a" }]]);
+    await expect(discardOrphanedRecordingTerminationIfUnowned(native, event)).resolves.toBe(false);
+    expect(calls).toEqual([{ recordingId: "recording-a" }]);
   });
 });

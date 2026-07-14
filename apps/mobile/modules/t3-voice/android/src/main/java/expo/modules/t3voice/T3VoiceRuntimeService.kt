@@ -622,14 +622,39 @@ class T3VoiceRuntimeService : Service() {
       T3VoiceStateStore.clearRecordingTermination(recordingId)
     }
 
+    fun discardUnownedRecordingTermination(recordingId: String): Boolean =
+      synchronized(operationLock) {
+        if (T3VoiceStateStore.isThreadVoiceHandoffRecordingProtected(recordingId)) {
+          return@synchronized false
+        }
+        val termination = T3VoiceStateStore.recordingTermination.value
+          ?.takeIf { it.recordingId == recordingId }
+          ?: return@synchronized false
+        termination.recording?.let { recording ->
+          runCatching { recorder.delete(recordingId, recording.uri) }
+            .onFailure {
+              T3VoiceDiagnostics.record(
+                0,
+                T3VoiceDiagnosticCategory.TERMINAL,
+                T3VoiceDiagnosticCode.FAILED,
+              )
+            }
+        }
+        T3VoiceStateStore.clearRecordingTermination(recordingId)
+        true
+      }
+
     fun pendingRecordingTermination(): Map<String, Any?>? =
       T3VoiceStateStore.recordingTermination.value?.toEventBody()
 
     fun pendingThreadVoiceHandoff(): Map<String, Any>? =
       synchronized(operationLock) {
         val handoff = T3VoiceStateStore.pendingThreadVoiceHandoff() ?: return@synchronized null
-        if (handoff.expiresAtEpochMillis <= System.currentTimeMillis()) {
-          cancelNativeHandoffRecordingLocked(handoff.recordingId, "handoff-adoption-expired")
+        if (
+          handoff.expiresAtEpochMillis <= System.currentTimeMillis() &&
+            !T3VoiceStateStore.isThreadVoiceHandoffAdopted(handoff.actionId)
+        ) {
+          discardNativeHandoffRecordingLocked(handoff.recordingId, "handoff-adoption-expired")
           T3VoiceStateStore.clearThreadVoiceHandoff(handoff.actionId)
           return@synchronized null
         }
@@ -641,10 +666,12 @@ class T3VoiceRuntimeService : Service() {
         val handoff = T3VoiceStateStore.pendingThreadVoiceHandoff()
           ?.takeIf { it.actionId == actionId }
           ?: return@synchronized
-        if (outcome == "failed") {
-          cancelNativeHandoffRecordingLocked(handoff.recordingId, "handoff-adoption-failed")
+        if (outcome == "adopted") {
+          T3VoiceStateStore.markThreadVoiceHandoffAdopted(actionId)
+        } else if (!T3VoiceStateStore.isThreadVoiceHandoffAdopted(actionId)) {
+          discardNativeHandoffRecordingLocked(handoff.recordingId, "handoff-adoption-failed")
+          T3VoiceStateStore.clearThreadVoiceHandoff(actionId)
         }
-        T3VoiceStateStore.clearThreadVoiceHandoff(actionId)
       }
     }
 
@@ -3594,6 +3621,17 @@ class T3VoiceRuntimeService : Service() {
     )
   }
 
+  private fun discardNativeHandoffRecordingLocked(recordingId: String, reason: String) {
+    cancelNativeHandoffRecordingLocked(recordingId, reason)
+    val termination = T3VoiceStateStore.recordingTermination.value
+      ?.takeIf { it.recordingId == recordingId }
+      ?: return
+    termination.recording?.let { recording ->
+      runCatching { recorder.delete(recordingId, recording.uri) }
+    }
+    T3VoiceStateStore.clearRecordingTermination(recordingId)
+  }
+
   private fun emitThreadVoiceHandoff(action: T3VoiceNativeHandoffAction, recordingId: String) {
     val environmentOrigin = handoffEnvironmentOrigin ?: return
     T3VoiceStateStore.publishThreadVoiceHandoff(
@@ -3613,8 +3651,11 @@ class T3VoiceRuntimeService : Service() {
           val pending = T3VoiceStateStore.pendingThreadVoiceHandoff()
             ?.takeIf { it.actionId == action.actionId && it.recordingId == recordingId }
             ?: return@synchronized
-          if (pending.expiresAtEpochMillis <= System.currentTimeMillis()) {
-            cancelNativeHandoffRecordingLocked(recordingId, "handoff-adoption-expired")
+          if (
+            pending.expiresAtEpochMillis <= System.currentTimeMillis() &&
+              !T3VoiceStateStore.isThreadVoiceHandoffAdopted(action.actionId)
+          ) {
+            discardNativeHandoffRecordingLocked(recordingId, "handoff-adoption-expired")
             T3VoiceStateStore.clearThreadVoiceHandoff(action.actionId)
           }
         }
