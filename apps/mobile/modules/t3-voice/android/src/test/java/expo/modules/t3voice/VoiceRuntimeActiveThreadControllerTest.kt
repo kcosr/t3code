@@ -259,6 +259,119 @@ class VoiceRuntimeActiveThreadControllerTest {
   }
 
   @Test
+  fun canonicalInstallCheckpointRestoresAuthorityIdentityJournalClaimsAndRetentionExactly() {
+    val drafts = VoiceRuntimeMemoryDraftRepository()
+    val retained = VoiceRuntimeMemoryJournalRepository()
+    val local = VoiceRuntimeActiveThreadController(
+      "runtime", "instance", { now }, { installed }, execution,
+      drafts = drafts, retained = retained,
+    )
+    val target = target()
+    val digest = local.targetDigest(target)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    local.configureAuthority(reservation(digest), target, "generation-1")
+    val handle = VoiceRuntimeDraftHandle(
+      "artifact", VoiceRuntimeIdentity("runtime", "instance", 1), "mode", "turn-client",
+      VoiceRuntimeDraftContext("environment", "project", "thread", "revision"), 5_000,
+    )
+    assertEquals(VoiceRuntimeRetentionWriteResult.INSERTED, local.publishDraft(handle, "draft"))
+    val lease = local.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
+    local.claimPresentationAction(lease, "review-artifact")
+    val checkpoint = local.checkpointCanonicalInstall()
+
+    val replacement = VoiceRuntimeAuthorityReservation(
+      VoiceRuntimeIdentity("runtime", "instance", 2),
+      "provision-2",
+      1,
+      digest,
+      "token-2",
+      1_000,
+      5_000,
+    )
+    installed = VoiceRuntimeInstalledAuthority("runtime", 2, digest, "token-2", 5_000)
+    local.configureAuthority(replacement, target, "generation-2")
+
+    assertTrue(local.restoreCanonicalInstall(checkpoint, replacement.provisioningOperationId))
+    assertEquals(checkpoint, local.checkpointCanonicalInstall())
+    local.configureAuthority(replacement, target, "generation-2")
+    assertEquals(2L, local.snapshot().identity.generation)
+  }
+
+  @Test
+  fun canonicalInstallCheckpointRestoresActiveThreadIdentifiers() {
+    configure()
+    controller.dispatch(start())
+    val checkpoint = controller.checkpointCanonicalInstall()
+    controller.observeRuntime(VoiceRuntimeExecutionSnapshot(
+      runtimeId = "runtime",
+      readinessGeneration = 1,
+      mode = VoiceRuntimeExecutionMode.THREAD,
+      phase = VoiceRuntimePhase.IDLE,
+    ))
+
+    assertTrue(controller.restoreCanonicalInstall(checkpoint, "unused-provisioning"))
+    assertEquals(checkpoint, controller.checkpointCanonicalInstall())
+  }
+
+  @Test
+  fun localRetentionAttentionIsTypedAndRestoresThePriorThreadPhase() {
+    configure()
+    controller.dispatch(start())
+    val before = (controller.snapshot().operation as VoiceRuntimeOperation.ThreadTurn).phase
+
+    assertTrue(controller.publishLocalRetentionStatus(
+      "mode", "turn-client", VoiceRuntimeRetentionAdmission.FULL,
+    ))
+    val blocked = controller.snapshot().operation as VoiceRuntimeOperation.ThreadTurn
+    assertEquals(
+      VoiceThreadPhase.AttentionRequired(VoiceThreadPhase.AttentionRequired.Reason.LOCAL_RETENTION),
+      blocked.phase,
+    )
+    @Suppress("UNCHECKED_CAST")
+    val operationBody = VoiceRuntimeBridge.snapshotBody(controller.snapshot())["operation"]
+      as Map<String, Any?>
+    @Suppress("UNCHECKED_CAST")
+    val phaseBody = operationBody["phase"] as Map<String, String>
+    assertEquals("local-retention", phaseBody["reason"])
+
+    assertTrue(controller.publishLocalRetentionStatus(
+      "mode", "turn-client", VoiceRuntimeRetentionAdmission.AVAILABLE,
+    ))
+    assertEquals(
+      before,
+      (controller.snapshot().operation as VoiceRuntimeOperation.ThreadTurn).phase,
+    )
+  }
+
+  @Test
+  fun `full retention rejects publication without exposing a journal event`() {
+    val retained = VoiceRuntimeMemoryJournalRepository(
+      now = { now },
+      receiptCapacity = 1,
+      actionCapacity = 1,
+    )
+    val local = VoiceRuntimeActiveThreadController(
+      "runtime", "instance", { now }, { installed }, execution, retained = retained,
+    )
+    val target = target()
+    val digest = local.targetDigest(target)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    local.configureAuthority(reservation(digest), target, "fingerprint")
+    val firstReceipt = VoiceRuntimeThreadReceipt(
+      VoiceRuntimeIdentity("runtime", "instance", 1), "mode-1", "turn-1", "operation-1",
+      "environment", "project", "thread", null, null, emptyList(), null, null, null,
+      null, emptyList(), null, null, 1_000, 5_000,
+    )
+    assertEquals(VoiceRuntimeRetentionWriteResult.INSERTED, local.publishThreadReceipt(firstReceipt))
+    val cursor = local.snapshot().cursor()
+    val secondReceipt = firstReceipt.copy(modeSessionId = "mode-2", turnClientOperationId = "turn-2")
+
+    assertEquals(VoiceRuntimeRetentionAdmission.FULL, local.receiptAdmission("mode-2", "turn-2"))
+    assertEquals(VoiceRuntimeRetentionWriteResult.FULL, local.publishThreadReceipt(secondReceipt))
+    assertEquals(cursor, local.snapshot().cursor())
+  }
+
+  @Test
   fun presentationElectionChangesAreDeliveredToExistingLeases() {
     configure()
     val first = controller.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
@@ -352,6 +465,70 @@ class VoiceRuntimeActiveThreadControllerTest {
     assertFalse(eventBody.toString().contains("control-token"))
   }
 
+  @Test
+  fun realtimeTerminalProjectionScopesPriorGenerationsToCurrentRuntimeAndEnvironment() {
+    val target = VoiceRuntimeTarget.Realtime("environment", "conversation")
+    val repository = VoiceRuntimeMemoryRealtimeCheckpointRepository()
+    val prior = realtimeSummary(
+      VoiceRuntimeIdentity("runtime", "old-instance", 2),
+      "prior-mode",
+    )
+    repository.publishTerminal(prior)
+    repository.publishTerminal(realtimeSummary(
+      VoiceRuntimeIdentity("runtime", "old-instance", 2),
+      "wrong-environment",
+    ).copy(environmentId = "other-environment"))
+    repository.publishTerminal(realtimeSummary(
+      VoiceRuntimeIdentity("other-runtime", "old-instance", 2),
+      "wrong-runtime",
+    ))
+    repository.publishTerminal(realtimeSummary(
+      VoiceRuntimeIdentity("runtime", "future-instance", 4),
+      "future-generation",
+    ))
+    val digest = T3VoiceRuntimeTargetIdentity.digest(
+      VoiceRuntimeBridge.canonicalRealtimeTargetIdentity(target),
+    )
+    installed = VoiceRuntimeInstalledAuthority("runtime", 3, digest, "token-3", 5_000)
+    val local = VoiceRuntimeActiveThreadController(
+      "runtime", "instance", { now }, { installed }, execution,
+      realtimeTerminals = repository::terminals,
+      realtimeTerminalAcknowledgement = repository::acknowledgeTerminal,
+      initialGeneration = 2,
+    )
+    local.configureRealtimeAuthority(
+      VoiceRuntimeAuthorityReservation(
+        VoiceRuntimeIdentity("runtime", "instance", 3),
+        "provision-3",
+        2,
+        digest,
+        "token-3",
+        1_000,
+        5_000,
+      ),
+      target,
+      "generation-3",
+    )
+    val lease = local.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
+
+    val rebase = local.deliver(lease, null) as VoiceRuntimeDelivery.Rebase
+    assertEquals(listOf(prior), rebase.realtimeTerminalSummaries)
+    local.acknowledgeRetainedRecord(
+      VoiceRuntimeIdentity("runtime", "instance", 3),
+      VoiceRuntimeRetainedRecordKey.RealtimeTerminal(prior.identity, prior.modeSessionId),
+    )
+    assertFalse(repository.terminals(now).contains(prior))
+    expectThrows<VoiceRuntimeFenceException> {
+      local.acknowledgeRetainedRecord(
+        VoiceRuntimeIdentity("runtime", "instance", 3),
+        VoiceRuntimeRetainedRecordKey.RealtimeTerminal(
+          VoiceRuntimeIdentity("runtime", "old-instance", 2),
+          "wrong-environment",
+        ),
+      )
+    }
+  }
+
   private fun configure() {
     val target = target()
     val digest = controller.targetDigest(target)
@@ -400,6 +577,7 @@ class VoiceRuntimeActiveThreadControllerTest {
   ) = VoiceRuntimeRealtimeTerminalSummary(
     identity,
     modeSessionId,
+    "environment",
     "conversation",
     "session",
     VoiceRuntimeRealtimeTerminalOutcome.STOPPED,

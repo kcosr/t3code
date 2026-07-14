@@ -80,9 +80,38 @@ internal data class VoiceRuntimeAuthoritySnapshot(
   val refreshPending: Boolean,
 )
 
+internal data class T3VoiceReadinessStoreCheckpoint(
+  val values: Map<String, Any?>,
+)
+
 internal class T3VoiceReadinessStore(context: Context) {
   private val preferences =
     context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+
+  @Synchronized
+  fun checkpoint(): T3VoiceReadinessStoreCheckpoint =
+    T3VoiceReadinessStoreCheckpoint(preferences.all.mapValues { it.value })
+
+  @Synchronized
+  fun restore(checkpoint: T3VoiceReadinessStoreCheckpoint) {
+    val edit = preferences.edit().clear()
+    checkpoint.values.forEach { (key, value) ->
+      when (value) {
+        null -> edit.remove(key)
+        is Boolean -> edit.putBoolean(key, value)
+        is Long -> edit.putLong(key, value)
+        is Int -> edit.putInt(key, value)
+        is Float -> edit.putFloat(key, value)
+        is String -> edit.putString(key, value)
+        is Set<*> -> {
+          @Suppress("UNCHECKED_CAST")
+          edit.putStringSet(key, value as Set<String>)
+        }
+        else -> error("Unsupported readiness checkpoint value for $key.")
+      }
+    }
+    check(edit.commit()) { "Could not restore voice readiness state." }
+  }
 
   fun read(): T3VoiceReadinessConfig =
     T3VoiceReadinessConfig(

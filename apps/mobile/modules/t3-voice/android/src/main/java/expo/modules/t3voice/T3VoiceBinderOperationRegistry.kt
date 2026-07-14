@@ -74,6 +74,11 @@ internal class T3VoiceBinderOperationRegistry<T> {
     return Entry(ticket, operation.value)
   }
 
+  fun isActive(ticket: Ticket, binderGeneration: Long): Boolean {
+    val operation = pending[ticket.operationId] ?: return false
+    return operation.ticket == ticket && operation.binderGeneration == binderGeneration
+  }
+
   fun destroy(): List<Entry<T>> {
     connected = false
     binderGeneration += 1

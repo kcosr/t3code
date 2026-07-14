@@ -9,7 +9,12 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import java.time.Instant
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.atomic.AtomicInteger
 import expo.modules.interfaces.permissions.Permissions
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
@@ -25,6 +30,14 @@ class T3VoiceModule : Module() {
   @Volatile private var destroyed = false
   private val binderLock = Any()
   private val mainHandler = Handler(Looper.getMainLooper())
+  private val binderWorkerIndex = AtomicInteger()
+  private val binderOperationExecutor: ExecutorService =
+    Executors.newFixedThreadPool(BINDER_OPERATION_WORKERS) { runnable ->
+      Thread(
+        runnable,
+        "t3-voice-binder-${binderWorkerIndex.incrementAndGet()}",
+      ).apply { isDaemon = true }
+    }
   private val pendingBinderOperations = T3VoiceBinderOperationRegistry<PendingBinderOperation>()
   private val bindingRealtimeOwner = T3VoiceBindingRealtimeOwnerPolicy()
   private var stateCollection: Job? = null
@@ -80,7 +93,7 @@ class T3VoiceModule : Module() {
           }
         dispatches.forEach { dispatch ->
           cancelBinderTimeout(dispatch.value)
-          executeBinderOperation(connectedBinder, dispatch)
+          scheduleBinderOperation(connectedBinder, dispatch)
         }
         stateCollection?.cancel()
         stateCollection =
@@ -229,6 +242,7 @@ class T3VoiceModule : Module() {
         }
         synchronized(binderLock) { binder = null }
         serviceBound = false
+        binderOperationExecutor.shutdownNow()
       }
 
       AsyncFunction("getMediaCapabilitiesAsync") {
@@ -1104,7 +1118,7 @@ class T3VoiceModule : Module() {
     when {
       unavailableMessage != null -> promise.reject(errorCode, unavailableMessage, null)
       dispatch != null && connectedBinder != null ->
-        executeBinderOperation(requireNotNull(connectedBinder), requireNotNull(dispatch))
+        scheduleBinderOperation(requireNotNull(connectedBinder), requireNotNull(dispatch))
       dispatch != null -> {
         val failed =
           synchronized(binderLock) {
@@ -1128,16 +1142,45 @@ class T3VoiceModule : Module() {
     )
   }
 
-  private fun executeBinderOperation(
+  private fun scheduleBinderOperation(
     connectedBinder: T3VoiceRuntimeService.VoiceBinder,
     dispatch: T3VoiceBinderOperationRegistry.Dispatch<PendingBinderOperation>,
   ) {
     val pending = dispatch.value
-    val settlement = BinderSettlement(pending, dispatch.binderGeneration)
     try {
-      pending.operation(connectedBinder, settlement)
-    } catch (cause: Throwable) {
-      settlement.reject(pending.errorCode, cause.message ?: "The voice operation failed.", cause)
+      binderOperationExecutor.execute {
+        val active = synchronized(binderLock) {
+          pendingBinderOperations.isActive(dispatch.ticket, dispatch.binderGeneration)
+        }
+        if (!active) return@execute
+        val settlement = BinderSettlement(pending, dispatch.binderGeneration)
+        val startedAt = SystemClock.elapsedRealtime()
+        T3VoiceDiagnostics.record(
+          0,
+          T3VoiceDiagnosticCategory.LIFECYCLE,
+          T3VoiceDiagnosticCode.BRIDGE_OPERATION_STARTED,
+        )
+        try {
+          pending.operation(connectedBinder, settlement)
+        } catch (cause: Throwable) {
+          settlement.reject(pending.errorCode, cause.message ?: "The voice operation failed.", cause)
+        } finally {
+          T3VoiceDiagnostics.record(
+            0,
+            T3VoiceDiagnosticCategory.LIFECYCLE,
+            T3VoiceDiagnosticCode.BRIDGE_OPERATION_FINISHED,
+            primaryCount = (SystemClock.elapsedRealtime() - startedAt)
+              .coerceAtMost(Int.MAX_VALUE.toLong())
+              .toInt(),
+          )
+        }
+      }
+    } catch (cause: RejectedExecutionException) {
+      BinderSettlement(pending, dispatch.binderGeneration).reject(
+        pending.errorCode,
+        "The T3 voice module is no longer accepting operations.",
+        cause,
+      )
     }
   }
 
@@ -1390,6 +1433,7 @@ class T3VoiceModule : Module() {
     private const val VOICE_RUNTIME_WAKE_EVENT = "voiceRuntimeWake"
     private const val BINDER_CONNECTION_TIMEOUT_MS = 5_000L
     private const val MAXIMUM_TARGET_IDENTITY_LENGTH = 4_096
+    private const val BINDER_OPERATION_WORKERS = 4
     private val READINESS_FIELDS =
       setOf(
         "enabled",

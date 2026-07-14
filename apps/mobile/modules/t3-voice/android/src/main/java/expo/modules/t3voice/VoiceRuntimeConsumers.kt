@@ -144,6 +144,11 @@ internal class VoiceRuntimePresentationActionStore(
   private data class Entry(val action: VoiceRuntimePresentationAction, val claimantLeaseId: String?)
   private val entries = mutableMapOf<String, Entry>()
 
+  data class CheckpointEntry(
+    val action: VoiceRuntimePresentationAction,
+    val claimantLeaseId: String?,
+  )
+
   fun publish(action: VoiceRuntimePresentationAction) { entries[action.actionId] = Entry(action, null) }
 
   fun claim(actionId: String, lease: VoiceRuntimeConsumerLease): VoiceRuntimePresentationAction {
@@ -158,10 +163,14 @@ internal class VoiceRuntimePresentationActionStore(
   }
 
   fun acknowledge(actionId: String, lease: VoiceRuntimeConsumerLease) {
+    requireAcknowledgement(actionId, lease)
+    entries.remove(actionId)
+  }
+
+  fun requireAcknowledgement(actionId: String, lease: VoiceRuntimeConsumerLease) {
     val elected = consumers.requireElected(lease)
     val entry = requireLive(actionId)
     if (entry.claimantLeaseId != elected.leaseId) throw VoiceRuntimeFenceException("Stale action claim.")
-    entries.remove(actionId)
   }
 
   fun live(): List<VoiceRuntimePresentationAction> {
@@ -174,6 +183,17 @@ internal class VoiceRuntimePresentationActionStore(
   fun replace(actions: List<VoiceRuntimePresentationAction>) {
     entries.clear()
     actions.forEach(::publish)
+  }
+
+  fun checkpoint(): List<CheckpointEntry> = entries.values.map {
+    CheckpointEntry(it.action, it.claimantLeaseId)
+  }
+
+  fun restore(checkpoint: List<CheckpointEntry>) {
+    entries.clear()
+    checkpoint.forEach { entry ->
+      entries[entry.action.actionId] = Entry(entry.action, entry.claimantLeaseId)
+    }
   }
 
   private fun requireLive(actionId: String): Entry {

@@ -69,6 +69,59 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
   }
 
   @Synchronized
+  override fun loadFinalization(): VoiceRuntimeRealtimeFinalization? {
+    val raw = storage.getString(KEY_FINALIZATION) ?: return null
+    return try {
+      decodeFinalization(raw)
+    } catch (cause: Throwable) {
+      throw VoiceRuntimeDurableStateCorruptionException(
+        "Realtime voice finalization is unreadable.",
+        cause,
+      )
+    }
+  }
+
+  @Synchronized
+  override fun installFinalization(
+    expectedCheckpoint: VoiceRuntimeRealtimeCheckpoint?,
+    finalization: VoiceRuntimeRealtimeFinalization,
+  ) {
+    validateFinalization(finalization)
+    check(load() == expectedCheckpoint) { "Realtime checkpoint changed before finalization." }
+    val existing = loadFinalization()
+    check(existing == null || existing == finalization) {
+      "A different Realtime finalization is already pending."
+    }
+    check(storage.put(mapOf(
+      KEY_CHECKPOINT to null,
+      KEY_FINALIZATION to encodeFinalization(finalization),
+    ))) { "Could not atomically install Realtime finalization." }
+  }
+
+  @Synchronized
+  override fun saveFinalization(finalization: VoiceRuntimeRealtimeFinalization) {
+    validateFinalization(finalization)
+    val current = requireNotNull(loadFinalization()) { "Realtime finalization is unavailable." }
+    require(current.fence == finalization.fence &&
+      current.session.state.sessionId == finalization.session.state.sessionId) {
+      "Realtime finalization fence changed."
+    }
+    require(current.acceptsUpdate(finalization)) {
+      "Realtime finalization operation changed or regressed."
+    }
+    check(storage.put(mapOf(KEY_FINALIZATION to encodeFinalization(finalization)))) {
+      "Could not persist Realtime finalization."
+    }
+  }
+
+  @Synchronized
+  override fun clearFinalization(fence: VoiceRuntimeRealtimeFence, sessionId: String) {
+    val current = loadFinalization() ?: return
+    if (current.fence != fence || current.session.state.sessionId != sessionId) return
+    check(storage.clear(setOf(KEY_FINALIZATION))) { "Could not clear Realtime finalization." }
+  }
+
+  @Synchronized
   override fun publishTerminal(summary: VoiceRuntimeRealtimeTerminalSummary) {
     validateTerminal(summary)
     val current = loadTerminals().filter {
@@ -142,6 +195,136 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     )
     validateCheckpoint(checkpoint)
     return checkpoint
+  }
+
+  private fun encodeFinalization(finalization: VoiceRuntimeRealtimeFinalization): String {
+    val metadata = encodeFinalizationMetadata(finalization).toString()
+    val secrets = JSONObject()
+      .put("controlGrantToken", finalization.session.controlGrant.token)
+      .put(
+        "handoffTransitionToken",
+        finalization.handoffExchange?.transitionGrant?.token ?: JSONObject.NULL,
+      )
+      .toString()
+    val encrypted = cipher.encrypt(
+      secrets.toByteArray(StandardCharsets.UTF_8),
+      metadata.toByteArray(StandardCharsets.UTF_8),
+    ).also(::requireEncrypted)
+    return JSONObject()
+      .put("version", VERSION)
+      .put("metadata", metadata)
+      .put("iv", Base64.getEncoder().encodeToString(encrypted.initializationVector))
+      .put("ciphertext", Base64.getEncoder().encodeToString(encrypted.ciphertext))
+      .toString()
+  }
+
+  private fun decodeFinalization(raw: String): VoiceRuntimeRealtimeFinalization {
+    val envelope = JSONObject(raw).requireExactFields(ENVELOPE_FIELDS)
+    require(envelope.getString("version") == VERSION)
+    val metadata = envelope.getString("metadata")
+    val encrypted = T3VoiceEncryptedGrant(
+      Base64.getDecoder().decode(envelope.getString("iv")),
+      Base64.getDecoder().decode(envelope.getString("ciphertext")),
+    ).also(::requireEncrypted)
+    val secrets = JSONObject(
+      cipher.decrypt(encrypted, metadata.toByteArray(StandardCharsets.UTF_8))
+        .toString(StandardCharsets.UTF_8),
+    ).requireExactFields(FINALIZATION_SECRET_FIELDS)
+    val decoded = decodeFinalizationMetadata(metadata)
+    val transitionToken = secrets.nullableString("handoffTransitionToken")
+    require((decoded.handoffExchange != null) == (transitionToken != null))
+    return decoded.copy(
+      session = decoded.session.copy(
+        controlGrant = decoded.session.controlGrant.copy(
+          token = secrets.getString("controlGrantToken"),
+        ),
+      ),
+      handoffExchange = decoded.handoffExchange?.let { exchange ->
+        exchange.copy(
+          transitionGrant = exchange.transitionGrant.copy(token = requireNotNull(transitionToken)),
+        )
+      },
+    ).also(::validateFinalization)
+  }
+
+  private fun encodeFinalizationMetadata(
+    finalization: VoiceRuntimeRealtimeFinalization,
+  ): JSONObject = JSONObject()
+    .put("version", VERSION)
+    .put("fence", encodeFence(finalization.fence))
+    .put("sourceTarget", encodeRealtimeTarget(finalization.sourceTarget))
+    .put("sourceEnvironmentOrigin", finalization.sourceEnvironmentOrigin)
+    .put("sourceAuthorityExpiresAtEpochMillis", finalization.sourceAuthorityExpiresAtEpochMillis)
+    .put("rootCommandId", finalization.rootCommandId)
+    .put("session", encodeSession(finalization.session))
+    .put("closeOperationId", finalization.closeOperationId)
+    .put("outcome", finalization.outcome.name)
+    .put("reason", finalization.reason)
+    .put(
+      "lastConnectedAtEpochMillis",
+      finalization.lastConnectedAtEpochMillis ?: JSONObject.NULL,
+    )
+    .put(
+      "handoffExchange",
+      finalization.handoffExchange?.let(::encodeHandoffExchange) ?: JSONObject.NULL,
+    )
+    .put("stage", finalization.stage.name)
+    .put("attemptCount", finalization.attemptCount)
+    .put("lastFailureCode", finalization.lastFailureCode ?: JSONObject.NULL)
+    .put("lastFailureRetryable", finalization.lastFailureRetryable)
+    .put("terminalPublication", finalization.terminalPublication.name)
+
+  private fun decodeFinalizationMetadata(raw: String): VoiceRuntimeRealtimeFinalization {
+    val value = JSONObject(raw).requireExactFields(FINALIZATION_FIELDS)
+    require(value.getString("version") == VERSION)
+    return VoiceRuntimeRealtimeFinalization(
+      fence = decodeFence(value.getJSONObject("fence")),
+      sourceTarget = decodeRealtimeTarget(value.getJSONObject("sourceTarget")),
+      sourceEnvironmentOrigin = value.getString("sourceEnvironmentOrigin"),
+      sourceAuthorityExpiresAtEpochMillis = value.exactLong("sourceAuthorityExpiresAtEpochMillis"),
+      rootCommandId = value.getString("rootCommandId"),
+      session = decodeSession(value.getJSONObject("session")),
+      closeOperationId = value.getString("closeOperationId"),
+      outcome = VoiceRuntimeRealtimeTerminalOutcome.valueOf(value.getString("outcome")),
+      reason = value.getString("reason"),
+      lastConnectedAtEpochMillis = value.nullableLong("lastConnectedAtEpochMillis"),
+      handoffExchange = value.nullableObject("handoffExchange")?.let(::decodeHandoffExchange),
+      stage = VoiceRuntimeRealtimeFinalizationStage.valueOf(value.getString("stage")),
+      attemptCount = value.exactInt("attemptCount"),
+      lastFailureCode = value.nullableString("lastFailureCode"),
+      lastFailureRetryable = value.exactBoolean("lastFailureRetryable"),
+      terminalPublication = VoiceRuntimeRealtimeTerminalPublication.valueOf(
+        value.getString("terminalPublication"),
+      ),
+    )
+  }
+
+  private fun encodeSession(session: VoiceRuntimeRealtimeStartResult): JSONObject = JSONObject()
+    .put("state", JSONObject()
+      .put("sessionId", session.state.sessionId)
+      .put("conversationId", session.state.conversationId)
+      .put("phase", session.state.phase)
+      .put("leaseGeneration", session.state.leaseGeneration)
+      .put("sequence", session.state.sequence))
+    .put("signalingPath", session.signalingPath)
+    .put("expiresAtEpochMillis", session.expiresAtEpochMillis)
+    .put("controlGrant", encodeControlGrant(session.controlGrant))
+
+  private fun decodeSession(value: JSONObject): VoiceRuntimeRealtimeStartResult {
+    value.requireExactFields(FINALIZATION_SESSION_FIELDS)
+    val state = value.getJSONObject("state").requireExactFields(FINALIZATION_SESSION_STATE_FIELDS)
+    return VoiceRuntimeRealtimeStartResult(
+      VoiceRuntimeRealtimeSessionState(
+        state.getString("sessionId"),
+        state.getString("conversationId"),
+        state.getString("phase"),
+        state.exactLong("leaseGeneration"),
+        state.exactLong("sequence"),
+      ),
+      value.getString("signalingPath"),
+      value.exactLong("expiresAtEpochMillis"),
+      decodeControlGrant(value.getJSONObject("controlGrant")),
+    )
   }
 
   private fun encodeCheckpointMetadata(checkpoint: VoiceRuntimeRealtimeCheckpoint): JSONObject =
@@ -432,6 +615,53 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     }
   }
 
+  private fun validateFinalization(finalization: VoiceRuntimeRealtimeFinalization) {
+    validateIdentity(finalization.fence.identity)
+    requireIdentifier(finalization.fence.modeSessionId, "mode session ID")
+    requireIdentifier(finalization.sourceTarget.environmentId, "environment ID")
+    requireIdentifier(finalization.sourceTarget.conversationId, "conversation ID")
+    require(VoiceRuntimeOriginPolicy.normalize(finalization.sourceEnvironmentOrigin) ==
+      finalization.sourceEnvironmentOrigin) { "Realtime finalization origin is not canonical." }
+    require(finalization.sourceAuthorityExpiresAtEpochMillis > 0)
+    requireIdentifier(finalization.rootCommandId, "root command ID")
+    requireIdentifier(finalization.closeOperationId, "close operation ID")
+    require(finalization.reason.isNotBlank() && finalization.reason.length <= MAXIMUM_REASON_LENGTH)
+    finalization.lastConnectedAtEpochMillis?.let { require(it >= 0) }
+    require(finalization.attemptCount >= 0)
+    finalization.lastFailureCode?.let {
+      require(it.isNotBlank() && it.length <= MAXIMUM_REASON_LENGTH)
+    }
+    val session = finalization.session
+    requireIdentifier(session.state.sessionId, "session ID")
+    require(session.state.conversationId == finalization.sourceTarget.conversationId)
+    require(session.state.phase.isNotBlank() && session.state.phase.length <= 64)
+    require(session.state.leaseGeneration > 0)
+    require(session.state.sequence >= 0)
+    require(session.signalingPath.isNotBlank() &&
+      session.signalingPath.length <= MAXIMUM_PATH_LENGTH)
+    require(session.expiresAtEpochMillis > 0)
+    requireCredential(session.controlGrant.token)
+    require(session.controlGrant.expiresAtEpochMillis > 0)
+    require(session.expiresAtEpochMillis >= session.controlGrant.expiresAtEpochMillis)
+    require(session.controlGrant.heartbeatIntervalSeconds > 0)
+    require(session.controlGrant.failureGraceSeconds > 0)
+    finalization.handoffExchange?.let { exchange ->
+      requireIdentifier(exchange.actionId, "handoff action ID")
+      require(exchange.actionSequence > 0)
+      requireIdentifier(exchange.projectId, "project ID")
+      requireIdentifier(exchange.threadId, "thread ID")
+      requireCredential(exchange.transitionGrant.token)
+      require(exchange.transitionGrant.expiresAtEpochMillis > 0)
+      require(exchange.transitionGrant.generation == finalization.fence.identity.generation + 1)
+      requireIdentifier(exchange.transitionGrant.modeSessionId, "thread mode session ID")
+      validateThreadTarget(exchange.transitionGrant.target)
+      require(exchange.transitionGrant.target.environmentId == finalization.sourceTarget.environmentId)
+      require(exchange.projectId == exchange.transitionGrant.target.projectId)
+      require(exchange.threadId == exchange.transitionGrant.target.threadId)
+      require(exchange.autoRearm == exchange.transitionGrant.target.autoRearm)
+    }
+  }
+
   private fun validateAction(action: VoiceRuntimeRealtimeAction) {
     require(action.sequence > 0)
     require(action.occurredAtEpochMillis >= 0)
@@ -530,6 +760,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     .put("runtimeInstanceId", summary.identity.runtimeInstanceId)
     .put("generation", summary.identity.generation)
     .put("modeSessionId", summary.modeSessionId)
+    .put("environmentId", summary.environmentId)
     .put("conversationId", summary.conversationId)
     .put("sessionId", summary.sessionId ?: JSONObject.NULL)
     .put("outcome", summary.outcome.name)
@@ -551,6 +782,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
         value.exactLong("generation"),
       ),
       modeSessionId = value.getString("modeSessionId"),
+      environmentId = value.getString("environmentId"),
       conversationId = value.getString("conversationId"),
       sessionId = value.nullableString("sessionId"),
       outcome = VoiceRuntimeRealtimeTerminalOutcome.valueOf(value.getString("outcome")),
@@ -565,6 +797,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
   private fun validateTerminal(summary: VoiceRuntimeRealtimeTerminalSummary) {
     validateIdentity(summary.identity)
     requireIdentifier(summary.modeSessionId, "mode session ID")
+    requireIdentifier(summary.environmentId, "environment ID")
     requireIdentifier(summary.conversationId, "conversation ID")
     summary.sessionId?.let { requireIdentifier(it, "session ID") }
     require(summary.reason.isNotBlank() && summary.reason.length <= MAXIMUM_REASON_LENGTH)
@@ -592,6 +825,12 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     return (value as Number).toLong()
   }
 
+  private fun JSONObject.exactInt(name: String): Int {
+    val value = get(name)
+    require(value is Byte || value is Short || value is Int)
+    return (value as Number).toInt()
+  }
+
   private fun JSONObject.exactBoolean(name: String): Boolean =
     get(name).let { value -> require(value is Boolean); value }
 
@@ -599,15 +838,18 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     const val VERSION = "t3-voice-runtime-realtime-checkpoint-v1"
     const val KEY_ALIAS = "t3.voice.canonical.realtime-checkpoint.v1"
     const val KEY_CHECKPOINT = "canonical_realtime_checkpoint_v1"
+    const val KEY_FINALIZATION = "canonical_realtime_finalization_v1"
     const val KEY_TERMINALS = "canonical_realtime_terminals_v1"
     const val PENDING_SECRET = "pending"
     const val MAXIMUM_IDENTIFIER_LENGTH = 256
     const val MAXIMUM_CREDENTIAL_LENGTH = 4_096
     const val MAXIMUM_SUMMARY_LENGTH = 4_096
     const val MAXIMUM_REASON_LENGTH = 256
+    const val MAXIMUM_PATH_LENGTH = 2_048
     const val MAXIMUM_TERMINALS = 64
     val ENVELOPE_FIELDS = setOf("version", "metadata", "iv", "ciphertext")
     val SECRET_FIELDS = setOf("controlGrantToken", "pendingHandoffTransitionToken")
+    val FINALIZATION_SECRET_FIELDS = setOf("controlGrantToken", "handoffTransitionToken")
     val CHECKPOINT_FIELDS = setOf(
       "version", "fence", "target", "rootCommandId", "phase", "serverSessionId",
       "leaseGeneration", "controlGrant", "lastActionSequence", "lastConnectedAtEpochMillis",
@@ -615,6 +857,18 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       "muted",
     )
     val FENCE_FIELDS = setOf("runtimeId", "runtimeInstanceId", "generation", "modeSessionId")
+    val FINALIZATION_FIELDS = setOf(
+      "version", "fence", "sourceTarget", "sourceEnvironmentOrigin",
+      "sourceAuthorityExpiresAtEpochMillis", "rootCommandId", "session", "closeOperationId",
+      "outcome", "reason", "lastConnectedAtEpochMillis", "handoffExchange", "stage",
+      "attemptCount", "lastFailureCode", "lastFailureRetryable", "terminalPublication",
+    )
+    val FINALIZATION_SESSION_FIELDS = setOf(
+      "state", "signalingPath", "expiresAtEpochMillis", "controlGrant",
+    )
+    val FINALIZATION_SESSION_STATE_FIELDS = setOf(
+      "sessionId", "conversationId", "phase", "leaseGeneration", "sequence",
+    )
     val REALTIME_TARGET_FIELDS = setOf("environmentId", "conversationId")
     val CONTROL_GRANT_FIELDS = setOf(
       "expiresAtEpochMillis", "heartbeatIntervalSeconds", "failureGraceSeconds",
@@ -645,7 +899,8 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     )
     val TERMINAL_ROOT_FIELDS = setOf("version", "entries")
     val TERMINAL_FIELDS = setOf(
-      "runtimeId", "runtimeInstanceId", "generation", "modeSessionId", "conversationId",
+      "runtimeId", "runtimeInstanceId", "generation", "modeSessionId", "environmentId",
+      "conversationId",
       "sessionId", "outcome", "reason", "lastConnectedAtEpochMillis",
       "terminalAtEpochMillis", "serverCleanupPending", "expiresAtEpochMillis",
     )

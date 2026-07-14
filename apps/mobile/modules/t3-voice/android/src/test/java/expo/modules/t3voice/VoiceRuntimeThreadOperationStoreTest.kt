@@ -31,6 +31,56 @@ class VoiceRuntimeThreadOperationStoreTest {
     assertEquals(VoiceRuntimeThreadOperationLoadResult.Missing, store.load())
   }
 
+  @Test fun `pending receipt survives restart until exact durable publication is cleared`() {
+    val store = store()
+    val claim = claim()
+    val receipt = VoiceRuntimeThreadReceipt(
+      identity = VoiceRuntimeIdentity("runtime-1", "instance-1", 4),
+      modeSessionId = "mode-1",
+      turnClientOperationId = "client-1",
+      turnOperationId = "operation-1",
+      environmentId = "environment-1",
+      projectId = "project-1",
+      threadId = "thread-1",
+      userMessageId = "message-1",
+      turnId = "turn-1",
+      assistantMessageIds = listOf("assistant-1"),
+      speechPlanId = "speech-1",
+      highestAdvertisedSegment = 2,
+      highestStartedSegment = 1,
+      highestDrainedSegment = 0,
+      segmentDispositions = listOf(VoiceRuntimeSpeechDisposition(0, "drained")),
+      speechTerminal = "completed",
+      terminalOutcome = "completed",
+      createdAtEpochMillis = 1_000,
+      expiresAtEpochMillis = 5_000,
+    )
+    store.writePrepared(claim)
+    store.writeActive(VoiceRuntimeThreadOperationState.Active(
+      claim = claim,
+      operationId = "operation-1",
+      expiresAtEpochMillis = 5_000,
+      token = "child-secret",
+      acknowledgedCursor = 0,
+      snapshot = VoiceRuntimeExecutionSnapshot(
+        runtimeId = "runtime-1",
+        readinessGeneration = 4,
+        mode = VoiceRuntimeExecutionMode.THREAD,
+        phase = VoiceRuntimePhase.WAITING,
+        operationId = "operation-1",
+        operationGeneration = 4,
+      ),
+      pendingReceipt = receipt,
+    ))
+
+    val recovered = available(store) as VoiceRuntimeThreadOperationState.Active
+    assertEquals(receipt, recovered.pendingReceipt)
+    val cleared = store.updateActive(claim.clientOperationId) { it.copy(pendingReceipt = null) }
+      as VoiceRuntimeThreadOperationUpdateResult.Updated
+    assertEquals(null, cleared.state.pendingReceipt)
+    assertEquals(null, (available(store) as VoiceRuntimeThreadOperationState.Active).pendingReceipt)
+  }
+
   @Test fun `corrupt active state locks without clearing durable claim`() {
     val storage = MemoryStore()
     val store = VoiceRuntimeThreadOperationStore(storage, Cipher())

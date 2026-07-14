@@ -97,6 +97,66 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
   }
 
   @Test
+  fun `checkpoint promotes atomically to encrypted finalization and survives terminal ack`() {
+    val storage = MemoryStore()
+    val cipher = AuthenticatedTestCipher()
+    val repository = VoiceRuntimeDurableRealtimeCheckpointRepository(storage, cipher)
+    val checkpoint = checkpoint()
+    val expected = finalization(checkpoint)
+    repository.save(checkpoint)
+
+    repository.installFinalization(checkpoint, expected)
+
+    assertNull(repository.load())
+    assertEquals(expected, repository.loadFinalization())
+    assertEquals(setOf("canonical_realtime_finalization_v1"), storage.values.keys)
+    assertFalse(storage.values.values.any { CONTROL_TOKEN in it || TRANSITION_TOKEN in it })
+    expectThrows<IllegalArgumentException> {
+      repository.saveFinalization(expected.copy(closeOperationId = "different-close-operation"))
+    }
+
+    val summary = terminal(1, expiresAt = 10_000)
+    repository.publishTerminal(summary)
+    assertTrue(repository.acknowledgeTerminal(VoiceRuntimeRetainedRecordKey.RealtimeTerminal(
+      summary.identity,
+      summary.modeSessionId,
+    )))
+    assertEquals(expected, repository.loadFinalization())
+
+    val pending = expected.copy(
+      attemptCount = 1,
+      lastFailureCode = "network-unavailable",
+      lastFailureRetryable = true,
+      terminalPublication = VoiceRuntimeRealtimeTerminalPublication.CLEANUP_PENDING,
+    )
+    repository.saveFinalization(pending)
+    val restarted = VoiceRuntimeDurableRealtimeCheckpointRepository(storage, cipher)
+    assertEquals(pending, restarted.loadFinalization())
+    restarted.clearFinalization(pending.fence, pending.session.state.sessionId)
+    assertNull(restarted.loadFinalization())
+  }
+
+  @Test
+  fun `finalization tampering fails closed independently of terminal summaries`() {
+    val storage = MemoryStore()
+    val repository = VoiceRuntimeDurableRealtimeCheckpointRepository(
+      storage,
+      AuthenticatedTestCipher(),
+    )
+    val expected = finalization(checkpoint())
+    repository.installFinalization(null, expected)
+    repository.publishTerminal(terminal(1, expiresAt = 10_000))
+    val envelope = JSONObject(storage.values.getValue("canonical_realtime_finalization_v1"))
+    val metadata = JSONObject(envelope.getString("metadata"))
+      .put("stage", VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING.name)
+    storage.values["canonical_realtime_finalization_v1"] =
+      envelope.put("metadata", metadata.toString()).toString()
+
+    assertCorrupt { repository.loadFinalization() }
+    assertEquals(1, repository.terminals(100).size)
+  }
+
+  @Test
   fun `full terminal retention rejects new summary without eviction until exact ack or expiry`() {
     val storage = MemoryStore()
     val repository =
@@ -201,6 +261,7 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
   private fun terminal(index: Int, expiresAt: Long) = VoiceRuntimeRealtimeTerminalSummary(
     identity = VoiceRuntimeIdentity("runtime-$index", "process-$index", 1),
     modeSessionId = "mode-$index",
+    environmentId = "environment-$index",
     conversationId = "conversation-$index",
     sessionId = "session-$index",
     outcome = VoiceRuntimeRealtimeTerminalOutcome.COMPLETED,
@@ -210,6 +271,33 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
     serverCleanupPending = false,
     expiresAtEpochMillis = expiresAt,
   )
+
+  private fun finalization(checkpoint: VoiceRuntimeRealtimeCheckpoint) =
+    VoiceRuntimeRealtimeFinalization(
+      fence = checkpoint.fence,
+      sourceTarget = checkpoint.target,
+      sourceEnvironmentOrigin = "https://environment.example.test",
+      sourceAuthorityExpiresAtEpochMillis = 9_000,
+      rootCommandId = checkpoint.rootCommandId,
+      session = VoiceRuntimeRealtimeStartResult(
+        VoiceRuntimeRealtimeSessionState(
+          requireNotNull(checkpoint.serverSessionId),
+          checkpoint.target.conversationId,
+          "signaling",
+          requireNotNull(checkpoint.leaseGeneration),
+          checkpoint.lastActionSequence,
+        ),
+        "/api/voice/runtime/realtime-sessions/session-1/webrtc-offer",
+        8_000,
+        requireNotNull(checkpoint.controlGrant),
+      ),
+      closeOperationId = "${checkpoint.rootCommandId}.close.thread-handoff",
+      outcome = VoiceRuntimeRealtimeTerminalOutcome.COMPLETED,
+      reason = "thread-handoff",
+      lastConnectedAtEpochMillis = checkpoint.lastConnectedAtEpochMillis,
+      handoffExchange = checkpoint.pendingHandoffExchange,
+      stage = VoiceRuntimeRealtimeFinalizationStage.HANDOFF_COMMIT_PENDING,
+    )
 
   private fun assertCorrupt(block: () -> Unit) {
     try {

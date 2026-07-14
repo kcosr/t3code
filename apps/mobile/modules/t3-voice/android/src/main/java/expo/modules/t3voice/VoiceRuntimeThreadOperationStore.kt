@@ -2,7 +2,9 @@ package expo.modules.t3voice
 
 import android.content.Context
 import java.nio.charset.StandardCharsets
+import java.time.Instant
 import java.util.Base64
+import org.json.JSONArray
 import org.json.JSONObject
 
 internal data class VoiceRuntimeThreadClaim(
@@ -40,6 +42,7 @@ internal sealed interface VoiceRuntimeThreadOperationState {
     val draftDispositionPending: Boolean = false,
     val draftConsumePending: Boolean = false,
     val snapshot: VoiceRuntimeExecutionSnapshot,
+    val pendingReceipt: VoiceRuntimeThreadReceipt? = null,
   ) : VoiceRuntimeThreadOperationState
 }
 
@@ -150,6 +153,17 @@ internal class VoiceRuntimeThreadOperationStore(
   private fun writeActiveUnchecked(state: VoiceRuntimeThreadOperationState.Active) {
     require(state.token.isNotBlank() && state.token.none(Char::isWhitespace))
     require(state.acknowledgedCursor in 0..state.snapshot.eventCursor)
+    state.pendingReceipt?.let { receipt ->
+      require(receipt.identity == VoiceRuntimeIdentity(
+        state.claim.runtimeId,
+        state.claim.runtimeInstanceId,
+        state.claim.readinessGeneration,
+      ))
+      require(receipt.modeSessionId == state.claim.modeSessionId)
+      require(receipt.turnClientOperationId == state.claim.clientOperationId)
+      require(receipt.turnOperationId == state.operationId)
+      require(receipt.projectId == state.claim.projectId && receipt.threadId == state.claim.threadId)
+    }
     val aad = metadataBytes(state)
     val encrypted = cipher.encrypt(state.token.toByteArray(), aad)
     writeBase("active", state.claim, mapOf(
@@ -165,6 +179,7 @@ internal class VoiceRuntimeThreadOperationStore(
       KEY_DRAFT_DISPOSITION_PENDING to state.draftDispositionPending.toString(),
       KEY_DRAFT_CONSUME_PENDING to state.draftConsumePending.toString(),
       KEY_SNAPSHOT to encodeSnapshot(state.snapshot),
+      KEY_PENDING_RECEIPT to state.pendingReceipt?.let(::encodeReceipt),
       KEY_IV to Base64.getEncoder().encodeToString(encrypted.initializationVector),
       KEY_CIPHERTEXT to Base64.getEncoder().encodeToString(encrypted.ciphertext),
     ))
@@ -201,6 +216,7 @@ internal class VoiceRuntimeThreadOperationStore(
             required(KEY_DRAFT_DISPOSITION_PENDING).toBooleanStrict(),
             required(KEY_DRAFT_CONSUME_PENDING).toBooleanStrict(),
             decodeSnapshot(required(KEY_SNAPSHOT)),
+            storage.getString(KEY_PENDING_RECEIPT)?.let(::decodeReceipt),
           )
           val token = cipher.decrypt(
             T3VoiceEncryptedGrant(
@@ -272,6 +288,7 @@ internal class VoiceRuntimeThreadOperationStore(
       state.draftDispositionPending.toString(),
       state.draftConsumePending.toString(),
       encodeSnapshot(state.snapshot),
+      state.pendingReceipt?.let(::encodeReceipt).orEmpty(),
     ).joinToString("\n").toByteArray(StandardCharsets.UTF_8)
 
   private fun recordingOrNull(): T3VoiceRecordingResult? {
@@ -354,6 +371,81 @@ internal class VoiceRuntimeThreadOperationStore(
     )
   }
 
+  private fun encodeReceipt(receipt: VoiceRuntimeThreadReceipt): String = JSONObject()
+    .put("runtimeId", receipt.identity.runtimeId)
+    .put("runtimeInstanceId", receipt.identity.runtimeInstanceId)
+    .put("runtimeGeneration", receipt.identity.generation)
+    .put("modeSessionId", receipt.modeSessionId)
+    .put("turnClientOperationId", receipt.turnClientOperationId)
+    .put("turnOperationId", receipt.turnOperationId ?: JSONObject.NULL)
+    .put("environmentId", receipt.environmentId)
+    .put("projectId", receipt.projectId)
+    .put("threadId", receipt.threadId)
+    .put("userMessageId", receipt.userMessageId ?: JSONObject.NULL)
+    .put("turnId", receipt.turnId ?: JSONObject.NULL)
+    .put("assistantMessageIds", JSONArray(receipt.assistantMessageIds))
+    .put("speechPlanId", receipt.speechPlanId ?: JSONObject.NULL)
+    .put("highestAdvertisedSegment", receipt.highestAdvertisedSegment ?: JSONObject.NULL)
+    .put("highestStartedSegment", receipt.highestStartedSegment ?: JSONObject.NULL)
+    .put("highestDrainedSegment", receipt.highestDrainedSegment ?: JSONObject.NULL)
+    .put("segmentDispositions", JSONArray().also { values ->
+      receipt.segmentDispositions.forEach { disposition ->
+        values.put(JSONObject()
+          .put("segmentIndex", disposition.segmentIndex)
+          .put("disposition", disposition.disposition))
+      }
+    })
+    .put("speechTerminal", receipt.speechTerminal ?: JSONObject.NULL)
+    .put("terminalOutcome", receipt.terminalOutcome ?: JSONObject.NULL)
+    .put("createdAt", Instant.ofEpochMilli(receipt.createdAtEpochMillis).toString())
+    .put("expiresAt", Instant.ofEpochMilli(receipt.expiresAtEpochMillis).toString())
+    .toString()
+
+  private fun decodeReceipt(value: String): VoiceRuntimeThreadReceipt {
+    val json = JSONObject(value)
+    require(json.keys().asSequence().toSet() == RECEIPT_FIELDS)
+    fun nullableString(key: String) = if (json.isNull(key)) null else json.getString(key)
+    fun nullableInt(key: String) = if (json.isNull(key)) null else json.getInt(key)
+    val messages = json.getJSONArray("assistantMessageIds")
+    val dispositions = json.getJSONArray("segmentDispositions")
+    return VoiceRuntimeThreadReceipt(
+      identity = VoiceRuntimeIdentity(
+        json.getString("runtimeId"),
+        json.getString("runtimeInstanceId"),
+        json.getLong("runtimeGeneration"),
+      ),
+      modeSessionId = json.getString("modeSessionId"),
+      turnClientOperationId = json.getString("turnClientOperationId"),
+      turnOperationId = nullableString("turnOperationId"),
+      environmentId = json.getString("environmentId"),
+      projectId = json.getString("projectId"),
+      threadId = json.getString("threadId"),
+      userMessageId = nullableString("userMessageId"),
+      turnId = nullableString("turnId"),
+      assistantMessageIds = buildList(messages.length()) {
+        for (index in 0 until messages.length()) add(messages.getString(index))
+      },
+      speechPlanId = nullableString("speechPlanId"),
+      highestAdvertisedSegment = nullableInt("highestAdvertisedSegment"),
+      highestStartedSegment = nullableInt("highestStartedSegment"),
+      highestDrainedSegment = nullableInt("highestDrainedSegment"),
+      segmentDispositions = buildList(dispositions.length()) {
+        for (index in 0 until dispositions.length()) {
+          val disposition = dispositions.getJSONObject(index)
+          require(disposition.keys().asSequence().toSet() == setOf("segmentIndex", "disposition"))
+          add(VoiceRuntimeSpeechDisposition(
+            disposition.getInt("segmentIndex"),
+            disposition.getString("disposition"),
+          ))
+        }
+      },
+      speechTerminal = nullableString("speechTerminal"),
+      terminalOutcome = nullableString("terminalOutcome"),
+      createdAtEpochMillis = Instant.parse(json.getString("createdAt")).toEpochMilli(),
+      expiresAtEpochMillis = Instant.parse(json.getString("expiresAt")).toEpochMilli(),
+    )
+  }
+
   private fun required(key: String) = checkNotNull(storage.getString(key))
 
   private companion object {
@@ -386,12 +478,13 @@ internal class VoiceRuntimeThreadOperationStore(
     const val KEY_DRAFT_DISPOSITION_PENDING = "thread_operation_draft_disposition_pending"
     const val KEY_DRAFT_CONSUME_PENDING = "thread_operation_draft_consume_pending"
     const val KEY_SNAPSHOT = "thread_operation_snapshot"
+    const val KEY_PENDING_RECEIPT = "thread_operation_pending_receipt"
     val ACTIVE_KEYS =
       setOf(
         KEY_OPERATION, KEY_EXPIRES, KEY_ACKNOWLEDGED_CURSOR, KEY_RECORDING_ID, KEY_RECORDING_URI,
         KEY_RECORDING_DURATION, KEY_RECORDING_BYTES, KEY_IV, KEY_CIPHERTEXT, KEY_DETACHED,
         KEY_CANCEL_REQUESTED, KEY_SNAPSHOT, KEY_DRAFT_DISPOSITION_PENDING,
-        KEY_DRAFT_CONSUME_PENDING,
+        KEY_DRAFT_CONSUME_PENDING, KEY_PENDING_RECEIPT,
       )
     val ALL_KEYS = ACTIVE_KEYS + setOf(KEY_PHASE, KEY_RUNTIME, KEY_GENERATION, KEY_ORIGIN,
       KEY_RUNTIME_INSTANCE, KEY_MODE_SESSION, KEY_PROJECT, KEY_THREAD, KEY_CLIENT_OPERATION,
@@ -402,5 +495,12 @@ internal class VoiceRuntimeThreadOperationStore(
       "playbackCursor", "highestAdvertisedSpeechSegment", "finalSpeechSegment", "speechTerminal",
       "highestStartedSpeechSegment", "highestDrainedSpeechSegment", "speechSegmentDispositions",
       "noSpeech", "responseTerminal", "autoRearm", "messageId", "turnId", "terminalSummary")
+    val RECEIPT_FIELDS = setOf(
+      "runtimeId", "runtimeInstanceId", "runtimeGeneration", "modeSessionId",
+      "turnClientOperationId", "turnOperationId", "environmentId", "projectId", "threadId",
+      "userMessageId", "turnId", "assistantMessageIds", "speechPlanId",
+      "highestAdvertisedSegment", "highestStartedSegment", "highestDrainedSegment",
+      "segmentDispositions", "speechTerminal", "terminalOutcome", "createdAt", "expiresAt",
+    )
   }
 }

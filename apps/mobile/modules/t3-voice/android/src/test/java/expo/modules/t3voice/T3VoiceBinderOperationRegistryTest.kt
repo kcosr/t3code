@@ -1,6 +1,7 @@
 package expo.modules.t3voice
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -88,5 +89,17 @@ class T3VoiceBinderOperationRegistryTest {
       "second",
       registry.complete(secondTicket, requireNotNull(secondDispatch).binderGeneration)?.value,
     )
+  }
+
+  @Test
+  fun disconnectedGenerationCannotExecuteAQueuedDispatch() {
+    val registry = T3VoiceBinderOperationRegistry<String>()
+    registry.connected()
+    val (_, dispatch) = registry.register("queued")
+    val queued = requireNotNull(dispatch)
+
+    assertTrue(registry.isActive(queued.ticket, queued.binderGeneration))
+    assertEquals("queued", registry.disconnected().single().value)
+    assertFalse(registry.isActive(queued.ticket, queued.binderGeneration))
   }
 }

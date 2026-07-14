@@ -58,7 +58,7 @@ internal sealed interface VoiceThreadPhase {
     enum class Reason { USER, AUTHORITY, NETWORK }
   }
   data class AttentionRequired(val reason: Reason) : VoiceThreadPhase {
-    enum class Reason { APPROVAL, USER_INPUT, INACCESSIBLE_TARGET, DRAFT_REVIEW }
+    enum class Reason { APPROVAL, USER_INPUT, INACCESSIBLE_TARGET, DRAFT_REVIEW, LOCAL_RETENTION }
   }
 }
 

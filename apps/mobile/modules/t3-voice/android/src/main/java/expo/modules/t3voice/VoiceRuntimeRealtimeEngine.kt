@@ -83,6 +83,7 @@ internal enum class VoiceRuntimeRealtimeTerminalOutcome {
 internal data class VoiceRuntimeRealtimeTerminalSummary(
   val identity: VoiceRuntimeIdentity,
   val modeSessionId: String,
+  val environmentId: String,
   val conversationId: String,
   val sessionId: String?,
   val outcome: VoiceRuntimeRealtimeTerminalOutcome,
@@ -115,10 +116,75 @@ internal data class VoiceRuntimeRealtimeCheckpoint(
   }
 }
 
+internal enum class VoiceRuntimeRealtimeFinalizationStage {
+  HANDOFF_COMMIT_PENDING,
+  HANDOFF_ACTIVATION_PENDING,
+  SOURCE_CLOSE_PENDING,
+}
+
+internal enum class VoiceRuntimeRealtimeTerminalPublication {
+  NONE,
+  CLEANUP_PENDING,
+  CLEANUP_COMPLETE,
+}
+
+internal data class VoiceRuntimeRealtimeFinalization(
+  val fence: VoiceRuntimeRealtimeFence,
+  val sourceTarget: VoiceRuntimeTarget.Realtime,
+  val sourceEnvironmentOrigin: String,
+  val sourceAuthorityExpiresAtEpochMillis: Long,
+  val rootCommandId: String,
+  val session: VoiceRuntimeRealtimeStartResult,
+  val closeOperationId: String,
+  val outcome: VoiceRuntimeRealtimeTerminalOutcome,
+  val reason: String,
+  val lastConnectedAtEpochMillis: Long?,
+  val handoffExchange: VoiceRuntimeRealtimeHandoffExchangeResult?,
+  val stage: VoiceRuntimeRealtimeFinalizationStage,
+  val attemptCount: Int = 0,
+  val lastFailureCode: String? = null,
+  val lastFailureRetryable: Boolean = true,
+  val terminalPublication: VoiceRuntimeRealtimeTerminalPublication =
+    VoiceRuntimeRealtimeTerminalPublication.NONE,
+) {
+  init {
+    require(attemptCount >= 0)
+    require(handoffExchange != null ||
+      stage == VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING)
+  }
+
+  fun acceptsUpdate(next: VoiceRuntimeRealtimeFinalization): Boolean = copy(
+    stage = next.stage,
+    attemptCount = next.attemptCount,
+    lastFailureCode = next.lastFailureCode,
+    lastFailureRetryable = next.lastFailureRetryable,
+    terminalPublication = next.terminalPublication,
+  ) == next && next.stage.ordinal >= stage.ordinal && next.attemptCount >= attemptCount
+}
+
+internal sealed interface VoiceRuntimeRealtimeFinalizationResult {
+  data object Idle : VoiceRuntimeRealtimeFinalizationResult
+  data class Pending(
+    val stage: VoiceRuntimeRealtimeFinalizationStage,
+    val attemptCount: Int,
+    val retryable: Boolean,
+    val failureCode: String?,
+  ) : VoiceRuntimeRealtimeFinalizationResult
+  data class Completed(val summary: VoiceRuntimeRealtimeTerminalSummary) :
+    VoiceRuntimeRealtimeFinalizationResult
+}
+
 internal interface VoiceRuntimeRealtimeCheckpointRepository {
   fun load(): VoiceRuntimeRealtimeCheckpoint?
   fun save(checkpoint: VoiceRuntimeRealtimeCheckpoint)
   fun clear(fence: VoiceRuntimeRealtimeFence)
+  fun loadFinalization(): VoiceRuntimeRealtimeFinalization?
+  fun installFinalization(
+    expectedCheckpoint: VoiceRuntimeRealtimeCheckpoint?,
+    finalization: VoiceRuntimeRealtimeFinalization,
+  )
+  fun saveFinalization(finalization: VoiceRuntimeRealtimeFinalization)
+  fun clearFinalization(fence: VoiceRuntimeRealtimeFence, sessionId: String)
   fun publishTerminal(summary: VoiceRuntimeRealtimeTerminalSummary)
   fun terminals(nowEpochMillis: Long): List<VoiceRuntimeRealtimeTerminalSummary>
   fun acknowledgeTerminal(key: VoiceRuntimeRetainedRecordKey.RealtimeTerminal): Boolean
@@ -127,6 +193,7 @@ internal interface VoiceRuntimeRealtimeCheckpointRepository {
 internal class VoiceRuntimeMemoryRealtimeCheckpointRepository :
   VoiceRuntimeRealtimeCheckpointRepository {
   private var checkpoint: VoiceRuntimeRealtimeCheckpoint? = null
+  private var finalization: VoiceRuntimeRealtimeFinalization? = null
   private val terminalValues = mutableListOf<VoiceRuntimeRealtimeTerminalSummary>()
 
   override fun load() = checkpoint
@@ -137,6 +204,37 @@ internal class VoiceRuntimeMemoryRealtimeCheckpointRepository :
 
   override fun clear(fence: VoiceRuntimeRealtimeFence) {
     if (checkpoint?.fence == fence) checkpoint = null
+  }
+
+  override fun loadFinalization() = finalization
+
+  override fun installFinalization(
+    expectedCheckpoint: VoiceRuntimeRealtimeCheckpoint?,
+    finalization: VoiceRuntimeRealtimeFinalization,
+  ) {
+    check(checkpoint == expectedCheckpoint) { "Realtime checkpoint changed before finalization." }
+    check(this.finalization == null || this.finalization == finalization) {
+      "A different Realtime finalization is already pending."
+    }
+    checkpoint = null
+    this.finalization = finalization
+  }
+
+  override fun saveFinalization(finalization: VoiceRuntimeRealtimeFinalization) {
+    val current = requireNotNull(this.finalization) { "Realtime finalization is unavailable." }
+    require(current.fence == finalization.fence &&
+      current.session.state.sessionId == finalization.session.state.sessionId) {
+      "Realtime finalization fence changed."
+    }
+    require(current.acceptsUpdate(finalization)) {
+      "Realtime finalization operation changed or regressed."
+    }
+    this.finalization = finalization
+  }
+
+  override fun clearFinalization(fence: VoiceRuntimeRealtimeFence, sessionId: String) {
+    val current = finalization ?: return
+    if (current.fence == fence && current.session.state.sessionId == sessionId) finalization = null
   }
 
   override fun publishTerminal(summary: VoiceRuntimeRealtimeTerminalSummary) {
@@ -281,7 +379,7 @@ internal interface VoiceRuntimeRealtimeHandoffCoordinator {
 }
 
 internal fun interface VoiceRuntimeRealtimePresentationSink {
-  fun publish(action: VoiceRuntimeRealtimeAction)
+  fun publish(action: VoiceRuntimeRealtimeAction): VoiceRuntimeRetentionWriteResult
 }
 
 internal fun interface VoiceRuntimeRealtimeStateSink {
@@ -316,6 +414,7 @@ internal class VoiceRuntimeRealtimeEngine(
   private var checkpoint = repository.load()
   private var serverSession: VoiceRuntimeRealtimeStartResult? = null
   private var pendingStart: PendingStart? = null
+  private var finalizationInFlight = false
   private val commands = VoiceRuntimeIdempotencyLedger<VoiceRuntimeRealtimeCommandResult>(256)
 
   init {
@@ -324,6 +423,9 @@ internal class VoiceRuntimeRealtimeEngine(
   }
 
   fun snapshot(): VoiceRuntimeRealtimeCheckpoint? = checkpoint
+
+  @Synchronized
+  fun isOperational(): Boolean = checkpoint != null || repository.loadFinalization() != null
 
   fun start(
     commandId: String,
@@ -353,6 +455,13 @@ internal class VoiceRuntimeRealtimeEngine(
           commandId,
           fingerprint,
           VoiceRuntimeRealtimeCommandResult.Rejected("authority-expired"),
+        )
+      }
+      repository.loadFinalization()?.let {
+        return recordCommand(
+          commandId,
+          fingerprint,
+          VoiceRuntimeRealtimeCommandResult.Rejected("finalization-pending"),
         )
       }
       val current = checkpoint
@@ -391,22 +500,17 @@ internal class VoiceRuntimeRealtimeEngine(
       if (current == null) return@synchronized StartCompletion.Stale
       StartCompletion.Current(completeStartLocked(fence, remote))
     }
-    var cleanupFailedSession: VoiceRuntimeRealtimeStartResult? = null
     if (outcome is StartCompletion.Stale && remote is VoiceRuntimeRealtimeRemoteResult.Success) {
-      val closed = server.close(
-        authority,
-        fence,
-        remote.value,
-        "$commandId.close.cancelled",
-      ) is VoiceRuntimeRealtimeRemoteResult.Success
-      if (!closed) cleanupFailedSession = remote.value
+      synchronized(this) {
+        installCancelledStartFinalization(fence, commandId, remote.value)
+      }
+      reconcileFinalization()
     }
     val result = when (outcome) {
       is StartCompletion.Current -> outcome.result
       StartCompletion.Stale -> VoiceRuntimeRealtimeCommandResult.Rejected("start-cancelled")
     }
     return synchronized(this) {
-      if (cleanupFailedSession != null) publishCancelledStartCleanupFailure(fence, cleanupFailedSession)
       pendingStart = null
       recordCommand(commandId, fingerprint, result)
     }
@@ -493,6 +597,9 @@ internal class VoiceRuntimeRealtimeEngine(
           }
           if (action is VoiceRuntimeRealtimeAction.HandoffToThreadVoice) {
             ActionPollCompletion.Handoff(action)
+          } else if (action is VoiceRuntimeRealtimeAction.NavigateThread ||
+            action is VoiceRuntimeRealtimeAction.ConfirmationRequired) {
+            ActionPollCompletion.Presentation(request.session.state.sessionId, action)
           } else {
             ActionPollCompletion.Immediate(consumeAction(action))
           }
@@ -502,6 +609,11 @@ internal class VoiceRuntimeRealtimeEngine(
     return when (completion) {
       is ActionPollCompletion.Immediate -> completion.result
       is ActionPollCompletion.Handoff -> consumeHandoff(fence, completion.action)
+      is ActionPollCompletion.Presentation -> consumePresentationAction(
+        fence,
+        completion.sessionId,
+        completion.action,
+      )
     }
   }
 
@@ -602,6 +714,9 @@ internal class VoiceRuntimeRealtimeEngine(
     fence: VoiceRuntimeRealtimeFence,
     policy: VoiceRuntimeRealtimeStopPolicy,
   ): VoiceRuntimeRealtimeCommandResult = commands.resolve(commandId, "stop:$fence:$policy") {
+    repository.loadFinalization()?.takeIf { it.fence == fence }?.let {
+      return@resolve VoiceRuntimeRealtimeCommandResult.Accepted(adopted = true)
+    }
     requireActive(fence)
     beginShutdown(policy, "user-stop")
     VoiceRuntimeRealtimeCommandResult.Accepted(adopted = false)
@@ -617,49 +732,212 @@ internal class VoiceRuntimeRealtimeEngine(
   }
 
   fun recoverInterrupted(currentIdentity: VoiceRuntimeIdentity): VoiceRuntimeRealtimeTerminalSummary? {
+    when (val pending = reconcileFinalization()) {
+      is VoiceRuntimeRealtimeFinalizationResult.Completed -> return pending.summary
+      is VoiceRuntimeRealtimeFinalizationResult.Pending -> return null
+      VoiceRuntimeRealtimeFinalizationResult.Idle -> Unit
+    }
     val request = synchronized(this) {
       val stale = checkpoint ?: return null
-      if (stale.fence.identity == currentIdentity && stale.pendingHandoffExchange == null) return null
-      val exchange = stale.pendingHandoffExchange
-      val recovering = if (exchange == null) stale else stale.copy(
+      if (stale.fence.identity == currentIdentity && stale.pendingHandoffExchange == null &&
+        stale.phase !in SHUTDOWN_PHASES) return null
+      val recovering = stale.copy(
         phase = VoiceRealtimePhase.STOPPING,
         drainDeadlineAtEpochMillis = null,
       ).also(::update)
-      RecoveryRequest(
-        recovering,
-        restoredSession(stale),
-        exchange,
-        authority.copy(identity = stale.fence.identity),
-      )
+      RecoveryRequest(recovering, restoredSession(stale))
     }
     peer.close(request.checkpoint.fence.modeSessionId)
-    val committed = request.exchange == null || (request.session != null &&
-      server.commitHandoff(
-        request.authority,
-        request.checkpoint.fence,
-        request.session,
-        request.exchange,
-      )
-        is VoiceRuntimeRealtimeRemoteResult.Success)
-    if (!committed) return null
-    val cleaned = request.session == null || server.close(
-      request.authority,
-      request.checkpoint.fence,
-      request.session,
-      "${request.checkpoint.rootCommandId}.recover-close",
-    ) is VoiceRuntimeRealtimeRemoteResult.Success
-    val activated = request.exchange == null || handoff.activate(request.exchange)
-    if (request.exchange != null && !activated) return null
-    return synchronized(this) {
-      val latest = checkpoint?.takeIf { it.fence == request.checkpoint.fence } ?: return@synchronized null
-      terminal(
+    if (request.session == null) return synchronized(this) {
+      val latest = checkpoint?.takeIf { it.fence == request.checkpoint.fence }
+        ?: return@synchronized null
+      terminal(latest, VoiceRuntimeRealtimeTerminalOutcome.INTERRUPTED, "process-restarted", false)
+    }
+    synchronized(this) {
+      val latest = checkpoint?.takeIf { it.fence == request.checkpoint.fence }
+        ?: return@synchronized null
+      installFinalization(
         latest,
-        if (request.exchange != null) VoiceRuntimeRealtimeTerminalOutcome.COMPLETED
-        else VoiceRuntimeRealtimeTerminalOutcome.INTERRUPTED,
-        if (request.exchange != null) "thread-handoff-recovered" else "process-restarted",
-        !cleaned,
+        request.session,
+        if (latest.pendingHandoffExchange == null) VoiceRuntimeRealtimeTerminalOutcome.INTERRUPTED
+        else VoiceRuntimeRealtimeTerminalOutcome.COMPLETED,
+        if (latest.pendingHandoffExchange == null) "process-restarted" else "thread-handoff-recovered",
+        "${latest.rootCommandId}.recover-close",
       )
     }
+    return when (val recovered = reconcileFinalization()) {
+      is VoiceRuntimeRealtimeFinalizationResult.Completed -> recovered.summary
+      is VoiceRuntimeRealtimeFinalizationResult.Pending,
+      VoiceRuntimeRealtimeFinalizationResult.Idle,
+      -> null
+    }
+  }
+
+  fun reconcileFinalization(): VoiceRuntimeRealtimeFinalizationResult {
+    val initial = synchronized(this) {
+      val current = repository.loadFinalization()
+        ?: return VoiceRuntimeRealtimeFinalizationResult.Idle
+      if (finalizationInFlight) {
+        return VoiceRuntimeRealtimeFinalizationResult.Pending(
+          current.stage,
+          current.attemptCount,
+          current.lastFailureRetryable,
+          current.lastFailureCode ?: "finalization-in-flight",
+        )
+      }
+      finalizationInFlight = true
+      current
+    }
+    return try {
+      reconcileFinalization(initial)
+    } finally {
+      synchronized(this) { finalizationInFlight = false }
+    }
+  }
+
+  private fun reconcileFinalization(
+    initial: VoiceRuntimeRealtimeFinalization,
+  ): VoiceRuntimeRealtimeFinalizationResult {
+    var current = initial
+    while (true) {
+      if (finalizationAuthorityExpired(current)) {
+        return abandonFinalization(current, "finalization-authority-expired")
+      }
+      when (current.stage) {
+        VoiceRuntimeRealtimeFinalizationStage.HANDOFF_COMMIT_PENDING -> {
+          val exchange = requireNotNull(current.handoffExchange)
+          val result = runCatching {
+            server.commitHandoff(sourceAuthority(current), current.fence, current.session, exchange)
+          }.getOrElse {
+            return failFinalization(current, "handoff-commit-exception", true)
+          }
+          if (result is VoiceRuntimeRealtimeRemoteResult.Failure) {
+            if (!result.retryable) return abandonFinalization(current, result.code)
+            return failFinalization(current, result.code, result.retryable)
+          }
+          current = advanceFinalization(
+            current,
+            VoiceRuntimeRealtimeFinalizationStage.HANDOFF_ACTIVATION_PENDING,
+          )
+        }
+        VoiceRuntimeRealtimeFinalizationStage.HANDOFF_ACTIVATION_PENDING -> {
+          val exchange = requireNotNull(current.handoffExchange)
+          val activated = runCatching { handoff.activate(exchange) }.getOrDefault(false)
+          if (!activated) {
+            return failFinalization(current, "handoff-activation-failed", true)
+          }
+          current = advanceFinalization(
+            current,
+            VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING,
+          )
+        }
+        VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING -> {
+          val result = runCatching {
+            server.close(
+              sourceAuthority(current),
+              current.fence,
+              current.session,
+              current.closeOperationId,
+            )
+          }.getOrElse {
+            val failed = recordFinalizationFailure(current, "source-close-exception", true)
+            publishFinalizationTerminal(failed, cleanupPending = true)
+            return VoiceRuntimeRealtimeFinalizationResult.Pending(
+              failed.stage,
+              failed.attemptCount,
+              failed.lastFailureRetryable,
+              failed.lastFailureCode,
+            )
+          }
+          if (result is VoiceRuntimeRealtimeRemoteResult.Failure) {
+            val failed = recordFinalizationFailure(current, result.code, result.retryable)
+            val summary = publishFinalizationTerminal(failed, cleanupPending = true)
+            if (!result.retryable) {
+              repository.clearFinalization(failed.fence, failed.session.state.sessionId)
+              return VoiceRuntimeRealtimeFinalizationResult.Completed(summary)
+            }
+            return VoiceRuntimeRealtimeFinalizationResult.Pending(
+              failed.stage,
+              failed.attemptCount,
+              failed.lastFailureRetryable,
+              failed.lastFailureCode,
+            )
+          }
+          val summary = publishFinalizationTerminal(current, cleanupPending = false)
+          repository.clearFinalization(current.fence, current.session.state.sessionId)
+          return VoiceRuntimeRealtimeFinalizationResult.Completed(summary)
+        }
+      }
+    }
+  }
+
+  private fun advanceFinalization(
+    current: VoiceRuntimeRealtimeFinalization,
+    stage: VoiceRuntimeRealtimeFinalizationStage,
+  ): VoiceRuntimeRealtimeFinalization {
+    val next = current.copy(
+      stage = stage,
+      lastFailureCode = null,
+      lastFailureRetryable = true,
+    )
+    repository.saveFinalization(next)
+    return next
+  }
+
+  private fun failFinalization(
+    current: VoiceRuntimeRealtimeFinalization,
+    code: String,
+    retryable: Boolean,
+  ): VoiceRuntimeRealtimeFinalizationResult.Pending {
+    val failed = recordFinalizationFailure(current, code, retryable)
+    return VoiceRuntimeRealtimeFinalizationResult.Pending(
+      failed.stage,
+      failed.attemptCount,
+      retryable,
+      code,
+    )
+  }
+
+  private fun abandonFinalization(
+    current: VoiceRuntimeRealtimeFinalization,
+    code: String,
+  ): VoiceRuntimeRealtimeFinalizationResult.Completed {
+    val failed = recordFinalizationFailure(current, code, retryable = false)
+    val terminalWasPublished = current.terminalPublication !=
+      VoiceRuntimeRealtimeTerminalPublication.NONE
+    val summary = publishFinalizationTerminal(
+      failed,
+      cleanupPending = true,
+      outcome = if (terminalWasPublished) current.outcome
+      else VoiceRuntimeRealtimeTerminalOutcome.FAILED,
+      reason = if (terminalWasPublished) current.reason else code,
+    )
+    repository.clearFinalization(failed.fence, failed.session.state.sessionId)
+    return VoiceRuntimeRealtimeFinalizationResult.Completed(summary)
+  }
+
+  private fun finalizationAuthorityExpired(finalization: VoiceRuntimeRealtimeFinalization): Boolean {
+    val deadline = minOf(
+      finalization.sourceAuthorityExpiresAtEpochMillis,
+      finalization.session.expiresAtEpochMillis,
+      finalization.session.controlGrant.expiresAtEpochMillis,
+      finalization.handoffExchange?.transitionGrant?.expiresAtEpochMillis ?: Long.MAX_VALUE,
+    )
+    return deadline <= now()
+  }
+
+  private fun recordFinalizationFailure(
+    current: VoiceRuntimeRealtimeFinalization,
+    code: String,
+    retryable: Boolean,
+  ): VoiceRuntimeRealtimeFinalization {
+    val failed = current.copy(
+      attemptCount = current.attemptCount + 1,
+      lastFailureCode = code,
+      lastFailureRetryable = retryable,
+    )
+    repository.saveFinalization(failed)
+    return failed
   }
 
   private fun completeStartLocked(
@@ -773,16 +1051,30 @@ internal class VoiceRuntimeRealtimeEngine(
     }
   }
 
+  private fun consumePresentationAction(
+    fence: VoiceRuntimeRealtimeFence,
+    sessionId: String,
+    action: VoiceRuntimeRealtimeAction,
+  ): Boolean {
+    val retained = presentation.publish(action)
+    if (retained != VoiceRuntimeRetentionWriteResult.INSERTED &&
+      retained != VoiceRuntimeRetentionWriteResult.UPDATED) return false
+    return synchronized(this) {
+      val current = runCatching { requireActive(fence, sessionId) }.getOrNull()
+        ?: return@synchronized false
+      if (current.pendingAction != null || current.phase in SHUTDOWN_PHASES ||
+        action.sequence <= current.lastActionSequence) return@synchronized false
+      update(current.copy(pendingAction = action))
+      true
+    }
+  }
+
   private fun consumeAction(action: VoiceRuntimeRealtimeAction): Boolean {
     val current = requireCheckpoint()
     return when (action) {
       is VoiceRuntimeRealtimeAction.NavigateThread,
       is VoiceRuntimeRealtimeAction.ConfirmationRequired,
-      -> {
-        update(current.copy(pendingAction = action))
-        presentation.publish(action)
-        true
-      }
+      -> error("Presentation actions require retention admission.")
       is VoiceRuntimeRealtimeAction.StopRealtimeVoice -> {
         update(current.copy(lastActionSequence = action.sequence))
         beginShutdown(VoiceRuntimeRealtimeStopPolicy.DRAIN, "agent-stop")
@@ -879,36 +1171,20 @@ internal class VoiceRuntimeRealtimeEngine(
   }
 
   private fun completeShutdown(request: ShutdownRequest) {
-    val exchange = synchronized(this) {
-      checkpoint?.takeIf {
-        it.fence == request.fence && it.phase == VoiceRealtimePhase.STOPPING
-      }?.pendingHandoffExchange ?: if (checkpoint?.fence == request.fence) null else return
-    }
-    val committed = exchange == null || (
-      server.commitHandoff(authority, request.fence, request.session, exchange)
-        is VoiceRuntimeRealtimeRemoteResult.Success
-    )
-    if (!committed) return
-    val closed = server.close(
-      authority,
-      request.fence,
-      request.session,
-      "${request.rootCommandId}.close.${request.reason}",
-    ) is VoiceRuntimeRealtimeRemoteResult.Success
-    val activated = exchange == null || handoff.activate(exchange)
-    if (exchange != null && !activated) return
     synchronized(this) {
       val latest = checkpoint?.takeIf {
         it.fence == request.fence && it.phase == VoiceRealtimePhase.STOPPING
       } ?: return
-      terminal(
+      installFinalization(
         latest,
-        if (exchange != null) VoiceRuntimeRealtimeTerminalOutcome.COMPLETED
+        request.session,
+        if (latest.pendingHandoffExchange != null) VoiceRuntimeRealtimeTerminalOutcome.COMPLETED
         else VoiceRuntimeRealtimeTerminalOutcome.STOPPED,
         request.reason,
-        !closed,
+        "${request.rootCommandId}.close.${request.reason}",
       )
     }
+    reconcileFinalization()
   }
 
   private fun fail(code: String) {
@@ -918,26 +1194,127 @@ internal class VoiceRuntimeRealtimeEngine(
     peer.close(current.fence.modeSessionId)
     val session = restoredSession(current)
     update(current.copy(phase = VoiceRealtimePhase.FAILED))
+    if (session == null) {
+      terminal(current.copy(phase = VoiceRealtimePhase.FAILED),
+        VoiceRuntimeRealtimeTerminalOutcome.FAILED, code, false)
+      return
+    }
+    installFinalization(
+      requireNotNull(checkpoint),
+      session,
+      VoiceRuntimeRealtimeTerminalOutcome.FAILED,
+      code,
+      "${current.rootCommandId}.close.failure",
+    )
     remoteDispatcher.dispatch {
-      val closed = session == null || server.close(
-        authority,
-        current.fence,
-        session,
-        "${current.rootCommandId}.close.failure",
-      ) is VoiceRuntimeRealtimeRemoteResult.Success
-      synchronized(this) {
-        val latest = checkpoint?.takeIf {
-          it.fence == current.fence && it.phase == VoiceRealtimePhase.FAILED
-        } ?: return@synchronized
-        terminal(
-          latest,
-          VoiceRuntimeRealtimeTerminalOutcome.FAILED,
-          code,
-          !closed,
-        )
-      }
+      reconcileFinalization()
     }
   }
+
+  private fun installFinalization(
+    current: VoiceRuntimeRealtimeCheckpoint,
+    session: VoiceRuntimeRealtimeStartResult,
+    outcome: VoiceRuntimeRealtimeTerminalOutcome,
+    reason: String,
+    closeOperationId: String,
+  ): VoiceRuntimeRealtimeFinalization {
+    val exchange = current.pendingHandoffExchange
+    val finalization = VoiceRuntimeRealtimeFinalization(
+      fence = current.fence,
+      sourceTarget = current.target,
+      sourceEnvironmentOrigin = authority.environmentOrigin,
+      sourceAuthorityExpiresAtEpochMillis = authority.expiresAtEpochMillis,
+      rootCommandId = current.rootCommandId,
+      session = session,
+      closeOperationId = closeOperationId,
+      outcome = outcome,
+      reason = reason,
+      lastConnectedAtEpochMillis = current.lastConnectedAtEpochMillis,
+      handoffExchange = exchange,
+      stage = if (exchange == null) VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING
+      else VoiceRuntimeRealtimeFinalizationStage.HANDOFF_COMMIT_PENDING,
+    )
+    repository.installFinalization(current, finalization)
+    checkpoint = null
+    serverSession = null
+    stateSink.publish(null)
+    return finalization
+  }
+
+  private fun installCancelledStartFinalization(
+    fence: VoiceRuntimeRealtimeFence,
+    rootCommandId: String,
+    session: VoiceRuntimeRealtimeStartResult,
+  ) {
+    val finalization = VoiceRuntimeRealtimeFinalization(
+      fence = fence,
+      sourceTarget = authority.target,
+      sourceEnvironmentOrigin = authority.environmentOrigin,
+      sourceAuthorityExpiresAtEpochMillis = authority.expiresAtEpochMillis,
+      rootCommandId = rootCommandId,
+      session = session,
+      closeOperationId = "$rootCommandId.close.cancelled",
+      outcome = VoiceRuntimeRealtimeTerminalOutcome.STOPPED,
+      reason = "user-stop",
+      lastConnectedAtEpochMillis = null,
+      handoffExchange = null,
+      stage = VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING,
+      terminalPublication = repository.terminals(now()).firstOrNull {
+        it.identity == fence.identity && it.modeSessionId == fence.modeSessionId
+      }?.let {
+        if (it.serverCleanupPending) VoiceRuntimeRealtimeTerminalPublication.CLEANUP_PENDING
+        else VoiceRuntimeRealtimeTerminalPublication.CLEANUP_COMPLETE
+      } ?: VoiceRuntimeRealtimeTerminalPublication.NONE,
+    )
+    repository.installFinalization(null, finalization)
+  }
+
+  private fun publishFinalizationTerminal(
+    finalization: VoiceRuntimeRealtimeFinalization,
+    cleanupPending: Boolean,
+    outcome: VoiceRuntimeRealtimeTerminalOutcome = finalization.outcome,
+    reason: String = finalization.reason,
+  ): VoiceRuntimeRealtimeTerminalSummary {
+    val publication = if (cleanupPending) {
+      VoiceRuntimeRealtimeTerminalPublication.CLEANUP_PENDING
+    } else {
+      VoiceRuntimeRealtimeTerminalPublication.CLEANUP_COMPLETE
+    }
+    val summary = terminalSummary(finalization, cleanupPending, outcome, reason)
+    if (finalization.terminalPublication == publication) return summary
+    repository.publishTerminal(summary)
+    runCatching { terminalSink.publish(summary) }
+    repository.saveFinalization(finalization.copy(terminalPublication = publication))
+    return summary
+  }
+
+  private fun terminalSummary(
+    finalization: VoiceRuntimeRealtimeFinalization,
+    cleanupPending: Boolean,
+    outcome: VoiceRuntimeRealtimeTerminalOutcome = finalization.outcome,
+    reason: String = finalization.reason,
+  ) = VoiceRuntimeRealtimeTerminalSummary(
+      identity = finalization.fence.identity,
+      modeSessionId = finalization.fence.modeSessionId,
+      environmentId = finalization.sourceTarget.environmentId,
+      conversationId = finalization.sourceTarget.conversationId,
+      sessionId = finalization.session.state.sessionId,
+      outcome = outcome,
+      reason = reason,
+      lastConnectedAtEpochMillis = finalization.lastConnectedAtEpochMillis,
+      terminalAtEpochMillis = now(),
+      serverCleanupPending = cleanupPending,
+      expiresAtEpochMillis = now() + terminalRetentionMillis,
+    )
+
+  private fun sourceAuthority(finalization: VoiceRuntimeRealtimeFinalization) =
+    VoiceRuntimeRealtimeAuthority(
+      finalization.fence.identity,
+      finalization.sourceTarget,
+      finalization.sourceEnvironmentOrigin,
+      authority.runtimeToken,
+      finalization.sourceAuthorityExpiresAtEpochMillis,
+    )
 
   private fun terminal(
     current: VoiceRuntimeRealtimeCheckpoint,
@@ -948,6 +1325,7 @@ internal class VoiceRuntimeRealtimeEngine(
     val summary = VoiceRuntimeRealtimeTerminalSummary(
       identity = current.fence.identity,
       modeSessionId = current.fence.modeSessionId,
+      environmentId = current.target.environmentId,
       conversationId = current.target.conversationId,
       sessionId = current.serverSessionId,
       outcome = outcome,
@@ -964,26 +1342,6 @@ internal class VoiceRuntimeRealtimeEngine(
     serverSession = null
     stateSink.publish(null)
     return summary
-  }
-
-  private fun publishCancelledStartCleanupFailure(
-    fence: VoiceRuntimeRealtimeFence,
-    session: VoiceRuntimeRealtimeStartResult,
-  ) {
-    val summary = VoiceRuntimeRealtimeTerminalSummary(
-      identity = fence.identity,
-      modeSessionId = fence.modeSessionId,
-      conversationId = authority.target.conversationId,
-      sessionId = session.state.sessionId,
-      outcome = VoiceRuntimeRealtimeTerminalOutcome.STOPPED,
-      reason = "user-stop",
-      lastConnectedAtEpochMillis = null,
-      terminalAtEpochMillis = now(),
-      serverCleanupPending = true,
-      expiresAtEpochMillis = now() + terminalRetentionMillis,
-    )
-    repository.publishTerminal(summary)
-    runCatching { terminalSink.publish(summary) }
   }
 
   private fun update(next: VoiceRuntimeRealtimeCheckpoint) {
@@ -1068,6 +1426,10 @@ internal class VoiceRuntimeRealtimeEngine(
       data class Immediate(val result: Boolean) : ActionPollCompletion
       data class Handoff(val action: VoiceRuntimeRealtimeAction.HandoffToThreadVoice) :
         ActionPollCompletion
+      data class Presentation(
+        val sessionId: String,
+        val action: VoiceRuntimeRealtimeAction,
+      ) : ActionPollCompletion
     }
 
     data class ActionPollRequest(
@@ -1101,8 +1463,6 @@ internal class VoiceRuntimeRealtimeEngine(
     data class RecoveryRequest(
       val checkpoint: VoiceRuntimeRealtimeCheckpoint,
       val session: VoiceRuntimeRealtimeStartResult?,
-      val exchange: VoiceRuntimeRealtimeHandoffExchangeResult?,
-      val authority: VoiceRuntimeRealtimeAuthority,
     )
 
     val SHUTDOWN_PHASES = setOf(

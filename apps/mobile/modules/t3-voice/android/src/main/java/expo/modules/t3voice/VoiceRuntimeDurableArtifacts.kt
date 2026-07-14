@@ -31,6 +31,8 @@ internal interface VoiceRuntimeDraftRepository {
   fun remove(artifactId: String): Boolean
   fun handles(nowEpochMillis: Long): List<VoiceRuntimeDraftHandle>
   fun rebind(identity: VoiceRuntimeIdentity, target: VoiceRuntimeTarget.Thread, nowEpochMillis: Long)
+  fun checkpoint(): List<VoiceRuntimeStoredDraft>?
+  fun restore(checkpoint: List<VoiceRuntimeStoredDraft>): Boolean
 }
 
 internal class VoiceRuntimeDurableDraftRepository(
@@ -100,6 +102,17 @@ internal class VoiceRuntimeDurableDraftRepository(
     }
     write(rebound)
   }
+
+  @Synchronized
+  override fun checkpoint(): List<VoiceRuntimeStoredDraft>? = runCatching {
+    loadEntries().map(::decrypt)
+  }.getOrNull()
+
+  @Synchronized
+  override fun restore(checkpoint: List<VoiceRuntimeStoredDraft>): Boolean = runCatching {
+    require(checkpoint.size <= MAXIMUM_ARTIFACTS)
+    write(checkpoint.map(::encrypt))
+  }.isSuccess
 
   private data class EncryptedEntry(
     val handle: VoiceRuntimeDraftHandle,
@@ -233,5 +246,11 @@ internal class VoiceRuntimeMemoryDraftRepository : VoiceRuntimeDraftRepository {
         artifact.copy(handle = handle.copy(identity = identity))
       } else artifact
     }
+  }
+  override fun checkpoint(): List<VoiceRuntimeStoredDraft> = entries.values.toList()
+  override fun restore(checkpoint: List<VoiceRuntimeStoredDraft>): Boolean {
+    entries.clear()
+    checkpoint.forEach { entries[it.handle.artifactId] = it }
+    return true
   }
 }
