@@ -85,6 +85,40 @@ const make = Effect.gen(function* () {
               expiresAt: record.expiresAt,
             };
       }),
+    activateTransition: (token, input) =>
+      Effect.gen(function* () {
+        if (token.length === 0 || token.length > 128) {
+          return yield* new VoiceError({
+            reason: "invalid-phase",
+            operation: "native-runtime-grant.transition",
+            detail: "Realtime handoff credential is invalid",
+            retryable: false,
+          });
+        }
+        const result = yield* repository
+          .transition({ ...input, tokenHash: hash(token) }, yield* Clock.currentTimeMillis)
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new VoiceError({
+                  reason: "provider-unavailable",
+                  operation: "native-runtime-grant.transition",
+                  detail: "Native voice authority transition storage is unavailable",
+                  retryable: true,
+                  cause,
+                }),
+            ),
+          );
+        if (result.status === "stale") {
+          return yield* new VoiceError({
+            reason: "authorization-revoked",
+            operation: "native-runtime-grant.transition",
+            detail: "Realtime handoff authority is stale or conflicts with the active generation",
+            retryable: false,
+          });
+        }
+        return { expiresAt: result.expiresAt, replayed: result.status === "existing" };
+      }),
     revokeRuntime: (authSessionId, runtimeId) =>
       Effect.gen(function* () {
         const revoked = yield* repository

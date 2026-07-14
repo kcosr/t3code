@@ -5,9 +5,14 @@ import {
   ProjectId,
   ThreadId,
   TurnId,
+  VoiceDraftArtifactId,
+  VoiceModeSessionId,
   VoiceNativeRuntimeId,
+  VoiceRuntimeInstanceId,
   VoiceNativeThreadTurnEvent,
-  VoiceNativeThreadTurnOperationId,
+  VoiceThreadTurnOperationId,
+  VoiceSpeechPlanId,
+  VoiceTurnClientOperationId,
   type VoiceNativeThreadTurnPhase,
   type VoiceSpeechPreset,
 } from "@t3tools/contracts";
@@ -22,6 +27,8 @@ import { toPersistenceSqlError } from "../Errors.ts";
 import {
   VoiceNativeThreadTurnStore,
   type PersistedVoiceNativeThreadTurn,
+  type VoiceNativeThreadTurnAssistantMessageRecord,
+  type VoiceNativeThreadTurnDraftRecord,
   type VoiceNativeThreadTurnEventWithoutSequence,
   type VoiceNativeThreadTurnStoreShape,
 } from "../Services/VoiceNativeThreadTurns.ts";
@@ -36,8 +43,8 @@ const decodeAssistantEventPayload = Schema.decodeUnknownSync(
     }),
   ),
 );
-const terminalPhase = (phase: VoiceNativeThreadTurnPhase) =>
-  phase === "completed" || phase === "failed" || phase === "cancelled";
+const terminalPhase = (phase: VoiceNativeThreadTurnPhase | "draft-ready") =>
+  phase === "completed" || phase === "failed" || phase === "cancelled" || phase === "draft-ready";
 const sha256 = (value: string) => NodeCrypto.createHash("sha256").update(value).digest("hex");
 interface AssistantEventRow {
   readonly sequence: number;
@@ -62,13 +69,17 @@ interface OperationRow {
   readonly operationId: string;
   readonly authSessionId: string;
   readonly runtimeId: string;
+  readonly runtimeInstanceId: string;
   readonly runtimeGeneration: number;
-  readonly clientOperationId: string;
+  readonly modeSessionId: string;
+  readonly turnClientOperationId: string;
   readonly projectId: string;
   readonly threadId: string;
   readonly speechPreset: VoiceSpeechPreset;
   readonly autoRearm: number;
-  readonly phase: VoiceNativeThreadTurnPhase;
+  readonly submissionPolicy: "auto-submit" | "draft";
+  readonly speechPlanId: string;
+  readonly phase: VoiceNativeThreadTurnPhase | "draft-ready";
   readonly processingLeaseUntil: number | null;
   readonly processingLeaseToken: string | null;
   readonly processingAttempt: number;
@@ -78,8 +89,12 @@ interface OperationRow {
   readonly lastSequence: number;
   readonly acknowledgedSequence: number;
   readonly speechTerminal: "completed" | "no-speech" | "failed" | null;
+  readonly highestStartedSegment: number | null;
+  readonly highestDrainedSegment: number | null;
   readonly dispatchAccepted: number;
-  readonly expiresAt: number;
+  readonly detachedAt: string | null;
+  readonly operationTokenExpiresAt: number;
+  readonly retentionExpiresAt: number;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -87,23 +102,35 @@ interface OperationRow {
 const operationColumns = `
   operation_id AS "operationId", auth_session_id AS "authSessionId",
   runtime_id AS "runtimeId", runtime_generation AS "runtimeGeneration",
-  client_operation_id AS "clientOperationId", project_id AS "projectId",
+  runtime_instance_id AS "runtimeInstanceId",
+  mode_session_id AS "modeSessionId", turn_client_operation_id AS "turnClientOperationId",
+  project_id AS "projectId",
   thread_id AS "threadId", speech_preset AS "speechPreset", auto_rearm AS "autoRearm",
+  submission_policy AS "submissionPolicy", speech_plan_id AS "speechPlanId",
   phase, processing_lease_until AS "processingLeaseUntil",
   processing_lease_token AS "processingLeaseToken",
   processing_attempt AS "processingAttempt", command_id AS "commandId",
   message_id AS "messageId", turn_id AS "turnId", last_sequence AS "lastSequence",
   acknowledged_sequence AS "acknowledgedSequence", speech_terminal AS "speechTerminal",
-  dispatch_accepted AS "dispatchAccepted", expires_at AS "expiresAt",
+  highest_started_segment AS "highestStartedSegment",
+  highest_drained_segment AS "highestDrainedSegment",
+  dispatch_accepted AS "dispatchAccepted", detached_at AS "detachedAt",
+  operation_token_expires_at AS "operationTokenExpiresAt",
+  retention_expires_at AS "retentionExpiresAt",
   created_at AS "createdAt", updated_at AS "updatedAt"
 `;
 
 const qualifiedOperationColumns = `
   operation.operation_id AS "operationId", operation.auth_session_id AS "authSessionId",
   operation.runtime_id AS "runtimeId", operation.runtime_generation AS "runtimeGeneration",
-  operation.client_operation_id AS "clientOperationId", operation.project_id AS "projectId",
+  operation.runtime_instance_id AS "runtimeInstanceId",
+  operation.mode_session_id AS "modeSessionId",
+  operation.turn_client_operation_id AS "turnClientOperationId",
+  operation.project_id AS "projectId",
   operation.thread_id AS "threadId", operation.speech_preset AS "speechPreset",
   operation.auto_rearm AS "autoRearm", operation.phase,
+  operation.submission_policy AS "submissionPolicy",
+  operation.speech_plan_id AS "speechPlanId",
   operation.processing_lease_until AS "processingLeaseUntil",
   operation.processing_lease_token AS "processingLeaseToken",
   operation.processing_attempt AS "processingAttempt", operation.command_id AS "commandId",
@@ -111,20 +138,28 @@ const qualifiedOperationColumns = `
   operation.last_sequence AS "lastSequence",
   operation.acknowledged_sequence AS "acknowledgedSequence",
   operation.speech_terminal AS "speechTerminal",
-  operation.dispatch_accepted AS "dispatchAccepted", operation.expires_at AS "expiresAt",
+  operation.highest_started_segment AS "highestStartedSegment",
+  operation.highest_drained_segment AS "highestDrainedSegment",
+  operation.dispatch_accepted AS "dispatchAccepted", operation.detached_at AS "detachedAt",
+  operation.operation_token_expires_at AS "operationTokenExpiresAt",
+  operation.retention_expires_at AS "retentionExpiresAt",
   operation.created_at AS "createdAt", operation.updated_at AS "updatedAt"
 `;
 
 const mapOperation = (row: OperationRow): PersistedVoiceNativeThreadTurn => ({
-  operationId: VoiceNativeThreadTurnOperationId.make(row.operationId),
+  operationId: VoiceThreadTurnOperationId.make(row.operationId),
   authSessionId: AuthSessionId.make(row.authSessionId),
   runtimeId: VoiceNativeRuntimeId.make(row.runtimeId),
+  runtimeInstanceId: VoiceRuntimeInstanceId.make(row.runtimeInstanceId),
   runtimeGeneration: row.runtimeGeneration,
-  clientOperationId: row.clientOperationId,
+  modeSessionId: VoiceModeSessionId.make(row.modeSessionId),
+  turnClientOperationId: VoiceTurnClientOperationId.make(row.turnClientOperationId),
   projectId: ProjectId.make(row.projectId),
   threadId: ThreadId.make(row.threadId),
   speechPreset: row.speechPreset,
   autoRearm: row.autoRearm === 1,
+  submissionPolicy: row.submissionPolicy,
+  speechPlanId: VoiceSpeechPlanId.make(row.speechPlanId),
   phase: row.phase,
   processingLeaseUntil: row.processingLeaseUntil,
   processingLeaseToken: row.processingLeaseToken,
@@ -135,10 +170,38 @@ const mapOperation = (row: OperationRow): PersistedVoiceNativeThreadTurn => ({
   lastSequence: row.lastSequence,
   acknowledgedSequence: row.acknowledgedSequence,
   speechTerminal: row.speechTerminal,
+  highestStartedSegment: row.highestStartedSegment,
+  highestDrainedSegment: row.highestDrainedSegment,
   dispatchAccepted: row.dispatchAccepted === 1,
-  expiresAt: row.expiresAt,
+  detachedAt: row.detachedAt,
+  operationTokenExpiresAt: row.operationTokenExpiresAt,
+  retentionExpiresAt: row.retentionExpiresAt,
   createdAt: row.createdAt,
   updatedAt: row.updatedAt,
+});
+
+interface DraftRow {
+  readonly operationId: string;
+  readonly draftId: string;
+  readonly state: "ready" | "consumed" | "expired";
+  readonly cipherVersion: number;
+  readonly nonce: Uint8Array | null;
+  readonly ciphertext: Uint8Array | null;
+  readonly expiresAt: number;
+  readonly createdAt: string;
+  readonly consumedAt: string | null;
+}
+
+const mapDraft = (row: DraftRow): VoiceNativeThreadTurnDraftRecord => ({
+  operationId: VoiceThreadTurnOperationId.make(row.operationId),
+  draftId: VoiceDraftArtifactId.make(row.draftId),
+  state: row.state,
+  cipherVersion: row.cipherVersion,
+  nonce: row.nonce,
+  ciphertext: row.ciphertext,
+  expiresAt: row.expiresAt,
+  createdAt: row.createdAt,
+  consumedAt: row.consumedAt,
 });
 
 const make = Effect.gen(function* () {
@@ -155,12 +218,320 @@ const make = Effect.gen(function* () {
         Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.get")),
       );
 
+  const recordAssistantMessages: VoiceNativeThreadTurnStoreShape["recordAssistantMessages"] = (
+    operationId,
+    messages,
+  ) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const operation = yield* sql<{
+            readonly found: number;
+          }>`SELECT 1 AS found
+            FROM voice_native_thread_turn_operations WHERE operation_id = ${operationId}`;
+          if (operation.length === 0) return [];
+          for (const message of messages) {
+            yield* sql`INSERT OR IGNORE INTO voice_native_thread_turn_assistant_messages (
+              operation_id, message_id, first_seen_sequence, created_at
+            ) VALUES (
+              ${operationId}, ${message.messageId}, ${message.firstSeenSequence},
+              ${message.createdAt}
+            )`;
+          }
+          const rows = yield* sql<{
+            readonly operationId: string;
+            readonly messageId: string;
+            readonly firstSeenSequence: number;
+            readonly createdAt: string;
+          }>`SELECT operation_id AS "operationId", message_id AS "messageId",
+              first_seen_sequence AS "firstSeenSequence", created_at AS "createdAt"
+            FROM voice_native_thread_turn_assistant_messages
+            WHERE operation_id = ${operationId}
+            ORDER BY first_seen_sequence ASC, message_id ASC`;
+          return rows.map(
+            (row): VoiceNativeThreadTurnAssistantMessageRecord => ({
+              operationId: VoiceThreadTurnOperationId.make(row.operationId),
+              messageId: MessageId.make(row.messageId),
+              firstSeenSequence: row.firstSeenSequence,
+              createdAt: row.createdAt,
+            }),
+          );
+        }),
+      )
+      .pipe(
+        Effect.mapError(
+          toPersistenceSqlError("VoiceNativeThreadTurnStore.recordAssistantMessages"),
+        ),
+      );
+
+  const getReceiptCorrelation: VoiceNativeThreadTurnStoreShape["getReceiptCorrelation"] = (
+    operationId,
+  ) =>
+    Effect.gen(function* () {
+      const operation = yield* get(operationId);
+      if (operation === undefined) return undefined;
+      const assistantRows = yield* sql<{ readonly messageId: string }>`
+        SELECT message_id AS "messageId"
+        FROM voice_native_thread_turn_assistant_messages
+        WHERE operation_id = ${operationId}
+        ORDER BY first_seen_sequence ASC, message_id ASC`;
+      const segmentRows = yield* sql<{
+        readonly highestAdvertisedSegment: number | null;
+      }>`
+        SELECT MAX(segment_index) AS "highestAdvertisedSegment"
+        FROM voice_native_thread_turn_speech_segments
+        WHERE operation_id = ${operationId}`;
+      const dispositionRows = yield* sql<{
+        readonly segmentIndex: number;
+        readonly disposition: "drained" | "interrupted" | "skipped" | "failed";
+      }>`SELECT segment_index AS "segmentIndex", disposition
+        FROM voice_native_thread_turn_speech_dispositions
+        WHERE operation_id = ${operationId} ORDER BY segment_index ASC`;
+      const terminalOutcome =
+        operation.phase === "completed" ||
+        operation.phase === "failed" ||
+        operation.phase === "cancelled"
+          ? operation.phase
+          : null;
+      return {
+        operationId: operation.operationId,
+        runtimeId: operation.runtimeId,
+        runtimeInstanceId: operation.runtimeInstanceId,
+        runtimeGeneration: operation.runtimeGeneration,
+        modeSessionId: operation.modeSessionId,
+        turnClientOperationId: operation.turnClientOperationId,
+        projectId: operation.projectId,
+        threadId: operation.threadId,
+        userMessageId: operation.messageId,
+        turnId: operation.turnId,
+        assistantMessageIds: assistantRows.map((row) => MessageId.make(row.messageId)),
+        speechPlanId: operation.speechPlanId,
+        highestAdvertisedSegment: segmentRows[0]?.highestAdvertisedSegment ?? null,
+        highestStartedSegment: operation.highestStartedSegment,
+        highestDrainedSegment: operation.highestDrainedSegment,
+        segmentDispositions: dispositionRows,
+        speechTerminal: operation.speechTerminal,
+        terminalOutcome,
+        detachedAt: operation.detachedAt,
+        createdAt: operation.createdAt,
+        retentionExpiresAt: operation.retentionExpiresAt,
+      };
+    }).pipe(
+      Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.getReceiptCorrelation")),
+    );
+
+  const readDraft: VoiceNativeThreadTurnStoreShape["readDraft"] = (operationId) =>
+    sql<DraftRow>`SELECT operation_id AS "operationId", draft_id AS "draftId", state,
+        cipher_version AS "cipherVersion", nonce, ciphertext, expires_at AS "expiresAt",
+        created_at AS "createdAt", consumed_at AS "consumedAt"
+      FROM voice_native_thread_turn_drafts WHERE operation_id = ${operationId} LIMIT 1`.pipe(
+      Effect.map((rows) => (rows[0] === undefined ? undefined : mapDraft(rows[0]))),
+      Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.readDraft")),
+    );
+
+  const completeDraft: VoiceNativeThreadTurnStoreShape["completeDraft"] = (input) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const existing = yield* readDraft(input.operationId);
+          if (existing !== undefined) {
+            if (existing.draftId !== input.draftId) return "invalid" as const;
+            return existing.state === "ready" ? ("existing" as const) : ("terminal" as const);
+          }
+          const eligible = yield* sql<{
+            readonly found: number;
+          }>`SELECT 1 AS found
+            FROM voice_native_thread_turn_operations
+            WHERE operation_id = ${input.operationId}
+              AND token_hash = ${input.tokenHash}
+              AND submission_policy = 'draft' AND dispatch_accepted = 0
+              AND active_slot = 1 AND processing_lease_token = ${input.leaseToken}
+              AND phase = 'transcribing' LIMIT 1`;
+          if (eligible.length === 0) return "invalid" as const;
+          yield* sql`INSERT INTO voice_native_thread_turn_drafts (
+            operation_id, draft_id, state, cipher_version, nonce, ciphertext,
+            expires_at, created_at
+          ) VALUES (
+            ${input.operationId}, ${input.draftId}, 'ready', ${input.cipherVersion},
+            ${input.nonce}, ${input.ciphertext}, ${input.expiresAt}, ${input.occurredAt}
+          )`;
+          yield* sql`UPDATE voice_native_thread_turn_operations SET
+            phase = 'draft-ready', active_slot = NULL,
+            processing_lease_until = NULL, processing_lease_token = NULL,
+            updated_at = ${input.occurredAt}
+            WHERE operation_id = ${input.operationId}`;
+          return "completed" as const;
+        }),
+      )
+      .pipe(Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.completeDraft")));
+
+  const readDraftAuthorized: VoiceNativeThreadTurnStoreShape["readDraftAuthorized"] = (
+    operationId,
+    tokenHash,
+    now,
+    occurredAt,
+  ) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const nowIso = DateTime.formatIso(DateTime.makeUnsafe(now));
+          const authorized = yield* sql<{ readonly found: number }>`SELECT 1 AS found
+            FROM voice_native_thread_turn_operations AS operation
+            INNER JOIN voice_native_runtime_grants AS runtime
+              ON runtime.auth_session_id = operation.auth_session_id
+              AND runtime.runtime_id = operation.runtime_id
+              AND runtime.generation = operation.runtime_generation
+            INNER JOIN auth_sessions AS auth ON auth.session_id = operation.auth_session_id
+            WHERE operation.operation_id = ${operationId}
+              AND operation.token_hash = ${tokenHash}
+              AND operation.retention_expires_at > ${now}
+              AND auth.revoked_at IS NULL AND auth.expires_at > ${nowIso}
+            LIMIT 1`;
+          if (authorized.length === 0) return { status: "revoked" as const };
+          const rows = yield* sql<DraftRow>`SELECT operation_id AS "operationId",
+              draft_id AS "draftId", state, cipher_version AS "cipherVersion", nonce,
+              ciphertext, expires_at AS "expiresAt", created_at AS "createdAt",
+              consumed_at AS "consumedAt"
+            FROM voice_native_thread_turn_drafts WHERE operation_id = ${operationId} LIMIT 1`;
+          const row = rows[0];
+          if (row === undefined || row.state !== "ready") return { status: "unavailable" as const };
+          if (row.expiresAt <= now) {
+            yield* sql`UPDATE voice_native_thread_turn_drafts SET
+              state = 'expired', nonce = NULL, ciphertext = NULL
+              WHERE operation_id = ${operationId} AND state = 'ready'
+                AND expires_at <= ${now}`;
+            yield* sql`UPDATE voice_native_thread_turn_operations SET updated_at = ${occurredAt}
+              WHERE operation_id = ${operationId}`;
+            return { status: "unavailable" as const };
+          }
+          return { status: "ready" as const, draft: mapDraft(row) };
+        }),
+      )
+      .pipe(
+        Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.readDraftAuthorized")),
+      );
+
+  const consumeDraft: VoiceNativeThreadTurnStoreShape["consumeDraft"] = (
+    operationId,
+    draftId,
+    tokenHash,
+    now,
+    consumedAt,
+  ) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const nowIso = DateTime.formatIso(DateTime.makeUnsafe(now));
+          const authorized = yield* sql<{ readonly found: number }>`SELECT 1 AS found
+            FROM voice_native_thread_turn_operations AS operation
+            INNER JOIN voice_native_runtime_grants AS runtime
+              ON runtime.auth_session_id = operation.auth_session_id
+              AND runtime.runtime_id = operation.runtime_id
+              AND runtime.generation = operation.runtime_generation
+            INNER JOIN auth_sessions AS auth ON auth.session_id = operation.auth_session_id
+            WHERE operation.operation_id = ${operationId}
+              AND operation.token_hash = ${tokenHash}
+              AND operation.retention_expires_at > ${now}
+              AND auth.revoked_at IS NULL AND auth.expires_at > ${nowIso}
+            LIMIT 1`;
+          if (authorized.length === 0) return "revoked" as const;
+          const rows = yield* sql<DraftRow>`SELECT operation_id AS "operationId",
+              draft_id AS "draftId", state, cipher_version AS "cipherVersion", nonce,
+              ciphertext, expires_at AS "expiresAt", created_at AS "createdAt",
+              consumed_at AS "consumedAt"
+            FROM voice_native_thread_turn_drafts
+            WHERE operation_id = ${operationId} AND draft_id = ${draftId} LIMIT 1`;
+          const draft = rows[0] === undefined ? undefined : mapDraft(rows[0]);
+          if (draft === undefined) return "not-found" as const;
+          if (draft.state === "consumed") return "already-consumed" as const;
+          if (draft.state === "expired") return "expired" as const;
+          if (draft.expiresAt <= now) {
+            yield* sql`UPDATE voice_native_thread_turn_drafts SET
+              state = 'expired', nonce = NULL, ciphertext = NULL
+              WHERE operation_id = ${operationId} AND draft_id = ${draftId}
+                AND state = 'ready'`;
+            return "expired" as const;
+          }
+          yield* sql`UPDATE voice_native_thread_turn_drafts SET
+            state = 'consumed', nonce = NULL, ciphertext = NULL, consumed_at = ${consumedAt}
+            WHERE operation_id = ${operationId} AND draft_id = ${draftId} AND state = 'ready'
+              AND expires_at > ${now}`;
+          const changed = yield* sql<{
+            readonly changed: number;
+          }>`SELECT changes() AS changed`;
+          if (changed[0]?.changed !== 1) return "expired" as const;
+          return "consumed" as const;
+        }),
+      )
+      .pipe(Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.consumeDraft")));
+
+  const expireDrafts: VoiceNativeThreadTurnStoreShape["expireDrafts"] = (now) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const rows = yield* sql<{ readonly operationId: string }>`
+            SELECT operation_id AS "operationId" FROM voice_native_thread_turn_drafts
+            WHERE state = 'ready' AND expires_at <= ${now}
+            ORDER BY operation_id ASC`;
+          yield* sql`UPDATE voice_native_thread_turn_drafts SET
+            state = 'expired', nonce = NULL, ciphertext = NULL
+            WHERE state = 'ready' AND expires_at <= ${now}`;
+          return rows.map((row) => VoiceThreadTurnOperationId.make(row.operationId));
+        }),
+      )
+      .pipe(Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.expireDrafts")));
+
+  const detach: VoiceNativeThreadTurnStoreShape["detach"] = (
+    operationId,
+    tokenHash,
+    now,
+    detachedAt,
+  ) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          yield* sql`UPDATE voice_native_thread_turn_operations
+            SET detached_at = COALESCE(detached_at, ${detachedAt}), updated_at = ${detachedAt}
+            WHERE operation_id = ${operationId} AND token_hash = ${tokenHash}
+              AND retention_expires_at > ${now}
+              AND (operation_token_expires_at > ${now}
+                OR phase IN ('completed', 'failed', 'cancelled', 'draft-ready'))
+              AND EXISTS (
+                SELECT 1 FROM voice_native_runtime_grants AS runtime
+                INNER JOIN auth_sessions AS auth ON auth.session_id = runtime.auth_session_id
+                WHERE runtime.auth_session_id = voice_native_thread_turn_operations.auth_session_id
+                  AND runtime.runtime_id = voice_native_thread_turn_operations.runtime_id
+                  AND runtime.generation = voice_native_thread_turn_operations.runtime_generation
+                  AND auth.revoked_at IS NULL
+                  AND auth.expires_at > ${DateTime.formatIso(DateTime.makeUnsafe(now))}
+              )`;
+          const changed = yield* sql<{
+            readonly changed: number;
+          }>`SELECT changes() AS changed`;
+          return changed[0]?.changed === 1 ? ("detached" as const) : ("revoked" as const);
+        }),
+      )
+      .pipe(Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.detach")));
+
+  const detachInternal: VoiceNativeThreadTurnStoreShape["detachInternal"] = (
+    operationId,
+    detachedAt,
+  ) =>
+    sql`UPDATE voice_native_thread_turn_operations
+      SET detached_at = COALESCE(detached_at, ${detachedAt}), updated_at = ${detachedAt}
+      WHERE operation_id = ${operationId}`.pipe(
+      Effect.asVoid,
+      Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.detachInternal")),
+    );
+
   const claim: VoiceNativeThreadTurnStoreShape["claim"] = (input) =>
     sql
       .withTransaction(
         Effect.gen(function* () {
           const nowIso = DateTime.formatIso(DateTime.makeUnsafe(input.nowEpochMillis));
-          const authority = yield* sql<{ readonly found: number }>`SELECT 1 AS found
+          const authority = yield* sql<{
+            readonly found: number;
+          }>`SELECT 1 AS found
             FROM voice_native_runtime_grants AS runtime
             INNER JOIN auth_sessions AS auth ON auth.session_id = runtime.auth_session_id
             WHERE runtime.auth_session_id = ${input.authSessionId}
@@ -172,36 +543,51 @@ const make = Effect.gen(function* () {
           if (authority.length === 0) return { status: "revoked" as const };
           const existing = yield* sql.unsafe<OperationRow>(
             `SELECT ${operationColumns} FROM voice_native_thread_turn_operations
-           WHERE auth_session_id = ? AND runtime_id = ? AND runtime_generation = ?
-             AND client_operation_id = ? LIMIT 1`,
+           WHERE operation_id = ? OR (
+             auth_session_id = ? AND runtime_id = ? AND runtime_generation = ?
+             AND mode_session_id = ? AND turn_client_operation_id = ?
+           ) LIMIT 1`,
             [
+              input.operationId,
               input.authSessionId,
               input.runtimeId,
               input.runtimeGeneration,
-              input.clientOperationId,
+              input.modeSessionId,
+              input.turnClientOperationId,
             ],
           );
           if (existing[0] !== undefined) {
             const prior = mapOperation(existing[0]);
-            if (prior.expiresAt <= input.nowEpochMillis)
+            if (prior.operationTokenExpiresAt <= input.nowEpochMillis)
               return { status: "expired" as const, operation: prior };
             if (
               prior.operationId !== input.operationId ||
+              prior.runtimeInstanceId !== input.runtimeInstanceId ||
+              prior.modeSessionId !== input.modeSessionId ||
+              prior.turnClientOperationId !== input.turnClientOperationId ||
               prior.projectId !== input.projectId ||
               prior.threadId !== input.threadId ||
               prior.speechPreset !== input.speechPreset ||
-              prior.autoRearm !== input.autoRearm
+              prior.autoRearm !== input.autoRearm ||
+              prior.submissionPolicy !== input.submissionPolicy ||
+              prior.speechPlanId !== input.speechPlanId
             )
               return { status: "mismatch" as const, operation: prior };
             yield* sql`UPDATE voice_native_thread_turn_operations
-            SET token_hash = ${input.tokenHash}, expires_at = ${input.expiresAt},
+            SET token_hash = ${input.tokenHash},
+                operation_token_expires_at = ${input.operationTokenExpiresAt},
+                retention_expires_at = MAX(retention_expires_at, ${input.retentionExpiresAt}),
                 updated_at = ${input.now}
             WHERE operation_id = ${existing[0].operationId}`;
             return {
               status: "claimed" as const,
               operation: mapOperation({
                 ...existing[0],
-                expiresAt: input.expiresAt,
+                operationTokenExpiresAt: input.operationTokenExpiresAt,
+                retentionExpiresAt: Math.max(
+                  existing[0].retentionExpiresAt,
+                  input.retentionExpiresAt,
+                ),
                 updatedAt: input.now,
               }),
             };
@@ -214,7 +600,8 @@ const make = Effect.gen(function* () {
             WHERE auth_session_id = ${input.authSessionId}
               AND runtime_id = ${input.runtimeId}
               AND runtime_generation = ${input.runtimeGeneration}
-              AND expires_at <= ${input.nowEpochMillis} AND active_slot = 1`;
+              AND operation_token_expires_at <= ${input.nowEpochMillis} AND active_slot = 1
+              AND dispatch_accepted = 0 AND phase <> 'dispatching'`;
           for (const prior of expired) {
             const events: ReadonlyArray<VoiceNativeThreadTurnEventWithoutSequence> = [
               {
@@ -223,13 +610,20 @@ const make = Effect.gen(function* () {
                 code: "operation-expired",
                 retryable: false,
               },
-              { type: "speech-terminal", occurredAt: nowIso, outcome: "failed" },
+              {
+                type: "speech-terminal",
+                occurredAt: nowIso,
+                outcome: "failed",
+              },
               { type: "terminal", occurredAt: nowIso, outcome: "failed" },
             ];
             let sequence = prior.lastSequence;
             for (const event of events) {
               sequence += 1;
-              const persisted = { ...event, sequence } as VoiceNativeThreadTurnEvent;
+              const persisted = {
+                ...event,
+                sequence,
+              } as VoiceNativeThreadTurnEvent;
               yield* sql`INSERT INTO voice_native_thread_turn_events
                 (operation_id, sequence, event_json, occurred_at)
                 VALUES (${prior.operationId}, ${sequence}, ${encodeEvent(persisted)}, ${nowIso})`;
@@ -241,14 +635,19 @@ const make = Effect.gen(function* () {
               WHERE operation_id = ${prior.operationId} AND active_slot = 1`;
           }
           yield* sql`INSERT INTO voice_native_thread_turn_operations (
-          operation_id, auth_session_id, runtime_id, runtime_generation, client_operation_id,
+          operation_id, auth_session_id, runtime_id, runtime_instance_id, runtime_generation, mode_session_id,
+          turn_client_operation_id,
           project_id, thread_id, speech_preset, auto_rearm, token_hash, phase, active_slot,
-          expires_at, created_at, updated_at, last_sequence
+          submission_policy, speech_plan_id, operation_token_expires_at, retention_expires_at,
+          created_at, updated_at, last_sequence
         ) VALUES (
-          ${input.operationId}, ${input.authSessionId}, ${input.runtimeId},
-          ${input.runtimeGeneration}, ${input.clientOperationId}, ${input.projectId},
+          ${input.operationId}, ${input.authSessionId}, ${input.runtimeId}, ${input.runtimeInstanceId},
+          ${input.runtimeGeneration}, ${input.modeSessionId}, ${input.turnClientOperationId},
+          ${input.projectId},
           ${input.threadId}, ${input.speechPreset}, ${input.autoRearm ? 1 : 0},
-          ${input.tokenHash}, 'created', 1, ${input.expiresAt}, ${input.now}, ${input.now}, 1
+          ${input.tokenHash}, 'created', 1, ${input.submissionPolicy}, ${input.speechPlanId},
+          ${input.operationTokenExpiresAt}, ${input.retentionExpiresAt},
+          ${input.now}, ${input.now}, 1
         )`;
           const event = {
             type: "phase" as const,
@@ -265,12 +664,16 @@ const make = Effect.gen(function* () {
               operationId: input.operationId,
               authSessionId: input.authSessionId,
               runtimeId: input.runtimeId,
+              runtimeInstanceId: input.runtimeInstanceId,
               runtimeGeneration: input.runtimeGeneration,
-              clientOperationId: input.clientOperationId,
+              modeSessionId: input.modeSessionId,
+              turnClientOperationId: input.turnClientOperationId,
               projectId: input.projectId,
               threadId: input.threadId,
               speechPreset: input.speechPreset,
               autoRearm: input.autoRearm,
+              submissionPolicy: input.submissionPolicy,
+              speechPlanId: input.speechPlanId,
               phase: "created" as const,
               processingLeaseUntil: null,
               processingLeaseToken: null,
@@ -281,8 +684,12 @@ const make = Effect.gen(function* () {
               lastSequence: 1,
               acknowledgedSequence: 0,
               speechTerminal: null,
+              highestStartedSegment: null,
+              highestDrainedSegment: null,
               dispatchAccepted: false,
-              expiresAt: input.expiresAt,
+              detachedAt: null,
+              operationTokenExpiresAt: input.operationTokenExpiresAt,
+              retentionExpiresAt: input.retentionExpiresAt,
               createdAt: input.now,
               updatedAt: input.now,
             },
@@ -302,12 +709,13 @@ const make = Effect.gen(function* () {
          ON runtime.auth_session_id = operation.auth_session_id
          AND runtime.runtime_id = operation.runtime_id
          AND runtime.generation = operation.runtime_generation
-         AND runtime.expires_at > ?
        WHERE operation.operation_id = ? AND operation.token_hash = ?
-         AND (operation.expires_at > ? OR operation.phase IN ('completed', 'failed', 'cancelled'))
+         AND operation.retention_expires_at > ?
+         AND (operation.operation_token_expires_at > ?
+           OR operation.phase IN ('completed', 'failed', 'cancelled', 'draft-ready'))
          AND auth.revoked_at IS NULL AND auth.expires_at > ?
        LIMIT 1`,
-        [now, operationId, tokenHash, now, nowIso],
+        [operationId, tokenHash, now, now, nowIso],
       )
       .pipe(
         Effect.map((rows) => (rows[0] === undefined ? undefined : mapOperation(rows[0]))),
@@ -317,6 +725,7 @@ const make = Effect.gen(function* () {
 
   const claimProcessing: VoiceNativeThreadTurnStoreShape["claimProcessing"] = (
     operationId,
+    tokenHash,
     leaseToken,
     now,
     leaseUntil,
@@ -329,8 +738,9 @@ const make = Effect.gen(function* () {
           SET processing_lease_until = ${leaseUntil}, processing_lease_token = ${leaseToken},
               processing_attempt = processing_attempt + 1,
               updated_at = ${updatedAt}
-          WHERE operation_id = ${operationId} AND dispatch_accepted = 0
-            AND active_slot = 1 AND expires_at > ${now}
+          WHERE operation_id = ${operationId} AND token_hash = ${tokenHash}
+            AND dispatch_accepted = 0
+            AND active_slot = 1 AND operation_token_expires_at > ${now}
             AND phase NOT IN ('completed', 'failed', 'cancelled')
             AND (processing_lease_until IS NULL OR processing_lease_until <= ${now})
             AND EXISTS (
@@ -339,18 +749,79 @@ const make = Effect.gen(function* () {
               WHERE runtime.auth_session_id = voice_native_thread_turn_operations.auth_session_id
                 AND runtime.runtime_id = voice_native_thread_turn_operations.runtime_id
                 AND runtime.generation = voice_native_thread_turn_operations.runtime_generation
-                AND runtime.expires_at > ${now}
                 AND auth.revoked_at IS NULL
                 AND auth.expires_at > ${DateTime.formatIso(DateTime.makeUnsafe(now))}
             )`;
-          const changed = yield* sql<{ readonly changed: number }>`SELECT changes() AS changed`;
+          const changed = yield* sql<{
+            readonly changed: number;
+          }>`SELECT changes() AS changed`;
           return changed[0]?.changed === 1;
         }),
       )
       .pipe(Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.claimProcessing")));
 
+  const setDraftDisposition: VoiceNativeThreadTurnStoreShape["setDraftDisposition"] = (
+    operationId,
+    tokenHash,
+    now,
+    updatedAt,
+  ) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const rows = yield* sql<{
+            readonly submissionPolicy: "auto-submit" | "draft";
+            readonly phase: VoiceNativeThreadTurnPhase | "draft-ready";
+            readonly processingAttempt: number;
+            readonly processingLeaseToken: string | null;
+            readonly dispatchAccepted: number;
+            readonly detachedAt: string | null;
+          }>`SELECT operation.submission_policy AS "submissionPolicy", operation.phase,
+              operation.processing_attempt AS "processingAttempt",
+              operation.processing_lease_token AS "processingLeaseToken",
+              operation.dispatch_accepted AS "dispatchAccepted",
+              operation.detached_at AS "detachedAt"
+            FROM voice_native_thread_turn_operations AS operation
+            INNER JOIN voice_native_runtime_grants AS runtime
+              ON runtime.auth_session_id = operation.auth_session_id
+              AND runtime.runtime_id = operation.runtime_id
+              AND runtime.generation = operation.runtime_generation
+            INNER JOIN auth_sessions AS auth ON auth.session_id = operation.auth_session_id
+            WHERE operation.operation_id = ${operationId}
+              AND operation.token_hash = ${tokenHash}
+              AND operation.operation_token_expires_at > ${now}
+              AND operation.retention_expires_at > ${now}
+              AND auth.revoked_at IS NULL
+              AND auth.expires_at > ${DateTime.formatIso(DateTime.makeUnsafe(now))}
+            LIMIT 1`;
+          const operation = rows[0];
+          if (operation === undefined) return "revoked" as const;
+          if (
+            operation.phase !== "created" ||
+            operation.processingAttempt !== 0 ||
+            operation.processingLeaseToken !== null ||
+            operation.dispatchAccepted === 1 ||
+            operation.detachedAt !== null
+          )
+            return "invalid" as const;
+          if (operation.submissionPolicy === "draft") return "unchanged" as const;
+          yield* sql`UPDATE voice_native_thread_turn_operations
+            SET submission_policy = 'draft', updated_at = ${updatedAt}
+            WHERE operation_id = ${operationId} AND token_hash = ${tokenHash}
+              AND phase = 'created' AND submission_policy = 'auto-submit'
+              AND processing_attempt = 0 AND processing_lease_token IS NULL
+              AND dispatch_accepted = 0 AND detached_at IS NULL`;
+          const changed = yield* sql<{ readonly changed: number }>`SELECT changes() AS changed`;
+          return changed[0]?.changed === 1 ? ("updated" as const) : ("invalid" as const);
+        }),
+      )
+      .pipe(
+        Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.setDraftDisposition")),
+      );
+
   const beginDispatch: VoiceNativeThreadTurnStoreShape["beginDispatch"] = (
     operationId,
+    tokenHash,
     leaseToken,
     now,
     occurredAt,
@@ -360,19 +831,27 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           yield* sql`UPDATE voice_native_thread_turn_operations
           SET phase = 'dispatching', updated_at = ${occurredAt}
-          WHERE operation_id = ${operationId} AND phase = 'transcribing'
-            AND active_slot = 1 AND processing_lease_token = ${leaseToken}
+          WHERE operation_id = ${operationId} AND token_hash = ${tokenHash}
+            AND phase = 'transcribing'
+            AND submission_policy = 'auto-submit'
+            AND active_slot = 1 AND operation_token_expires_at > ${now}
+            AND processing_lease_token = ${leaseToken}
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_native_thread_turn_drafts AS draft
+              WHERE draft.operation_id = voice_native_thread_turn_operations.operation_id
+            )
             AND EXISTS (
               SELECT 1 FROM voice_native_runtime_grants AS runtime
               INNER JOIN auth_sessions AS auth ON auth.session_id = runtime.auth_session_id
               WHERE runtime.auth_session_id = voice_native_thread_turn_operations.auth_session_id
                 AND runtime.runtime_id = voice_native_thread_turn_operations.runtime_id
                 AND runtime.generation = voice_native_thread_turn_operations.runtime_generation
-                AND runtime.expires_at > ${now}
                 AND auth.revoked_at IS NULL
                 AND auth.expires_at > ${DateTime.formatIso(DateTime.makeUnsafe(now))}
             )`;
-          const changed = yield* sql<{ readonly changed: number }>`SELECT changes() AS changed`;
+          const changed = yield* sql<{
+            readonly changed: number;
+          }>`SELECT changes() AS changed`;
           if (changed[0]?.changed !== 1) return false;
           const row = yield* sql<{ readonly lastSequence: number }>`
             SELECT last_sequence AS "lastSequence"
@@ -401,8 +880,14 @@ const make = Effect.gen(function* () {
           const row = yield* sql<{ readonly lastSequence: number }>`
             SELECT last_sequence AS "lastSequence"
             FROM voice_native_thread_turn_operations
-            WHERE operation_id = ${input.operationId} AND phase = 'dispatching'
-              AND active_slot = 1 AND processing_lease_token = ${input.leaseToken}`;
+            WHERE operation_id = ${input.operationId} AND token_hash = ${input.tokenHash}
+              AND phase = 'dispatching'
+              AND submission_policy = 'auto-submit'
+              AND active_slot = 1 AND processing_lease_token = ${input.leaseToken}
+              AND NOT EXISTS (
+                SELECT 1 FROM voice_native_thread_turn_drafts AS draft
+                WHERE draft.operation_id = voice_native_thread_turn_operations.operation_id
+              )`;
           if (row[0] === undefined) return false;
           const sequence = row[0].lastSequence + 1;
           const event = {
@@ -478,7 +963,10 @@ const make = Effect.gen(function* () {
             WHERE operation_id = ${operationId} LIMIT 1`;
           if (rows[0] === undefined || terminalPhase(rows[0].phase)) return undefined;
           const sequence = rows[0].lastSequence + 1;
-          const persisted = { ...event, sequence } as VoiceNativeThreadTurnEvent;
+          const persisted = {
+            ...event,
+            sequence,
+          } as VoiceNativeThreadTurnEvent;
           yield* sql`INSERT INTO voice_native_thread_turn_events (
           operation_id, sequence, event_json, occurred_at
         ) VALUES (${operationId}, ${sequence}, ${encodeEvent(persisted)}, ${event.occurredAt})`;
@@ -532,11 +1020,22 @@ const make = Effect.gen(function* () {
               outcome: input.speechOutcome,
             });
           if (input.outcome === "completed")
-            events.push({ type: "phase", occurredAt: input.occurredAt, phase: "completed" });
-          events.push({ type: "terminal", occurredAt: input.occurredAt, outcome: input.outcome });
+            events.push({
+              type: "phase",
+              occurredAt: input.occurredAt,
+              phase: "completed",
+            });
+          events.push({
+            type: "terminal",
+            occurredAt: input.occurredAt,
+            outcome: input.outcome,
+          });
           for (const event of events) {
             sequence += 1;
-            const persisted = { ...event, sequence } as VoiceNativeThreadTurnEvent;
+            const persisted = {
+              ...event,
+              sequence,
+            } as VoiceNativeThreadTurnEvent;
             yield* sql`INSERT INTO voice_native_thread_turn_events
               (operation_id, sequence, event_json, occurred_at)
               VALUES (${input.operationId}, ${sequence}, ${encodeEvent(persisted)}, ${input.occurredAt})`;
@@ -570,20 +1069,21 @@ const make = Effect.gen(function* () {
               dispatch_accepted AS "dispatchAccepted"
             FROM voice_native_thread_turn_operations
             WHERE operation_id = ${operationId} AND token_hash = ${tokenHash}
+              AND operation_token_expires_at > ${now}
               AND EXISTS (
                 SELECT 1 FROM voice_native_runtime_grants AS runtime
                 INNER JOIN auth_sessions AS auth ON auth.session_id = runtime.auth_session_id
                 WHERE runtime.auth_session_id = voice_native_thread_turn_operations.auth_session_id
                   AND runtime.runtime_id = voice_native_thread_turn_operations.runtime_id
                   AND runtime.generation = voice_native_thread_turn_operations.runtime_generation
-                  AND runtime.expires_at > ${now}
                   AND auth.revoked_at IS NULL
                   AND auth.expires_at > ${DateTime.formatIso(DateTime.makeUnsafe(now))}
               ) LIMIT 1`;
           const row = rows[0];
           if (row === undefined) return "revoked" as const;
           if (terminalPhase(row.phase)) return "terminal" as const;
-          if (row.phase === "dispatching") return "dispatch-committed" as const;
+          if (row.dispatchAccepted === 1 || row.phase === "dispatching")
+            return "dispatch-committed" as const;
           let sequence = row.lastSequence + 1;
           const phaseEvent = {
             type: "phase" as const,
@@ -646,12 +1146,13 @@ const make = Effect.gen(function* () {
                ON runtime.auth_session_id = operation.auth_session_id
                AND runtime.runtime_id = operation.runtime_id
                AND runtime.generation = operation.runtime_generation
-               AND runtime.expires_at > ?
              WHERE operation.operation_id = ? AND operation.token_hash = ?
-               AND (operation.expires_at > ? OR operation.phase IN ('completed', 'failed', 'cancelled'))
+               AND operation.retention_expires_at > ?
+               AND (operation.operation_token_expires_at > ?
+                 OR operation.phase IN ('completed', 'failed', 'cancelled', 'draft-ready'))
                AND auth.revoked_at IS NULL
                AND auth.expires_at > ? LIMIT 1`,
-            [now, operationId, tokenHash, now, nowIso],
+            [operationId, tokenHash, now, now, nowIso],
           );
           if (operations[0] === undefined) return undefined;
           const events = yield* sql<{
@@ -671,37 +1172,135 @@ const make = Effect.gen(function* () {
   const acknowledge: VoiceNativeThreadTurnStoreShape["acknowledge"] = (
     operationId,
     tokenHash,
-    sequence,
+    input,
     now,
   ) =>
     sql
       .withTransaction(
         Effect.gen(function* () {
+          const operationRows = yield* sql<{
+            readonly speechPlanId: string;
+            readonly lastSequence: number;
+            readonly highestStartedSegment: number | null;
+            readonly highestDrainedSegment: number | null;
+          }>`SELECT operation.speech_plan_id AS "speechPlanId",
+              operation.last_sequence AS "lastSequence",
+              operation.highest_started_segment AS "highestStartedSegment",
+              operation.highest_drained_segment AS "highestDrainedSegment"
+            FROM voice_native_thread_turn_operations AS operation
+            INNER JOIN voice_native_runtime_grants AS runtime
+              ON runtime.auth_session_id = operation.auth_session_id
+              AND runtime.runtime_id = operation.runtime_id
+              AND runtime.generation = operation.runtime_generation
+            INNER JOIN auth_sessions AS auth ON auth.session_id = operation.auth_session_id
+            WHERE operation.operation_id = ${operationId}
+              AND operation.token_hash = ${tokenHash}
+              AND operation.retention_expires_at > ${now}
+              AND (operation.operation_token_expires_at > ${now}
+                OR operation.phase IN ('completed', 'failed', 'cancelled', 'draft-ready'))
+              AND auth.revoked_at IS NULL
+              AND auth.expires_at > ${DateTime.formatIso(DateTime.makeUnsafe(now))}`;
+          const operation = operationRows[0];
+          if (operation === undefined) return "revoked" as const;
+          const advertisedRows = yield* sql<{ readonly segmentIndex: number }>`
+            SELECT segment_index AS "segmentIndex"
+            FROM voice_native_thread_turn_speech_segments
+            WHERE operation_id = ${operationId} ORDER BY segment_index ASC`;
+          const advertised = new Set(advertisedRows.map((row) => row.segmentIndex));
+          const existingRows = yield* sql<{
+            readonly segmentIndex: number;
+            readonly disposition: "drained" | "interrupted" | "skipped" | "failed";
+          }>`SELECT segment_index AS "segmentIndex", disposition
+            FROM voice_native_thread_turn_speech_dispositions
+            WHERE operation_id = ${operationId} ORDER BY segment_index ASC`;
+          const dispositions = new Map(
+            existingRows.map((row) => [row.segmentIndex, row.disposition] as const),
+          );
+          for (const item of input.segmentDispositions) {
+            const existing = dispositions.get(item.segmentIndex);
+            if (existing !== undefined && existing !== item.disposition) return "invalid" as const;
+            dispositions.set(item.segmentIndex, item.disposition);
+          }
+          const drained = [...dispositions.entries()]
+            .filter(([, disposition]) => disposition === "drained")
+            .map(([segmentIndex]) => segmentIndex);
+          const maximumDrained = drained.length === 0 ? null : Math.max(...drained);
+          const startedRangeIsAdvertised =
+            input.highestStartedSegment === null ||
+            Array.from({ length: input.highestStartedSegment + 1 }, (_, index) => index).every(
+              (index) => advertised.has(index),
+            );
+          const priorSegmentsAreTerminal =
+            input.highestStartedSegment === null ||
+            Array.from({ length: input.highestStartedSegment }, (_, index) => index).every(
+              (index) => dispositions.has(index),
+            );
+          const drainedRangeIsComplete =
+            input.highestDrainedSegment === null ||
+            Array.from({ length: input.highestDrainedSegment + 1 }, (_, index) => index).every(
+              (index) => dispositions.get(index) === "drained",
+            );
+          const invalidProgress =
+            operation.speechPlanId !== input.speechPlanId ||
+            new Set(input.segmentDispositions.map((item) => item.segmentIndex)).size !==
+              input.segmentDispositions.length ||
+            input.acknowledgedSequence > operation.lastSequence ||
+            !startedRangeIsAdvertised ||
+            !priorSegmentsAreTerminal ||
+            !drainedRangeIsComplete ||
+            maximumDrained !== input.highestDrainedSegment ||
+            (input.highestDrainedSegment !== null &&
+              (input.highestStartedSegment === null ||
+                input.highestDrainedSegment > input.highestStartedSegment)) ||
+            (operation.highestStartedSegment !== null &&
+              (input.highestStartedSegment === null ||
+                input.highestStartedSegment < operation.highestStartedSegment)) ||
+            (operation.highestDrainedSegment !== null &&
+              (input.highestDrainedSegment === null ||
+                input.highestDrainedSegment < operation.highestDrainedSegment)) ||
+            input.segmentDispositions.some(
+              (item) =>
+                !advertised.has(item.segmentIndex) ||
+                input.highestStartedSegment === null ||
+                item.segmentIndex > input.highestStartedSegment,
+            );
+          if (invalidProgress) return "invalid" as const;
           yield* sql`UPDATE voice_native_thread_turn_operations
-          SET acknowledged_sequence = MAX(acknowledged_sequence, ${sequence})
+          SET acknowledged_sequence = MAX(acknowledged_sequence, ${input.acknowledgedSequence}),
+              highest_started_segment = ${input.highestStartedSegment},
+              highest_drained_segment = ${input.highestDrainedSegment}
           WHERE operation_id = ${operationId} AND token_hash = ${tokenHash}
-            AND last_sequence >= ${sequence}
+            AND retention_expires_at > ${now}
+            AND (operation_token_expires_at > ${now}
+              OR phase IN ('completed', 'failed', 'cancelled', 'draft-ready'))
             AND EXISTS (
               SELECT 1 FROM voice_native_runtime_grants AS runtime
               INNER JOIN auth_sessions AS auth ON auth.session_id = runtime.auth_session_id
               WHERE runtime.auth_session_id = voice_native_thread_turn_operations.auth_session_id
                 AND runtime.runtime_id = voice_native_thread_turn_operations.runtime_id
                 AND runtime.generation = voice_native_thread_turn_operations.runtime_generation
-                AND runtime.expires_at > ${now}
                 AND auth.revoked_at IS NULL
                 AND auth.expires_at > ${DateTime.formatIso(DateTime.makeUnsafe(now))}
             )`;
-          const changed = yield* sql<{ readonly changed: number }>`SELECT changes() AS changed`;
-          if (changed[0]?.changed === 1) return "acknowledged" as const;
+          const changed = yield* sql<{
+            readonly changed: number;
+          }>`SELECT changes() AS changed`;
+          if (changed[0]?.changed === 1) {
+            for (const item of input.segmentDispositions)
+              yield* sql`INSERT OR IGNORE INTO voice_native_thread_turn_speech_dispositions (
+                operation_id, segment_index, disposition, created_at
+              ) VALUES (${operationId}, ${item.segmentIndex}, ${item.disposition}, ${input.occurredAt})`;
+            return "acknowledged" as const;
+          }
           const authorized = yield* sql<{ readonly found: number }>`
             SELECT 1 AS found FROM voice_native_thread_turn_operations AS operation
             INNER JOIN voice_native_runtime_grants AS runtime
               ON runtime.auth_session_id = operation.auth_session_id
               AND runtime.runtime_id = operation.runtime_id
               AND runtime.generation = operation.runtime_generation
-              AND runtime.expires_at > ${now}
             INNER JOIN auth_sessions AS auth ON auth.session_id = operation.auth_session_id
             WHERE operation.operation_id = ${operationId} AND operation.token_hash = ${tokenHash}
+              AND operation.retention_expires_at > ${now}
               AND auth.revoked_at IS NULL
               AND auth.expires_at > ${DateTime.formatIso(DateTime.makeUnsafe(now))}
             LIMIT 1`;
@@ -745,11 +1344,13 @@ const make = Effect.gen(function* () {
           const operation = yield* sql<{
             readonly phase: VoiceNativeThreadTurnPhase;
             readonly lastSequence: number;
-          }>`SELECT phase, last_sequence AS "lastSequence"
+            readonly detachedAt: string | null;
+          }>`SELECT phase, last_sequence AS "lastSequence", detached_at AS "detachedAt"
             FROM voice_native_thread_turn_operations
             WHERE operation_id = ${segment.operationId}`;
           if (operation[0] === undefined || terminalPhase(operation[0].phase))
             return "terminal" as const;
+          if (operation[0].detachedAt !== null) return "detached" as const;
           const existing = yield* sql<{
             readonly assistantMessageId: string;
             readonly startOffset: number;
@@ -797,7 +1398,7 @@ const make = Effect.gen(function* () {
             VALUES (${segment.operationId}, ${sequence}, ${encodeEvent(event)}, ${segment.createdAt})`;
           yield* sql`UPDATE voice_native_thread_turn_operations SET
             phase = 'speaking', last_sequence = ${sequence}, updated_at = ${segment.createdAt}
-            WHERE operation_id = ${segment.operationId}`;
+            WHERE operation_id = ${segment.operationId} AND detached_at IS NULL`;
           return "inserted" as const;
         }),
       )
@@ -833,7 +1434,7 @@ const make = Effect.gen(function* () {
         return row === undefined
           ? undefined
           : {
-              operationId: VoiceNativeThreadTurnOperationId.make(row.operationId),
+              operationId: VoiceThreadTurnOperationId.make(row.operationId),
               segmentIndex: row.segmentIndex,
               assistantMessageId: MessageId.make(row.assistantMessageId),
               startOffset: row.startOffset,
@@ -846,6 +1447,44 @@ const make = Effect.gen(function* () {
       }),
       Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.getSpeechSegment")),
     );
+
+  const getSpeechSegmentAuthorized: VoiceNativeThreadTurnStoreShape["getSpeechSegmentAuthorized"] =
+    (operationId, segmentIndex, tokenHash, now) => {
+      const nowIso = DateTime.formatIso(DateTime.makeUnsafe(now));
+      return sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const operations = yield* sql<{
+              readonly detachedAt: string | null;
+            }>`SELECT operation.detached_at AS "detachedAt"
+              FROM voice_native_thread_turn_operations AS operation
+              INNER JOIN voice_native_runtime_grants AS runtime
+                ON runtime.auth_session_id = operation.auth_session_id
+                AND runtime.runtime_id = operation.runtime_id
+                AND runtime.generation = operation.runtime_generation
+              INNER JOIN auth_sessions AS auth ON auth.session_id = operation.auth_session_id
+              WHERE operation.operation_id = ${operationId}
+                AND operation.token_hash = ${tokenHash}
+                AND operation.retention_expires_at > ${now}
+                AND (operation.operation_token_expires_at > ${now}
+                  OR operation.phase IN ('completed', 'failed', 'cancelled'))
+                AND auth.revoked_at IS NULL AND auth.expires_at > ${nowIso}
+              LIMIT 1`;
+            const operation = operations[0];
+            if (operation === undefined) return { status: "revoked" as const };
+            if (operation.detachedAt !== null) return { status: "detached" as const };
+            const segment = yield* getSpeechSegment(operationId, segmentIndex);
+            return segment === undefined
+              ? { status: "missing" as const }
+              : { status: "ready" as const, segment };
+          }),
+        )
+        .pipe(
+          Effect.mapError(
+            toPersistenceSqlError("VoiceNativeThreadTurnStore.getSpeechSegmentAuthorized"),
+          ),
+        );
+    };
 
   const getSpeechSegmentText: VoiceNativeThreadTurnStoreShape["getSpeechSegmentText"] = (
     operationId,
@@ -877,14 +1516,16 @@ const make = Effect.gen(function* () {
     retentionCutoff,
   ) =>
     Effect.gen(function* () {
+      yield* expireDrafts(now);
       const rows = yield* sql<{ readonly operationId: string }>`
         SELECT operation_id AS "operationId"
         FROM voice_native_thread_turn_operations
-        WHERE expires_at <= ${now} AND active_slot = 1
+        WHERE operation_token_expires_at <= ${now} AND active_slot = 1
+          AND dispatch_accepted = 0 AND phase <> 'dispatching'
           AND phase NOT IN ('completed', 'failed', 'cancelled')`;
-      const expired: Array<VoiceNativeThreadTurnOperationId> = [];
+      const expired: Array<VoiceThreadTurnOperationId> = [];
       for (const row of rows) {
-        const operationId = VoiceNativeThreadTurnOperationId.make(row.operationId);
+        const operationId = VoiceThreadTurnOperationId.make(row.operationId);
         const finalized = yield* finalize({
           operationId,
           occurredAt,
@@ -896,7 +1537,7 @@ const make = Effect.gen(function* () {
         if (finalized) expired.push(operationId);
       }
       yield* sql`DELETE FROM voice_native_thread_turn_operations
-        WHERE active_slot IS NULL AND expires_at < ${retentionCutoff}`;
+        WHERE active_slot IS NULL AND retention_expires_at < ${retentionCutoff}`;
       return expired;
     }).pipe(Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.expireAndPurge")));
 
@@ -904,13 +1545,27 @@ const make = Effect.gen(function* () {
     authSessionId,
     runtimeId,
   ) =>
-    sql`DELETE FROM voice_native_thread_turn_operations
+    sql`UPDATE voice_native_thread_turn_operations SET
+      token_hash = 'revoked:' || operation_id,
+      detached_at = COALESCE(detached_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      phase = CASE WHEN dispatch_accepted = 0 THEN 'cancelled' ELSE phase END,
+      active_slot = CASE WHEN dispatch_accepted = 0 THEN NULL ELSE active_slot END,
+      processing_lease_until = CASE WHEN dispatch_accepted = 0 THEN NULL ELSE processing_lease_until END,
+      processing_lease_token = CASE WHEN dispatch_accepted = 0 THEN NULL ELSE processing_lease_token END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
       WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`.pipe(
       Effect.asVoid,
       Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.revokeRuntime")),
     );
   const revokeAuthSession: VoiceNativeThreadTurnStoreShape["revokeAuthSession"] = (authSessionId) =>
-    sql`DELETE FROM voice_native_thread_turn_operations
+    sql`UPDATE voice_native_thread_turn_operations SET
+      token_hash = 'revoked:' || operation_id,
+      detached_at = COALESCE(detached_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      phase = CASE WHEN dispatch_accepted = 0 THEN 'cancelled' ELSE phase END,
+      active_slot = CASE WHEN dispatch_accepted = 0 THEN NULL ELSE active_slot END,
+      processing_lease_until = CASE WHEN dispatch_accepted = 0 THEN NULL ELSE processing_lease_until END,
+      processing_lease_token = CASE WHEN dispatch_accepted = 0 THEN NULL ELSE processing_lease_token END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
       WHERE auth_session_id = ${authSessionId}`.pipe(
       Effect.asVoid,
       Effect.mapError(toPersistenceSqlError("VoiceNativeThreadTurnStore.revokeAuthSession")),
@@ -920,7 +1575,17 @@ const make = Effect.gen(function* () {
     claim,
     authorize,
     get,
+    recordAssistantMessages,
+    getReceiptCorrelation,
+    completeDraft,
+    readDraft,
+    readDraftAuthorized,
+    consumeDraft,
+    expireDrafts,
+    detach,
+    detachInternal,
     claimProcessing,
+    setDraftDisposition,
     beginDispatch,
     acceptDispatch,
     releaseProcessing,
@@ -932,6 +1597,7 @@ const make = Effect.gen(function* () {
     putSpeechSegmentAndEvent,
     resolveAssistantRevision,
     getSpeechSegment,
+    getSpeechSegmentAuthorized,
     getSpeechSegmentText,
     cancel,
     expireAndPurge,

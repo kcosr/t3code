@@ -14,8 +14,10 @@ import { VoiceHandoffActionRepositoryLive } from "../persistence/Layers/VoiceHan
 import { VoiceNativeControlGrantRepositoryLive } from "../persistence/Layers/VoiceNativeControlGrants.ts";
 import { VoiceNativeRuntimeGrantRepositoryLive } from "../persistence/Layers/VoiceNativeRuntimeGrants.ts";
 import { VoiceNativeRealtimeStartRepositoryLive } from "../persistence/Layers/VoiceNativeRealtimeStarts.ts";
+import { VoiceRealtimeTransitionGrantRepositoryLive } from "../persistence/Layers/VoiceRealtimeTransitionGrants.ts";
 import { VoiceContextCompilerLive } from "./Layers/VoiceContextCompiler.ts";
 import { VoiceSessionServiceLive } from "./Layers/VoiceSessionService.ts";
+import { VoiceRealtimeControlServiceLive } from "./Layers/VoiceRealtimeControlService.ts";
 import { VoiceSessionLifecycleLive } from "./Layers/VoiceSessionLifecycle.ts";
 import { VoiceToolExecutorLive } from "./Layers/VoiceToolExecutor.ts";
 import {
@@ -111,6 +113,7 @@ const VoiceCoreDependenciesLive = Layer.mergeAll(
   VoiceNativeControlGrantRepositoryLive,
   VoiceNativeRuntimeGrantRepositoryLive,
   VoiceNativeRealtimeStartRepositoryLive,
+  VoiceRealtimeTransitionGrantRepositoryLive,
   VoiceNativeThreadTurnStoreLive,
   VoiceNativeRuntimeGrantRegistryLive.pipe(
     Layer.provide(
@@ -144,6 +147,17 @@ const VoiceSessionServiceConfiguredLive = VoiceSessionServiceLive.pipe(
   Layer.provide(VoiceCoreDependenciesLive),
 );
 
+const VoiceRealtimeControlServiceConfiguredLive = VoiceRealtimeControlServiceLive.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      VoiceSessionServiceConfiguredLive,
+      VoiceCoreDependenciesLive,
+      VoiceNativeRealtimeStartRepositoryLive,
+      VoiceRealtimeTransitionGrantRepositoryLive,
+    ),
+  ),
+);
+
 const VoiceLifecycleConfiguredLive = VoiceSessionLifecycleLive.pipe(
   Layer.provide(Layer.merge(VoiceSessionServiceConfiguredLive, VoiceCoreDependenciesLive)),
 );
@@ -153,4 +167,5 @@ export const VoiceRuntimeLive = Layer.mergeAll(
   VoiceCoreDependenciesLive,
   VoiceLifecycleConfiguredLive,
   VoiceNativeThreadTurnServiceConfiguredLive,
+  VoiceRealtimeControlServiceConfiguredLive,
 );

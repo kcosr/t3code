@@ -94,7 +94,7 @@ import { historyHttpApiLayer, historyPrivacyBoundaryLayer } from "./history/http
 import { HistoryRuntimeLive } from "./history/runtimeLayer.ts";
 import { voiceControlHttpApiLayer } from "./voice/controlHttp.ts";
 import { voiceMediaRoutesLayer } from "./voice/http.ts";
-import { voiceNativeControlRoutesLayer } from "./voice/nativeControlHttp.ts";
+import { voiceRealtimeControlRoutesLayer } from "./voice/realtimeControlHttp.ts";
 import { voiceNativeThreadTurnRoutesLayer } from "./voice/nativeThreadTurnHttp.ts";
 import { VoiceRuntimeLive } from "./voice/runtimeLayer.ts";
 import * as NetService from "@t3tools/shared/Net";
@@ -376,7 +376,7 @@ const makeRoutesLayerBase = Layer.mergeAll(
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,
     voiceMediaRoutesLayer,
-    voiceNativeControlRoutesLayer,
+    voiceRealtimeControlRoutesLayer,
     voiceNativeThreadTurnRoutesLayer,
   ),
   McpHttpServer.layer.pipe(Layer.provide(McpSessionRegistry.layer)),

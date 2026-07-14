@@ -3,15 +3,23 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import {
   AuthSessionId,
+  CommandId,
+  EnvironmentId,
   MessageId,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
   VoiceNativeRuntimeId,
   VoiceNativeRuntimeTarget,
+  VoiceModeSessionId,
+  VoiceRuntimeInstanceId,
+  VoiceRuntimeId,
+  VoiceSpeechPlanId,
+  VoiceTurnClientOperationId,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import * as NodeFS from "node:fs";
+import * as NodeCrypto from "node:crypto";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -24,6 +32,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 
 import { ClientCommandDispatcher } from "../../orchestration/Services/ClientCommandDispatcher.ts";
+import { ServerSecretStore } from "../../auth/ServerSecretStore.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { VoiceNativeThreadTurnStoreLive } from "../../persistence/Layers/VoiceNativeThreadTurns.ts";
 import { runMigrations } from "../../persistence/Migrations.ts";
@@ -41,7 +50,9 @@ import { VoiceNativeThreadTurnServiceLive } from "./VoiceNativeThreadTurnService
 
 const authSessionId = AuthSessionId.make("native-thread-service-auth");
 const runtimeId = VoiceNativeRuntimeId.make("native-thread-service-runtime");
+const runtimeInstanceId = VoiceRuntimeInstanceId.make("native-thread-service-instance");
 const projectId = ProjectId.make("native-thread-service-project");
+const environmentId = EnvironmentId.make("native-thread-service-environment");
 const threadId = ThreadId.make("native-thread-service-thread");
 const runtimeToken = "runtime-token";
 const encodeRuntimeTarget = Schema.encodeSync(Schema.fromJsonString(VoiceNativeRuntimeTarget));
@@ -88,7 +99,10 @@ const makeTestLayer = Effect.fn("test.makeNativeThreadTurnServiceLayer")(functio
         return afterStarted(
           Stream.make({
             type: "final" as const,
-            result: { requestId: request.requestId, text: "service transcript" },
+            result: {
+              requestId: request.requestId,
+              text: "service transcript",
+            },
           }),
         );
       },
@@ -102,10 +116,14 @@ const makeTestLayer = Effect.fn("test.makeNativeThreadTurnServiceLayer")(functio
     serverSettingsLayerTest({ voice: { enabled: true } }),
     VoiceMediaRequestLimiterLive,
     voiceProviderRegistryLayer([provider], new Map([["transcription.request", "fake"]])),
+    Layer.succeed(ServerSecretStore, {
+      getOrCreateRandom: () => Effect.succeed(new Uint8Array(32).fill(7)),
+    } as unknown as ServerSecretStore["Service"]),
     Layer.succeed(
       VoiceNativeRuntimeGrantRegistry,
       VoiceNativeRuntimeGrantRegistry.of({
         issue: () => Effect.die("unused"),
+        activateTransition: () => Effect.die("unused"),
         authorize: (token) =>
           Effect.succeed(
             token === runtimeToken
@@ -116,10 +134,18 @@ const makeTestLayer = Effect.fn("test.makeNativeThreadTurnServiceLayer")(functio
                   grantedScopes: new Set(),
                   target: {
                     mode: "thread" as const,
+                    environmentId,
                     projectId,
                     threadId,
                     speechPreset: "default" as const,
                     autoRearm: true,
+                    endpointPolicy: {
+                      endSilenceMs: 2_200,
+                      noSpeechTimeoutMs: null,
+                      maximumUtteranceMs: 120_000,
+                    },
+                    speechEnabled: true,
+                    rearmGuardMs: 500,
                   },
                   expiresAt: 60_000,
                 }
@@ -135,13 +161,16 @@ const makeTestLayer = Effect.fn("test.makeNativeThreadTurnServiceLayer")(functio
     } as unknown as ProjectionSnapshotQuery["Service"]),
     Layer.succeed(ProjectionThreadMessageRepository, {
       getByMessageId: (_input: { readonly messageId: MessageId }) => Effect.succeed(Option.none()),
+      listByThreadId: () => Effect.succeed([]),
     } as unknown as ProjectionThreadMessageRepository["Service"]),
     Layer.succeed(ProjectionTurnStartRepository, {
       getOutcomeByMessageId: () => Effect.die("monitor projection defect"),
     } as unknown as ProjectionTurnStartRepository["Service"]),
     Layer.succeed(
       ClientCommandDispatcher,
-      ClientCommandDispatcher.of({ dispatch: () => Effect.succeed({ sequence: 1 }) }),
+      ClientCommandDispatcher.of({
+        dispatch: () => Effect.succeed({ sequence: 1 }),
+      }),
     ),
   ).pipe(Layer.provideMerge(NodeServices.layer));
   return {
@@ -151,7 +180,7 @@ const makeTestLayer = Effect.fn("test.makeNativeThreadTurnServiceLayer")(functio
 });
 
 const initialize = Effect.gen(function* () {
-  yield* runMigrations({ toMigrationInclusive: 46 });
+  yield* runMigrations({ toMigrationInclusive: 47 });
   const sql = yield* SqlClient.SqlClient;
   const now = yield* Clock.currentTimeMillis;
   yield* sql`INSERT INTO auth_sessions (
@@ -167,27 +196,42 @@ const initialize = Effect.gen(function* () {
     'runtime-hash', ${runtimeId}, 1, ${authSessionId}, '[]',
     ${encodeRuntimeTarget({
       mode: "thread",
+      environmentId,
       projectId,
       threadId,
       speechPreset: "default",
       autoRearm: true,
+      endpointPolicy: {
+        endSilenceMs: 2_200,
+        noSpeechTimeoutMs: null,
+        maximumUtteranceMs: 120_000,
+      },
+      speechEnabled: true,
+      rearmGuardMs: 500,
     })},
     ${now + 60_000}, ${now}
   )`;
 });
 
-const create = (clientOperationId: string) =>
+const create = (
+  clientOperationId: string,
+  submissionPolicy: "auto-submit" | "draft" = "auto-submit",
+) =>
   Effect.gen(function* () {
     const service = yield* VoiceNativeThreadTurnService;
     return yield* service.create(runtimeToken, {
-      runtimeId,
+      runtimeId: VoiceRuntimeId.make(runtimeId),
+      runtimeInstanceId,
       generation: 1,
-      clientOperationId,
+      modeSessionId: VoiceModeSessionId.make("service-mode"),
+      turnClientOperationId: VoiceTurnClientOperationId.make(clientOperationId),
+      submissionPolicy,
+      speechPlanId: VoiceSpeechPlanId.make(`speech-plan:${clientOperationId}`),
     });
   });
 
 describe.sequential("VoiceNativeThreadTurnService", () => {
-  it.effect("atomically fences event reads and acknowledgements after child-token rotation", () =>
+  it.effect("returns one stable child grant for an idempotent create replay", () =>
     Effect.gen(function* () {
       const test = yield* makeTestLayer("never");
       yield* Effect.gen(function* () {
@@ -199,6 +243,7 @@ describe.sequential("VoiceNativeThreadTurnService", () => {
         const replay = yield* create("event-auth");
 
         expect(replay.snapshot.operationId).toBe(first.snapshot.operationId);
+        expect(replay.operationGrant.token).toBe(first.operationGrant.token);
         expect(
           yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
             FROM voice_native_thread_turn_operations
@@ -212,24 +257,17 @@ describe.sequential("VoiceNativeThreadTurnService", () => {
           })).events.map((event) => event.sequence),
         ).toEqual([1]);
         expect(
-          (yield* service
-            .events(first.operationGrant.token, first.snapshot.operationId, {
-              afterSequence: 0,
-              waitMilliseconds: 0,
-            })
-            .pipe(Effect.flip)).reason,
-        ).toBe("authorization-revoked");
-        expect(
-          (yield* service
-            .acknowledgeEvents(first.operationGrant.token, first.snapshot.operationId, 1)
-            .pipe(Effect.flip)).reason,
-        ).toBe("authorization-revoked");
-        expect(
-          (yield* service
-            .cancel(first.operationGrant.token, first.snapshot.operationId)
-            .pipe(Effect.flip)).reason,
-        ).toBe("authorization-revoked");
-        expect(yield* store.get(first.snapshot.operationId)).toMatchObject({ phase: "created" });
+          yield* service.acknowledgeEvents(first.operationGrant.token, first.snapshot.operationId, {
+            acknowledgedSequence: 1,
+            speechPlanId: first.snapshot.speechPlanId,
+            highestStartedSegment: null,
+            highestDrainedSegment: null,
+            segmentDispositions: [],
+          }),
+        ).toMatchObject({ acknowledgedSequence: 1 });
+        expect(yield* store.get(first.snapshot.operationId)).toMatchObject({
+          phase: "created",
+        });
       }).pipe(Effect.provide(test.layer));
     }),
   );
@@ -243,9 +281,13 @@ describe.sequential("VoiceNativeThreadTurnService", () => {
         expect(
           (yield* service
             .create("unknown-runtime-token", {
-              runtimeId,
+              runtimeId: VoiceRuntimeId.make(runtimeId),
+              runtimeInstanceId,
               generation: 1,
-              clientOperationId: "unknown-runtime",
+              modeSessionId: VoiceModeSessionId.make("unknown-mode"),
+              turnClientOperationId: VoiceTurnClientOperationId.make("unknown-runtime"),
+              submissionPolicy: "auto-submit",
+              speechPlanId: VoiceSpeechPlanId.make("unknown-speech-plan"),
             })
             .pipe(Effect.flip)).reason,
         ).toBe("authorization-revoked");
@@ -303,10 +345,14 @@ describe.sequential("VoiceNativeThreadTurnService", () => {
         const service = yield* VoiceNativeThreadTurnService;
         const store = yield* VoiceNativeThreadTurnStore;
         const operation = yield* create("dispatch-cancel");
+        const tokenHash = NodeCrypto.createHash("sha256")
+          .update(operation.operationGrant.token)
+          .digest("hex");
         const now = yield* Clock.currentTimeMillis;
         expect(
           yield* store.claimProcessing(
             operation.snapshot.operationId,
+            tokenHash,
             "dispatch-lease",
             now,
             now + 1_000,
@@ -325,15 +371,67 @@ describe.sequential("VoiceNativeThreadTurnService", () => {
         expect(
           yield* store.beginDispatch(
             operation.snapshot.operationId,
+            tokenHash,
             "dispatch-lease",
             now,
             "2026-07-13T12:00:00.000Z",
           ),
         ).toBe(true);
+        expect(
+          yield* store.acceptDispatch({
+            operationId: operation.snapshot.operationId,
+            tokenHash,
+            leaseToken: "dispatch-lease",
+            occurredAt: "2026-07-13T12:00:00.000Z",
+            commandId: CommandId.make("dispatch-command"),
+            messageId: MessageId.make("dispatch-message"),
+          }),
+        ).toBe(true);
 
         expect(
           yield* service.cancel(operation.operationGrant.token, operation.snapshot.operationId),
-        ).toMatchObject({ cancelled: false, snapshot: { phase: "dispatching" } });
+        ).toMatchObject({
+          cancelled: false,
+          snapshot: { phase: "waiting", dispatchAccepted: true },
+        });
+      }).pipe(Effect.provide(test.layer));
+    }),
+  );
+
+  it.effect("survives parent expiry but denies auth revocation without deleting the receipt", () =>
+    Effect.gen(function* () {
+      const test = yield* makeTestLayer("never");
+      yield* Effect.gen(function* () {
+        yield* initialize;
+        const service = yield* VoiceNativeThreadTurnService;
+        const store = yield* VoiceNativeThreadTurnStore;
+        const sql = yield* SqlClient.SqlClient;
+        const operation = yield* create("authority-lifetime");
+        yield* sql`UPDATE voice_native_runtime_grants SET expires_at = -1
+          WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`;
+
+        expect(
+          yield* service.events(operation.operationGrant.token, operation.snapshot.operationId, {
+            afterSequence: 0,
+            waitMilliseconds: 0,
+          }),
+        ).toMatchObject({
+          snapshot: { operationId: operation.snapshot.operationId },
+        });
+
+        yield* sql`UPDATE auth_sessions SET revoked_at = '2026-07-13T12:00:01.000Z'
+          WHERE session_id = ${authSessionId}`;
+        expect(
+          (yield* service
+            .events(operation.operationGrant.token, operation.snapshot.operationId, {
+              afterSequence: 0,
+              waitMilliseconds: 0,
+            })
+            .pipe(Effect.flip)).reason,
+        ).toBe("authorization-revoked");
+        expect(yield* store.getReceiptCorrelation(operation.snapshot.operationId)).toMatchObject({
+          operationId: operation.snapshot.operationId,
+        });
       }).pipe(Effect.provide(test.layer));
     }),
   );
@@ -362,6 +460,42 @@ describe.sequential("VoiceNativeThreadTurnService", () => {
           processingLeaseToken: null,
           processingLeaseUntil: null,
         });
+      }).pipe(Effect.provide(test.layer));
+    }),
+  );
+
+  it.effect("switches stop-to-composer to draft before upload and rejects it after admission", () =>
+    Effect.gen(function* () {
+      const test = yield* makeTestLayer("never");
+      yield* Effect.gen(function* () {
+        yield* initialize;
+        const service = yield* VoiceNativeThreadTurnService;
+        const operation = yield* create("draft-disposition");
+        expect(
+          yield* service.setDraftDisposition(
+            operation.operationGrant.token,
+            operation.snapshot.operationId,
+          ),
+        ).toMatchObject({ snapshot: { submissionPolicy: "draft", phase: "created" } });
+        expect(
+          yield* service.setDraftDisposition(
+            operation.operationGrant.token,
+            operation.snapshot.operationId,
+          ),
+        ).toMatchObject({ snapshot: { submissionPolicy: "draft", phase: "created" } });
+        yield* service.cancel(operation.operationGrant.token, operation.snapshot.operationId);
+
+        const admitted = yield* create("admitted-disposition");
+        const upload = yield* service
+          .uploadAudio(admitted.operationGrant.token, admitted.snapshot.operationId, fixture)
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(test.transcriptionStarted);
+        expect(
+          (yield* service
+            .setDraftDisposition(admitted.operationGrant.token, admitted.snapshot.operationId)
+            .pipe(Effect.flip)).reason,
+        ).toBe("invalid-phase");
+        yield* Fiber.interrupt(upload);
       }).pipe(Effect.provide(test.layer));
     }),
   );
@@ -408,6 +542,60 @@ describe.sequential("VoiceNativeThreadTurnService", () => {
           speechTerminal: "failed",
         });
       }).pipe(Effect.provide(monitor.layer), Effect.timeout("3 seconds"));
+    }),
+  );
+
+  it.effect("encrypts draft transcripts, reports corruption, and consumes atomically", () =>
+    Effect.gen(function* () {
+      const test = yield* makeTestLayer("success");
+      yield* Effect.gen(function* () {
+        yield* initialize;
+        const service = yield* VoiceNativeThreadTurnService;
+        const sql = yield* SqlClient.SqlClient;
+        const operation = yield* create("draft-service");
+        yield* service.setDraftDisposition(
+          operation.operationGrant.token,
+          operation.snapshot.operationId,
+        );
+        const uploaded = yield* service.uploadAudio(
+          operation.operationGrant.token,
+          operation.snapshot.operationId,
+          fixture,
+        );
+        expect(uploaded).toMatchObject({ disposition: "draft-ready" });
+        expect(
+          yield* service.readDraft(operation.operationGrant.token, operation.snapshot.operationId),
+        ).toMatchObject({ transcript: "service transcript" });
+
+        yield* sql`UPDATE voice_native_thread_turn_drafts
+          SET ciphertext = ${new Uint8Array([1, 2, 3])}
+          WHERE operation_id = ${operation.snapshot.operationId}`;
+        expect(
+          (yield* service
+            .readDraft(operation.operationGrant.token, operation.snapshot.operationId)
+            .pipe(Effect.flip)).reason,
+        ).toBe("invalid-context");
+
+        const consumed = yield* service.consumeDraft(
+          operation.operationGrant.token,
+          operation.snapshot.operationId,
+        );
+        expect(consumed).toMatchObject({
+          consumed: true,
+          snapshot: { phase: "draft-ready" },
+        });
+        expect(
+          yield* service.consumeDraft(
+            operation.operationGrant.token,
+            operation.snapshot.operationId,
+          ),
+        ).toMatchObject({ consumed: false });
+        expect(
+          yield* sql<{ readonly ciphertext: Uint8Array | null }>`
+          SELECT ciphertext FROM voice_native_thread_turn_drafts
+          WHERE operation_id = ${operation.snapshot.operationId}`,
+        ).toEqual([{ ciphertext: null }]);
+      }).pipe(Effect.provide(test.layer));
     }),
   );
 });

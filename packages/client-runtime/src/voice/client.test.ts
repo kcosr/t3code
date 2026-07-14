@@ -33,6 +33,21 @@ const CLIENT_ACTION_ID = VoiceClientActionId.make("client-action-1");
 const NATIVE_RUNTIME_ID = VoiceNativeRuntimeId.make("native-runtime-1");
 const PROJECT_ID = ProjectId.make("project-1");
 const THREAD_ID = ThreadId.make("thread-1");
+const threadGrantTarget = (autoRearm: boolean) => ({
+  mode: "thread" as const,
+  environmentId: ENVIRONMENT_ID,
+  projectId: PROJECT_ID,
+  threadId: THREAD_ID,
+  speechPreset: "default" as const,
+  autoRearm,
+  endpointPolicy: {
+    endSilenceMs: 2_200,
+    noSpeechTimeoutMs: null,
+    maximumUtteranceMs: 600_000,
+  },
+  speechEnabled: true,
+  rearmGuardMs: 500,
+});
 
 const preparedConnection = (
   httpAuthorization: PreparedHttpAuthorization | null,
@@ -84,13 +99,7 @@ describe("makeVoiceHttpClient", () => {
               token: "narrow-runtime-token",
               runtimeId: NATIVE_RUNTIME_ID,
               generation: 3,
-              target: {
-                mode: "thread",
-                projectId: PROJECT_ID,
-                threadId: THREAD_ID,
-                speechPreset: "default",
-                autoRearm: true,
-              },
+              target: threadGrantTarget(true),
               expiresAt: "2026-08-10T20:00:00.000Z",
             });
       };
@@ -101,13 +110,7 @@ describe("makeVoiceHttpClient", () => {
 
       const grant = yield* client.provisionNativeRuntimeGrant(NATIVE_RUNTIME_ID, {
         generation: 3,
-        target: {
-          mode: "thread",
-          projectId: PROJECT_ID,
-          threadId: THREAD_ID,
-          speechPreset: "default",
-          autoRearm: true,
-        },
+        target: threadGrantTarget(true),
       });
       const revoked = yield* client.revokeNativeRuntimeGrant(NATIVE_RUNTIME_ID);
 
@@ -123,7 +126,7 @@ describe("makeVoiceHttpClient", () => {
           ? new TextDecoder().decode(provisionBody)
           : provisionBody,
       ).toBe(
-        '{"generation":3,"target":{"mode":"thread","projectId":"project-1","threadId":"thread-1","speechPreset":"default","autoRearm":true}}',
+        '{"generation":3,"target":{"mode":"thread","environmentId":"environment-voice-test","projectId":"project-1","threadId":"thread-1","speechPreset":"default","autoRearm":true,"endpointPolicy":{"endSilenceMs":2200,"noSpeechTimeoutMs":null,"maximumUtteranceMs":600000},"speechEnabled":true,"rearmGuardMs":500}}',
       );
     }),
   );
@@ -146,26 +149,14 @@ describe("makeVoiceHttpClient", () => {
             token: "narrow-runtime-token",
             runtimeId: NATIVE_RUNTIME_ID,
             generation: 3,
-            target: {
-              mode: "thread",
-              projectId: PROJECT_ID,
-              threadId: THREAD_ID,
-              speechPreset: "default",
-              autoRearm: false,
-            },
+            target: threadGrantTarget(false),
             expiresAt: "2026-08-10T20:00:00.000Z",
           }),
       });
 
       yield* client.provisionNativeRuntimeGrant(NATIVE_RUNTIME_ID, {
         generation: 3,
-        target: {
-          mode: "thread",
-          projectId: PROJECT_ID,
-          threadId: THREAD_ID,
-          speechPreset: "default",
-          autoRearm: false,
-        },
+        target: threadGrantTarget(false),
       });
 
       expect(proofs).toEqual([

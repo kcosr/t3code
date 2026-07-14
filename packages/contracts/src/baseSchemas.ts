@@ -58,6 +58,54 @@ export const VoiceNativeThreadTurnOperationId = TrimmedNonEmptyString.check(
   Schema.isMaxLength(192),
 ).pipe(Schema.brand("VoiceNativeThreadTurnOperationId"));
 export type VoiceNativeThreadTurnOperationId = typeof VoiceNativeThreadTurnOperationId.Type;
+export const VoiceRuntimeId = TrimmedNonEmptyString.check(Schema.isMaxLength(128)).pipe(
+  Schema.brand("VoiceRuntimeId"),
+);
+export type VoiceRuntimeId = typeof VoiceRuntimeId.Type;
+export const VoiceRuntimeInstanceId = TrimmedNonEmptyString.check(Schema.isMaxLength(128)).pipe(
+  Schema.brand("VoiceRuntimeInstanceId"),
+);
+export type VoiceRuntimeInstanceId = typeof VoiceRuntimeInstanceId.Type;
+export const VoiceRuntimeCommandId = TrimmedNonEmptyString.check(Schema.isMaxLength(128)).pipe(
+  Schema.brand("VoiceRuntimeCommandId"),
+);
+export type VoiceRuntimeCommandId = typeof VoiceRuntimeCommandId.Type;
+export const VoiceModeSessionId = TrimmedNonEmptyString.check(Schema.isMaxLength(128)).pipe(
+  Schema.brand("VoiceModeSessionId"),
+);
+export type VoiceModeSessionId = typeof VoiceModeSessionId.Type;
+export const VoiceTurnClientOperationId = TrimmedNonEmptyString.check(Schema.isMaxLength(192)).pipe(
+  Schema.brand("VoiceTurnClientOperationId"),
+);
+export type VoiceTurnClientOperationId = typeof VoiceTurnClientOperationId.Type;
+export const VoiceThreadTurnOperationId = TrimmedNonEmptyString.check(Schema.isMaxLength(192)).pipe(
+  Schema.brand("VoiceThreadTurnOperationId"),
+);
+export type VoiceThreadTurnOperationId = typeof VoiceThreadTurnOperationId.Type;
+export const VoiceRuntimeConsumerLeaseId = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(128),
+).pipe(Schema.brand("VoiceRuntimeConsumerLeaseId"));
+export type VoiceRuntimeConsumerLeaseId = typeof VoiceRuntimeConsumerLeaseId.Type;
+export const VoiceRuntimeProvisioningOperationId = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(128),
+).pipe(Schema.brand("VoiceRuntimeProvisioningOperationId"));
+export type VoiceRuntimeProvisioningOperationId = typeof VoiceRuntimeProvisioningOperationId.Type;
+export const VoiceComposerCaptureOperationId = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(128),
+).pipe(Schema.brand("VoiceComposerCaptureOperationId"));
+export type VoiceComposerCaptureOperationId = typeof VoiceComposerCaptureOperationId.Type;
+export const VoiceManualPlaybackOperationId = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(128),
+).pipe(Schema.brand("VoiceManualPlaybackOperationId"));
+export type VoiceManualPlaybackOperationId = typeof VoiceManualPlaybackOperationId.Type;
+export const VoiceDraftArtifactId = TrimmedNonEmptyString.check(Schema.isMaxLength(192)).pipe(
+  Schema.brand("VoiceDraftArtifactId"),
+);
+export type VoiceDraftArtifactId = typeof VoiceDraftArtifactId.Type;
+export const VoiceSpeechPlanId = TrimmedNonEmptyString.check(Schema.isMaxLength(192)).pipe(
+  Schema.brand("VoiceSpeechPlanId"),
+);
+export type VoiceSpeechPlanId = typeof VoiceSpeechPlanId.Type;
 export const VoiceSessionId = makeEntityId("VoiceSessionId");
 export type VoiceSessionId = typeof VoiceSessionId.Type;
 export const VoiceRequestId = makeEntityId("VoiceRequestId");

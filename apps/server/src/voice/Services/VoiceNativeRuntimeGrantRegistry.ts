@@ -23,6 +23,16 @@ export interface VoiceNativeRuntimeGrantRegistryShape {
     scope: VoiceNativeRuntimeGrantScope,
   ) => Effect.Effect<{ readonly token: string; readonly refreshed: boolean }, VoiceError>;
   readonly authorize: (token: string) => Effect.Effect<VoiceNativeRuntimeGrantScope | undefined>;
+  readonly activateTransition: (
+    token: string,
+    input: {
+      readonly authSessionId: AuthSessionId;
+      readonly runtimeId: VoiceNativeRuntimeId;
+      readonly sourceGeneration: number;
+      readonly targetGeneration: number;
+      readonly target: VoiceNativeRuntimeTarget;
+    },
+  ) => Effect.Effect<{ readonly expiresAt: number; readonly replayed: boolean }, VoiceError>;
   readonly revokeRuntime: (
     authSessionId: AuthSessionId,
     runtimeId: VoiceNativeRuntimeId,

@@ -3,6 +3,9 @@ import { expect, it } from "@effect/vitest";
 import {
   AuthSessionId,
   AuthVoiceUseScope,
+  EnvironmentId,
+  ProjectId,
+  ThreadId,
   VoiceConversationId,
   VoiceNativeRuntimeId,
   VoiceSessionId,
@@ -62,7 +65,7 @@ const insertActiveAuthSession = (sessionId = authSessionId) =>
 
 it.effect("hashes, rotates, expires, and auth-fences runtime grants", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 46 });
+    yield* runMigrations({ toMigrationInclusive: 48 });
     yield* insertActiveAuthSession();
     const registry = yield* __testing.make;
     const realtimeStarts = yield* VoiceNativeRealtimeStartRepository;
@@ -144,7 +147,7 @@ it.effect("hashes, rotates, expires, and auth-fences runtime grants", () =>
 
 it.effect("refreshes an identical generation without revoking its child authority", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 46 });
+    yield* runMigrations({ toMigrationInclusive: 48 });
     yield* insertActiveAuthSession();
     const runtimeGrants = yield* __testing.make;
     const childGrants = yield* VoiceNativeControlGrantRegistry;
@@ -199,9 +202,79 @@ it.effect("refreshes an identical generation without revoking its child authorit
   }).pipe(Effect.provide(testLayer)),
 );
 
+it.effect("atomically rotates runtime authority to a replay-stable thread credential", () =>
+  Effect.gen(function* () {
+    yield* runMigrations({ toMigrationInclusive: 48 });
+    const transitionAuthSessionId = AuthSessionId.make("auth-transition");
+    const transitionRuntimeId = VoiceNativeRuntimeId.make("android-transition");
+    yield* insertActiveAuthSession(transitionAuthSessionId);
+    const runtimeGrants = yield* __testing.make;
+    const now = yield* Clock.currentTimeMillis;
+    const issued = yield* runtimeGrants.issue({
+      authSessionId: transitionAuthSessionId,
+      runtimeId: transitionRuntimeId,
+      generation: 1,
+      grantedScopes: new Set([AuthVoiceUseScope]),
+      target,
+      expiresAt: now + 60_000,
+    });
+    const threadTarget = {
+      mode: "thread" as const,
+      environmentId: EnvironmentId.make("environment-transition"),
+      projectId: ProjectId.make("project-transition"),
+      threadId: ThreadId.make("thread-transition"),
+      speechPreset: "default" as const,
+      autoRearm: true,
+      endpointPolicy: {
+        endSilenceMs: 2_200,
+        noSpeechTimeoutMs: null,
+        maximumUtteranceMs: 600_000,
+      },
+      speechEnabled: true,
+      rearmGuardMs: 500,
+    };
+
+    const first = yield* runtimeGrants.activateTransition("thread-transition-token", {
+      authSessionId: transitionAuthSessionId,
+      runtimeId: transitionRuntimeId,
+      sourceGeneration: 1,
+      targetGeneration: 2,
+      target: threadTarget,
+    });
+    expect(first).toEqual({ expiresAt: now + 60_000, replayed: false });
+    expect(yield* runtimeGrants.authorize(issued.token)).toBeUndefined();
+    expect(yield* runtimeGrants.authorize("thread-transition-token")).toMatchObject({
+      generation: 2,
+      expiresAt: now + 60_000,
+      target: threadTarget,
+    });
+
+    expect(
+      yield* runtimeGrants.activateTransition("thread-transition-token", {
+        authSessionId: transitionAuthSessionId,
+        runtimeId: transitionRuntimeId,
+        sourceGeneration: 1,
+        targetGeneration: 2,
+        target: threadTarget,
+      }),
+    ).toEqual({ expiresAt: now + 60_000, replayed: true });
+    expect(
+      yield* runtimeGrants
+        .activateTransition("conflicting-transition-token", {
+          authSessionId: transitionAuthSessionId,
+          runtimeId: transitionRuntimeId,
+          sourceGeneration: 1,
+          targetGeneration: 2,
+          target: threadTarget,
+        })
+        .pipe(Effect.flip),
+    ).toMatchObject({ reason: "authorization-revoked" });
+  }).pipe(Effect.provide(testLayer)),
+);
+
 it.effect("rejects a stale generation when child authority is issued after rotation", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 46 });
+    yield* runMigrations({ toMigrationInclusive: 48 });
     yield* insertActiveAuthSession();
     const registry = yield* __testing.make;
     const childGrants = yield* VoiceNativeControlGrantRegistry;
@@ -240,7 +313,7 @@ it.effect("rejects a stale generation when child authority is issued after rotat
 
 it.effect("immediately fences an existing child grant when its parent generation changes", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 46 });
+    yield* runMigrations({ toMigrationInclusive: 48 });
     yield* insertActiveAuthSession();
     const runtimeGrants = yield* __testing.make;
     const childGrants = yield* VoiceNativeControlGrantRegistry;
@@ -274,7 +347,7 @@ it.effect("immediately fences an existing child grant when its parent generation
 
 it.effect("rejects a runtime token after durable parent revocation across restart", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 46 });
+    yield* runMigrations({ toMigrationInclusive: 48 });
     yield* insertActiveAuthSession();
     const beforeRestart = yield* __testing.make;
     const now = yield* Clock.currentTimeMillis;
@@ -297,7 +370,7 @@ it.effect("rejects a runtime token after durable parent revocation across restar
 
 it.effect("reports durable revocation success when derived thread cleanup fails", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 46 });
+    yield* runMigrations({ toMigrationInclusive: 48 });
     yield* insertActiveAuthSession();
     const registry = yield* __testing.make;
     const now = yield* Clock.currentTimeMillis;

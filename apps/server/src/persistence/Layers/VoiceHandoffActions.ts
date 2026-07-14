@@ -1,3 +1,4 @@
+import { VoiceHandoffFailureReason, VoiceHandoffFailureStage } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -29,8 +30,8 @@ const VoiceHandoffActionRow = Schema.Struct({
   status: Schema.Literals(["prepared", "pending", "settled", "expired"]),
   outcome: Schema.NullOr(Schema.Literals(["succeeded", "failed"])),
   outcomeState: Schema.NullOr(Schema.String),
-  outcomeStage: Schema.NullOr(Schema.String),
-  outcomeReason: Schema.NullOr(Schema.String),
+  outcomeStage: Schema.NullOr(VoiceHandoffFailureStage),
+  outcomeReason: Schema.NullOr(VoiceHandoffFailureReason),
   createdAt: Schema.String,
   updatedAt: Schema.String,
   expiresAt: Schema.String,

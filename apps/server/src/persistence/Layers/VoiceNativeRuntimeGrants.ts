@@ -105,6 +105,57 @@ const make = Effect.gen(function* () {
       };
     }).pipe(Effect.mapError(toPersistenceSqlError("VoiceNativeRuntimeGrantRepository.findActive")));
 
+  const transition: VoiceNativeRuntimeGrantRepositoryShape["transition"] = (input, now) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          if (input.targetGeneration !== input.sourceGeneration + 1) {
+            return { status: "stale" as const };
+          }
+          const rows = yield* sql<{
+            readonly tokenHash: string;
+            readonly generation: number;
+            readonly grantedScopesJson: string;
+            readonly targetJson: string;
+            readonly expiresAt: number;
+          }>`SELECT token_hash AS "tokenHash", generation,
+              granted_scopes_json AS "grantedScopesJson", target_json AS "targetJson",
+              expires_at AS "expiresAt"
+            FROM voice_native_runtime_grants
+            WHERE auth_session_id = ${input.authSessionId} AND runtime_id = ${input.runtimeId}
+            LIMIT 1`;
+          const current = rows[0];
+          if (current === undefined || current.expiresAt <= now) {
+            return { status: "stale" as const };
+          }
+          const targetJson = encodeTarget(input.target);
+          if (current.generation === input.targetGeneration) {
+            return current.tokenHash === input.tokenHash && current.targetJson === targetJson
+              ? ({
+                  status: "existing" as const,
+                  expiresAt: current.expiresAt,
+                } as const)
+              : ({ status: "stale" as const } as const);
+          }
+          if (current.generation !== input.sourceGeneration) {
+            return { status: "stale" as const };
+          }
+          yield* sql`DELETE FROM voice_native_runtime_grants
+            WHERE auth_session_id = ${input.authSessionId} AND runtime_id = ${input.runtimeId}
+              AND generation = ${input.sourceGeneration}`;
+          yield* sql`INSERT INTO voice_native_runtime_grants (
+            token_hash, runtime_id, generation, auth_session_id, granted_scopes_json,
+            target_json, expires_at, created_at
+          ) VALUES (
+            ${input.tokenHash}, ${input.runtimeId}, ${input.targetGeneration},
+            ${input.authSessionId}, ${current.grantedScopesJson}, ${targetJson},
+            ${current.expiresAt}, ${now}
+          )`;
+          return { status: "issued" as const, expiresAt: current.expiresAt };
+        }),
+      )
+      .pipe(Effect.mapError(toPersistenceSqlError("VoiceNativeRuntimeGrantRepository.transition")));
+
   const revokeRuntime: VoiceNativeRuntimeGrantRepositoryShape["revokeRuntime"] = (
     authSessionId,
     runtimeId,
@@ -132,6 +183,7 @@ const make = Effect.gen(function* () {
   return VoiceNativeRuntimeGrantRepository.of({
     replace,
     findActive,
+    transition,
     revokeRuntime,
     revokeAuthSession,
   });

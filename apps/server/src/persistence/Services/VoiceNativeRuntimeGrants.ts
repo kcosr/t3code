@@ -28,6 +28,21 @@ export interface VoiceNativeRuntimeGrantRepositoryShape {
     tokenHash: string,
     now: number,
   ) => Effect.Effect<PersistedVoiceNativeRuntimeGrant | undefined, PersistenceSqlError>;
+  readonly transition: (
+    input: {
+      readonly authSessionId: AuthSessionId;
+      readonly runtimeId: VoiceNativeRuntimeId;
+      readonly sourceGeneration: number;
+      readonly targetGeneration: number;
+      readonly tokenHash: string;
+      readonly target: VoiceNativeRuntimeTarget;
+    },
+    now: number,
+  ) => Effect.Effect<
+    | { readonly status: "issued" | "existing"; readonly expiresAt: number }
+    | { readonly status: "stale" },
+    PersistenceSqlError
+  >;
   readonly revokeRuntime: (
     authSessionId: AuthSessionId,
     runtimeId: VoiceNativeRuntimeId,

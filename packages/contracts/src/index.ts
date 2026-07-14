@@ -8,6 +8,7 @@ export * from "./remoteAccess.ts";
 export * from "./ipc.ts";
 export * from "./terminal.ts";
 export * from "./voice.ts";
+export * from "./voiceRuntime.ts";
 export * from "./history.ts";
 export * from "./provider.ts";
 export * from "./providerInstance.ts";

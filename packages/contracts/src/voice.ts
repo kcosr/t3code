@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 
 import {
   CommandId,
+  EnvironmentId,
   IsoDateTime,
   MessageId,
   NonNegativeInt,
@@ -300,10 +301,22 @@ export const VoiceNativeRuntimeTarget = Schema.Union([
   }),
   Schema.Struct({
     mode: Schema.Literal("thread"),
+    environmentId: EnvironmentId,
     projectId: ProjectId,
     threadId: ThreadId,
     speechPreset: VoiceSpeechPreset,
     autoRearm: Schema.Boolean,
+    endpointPolicy: Schema.Struct({
+      endSilenceMs: Schema.Int.check(Schema.isBetween({ minimum: 100, maximum: 30_000 })),
+      noSpeechTimeoutMs: Schema.NullOr(
+        Schema.Int.check(Schema.isBetween({ minimum: 100, maximum: 30 * 60_000 })),
+      ),
+      maximumUtteranceMs: Schema.Int.check(
+        Schema.isBetween({ minimum: 1_000, maximum: 60 * 60_000 }),
+      ),
+    }),
+    speechEnabled: Schema.Boolean,
+    rearmGuardMs: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 60_000 })),
   }),
 ]);
 export type VoiceNativeRuntimeTarget = typeof VoiceNativeRuntimeTarget.Type;

@@ -1,0 +1,115 @@
+{
+  "command": {
+    "kind": "start-thread-mode",
+    "commandId": "command-1",
+    "runtimeId": "runtime-1",
+    "runtimeInstanceId": "instance-1",
+    "authorityGeneration": 4,
+    "modeSessionId": "mode-1",
+    "turnClientOperationId": "turn-client-1",
+    "submissionPolicy": "auto-submit",
+    "draftContext": null,
+    "interruptionPolicy": "reject"
+  },
+  "snapshot": {
+    "runtimeId": "runtime-1",
+    "runtimeInstanceId": "instance-1",
+    "generation": 4,
+    "sequence": 8,
+    "availability": "ready",
+    "target": {
+      "mode": "thread",
+      "environmentId": "environment-1",
+      "projectId": "project-1",
+      "threadId": "thread-1",
+      "speechPreset": "default",
+      "autoRearm": true,
+      "endpointPolicy": {
+        "endSilenceMs": 2200,
+        "noSpeechTimeoutMs": null,
+        "maximumUtteranceMs": 600000
+      },
+      "speechEnabled": true,
+      "rearmGuardMs": 500
+    },
+    "operation": {
+      "kind": "thread-turn",
+      "modeSessionId": "mode-1",
+      "phase": { "phase": "recording" },
+      "turnClientOperationId": "turn-client-1",
+      "turnOperationId": "operation-1"
+    },
+    "mediaOwner": {
+      "kind": "recorder",
+      "owner": "thread-mode",
+      "root": {
+        "kind": "turn",
+        "modeSessionId": "mode-1",
+        "turnClientOperationId": "turn-client-1",
+        "turnOperationId": "operation-1"
+      }
+    },
+    "readiness": { "state": "active", "mode": "thread" },
+    "route": { "inputRouteId": null, "outputRouteId": null },
+    "failure": null
+  },
+  "receipt": {
+    "runtimeId": "runtime-1",
+    "runtimeInstanceId": "instance-1",
+    "runtimeGeneration": 4,
+    "modeSessionId": "mode-1",
+    "turnClientOperationId": "turn-client-1",
+    "turnOperationId": "operation-1",
+    "target": {
+      "environmentId": "environment-1",
+      "projectId": "project-1",
+      "threadId": "thread-1"
+    },
+    "userMessageId": "message-1",
+    "turnId": "turn-1",
+    "assistantMessageIds": ["assistant-1"],
+    "speechPlanId": "speech-1",
+    "highestAdvertisedSegment": 1,
+    "highestStartedSegment": 1,
+    "highestDrainedSegment": 1,
+    "segmentDispositions": [{ "segmentIndex": 1, "disposition": "drained" }],
+    "speechTerminal": "completed",
+    "terminalOutcome": "completed",
+    "createdAt": "2026-07-14T00:00:00Z",
+    "expiresAt": "2026-08-14T00:00:00Z"
+  },
+  "event": {
+    "runtimeId": "runtime-1",
+    "runtimeInstanceId": "instance-1",
+    "authorityGeneration": 4,
+    "sequence": 9,
+    "occurredAt": "2026-07-14T00:00:01Z",
+    "root": { "kind": "mode", "modeSessionId": "mode-1" },
+    "kind": "thread-receipt",
+    "receipt": {
+      "runtimeId": "runtime-1",
+      "runtimeInstanceId": "instance-1",
+      "runtimeGeneration": 4,
+      "modeSessionId": "mode-1",
+      "turnClientOperationId": "turn-client-1",
+      "turnOperationId": "operation-1",
+      "target": {
+        "environmentId": "environment-1",
+        "projectId": "project-1",
+        "threadId": "thread-1"
+      },
+      "userMessageId": "message-1",
+      "turnId": "turn-1",
+      "assistantMessageIds": ["assistant-1"],
+      "speechPlanId": "speech-1",
+      "highestAdvertisedSegment": 1,
+      "highestStartedSegment": 1,
+      "highestDrainedSegment": 1,
+      "segmentDispositions": [{ "segmentIndex": 1, "disposition": "drained" }],
+      "speechTerminal": "completed",
+      "terminalOutcome": "completed",
+      "createdAt": "2026-07-14T00:00:00Z",
+      "expiresAt": "2026-08-14T00:00:00Z"
+    }
+  }
+}

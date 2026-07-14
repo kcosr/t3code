@@ -43,6 +43,10 @@
       "types": "./src/voice/index.ts",
       "default": "./src/voice/index.ts"
     },
+    "./voice/react": {
+      "types": "./src/voice/reactPresentation.ts",
+      "default": "./src/voice/reactPresentation.ts"
+    },
     "./history": {
       "types": "./src/history/index.ts",
       "default": "./src/history/index.ts"
@@ -145,12 +149,17 @@
     "test": "vp test run"
   },
   "dependencies": {
+    "@noble/hashes": "catalog:",
     "@t3tools/contracts": "workspace:*",
     "@t3tools/shared": "workspace:*",
     "effect": "catalog:"
   },
   "devDependencies": {
     "@effect/vitest": "catalog:",
+    "@types/react": "~19.2.14",
     "vite-plus": "catalog:"
+  },
+  "peerDependencies": {
+    "react": ">=19.2.0"
   }
 }

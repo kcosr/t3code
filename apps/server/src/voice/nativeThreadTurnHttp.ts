@@ -1,9 +1,10 @@
 import {
-  VoiceNativeThreadTurnCancelInput,
-  VoiceNativeThreadTurnCreateInput,
-  VoiceNativeThreadTurnEventsAckInput,
-  VoiceNativeThreadTurnEventsQuery,
-  VoiceNativeThreadTurnOperationId,
+  VoiceRuntimeThreadTurnCancelInput,
+  VoiceRuntimeThreadTurnEventsAckInput,
+  VoiceRuntimeThreadTurnEventsQuery,
+  VoiceRuntimeThreadTurnDispositionInput,
+  VoiceRuntimeThreadTurnCreateInput,
+  VoiceThreadTurnOperationId,
   VoiceTranscriptionLanguage,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -20,23 +21,31 @@ import { VoiceNativeThreadTurnService } from "./Services/VoiceNativeThreadTurnSe
 const VOICE_RUNTIME_HEADER = "x-t3-voice-runtime";
 const VOICE_OPERATION_HEADER = "x-t3-voice-operation";
 const JSON_LIMIT = 2_048;
-const noStore = { "cache-control": "no-store", "x-content-type-options": "nosniff" };
+const noStore = {
+  "cache-control": "no-store",
+  "x-content-type-options": "nosniff",
+};
 
-const decodeOperationId = Schema.decodeUnknownEffect(VoiceNativeThreadTurnOperationId);
+const decodeOperationId = Schema.decodeUnknownEffect(VoiceThreadTurnOperationId);
 const decodeCreateSchema = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(VoiceNativeThreadTurnCreateInput),
+  Schema.fromJsonString(VoiceRuntimeThreadTurnCreateInput),
 );
 const decodeCreate = (json: string) => decodeCreateSchema(json, { onExcessProperty: "error" });
 const decodeAckSchema = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(VoiceNativeThreadTurnEventsAckInput),
+  Schema.fromJsonString(VoiceRuntimeThreadTurnEventsAckInput),
 );
 const decodeAck = (json: string) => decodeAckSchema(json, { onExcessProperty: "error" });
+const decodeDispositionSchema = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(VoiceRuntimeThreadTurnDispositionInput),
+);
+const decodeDisposition = (json: string) =>
+  decodeDispositionSchema(json, { onExcessProperty: "error" });
 const decodeCancelSchema = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(VoiceNativeThreadTurnCancelInput),
+  Schema.fromJsonString(VoiceRuntimeThreadTurnCancelInput),
 );
 const decodeCancel = (json: string) => decodeCancelSchema(json, { onExcessProperty: "error" });
 const decodeLanguage = Schema.decodeUnknownEffect(VoiceTranscriptionLanguage);
-const decodeEventsQuery = Schema.decodeUnknownEffect(VoiceNativeThreadTurnEventsQuery);
+const decodeEventsQuery = Schema.decodeUnknownEffect(VoiceRuntimeThreadTurnEventsQuery);
 
 const response = (body: unknown, status = 200) =>
   HttpServerResponse.jsonUnsafe(body, { status, headers: noStore });
@@ -129,7 +138,7 @@ const withOperation = Effect.fn("voice.native-thread.http.operation")(function* 
 
 const createRoute = HttpRouter.add(
   "POST",
-  "/api/voice/native/thread-turns",
+  "/api/voice/runtime/thread-turns",
   Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const token = request.headers[VOICE_RUNTIME_HEADER];
@@ -146,7 +155,7 @@ const createRoute = HttpRouter.add(
 
 const audioRoute = HttpRouter.add(
   "PUT",
-  "/api/voice/native/thread-turns/:operationId/audio",
+  "/api/voice/runtime/thread-turns/:operationId/audio",
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context === undefined) return unauthorized();
@@ -181,9 +190,24 @@ const audioRoute = HttpRouter.add(
   }),
 );
 
+const dispositionRoute = HttpRouter.add(
+  "POST",
+  "/api/voice/runtime/thread-turns/:operationId/disposition",
+  Effect.gen(function* () {
+    const context = yield* withOperation();
+    if (context === undefined) return unauthorized();
+    const input = yield* decodeJson(context.request, decodeDisposition);
+    if (Option.isNone(input)) return invalidRequest();
+    const result = yield* (yield* VoiceNativeThreadTurnService)
+      .setDraftDisposition(context.token, context.operationId)
+      .pipe(Effect.result);
+    return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
+  }),
+);
+
 const eventsRoute = HttpRouter.add(
   "GET",
-  "/api/voice/native/thread-turns/:operationId/events",
+  "/api/voice/runtime/thread-turns/:operationId/events",
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context === undefined) return unauthorized();
@@ -205,7 +229,7 @@ const eventsRoute = HttpRouter.add(
 
 const acknowledgeRoute = HttpRouter.add(
   "POST",
-  "/api/voice/native/thread-turns/:operationId/events/ack",
+  "/api/voice/runtime/thread-turns/:operationId/events/ack",
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context === undefined) return unauthorized();
@@ -217,7 +241,7 @@ const acknowledgeRoute = HttpRouter.add(
     const input = yield* decodeJson(context.request, decodeAck);
     if (Option.isNone(input)) return invalidRequest();
     const result = yield* service
-      .acknowledgeEvents(context.token, context.operationId, input.value.acknowledgedSequence)
+      .acknowledgeEvents(context.token, context.operationId, input.value)
       .pipe(Effect.result);
     return Result.isFailure(result)
       ? voiceFailure(result.failure)
@@ -227,7 +251,7 @@ const acknowledgeRoute = HttpRouter.add(
 
 const speechRoute = HttpRouter.add(
   "GET",
-  "/api/voice/native/thread-turns/:operationId/speech/:segmentIndex",
+  "/api/voice/runtime/thread-turns/:operationId/speech/:segmentIndex",
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context === undefined) return unauthorized();
@@ -240,14 +264,17 @@ const speechRoute = HttpRouter.add(
     if (Result.isFailure(result)) return voiceFailure(result.failure);
     return HttpServerResponse.stream(result.success, {
       contentType: "audio/pcm",
-      headers: { ...noStore, "x-t3-audio-format": "s16le;rate=24000;channels=1" },
+      headers: {
+        ...noStore,
+        "x-t3-audio-format": "s16le;rate=24000;channels=1",
+      },
     });
   }),
 );
 
 const cancelRoute = HttpRouter.add(
   "POST",
-  "/api/voice/native/thread-turns/:operationId/cancel",
+  "/api/voice/runtime/thread-turns/:operationId/cancel",
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context === undefined) return unauthorized();
@@ -263,11 +290,56 @@ const cancelRoute = HttpRouter.add(
   }),
 );
 
+const draftRoute = HttpRouter.add(
+  "GET",
+  "/api/voice/runtime/thread-turns/:operationId/draft",
+  Effect.gen(function* () {
+    const context = yield* withOperation();
+    if (context === undefined) return unauthorized();
+    const result = yield* (yield* VoiceNativeThreadTurnService)
+      .readDraft(context.token, context.operationId)
+      .pipe(Effect.result);
+    return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
+  }),
+);
+
+const consumeDraftRoute = HttpRouter.add(
+  "POST",
+  "/api/voice/runtime/thread-turns/:operationId/draft/consume",
+  Effect.gen(function* () {
+    const context = yield* withOperation();
+    if (context === undefined) return unauthorized();
+    const result = yield* (yield* VoiceNativeThreadTurnService)
+      .consumeDraft(context.token, context.operationId)
+      .pipe(Effect.result);
+    return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
+  }),
+);
+
+const detachRoute = HttpRouter.add(
+  "POST",
+  "/api/voice/runtime/thread-turns/:operationId/detach",
+  Effect.gen(function* () {
+    const context = yield* withOperation();
+    if (context === undefined) return unauthorized();
+    const result = yield* (yield* VoiceNativeThreadTurnService)
+      .detach(context.token, context.operationId)
+      .pipe(Effect.result);
+    return Result.isFailure(result)
+      ? voiceFailure(result.failure)
+      : response({ snapshot: result.success });
+  }),
+);
+
 export const voiceNativeThreadTurnRoutesLayer = Layer.mergeAll(
   createRoute,
   audioRoute,
+  dispositionRoute,
   eventsRoute,
   acknowledgeRoute,
   speechRoute,
+  draftRoute,
+  consumeDraftRoute,
+  detachRoute,
   cancelRoute,
 );
