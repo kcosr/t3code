@@ -372,8 +372,37 @@ export type T3VoiceDiagnosticCode =
   | "device-callback-unregistered"
   | "ended"
   | "failed"
+  | "prepare-started"
+  | "peer-resources-ready"
+  | "audio-focus-granted"
+  | "local-offer-ready"
+  | "answer-applied"
+  | "peer-connected"
+  | "stop-started"
+  | "media-released"
+  | "foreground-released"
+  | "authority-validated"
+  | "server-session-started"
+  | "signaling-completed"
+  | "close-requested"
+  | "cleanup-reconciliation-required"
+  | "thread-reconciliation-required"
   | "endpoint-sample"
-  | "endpoint-terminated";
+  | "endpoint-terminated"
+  | "cue-ready-started"
+  | "cue-ended-started"
+  | "cue-drained"
+  | "cue-cancelled"
+  | "cue-failed"
+  | "cue-timed-out"
+  | "handoff-drain-started"
+  | "handoff-drained"
+  | "handoff-drain-timed-out"
+  | "handoff-drain-interrupted"
+  | "handoff-published"
+  | "handoff-client-accepted"
+  | "handoff-navigation-requested"
+  | "handoff-composer-adopted";
 
 export interface T3VoiceDiagnosticEntry {
   readonly elapsedRealtimeMillis: number;
@@ -485,6 +514,9 @@ export interface T3VoiceNativeModule {
     readonly actionId: string;
     readonly outcome: "adopted" | "failed";
   }) => Promise<void>;
+  readonly beginThreadVoiceHandoffAdoptionAsync: (input: {
+    readonly actionId: string;
+  }) => Promise<boolean>;
   readonly armThreadVoiceHandoffAsync: (input: T3VoiceRealtimeIdentifier) => Promise<void>;
   readonly setReadinessSnapshotAsync: (
     input: T3VoiceReadinessSnapshot,
@@ -521,6 +553,9 @@ export interface T3VoiceNativeModule {
   ) => Promise<void>;
   readonly getAudioRoutesAsync: () => Promise<ReadonlyArray<T3VoiceAudioRoute>>;
   readonly getDiagnosticsAsync: () => Promise<ReadonlyArray<T3VoiceDiagnosticEntry>>;
+  readonly recordThreadVoiceHandoffClientStageAsync: (input: {
+    readonly stage: "accepted" | "navigation-requested" | "composer-adopted";
+  }) => Promise<void>;
   readonly setAudioRouteAsync: (
     input: T3VoiceRealtimeIdentifier & {
       readonly routeId: T3VoiceAudioRoute["id"];

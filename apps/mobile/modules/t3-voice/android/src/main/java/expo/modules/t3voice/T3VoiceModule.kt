@@ -191,7 +191,7 @@ class T3VoiceModule : Module() {
       )
 
       Constants(
-        "nativeRevision" to 12,
+        "nativeRevision" to 13,
       )
 
       OnCreate {
@@ -874,6 +874,23 @@ class T3VoiceModule : Module() {
       AsyncFunction("getDiagnosticsAsync") { promise: Promise ->
         withBinder(promise, "diagnostics-read-failed") { voice, result ->
           result.resolve(voice.getDiagnostics())
+        }
+      }
+
+      AsyncFunction("recordThreadVoiceHandoffClientStageAsync") {
+        input: Map<String, String>, promise: Promise ->
+        requireExactKeys(input, setOf("stage"))
+        withBinder(promise, "handoff-diagnostic-failed") { voice, result ->
+          voice.recordThreadVoiceHandoffClientStage(requireText(input, "stage", 64))
+          result.resolve()
+        }
+      }
+
+      AsyncFunction("beginThreadVoiceHandoffAdoptionAsync") {
+        input: Map<String, String>, promise: Promise ->
+        requireExactKeys(input, setOf("actionId"))
+        withBinder(promise, "handoff-adoption-claim-failed") { voice, result ->
+          result.resolve(voice.beginThreadVoiceHandoffAdoption(requireIdentifier(input, "actionId")))
         }
       }
 

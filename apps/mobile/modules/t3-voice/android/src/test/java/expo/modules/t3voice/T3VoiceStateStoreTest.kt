@@ -147,6 +147,28 @@ class T3VoiceStateStoreTest {
   }
 
   @Test
+  fun adoptionClaimProtectsPendingHandoffUntilItsBoundedDeadline() {
+    val event =
+      T3VoiceRuntimeEvent.ThreadVoiceHandoff(
+        actionId = "claimed-action",
+        projectId = "project-1",
+        threadId = "thread-1",
+        recordingId = "recording-1",
+        autoRearm = true,
+        environmentOrigin = "https://termstation",
+        expiresAtEpochMillis = 2_000,
+      )
+    val owner = checkNotNull(T3VoiceStateStore.claimRecording(event.recordingId))
+    T3VoiceStateStore.publishThreadVoiceHandoff(event)
+
+    assertTrue(T3VoiceStateStore.beginThreadVoiceHandoffAdoption(event.actionId, 5_000))
+    assertTrue(T3VoiceStateStore.isThreadVoiceHandoffAdoptionClaimed(event.actionId, 4_999))
+    assertFalse(T3VoiceStateStore.isThreadVoiceHandoffAdoptionClaimed(event.actionId, 5_000))
+    assertFalse(T3VoiceStateStore.beginThreadVoiceHandoffAdoption("other-action", 5_000))
+    assertTrue(T3VoiceStateStore.releaseRecording(owner))
+  }
+
+  @Test
   fun recordingAndPlaybackRejectStaleGenerationsEvenWhenIdsAreReused() {
     val firstRecording = checkNotNull(T3VoiceStateStore.claimRecording("recording"))
     assertTrue(T3VoiceStateStore.releaseRecording(firstRecording))

@@ -17,6 +17,7 @@ import {
   type ComposerTrigger,
 } from "@t3tools/shared/composerTrigger";
 import type { VoiceThreadModePauseReason } from "@t3tools/shared/voiceThreadMode";
+import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import type { ReactNode } from "react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
@@ -444,8 +445,24 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       return;
     }
     if (handoffAdoptionsRef.current.has(handoff.actionId)) return;
+    const releaseAdoption = realtimeVoice.beginThreadVoiceHandoffAdoption(handoff.actionId);
+    if (releaseAdoption === null) return;
     handoffAdoptionsRef.current.add(handoff.actionId);
     void (async () => {
+      const native = getT3VoiceNativeModule();
+      if (native === null) return;
+      for (;;) {
+        try {
+          if (
+            !(await native.beginThreadVoiceHandoffAdoptionAsync({ actionId: handoff.actionId }))
+          ) {
+            return;
+          }
+          break;
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+      }
       let adopted = false;
       try {
         adopted = await dictation.adopt(handoff.recordingId);
@@ -459,13 +476,24 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       }
       try {
         if (handoff.autoRearm) adoptHandoffRecording(handoff.recordingId);
-      } finally {
-        await realtimeVoice
-          .settleThreadVoiceHandoff(handoff.actionId, "adopted")
+        void native
+          .recordThreadVoiceHandoffClientStageAsync({ stage: "composer-adopted" })
           .catch(() => undefined);
+      } finally {
+        for (;;) {
+          try {
+            await realtimeVoice.settleThreadVoiceHandoff(handoff.actionId, "adopted");
+            break;
+          } catch {
+            await new Promise((resolve) => setTimeout(resolve, 1_000));
+          }
+        }
       }
     })()
-      .finally(() => handoffAdoptionsRef.current.delete(handoff.actionId))
+      .finally(() => {
+        releaseAdoption();
+        handoffAdoptionsRef.current.delete(handoff.actionId);
+      })
       .catch(() => undefined);
   }, [
     adoptHandoffRecording,

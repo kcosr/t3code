@@ -57,6 +57,7 @@ export type {
 } from "./T3Voice.types";
 
 const NATIVE_MODULE_NAME = "T3Voice";
+const NATIVE_REVISION = 13;
 
 let resolvedModule: T3VoiceNativeModule | null | undefined;
 
@@ -67,6 +68,7 @@ export function getT3VoiceNativeModule(): T3VoiceNativeModule | null {
 
   try {
     resolvedModule = requireOptionalNativeModule<T3VoiceNativeModule>(NATIVE_MODULE_NAME);
+    if (resolvedModule?.nativeRevision !== NATIVE_REVISION) resolvedModule = null;
   } catch {
     resolvedModule = null;
   }

@@ -24,13 +24,21 @@ describe("T3 voice native module resolution", () => {
   });
 
   it("returns and caches the installed native module", async () => {
-    const nativeModule = { nativeRevision: 1 };
+    const nativeModule = { nativeRevision: 13 };
     expoMocks.requireOptionalNativeModule.mockReturnValue(nativeModule);
     const voice = await import("./index");
 
     expect(voice.getT3VoiceNativeModule()).toBe(nativeModule);
     expect(voice.isT3VoiceNativeModuleAvailable()).toBe(true);
     expect(expoMocks.requireOptionalNativeModule).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an obsolete native module revision", async () => {
+    expoMocks.requireOptionalNativeModule.mockReturnValue({ nativeRevision: 12 });
+    const voice = await import("./index");
+
+    expect(voice.getT3VoiceNativeModule()).toBeNull();
+    expect(voice.isT3VoiceNativeModuleAvailable()).toBe(false);
   });
 
   it("treats native resolution failures as unavailable", async () => {

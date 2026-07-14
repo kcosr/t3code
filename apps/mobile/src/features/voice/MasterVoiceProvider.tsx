@@ -99,6 +99,10 @@ import {
   type MasterVoiceFocus,
 } from "./masterVoiceState";
 import {
+  reconcileThreadVoiceHandoff,
+  resolveVoiceEnvironmentIdByOrigin,
+} from "./threadVoiceHandoffReconciler";
+import {
   RealtimeControllerHandoff,
   RealtimeVoiceController,
   RealtimeServerCleanupCoordinator,
@@ -135,12 +139,14 @@ interface MasterVoiceContextValue {
     | (T3VoiceThreadVoiceHandoffEvent & {
         readonly environmentId: EnvironmentId;
         readonly threadId: ThreadId;
+        readonly acceptedAtEpochMillis: number;
       })
     | null;
   readonly settleThreadVoiceHandoff: (
     actionId: string,
     outcome: "adopted" | "failed",
   ) => Promise<void>;
+  readonly beginThreadVoiceHandoffAdoption: (actionId: string) => (() => void) | null;
   readonly nativeThreadCommand:
     | (T3VoiceCommandEvent & {
         readonly environmentId: EnvironmentId;
@@ -259,8 +265,12 @@ export function MasterVoiceProvider(props: {
   const pendingClientActionsRef = useRef(
     new Map<string, Extract<VoiceSessionEvent, { readonly type: "client-action" }>>(),
   );
-  const acceptedThreadVoiceHandoffIdRef = useRef<string | null>(null);
   const settledThreadVoiceHandoffIdRef = useRef<string | null>(null);
+  const threadVoiceHandoffRef = useRef<MasterVoiceContextValue["threadVoiceHandoff"]>(null);
+  const threadVoiceHandoffSettlementsRef = useRef(
+    new Map<string, { outcome: "adopted" | "failed"; promise: Promise<void> }>(),
+  );
+  const adoptingThreadVoiceHandoffIdsRef = useRef(new Set<string>());
   const traditionalAudioInterruptionsRef = useRef(
     new Set<() => void | (() => void) | Promise<void | (() => void)>>(),
   );
@@ -342,13 +352,10 @@ export function MasterVoiceProvider(props: {
   const nativeOwnerEnvironmentId =
     nativeRealtimeOwner.environmentOrigin === null
       ? null
-      : ((Object.entries(savedConnectionsById).find(([, connection]) => {
-          try {
-            return new URL(connection.httpBaseUrl).origin === nativeRealtimeOwner.environmentOrigin;
-          } catch {
-            return false;
-          }
-        })?.[0] as EnvironmentId | undefined) ?? null);
+      : resolveVoiceEnvironmentIdByOrigin(
+          Object.values(savedConnectionsById),
+          nativeRealtimeOwner.environmentOrigin,
+        );
   const nativeOwnerOriginUnavailable = shouldRetireUnresolvableNativeVoiceOwner({
     nativeOwnerChecked: nativeRealtimeOwner.checked,
     catalogLoading: isLoadingSavedConnection,
@@ -515,64 +522,172 @@ export function MasterVoiceProvider(props: {
     );
   }, [native]);
 
+  const settleNativeThreadVoiceHandoff = useCallback(
+    (actionId: string, outcome: "adopted" | "failed"): Promise<void> => {
+      if (native === null) {
+        return Promise.reject(new Error("The native voice runtime is unavailable"));
+      }
+      const existing = threadVoiceHandoffSettlementsRef.current.get(actionId);
+      if (existing !== undefined) {
+        if (existing.outcome === outcome) return existing.promise;
+        return Promise.reject(
+          new Error(`Thread voice handoff ${actionId} is already settling as ${existing.outcome}`),
+        );
+      }
+
+      const operation = native
+        .acknowledgeThreadVoiceHandoffAsync({ actionId, outcome })
+        .then(() => {
+          settledThreadVoiceHandoffIdRef.current = actionId;
+          if (threadVoiceHandoffRef.current?.actionId === actionId) {
+            threadVoiceHandoffRef.current = null;
+          }
+          setThreadVoiceHandoff((current) => (current?.actionId === actionId ? null : current));
+        });
+      const tracked = operation.finally(() => {
+        if (threadVoiceHandoffSettlementsRef.current.get(actionId)?.promise === tracked) {
+          threadVoiceHandoffSettlementsRef.current.delete(actionId);
+        }
+      });
+      threadVoiceHandoffSettlementsRef.current.set(actionId, { outcome, promise: tracked });
+      return tracked;
+    },
+    [native],
+  );
+
+  const beginThreadVoiceHandoffAdoption = useCallback((actionId: string) => {
+    if (
+      adoptingThreadVoiceHandoffIdsRef.current.has(actionId) ||
+      threadVoiceHandoffSettlementsRef.current.has(actionId)
+    ) {
+      return null;
+    }
+    adoptingThreadVoiceHandoffIdsRef.current.add(actionId);
+    return () => adoptingThreadVoiceHandoffIdsRef.current.delete(actionId);
+  }, []);
+
   useEffect(() => {
-    if (native === null || prepared === null || controllerEnvironmentId === null) return;
+    if (native === null) return;
     let disposed = false;
-    const accept = (event: T3VoiceThreadVoiceHandoffEvent) => {
+    let pendingQueryInFlight = false;
+    let pendingQueryRequested = false;
+    let previousRecordingState: string | null = null;
+    const candidates = Object.values(savedConnectionsById);
+    const applyPending = (pending: T3VoiceThreadVoiceHandoffEvent | null) => {
       if (disposed) return;
-      if (event.environmentOrigin !== new URL(prepared.httpBaseUrl).origin) return;
-      if (
-        acceptedThreadVoiceHandoffIdRef.current === event.actionId ||
-        settledThreadVoiceHandoffIdRef.current === event.actionId
-      ) {
+      if (pending === null) {
+        const current = threadVoiceHandoffRef.current;
+        if (
+          current !== null &&
+          !threadVoiceHandoffSettlementsRef.current.has(current.actionId) &&
+          !adoptingThreadVoiceHandoffIdsRef.current.has(current.actionId)
+        ) {
+          threadVoiceHandoffRef.current = null;
+          setThreadVoiceHandoff((value) => (value?.actionId === current.actionId ? null : value));
+        }
         return;
       }
-      acceptedThreadVoiceHandoffIdRef.current = event.actionId;
-      setThreadVoiceHandoff({
-        ...event,
-        environmentId: controllerEnvironmentId,
-        threadId: ThreadId.make(event.threadId),
+      if (threadVoiceHandoffSettlementsRef.current.has(pending.actionId)) return;
+      const decision = reconcileThreadVoiceHandoff({
+        pending,
+        candidates,
+        catalogReady: !isLoadingSavedConnection,
+        settledActionId: settledThreadVoiceHandoffIdRef.current,
+        currentActionId: threadVoiceHandoffRef.current?.actionId ?? null,
       });
+      if (decision.type === "settle-failed") {
+        void settleNativeThreadVoiceHandoff(decision.actionId, "failed").catch(() => undefined);
+        return;
+      }
+      if (decision.type !== "accept") return;
+      const accepted = {
+        ...decision.handoff,
+        environmentId: decision.environmentId,
+        threadId: ThreadId.make(decision.handoff.threadId),
+        acceptedAtEpochMillis: Date.now(),
+      };
+      threadVoiceHandoffRef.current = accepted;
+      setThreadVoiceHandoff(accepted);
+      void native
+        .recordThreadVoiceHandoffClientStageAsync({ stage: "accepted" })
+        .catch(() => undefined);
       setBrowserVisible(false);
       setTranscriptVisible(false);
     };
-    const subscription = native.addListener("threadVoiceHandoff", accept);
-    const loadPending = () =>
-      native
+    const loadPending = () => {
+      if (disposed) return;
+      if (pendingQueryInFlight) {
+        pendingQueryRequested = true;
+        return;
+      }
+      pendingQueryInFlight = true;
+      void native
         .getPendingThreadVoiceHandoffAsync()
-        .then((event) => {
-          if (!disposed && event !== null) accept(event);
-        })
-        .catch(() => undefined);
-    void loadPending();
+        .then(applyPending)
+        .catch(() => undefined)
+        .finally(() => {
+          pendingQueryInFlight = false;
+          if (!disposed && pendingQueryRequested) {
+            pendingQueryRequested = false;
+            loadPending();
+          }
+        });
+    };
+    const subscription = native.addListener("threadVoiceHandoff", loadPending);
+    const stateSubscription = native.addListener("stateChanged", (state) => {
+      const recordingState = `${state.phase}:${state.activeRecordingId ?? ""}`;
+      if (recordingState === previousRecordingState) return;
+      previousRecordingState = recordingState;
+      loadPending();
+    });
+    loadPending();
     const appStateSubscription = AppState.addEventListener("change", (state) => {
-      if (state === "active") void loadPending();
+      if (state === "active") loadPending();
     });
     return () => {
       disposed = true;
       subscription.remove();
+      stateSubscription.remove();
       appStateSubscription.remove();
     };
-  }, [controllerEnvironmentId, native, prepared]);
+  }, [isLoadingSavedConnection, native, savedConnectionsById, settleNativeThreadVoiceHandoff]);
+
+  threadVoiceHandoffRef.current = threadVoiceHandoff;
 
   useEffect(() => {
     if (threadVoiceHandoff === null) return;
-    if (
-      props.focus?.environmentId === threadVoiceHandoff.environmentId &&
-      props.focus.projectId === threadVoiceHandoff.projectId &&
-      props.focus.threadId === threadVoiceHandoff.threadId
-    ) {
-      return;
-    }
 
     let retry: ReturnType<typeof setTimeout> | null = null;
     let disposed = false;
+    void native
+      ?.recordThreadVoiceHandoffClientStageAsync({ stage: "navigation-requested" })
+      .catch(() => undefined);
     const navigate = () => {
       if (disposed) return;
-      navigation.navigate("Thread", {
-        environmentId: String(threadVoiceHandoff.environmentId),
-        threadId: String(threadVoiceHandoff.threadId),
-      });
+      const targetFocused =
+        props.focus?.environmentId === threadVoiceHandoff.environmentId &&
+        props.focus.projectId === threadVoiceHandoff.projectId &&
+        props.focus.threadId === threadVoiceHandoff.threadId;
+      const clientDeadline = Math.max(
+        threadVoiceHandoff.acceptedAtEpochMillis + 10_000,
+        threadVoiceHandoff.expiresAtEpochMillis + 1_000,
+      );
+      if (!targetFocused && Date.now() >= clientDeadline) {
+        if (adoptingThreadVoiceHandoffIdsRef.current.has(threadVoiceHandoff.actionId)) {
+          retry = setTimeout(navigate, 300);
+          return;
+        }
+        void settleNativeThreadVoiceHandoff(threadVoiceHandoff.actionId, "failed").catch(() => {
+          if (!disposed) retry = setTimeout(navigate, 1_000);
+        });
+        return;
+      }
+      if (!targetFocused) {
+        navigation.navigate("Thread", {
+          environmentId: String(threadVoiceHandoff.environmentId),
+          threadId: String(threadVoiceHandoff.threadId),
+        });
+      }
       retry = setTimeout(navigate, 300);
     };
     navigate();
@@ -585,6 +700,7 @@ export function MasterVoiceProvider(props: {
     props.focus?.environmentId,
     props.focus?.projectId,
     props.focus?.threadId,
+    settleNativeThreadVoiceHandoff,
     threadVoiceHandoff,
   ]);
 
@@ -1677,21 +1793,17 @@ export function MasterVoiceProvider(props: {
       stop,
       registerTraditionalAudioInterruption,
       threadVoiceHandoff,
+      beginThreadVoiceHandoffAdoption,
       nativeThreadCommand,
       completeNativeThreadCommand,
       settleThreadVoiceHandoff: async (actionId, outcome) => {
-        if (native === null) throw new Error("The native voice runtime is unavailable");
-        await native.acknowledgeThreadVoiceHandoffAsync({ actionId, outcome });
-        settledThreadVoiceHandoffIdRef.current = actionId;
-        setThreadVoiceHandoff((current) => (current?.actionId === actionId ? null : current));
-        if (acceptedThreadVoiceHandoffIdRef.current === actionId) {
-          acceptedThreadVoiceHandoffIdRef.current = null;
-        }
+        await settleNativeThreadVoiceHandoff(actionId, outcome);
       },
     }),
     [
+      beginThreadVoiceHandoffAdoption,
       completeNativeThreadCommand,
-      native,
+      settleNativeThreadVoiceHandoff,
       nativeThreadCommand,
       registerTraditionalAudioInterruption,
       snapshot.phase,
