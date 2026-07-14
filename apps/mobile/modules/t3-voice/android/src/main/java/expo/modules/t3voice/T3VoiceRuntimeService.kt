@@ -38,6 +38,13 @@ internal class T3VoiceForegroundReleaseCoordinator(
     check(isIdle()) { "Cannot release foreground ownership while voice is active." }
     releaseForeground()
   }
+
+  fun releaseIfIdleWhileLocked(): Boolean {
+    check(Thread.holdsLock(lock)) { "Foreground release must hold the operation lock." }
+    if (!isIdle()) return false
+    releaseForeground()
+    return true
+  }
 }
 
 internal object T3VoiceRealtimeControlStartPolicy {
@@ -2522,7 +2529,7 @@ class T3VoiceRuntimeService : Service() {
     T3VoiceRuntimeGrantStore(applicationContext).clear(deleteKey = true)
     controllerCommands.invalidateReadiness()
     applyBackgroundEventLocked(T3VoiceBackgroundEvent.Stop)
-    if (recordingEndedCue == null && realtimeEndedCue == null) stopRuntimeForegroundLocked()
+    reconcileForegroundAfterVoiceStopLocked()
   }
 
   private fun stopBackgroundThreadLocked(cancelServer: Boolean) {
@@ -3182,7 +3189,7 @@ class T3VoiceRuntimeService : Service() {
       message = "Background voice authorization must be refreshed.",
       recoverable = true,
     ))
-    if (recordingEndedCue == null && realtimeEndedCue == null) stopRuntimeForegroundLocked()
+    reconcileForegroundAfterVoiceStopLocked()
   }
 
   private fun scheduleBackgroundRealtimeCleanupRetryLocked(
@@ -3403,7 +3410,14 @@ class T3VoiceRuntimeService : Service() {
       val stopped = runCatching { realtime.stop(it) }.getOrDefault(false)
       if (!stopped) T3VoiceStateStore.releaseRealtimeClaim(it)
     }
-    if (recordingEndedCue == null && realtimeEndedCue == null) stopRuntimeForegroundLocked()
+    reconcileForegroundAfterVoiceStopLocked()
+  }
+
+  private fun reconcileForegroundAfterVoiceStopLocked() {
+    val cuePending = recordingEndedCue != null || realtimeEndedCue != null
+    if (cuePending || !foregroundReleaseCoordinator.releaseIfIdleWhileLocked()) {
+      updateNativeControlSurfacesLocked()
+    }
   }
 
   private fun stopTraditionalAudioLocked(

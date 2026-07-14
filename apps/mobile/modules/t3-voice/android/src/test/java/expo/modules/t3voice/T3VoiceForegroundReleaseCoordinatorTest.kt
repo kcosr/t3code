@@ -51,4 +51,34 @@ class T3VoiceForegroundReleaseCoordinatorTest {
 
     synchronized(coordinator.lock) { coordinator.releaseWhileLocked() }
   }
+
+  @Test
+  fun conditionalForegroundReleaseKeepsAnActiveOwner() {
+    val foregroundReleased = AtomicBoolean(false)
+    val coordinator =
+      T3VoiceForegroundReleaseCoordinator(
+        isIdle = { false },
+        releaseForeground = { foregroundReleased.set(true) },
+      )
+
+    val released = synchronized(coordinator.lock) { coordinator.releaseIfIdleWhileLocked() }
+
+    assertFalse(released)
+    assertFalse(foregroundReleased.get())
+  }
+
+  @Test
+  fun conditionalForegroundReleaseReleasesAnIdleRuntime() {
+    val foregroundReleased = AtomicBoolean(false)
+    val coordinator =
+      T3VoiceForegroundReleaseCoordinator(
+        isIdle = { true },
+        releaseForeground = { foregroundReleased.set(true) },
+      )
+
+    val released = synchronized(coordinator.lock) { coordinator.releaseIfIdleWhileLocked() }
+
+    assertTrue(released)
+    assertTrue(foregroundReleased.get())
+  }
 }
