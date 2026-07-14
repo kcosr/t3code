@@ -167,6 +167,102 @@ internal class T3VoiceCanonicalReadinessPolicyTest {
     assertEquals(8L, persistent.config.generation)
   }
 
+  @Test
+  fun `prepared attached reservation remains an exact idle ownership fence after restart`() {
+    val readiness = T3VoiceReadinessConfig(
+      enabled = false,
+      mode = T3VoiceReadinessMode.THREAD,
+      targetId = "project-1/thread-1",
+      generation = 7,
+    )
+    val prepared = T3VoicePreparedReadiness(
+      readiness,
+      "runtime-1",
+      "https://environment.example.test",
+      T3VoiceRuntimeGrantOperation.THREAD_TURN_START,
+      "a".repeat(64),
+    )
+
+    assertEquals(
+      T3VoiceRuntimeOwnershipFence(
+        "runtime-1",
+        6,
+        "https://environment.example.test",
+      ),
+      T3VoiceRuntimeOwnershipPolicy.canonicalFence(
+        readiness,
+        activeReadiness = null,
+        persistedAuthority = null,
+        preparedAttached = prepared,
+      ),
+    )
+    assertTrue(
+      T3VoiceConditionalDisablePolicy.canDisable(
+        expectedRuntimeId = "runtime-1",
+        expectedGeneration = 6,
+        canonicalGeneration = 6,
+        authorityIdentities = listOf("runtime-1" to 6),
+        nativeVoiceActive = false,
+      ),
+    )
+  }
+
+  @Test
+  fun `opposing preparation requests reject before either reservation is mutated`() {
+    val persistentState = mutableListOf("persistent-reservation")
+    val persistentBefore = persistentState.toList()
+    assertTrue(runCatching {
+      T3VoicePreparationExclusionPolicy.requireCompatible(
+        readinessEnabled = false,
+        persistentPrepared = true,
+        attachedPrepared = false,
+      )
+      persistentState.clear()
+      persistentState += "attached-reservation"
+    }.isFailure)
+    assertEquals(persistentBefore, persistentState)
+
+    val attachedState = mutableListOf("attached-reservation")
+    val attachedBefore = attachedState.toList()
+    assertTrue(runCatching {
+      T3VoicePreparationExclusionPolicy.requireCompatible(
+        readinessEnabled = true,
+        persistentPrepared = false,
+        attachedPrepared = true,
+      )
+      attachedState.clear()
+      attachedState += "persistent-reservation"
+    }.isFailure)
+    assertEquals(attachedBefore, attachedState)
+  }
+
+  @Test
+  fun `prepared persistent reservation uses expected-current generation for cleanup`() {
+    val readiness = T3VoiceReadinessConfig(enabled = false, generation = 7)
+    val prepared = T3VoicePreparedReadiness(
+      readiness.copy(enabled = true),
+      "runtime-1",
+      "https://environment.example.test",
+      T3VoiceRuntimeGrantOperation.REALTIME_START,
+      "a".repeat(64),
+    )
+    val fence = requireNotNull(T3VoiceRuntimeOwnershipPolicy.canonicalFence(
+      readiness,
+      activeReadiness = null,
+      persistedAuthority = null,
+      preparedPersistent = prepared,
+    ))
+
+    assertEquals(6, fence.generation)
+    assertTrue(T3VoiceConditionalDisablePolicy.canDisable(
+      fence.runtimeId,
+      fence.generation,
+      canonicalGeneration = 6,
+      authorityIdentities = listOf("runtime-1" to 6),
+      nativeVoiceActive = false,
+    ))
+  }
+
   private fun authority(
     generation: Long,
     readinessEnabled: Boolean,

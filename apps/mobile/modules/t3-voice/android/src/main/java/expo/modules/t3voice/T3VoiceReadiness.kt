@@ -459,6 +459,8 @@ internal object T3VoiceRuntimeOwnershipPolicy {
     readiness: T3VoiceReadinessConfig,
     activeReadiness: T3VoicePreparedReadiness?,
     persistedAuthority: VoiceRuntimePersistedAuthority?,
+    preparedPersistent: T3VoicePreparedReadiness? = null,
+    preparedAttached: T3VoicePreparedReadiness? = null,
   ): T3VoiceRuntimeOwnershipFence? {
     if (
       activeReadiness != null &&
@@ -481,7 +483,49 @@ internal object T3VoiceRuntimeOwnershipPolicy {
         persistedAuthority.environmentOrigin,
       )
     }
+    if (
+      preparedPersistent != null &&
+        preparedPersistent.config.enabled &&
+        preparedPersistent.config.generation == readiness.generation
+    ) {
+      require(preparedPersistent.config.generation > 0)
+      return T3VoiceRuntimeOwnershipFence(
+        preparedPersistent.runtimeId,
+        preparedPersistent.config.generation - 1,
+        preparedPersistent.environmentOrigin,
+      )
+    }
+    if (
+      preparedAttached != null &&
+        !preparedAttached.config.enabled &&
+        preparedAttached.config.generation == readiness.generation
+    ) {
+      require(preparedAttached.config.generation > 0)
+      return T3VoiceRuntimeOwnershipFence(
+        preparedAttached.runtimeId,
+        preparedAttached.config.generation - 1,
+        preparedAttached.environmentOrigin,
+      )
+    }
     return null
+  }
+}
+
+internal object T3VoicePreparationExclusionPolicy {
+  fun requireCompatible(
+    readinessEnabled: Boolean,
+    persistentPrepared: Boolean,
+    attachedPrepared: Boolean,
+  ) {
+    if (readinessEnabled) {
+      require(!attachedPrepared) {
+        "Attached authority must be revoked before persistent readiness is prepared."
+      }
+    } else {
+      require(!persistentPrepared) {
+        "Persistent readiness authority must be revoked before attached authority is prepared."
+      }
+    }
   }
 }
 

@@ -157,6 +157,57 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
   }
 
   @Test
+  fun `exact legacy finalization fixture recovers and rewrites canonical shape`() {
+    val storage = MemoryStore().also {
+      it.values["canonical_realtime_finalization_v1"] = LEGACY_FINALIZATION_V1_FIXTURE
+    }
+    val cipher = AuthenticatedTestCipher()
+    val expected = finalization(checkpoint()).copy(
+      sourceAuthorityExpiresAtEpochMillis = 8_000,
+    )
+
+    val recovered = VoiceRuntimeDurableRealtimeCheckpointRepository(storage, cipher)
+      .loadFinalization()
+
+    assertEquals(expected, recovered)
+    assertEquals(1, storage.putCount)
+    val rewritten = storage.values.getValue("canonical_realtime_finalization_v1")
+    assertFalse(rewritten == LEGACY_FINALIZATION_V1_FIXTURE)
+    assertEquals(
+      8_000L,
+      JSONObject(JSONObject(rewritten).getString("metadata"))
+        .getLong("sourceAuthorityExpiresAtEpochMillis"),
+    )
+    assertFalse(CONTROL_TOKEN in rewritten || TRANSITION_TOKEN in rewritten)
+
+    assertEquals(
+      expected,
+      VoiceRuntimeDurableRealtimeCheckpointRepository(storage, cipher).loadFinalization(),
+    )
+    assertEquals(1, storage.putCount)
+  }
+
+  @Test
+  fun `tampered legacy finalization fixture fails closed without rewrite`() {
+    val envelope = JSONObject(LEGACY_FINALIZATION_V1_FIXTURE)
+    val tampered = envelope.put(
+      "metadata",
+      JSONObject(envelope.getString("metadata")).put("reason", "tampered").toString(),
+    ).toString()
+    val storage = MemoryStore().also {
+      it.values["canonical_realtime_finalization_v1"] = tampered
+    }
+
+    assertCorrupt {
+      VoiceRuntimeDurableRealtimeCheckpointRepository(storage, AuthenticatedTestCipher())
+        .loadFinalization()
+    }
+
+    assertEquals(tampered, storage.values.getValue("canonical_realtime_finalization_v1"))
+    assertEquals(0, storage.putCount)
+  }
+
+  @Test
   fun `full terminal retention preserves every unacknowledged summary`() {
     val storage = MemoryStore()
     val repository =
@@ -416,5 +467,6 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
   private companion object {
     const val CONTROL_TOKEN = "control-secret-token"
     const val TRANSITION_TOKEN = "handoff-secret-token"
+    const val LEGACY_FINALIZATION_V1_FIXTURE = """{"version":"t3-voice-runtime-realtime-checkpoint-v1","metadata":"{\"version\":\"t3-voice-runtime-realtime-checkpoint-v1\",\"fence\":{\"runtimeId\":\"runtime-1\",\"runtimeInstanceId\":\"process-1\",\"generation\":7,\"modeSessionId\":\"mode-realtime-1\"},\"sourceTarget\":{\"environmentId\":\"environment-1\",\"conversationId\":\"conversation-1\"},\"sourceEnvironmentOrigin\":\"https://environment.example.test\",\"rootCommandId\":\"start-realtime-1\",\"session\":{\"state\":{\"sessionId\":\"session-1\",\"conversationId\":\"conversation-1\",\"phase\":\"signaling\",\"leaseGeneration\":3,\"sequence\":10},\"signalingPath\":\"/api/voice/runtime/realtime-sessions/session-1/webrtc-offer\",\"expiresAtEpochMillis\":8000,\"controlGrant\":{\"expiresAtEpochMillis\":8000,\"heartbeatIntervalSeconds\":15,\"failureGraceSeconds\":45}},\"closeOperationId\":\"start-realtime-1.close.thread-handoff\",\"outcome\":\"COMPLETED\",\"reason\":\"thread-handoff\",\"lastConnectedAtEpochMillis\":1500,\"handoffExchange\":{\"actionId\":\"action-handoff\",\"actionSequence\":10,\"projectId\":\"project-1\",\"threadId\":\"thread-1\",\"autoRearm\":true,\"transitionGrant\":{\"expiresAtEpochMillis\":8500,\"generation\":8,\"modeSessionId\":\"mode-thread-1\",\"target\":{\"environmentId\":\"environment-1\",\"projectId\":\"project-1\",\"threadId\":\"thread-1\",\"speechPreset\":\"default\",\"autoRearm\":true,\"endpointPolicy\":{\"endSilenceMs\":2200,\"noSpeechTimeoutMs\":60000,\"maximumUtteranceMs\":600000},\"speechEnabled\":true,\"rearmGuardMs\":500}},\"replayed\":false},\"stage\":\"HANDOFF_COMMIT_PENDING\",\"attemptCount\":0,\"lastFailureCode\":null,\"lastFailureRetryable\":true,\"terminalPublication\":\"NONE\"}","iv":"AAAAAAAAAAAAAAAA","ciphertext":"1QvBxCbNugXCRUB7apt0qD1zRTMKIkaTXbL62A/TBhauKaKrSLnIaq4CMhoE7yDHVhYrETAAJfwzxoi3Y/51c7Z5pLALudVupytiV0jzFcZZHCNVXlAn/S7bjrFgvVJ5vm6v5hzv0mSsIS8dDLYHzV4BIEcnVin4ONzYpQ=="}"""
   }
 }

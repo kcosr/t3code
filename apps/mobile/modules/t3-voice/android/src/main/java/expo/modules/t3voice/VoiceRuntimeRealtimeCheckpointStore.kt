@@ -72,7 +72,13 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
   override fun loadFinalization(): VoiceRuntimeRealtimeFinalization? {
     val raw = storage.getString(KEY_FINALIZATION) ?: return null
     return try {
-      decodeFinalization(raw)
+      val decoded = decodeFinalization(raw)
+      if (decoded.requiresCanonicalRewrite) {
+        check(storage.put(mapOf(KEY_FINALIZATION to encodeFinalization(decoded.finalization)))) {
+          "Could not migrate legacy Realtime finalization."
+        }
+      }
+      decoded.finalization
     } catch (cause: Throwable) {
       throw VoiceRuntimeDurableStateCorruptionException(
         "Realtime voice finalization is unreadable.",
@@ -229,7 +235,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       .toString()
   }
 
-  private fun decodeFinalization(raw: String): VoiceRuntimeRealtimeFinalization {
+  private fun decodeFinalization(raw: String): DecodedFinalization {
     val envelope = JSONObject(raw).requireExactFields(ENVELOPE_FIELDS)
     require(envelope.getString("version") == VERSION)
     val metadata = envelope.getString("metadata")
@@ -241,10 +247,16 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       cipher.decrypt(encrypted, metadata.toByteArray(StandardCharsets.UTF_8))
         .toString(StandardCharsets.UTF_8),
     ).requireExactFields(FINALIZATION_SECRET_FIELDS)
-    val decoded = decodeFinalizationMetadata(metadata)
+    val metadataFields = JSONObject(metadata).keys().asSequence().toSet()
+    val requiresCanonicalRewrite = metadataFields == LEGACY_FINALIZATION_FIELDS_V1
+    val decoded = when (metadataFields) {
+      FINALIZATION_FIELDS -> decodeFinalizationMetadata(metadata)
+      LEGACY_FINALIZATION_FIELDS_V1 -> decodeLegacyFinalizationMetadataV1(metadata)
+      else -> throw IllegalArgumentException("Unsupported Realtime finalization schema.")
+    }
     val transitionToken = secrets.nullableString("handoffTransitionToken")
     require((decoded.handoffExchange != null) == (transitionToken != null))
-    return decoded.copy(
+    val finalization = decoded.copy(
       session = decoded.session.copy(
         controlGrant = decoded.session.controlGrant.copy(
           token = secrets.getString("controlGrantToken"),
@@ -256,6 +268,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
         )
       },
     ).also(::validateFinalization)
+    return DecodedFinalization(finalization, requiresCanonicalRewrite)
   }
 
   private fun encodeFinalizationMetadata(
@@ -295,6 +308,34 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       sourceAuthorityExpiresAtEpochMillis = value.exactLong("sourceAuthorityExpiresAtEpochMillis"),
       rootCommandId = value.getString("rootCommandId"),
       session = decodeSession(value.getJSONObject("session")),
+      closeOperationId = value.getString("closeOperationId"),
+      outcome = VoiceRuntimeRealtimeTerminalOutcome.valueOf(value.getString("outcome")),
+      reason = value.getString("reason"),
+      lastConnectedAtEpochMillis = value.nullableLong("lastConnectedAtEpochMillis"),
+      handoffExchange = value.nullableObject("handoffExchange")?.let(::decodeHandoffExchange),
+      stage = VoiceRuntimeRealtimeFinalizationStage.valueOf(value.getString("stage")),
+      attemptCount = value.exactInt("attemptCount"),
+      lastFailureCode = value.nullableString("lastFailureCode"),
+      lastFailureRetryable = value.exactBoolean("lastFailureRetryable"),
+      terminalPublication = VoiceRuntimeRealtimeTerminalPublication.valueOf(
+        value.getString("terminalPublication"),
+      ),
+    )
+  }
+
+  private fun decodeLegacyFinalizationMetadataV1(raw: String): VoiceRuntimeRealtimeFinalization {
+    val value = JSONObject(raw).requireExactFields(LEGACY_FINALIZATION_FIELDS_V1)
+    require(value.getString("version") == VERSION)
+    val session = decodeSession(value.getJSONObject("session"))
+    return VoiceRuntimeRealtimeFinalization(
+      fence = decodeFence(value.getJSONObject("fence")),
+      sourceTarget = decodeRealtimeTarget(value.getJSONObject("sourceTarget")),
+      sourceEnvironmentOrigin = value.getString("sourceEnvironmentOrigin"),
+      // V1 did not retain the broader authority expiry; use the authenticated,
+      // least-privilege source-close credential boundary for the one-time cutover.
+      sourceAuthorityExpiresAtEpochMillis = session.controlGrant.expiresAtEpochMillis,
+      rootCommandId = value.getString("rootCommandId"),
+      session = session,
       closeOperationId = value.getString("closeOperationId"),
       outcome = VoiceRuntimeRealtimeTerminalOutcome.valueOf(value.getString("outcome")),
       reason = value.getString("reason"),
@@ -880,6 +921,8 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       "outcome", "reason", "lastConnectedAtEpochMillis", "handoffExchange", "stage",
       "attemptCount", "lastFailureCode", "lastFailureRetryable", "terminalPublication",
     )
+    val LEGACY_FINALIZATION_FIELDS_V1 = FINALIZATION_FIELDS -
+      "sourceAuthorityExpiresAtEpochMillis"
     val FINALIZATION_SESSION_FIELDS = setOf(
       "state", "signalingPath", "expiresAtEpochMillis", "controlGrant",
     )
@@ -922,4 +965,9 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       "terminalAtEpochMillis", "serverCleanupPending", "expiresAtEpochMillis",
     )
   }
+
+  private data class DecodedFinalization(
+    val finalization: VoiceRuntimeRealtimeFinalization,
+    val requiresCanonicalRewrite: Boolean,
+  )
 }

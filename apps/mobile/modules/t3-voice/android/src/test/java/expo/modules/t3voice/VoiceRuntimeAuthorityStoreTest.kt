@@ -34,6 +34,7 @@ internal class VoiceRuntimeAuthorityStoreTest {
     assertEquals(legacy.generation, controller.snapshot().identity.generation)
 
     val replacement = legacy.copy(readinessEnabled = false)
+    store.prepareAttachedAuthority(fence(replacement), attachedReadiness())
     store.activate(replacement) {}
     assertNull(store.retiredFence())
     assertEquals(
@@ -122,6 +123,99 @@ internal class VoiceRuntimeAuthorityStoreTest {
   }
 
   @Test
+  fun `attached reservation survives process death after server grant issuance`() {
+    val storage = MemoryRuntimeStorage()
+    val initial = VoiceRuntimeAuthorityStore(storage, AuthorityTestCipher(), now = { 1_000 })
+    val expected = VoiceRuntimePreparedAttachedAuthority(fence(), attachedReadiness())
+
+    assertEquals(
+      expected,
+      initial.prepareAttachedAuthority(expected.fence, expected.readiness),
+    )
+
+    val restarted = VoiceRuntimeAuthorityStore(storage, AuthorityTestCipher(), now = { 1_000 })
+    assertEquals(expected, restarted.inspectPreparedAttachedAuthority())
+    val issuedGrant = authority().copy(readinessEnabled = false)
+    restarted.activate(issuedGrant) {}
+
+    assertNull(restarted.inspectPreparedAttachedAuthority())
+    assertEquals(
+      issuedGrant,
+      (restarted.load() as VoiceRuntimeAuthorityLoadResult.Available).authority,
+    )
+  }
+
+  @Test
+  fun `failed attached activation restores the exact durable reservation`() {
+    val storage = MemoryRuntimeStorage()
+    val expected = VoiceRuntimePreparedAttachedAuthority(fence(), attachedReadiness())
+    VoiceRuntimeAuthorityStore(storage, AuthorityTestCipher(), now = { 1_000 })
+      .prepareAttachedAuthority(expected.fence, expected.readiness)
+    val restarted = VoiceRuntimeAuthorityStore(storage, AuthorityTestCipher(), now = { 1_000 })
+
+    runCatching {
+      restarted.activate(authority().copy(readinessEnabled = false)) {
+        error("controller activation interrupted")
+      }
+    }
+
+    assertEquals(VoiceRuntimeAuthorityLoadResult.Missing, restarted.load())
+    assertEquals(expected, restarted.inspectPreparedAttachedAuthority())
+    assertTrue(runCatching {
+      restarted.prepareAttachedAuthority(
+        expected.fence.copy(provisioningOperationId = "different-reservation"),
+        expected.readiness,
+      )
+    }.isFailure)
+  }
+
+  @Test
+  fun `restart requires revocation before replacing an attached reservation`() {
+    val storage = MemoryRuntimeStorage()
+    val original = VoiceRuntimePreparedAttachedAuthority(fence(), attachedReadiness())
+    VoiceRuntimeAuthorityStore(storage, AuthorityTestCipher(), now = { 1_000 })
+      .prepareAttachedAuthority(original.fence, original.readiness)
+    val restarted = VoiceRuntimeAuthorityStore(storage, AuthorityTestCipher(), now = { 1_000 })
+    val replacementFence = original.fence.copy(
+      provisioningOperationId = "replacement-after-revocation",
+    )
+
+    assertTrue(runCatching {
+      restarted.prepareAttachedAuthority(replacementFence, original.readiness)
+    }.isFailure)
+
+    // Service cleanup records the old runtime id for server revocation before clearing this store.
+    restarted.clear()
+    assertEquals(
+      VoiceRuntimePreparedAttachedAuthority(replacementFence, original.readiness),
+      restarted.prepareAttachedAuthority(replacementFence, original.readiness),
+    )
+  }
+
+  @Test
+  fun `opposing preparation types reject without mutating the first reservation`() {
+    val persistentStorage = MemoryRuntimeStorage()
+    val persistentStore = refreshStore(persistentStorage)
+    val persistent = requireNotNull(persistentStore.prepareRefreshCredential(fence(), true))
+    val persistentBefore = persistentStorage.values.toMap()
+    assertTrue(runCatching {
+      persistentStore.prepareAttachedAuthority(fence(), attachedReadiness())
+    }.isFailure)
+    assertEquals(persistentBefore, persistentStorage.values)
+    assertEquals(persistent, persistentStore.inspectPreparedRefreshCredential())
+
+    val attachedStorage = MemoryRuntimeStorage()
+    val attachedStore = refreshStore(attachedStorage)
+    val attached = attachedStore.prepareAttachedAuthority(fence(), attachedReadiness())
+    val attachedBefore = attachedStorage.values.toMap()
+    assertTrue(runCatching {
+      attachedStore.prepareRefreshCredential(fence(), true)
+    }.isFailure)
+    assertEquals(attachedBefore, attachedStorage.values)
+    assertEquals(attached, attachedStore.inspectPreparedAttachedAuthority())
+  }
+
+  @Test
   fun `failed candidate activation restores exact current authority`() {
     val storage = MemoryRuntimeStorage()
     val cipher = AuthorityTestCipher()
@@ -129,13 +223,13 @@ internal class VoiceRuntimeAuthorityStoreTest {
     val current = authority()
     store.prepareRefreshCredential(fence(), true)
     store.activate(current) {}
-    val previousBytes = storage.values.toMap()
     val candidate = current.copy(
       generation = current.generation + 1,
       provisioningOperationId = "candidate",
-      readinessEnabled = false,
       token = "candidate-secret",
     )
+    store.prepareRefreshCredential(fence(candidate), true)
+    val previousBytes = storage.values.toMap()
 
     runCatching {
       store.activate(candidate) { error("generation CAS rejected") }
@@ -317,8 +411,7 @@ internal class VoiceRuntimeAuthorityStoreTest {
     { "refresh-request-1" },
   )
 
-  private fun fence(): VoiceRuntimeAuthorityFence {
-    val expected = authority()
+  private fun fence(expected: VoiceRuntimePersistedAuthority = authority()): VoiceRuntimeAuthorityFence {
     return VoiceRuntimeAuthorityFence(
       expected.runtimeId,
       expected.generation,
@@ -348,6 +441,17 @@ internal class VoiceRuntimeAuthorityStoreTest {
       5_000,
     )
   }
+
+  private fun attachedReadiness() = T3VoiceReadinessConfig(
+    enabled = false,
+    mode = T3VoiceReadinessMode.THREAD,
+    targetId = "project-1/thread-1",
+    audioRouteId = "system",
+    autoRearm = true,
+    microphonePermissionGranted = true,
+    notificationPermissionGranted = true,
+    generation = 7,
+  )
 
   private fun legacyV2Values(
     authority: VoiceRuntimePersistedAuthority,

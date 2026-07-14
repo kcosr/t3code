@@ -43,6 +43,11 @@ internal data class VoiceRuntimePreparedRefreshCredential(
   val credentialHash: String,
 )
 
+internal data class VoiceRuntimePreparedAttachedAuthority(
+  val fence: VoiceRuntimeAuthorityFence,
+  val readiness: T3VoiceReadinessConfig,
+)
+
 internal data class VoiceRuntimeAuthorityPreparation(
   val runtimeId: String,
   val runtimeInstanceId: String,
@@ -125,6 +130,36 @@ internal class VoiceRuntimeAuthorityStore(
   )
 
   @Synchronized
+  fun prepareAttachedAuthority(
+    fence: VoiceRuntimeAuthorityFence,
+    readiness: T3VoiceReadinessConfig,
+  ): VoiceRuntimePreparedAttachedAuthority {
+    validateFence(fence)
+    validateAttachedReadiness(fence, readiness)
+    require(load() == VoiceRuntimeAuthorityLoadResult.Missing) {
+      "Canonical authority must be disabled before attached preparation."
+    }
+    require(REFRESH_KEYS.all { storage.getString(it) == null }) {
+      "Persistent readiness authority must be revoked before attached authority is prepared."
+    }
+    val expected = VoiceRuntimePreparedAttachedAuthority(fence, readiness)
+    inspectPreparedAttachedAuthority()?.let { prepared ->
+      require(prepared == expected) { "A different attached authority is already prepared." }
+      return prepared
+    }
+    check(storage.put(mapOf(KEY_PREPARED_ATTACHED to attachedPreparationJson(expected)))) {
+      "Could not persist prepared attached authority."
+    }
+    return requireNotNull(inspectPreparedAttachedAuthority()) {
+      "Prepared attached authority could not be verified."
+    }
+  }
+
+  @Synchronized
+  fun inspectPreparedAttachedAuthority(): VoiceRuntimePreparedAttachedAuthority? =
+    storage.getString(KEY_PREPARED_ATTACHED)?.let(::parseAttachedPreparation)
+
+  @Synchronized
   fun prepareRefreshCredential(
     fence: VoiceRuntimeAuthorityFence,
     readinessEnabled: Boolean,
@@ -133,6 +168,9 @@ internal class VoiceRuntimeAuthorityStore(
     if (!readinessEnabled) {
       check(storage.clear(REFRESH_KEYS)) { "Could not clear canonical refresh authority." }
       return null
+    }
+    require(inspectPreparedAttachedAuthority() == null) {
+      "Attached authority must be revoked before persistent readiness is prepared."
     }
     readCredential(PREPARED_PREFIX)?.let { prepared ->
       if (prepared.fence == fence && prepared.requestId == null && prepared.rotationCounter == null) {
@@ -173,11 +211,17 @@ internal class VoiceRuntimeAuthorityStore(
       require(prepared?.fence == fence && prepared.requestId == null) {
         "The canonical refresh credential reservation is stale."
       }
+      require(inspectPreparedAttachedAuthority() == null) {
+        "Persistent readiness cannot consume an attached authority reservation."
+      }
       require(authority.refreshRotationCounter == 0L) {
         "Initial canonical refresh authority has an invalid rotation counter."
       }
     } else {
       require(prepared == null) { "Attached-only authority cannot retain a refresh credential." }
+      require(inspectPreparedAttachedAuthority()?.fence == fence) {
+        "The attached authority reservation is stale."
+      }
     }
     val previous = ALL_KEYS.associateWith(storage::getString)
     val authorityEncrypted = cipher.encrypt(
@@ -194,7 +238,7 @@ internal class VoiceRuntimeAuthorityStore(
     }
     check(storage.put(
       values(authority, authorityEncrypted) + refreshValues + RETIRED_KEYS.associateWith { null } +
-        PREPARED_TRANSITION_KEYS.associateWith { null },
+        PREPARED_TRANSITION_KEYS.associateWith { null } + (KEY_PREPARED_ATTACHED to null),
     )) {
       "Could not atomically activate canonical voice runtime authority."
     }
@@ -552,6 +596,59 @@ internal class VoiceRuntimeAuthorityStore(
     is VoiceRuntimeTarget.Thread -> VoiceRuntimeBridge.canonicalThreadTargetIdentity(target)
   }
 
+  private fun attachedPreparationJson(
+    preparation: VoiceRuntimePreparedAttachedAuthority,
+  ): String = JSONObject()
+    .put("fence", JSONObject(fenceJson(preparation.fence)))
+    .put("readiness", JSONObject()
+      .put("enabled", preparation.readiness.enabled)
+      .put("mode", preparation.readiness.mode.name)
+      .put("targetId", preparation.readiness.targetId ?: JSONObject.NULL)
+      .put("audioRouteId", preparation.readiness.audioRouteId)
+      .put("autoRearm", preparation.readiness.autoRearm)
+      .put("microphonePermissionGranted", preparation.readiness.microphonePermissionGranted)
+      .put("notificationPermissionGranted", preparation.readiness.notificationPermissionGranted)
+      .put("generation", preparation.readiness.generation))
+    .toString()
+
+  private fun parseAttachedPreparation(value: String): VoiceRuntimePreparedAttachedAuthority {
+    val json = JSONObject(value)
+    require(json.keys().asSequence().toSet() == ATTACHED_PREPARATION_FIELDS)
+    val fence = parseFence(json.getJSONObject("fence").toString())
+    val readinessJson = json.getJSONObject("readiness")
+    require(readinessJson.keys().asSequence().toSet() == ATTACHED_READINESS_FIELDS)
+    val readiness = T3VoiceReadinessConfig(
+      enabled = readinessJson.getBoolean("enabled"),
+      mode = T3VoiceReadinessMode.valueOf(readinessJson.getString("mode")),
+      targetId = if (readinessJson.isNull("targetId")) null else readinessJson.getString("targetId"),
+      audioRouteId = readinessJson.getString("audioRouteId"),
+      autoRearm = readinessJson.getBoolean("autoRearm"),
+      microphonePermissionGranted = readinessJson.getBoolean("microphonePermissionGranted"),
+      notificationPermissionGranted = readinessJson.getBoolean("notificationPermissionGranted"),
+      generation = readinessJson.getLong("generation"),
+    )
+    validateAttachedReadiness(fence, readiness)
+    return VoiceRuntimePreparedAttachedAuthority(fence, readiness)
+  }
+
+  private fun validateAttachedReadiness(
+    fence: VoiceRuntimeAuthorityFence,
+    readiness: T3VoiceReadinessConfig,
+  ) {
+    require(!readiness.enabled)
+    require(readiness.generation == fence.generation)
+    when (val target = fence.target) {
+      is VoiceRuntimeTarget.Realtime -> {
+        require(readiness.mode == T3VoiceReadinessMode.REALTIME)
+        require(readiness.targetId == target.conversationId)
+      }
+      is VoiceRuntimeTarget.Thread -> {
+        require(readiness.mode == T3VoiceReadinessMode.THREAD)
+        require(readiness.targetId == "${target.projectId}/${target.threadId}")
+      }
+    }
+  }
+
   private fun validate(authority: VoiceRuntimePersistedAuthority) {
     require(authority.runtimeId.isNotBlank())
     require(authority.generation > 0)
@@ -711,6 +808,7 @@ internal class VoiceRuntimeAuthorityStore(
     const val CANDIDATE_PREFIX = "canonical_refresh_candidate_"
     const val KEY_REFRESH_REJECTED = "canonical_refresh_rejected"
     const val PREPARED_TRANSITION_PREFIX = "canonical_transition_prepared_"
+    const val KEY_PREPARED_ATTACHED = "canonical_attached_prepared"
     const val NONE = "-"
     val KEYS = setOf(
       KEY_VERSION, KEY_RUNTIME_ID, KEY_GENERATION, KEY_PROVISIONING_OPERATION_ID,
@@ -726,7 +824,8 @@ internal class VoiceRuntimeAuthorityStore(
     val REFRESH_KEYS = credentialKeys(PREPARED_PREFIX) + credentialKeys(CURRENT_PREFIX) +
       credentialKeys(CANDIDATE_PREFIX) + KEY_REFRESH_REJECTED
     val PREPARED_TRANSITION_KEYS = KEYS.mapTo(mutableSetOf()) { "$PREPARED_TRANSITION_PREFIX$it" }
-    val ALL_KEYS = KEYS + REFRESH_KEYS + RETIRED_KEYS + PREPARED_TRANSITION_KEYS
+    val ALL_KEYS = KEYS + REFRESH_KEYS + RETIRED_KEYS + PREPARED_TRANSITION_KEYS +
+      KEY_PREPARED_ATTACHED
     val REALTIME_TARGET_FIELDS = setOf("mode", "environmentId", "conversationId")
     val THREAD_TARGET_FIELDS = setOf(
       "mode", "environmentId", "projectId", "threadId", "speechPreset", "autoRearm",
@@ -736,6 +835,11 @@ internal class VoiceRuntimeAuthorityStore(
     val FENCE_FIELDS = setOf(
       "runtimeId", "generation", "provisioningOperationId", "targetDigest", "target", "operation",
       "environmentOrigin",
+    )
+    val ATTACHED_PREPARATION_FIELDS = setOf("fence", "readiness")
+    val ATTACHED_READINESS_FIELDS = setOf(
+      "enabled", "mode", "targetId", "audioRouteId", "autoRearm",
+      "microphonePermissionGranted", "notificationPermissionGranted", "generation",
     )
     val SHA256_PATTERN = Regex("^[0-9a-f]{64}$")
     val CREDENTIAL_PATTERN = Regex("^[A-Za-z0-9_-]{43}$")

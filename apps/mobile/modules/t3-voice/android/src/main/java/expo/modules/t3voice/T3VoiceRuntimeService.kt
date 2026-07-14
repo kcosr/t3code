@@ -381,7 +381,13 @@ class T3VoiceRuntimeService : Service() {
       val metadata = voiceRuntimeAuthorityStore.loadForRefresh()
       val identities = listOfNotNull(
         metadata?.let { it.runtimeId to it.generation },
-        readinessStore.prepared()?.let { it.runtimeId to it.config.generation },
+        voiceRuntimeAuthorityStore.inspectPreparedAttachedAuthority()?.let {
+          it.fence.runtimeId to (it.fence.generation - 1)
+        },
+        canonicalPreparedAuthority?.takeIf { !it.config.enabled }?.let {
+          it.runtimeId to (it.config.generation - 1)
+        },
+        readinessStore.prepared()?.let { it.runtimeId to (it.config.generation - 1) },
         readinessStore.activeAuthority()?.let { it.runtimeId to it.config.generation },
       ).distinct()
       val durableThreadOwnership =
@@ -403,6 +409,7 @@ class T3VoiceRuntimeService : Service() {
     private fun disableRuntimeVoiceReadinessLocked(): T3VoiceDisabledReadiness {
         VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
         val prepared = readinessStore.prepared()
+        val preparedAttached = voiceRuntimeAuthorityStore.inspectPreparedAttachedAuthority()
         val activeAuthority = readinessStore.activeAuthority()
         val persistedAuthority = voiceRuntimeAuthorityStore.loadForRefresh()
         val priorPending = readinessStore.pendingRuntimeRevocation()
@@ -412,6 +419,12 @@ class T3VoiceRuntimeService : Service() {
               T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin)
             }
             ?: prepared?.let {
+              T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin)
+            }
+            ?: preparedAttached?.let {
+              T3VoicePendingRuntimeRevocation(it.fence.runtimeId, it.fence.environmentOrigin)
+            }
+            ?: canonicalPreparedAuthority?.let {
               T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin)
             }
             ?: activeAuthority?.let {
@@ -450,6 +463,8 @@ class T3VoiceRuntimeService : Service() {
         readinessConfig,
         authority,
         voiceRuntimeAuthorityStore.loadForRefresh(),
+        readinessStore.prepared(),
+        canonicalPreparedAuthority?.takeIf { !it.config.enabled },
       )
       val activeRealtimeOrigin = handoffEnvironmentOrigin?.takeIf {
         state.activeRealtimeSessionId != null
@@ -1041,6 +1056,46 @@ class T3VoiceRuntimeService : Service() {
         is VoiceRuntimeTarget.Thread -> VoiceRuntimeBridge.canonicalThreadTargetIdentity(target)
       }
       require(input.targetDigest == T3VoiceRuntimeTargetIdentity.digest(targetIdentity))
+      val attachedPrepared = voiceRuntimeAuthorityStore.inspectPreparedAttachedAuthority()
+      val persistentPrepared = readinessStore.prepared()
+      T3VoicePreparationExclusionPolicy.requireCompatible(
+        readinessEnabled = input.readinessEnabled,
+        persistentPrepared = persistentPrepared != null ||
+          voiceRuntimeAuthorityStore.inspectPreparedRefreshCredential() != null,
+        attachedPrepared = attachedPrepared != null ||
+          canonicalPreparedAuthority?.config?.enabled == false,
+      )
+      if (!input.readinessEnabled) {
+        attachedPrepared?.let { durable ->
+          val expectedReadiness = verifyReadiness(durable.readiness)
+          require(
+            durable.fence.runtimeId == input.runtimeId &&
+              durable.fence.generation == input.generation &&
+              durable.fence.targetDigest == input.targetDigest &&
+              durable.fence.target == input.target &&
+              durable.fence.operation == input.operation &&
+              durable.fence.environmentOrigin ==
+                VoiceRuntimeOriginPolicy.normalize(input.environmentOrigin) &&
+              expectedReadiness.sameReservationPayload(desired),
+          ) { "A different attached authority must be revoked before replacement." }
+          val recovered = T3VoicePreparedReadiness(
+            expectedReadiness,
+            durable.fence.runtimeId,
+            durable.fence.environmentOrigin,
+            durable.fence.operation,
+            durable.fence.targetDigest,
+          )
+          canonicalPreparedAuthority = recovered
+          readinessConfig = expectedReadiness
+          return@synchronized VoiceRuntimeAuthorityPreparationResult(
+            input.copy(
+              provisioningOperationId = durable.fence.provisioningOperationId,
+              environmentOrigin = durable.fence.environmentOrigin,
+            ),
+            null,
+          )
+        }
+      }
       val prepared = prepareRuntimeVoiceReadiness(
         desired,
         input.runtimeId,
@@ -1049,6 +1104,9 @@ class T3VoiceRuntimeService : Service() {
         input.targetDigest,
       )
       require(prepared.runtimeId == input.runtimeId && prepared.config.generation == input.generation)
+      if (!input.readinessEnabled) {
+        voiceRuntimeAuthorityStore.prepareAttachedAuthority(input.fence(), prepared.config)
+      }
       val refresh = voiceRuntimeAuthorityStore.prepareRefreshCredential(
         input.fence(),
         input.readinessEnabled,
@@ -1076,6 +1134,25 @@ class T3VoiceRuntimeService : Service() {
           "active", input, readinessConfig, null,
           persisted.issuedAtEpochMillis, persisted.expiresAtEpochMillis,
           persisted.refreshRotationCounter,
+        )
+      }
+      voiceRuntimeAuthorityStore.inspectPreparedAttachedAuthority()?.let { prepared ->
+        val fence = prepared.fence
+        val readiness = verifyReadiness(prepared.readiness)
+        val input = VoiceRuntimeAuthorityPreparation(
+          fence.runtimeId,
+          snapshot.identity.runtimeInstanceId,
+          fence.provisioningOperationId,
+          fence.generation - 1,
+          fence.generation,
+          fence.targetDigest,
+          fence.target,
+          fence.operation,
+          fence.environmentOrigin,
+          false,
+        )
+        return@synchronized VoiceRuntimeAuthorityInspection(
+          "prepared", input, readiness, null, null, null, null,
         )
       }
       val prepared = voiceRuntimeAuthorityStore.inspectPreparedRefreshCredential()
@@ -1776,6 +1853,9 @@ class T3VoiceRuntimeService : Service() {
           Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
             hasPermission(Manifest.permission.POST_NOTIFICATIONS),
       )
+    val startupAttachedPreparation = runCatching {
+      voiceRuntimeAuthorityStore.inspectPreparedAttachedAuthority()
+    }.getOrNull()
     var canonicalInstalled = voiceRuntimeAuthorityStore.load()
       as? VoiceRuntimeAuthorityLoadResult.Available
     val startupFinalization = runCatching {
@@ -1834,7 +1914,7 @@ class T3VoiceRuntimeService : Service() {
       startupRealtimeCheckpoint,
       retiredAuthorityFence,
       readinessStore.activeAuthority(),
-    )
+    ) ?: startupAttachedPreparation?.fence?.runtimeId
     val canonicalRuntimeId = VoiceRuntimeDeviceIdentityStore(applicationContext)
       .getOrCreate(installedRuntimeId)
     voiceRuntimeController = VoiceRuntimeActiveThreadController(
@@ -1930,8 +2010,23 @@ class T3VoiceRuntimeService : Service() {
           cursor.sequence,
         ))
       },
-      initialGeneration = retiredAuthorityFence?.generation,
+      initialGeneration = listOfNotNull(
+        retiredAuthorityFence?.generation,
+        startupAttachedPreparation?.fence?.generation?.minus(1),
+      ).maxOrNull(),
     )
+    startupAttachedPreparation?.takeIf { canonicalInstalled == null }?.let { prepared ->
+      val config = verifyReadiness(prepared.readiness)
+      readinessStore.write(config)
+      readinessConfig = config
+      canonicalPreparedAuthority = T3VoicePreparedReadiness(
+        config,
+        prepared.fence.runtimeId,
+        prepared.fence.environmentOrigin,
+        prepared.fence.operation,
+        prepared.fence.targetDigest,
+      )
+    }
     cueSettings = cueSettingsStore.read()
     cueCoordinator = T3VoiceCueCoordinator()
     val canonicalRestored = canonicalInstalled?.authority?.let(::restoreCanonicalAuthorityLocked) == true
@@ -5645,6 +5740,7 @@ class T3VoiceRuntimeService : Service() {
     )
     val grantMetadata = voiceRuntimeAuthorityStore.loadForRefresh()
     val prepared = readinessStore.prepared()
+    val preparedAttached = voiceRuntimeAuthorityStore.inspectPreparedAttachedAuthority()
     val activeAuthority = readinessStore.activeAuthority()
     val revocation =
       readinessStore.pendingRuntimeRevocation()
@@ -5652,6 +5748,12 @@ class T3VoiceRuntimeService : Service() {
           T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin)
         }
         ?: prepared?.let {
+          T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin)
+        }
+        ?: preparedAttached?.let {
+          T3VoicePendingRuntimeRevocation(it.fence.runtimeId, it.fence.environmentOrigin)
+        }
+        ?: canonicalPreparedAuthority?.let {
           T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin)
         }
         ?: activeAuthority?.let {
