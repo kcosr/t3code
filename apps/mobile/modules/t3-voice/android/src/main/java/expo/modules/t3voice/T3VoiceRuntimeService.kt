@@ -2177,9 +2177,13 @@ class T3VoiceRuntimeService : Service() {
       VoiceRuntimeThreadOperationLoadResult.Missing -> null
     }
     if (pending != null) {
-      val disabled = readinessConfig.copy(enabled = false, generation = readinessConfig.generation + 1)
+      val disabled = T3VoiceCanonicalReadinessPolicy.disabled(
+        readinessConfig,
+        voiceRuntimeController.snapshot().identity.generation,
+      )
       readinessStore.writeDisabledForRuntimeRevocation(disabled, pending)
       readinessConfig = disabled
+      canonicalPreparedAuthority = null
       voiceRuntimeAuthorityStore.clear()
       controllerCommands.invalidateReadiness()
     } else if (loaded == VoiceRuntimeThreadOperationLoadResult.Locked) {
@@ -4705,9 +4709,9 @@ class T3VoiceRuntimeService : Service() {
     }
     runtimeThreadAttempt = null
     val persisted = voiceRuntimeAuthorityStore.loadForRefresh()
-    val disabled = readinessConfig.copy(
-      enabled = false,
-      generation = readinessConfig.generation + 1,
+    val disabled = T3VoiceCanonicalReadinessPolicy.disabled(
+      readinessConfig,
+      voiceRuntimeController.snapshot().identity.generation,
     )
     runCatching {
       readinessStore.writeDisabledForRuntimeRevocation(
@@ -4716,6 +4720,7 @@ class T3VoiceRuntimeService : Service() {
       )
     }
     readinessConfig = disabled
+    canonicalPreparedAuthority = null
     runCatching { voiceRuntimeAuthorityStore.clear() }
     VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
     controllerCommands.invalidateReadiness()
@@ -5633,7 +5638,11 @@ class T3VoiceRuntimeService : Service() {
       reconcileReadinessLocked()
       return
     }
-    val disabled = readinessConfig.copy(enabled = false, generation = readinessConfig.generation + 1)
+    val canonical = voiceRuntimeController.snapshot()
+    val disabled = T3VoiceCanonicalReadinessPolicy.disabled(
+      readinessConfig,
+      canonical.identity.generation,
+    )
     val grantMetadata = voiceRuntimeAuthorityStore.loadForRefresh()
     val prepared = readinessStore.prepared()
     val activeAuthority = readinessStore.activeAuthority()
@@ -5650,6 +5659,23 @@ class T3VoiceRuntimeService : Service() {
         }
     readinessConfig = disabled
     readinessStore.writeDisabledWithPending(disabled, revocation)
+    canonicalPreparedAuthority = null
+    if (canonical.operation == VoiceRuntimeOperation.None) {
+      if (canonical.target != null) {
+        runCatching {
+          voiceRuntimeController.clearAuthority(
+            "notification-disable-${UUID.randomUUID()}",
+            canonical.identity,
+          )
+        }.onFailure {
+          enterCanonicalRecoveryRequiredLocked("notification-disable-controller-clear")
+          return
+        }
+      }
+      voiceRuntimeAuthorityStore.clear()
+      VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
+      clearIdleRealtimeEngineLocked()
+    }
     controllerCommands.invalidateReadiness()
     T3VoiceStateStore.emit(
       T3VoiceRuntimeEvent.ReadinessDisabled(disabled.generation, "notification"),

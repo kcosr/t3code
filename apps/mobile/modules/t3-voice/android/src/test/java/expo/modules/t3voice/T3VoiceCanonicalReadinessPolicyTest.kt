@@ -56,6 +56,61 @@ internal class T3VoiceCanonicalReadinessPolicyTest {
   }
 
   @Test
+  fun `notification disable preserves the exact canonical cleanup fence`() {
+    val authority = authority(
+      generation = 9,
+      readinessEnabled = true,
+      target = VoiceRuntimeTarget.Realtime("environment-1", "conversation-1"),
+    )
+    val disabled = T3VoiceCanonicalReadinessPolicy.disabled(
+      T3VoiceReadinessConfig(enabled = true, generation = 9),
+      canonicalGeneration = 9,
+    )
+
+    val ownershipFence = requireNotNull(
+      T3VoiceRuntimeOwnershipPolicy.canonicalFence(
+        disabled,
+        activeReadiness = null,
+        persistedAuthority = authority,
+      ),
+    )
+    assertEquals(
+      T3VoiceRuntimeOwnershipFence("runtime-1", 9, authority.environmentOrigin),
+      ownershipFence,
+    )
+    assertTrue(
+      T3VoiceConditionalDisablePolicy.canDisable(
+        ownershipFence.runtimeId,
+        ownershipFence.generation,
+        canonicalGeneration = 9,
+        authorityIdentities = listOf("runtime-1" to 9),
+        nativeVoiceActive = false,
+      ),
+    )
+  }
+
+  @Test
+  fun `recovery disable reserves the next canonical generation`() {
+    val disabled = T3VoiceCanonicalReadinessPolicy.disabled(
+      T3VoiceReadinessConfig(enabled = true, generation = 12),
+      canonicalGeneration = 7,
+    )
+
+    val reservation = T3VoiceReadinessReservationPolicy.reserve(
+      disabled,
+      prepared = null,
+      desired = disabled.copy(enabled = true),
+      proposedRuntimeId = "runtime-2",
+      environmentOrigin = "https://environment.example.test",
+      operation = T3VoiceRuntimeGrantOperation.REALTIME_START,
+      targetIdentityDigest = "b".repeat(64),
+    )
+
+    assertEquals(7L, disabled.generation)
+    assertEquals(8L, reservation.config.generation)
+  }
+
+  @Test
   fun `transient restart restores canonical readiness before enabling controls`() {
     val authority = authority(
       generation = 7,

@@ -473,7 +473,6 @@ internal object T3VoiceRuntimeOwnershipPolicy {
     }
     if (
       persistedAuthority != null &&
-        !persistedAuthority.readinessEnabled &&
         persistedAuthority.generation == readiness.generation
     ) {
       return T3VoiceRuntimeOwnershipFence(

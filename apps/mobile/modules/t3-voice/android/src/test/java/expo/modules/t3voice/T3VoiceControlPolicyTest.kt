@@ -300,8 +300,8 @@ class T3VoiceControlPolicyTest {
   fun `repeated disable does not create a new generation`() {
     val enabled = T3VoiceReadinessConfig(enabled = true, generation = 8)
     assertTrue(T3VoiceDisablePolicy.shouldCreatePendingDisable(enabled, null))
-    val disabled = enabled.copy(enabled = false, generation = 9)
-    val pending = T3VoiceRuntimeEvent.ReadinessDisabled(9, "notification")
+    val disabled = enabled.copy(enabled = false)
+    val pending = T3VoiceRuntimeEvent.ReadinessDisabled(8, "notification")
     assertFalse(T3VoiceDisablePolicy.shouldCreatePendingDisable(disabled, pending))
     assertFalse(T3VoiceDisablePolicy.shouldCreatePendingDisable(disabled, null))
   }
