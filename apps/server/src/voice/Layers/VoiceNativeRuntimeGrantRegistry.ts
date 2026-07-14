@@ -100,6 +100,7 @@ const make = Effect.gen(function* () {
               authSessionId: record.authSessionId,
               runtimeId: record.runtimeId,
               generation: record.generation,
+              provisioningOperationId: record.provisioningOperationId,
               grantedScopes: record.grantedScopes,
               target: record.target,
               expiresAt: record.expiresAt,

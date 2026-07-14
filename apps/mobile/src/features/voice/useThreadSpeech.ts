@@ -16,6 +16,7 @@ import {
   initialThreadSpeechPlannerState,
   interruptThreadSpeech,
   isThreadSpeechSuspended,
+  observeThreadSpeechHistorically,
   planThreadSpeechToggle,
   restoreThreadSpeechPreference,
   setThreadSpeechEnabled,
@@ -54,6 +55,7 @@ export function useThreadSpeech(input: {
   readonly historyReady: boolean;
   readonly latestAssistant: AssistantSpeechSnapshot | null;
   readonly realtimeActive: boolean;
+  readonly automaticPlaybackEligible: boolean;
 }) {
   const prepared = Option.getOrNull(usePreparedConnection(input.environmentId));
   const native = getT3VoiceNativeModule();
@@ -402,15 +404,20 @@ export function useThreadSpeech(input: {
   );
 
   useEffect(() => {
-    const result = updateThreadSpeech(
-      plannerRef.current,
-      input.latestAssistant,
-      uuidv4,
-      isThreadSpeechSuspended(suspendedForDictationRef.current, suspendedForRealtimeRef.current),
-    );
+    const result = input.automaticPlaybackEligible
+      ? updateThreadSpeech(
+          plannerRef.current,
+          input.latestAssistant,
+          uuidv4,
+          isThreadSpeechSuspended(
+            suspendedForDictationRef.current,
+            suspendedForRealtimeRef.current,
+          ),
+        )
+      : observeThreadSpeechHistorically(plannerRef.current, input.latestAssistant);
     plannerRef.current = result.state;
     enqueueActions(result.actions);
-  }, [enqueueActions, input.latestAssistant]);
+  }, [enqueueActions, input.automaticPlaybackEligible, input.latestAssistant]);
 
   useEffect(() => {
     ++operationGenerationRef.current;

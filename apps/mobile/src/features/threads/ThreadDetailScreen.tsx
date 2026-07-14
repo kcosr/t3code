@@ -44,6 +44,7 @@ import {
 import { ThreadFeed } from "./ThreadFeed";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
 import { useMasterVoice } from "../voice/MasterVoiceProvider";
+import { ThreadSpeechObservationGate } from "../voice/threadSpeechObservationGate";
 import { useThreadSpeech } from "../voice/useThreadSpeech";
 
 export interface ThreadDetailScreenProps {
@@ -271,16 +272,33 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     }
   })();
   const selectedThreadFeed = props.selectedThreadFeed;
+  const threadSpeechObservationGateRef = useRef<ThreadSpeechObservationGate | null>(null);
+  threadSpeechObservationGateRef.current ??= new ThreadSpeechObservationGate();
   const latestAssistant = useMemo(
     () => latestAssistantSpeechSnapshot(selectedThreadFeed),
     [selectedThreadFeed],
   );
   const realtimeVoice = useMasterVoice();
+  const threadHistoryLive =
+    contentPresentationKind === "ready" &&
+    (props.threadSyncStatus === undefined || props.threadSyncStatus === "live");
+  const threadSpeechObservation = threadSpeechObservationGateRef.current.previewAutomaticPlayback({
+    scopeKey: selectedThreadKey,
+    syncStatus: props.threadSyncStatus,
+    latestAssistant,
+    feed: selectedThreadFeed,
+    nativeAssistantMessageIds: realtimeVoice.nativeAssistantMessageIds,
+    monotonicMillis: globalThis.performance.now(),
+  });
+  useLayoutEffect(() => {
+    threadSpeechObservation.commit();
+  }, [threadSpeechObservation]);
   const speechPlayback = useThreadSpeech({
     environmentId: props.environmentId,
     scopeKey: selectedThreadKey,
-    historyReady: contentPresentationKind === "ready",
+    historyReady: threadHistoryLive,
     latestAssistant,
+    automaticPlaybackEligible: threadSpeechObservation.automaticPlaybackEligible,
     realtimeActive:
       realtimeVoice.suppressAutomaticThreadSpeech ||
       (latestAssistant !== null &&
@@ -394,6 +412,11 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
       return messageId;
     }
 
+    threadSpeechObservationGateRef.current?.recordLocalCommand(
+      targetThreadKey,
+      String(messageId),
+      globalThis.performance.now(),
+    );
     setAnchorMessageId(messageId);
     composerEditorRef.current?.blur();
     return messageId;
@@ -403,6 +426,11 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
       const targetThreadKey = selectedThreadKeyRef.current;
       const messageId = await props.onSendVoiceMessage(input);
       if (messageId !== null && selectedThreadKeyRef.current === targetThreadKey) {
+        threadSpeechObservationGateRef.current?.recordLocalCommand(
+          targetThreadKey,
+          String(messageId),
+          globalThis.performance.now(),
+        );
         setAnchorMessageId(messageId);
       }
       return messageId;

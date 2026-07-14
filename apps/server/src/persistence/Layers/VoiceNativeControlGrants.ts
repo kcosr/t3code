@@ -119,6 +119,23 @@ const make = Effect.gen(function* () {
         toPersistenceSqlError("VoiceNativeControlGrantRepository.releaseSessionControl"),
       ),
     );
+  const completeHandoff: VoiceNativeControlGrantRepositoryShape["completeHandoff"] = (sessionId) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          yield* sql`DELETE FROM voice_native_control_grants
+            WHERE session_id = ${sessionId}
+              AND (runtime_id IS NULL OR session_close = 0)`;
+          yield* sql`UPDATE voice_native_control_grants
+            SET session_control = 0, handoff_actions = 0, webrtc_signaling = 0
+            WHERE session_id = ${sessionId}
+              AND runtime_id IS NOT NULL AND session_close = 1`;
+        }),
+      )
+      .pipe(
+        Effect.asVoid,
+        Effect.mapError(toPersistenceSqlError("VoiceNativeControlGrantRepository.completeHandoff")),
+      );
   const revokeSession = (sessionId: VoiceSessionId) =>
     sql`DELETE FROM voice_native_control_grants WHERE session_id = ${sessionId}`.pipe(
       Effect.asVoid,
@@ -139,6 +156,7 @@ const make = Effect.gen(function* () {
     insert,
     findActive,
     releaseSessionControl,
+    completeHandoff,
     revokeSession,
     revokeAuthSession,
     revokeRuntime,

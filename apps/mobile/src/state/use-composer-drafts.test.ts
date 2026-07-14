@@ -3,11 +3,15 @@ import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
 
 import { appAtomRegistry } from "./atom-registry";
 import {
+  applyVoiceArtifactToState,
   clearComposerDraftContentState,
   composerDraftsAtom,
   decodePersistedComposerDrafts,
+  decodePersistedComposerDraftsState,
+  encodePersistedComposerDraftsState,
   type ComposerDraft,
   getComposerDraftSnapshot,
+  MAXIMUM_APPLIED_VOICE_ARTIFACTS,
   removeComposerDraftsForEnvironment,
 } from "./use-composer-drafts";
 
@@ -87,6 +91,73 @@ describe("mobile composer drafts", () => {
         },
       }),
     ).toThrow();
+  });
+
+  it("migrates version-one drafts without inventing voice artifact receipts", () => {
+    expect(
+      decodePersistedComposerDraftsState({
+        schemaVersion: 1,
+        drafts: { "environment-1:thread-1": DRAFT },
+      }),
+    ).toEqual({
+      drafts: { "environment-1:thread-1": DRAFT },
+      appliedVoiceArtifacts: {},
+    });
+  });
+
+  it("keeps a voice append idempotent after persistence and process reload", () => {
+    const now = 1_000;
+    const input = {
+      draftKey: "environment-1:thread-1",
+      artifactId: "artifact-1",
+      transcript: "voice text",
+      appliedAtEpochMillis: now,
+      expiresAtEpochMillis: 10_000,
+    } as const;
+    const first = applyVoiceArtifactToState(
+      { drafts: { [input.draftKey]: DRAFT }, appliedVoiceArtifacts: {} },
+      input,
+    );
+    const reloaded = decodePersistedComposerDraftsState(
+      encodePersistedComposerDraftsState(first.state, now),
+      now,
+    );
+    const retried = applyVoiceArtifactToState(reloaded, {
+      ...input,
+      appliedAtEpochMillis: now + 1,
+    });
+
+    expect(first.result.outcome).toBe("appended");
+    expect(retried.result.outcome).toBe("already-applied");
+    expect(retried.state.drafts[input.draftKey]?.text).toBe("hello voice text");
+  });
+
+  it("expires and bounds persisted voice artifact receipts", () => {
+    const now = 10_000;
+    const applications = Object.fromEntries(
+      Array.from({ length: MAXIMUM_APPLIED_VOICE_ARTIFACTS + 2 }, (_, index) => [
+        `artifact-${index}`,
+        {
+          draftKey: "environment-1:thread-1",
+          appliedAtEpochMillis: index,
+          expiresAtEpochMillis: index === 0 ? now : now + 1_000,
+        },
+      ]),
+    );
+    const encoded = encodePersistedComposerDraftsState(
+      { drafts: { "environment-1:thread-1": DRAFT }, appliedVoiceArtifacts: applications },
+      now,
+    );
+    const decoded = decodePersistedComposerDraftsState(encoded, now);
+
+    expect(Object.keys(decoded.appliedVoiceArtifacts)).toHaveLength(
+      MAXIMUM_APPLIED_VOICE_ARTIFACTS,
+    );
+    expect(decoded.appliedVoiceArtifacts["artifact-0"]).toBeUndefined();
+    expect(decoded.appliedVoiceArtifacts["artifact-1"]).toBeUndefined();
+    expect(
+      decoded.appliedVoiceArtifacts[`artifact-${MAXIMUM_APPLIED_VOICE_ARTIFACTS + 1}`],
+    ).toBeDefined();
   });
 
   it("clears sent content without clearing the selected model or workspace", () => {

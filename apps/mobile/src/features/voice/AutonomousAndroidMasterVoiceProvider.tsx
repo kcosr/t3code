@@ -53,6 +53,10 @@ import {
 } from "./masterVoiceState";
 import { resolveVoicePreferences } from "./voicePreferences";
 import { NativeVoiceReceiptIndex } from "./nativeVoiceReceiptIndex";
+import {
+  VoicePresentationGenerationWaitScope,
+  waitForVoicePresentationGeneration,
+} from "./voicePresentationGeneration";
 import { VoiceConversationBrowser } from "./VoiceConversationBrowser";
 
 const nativeReceiptIndex = new NativeVoiceReceiptIndex();
@@ -70,21 +74,8 @@ export const autonomousAndroidVoiceBinding = new VoiceRuntimePresentationBinding
   },
 });
 
-const waitForBindingGeneration = async (snapshot: VoiceRuntimeSnapshot): Promise<void> => {
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    const current = autonomousAndroidVoiceBinding.getSnapshot().snapshot;
-    if (
-      current?.runtimeId === snapshot.runtimeId &&
-      current.runtimeInstanceId === snapshot.runtimeInstanceId &&
-      current.generation === snapshot.generation
-    ) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  throw new Error("The voice presentation did not attach to the current native authority.");
-};
+const errorMessage = (cause: unknown): string =>
+  cause instanceof Error ? cause.message : String(cause);
 
 export function AutonomousAndroidMasterVoiceProvider(props: {
   readonly children: ReactNode;
@@ -107,6 +98,13 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
   const [audioRoutePicker, setAudioRoutePicker] =
     useState<Parameters<typeof VoiceAudioRoutePicker>[0]["state"]>(null);
   const [conversationClient, setConversationClient] = useState<VoiceHttpClient | null>(null);
+  const [commandState, setCommandState] = useState<{
+    readonly pendingLabel: string | null;
+    readonly error: string | null;
+  }>({ pendingLabel: null, error: null });
+  const [rebasePendingCount, setRebasePendingCount] = useState(0);
+  const commandEpochRef = useRef(0);
+  const presentationWaitScopeRef = useRef(new VoicePresentationGenerationWaitScope());
   const focusDispatchRef = useRef<string | null>(null);
   const provisioningRef = useRef<NativeVoiceRuntimeProvisioningCoordinator | null>(null);
   const provisioningEpochRef = useRef(0);
@@ -125,6 +123,19 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
   provisioningRef.current ??= new NativeVoiceRuntimeProvisioningCoordinator(
     makeNativeVoiceRuntimeProvisioningAdapter(native, uuidv4),
   );
+
+  useEffect(() => {
+    if (presentationWaitScopeRef.current.disposed) {
+      presentationWaitScopeRef.current = new VoicePresentationGenerationWaitScope();
+      setCommandState({ pendingLabel: null, error: null });
+      setRebasePendingCount(0);
+    }
+    const scope = presentationWaitScopeRef.current;
+    return () => {
+      scope.dispose();
+      commandEpochRef.current += 1;
+    };
+  }, []);
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", setApplicationState);
@@ -156,9 +167,16 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
       return;
     }
     let disposed = false;
-    void makeMobileVoiceClient(prepared).then((client) => {
-      if (!disposed) setConversationClient(client);
-    });
+    void makeMobileVoiceClient(prepared)
+      .then((client) => {
+        if (!disposed) setConversationClient(client);
+      })
+      .catch((cause) => {
+        if (!disposed) {
+          setConversationClient(null);
+          setCommandState({ pendingLabel: null, error: errorMessage(cause) });
+        }
+      });
     return () => {
       disposed = true;
     };
@@ -166,8 +184,10 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
 
   const ensureMode = useCallback(
     (mode: "realtime" | "thread"): Promise<VoiceRuntimeSnapshot> => {
+      const lifecycle = presentationWaitScopeRef.current;
       let result!: VoiceRuntimeSnapshot;
       const operation = provisioningQueueRef.current.then(async () => {
+        lifecycle.throwIfDisposed();
         const latest = latestRef.current;
         if (latest.environmentId === null || latest.preferences === null) {
           throw new Error("Voice environment preferences are not ready.");
@@ -229,8 +249,11 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
           operation: mode === "realtime" ? "realtime-start" : "thread-turn-start",
           resolvedTarget: target,
         });
+        lifecycle.throwIfDisposed();
         const snapshot = await native.getVoiceRuntimeSnapshotAsync();
-        await waitForBindingGeneration(snapshot);
+        await waitForVoicePresentationGeneration(autonomousAndroidVoiceBinding, snapshot, {
+          signal: lifecycle.signal,
+        });
         requestedConversationIdRef.current = null;
         result = snapshot;
       });
@@ -241,19 +264,64 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
   );
 
   const dispatch = useCallback(async (request: VoiceRuntimeCommandRequest): Promise<void> => {
+    const lifecycle = presentationWaitScopeRef.current;
+    lifecycle.throwIfDisposed();
     const receipt = await autonomousAndroidVoiceBinding.dispatch(request);
+    lifecycle.throwIfDisposed();
     if (receipt.outcome.type === "accepted") return;
     if (receipt.outcome.type === "rebase-required") {
-      await waitForBindingGeneration(receipt.outcome.rebase.snapshot);
-      const retry = await autonomousAndroidVoiceBinding.dispatch(request);
-      if (retry.outcome.type === "accepted") return;
-      throw new Error(
-        retry.outcome.type === "rejected"
-          ? `Voice command rejected: ${retry.outcome.reason}`
-          : "Voice authority changed while retrying the command.",
-      );
+      if (presentationWaitScopeRef.current === lifecycle) {
+        setRebasePendingCount((count) => count + 1);
+      }
+      try {
+        await waitForVoicePresentationGeneration(
+          autonomousAndroidVoiceBinding,
+          receipt.outcome.rebase.snapshot,
+          { signal: lifecycle.signal },
+        );
+        lifecycle.throwIfDisposed();
+        const retry = await autonomousAndroidVoiceBinding.dispatch(request);
+        lifecycle.throwIfDisposed();
+        if (retry.outcome.type === "accepted") return;
+        throw new Error(
+          retry.outcome.type === "rejected"
+            ? `Voice command rejected: ${retry.outcome.reason}`
+            : "Voice authority changed while retrying the command.",
+        );
+      } finally {
+        if (presentationWaitScopeRef.current === lifecycle && !lifecycle.disposed) {
+          setRebasePendingCount((count) => Math.max(0, count - 1));
+        }
+      }
     }
     throw new Error(`Voice command rejected: ${receipt.outcome.reason}`);
+  }, []);
+
+  const runCommand = useCallback((pendingLabel: string, command: () => Promise<unknown>): void => {
+    const lifecycle = presentationWaitScopeRef.current;
+    if (lifecycle.disposed) return;
+    const epoch = ++commandEpochRef.current;
+    setCommandState({ pendingLabel, error: null });
+    void command().then(
+      () => {
+        if (
+          presentationWaitScopeRef.current === lifecycle &&
+          !lifecycle.disposed &&
+          commandEpochRef.current === epoch
+        ) {
+          setCommandState({ pendingLabel: null, error: null });
+        }
+      },
+      (cause: unknown) => {
+        if (
+          presentationWaitScopeRef.current === lifecycle &&
+          !lifecycle.disposed &&
+          commandEpochRef.current === epoch
+        ) {
+          setCommandState({ pendingLabel: null, error: errorMessage(cause) });
+        }
+      },
+    );
   }, []);
 
   useEffect(() => {
@@ -265,12 +333,19 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
     const key = `${runtimeSnapshot.operation.modeSessionId}:${focus?.projectId ?? "none"}:${focus?.threadId ?? "none"}`;
     if (focusDispatchRef.current === key) return;
     focusDispatchRef.current = key;
+    const lifecycle = presentationWaitScopeRef.current;
     void dispatch({
       kind: "update-realtime-focus",
       modeSessionId: runtimeSnapshot.operation.modeSessionId,
       focus,
     }).catch(() => {
       if (focusDispatchRef.current === key) focusDispatchRef.current = null;
+      if (presentationWaitScopeRef.current === lifecycle && !lifecycle.disposed) {
+        setCommandState({
+          pendingLabel: null,
+          error: "Voice thread focus could not be updated.",
+        });
+      }
     });
   }, [dispatch, props.focus, runtimeSnapshot]);
 
@@ -309,7 +384,9 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
     if (action?.action !== "realtime-confirmation-required" || controller === null) return;
     if (presentedConfirmationActionIdsRef.current.has(action.actionId)) return;
     presentedConfirmationActionIdsRef.current.add(action.actionId);
+    const lifecycle = presentationWaitScopeRef.current;
     const decide = (decision: "approve" | "reject") => {
+      if (presentationWaitScopeRef.current !== lifecycle || lifecycle.disposed) return;
       const operation = autonomousAndroidVoiceBinding.getSnapshot().snapshot?.operation;
       if (operation?.kind !== "realtime") {
         autonomousAndroidVoiceBinding.completePresentationAction(action.actionId, {
@@ -331,12 +408,15 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
             outcome: "succeeded",
           }),
         )
-        .catch((cause) =>
+        .catch((cause) => {
+          if (presentationWaitScopeRef.current === lifecycle && !lifecycle.disposed) {
+            setCommandState({ pendingLabel: null, error: errorMessage(cause) });
+          }
           autonomousAndroidVoiceBinding.completePresentationAction(action.actionId, {
             outcome: "failed",
-            message: cause instanceof Error ? cause.message : "Confirmation failed.",
-          }),
-        );
+            message: errorMessage(cause),
+          });
+        });
     };
     if (controller.snapshot.operation.kind !== "realtime") {
       autonomousAndroidVoiceBinding.completePresentationAction(action.actionId, {
@@ -372,7 +452,7 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
         });
       },
       completeDraftArtifact: (artifactId, outcome) => {
-        autonomousAndroidVoiceBinding.completeDraftArtifact(artifactId, outcome);
+        return autonomousAndroidVoiceBinding.completeDraftArtifact(artifactId, outcome);
       },
       stop,
       active: voice?.active === true,
@@ -433,16 +513,22 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
   }, [dispatch, runtimeSnapshot, voice?.muted]);
 
   const chooseAudioRoute = useCallback(async () => {
+    const lifecycle = presentationWaitScopeRef.current;
+    lifecycle.throwIfDisposed();
     const routes = await native.getAudioRoutesAsync();
-    setAudioRoutePicker({
-      routes,
-      selectingRouteId: null,
-      error: null,
-    });
+    if (presentationWaitScopeRef.current === lifecycle && !lifecycle.disposed) {
+      setAudioRoutePicker({
+        routes,
+        selectingRouteId: null,
+        error: null,
+      });
+    }
   }, [native, runtimeSnapshot?.route.outputRouteId]);
 
   const selectAudioRoute = useCallback(
     async (route: T3VoiceAudioRoute) => {
+      const lifecycle = presentationWaitScopeRef.current;
+      lifecycle.throwIfDisposed();
       if (runtimeSnapshot === null) return;
       const intent = voiceRouteIntent(runtimeSnapshot, {
         inputRouteId: runtimeSnapshot.route.inputRouteId,
@@ -454,17 +540,21 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
       );
       try {
         await dispatch(intent);
-        setAudioRoutePicker(null);
+        if (presentationWaitScopeRef.current === lifecycle && !lifecycle.disposed) {
+          setAudioRoutePicker(null);
+        }
       } catch (cause) {
-        setAudioRoutePicker((current) =>
-          current === null
-            ? null
-            : {
-                ...current,
-                selectingRouteId: null,
-                error: cause instanceof Error ? cause.message : String(cause),
-              },
-        );
+        if (presentationWaitScopeRef.current === lifecycle && !lifecycle.disposed) {
+          setAudioRoutePicker((current) =>
+            current === null
+              ? null
+              : {
+                  ...current,
+                  selectingRouteId: null,
+                  error: cause instanceof Error ? cause.message : String(cause),
+                },
+          );
+        }
       }
     },
     [dispatch, runtimeSnapshot],
@@ -475,13 +565,22 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
       <View className="flex-1">
         {props.children}
         <CanonicalMasterVoiceCallBar
+          commandError={
+            commandState.error ??
+            (presentation.phase === "error" && presentation.error !== null
+              ? errorMessage(presentation.error)
+              : null)
+          }
+          commandPendingLabel={
+            rebasePendingCount > 0 ? "Synchronizing voice controls…" : commandState.pendingLabel
+          }
           historyAvailable={conversationClient !== null}
           voice={voice}
           onHistory={() => setBrowserVisible(true)}
-          onMute={() => void toggleMuted()}
-          onRoute={() => void chooseAudioRoute()}
-          onResume={() => void resume()}
-          onStop={() => void stop()}
+          onMute={() => runCommand("Updating microphone…", toggleMuted)}
+          onRoute={() => runCommand("Loading audio routes…", chooseAudioRoute)}
+          onResume={() => runCommand("Connecting voice…", resume)}
+          onStop={() => runCommand("Stopping voice…", stop)}
         />
       </View>
       <VoiceConversationBrowser
@@ -490,11 +589,11 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
         onClose={() => setBrowserVisible(false)}
         onNew={() => {
           setBrowserVisible(false);
-          void startNewConversation();
+          runCommand("Starting conversation…", startNewConversation);
         }}
         onResume={(conversationId) => {
           setBrowserVisible(false);
-          void resumeConversation(conversationId);
+          runCommand("Connecting voice…", () => resumeConversation(conversationId));
         }}
       />
       <VoiceAudioRoutePicker

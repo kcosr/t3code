@@ -31,6 +31,7 @@ export interface VoiceNativeControlGrantRegistryShape {
   readonly authorize: (token: string) => Effect.Effect<VoiceNativeControlGrantScope | undefined>;
   readonly revokeSession: (sessionId: VoiceSessionId) => Effect.Effect<void>;
   readonly releaseSessionControl: (sessionId: VoiceSessionId) => Effect.Effect<void>;
+  readonly completeHandoff: (sessionId: VoiceSessionId) => Effect.Effect<void>;
   readonly revokeAuthSession: (authSessionId: AuthSessionId) => Effect.Effect<void>;
   readonly revokeRuntime: (
     authSessionId: AuthSessionId,
@@ -109,6 +110,7 @@ const makeWithOptions = Effect.fn("VoiceNativeControlGrantRegistry.make")(functi
     revokeSession: (sessionId) => repository.revokeSession(sessionId).pipe(Effect.orDie),
     releaseSessionControl: (sessionId) =>
       repository.releaseSessionControl(sessionId).pipe(Effect.orDie),
+    completeHandoff: (sessionId) => repository.completeHandoff(sessionId).pipe(Effect.orDie),
     revokeAuthSession: (authSessionId) =>
       repository.revokeAuthSession(authSessionId).pipe(Effect.orDie),
     revokeRuntime: (authSessionId, runtimeId) =>

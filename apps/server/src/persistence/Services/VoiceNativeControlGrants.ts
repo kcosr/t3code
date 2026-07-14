@@ -29,6 +29,7 @@ export interface VoiceNativeControlGrantRepositoryShape {
   readonly releaseSessionControl: (
     sessionId: VoiceSessionId,
   ) => Effect.Effect<void, PersistenceSqlError>;
+  readonly completeHandoff: (sessionId: VoiceSessionId) => Effect.Effect<void, PersistenceSqlError>;
   readonly revokeSession: (sessionId: VoiceSessionId) => Effect.Effect<void, PersistenceSqlError>;
   readonly revokeAuthSession: (
     authSessionId: AuthSessionId,

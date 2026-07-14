@@ -31,7 +31,7 @@ export interface AutonomousMasterVoiceContextValue {
   readonly completeDraftArtifact: (
     artifactId: VoiceDraftArtifact["handle"]["artifactId"],
     outcome: "appended" | "discarded",
-  ) => void;
+  ) => boolean;
   readonly stop: () => Promise<void>;
   readonly active: boolean;
   readonly suppressAutomaticThreadSpeech: boolean;

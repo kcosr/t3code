@@ -16,10 +16,12 @@ import { DraftComposerImageAttachmentSchema } from "../lib/composer-image-schema
 import type { DraftComposerImageAttachment } from "../lib/composerImages";
 import { appAtomRegistry } from "./atom-registry";
 
-const COMPOSER_DRAFTS_SCHEMA_VERSION = 1;
+const COMPOSER_DRAFTS_SCHEMA_VERSION = 2;
 const COMPOSER_DRAFTS_DIRECTORY = "composer-drafts";
 const COMPOSER_DRAFTS_FILE = "drafts.json";
+const COMPOSER_DRAFTS_TEMP_FILE = "drafts.next.json";
 const PERSIST_DEBOUNCE_MS = 200;
+export const MAXIMUM_APPLIED_VOICE_ARTIFACTS = 4_096;
 
 export class ComposerDraftPersistenceError extends Schema.TaggedErrorClass<ComposerDraftPersistenceError>()(
   "ComposerDraftPersistenceError",
@@ -72,14 +74,50 @@ const ComposerDraftSchema = Schema.Struct({
   workspaceSelection: Schema.optional(ComposerDraftWorkspaceSelectionSchema),
 });
 
-const PersistedComposerDraftsSchema = Schema.Struct({
-  schemaVersion: Schema.Literal(COMPOSER_DRAFTS_SCHEMA_VERSION),
+const PersistedVoiceArtifactApplicationSchema = Schema.Struct({
+  draftKey: Schema.String,
+  appliedAtEpochMillis: Schema.Number,
+  expiresAtEpochMillis: Schema.Number,
+});
+
+const PersistedComposerDraftsV1Schema = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
   drafts: Schema.Record(Schema.String, ComposerDraftSchema),
 });
 
+const PersistedComposerDraftsV2Schema = Schema.Struct({
+  schemaVersion: Schema.Literal(COMPOSER_DRAFTS_SCHEMA_VERSION),
+  drafts: Schema.Record(Schema.String, ComposerDraftSchema),
+  appliedVoiceArtifacts: Schema.Record(Schema.String, PersistedVoiceArtifactApplicationSchema),
+});
+
 const decodePersistedComposerDraftsDocument = Schema.decodeUnknownSync(
-  PersistedComposerDraftsSchema,
+  Schema.Union([PersistedComposerDraftsV1Schema, PersistedComposerDraftsV2Schema]),
 );
+
+export interface PersistedVoiceArtifactApplication {
+  readonly draftKey: string;
+  readonly appliedAtEpochMillis: number;
+  readonly expiresAtEpochMillis: number;
+}
+
+export interface ComposerDraftsPersistenceState {
+  readonly drafts: Record<string, ComposerDraft>;
+  readonly appliedVoiceArtifacts: Record<string, PersistedVoiceArtifactApplication>;
+}
+
+export interface ApplyVoiceArtifactInput {
+  readonly draftKey: string;
+  readonly artifactId: string;
+  readonly transcript: string;
+  readonly appliedAtEpochMillis: number;
+  readonly expiresAtEpochMillis: number;
+}
+
+export interface ApplyVoiceArtifactResult {
+  readonly outcome: "appended" | "already-applied";
+  readonly draft: ComposerDraft;
+}
 
 const EMPTY_DRAFT: ComposerDraft = {
   text: "",
@@ -93,6 +131,8 @@ export const composerDraftsAtom = Atom.make<Record<string, ComposerDraft>>({}).p
 
 let loadPromise: Promise<void> | null = null;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
+let persistenceQueue: Promise<void> = Promise.resolve();
+let appliedVoiceArtifacts: Record<string, PersistedVoiceArtifactApplication> = {};
 
 function normalizeDraft(draft: ComposerDraft | undefined): ComposerDraft {
   if (!draft) {
@@ -124,11 +164,68 @@ function isEmptyDraft(draft: ComposerDraft): boolean {
   );
 }
 
-export function decodePersistedComposerDrafts(value: unknown): Record<string, ComposerDraft> {
+export function decodePersistedComposerDraftsState(
+  value: unknown,
+  now = Date.now(),
+): ComposerDraftsPersistenceState {
   const parsed = decodePersistedComposerDraftsDocument(value);
-  return Object.fromEntries(
-    Object.entries(parsed.drafts).filter(([, draft]) => !isEmptyDraft(draft)),
+  return {
+    drafts: Object.fromEntries(
+      Object.entries(parsed.drafts).filter(([, draft]) => !isEmptyDraft(draft)),
+    ),
+    appliedVoiceArtifacts:
+      parsed.schemaVersion === 1
+        ? {}
+        : pruneAppliedVoiceArtifacts(parsed.appliedVoiceArtifacts, now),
+  };
+}
+
+export function decodePersistedComposerDrafts(value: unknown): Record<string, ComposerDraft> {
+  return decodePersistedComposerDraftsState(value).drafts;
+}
+
+export function applyVoiceArtifactToState(
+  state: ComposerDraftsPersistenceState,
+  input: ApplyVoiceArtifactInput,
+): { readonly state: ComposerDraftsPersistenceState; readonly result: ApplyVoiceArtifactResult } {
+  const existing = normalizeDraft(state.drafts[input.draftKey]);
+  const liveApplications = pruneAppliedVoiceArtifacts(
+    state.appliedVoiceArtifacts,
+    input.appliedAtEpochMillis,
   );
+  if (liveApplications[input.artifactId] !== undefined) {
+    return {
+      state: { ...state, appliedVoiceArtifacts: liveApplications },
+      result: { outcome: "already-applied", draft: existing },
+    };
+  }
+
+  const prefix =
+    existing.text.length === 0 || /\s$/.test(existing.text) ? existing.text : `${existing.text} `;
+  const draft = {
+    ...existing,
+    text: `${prefix}${input.transcript}`,
+  };
+  return {
+    state: {
+      drafts: {
+        ...state.drafts,
+        [input.draftKey]: draft,
+      },
+      appliedVoiceArtifacts: pruneAppliedVoiceArtifacts(
+        {
+          ...liveApplications,
+          [input.artifactId]: {
+            draftKey: input.draftKey,
+            appliedAtEpochMillis: input.appliedAtEpochMillis,
+            expiresAtEpochMillis: input.expiresAtEpochMillis,
+          },
+        },
+        input.appliedAtEpochMillis,
+      ),
+    },
+    result: { outcome: "appended", draft },
+  };
 }
 
 async function getComposerDraftsFile() {
@@ -138,17 +235,17 @@ async function getComposerDraftsFile() {
   return new File(directory, COMPOSER_DRAFTS_FILE);
 }
 
-async function loadPersistedComposerDrafts(): Promise<Record<string, ComposerDraft>> {
+async function loadPersistedComposerDrafts(): Promise<ComposerDraftsPersistenceState> {
   let operation: ComposerDraftPersistenceError["operation"] = "open";
   try {
     const file = await getComposerDraftsFile();
     if (!file.exists) {
-      return {};
+      return { drafts: {}, appliedVoiceArtifacts: {} };
     }
     operation = "read";
     const raw = await file.text();
     operation = "decode";
-    return decodePersistedComposerDrafts(JSON.parse(raw) as unknown);
+    return decodePersistedComposerDraftsState(JSON.parse(raw) as unknown);
   } catch (cause) {
     console.warn(
       "[composer-drafts] ignored persisted draft failure",
@@ -159,28 +256,52 @@ async function loadPersistedComposerDrafts(): Promise<Record<string, ComposerDra
         cause,
       }),
     );
-    return {};
+    return { drafts: {}, appliedVoiceArtifacts: {} };
   }
 }
 
-async function writePersistedComposerDrafts(drafts: Record<string, ComposerDraft>): Promise<void> {
+function pruneAppliedVoiceArtifacts(
+  applications: Record<string, PersistedVoiceArtifactApplication>,
+  now: number,
+): Record<string, PersistedVoiceArtifactApplication> {
+  return Object.fromEntries(
+    Object.entries(applications)
+      .filter(([, application]) => application.expiresAtEpochMillis > now)
+      .sort(
+        ([leftId, left], [rightId, right]) =>
+          left.appliedAtEpochMillis - right.appliedAtEpochMillis || leftId.localeCompare(rightId),
+      )
+      .slice(-MAXIMUM_APPLIED_VOICE_ARTIFACTS),
+  );
+}
+
+export function encodePersistedComposerDraftsState(
+  state: ComposerDraftsPersistenceState,
+  now = Date.now(),
+) {
+  return {
+    schemaVersion: COMPOSER_DRAFTS_SCHEMA_VERSION,
+    drafts: Object.fromEntries(
+      Object.entries(state.drafts).filter(([, draft]) => !isEmptyDraft(draft)),
+    ),
+    appliedVoiceArtifacts: pruneAppliedVoiceArtifacts(state.appliedVoiceArtifacts, now),
+  } as const;
+}
+
+async function writePersistedComposerDrafts(state: ComposerDraftsPersistenceState): Promise<void> {
   let operation: ComposerDraftPersistenceError["operation"] = "open";
   try {
-    const file = await getComposerDraftsFile();
+    const { Directory, File, Paths } = await import("expo-file-system");
+    const directory = new Directory(Paths.document, COMPOSER_DRAFTS_DIRECTORY);
+    directory.create({ idempotent: true, intermediates: true });
+    const file = new File(directory, COMPOSER_DRAFTS_FILE);
+    const temporaryFile = new File(directory, COMPOSER_DRAFTS_TEMP_FILE);
     operation = "encode";
-    const nonEmptyDrafts = Object.fromEntries(
-      Object.entries(drafts).filter(([, draft]) => !isEmptyDraft(draft)),
-    );
-    const document = {
-      schemaVersion: COMPOSER_DRAFTS_SCHEMA_VERSION,
-      drafts: nonEmptyDrafts,
-    } as const;
-    const encoded = JSON.stringify(document);
+    const encoded = JSON.stringify(encodePersistedComposerDraftsState(state));
     operation = "write";
-    if (!file.exists) {
-      file.create({ intermediates: true, overwrite: true });
-    }
-    file.write(encoded);
+    temporaryFile.create({ intermediates: true, overwrite: true });
+    temporaryFile.write(encoded);
+    await temporaryFile.move(file, { overwrite: true });
   } catch (cause) {
     throw new ComposerDraftPersistenceError({
       operation,
@@ -191,9 +312,15 @@ async function writePersistedComposerDrafts(drafts: Record<string, ComposerDraft
   }
 }
 
-async function savePersistedComposerDrafts(drafts: Record<string, ComposerDraft>): Promise<void> {
+function enqueuePersistedComposerDrafts(state: ComposerDraftsPersistenceState): Promise<void> {
+  const write = persistenceQueue.then(() => writePersistedComposerDrafts(state));
+  persistenceQueue = write.catch(() => undefined);
+  return write;
+}
+
+async function savePersistedComposerDrafts(state: ComposerDraftsPersistenceState): Promise<void> {
   try {
-    await writePersistedComposerDrafts(drafts);
+    await enqueuePersistedComposerDrafts(state);
   } catch (error) {
     console.warn("[composer-drafts] failed to persist drafts", error);
     // Draft persistence is best-effort; in-memory drafts still keep working.
@@ -206,7 +333,7 @@ function schedulePersistComposerDrafts(drafts: Record<string, ComposerDraft>): v
   }
   persistTimer = setTimeout(() => {
     persistTimer = null;
-    void savePersistedComposerDrafts(drafts);
+    void savePersistedComposerDrafts({ drafts, appliedVoiceArtifacts });
   }, PERSIST_DEBOUNCE_MS);
 }
 
@@ -215,13 +342,15 @@ export function ensureComposerDraftsLoaded(): void {
     return;
   }
   loadPromise = loadPersistedComposerDrafts()
-    .then((persistedDrafts) => {
-      if (Object.keys(persistedDrafts).length === 0) {
-        return;
-      }
+    .then((persisted) => {
+      appliedVoiceArtifacts = {
+        ...persisted.appliedVoiceArtifacts,
+        ...appliedVoiceArtifacts,
+      };
+      if (Object.keys(persisted.drafts).length === 0) return;
       const current = appAtomRegistry.get(composerDraftsAtom);
       appAtomRegistry.set(composerDraftsAtom, {
-        ...persistedDrafts,
+        ...persisted.drafts,
         ...current,
       });
     })
@@ -237,6 +366,31 @@ export function ensureComposerDraftsLoaded(): void {
       );
       // Draft loading is best-effort; in-memory drafts still keep working.
     });
+}
+
+async function awaitComposerDraftsLoaded(): Promise<void> {
+  ensureComposerDraftsLoaded();
+  await loadPromise;
+}
+
+export async function applyVoiceArtifact(
+  input: ApplyVoiceArtifactInput,
+): Promise<ApplyVoiceArtifactResult> {
+  await awaitComposerDraftsLoaded();
+  if (persistTimer !== null) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+
+  const currentDrafts = appAtomRegistry.get(composerDraftsAtom);
+  const applied = applyVoiceArtifactToState(
+    { drafts: currentDrafts, appliedVoiceArtifacts },
+    input,
+  );
+  appliedVoiceArtifacts = applied.state.appliedVoiceArtifacts;
+  appAtomRegistry.set(composerDraftsAtom, applied.state.drafts);
+  await enqueuePersistedComposerDrafts(applied.state);
+  return applied.result;
 }
 
 function updateComposerDrafts(
@@ -412,10 +566,7 @@ export function removeComposerDraftsForEnvironment(
 }
 
 export async function clearComposerDraftsEnvironment(environmentId: EnvironmentId): Promise<void> {
-  ensureComposerDraftsLoaded();
-  if (loadPromise !== null) {
-    await loadPromise;
-  }
+  await awaitComposerDraftsLoaded();
 
   const next = removeComposerDraftsForEnvironment(
     appAtomRegistry.get(composerDraftsAtom),
@@ -426,8 +577,17 @@ export async function clearComposerDraftsEnvironment(environmentId: EnvironmentI
     clearTimeout(persistTimer);
     persistTimer = null;
   }
+  const environmentPrefix = `${environmentId}:`;
+  const newTaskPrefix = `new-task:${environmentId}:`;
+  appliedVoiceArtifacts = Object.fromEntries(
+    Object.entries(appliedVoiceArtifacts).filter(
+      ([, application]) =>
+        !application.draftKey.startsWith(environmentPrefix) &&
+        !application.draftKey.startsWith(newTaskPrefix),
+    ),
+  );
   appAtomRegistry.set(composerDraftsAtom, next);
-  await writePersistedComposerDrafts(next);
+  await enqueuePersistedComposerDrafts({ drafts: next, appliedVoiceArtifacts });
 }
 
 export function useComposerDraft(draftKey: string | null): ComposerDraft {

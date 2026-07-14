@@ -115,6 +115,15 @@ export interface VoiceHandoffActionRepositoryShape {
     readonly result: VoiceHandoffActionResult;
     readonly acknowledgedAt: string;
   }) => Effect.Effect<DurableVoiceHandoffAction, VoiceHandoffActionRepositoryError>;
+  readonly reconcileActivatedTransition: (input: {
+    readonly actionId: string;
+    readonly authSessionId: string;
+    readonly realtimeSessionId: string;
+    readonly realtimeGeneration: number;
+    readonly projectId: string;
+    readonly threadId: string;
+    readonly reconciledAt: string;
+  }) => Effect.Effect<DurableVoiceHandoffAction, VoiceHandoffActionRepositoryError>;
   readonly expire: (input: {
     readonly now: string;
   }) => Effect.Effect<ReadonlyArray<DurableVoiceHandoffAction>, VoiceHandoffActionRepositoryError>;

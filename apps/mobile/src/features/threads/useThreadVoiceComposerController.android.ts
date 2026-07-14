@@ -6,6 +6,8 @@ import {
 } from "@t3tools/contracts";
 
 import { uuidv4 } from "../../lib/uuid";
+import { scopedThreadKey } from "../../lib/scopedEntities";
+import { applyVoiceArtifact } from "../../state/use-composer-drafts";
 import { useMasterVoice } from "../voice/MasterVoiceProvider";
 import {
   voiceStopIntent,
@@ -13,11 +15,7 @@ import {
   type VoiceWaveformIntentInput,
 } from "../voice/canonicalVoiceViewModel";
 import type { ThreadVoiceComposerControllerInput } from "./threadVoiceComposerControllerTypes";
-
-const appendTranscript = (draft: string, transcript: string): string => {
-  const prefix = draft.length === 0 || /\s$/.test(draft) ? draft : `${draft} `;
-  return `${prefix}${transcript}`;
-};
+import { consumeAndroidVoiceDraftArtifact } from "./androidVoiceDraftArtifactController";
 
 export function useThreadVoiceComposerController(input: ThreadVoiceComposerControllerInput) {
   const { props, dictation } = input;
@@ -26,8 +24,7 @@ export function useThreadVoiceComposerController(input: ThreadVoiceComposerContr
     throw new Error("The Android Thread voice controller requires the autonomous runtime.");
   }
   const composerRevisionRef = useRef(uuidv4());
-  const draftRef = useRef(props.draftMessage);
-  draftRef.current = props.draftMessage;
+  const draftArtifactApplicationsRef = useRef(new Set<string>());
   const operation = master.snapshot?.operation ?? null;
   const autoListenActive = operation?.kind === "thread-turn" && master.voice?.active === true;
   const realtimeInUse = operation?.kind === "realtime" && master.voice?.active === true;
@@ -58,10 +55,37 @@ export function useThreadVoiceComposerController(input: ThreadVoiceComposerContr
     ) {
       return;
     }
-    props.onChangeDraftMessage(appendTranscript(draftRef.current, artifact.transcript));
-    master.completeDraftArtifact(artifact.handle.artifactId, "appended");
-    composerRevisionRef.current = uuidv4();
-  }, [master, props.environmentId, props.onChangeDraftMessage, props.selectedThread]);
+    const artifactId = artifact.handle.artifactId;
+    if (draftArtifactApplicationsRef.current.has(artifactId)) return;
+    draftArtifactApplicationsRef.current.add(artifactId);
+    void consumeAndroidVoiceDraftArtifact({
+      artifact,
+      draftKey: scopedThreadKey(props.environmentId, props.selectedThread.id),
+      now: Date.now(),
+      dependencies: {
+        apply: applyVoiceArtifact,
+        acknowledge: master.completeDraftArtifact,
+      },
+    })
+      .then(() => {
+        composerRevisionRef.current = uuidv4();
+      })
+      .catch((cause: unknown) => {
+        console.warn("[voice-runtime] could not apply draft artifact", {
+          artifactId,
+          cause: cause instanceof Error ? cause.message : "Unknown draft persistence failure.",
+        });
+      })
+      .finally(() => {
+        draftArtifactApplicationsRef.current.delete(artifactId);
+      });
+  }, [
+    master.completeDraftArtifact,
+    master.draftArtifact,
+    props.environmentId,
+    props.selectedThread.id,
+    props.selectedThread.projectId,
+  ]);
 
   const stopNativeMode = useCallback(async () => {
     if (master.snapshot === null) return;

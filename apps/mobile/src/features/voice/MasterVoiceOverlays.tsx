@@ -319,6 +319,8 @@ export function MasterVoiceCallBar(props: {
 export function CanonicalMasterVoiceCallBar(props: {
   readonly historyAvailable: boolean;
   readonly voice: CanonicalVoiceViewModel | null;
+  readonly commandError: string | null;
+  readonly commandPendingLabel: string | null;
   readonly onMute: () => void;
   readonly onRoute: () => void;
   readonly onResume: () => void;
@@ -338,8 +340,14 @@ export function CanonicalMasterVoiceCallBar(props: {
           <Text className="text-sm font-t3-bold text-foreground" numberOfLines={1}>
             Voice conversation
           </Text>
-          <Text className="text-xs text-foreground-muted" numberOfLines={1}>
-            Resume your last conversation
+          <Text
+            accessibilityRole={props.commandError === null ? undefined : "alert"}
+            className={
+              props.commandError === null ? "text-xs text-foreground-muted" : "text-xs text-danger"
+            }
+            numberOfLines={2}
+          >
+            {props.commandError ?? props.commandPendingLabel ?? "Resume your last conversation"}
           </Text>
         </View>
         {props.historyAvailable ? (
@@ -354,6 +362,7 @@ export function CanonicalMasterVoiceCallBar(props: {
           label="Resume"
           accessibilityLabel="Resume last voice conversation"
           variant="primary"
+          disabled={props.commandPendingLabel !== null}
           onPress={props.onResume}
         />
       </View>
@@ -374,8 +383,16 @@ export function CanonicalMasterVoiceCallBar(props: {
         <Text className="text-sm font-t3-bold text-foreground" numberOfLines={1}>
           {props.voice.label}
         </Text>
-        <Text className="text-xs text-foreground-muted" numberOfLines={1}>
-          {props.voice.attention?.label ??
+        <Text
+          accessibilityRole={props.commandError === null ? undefined : "alert"}
+          className={
+            props.commandError === null ? "text-xs text-foreground-muted" : "text-xs text-danger"
+          }
+          numberOfLines={2}
+        >
+          {props.commandError ??
+            props.commandPendingLabel ??
+            props.voice.attention?.label ??
             (props.voice.mode === "thread" ? "Active Thread voice" : "Realtime voice")}
         </Text>
       </View>

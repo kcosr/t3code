@@ -64,6 +64,11 @@ const operationError = (
   retryable = false,
 ) => new VoiceError({ reason, operation, detail, retryable });
 
+const isExpiredHandoffAcknowledgement = (error: VoiceError): boolean =>
+  error.reason === "invalid-phase" &&
+  error.operation === "session.client-action" &&
+  error.detail === "Voice handoff action has expired";
+
 const canonicalFence = (input: {
   readonly runtimeId: string;
   readonly runtimeInstanceId: string;
@@ -392,7 +397,10 @@ const make = Effect.gen(function* () {
       const principal = {
         sessionId: grant.authSessionId,
         scopes: grant.grantedScopes,
-        nativeRuntime: { runtimeId: grant.runtimeId, generation: grant.generation },
+        nativeRuntime: {
+          runtimeId: grant.runtimeId,
+          generation: grant.generation,
+        },
       };
       const created = yield* (
         existingSessionId === undefined
@@ -504,7 +512,10 @@ const make = Effect.gen(function* () {
           leaseGeneration: input.leaseGeneration,
           sdp: input.sdp,
         });
-        return { ...answer, replayed: false } satisfies VoiceRuntimeRealtimeWebRtcAnswer;
+        return {
+          ...answer,
+          replayed: false,
+        } satisfies VoiceRuntimeRealtimeWebRtcAnswer;
       }),
       (value) => ({ ...value, replayed: true as const }),
     );
@@ -720,6 +731,7 @@ const make = Effect.gen(function* () {
               ),
             ),
           );
+        const isStoredReceiptReplay = stored !== undefined;
         let binding: SessionBinding | undefined;
         let receipt = stored;
         let replayed = stored !== undefined;
@@ -840,7 +852,24 @@ const make = Effect.gen(function* () {
           )
           .pipe(Effect.result);
         if (Result.isFailure(acknowledged)) {
-          return yield* acknowledged.failure;
+          if (
+            isStoredReceiptReplay &&
+            activated.replayed &&
+            isExpiredHandoffAcknowledgement(acknowledged.failure)
+          ) {
+            yield* sessions.reconcileActivatedNativeHandoff(
+              receipt.authSessionId,
+              sessionId,
+              input.leaseGeneration,
+              actionId,
+              {
+                projectId: receipt.target.projectId,
+                threadId: receipt.target.threadId,
+              },
+            );
+          } else {
+            return yield* acknowledged.failure;
+          }
         }
         const consumed = yield* transitions
           .consume(transitionTokenHash, now)
@@ -890,7 +919,10 @@ const make = Effect.gen(function* () {
         const result = yield* sessions.close(grant.authSessionId, sessionId, input.leaseGeneration);
         yield* controlGrants.revokeSession(sessionId);
         bindings.delete(sessionId);
-        return { ...result, replayed: false } satisfies VoiceRuntimeRealtimeCloseResult;
+        return {
+          ...result,
+          replayed: false,
+        } satisfies VoiceRuntimeRealtimeCloseResult;
       }),
       (value) => ({ ...value, replayed: true as const }),
     );

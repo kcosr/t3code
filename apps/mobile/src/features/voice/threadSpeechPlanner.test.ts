@@ -4,6 +4,7 @@ import {
   initialThreadSpeechPlannerState,
   interruptThreadSpeech,
   isThreadSpeechSuspended,
+  observeThreadSpeechHistorically,
   planThreadSpeechToggle,
   restoreThreadSpeechPreference,
   setThreadSpeechEnabled,
@@ -12,6 +13,20 @@ import {
 } from "./threadSpeechPlanner";
 
 describe("threadSpeechPlanner", () => {
+  it("baselines historical projection without starting playback", () => {
+    const historical = { id: "restored", text: "restored response", streaming: false };
+    const enabled = setThreadSpeechEnabled(initialThreadSpeechPlannerState(), true, null).state;
+    const result = observeThreadSpeechHistorically(enabled, historical);
+
+    expect(result.actions).toEqual([]);
+    expect(result.state).toEqual({
+      enabled: true,
+      baselineMessageId: "restored",
+      active: null,
+    });
+    expect(updateThreadSpeech(result.state, historical, () => "playback-1").actions).toEqual([]);
+  });
+
   it("suppresses queued speech work during Realtime while preserving cancellation", () => {
     expect(shouldSuppressThreadSpeechAction("start", true)).toBe(true);
     expect(shouldSuppressThreadSpeechAction("segment", true)).toBe(true);

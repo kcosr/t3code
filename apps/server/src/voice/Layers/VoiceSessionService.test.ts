@@ -215,9 +215,31 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
             [...records].map(([tokenHash, record]) => [
               tokenHash,
               record.sessionId === sessionId
-                ? { ...record, capabilities: new Set(["handoff-actions" as const]) }
+                ? {
+                    ...record,
+                    capabilities: new Set(["handoff-actions" as const]),
+                  }
                 : record,
             ]),
+          ),
+      ),
+    completeHandoff: (sessionId) =>
+      Ref.update(
+        nativeControlGrantRecords,
+        (records) =>
+          new Map(
+            [...records].flatMap(([tokenHash, record]) => {
+              if (record.sessionId !== sessionId) return [[tokenHash, record] as const];
+              if (record.runtimeId === undefined || !record.capabilities.has("session-close")) {
+                return [];
+              }
+              return [
+                [
+                  tokenHash,
+                  { ...record, capabilities: new Set(["session-close" as const]) },
+                ] as const,
+              ];
+            }),
           ),
       ),
     revokeSession: (sessionId) =>
@@ -339,6 +361,35 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
             };
             yield* Ref.update(handoffActions, (actions) => new Map(actions).set(actionId, settled));
             return settled;
+          }),
+        reconcileActivatedTransition: (input) =>
+          Effect.gen(function* () {
+            const action = (yield* Ref.get(handoffActions)).get(input.actionId);
+            if (
+              action === undefined ||
+              action.authSessionId !== input.authSessionId ||
+              action.realtimeSessionId !== input.realtimeSessionId ||
+              action.realtimeGeneration !== input.realtimeGeneration ||
+              action.projectId !== input.projectId ||
+              action.threadId !== input.threadId ||
+              (action.status !== "expired" && action.status !== "settled")
+            ) {
+              return yield* Effect.die("invalid test handoff reconciliation");
+            }
+            const reconciled: DurableVoiceHandoffAction = {
+              ...action,
+              status: "settled",
+              outcome: "succeeded",
+              outcomeState: "accepted",
+              outcomeStage: null,
+              outcomeReason: null,
+              updatedAt: input.reconciledAt,
+              settledAt: input.reconciledAt,
+            };
+            yield* Ref.update(handoffActions, (actions) =>
+              new Map(actions).set(input.actionId, reconciled),
+            );
+            return reconciled;
           }),
         expire: ({ now }) =>
           Ref.modify(handoffActions, (actions) => {
@@ -800,8 +851,9 @@ it.effect(
         expect(encodeJson(diagnostics)).not.toContain("show threads");
         expect(encodeJson(diagnostics)).not.toContain("fake-offer");
       }).pipe(
-        Effect.provide(test.layer),
-        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        Effect.provide(
+          Layer.mergeAll(test.layer, Logger.layer([logger], { mergeWithExisting: false })),
+        ),
       );
     }),
 );
@@ -2257,6 +2309,127 @@ it.effect("journals and revokes a handoff that expires during native acknowledge
       expect(
         (yield* Ref.get(test.appended)).filter((entry) => entry.kind === "device-handoff"),
       ).toHaveLength(1);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("durably reconciles an expired handoff after exact transition activation", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeTerminalHandoffFixture("activated-recovery");
+    const test = yield* makeLayer(fixture.provider, fixture.executor);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("handoff-recovery-owner");
+      const created = yield* sessions.create(principal(owner), input(false, "handoff-recovery"));
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      yield* Deferred.await(fixture.terminalOutput);
+      yield* Deferred.succeed(fixture.terminalOutputRelease, undefined);
+      yield* Effect.yieldNow;
+      yield* Ref.update(test.handoffActions, (actions) => {
+        const action = actions.get(fixture.actionId);
+        if (action === undefined) throw new Error("missing recovery handoff action");
+        return new Map(actions).set(fixture.actionId, {
+          ...action,
+          expiresAt: "1970-01-01T00:00:00.000Z",
+        });
+      });
+
+      const expired = yield* sessions
+        .acknowledgeNativeHandoffAction(
+          owner,
+          created.state.sessionId,
+          created.state.leaseGeneration,
+          fixture.actionId,
+          { outcome: "succeeded", state: "accepted" },
+        )
+        .pipe(Effect.flip);
+      expect(expired.reason).toBe("invalid-phase");
+
+      const wrongTarget = yield* sessions
+        .reconcileActivatedNativeHandoff(
+          owner,
+          created.state.sessionId,
+          created.state.leaseGeneration,
+          fixture.actionId,
+          {
+            projectId: fixture.projectId,
+            threadId: ThreadId.make("other-thread"),
+          },
+        )
+        .pipe(Effect.flip);
+      expect(wrongTarget.reason).toBe("authorization-revoked");
+
+      const reconciled = yield* sessions.reconcileActivatedNativeHandoff(
+        owner,
+        created.state.sessionId,
+        created.state.leaseGeneration,
+        fixture.actionId,
+        { projectId: fixture.projectId, threadId: fixture.threadId },
+      );
+      expect(reconciled).toEqual({
+        actionId: fixture.actionId,
+        action: "handoff-to-thread-voice",
+        outcome: "succeeded",
+      });
+      expect((yield* Ref.get(test.handoffActions)).get(fixture.actionId)).toMatchObject({
+        status: "settled",
+        outcome: "succeeded",
+        outcomeState: "accepted",
+        outcomeStage: null,
+        outcomeReason: null,
+      });
+      const journal = (yield* Ref.get(test.appended)).filter(
+        (entry) => entry.kind === "device-handoff",
+      );
+      expect(journal).toHaveLength(2);
+      expect(journal[0]?.payload).toMatchObject({
+        actionId: fixture.actionId,
+        outcome: "failed",
+        reason: "operation-timeout",
+      });
+      expect(journal[1]?.payload).toMatchObject({
+        actionId: fixture.actionId,
+        outcome: "succeeded",
+        state: "accepted",
+        reconciliation: "activated-transition-replay",
+        reconcilesEntryId: expect.stringMatching(
+          new RegExp(`^voice-handoff:${fixture.actionId}:outcome:`),
+        ),
+      });
+
+      yield* sessions.reconcileActivatedNativeHandoff(
+        owner,
+        created.state.sessionId,
+        created.state.leaseGeneration,
+        fixture.actionId,
+        { projectId: fixture.projectId, threadId: fixture.threadId },
+      );
+      expect(
+        (yield* Ref.get(test.appended)).filter((entry) => entry.kind === "device-handoff"),
+      ).toHaveLength(2);
+
+      expect(
+        yield* sessions.acknowledgeNativeHandoffAction(
+          owner,
+          created.state.sessionId,
+          created.state.leaseGeneration,
+          fixture.actionId,
+          { outcome: "succeeded", state: "accepted" },
+        ),
+      ).toMatchObject({ outcome: "succeeded" });
+      const afterReceiptReplay = (yield* Ref.get(test.appended)).filter(
+        (entry) => entry.kind === "device-handoff",
+      );
+      expect(afterReceiptReplay).toHaveLength(3);
+      expect(afterReceiptReplay.at(-1)?.payload).toMatchObject({
+        actionId: fixture.actionId,
+        outcome: "succeeded",
+        state: "accepted",
+      });
     }).pipe(Effect.provide(test.layer));
   }),
 );

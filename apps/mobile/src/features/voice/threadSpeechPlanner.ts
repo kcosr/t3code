@@ -102,6 +102,22 @@ export const interruptThreadSpeech = (
   active: null,
 });
 
+/** Advances the baseline without making a restored or unanchored message audible. */
+export const observeThreadSpeechHistorically = (
+  state: ThreadSpeechPlannerState,
+  latest: AssistantSpeechSnapshot | null,
+): {
+  readonly state: ThreadSpeechPlannerState;
+  readonly actions: ReadonlyArray<ThreadSpeechAction>;
+} => ({
+  state: {
+    enabled: state.enabled,
+    baselineMessageId: latest?.id ?? state.baselineMessageId,
+    active: null,
+  },
+  actions: state.active ? [{ type: "cancel", playbackId: state.active.playbackId }] : [],
+});
+
 export const planThreadSpeechToggle = (
   state: ThreadSpeechPlannerState,
   latest: AssistantSpeechSnapshot | null,

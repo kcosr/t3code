@@ -5,6 +5,7 @@ import {
   ThreadId,
   EnvironmentId,
   VoiceNativeRuntimeId,
+  VoiceRuntimeProvisioningOperationId,
   type VoiceNativeRuntimeGrant,
 } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vitest";
@@ -65,7 +66,7 @@ function grant(token = "runtime-secret"): VoiceNativeRuntimeGrant {
     token,
     runtimeId: RUNTIME_ID,
     generation: 7,
-    provisioningOperationId: `provision-${RUNTIME_ID}-7`,
+    provisioningOperationId: VoiceRuntimeProvisioningOperationId.make(`provision-${RUNTIME_ID}-7`),
     target,
     issuedAt: ISSUED_AT,
     expiresAt: EXPIRES_AT,

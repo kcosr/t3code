@@ -276,6 +276,66 @@ layer("VoiceHandoffActionRepository", (it) => {
     }),
   );
 
+  it.effect("reconciles only an exactly matching activated transition after canonical expiry", () =>
+    Effect.gen(function* () {
+      yield* seedConversation;
+      const repository = yield* VoiceHandoffActionRepository;
+      yield* repository.create(identity);
+      yield* repository.activate({
+        actionId: identity.actionId,
+        activatedAt: identity.createdAt,
+        expiresAt: identity.expiresAt,
+      });
+      yield* repository.expire({ now: identity.expiresAt });
+
+      const mismatched = yield* Effect.flip(
+        repository.reconcileActivatedTransition({
+          ...identity,
+          threadId: "thread-other",
+          reconciledAt: "2026-07-12T10:01:01.000Z",
+        }),
+      );
+      assert.instanceOf(mismatched, VoiceHandoffActionConflictError);
+      const reconciled = yield* repository.reconcileActivatedTransition({
+        ...identity,
+        reconciledAt: "2026-07-12T10:01:02.000Z",
+      });
+      assert.equal(reconciled.status, "settled");
+      assert.equal(reconciled.outcome, "succeeded");
+      assert.equal(reconciled.outcomeState, "accepted");
+      assert.isNull(reconciled.outcomeStage);
+      assert.isNull(reconciled.outcomeReason);
+      assert.deepStrictEqual(
+        yield* repository.reconcileActivatedTransition({
+          ...identity,
+          reconciledAt: "2026-07-12T10:01:03.000Z",
+        }),
+        reconciled,
+      );
+    }),
+  );
+
+  it.effect("does not turn an ordinary first-time expiry into success", () =>
+    Effect.gen(function* () {
+      yield* seedConversation;
+      const repository = yield* VoiceHandoffActionRepository;
+      yield* repository.create(identity);
+      yield* repository.activate({
+        actionId: identity.actionId,
+        activatedAt: identity.createdAt,
+        expiresAt: identity.expiresAt,
+      });
+      const pending = yield* Effect.flip(
+        repository.reconcileActivatedTransition({
+          ...identity,
+          reconciledAt: "2026-07-12T10:00:30.000Z",
+        }),
+      );
+      assert.instanceOf(pending, VoiceHandoffActionConflictError);
+      assert.equal(Option.getOrThrow(yield* repository.get(identity.actionId)).status, "pending");
+    }),
+  );
+
   it.effect("allows only one of two concurrent conflicting acknowledgements", () =>
     Effect.gen(function* () {
       yield* seedConversation;
@@ -319,6 +379,51 @@ layer("VoiceHandoffActionRepository", (it) => {
       const stored = yield* repository.get(identity.actionId);
       assert.isTrue(Option.isSome(stored));
       assert.equal(Option.getOrThrow(stored).status, "settled");
+    }),
+  );
+
+  it.effect("returns only rows atomically expired during a concurrent acknowledgement", () =>
+    Effect.gen(function* () {
+      yield* seedConversation;
+      const repository = yield* VoiceHandoffActionRepository;
+      yield* repository.create(identity);
+      yield* repository.activate({
+        actionId: identity.actionId,
+        activatedAt: identity.createdAt,
+        expiresAt: identity.expiresAt,
+      });
+      const [acknowledged, expired] = yield* Effect.all(
+        [
+          Effect.exit(
+            repository.acknowledge({
+              actionId: identity.actionId,
+              authSessionId: identity.authSessionId,
+              result: {
+                outcome: "succeeded",
+                outcomeState: "accepted",
+                outcomeStage: null,
+                outcomeReason: null,
+              },
+              acknowledgedAt: "2026-07-12T10:00:59.000Z",
+            }),
+          ),
+          repository.expire({ now: identity.expiresAt }),
+        ],
+        { concurrency: "unbounded" },
+      );
+      const stored = Option.getOrThrow(yield* repository.get(identity.actionId));
+      assert.isTrue(expired.every((action) => action.status === "expired"));
+      if (stored.status === "settled") {
+        assert.equal(acknowledged._tag, "Success");
+        assert.lengthOf(expired, 0);
+        assert.equal(stored.outcome, "succeeded");
+      } else {
+        assert.equal(stored.status, "expired");
+        assert.deepStrictEqual(
+          expired.map((action) => action.actionId),
+          [identity.actionId],
+        );
+      }
     }),
   );
 });

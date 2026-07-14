@@ -18,6 +18,7 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
 import * as NodeCrypto from "node:crypto";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -150,7 +151,7 @@ it.effect("hashes, rotates, expires, and auth-fences runtime grants", () =>
       operationTokenExpiresAt: now + 60_000,
       retentionExpiresAt: now + 120_000,
       nowEpochMillis: now,
-      now: new Date(now).toISOString(),
+      now: DateTime.formatIso(DateTime.makeUnsafe(now)),
     });
     expect(yield* threadTurns.authorize(threadOperationId, threadTokenHash, now)).toBeDefined();
 
@@ -379,6 +380,48 @@ it.effect("rejects a stale generation when child authority is issued after rotat
       })
       .pipe(Effect.flip);
     expect(rejected).toMatchObject({ reason: "invalid-phase" });
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("reduces a completed runtime handoff to close-only child authority", () =>
+  Effect.gen(function* () {
+    yield* runMigrations({ toMigrationInclusive: 52 });
+    yield* insertActiveAuthSession();
+    const runtimeGrants = yield* __testing.make;
+    const childGrants = yield* VoiceNativeControlGrantRegistry;
+    const now = yield* Clock.currentTimeMillis;
+    yield* runtimeGrants.issue({
+      authSessionId,
+      runtimeId,
+      generation: 1,
+      provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("close-only-runtime"),
+      grantedScopes: new Set([AuthVoiceUseScope]),
+      target,
+      expiresAt: now + 60_000,
+    });
+    const sessionId = VoiceSessionId.make("completed-handoff-session");
+    const token = yield* childGrants.issue({
+      authSessionId,
+      runtimeId,
+      runtimeGeneration: 1,
+      sessionId,
+      leaseGeneration: 1,
+      expiresAt: now + 60_000,
+      capabilities: new Set([
+        "session-control",
+        "handoff-actions",
+        "webrtc-signaling",
+        "session-close",
+      ]),
+    });
+
+    yield* childGrants.completeHandoff(sessionId);
+
+    expect(yield* childGrants.authorize(token)).toMatchObject({
+      runtimeId,
+      runtimeGeneration: 1,
+      capabilities: new Set(["session-close"]),
+    });
   }).pipe(Effect.provide(testLayer)),
 );
 

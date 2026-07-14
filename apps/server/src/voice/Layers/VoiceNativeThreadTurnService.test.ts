@@ -15,6 +15,7 @@ import {
   VoiceRuntimeInstanceId,
   VoiceRuntimeId,
   VoiceSpeechPlanId,
+  VoiceRuntimeProvisioningOperationId,
   VoiceTurnClientOperationId,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
@@ -133,6 +134,9 @@ const makeTestLayer = Effect.fn("test.makeNativeThreadTurnServiceLayer")(functio
                   authSessionId,
                   runtimeId,
                   generation: 1,
+                  provisioningOperationId: VoiceRuntimeProvisioningOperationId.make(
+                    "provision-thread-turn-test-1",
+                  ),
                   grantedScopes: new Set(),
                   target: {
                     mode: "thread" as const,

@@ -97,16 +97,17 @@ const make = Effect.gen(function* () {
         ],
       ),
   });
-  const findExpired = SqlSchema.findAll({
+  const expirePending = SqlSchema.findAll({
     Request: Schema.Struct({ now: Schema.String }),
     Result: VoiceHandoffActionRow,
     execute: ({ now }) =>
       sql.unsafe(
-        `SELECT ${selectColumns}
-       FROM voice_handoff_actions
-       WHERE status = 'pending' AND expires_at <= ?
-       ORDER BY expires_at ASC, action_id ASC`,
-        [now],
+        `UPDATE voice_handoff_actions
+         SET status = 'expired', outcome = 'failed', outcome_stage = 'recognition-start',
+             outcome_reason = 'operation-timeout', updated_at = ?, settled_at = ?
+         WHERE status = 'pending' AND expires_at <= ?
+         RETURNING ${selectColumns}`,
+        [now, now, now],
       ),
   });
 
@@ -255,18 +256,94 @@ const make = Effect.gen(function* () {
   const expire: VoiceHandoffActionRepositoryShape["expire"] = Effect.fn(
     "VoiceHandoffActionRepository.expire",
   )(function* (input) {
-    const candidates = yield* findExpired({ now: input.now }).pipe(
-      Effect.mapError(toPersistenceSqlError("VoiceHandoffActionRepository.expire:list")),
+    return yield* expirePending({ now: input.now }).pipe(
+      Effect.map((rows) => rows.map(mapRow)),
+      Effect.mapError(toPersistenceSqlError("VoiceHandoffActionRepository.expire:update")),
     );
-    if (candidates.length === 0) return [];
-    yield* sql`
-      UPDATE voice_handoff_actions
-      SET status = 'expired', outcome = 'failed', outcome_stage = 'recognition-start',
-          outcome_reason = 'operation-timeout', updated_at = ${input.now}, settled_at = ${input.now}
-      WHERE status = 'pending' AND expires_at <= ${input.now}
-    `.pipe(Effect.mapError(toPersistenceSqlError("VoiceHandoffActionRepository.expire:update")));
-    return yield* Effect.forEach(candidates, (candidate) => requireAction(candidate.actionId));
   });
+
+  const reconcileActivatedTransition: VoiceHandoffActionRepositoryShape["reconcileActivatedTransition"] =
+    Effect.fn("VoiceHandoffActionRepository.reconcileActivatedTransition")(function* (input) {
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const action = yield* requireAction(input.actionId);
+            const identityMatches =
+              action.authSessionId === input.authSessionId &&
+              action.realtimeSessionId === input.realtimeSessionId &&
+              action.realtimeGeneration === input.realtimeGeneration &&
+              action.projectId === input.projectId &&
+              action.threadId === input.threadId;
+            if (!identityMatches) {
+              return yield* new VoiceHandoffActionConflictError({
+                actionId: input.actionId,
+                operation: "reconcile-activated-transition-identity",
+              });
+            }
+            const alreadyReconciled =
+              action.status === "settled" &&
+              action.outcome === "succeeded" &&
+              action.outcomeState === "accepted" &&
+              action.outcomeStage === null &&
+              action.outcomeReason === null;
+            if (alreadyReconciled) return action;
+            const isCanonicalExpiry =
+              action.status === "expired" &&
+              action.outcome === "failed" &&
+              action.outcomeState === null &&
+              action.outcomeStage === "recognition-start" &&
+              action.outcomeReason === "operation-timeout";
+            if (!isCanonicalExpiry) {
+              return yield* new VoiceHandoffActionConflictError({
+                actionId: input.actionId,
+                operation: "reconcile-activated-transition-state",
+              });
+            }
+            yield* sql`
+            UPDATE voice_handoff_actions
+            SET status = 'settled', outcome = 'succeeded', outcome_state = 'accepted',
+                outcome_stage = NULL, outcome_reason = NULL,
+                updated_at = ${input.reconciledAt}, settled_at = ${input.reconciledAt}
+            WHERE action_id = ${input.actionId}
+              AND auth_session_id = ${input.authSessionId}
+              AND realtime_session_id = ${input.realtimeSessionId}
+              AND realtime_generation = ${input.realtimeGeneration}
+              AND project_id = ${input.projectId} AND thread_id = ${input.threadId}
+              AND status = 'expired' AND outcome = 'failed' AND outcome_state IS NULL
+              AND outcome_stage = 'recognition-start' AND outcome_reason = 'operation-timeout'
+          `.pipe(
+              Effect.mapError(
+                toPersistenceSqlError(
+                  "VoiceHandoffActionRepository.reconcileActivatedTransition:update",
+                ),
+              ),
+            );
+            const reconciled = yield* requireAction(input.actionId);
+            if (
+              reconciled.status !== "settled" ||
+              reconciled.outcome !== "succeeded" ||
+              reconciled.outcomeState !== "accepted" ||
+              reconciled.outcomeStage !== null ||
+              reconciled.outcomeReason !== null
+            ) {
+              return yield* new VoiceHandoffActionConflictError({
+                actionId: input.actionId,
+                operation: "reconcile-activated-transition-race",
+              });
+            }
+            return reconciled;
+          }),
+        )
+        .pipe(
+          Effect.catchTag("SqlError", (cause) =>
+            Effect.fail(
+              toPersistenceSqlError(
+                "VoiceHandoffActionRepository.reconcileActivatedTransition:transaction",
+              )(cause),
+            ),
+          ),
+        );
+    });
 
   return VoiceHandoffActionRepository.of({
     create,
@@ -274,6 +351,7 @@ const make = Effect.gen(function* () {
     activate,
     listPending,
     acknowledge,
+    reconcileActivatedTransition,
     expire,
   });
 });

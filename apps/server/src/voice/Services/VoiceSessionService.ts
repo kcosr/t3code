@@ -114,6 +114,16 @@ export interface VoiceSessionServiceShape {
     actionId: VoiceClientActionId,
     input: VoiceNativeHandoffActionAckInput,
   ) => Effect.Effect<VoiceClientActionAckResult, VoiceError>;
+  readonly reconcileActivatedNativeHandoff: (
+    ownerAuthSessionId: AuthSessionId,
+    sessionId: VoiceSessionId,
+    leaseGeneration: number,
+    actionId: VoiceClientActionId,
+    target: {
+      readonly projectId: import("@t3tools/contracts").ProjectId;
+      readonly threadId: import("@t3tools/contracts").ThreadId;
+    },
+  ) => Effect.Effect<VoiceClientActionAckResult, VoiceError>;
 }
 
 export class VoiceSessionService extends Context.Service<
