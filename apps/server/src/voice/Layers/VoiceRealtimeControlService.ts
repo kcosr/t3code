@@ -34,12 +34,16 @@ import { VoiceSessionService } from "../Services/VoiceSessionService.ts";
 
 const START_CLAIM_MILLIS = 60_000;
 const TRANSITION_TOKEN_KEY_NAME = "voice-realtime-transition-token-key-v1";
+const OPERATION_CACHE_TTL_MILLIS = 5 * 60_000;
+const OPERATION_CACHE_LIMIT = 512;
 
 interface SessionBinding {
+  readonly authSessionId: string;
   readonly runtimeId: string;
   readonly runtimeInstanceId: string;
   readonly generation: number;
   readonly modeSessionId: string;
+  readonly leaseGeneration: number;
   readonly acknowledgedActionSequences: Set<number>;
 }
 
@@ -47,6 +51,7 @@ interface CachedOperation {
   readonly tokenHash: string;
   readonly fingerprint: string;
   readonly result: unknown;
+  readonly expiresAt: number;
 }
 
 const hash = (...parts: ReadonlyArray<string | number>) =>
@@ -137,6 +142,38 @@ const make = Effect.gen(function* () {
   const mutex = yield* Semaphore.make(1);
   const bindings = new Map<string, SessionBinding>();
   const operations = new Map<string, CachedOperation>();
+  const sessionMutexes = new Map<string, Semaphore.Semaphore>();
+
+  const maintainOperationCache = (now: number): void => {
+    for (const [key, cached] of operations) {
+      if (cached.expiresAt <= now) operations.delete(key);
+    }
+    while (operations.size > OPERATION_CACHE_LIMIT) {
+      const oldest = operations.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      operations.delete(oldest);
+    }
+    const retainedSessions = new Set(
+      [...operations.keys()].map((key) => key.slice(0, key.indexOf("\0"))),
+    );
+    for (const sessionKey of sessionMutexes.keys()) {
+      if (!bindings.has(sessionKey) && !retainedSessions.has(sessionKey)) {
+        sessionMutexes.delete(sessionKey);
+      }
+    }
+  };
+
+  const sessionMutex = (sessionId: VoiceSessionId): Effect.Effect<Semaphore.Semaphore> =>
+    mutex.withPermits(1)(
+      Effect.gen(function* () {
+        const key = String(sessionId);
+        const existing = sessionMutexes.get(key);
+        if (existing !== undefined) return existing;
+        const created = yield* Semaphore.make(1);
+        sessionMutexes.set(key, created);
+        return created;
+      }),
+    );
 
   const requireControl = Effect.fn("VoiceRealtimeControlService.requireControl")(function* (
     token: string,
@@ -151,7 +188,37 @@ const make = Effect.gen(function* () {
     capability: "session-control" | "handoff-actions" | "webrtc-signaling" | "session-close",
   ) {
     const grant = yield* controlGrants.authorize(token);
-    const binding = bindings.get(sessionId);
+    let binding = bindings.get(sessionId);
+    if (grant !== undefined && binding === undefined) {
+      const persisted = yield* starts
+        .findBySession(sessionId, yield* Clock.currentTimeMillis)
+        .pipe(
+          Effect.mapError((cause) =>
+            operationError(
+              "provider-unavailable",
+              "runtime-realtime.authorize",
+              `Realtime start storage is unavailable: ${String(cause)}`,
+              true,
+            ),
+          ),
+        );
+      if (
+        persisted !== undefined &&
+        persisted.sessionId === sessionId &&
+        persisted.leaseGeneration !== null
+      ) {
+        binding = {
+          authSessionId: String(persisted.authSessionId),
+          runtimeId: String(persisted.runtimeId),
+          runtimeInstanceId: String(persisted.runtimeInstanceId),
+          generation: persisted.runtimeGeneration,
+          modeSessionId: String(persisted.modeSessionId),
+          leaseGeneration: persisted.leaseGeneration,
+          acknowledgedActionSequences: new Set(),
+        };
+        bindings.set(sessionId, binding);
+      }
+    }
     if (
       grant === undefined ||
       binding === undefined ||
@@ -161,10 +228,12 @@ const make = Effect.gen(function* () {
       grant.runtimeId === undefined ||
       String(grant.runtimeId) !== input.runtimeId ||
       grant.runtimeGeneration !== input.generation ||
+      binding.authSessionId !== grant.authSessionId ||
       binding.runtimeId !== input.runtimeId ||
       binding.runtimeInstanceId !== input.runtimeInstanceId ||
       binding.generation !== input.generation ||
-      binding.modeSessionId !== input.modeSessionId
+      binding.modeSessionId !== input.modeSessionId ||
+      binding.leaseGeneration !== input.leaseGeneration
     ) {
       return yield* operationError(
         "authorization-revoked",
@@ -183,26 +252,37 @@ const make = Effect.gen(function* () {
     effect: Effect.Effect<A, VoiceError>,
     replay: (value: A) => A,
   ): Effect.Effect<A, VoiceError> =>
-    mutex.withPermits(1)(
-      Effect.gen(function* () {
-        const key = `${sessionId}\0${clientOperationId}`;
-        const existing = operations.get(key);
-        const tokenHash = hash(token);
-        if (existing !== undefined) {
-          if (existing.tokenHash !== tokenHash || existing.fingerprint !== fingerprint) {
-            return yield* operationError(
-              "invalid-phase",
-              "runtime-realtime.idempotency",
-              "Realtime operation identity was reused with different input",
-            );
+    Effect.gen(function* () {
+      const sessionLock = yield* sessionMutex(sessionId);
+      return yield* sessionLock.withPermits(1)(
+        Effect.gen(function* () {
+          const now = yield* Clock.currentTimeMillis;
+          maintainOperationCache(now);
+          const key = `${sessionId}\0${clientOperationId}`;
+          const existing = operations.get(key);
+          const tokenHash = hash(token);
+          if (existing !== undefined) {
+            if (existing.tokenHash !== tokenHash || existing.fingerprint !== fingerprint) {
+              return yield* operationError(
+                "invalid-phase",
+                "runtime-realtime.idempotency",
+                "Realtime operation identity was reused with different input",
+              );
+            }
+            return replay(existing.result as A);
           }
-          return replay(existing.result as A);
-        }
-        const value = yield* effect;
-        operations.set(key, { tokenHash, fingerprint, result: value });
-        return value;
-      }),
-    );
+          const value = yield* effect;
+          operations.set(key, {
+            tokenHash,
+            fingerprint,
+            result: value,
+            expiresAt: now + OPERATION_CACHE_TTL_MILLIS,
+          });
+          maintainOperationCache(now);
+          return value;
+        }),
+      );
+    });
 
   const create: VoiceRealtimeControlServiceShape["create"] = (runtimeToken, input) =>
     Effect.gen(function* () {
@@ -267,7 +347,9 @@ const make = Effect.gen(function* () {
           operationKey,
           authSessionId: grant.authSessionId,
           runtimeId: grant.runtimeId,
+          runtimeInstanceId: input.runtimeInstanceId,
           runtimeGeneration: grant.generation,
+          modeSessionId: input.modeSessionId,
           clientOperationId: operationIdentity,
           conversationId: grant.target.conversation.conversationId,
           claimExpiresAt: Math.min(grant.expiresAt, now + START_CLAIM_MILLIS),
@@ -334,11 +416,22 @@ const make = Effect.gen(function* () {
         }
         return yield* created.failure;
       }
+      if (
+        claimed.status === "existing" &&
+        claimed.record.leaseGeneration !== created.success.state.leaseGeneration
+      ) {
+        return yield* operationError(
+          "authorization-revoked",
+          "runtime-realtime.create",
+          "The persisted Realtime lease no longer matches the resident session",
+        );
+      }
       if (claimed.status === "claimed") {
         const bound = yield* starts
           .bindSession(
             operationKey,
             created.success.state.sessionId,
+            created.success.state.leaseGeneration,
             yield* Clock.currentTimeMillis,
           )
           .pipe(
@@ -369,15 +462,19 @@ const make = Effect.gen(function* () {
       }
       const priorBinding = bindings.get(created.success.state.sessionId);
       bindings.set(created.success.state.sessionId, {
+        authSessionId: String(grant.authSessionId),
         runtimeId: input.runtimeId,
         runtimeInstanceId: input.runtimeInstanceId,
         generation: input.generation,
         modeSessionId: input.modeSessionId,
+        leaseGeneration: created.success.state.leaseGeneration,
         acknowledgedActionSequences:
-          priorBinding?.runtimeId === input.runtimeId &&
+          priorBinding?.authSessionId === grant.authSessionId &&
+          priorBinding.runtimeId === input.runtimeId &&
           priorBinding.runtimeInstanceId === input.runtimeInstanceId &&
           priorBinding.generation === input.generation &&
-          priorBinding.modeSessionId === input.modeSessionId
+          priorBinding.modeSessionId === input.modeSessionId &&
+          priorBinding.leaseGeneration === created.success.state.leaseGeneration
             ? priorBinding.acknowledgedActionSequences
             : new Set(),
       });
@@ -474,7 +571,11 @@ const make = Effect.gen(function* () {
       token,
       sessionId,
       input.clientOperationId,
-      `action-ack\0${canonicalFence(input)}\0${actionId}\0${input.actionSequence}\0${input.outcome}\0${input.message ?? ""}`,
+      `action-ack\0${canonicalFence(input)}\0${actionId}\0${input.actionSequence}\0${
+        input.action === "navigate-thread"
+          ? `${input.action}\0${input.outcome}\0${input.message ?? ""}`
+          : `${input.action}\0${input.confirmationId}\0${input.decision}`
+      }`,
       Effect.gen(function* () {
         const { grant, binding } = yield* requireControl(
           token,
@@ -495,19 +596,14 @@ const make = Effect.gen(function* () {
             "Realtime action identity or sequence does not match",
           );
         }
-        const earlier = actions.find(
-          (candidate) =>
-            candidate.sequence < action.sequence &&
-            !binding.acknowledgedActionSequences.has(candidate.sequence),
-        );
-        if (earlier !== undefined) {
-          return yield* operationError(
-            "invalid-phase",
-            "runtime-realtime.action-ack",
-            "Realtime actions must be acknowledged in order",
-          );
-        }
         if (action.type === "navigate-thread") {
+          if (input.action !== "navigate-thread") {
+            return yield* operationError(
+              "invalid-phase",
+              "runtime-realtime.action-ack",
+              "Realtime action acknowledgement kind does not match the pending action",
+            );
+          }
           yield* sessions.acknowledgeClientAction(grant.authSessionId, sessionId, actionId, {
             leaseGeneration: input.leaseGeneration,
             action: "activate-thread",
@@ -515,8 +611,18 @@ const make = Effect.gen(function* () {
             ...(input.message === undefined ? {} : { message: input.message }),
           });
         } else if (action.type === "confirmation-required") {
+          if (
+            input.action !== "confirmation-required" ||
+            input.confirmationId !== action.confirmationId
+          ) {
+            return yield* operationError(
+              "invalid-phase",
+              "runtime-realtime.action-ack",
+              "Realtime confirmation decision does not match the pending action",
+            );
+          }
           yield* sessions.confirm(grant.authSessionId, sessionId, action.confirmationId, {
-            decision: input.outcome === "succeeded" ? "approve" : "reject",
+            decision: input.decision,
           });
         } else {
           return yield* operationError(
@@ -529,7 +635,7 @@ const make = Effect.gen(function* () {
         return {
           actionId,
           actionSequence: action.sequence,
-          outcome: input.outcome,
+          outcome: input.action === "navigate-thread" ? input.outcome : "succeeded",
           replayed: false,
         } satisfies VoiceRuntimeRealtimeActionAckResult;
       }),
@@ -666,22 +772,6 @@ const make = Effect.gen(function* () {
               "Realtime handoff action is not pending for this session",
             );
           }
-          const earlier = events.events
-            .map(toAction)
-            .find(
-              (candidate) =>
-                candidate !== undefined &&
-                "actionId" in candidate &&
-                candidate.sequence < event.sequence &&
-                !authorized.binding.acknowledgedActionSequences.has(candidate.sequence),
-            );
-          if (earlier !== undefined) {
-            return yield* operationError(
-              "invalid-phase",
-              "runtime-realtime.handoff",
-              "Realtime actions must be consumed in order",
-            );
-          }
           const target: VoiceThreadRuntimeTarget = {
             mode: "thread",
             environmentId: input.environmentId,
@@ -733,18 +823,6 @@ const make = Effect.gen(function* () {
             claimed.status === "existing" ? claimed.record : { ...candidate, consumedAt: null };
           replayed = claimed.status === "existing";
         }
-        const acknowledged = yield* sessions
-          .acknowledgeNativeHandoffAction(
-            receipt.authSessionId,
-            sessionId,
-            input.leaseGeneration,
-            actionId,
-            { outcome: "succeeded", state: "listening" },
-          )
-          .pipe(Effect.result);
-        if (Result.isFailure(acknowledged)) {
-          return yield* acknowledged.failure;
-        }
         const activated = yield* runtimeGrants.activateTransition(transitionToken, {
           authSessionId: receipt.authSessionId,
           runtimeId: VoiceNativeRuntimeId.make(receipt.runtimeId),
@@ -752,6 +830,18 @@ const make = Effect.gen(function* () {
           targetGeneration: receipt.targetGeneration,
           target: receipt.target,
         });
+        const acknowledged = yield* sessions
+          .acknowledgeNativeHandoffAction(
+            receipt.authSessionId,
+            sessionId,
+            input.leaseGeneration,
+            actionId,
+            { outcome: "succeeded", state: "accepted" },
+          )
+          .pipe(Effect.result);
+        if (Result.isFailure(acknowledged)) {
+          return yield* acknowledged.failure;
+        }
         const consumed = yield* transitions
           .consume(transitionTokenHash, now)
           .pipe(
@@ -764,14 +854,6 @@ const make = Effect.gen(function* () {
               ),
             ),
           );
-        if (consumed.status === "missing") {
-          return yield* operationError(
-            "provider-unavailable",
-            "runtime-realtime.handoff",
-            "Realtime handoff transition receipt expired before activation completed",
-            true,
-          );
-        }
         binding?.acknowledgedActionSequences.add(receipt.actionSequence);
         return {
           actionId,
@@ -786,7 +868,11 @@ const make = Effect.gen(function* () {
             modeSessionId: input.threadModeSessionId,
             target: receipt.target,
           },
-          replayed: replayed || activated.replayed || consumed.status === "already-consumed",
+          replayed:
+            replayed ||
+            activated.replayed ||
+            consumed.status === "already-consumed" ||
+            consumed.status === "missing",
         } satisfies VoiceRuntimeRealtimeHandoffExchangeResult;
       }).pipe(Effect.uninterruptible),
       (value) => ({ ...value, replayed: true as const }),

@@ -9,6 +9,7 @@ import { platformSymbolName } from "../../components/platformSymbolName";
 import { useThemeColor } from "../../lib/useThemeColor";
 import type { ActiveMasterVoiceAttachment } from "./masterVoiceState";
 import type { RealtimeVoiceControllerSnapshot } from "./realtimeVoiceController";
+import type { CanonicalVoiceViewModel } from "./canonicalVoiceViewModel";
 
 export interface MasterVoiceTranscriptTurn {
   readonly role: "user" | "assistant";
@@ -308,6 +309,94 @@ export function MasterVoiceCallBar(props: {
             ? "Dismiss voice error"
             : "End voice session"
         }
+        variant="danger"
+        onPress={props.onStop}
+      />
+    </View>
+  );
+}
+
+export function CanonicalMasterVoiceCallBar(props: {
+  readonly historyAvailable: boolean;
+  readonly voice: CanonicalVoiceViewModel | null;
+  readonly onMute: () => void;
+  readonly onRoute: () => void;
+  readonly onResume: () => void;
+  readonly onHistory: () => void;
+  readonly onStop: () => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const iconColor = useThemeColor("--color-icon");
+  const active = props.voice?.active === true;
+  if (!active) {
+    return (
+      <View
+        className="flex-row items-center gap-3 border-t border-border bg-screen px-3 pt-2"
+        style={{ paddingBottom: Math.max(insets.bottom, 12) }}
+      >
+        <View className="min-w-0 flex-1">
+          <Text className="text-sm font-t3-bold text-foreground" numberOfLines={1}>
+            Voice conversation
+          </Text>
+          <Text className="text-xs text-foreground-muted" numberOfLines={1}>
+            Resume your last conversation
+          </Text>
+        </View>
+        {props.historyAvailable ? (
+          <ControlPill
+            icon="clock.arrow.circlepath"
+            accessibilityLabel="Browse voice conversations"
+            onPress={props.onHistory}
+          />
+        ) : null}
+        <ControlPill
+          icon="waveform.circle.fill"
+          label="Resume"
+          accessibilityLabel="Resume last voice conversation"
+          variant="primary"
+          onPress={props.onResume}
+        />
+      </View>
+    );
+  }
+  return (
+    <View
+      className="flex-row items-center gap-3 border-t border-border bg-screen px-3 pt-2"
+      style={{ paddingBottom: Math.max(insets.bottom, 12) }}
+    >
+      <SymbolView
+        name={platformSymbolName("waveform.circle.fill")}
+        size={24}
+        tintColor={iconColor}
+        type="monochrome"
+      />
+      <View className="min-w-0 flex-1">
+        <Text className="text-sm font-t3-bold text-foreground" numberOfLines={1}>
+          {props.voice.label}
+        </Text>
+        <Text className="text-xs text-foreground-muted" numberOfLines={1}>
+          {props.voice.attention?.label ??
+            (props.voice.mode === "thread" ? "Active Thread voice" : "Realtime voice")}
+        </Text>
+      </View>
+      {props.voice.mode === "realtime" ? (
+        <>
+          <ControlPill
+            icon={props.voice.muted ? "mic.slash.fill" : "mic.fill"}
+            accessibilityLabel={props.voice.muted ? "Unmute microphone" : "Mute microphone"}
+            active={props.voice.muted}
+            onPress={props.onMute}
+          />
+          <ControlPill
+            icon="airplayaudio"
+            accessibilityLabel="Choose audio route"
+            onPress={props.onRoute}
+          />
+        </>
+      ) : null}
+      <ControlPill
+        icon="stop.fill"
+        accessibilityLabel="Stop voice"
         variant="danger"
         onPress={props.onStop}
       />

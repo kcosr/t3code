@@ -6,6 +6,8 @@ import {
   type VoiceConversationId,
   type VoiceConversationSelection,
   type VoiceConversationSummary,
+  type VoiceRuntimeConsumerLease,
+  type VoiceRuntimePresentationState,
   type VoiceSessionCreateInput,
   type VoiceSessionEvent,
 } from "@t3tools/contracts";
@@ -19,17 +21,8 @@ import type {
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
-import {
-  createContext,
-  use,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
-import { Alert, AppState, View } from "react-native";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Alert, AppState, Platform, View } from "react-native";
 import { useNavigation } from "@react-navigation/native";
 
 import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
@@ -57,6 +50,8 @@ import {
   type VoiceAudioRoutePickerState,
 } from "./MasterVoiceOverlays";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
+import { MasterVoiceContext, type UiAttachedMasterVoiceContextValue } from "./MasterVoiceContext";
+import { AutonomousAndroidMasterVoiceProvider } from "./AutonomousAndroidMasterVoiceProvider";
 import {
   completeNativeVoiceCommandAttempt,
   completeNativeVoiceCommandSafely,
@@ -78,6 +73,8 @@ import {
   resolveNativeVoiceRuntimeRevocationEndpoint,
 } from "./nativeVoiceRuntimeProvisioning";
 import { NativeVoiceReconciliationBackoff } from "./nativeVoiceReconciliationBackoff";
+import { resolveVoicePreferences } from "./voicePreferences";
+import { mobileVoiceExecutionModel } from "./voiceExecutionComposition";
 import {
   nativeVoiceRuntimeReadinessTargetId,
   resolveNativeVoiceRuntimeTarget,
@@ -132,36 +129,6 @@ interface VoiceConversationConnection {
   readonly client: VoiceHttpClient;
 }
 
-interface MasterVoiceContextValue {
-  readonly phase: RealtimeVoiceControllerSnapshot["phase"];
-  readonly stop: () => Promise<void>;
-  readonly registerTraditionalAudioInterruption: (
-    interrupt: () => void | (() => void) | Promise<void | (() => void)>,
-  ) => () => void;
-  readonly threadVoiceHandoff:
-    | (T3VoiceThreadVoiceHandoffEvent & {
-        readonly environmentId: EnvironmentId;
-        readonly threadId: ThreadId;
-        readonly acceptedAtEpochMillis: number;
-      })
-    | null;
-  readonly settleThreadVoiceHandoff: (
-    actionId: string,
-    outcome: "adopted" | "failed",
-  ) => Promise<void>;
-  readonly beginThreadVoiceHandoffAdoption: (actionId: string) => (() => void) | null;
-  readonly nativeThreadCommand:
-    | (T3VoiceCommandEvent & {
-        readonly environmentId: EnvironmentId;
-        readonly threadId: ThreadId;
-      })
-    | null;
-  readonly completeNativeThreadCommand: (
-    commandId: string,
-    outcome: "success" | "failure",
-  ) => Promise<void>;
-}
-
 const INITIAL_SNAPSHOT: RealtimeVoiceControllerSnapshot = {
   phase: "idle",
   session: null,
@@ -169,8 +136,6 @@ const INITIAL_SNAPSHOT: RealtimeVoiceControllerSnapshot = {
   error: null,
   focus: null,
 };
-
-const MasterVoiceContext = createContext<MasterVoiceContextValue | null>(null);
 
 const errorReason = (cause: unknown): string | null =>
   typeof cause === "object" && cause !== null && "reason" in cause
@@ -212,7 +177,7 @@ const loadResumeSelection = async (
   return resumeVoiceConversationSelection(conversations);
 };
 
-export function MasterVoiceProvider(props: {
+export function UiAttachedMasterVoiceProvider(props: {
   readonly children: ReactNode;
   readonly environmentId: EnvironmentId | null;
   readonly focus: MasterVoiceFocus | null;
@@ -234,9 +199,9 @@ export function MasterVoiceProvider(props: {
   const [transcriptVisible, setTranscriptVisible] = useState(false);
   const [resumePending, setResumePending] = useState(false);
   const [threadVoiceHandoff, setThreadVoiceHandoff] =
-    useState<MasterVoiceContextValue["threadVoiceHandoff"]>(null);
+    useState<UiAttachedMasterVoiceContextValue["threadVoiceHandoff"]>(null);
   const [nativeThreadCommand, setNativeThreadCommand] =
-    useState<MasterVoiceContextValue["nativeThreadCommand"]>(null);
+    useState<UiAttachedMasterVoiceContextValue["nativeThreadCommand"]>(null);
   const [transcript, setTranscript] = useState<ReadonlyArray<MasterVoiceTranscriptTurn>>([]);
   const [confirmations, setConfirmations] = useState<ReadonlyArray<PendingVoiceConfirmation>>([]);
   const [nativePermissions, setNativePermissions] = useState({
@@ -269,7 +234,8 @@ export function MasterVoiceProvider(props: {
     new Map<string, Extract<VoiceSessionEvent, { readonly type: "client-action" }>>(),
   );
   const settledThreadVoiceHandoffIdRef = useRef<string | null>(null);
-  const threadVoiceHandoffRef = useRef<MasterVoiceContextValue["threadVoiceHandoff"]>(null);
+  const threadVoiceHandoffRef =
+    useRef<UiAttachedMasterVoiceContextValue["threadVoiceHandoff"]>(null);
   const threadVoiceHandoffSettlementsRef = useRef(
     new Map<string, { outcome: "adopted" | "failed"; promise: Promise<void> }>(),
   );
@@ -282,7 +248,8 @@ export function MasterVoiceProvider(props: {
   const nativeOperationsRef = useRef(new NativeVoiceOperationEpoch());
   const nativeCommandsRef = useRef(new NativeVoiceCommandDeduplicator());
   const nativeThreadCompletionsRef = useRef(new NativeVoiceCommandCompletionGate());
-  const nativeThreadCommandRef = useRef<MasterVoiceContextValue["nativeThreadCommand"]>(null);
+  const nativeThreadCommandRef =
+    useRef<UiAttachedMasterVoiceContextValue["nativeThreadCommand"]>(null);
   const nativeThreadTimeoutsRef = useRef(new Map<string, () => void>());
   const completeNativeThreadCommandRef = useRef<
     (commandId: string, outcome: "success" | "failure") => Promise<void>
@@ -411,8 +378,8 @@ export function MasterVoiceProvider(props: {
       controllerEnvironmentId,
       preferences?.voiceAudioRouteId,
       preferences?.voiceAutoListenEnabled,
-      preferences?.voiceBackgroundControlsEnabled,
-      preferences?.voiceBackgroundDefaultMode,
+      preferences?.voiceNotificationControlsEnabled,
+      preferences?.voiceNotificationDefaultMode,
       nativePermissions.microphone,
       nativePermissions.notification,
       backgroundThreadTargetProjectId,
@@ -669,8 +636,8 @@ export function MasterVoiceProvider(props: {
       if (disposed) return;
       const targetFocused =
         props.focus?.environmentId === threadVoiceHandoff.environmentId &&
-        props.focus.projectId === threadVoiceHandoff.projectId &&
-        props.focus.threadId === threadVoiceHandoff.threadId;
+        props.focus?.projectId === threadVoiceHandoff.projectId &&
+        props.focus?.threadId === threadVoiceHandoff.threadId;
       const clientDeadline = Math.max(
         threadVoiceHandoff.acceptedAtEpochMillis + 10_000,
         threadVoiceHandoff.expiresAtEpochMillis + 1_000,
@@ -1266,6 +1233,9 @@ export function MasterVoiceProvider(props: {
     let disposed = false;
     let registeredGeneration: number | null = null;
     let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+    let canonicalLease: VoiceRuntimeConsumerLease | null = null;
+    let canonicalLeaseTimer: ReturnType<typeof setInterval> | null = null;
+    let canonicalLeaseQueue = Promise.resolve();
     const epoch = nativeOperationsRef.current.begin();
     const provisioningEpoch = ++nativeProvisioningEpochRef.current;
     activeNativeEpochRef.current = epoch;
@@ -1349,8 +1319,20 @@ export function MasterVoiceProvider(props: {
       foregroundCommands.enqueue(event, readiness.mode);
     };
     const subscription = native.addListener("voiceCommand", acceptCommand);
+    const updateCanonicalPresentation = (presentation: VoiceRuntimePresentationState) => {
+      canonicalLeaseQueue = canonicalLeaseQueue
+        .then(async () => {
+          if (disposed || canonicalLease === null) return;
+          canonicalLease = await native.updateVoiceRuntimeAttachmentAsync({
+            lease: canonicalLease,
+            presentation,
+          });
+        })
+        .catch(() => undefined);
+    };
     const appStateSubscription = AppState.addEventListener("change", (state) => {
       foregroundCommands.setActive(state === "active");
+      updateCanonicalPresentation(state === "active" ? "foreground-active" : "background");
     });
     const disabledSubscription = native.addListener("readinessDisabled", (event) => {
       if (!nativeOperationsRef.current.isCurrent(epoch)) return;
@@ -1360,9 +1342,9 @@ export function MasterVoiceProvider(props: {
       }
       void nativeOperationsRef.current
         .run(epoch, async () => {
-          await savePreferencesPatch({ voiceBackgroundControlsEnabled: false });
+          await savePreferencesPatch({ voiceNotificationControlsEnabled: false });
           nativeOperationsRef.current.assertCurrent(epoch);
-          savePreferences({ voiceBackgroundControlsEnabled: false });
+          savePreferences({ voiceNotificationControlsEnabled: false });
           nativeReadinessGenerationRef.current = event.readinessGeneration;
           await native.acknowledgeReadinessDisabledAsync({
             readinessGeneration: event.readinessGeneration,
@@ -1393,10 +1375,10 @@ export function MasterVoiceProvider(props: {
         const pendingDisable = await reconcilePendingNativeReadinessDisable({
           getPending: () => native.getPendingReadinessDisabledAsync(),
           persistDisabled: async (event) => {
-            await savePreferencesPatch({ voiceBackgroundControlsEnabled: false });
+            await savePreferencesPatch({ voiceNotificationControlsEnabled: false });
             nativeOperationsRef.current.assertCurrent(epoch);
             nativeReadinessGenerationRef.current = event.readinessGeneration;
-            savePreferences({ voiceBackgroundControlsEnabled: false });
+            savePreferences({ voiceNotificationControlsEnabled: false });
           },
           acknowledge: (event) =>
             native.acknowledgeReadinessDisabledAsync({
@@ -1406,7 +1388,7 @@ export function MasterVoiceProvider(props: {
         nativeOperationsRef.current.assertCurrent(epoch);
         const readinessToPersist =
           pendingDisable === null ? readiness : { ...readiness, enabled: false };
-        if (!readinessToPersist.enabled || prepared === null) {
+        if (prepared === null) {
           await nativeProvisioning.disable(provisioningEpoch, {
             client: conversationConnection.client,
             environmentOrigin: conversationConnection.environmentOrigin,
@@ -1416,20 +1398,31 @@ export function MasterVoiceProvider(props: {
           nativeGrantRefreshScheduleRef.current = null;
           return;
         }
+        const authorityReadiness = readinessToPersist.enabled
+          ? readinessToPersist
+          : { ...readinessToPersist, mode: "thread" as const };
         const attachedFocus = attachmentRef.current?.focus ?? null;
+        const resolvedVoicePreferences = resolveVoicePreferences(preferences ?? {});
         const resolvedTarget = await resolveNativeVoiceRuntimeTarget({
           client: conversationConnection!.client,
-          mode: readinessToPersist.mode,
+          mode: authorityReadiness.mode,
           environmentId: controllerEnvironmentId,
           activeConversationId: snapshot.session?.conversationId ?? null,
           focus: snapshot.session === null ? focusRef.current : attachedFocus,
           threadTarget: preferences?.voiceThreadTarget,
           threads: threadShellsRef.current,
-          autoRearm: readinessToPersist.autoRearm,
+          autoRearm: authorityReadiness.autoRearm,
+          endpointPolicy: {
+            endSilenceMs: resolvedVoicePreferences.endSilenceMs,
+            noSpeechTimeoutMs: resolvedVoicePreferences.noSpeechTimeoutMs,
+            maximumUtteranceMs: resolvedVoicePreferences.maximumUtteranceMs,
+          },
+          speechEnabled: true,
+          rearmGuardMs: resolvedVoicePreferences.postPlaybackGuardMs,
         });
         nativeOperationsRef.current.assertCurrent(epoch);
         const exactReadiness = {
-          ...readinessToPersist,
+          ...authorityReadiness,
           targetId: nativeVoiceRuntimeReadinessTargetId(resolvedTarget.target),
         };
         const provisioned = await nativeProvisioning.provision(conversationConnection.client, {
@@ -1472,6 +1465,20 @@ export function MasterVoiceProvider(props: {
         };
         scheduleRefresh();
         nativeReadinessGenerationRef.current = provisioned.readinessGeneration;
+        if (resolvedTarget.target.mode === "thread") {
+          const runtimeSnapshot = await native.getVoiceRuntimeSnapshotAsync();
+          canonicalLease = await native.attachVoiceRuntimeAsync({
+            runtimeId: runtimeSnapshot.runtimeId,
+            runtimeInstanceId: runtimeSnapshot.runtimeInstanceId,
+            generation: runtimeSnapshot.generation,
+            presentation: AppState.currentState === "active" ? "foreground-active" : "background",
+          });
+          canonicalLeaseTimer = setInterval(() => {
+            updateCanonicalPresentation(
+              AppState.currentState === "active" ? "foreground-active" : "background",
+            );
+          }, 10_000);
+        }
         if (disposed) return;
         const generation = nativeControllerGenerationRef.current.register(
           provisioned.readinessGeneration,
@@ -1499,7 +1506,7 @@ export function MasterVoiceProvider(props: {
               style: "destructive",
               onPress: () => {
                 readinessAlertVisibleRef.current = false;
-                savePreferences({ voiceBackgroundControlsEnabled: false });
+                savePreferences({ voiceNotificationControlsEnabled: false });
               },
             },
             {
@@ -1517,6 +1524,12 @@ export function MasterVoiceProvider(props: {
     return () => {
       disposed = true;
       if (refreshTimer !== null) clearTimeout(refreshTimer);
+      if (canonicalLeaseTimer !== null) clearInterval(canonicalLeaseTimer);
+      const leaseToDetach = canonicalLease;
+      canonicalLease = null;
+      if (leaseToDetach !== null) {
+        void canonicalLeaseQueue.finally(() => native.detachVoiceRuntimeAsync(leaseToDetach));
+      }
       foregroundCommands.dispose();
       const pendingThreadCommand = nativeThreadCommandRef.current;
       if (
@@ -1787,9 +1800,19 @@ export function MasterVoiceProvider(props: {
     );
   }, [decideConfirmation, pendingConfirmation]);
 
-  const contextValue = useMemo<MasterVoiceContextValue>(
+  const contextValue = useMemo<UiAttachedMasterVoiceContextValue>(
     () => ({
+      executionModel: "ui-attached",
       phase: snapshot.phase,
+      active:
+        snapshot.phase === "starting" ||
+        snapshot.phase === "active" ||
+        snapshot.phase === "stopping",
+      suppressAutomaticThreadSpeech:
+        snapshot.phase === "starting" ||
+        snapshot.phase === "active" ||
+        snapshot.phase === "stopping",
+      nativeAssistantMessageIds: new Set(),
       stop,
       registerTraditionalAudioInterruption,
       threadVoiceHandoff,
@@ -1853,8 +1876,16 @@ export function MasterVoiceProvider(props: {
   );
 }
 
-export function useMasterVoice(): MasterVoiceContextValue {
-  const context = use(MasterVoiceContext);
-  if (context === null) throw new Error("useMasterVoice must be used inside MasterVoiceProvider");
-  return context;
+export function MasterVoiceProvider(props: {
+  readonly children: ReactNode;
+  readonly environmentId: EnvironmentId | null;
+  readonly focus: MasterVoiceFocus | null;
+}) {
+  return mobileVoiceExecutionModel(Platform.OS) === "autonomous" ? (
+    <AutonomousAndroidMasterVoiceProvider {...props} />
+  ) : (
+    <UiAttachedMasterVoiceProvider {...props} />
+  );
 }
+
+export { useMasterVoice } from "./MasterVoiceContext";

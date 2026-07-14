@@ -334,6 +334,9 @@ export interface VoiceNativeThreadTurnStoreShape {
     operationId: VoiceThreadTurnOperationId,
     segmentIndex: number,
   ) => Effect.Effect<VoiceNativeThreadTurnSpeechSegmentRecord | undefined, PersistenceSqlError>;
+  readonly listSpeechSegments: (
+    operationId: VoiceThreadTurnOperationId,
+  ) => Effect.Effect<ReadonlyArray<VoiceNativeThreadTurnSpeechSegmentRecord>, PersistenceSqlError>;
   readonly getSpeechSegmentAuthorized: (
     operationId: VoiceThreadTurnOperationId,
     segmentIndex: number,
@@ -361,6 +364,9 @@ export interface VoiceNativeThreadTurnStoreShape {
     now: number,
     occurredAt: string,
     retentionCutoff: number,
+  ) => Effect.Effect<ReadonlyArray<VoiceThreadTurnOperationId>, PersistenceSqlError>;
+  readonly listRecoverableOperationIds: (
+    now: number,
   ) => Effect.Effect<ReadonlyArray<VoiceThreadTurnOperationId>, PersistenceSqlError>;
   readonly revokeRuntime: (
     authSessionId: AuthSessionId,

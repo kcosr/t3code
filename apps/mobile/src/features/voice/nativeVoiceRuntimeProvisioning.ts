@@ -1,5 +1,9 @@
 import type { VoiceHttpClient } from "@t3tools/client-runtime/voice";
-import { VoiceNativeRuntimeId, type VoiceNativeRuntimeTarget } from "@t3tools/contracts";
+import {
+  VoiceNativeRuntimeId,
+  VoiceRuntimeProvisioningOperationId,
+  type VoiceNativeRuntimeTarget,
+} from "@t3tools/contracts";
 import type {
   T3VoiceBackgroundAuthoritySnapshot,
   T3VoiceBackgroundGrantOperation,
@@ -315,6 +319,14 @@ function assertValidReservation(reservation: NativeVoiceRuntimeReservation): voi
   }
 }
 
+function provisioningOperationId(
+  reservation: NativeVoiceRuntimeReservation,
+): VoiceRuntimeProvisioningOperationId {
+  return VoiceRuntimeProvisioningOperationId.make(
+    `provision-${reservation.runtimeId}-${reservation.readinessGeneration}`,
+  );
+}
+
 function targetMatches(actual: VoiceNativeRuntimeTarget, expectedIdentity: string): boolean {
   return canonicalNativeVoiceRuntimeTargetIdentity(actual) === expectedIdentity;
 }
@@ -445,6 +457,9 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
           environmentOrigin: input.environmentOrigin,
           operation: input.operation,
           targetIdentity: input.resolvedTarget.targetIdentity,
+          target: input.resolvedTarget.target,
+          provisioningOperationId: grant.provisioningOperationId,
+          issuedAt: grant.issuedAt,
           expiresAtEpochMillis,
           token: grant.token,
         });
@@ -693,16 +708,20 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
     input: NativeVoiceRuntimeProvisioningInput,
     reservation: NativeVoiceRuntimeReservation,
   ) {
+    const expectedProvisioningOperationId = provisioningOperationId(reservation);
     const grant = await Effect.runPromise(
       client.provisionNativeRuntimeGrant(reservation.runtimeId, {
         generation: reservation.readinessGeneration,
+        provisioningOperationId: expectedProvisioningOperationId,
         target: input.resolvedTarget.target,
       }),
     );
     if (
       grant.runtimeId !== reservation.runtimeId ||
       grant.generation !== reservation.readinessGeneration ||
+      grant.provisioningOperationId !== expectedProvisioningOperationId ||
       !targetMatches(grant.target, input.resolvedTarget.targetIdentity) ||
+      !Number.isFinite(Date.parse(grant.issuedAt)) ||
       !Number.isFinite(Date.parse(grant.expiresAt))
     ) {
       throw new InvalidNativeVoiceRuntimeProvisioningResultError();
@@ -796,6 +815,9 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
       environmentOrigin: input.environmentOrigin,
       operation: input.operation,
       targetIdentity: input.resolvedTarget.targetIdentity,
+      target: input.resolvedTarget.target,
+      provisioningOperationId: grant.provisioningOperationId,
+      issuedAt: grant.issuedAt,
       expiresAtEpochMillis: Date.parse(grant.expiresAt),
       token: grant.token,
     });

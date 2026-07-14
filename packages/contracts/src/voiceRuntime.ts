@@ -790,13 +790,24 @@ export const VoiceRuntimeRealtimeActionsResult = Schema.Struct({
 });
 export type VoiceRuntimeRealtimeActionsResult = typeof VoiceRuntimeRealtimeActionsResult.Type;
 
-export const VoiceRuntimeRealtimeActionAckInput = Schema.Struct({
-  ...VoiceRuntimeRealtimeLeaseFence,
-  clientOperationId: RuntimeIdentifier,
-  actionSequence: PositiveInt,
-  outcome: Schema.Literals(["succeeded", "failed"]),
-  message: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(512))),
-});
+export const VoiceRuntimeRealtimeActionAckInput = Schema.Union([
+  Schema.Struct({
+    ...VoiceRuntimeRealtimeLeaseFence,
+    clientOperationId: RuntimeIdentifier,
+    actionSequence: PositiveInt,
+    action: Schema.Literal("navigate-thread"),
+    outcome: Schema.Literals(["succeeded", "failed"]),
+    message: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(512))),
+  }),
+  Schema.Struct({
+    ...VoiceRuntimeRealtimeLeaseFence,
+    clientOperationId: RuntimeIdentifier,
+    actionSequence: PositiveInt,
+    action: Schema.Literal("confirmation-required"),
+    confirmationId: VoiceConfirmationId,
+    decision: Schema.Literals(["approve", "reject"]),
+  }),
+]);
 export type VoiceRuntimeRealtimeActionAckInput = typeof VoiceRuntimeRealtimeActionAckInput.Type;
 
 export const VoiceRuntimeRealtimeActionAckResult = Schema.Struct({

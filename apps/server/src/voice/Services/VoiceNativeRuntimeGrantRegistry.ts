@@ -3,6 +3,7 @@ import type {
   AuthSessionId,
   VoiceNativeRuntimeId,
   VoiceNativeRuntimeTarget,
+  VoiceRuntimeProvisioningOperationId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
@@ -13,15 +14,22 @@ export interface VoiceNativeRuntimeGrantScope {
   readonly authSessionId: AuthSessionId;
   readonly runtimeId: VoiceNativeRuntimeId;
   readonly generation: number;
+  readonly provisioningOperationId: VoiceRuntimeProvisioningOperationId;
   readonly grantedScopes: ReadonlySet<AuthEnvironmentScope>;
   readonly target: VoiceNativeRuntimeTarget;
   readonly expiresAt: number;
 }
 
 export interface VoiceNativeRuntimeGrantRegistryShape {
-  readonly issue: (
-    scope: VoiceNativeRuntimeGrantScope,
-  ) => Effect.Effect<{ readonly token: string; readonly refreshed: boolean }, VoiceError>;
+  readonly issue: (scope: VoiceNativeRuntimeGrantScope) => Effect.Effect<
+    {
+      readonly token: string;
+      readonly replayed: boolean;
+      readonly issuedAt: number;
+      readonly expiresAt: number;
+    },
+    VoiceError
+  >;
   readonly authorize: (token: string) => Effect.Effect<VoiceNativeRuntimeGrantScope | undefined>;
   readonly activateTransition: (
     token: string,

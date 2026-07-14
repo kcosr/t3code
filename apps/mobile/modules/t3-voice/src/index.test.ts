@@ -24,7 +24,7 @@ describe("T3 voice native module resolution", () => {
   });
 
   it("returns and caches the installed native module", async () => {
-    const nativeModule = { nativeRevision: 13 };
+    const nativeModule = { nativeRevision: 14 };
     expoMocks.requireOptionalNativeModule.mockReturnValue(nativeModule);
     const voice = await import("./index");
 
@@ -34,7 +34,7 @@ describe("T3 voice native module resolution", () => {
   });
 
   it("rejects an obsolete native module revision", async () => {
-    expoMocks.requireOptionalNativeModule.mockReturnValue({ nativeRevision: 12 });
+    expoMocks.requireOptionalNativeModule.mockReturnValue({ nativeRevision: 13 });
     const voice = await import("./index");
 
     expect(voice.getT3VoiceNativeModule()).toBeNull();

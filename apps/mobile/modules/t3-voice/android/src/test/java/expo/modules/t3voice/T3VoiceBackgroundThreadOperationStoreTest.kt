@@ -189,8 +189,19 @@ class T3VoiceBackgroundThreadOperationStoreTest {
   private fun available(store: T3VoiceBackgroundThreadOperationStore) =
     (store.load() as T3VoiceBackgroundThreadOperationLoadResult.Available).state
   private fun store() = T3VoiceBackgroundThreadOperationStore(MemoryStore(), Cipher())
-  private fun claim() = T3VoiceBackgroundThreadClaim("runtime-1", 4, "https://example.test",
-    "project-1", "thread-1", "client-1")
+  private fun claim() = T3VoiceBackgroundThreadClaim(
+    runtimeId = "runtime-1",
+    runtimeInstanceId = "instance-1",
+    readinessGeneration = 4,
+    modeSessionId = "mode-1",
+    environmentOrigin = "https://example.test",
+    projectId = "project-1",
+    threadId = "thread-1",
+    clientOperationId = "client-1",
+    submissionPolicy = "auto-submit",
+    speechPlanId = "speech-1",
+    draftContext = null,
+  )
   private fun active(snapshot: T3VoiceBackgroundSnapshot) =
     T3VoiceBackgroundThreadOperationState.Active(
       claim(), "operation-1", 1_900_000_000_000, "child-secret", 0,

@@ -6,14 +6,28 @@ import org.json.JSONObject
 
 internal data class T3VoiceBackgroundThreadTurnCreateInput(
   val runtimeId: String,
+  val runtimeInstanceId: String,
   val generation: Long,
-  val clientOperationId: String,
+  val modeSessionId: String,
+  val turnClientOperationId: String,
+  val submissionPolicy: String,
+  val speechPlanId: String,
+)
+
+internal data class T3VoiceBackgroundSpeechDisposition(
+  val segmentIndex: Int,
+  val disposition: String,
 )
 
 internal data class T3VoiceBackgroundThreadTurnSnapshot(
   val operationId: String,
   val runtimeId: String,
   val generation: Long,
+  val runtimeInstanceId: String,
+  val modeSessionId: String,
+  val turnClientOperationId: String,
+  val submissionPolicy: String,
+  val speechPlanId: String,
   val projectId: String,
   val threadId: String,
   val speechPreset: String,
@@ -21,11 +35,18 @@ internal data class T3VoiceBackgroundThreadTurnSnapshot(
   val phase: String,
   val messageId: String?,
   val turnId: String?,
+  val assistantMessageIds: List<String>,
+  val highestAdvertisedSegment: Int?,
+  val highestStartedSegment: Int?,
+  val highestDrainedSegment: Int?,
+  val segmentDispositions: List<T3VoiceBackgroundSpeechDisposition>,
   val lastSequence: Long,
   val acknowledgedSequence: Long,
   val speechTerminal: String?,
   val dispatchAccepted: Boolean,
-  val expiresAtEpochMillis: Long,
+  val detachedAtEpochMillis: Long?,
+  val operationTokenExpiresAtEpochMillis: Long,
+  val retentionExpiresAtEpochMillis: Long,
 )
 
 internal data class T3VoiceBackgroundThreadTurnGrant(
@@ -51,6 +72,11 @@ internal sealed interface T3VoiceBackgroundThreadTurnEvent {
     val commandId: String,
     val messageId: String,
     val turnId: String?,
+  ) : T3VoiceBackgroundThreadTurnEvent
+
+  data class AssistantMessageCorrelated(
+    override val sequence: Long,
+    val messageId: String,
   ) : T3VoiceBackgroundThreadTurnEvent
 
   data class SpeechReady(
@@ -91,9 +117,24 @@ internal data class T3VoiceBackgroundThreadTurnAudioResult(
   val disposition: String,
 )
 
+internal data class T3VoiceBackgroundThreadTurnDispositionResult(
+  val snapshot: T3VoiceBackgroundThreadTurnSnapshot,
+)
+
 internal data class T3VoiceBackgroundThreadTurnCancelResult(
   val snapshot: T3VoiceBackgroundThreadTurnSnapshot,
   val cancelled: Boolean,
+)
+
+internal data class T3VoiceBackgroundThreadDraft(
+  val operationId: String,
+  val transcript: String,
+  val expiresAtEpochMillis: Long,
+)
+
+internal data class T3VoiceBackgroundThreadDraftConsumeResult(
+  val snapshot: T3VoiceBackgroundThreadTurnSnapshot,
+  val consumed: Boolean,
 )
 
 internal sealed interface T3VoiceBackgroundThreadTurnResult<out T> {
@@ -108,12 +149,20 @@ internal sealed interface T3VoiceBackgroundThreadTurnResult<out T> {
 internal object T3VoiceBackgroundThreadTurnJson {
   fun encodeCreate(input: T3VoiceBackgroundThreadTurnCreateInput): ByteArray {
     requireIdentifier(input.runtimeId, "native runtime ID", MAXIMUM_RUNTIME_ID_LENGTH)
+    requireIdentifier(input.runtimeInstanceId, "runtime instance ID", MAXIMUM_IDENTIFIER_LENGTH)
     require(input.generation in 1..MAXIMUM_SAFE_INTEGER) { "Invalid readiness generation." }
-    requireIdentifier(input.clientOperationId, "client operation ID", MAXIMUM_CLIENT_OPERATION_ID_LENGTH)
+    requireIdentifier(input.modeSessionId, "mode session ID", MAXIMUM_IDENTIFIER_LENGTH)
+    requireIdentifier(input.turnClientOperationId, "turn client operation ID", MAXIMUM_CLIENT_OPERATION_ID_LENGTH)
+    require(input.submissionPolicy in SUBMISSION_POLICIES)
+    requireIdentifier(input.speechPlanId, "speech plan ID", MAXIMUM_IDENTIFIER_LENGTH)
     return JSONObject()
       .put("runtimeId", input.runtimeId)
+      .put("runtimeInstanceId", input.runtimeInstanceId)
       .put("generation", input.generation)
-      .put("clientOperationId", input.clientOperationId)
+      .put("modeSessionId", input.modeSessionId)
+      .put("turnClientOperationId", input.turnClientOperationId)
+      .put("submissionPolicy", input.submissionPolicy)
+      .put("speechPlanId", input.speechPlanId)
       .toString()
       .toByteArray(Charsets.UTF_8)
   }
@@ -136,6 +185,18 @@ internal object T3VoiceBackgroundThreadTurnJson {
     return T3VoiceBackgroundThreadTurnAudioResult(
       snapshot = snapshot(objectField(root, "snapshot", SNAPSHOT_FIELDS)),
       disposition = literal(root, "disposition", AUDIO_DISPOSITIONS),
+    )
+  }
+
+  fun encodeDraftDisposition(): ByteArray = JSONObject()
+    .put("submissionPolicy", "draft")
+    .toString()
+    .toByteArray(Charsets.UTF_8)
+
+  fun decodeDisposition(bytes: ByteArray): T3VoiceBackgroundThreadTurnDispositionResult {
+    val root = objectFrom(bytes, setOf("snapshot"))
+    return T3VoiceBackgroundThreadTurnDispositionResult(
+      snapshot = snapshot(objectField(root, "snapshot", SNAPSHOT_FIELDS)),
     )
   }
 
@@ -166,9 +227,30 @@ internal object T3VoiceBackgroundThreadTurnJson {
     )
   }
 
-  fun encodeAcknowledgement(sequence: Long): ByteArray {
+  fun encodeAcknowledgement(
+    sequence: Long,
+    speechPlanId: String,
+    highestStartedSegment: Int?,
+    highestDrainedSegment: Int?,
+    segmentDispositions: List<T3VoiceBackgroundSpeechDisposition>,
+  ): ByteArray {
     require(sequence in 0..MAXIMUM_SAFE_INTEGER) { "Invalid acknowledged sequence." }
-    return JSONObject().put("acknowledgedSequence", sequence).toString().toByteArray(Charsets.UTF_8)
+    requireIdentifier(speechPlanId, "speech plan ID", MAXIMUM_IDENTIFIER_LENGTH)
+    require(segmentDispositions.size <= 512)
+    return JSONObject()
+      .put("acknowledgedSequence", sequence)
+      .put("speechPlanId", speechPlanId)
+      .put("highestStartedSegment", highestStartedSegment ?: JSONObject.NULL)
+      .put("highestDrainedSegment", highestDrainedSegment ?: JSONObject.NULL)
+      .put("segmentDispositions", JSONArray().also { values ->
+        segmentDispositions.forEach { disposition ->
+          require(disposition.segmentIndex >= 0 && disposition.disposition in SEGMENT_DISPOSITIONS)
+          values.put(JSONObject()
+            .put("segmentIndex", disposition.segmentIndex)
+            .put("disposition", disposition.disposition))
+        }
+      })
+      .toString().toByteArray(Charsets.UTF_8)
   }
 
   fun decodeAcknowledgement(bytes: ByteArray): T3VoiceBackgroundThreadTurnSnapshot {
@@ -187,6 +269,24 @@ internal object T3VoiceBackgroundThreadTurnJson {
     )
   }
 
+  fun decodeDraft(bytes: ByteArray): T3VoiceBackgroundThreadDraft {
+    val root = objectFrom(bytes, setOf("operationId", "transcript", "expiresAt"))
+    val transcript = string(root, "transcript", 128 * 1024)
+    return T3VoiceBackgroundThreadDraft(
+      identifier(root, "operationId", MAXIMUM_OPERATION_ID_LENGTH),
+      transcript,
+      instant(root, "expiresAt"),
+    )
+  }
+
+  fun decodeDraftConsume(bytes: ByteArray): T3VoiceBackgroundThreadDraftConsumeResult {
+    val root = objectFrom(bytes, setOf("snapshot", "consumed"))
+    return T3VoiceBackgroundThreadDraftConsumeResult(
+      snapshot(objectField(root, "snapshot", SNAPSHOT_FIELDS)),
+      boolean(root, "consumed"),
+    )
+  }
+
   private fun snapshot(value: JSONObject): T3VoiceBackgroundThreadTurnSnapshot {
     value.requireExactFields(SNAPSHOT_FIELDS)
     val lastSequence = nonNegativeLong(value, "lastSequence")
@@ -196,18 +296,30 @@ internal object T3VoiceBackgroundThreadTurnJson {
       operationId = identifier(value, "operationId", MAXIMUM_OPERATION_ID_LENGTH),
       runtimeId = identifier(value, "runtimeId", MAXIMUM_RUNTIME_ID_LENGTH),
       generation = positiveLong(value, "generation"),
+      runtimeInstanceId = identifier(value, "runtimeInstanceId"),
+      modeSessionId = identifier(value, "modeSessionId"),
+      turnClientOperationId = identifier(value, "turnClientOperationId"),
+      submissionPolicy = literal(value, "submissionPolicy", SUBMISSION_POLICIES),
+      speechPlanId = identifier(value, "speechPlanId"),
       projectId = identifier(value, "projectId"),
       threadId = identifier(value, "threadId"),
       speechPreset = literal(value, "speechPreset", SPEECH_PRESETS),
       autoRearm = boolean(value, "autoRearm"),
       phase = literal(value, "phase", PHASES),
-      messageId = nullableIdentifier(value, "messageId"),
+      messageId = nullableIdentifier(value, "userMessageId"),
       turnId = nullableIdentifier(value, "turnId"),
+      assistantMessageIds = identifierArray(value, "assistantMessageIds", 256),
+      highestAdvertisedSegment = nullableNonNegativeInt(value, "highestAdvertisedSegment"),
+      highestStartedSegment = nullableNonNegativeInt(value, "highestStartedSegment"),
+      highestDrainedSegment = nullableNonNegativeInt(value, "highestDrainedSegment"),
+      segmentDispositions = dispositionArray(value, "segmentDispositions"),
       lastSequence = lastSequence,
       acknowledgedSequence = acknowledgedSequence,
       speechTerminal = nullableLiteral(value, "speechTerminal", SPEECH_TERMINALS),
       dispatchAccepted = boolean(value, "dispatchAccepted"),
-      expiresAtEpochMillis = instant(value, "expiresAt"),
+      detachedAtEpochMillis = nullableInstant(value, "detachedAt"),
+      operationTokenExpiresAtEpochMillis = instant(value, "operationTokenExpiresAt"),
+      retentionExpiresAtEpochMillis = instant(value, "retentionExpiresAt"),
     )
   }
 
@@ -227,6 +339,13 @@ internal object T3VoiceBackgroundThreadTurnJson {
           identifier(value, "commandId"),
           identifier(value, "messageId"),
           nullableIdentifier(value, "turnId"),
+        )
+      }
+      "assistant-message-correlated" -> {
+        value.requireExactFields(EVENT_BASE_FIELDS + "messageId")
+        T3VoiceBackgroundThreadTurnEvent.AssistantMessageCorrelated(
+          sequence,
+          identifier(value, "messageId"),
         )
       }
       "speech-ready" -> {
@@ -338,6 +457,45 @@ internal object T3VoiceBackgroundThreadTurnJson {
   private fun instant(source: JSONObject, name: String): Long =
     Instant.parse(string(source, name, 64)).toEpochMilli()
 
+  private fun nullableInstant(source: JSONObject, name: String): Long? =
+    if (source.isNull(name)) null else instant(source, name)
+
+  private fun nullableNonNegativeInt(source: JSONObject, name: String): Int? =
+    if (source.isNull(name)) null else nonNegativeLong(source, name).also {
+      require(it <= Int.MAX_VALUE)
+    }.toInt()
+
+  private fun identifierArray(source: JSONObject, name: String, maximum: Int): List<String> {
+    val values = source.get(name)
+    require(values is JSONArray && values.length() <= maximum)
+    return buildList(values.length()) {
+      for (index in 0 until values.length()) {
+        val value = values.get(index)
+        require(value is String)
+        add(requireIdentifier(value, name, MAXIMUM_IDENTIFIER_LENGTH))
+      }
+    }
+  }
+
+  private fun dispositionArray(
+    source: JSONObject,
+    name: String,
+  ): List<T3VoiceBackgroundSpeechDisposition> {
+    val values = source.get(name)
+    require(values is JSONArray && values.length() <= 512)
+    return buildList(values.length()) {
+      for (index in 0 until values.length()) {
+        val value = values.get(index)
+        require(value is JSONObject)
+        value.requireExactFields(setOf("segmentIndex", "disposition"))
+        add(T3VoiceBackgroundSpeechDisposition(
+          nonNegativeLong(value, "segmentIndex").also { require(it <= Int.MAX_VALUE) }.toInt(),
+          literal(value, "disposition", SEGMENT_DISPOSITIONS),
+        ))
+      }
+    }
+  }
+
   private fun token(source: JSONObject, name: String): String =
     string(source, name, 128).also {
       require(it.isNotBlank() && it.none(Char::isWhitespace)) { "Invalid operation credential." }
@@ -353,19 +511,31 @@ internal object T3VoiceBackgroundThreadTurnJson {
     setOf(
       "operationId",
       "runtimeId",
+      "runtimeInstanceId",
       "generation",
+      "modeSessionId",
+      "turnClientOperationId",
+      "submissionPolicy",
+      "speechPlanId",
       "projectId",
       "threadId",
       "speechPreset",
       "autoRearm",
       "phase",
-      "messageId",
+      "userMessageId",
       "turnId",
+      "assistantMessageIds",
+      "highestAdvertisedSegment",
+      "highestStartedSegment",
+      "highestDrainedSegment",
+      "segmentDispositions",
       "lastSequence",
       "acknowledgedSequence",
       "speechTerminal",
       "dispatchAccepted",
-      "expiresAt",
+      "detachedAt",
+      "operationTokenExpiresAt",
+      "retentionExpiresAt",
     )
   private val EVENT_BASE_FIELDS = setOf("type", "sequence", "occurredAt")
   private val PHASES =
@@ -376,13 +546,16 @@ internal object T3VoiceBackgroundThreadTurnJson {
       "waiting",
       "speaking",
       "attention-required",
+      "draft-ready",
       "completed",
       "failed",
       "cancelled",
     )
   private val SPEECH_PRESETS = setOf("default", "warm")
   private val SPEECH_TERMINALS = setOf("completed", "no-speech", "failed")
-  private val AUDIO_DISPOSITIONS = setOf("processing", "already-dispatched", "terminal")
+  private val AUDIO_DISPOSITIONS = setOf("processing", "already-dispatched", "terminal", "draft-ready")
+  private val SUBMISSION_POLICIES = setOf("auto-submit", "draft")
+  private val SEGMENT_DISPOSITIONS = setOf("drained", "interrupted", "skipped", "failed")
   private val ATTENTION_TYPES = setOf("approval", "user-input")
   private val FAILURE_CODES =
     setOf(
@@ -434,7 +607,7 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
     jsonCall(
       T3VoiceBackgroundHttpRequest(
         origin = origin,
-        path = "/api/voice/native/thread-turns",
+        path = "/api/voice/runtime/thread-turns",
         method = T3VoiceBackgroundHttpMethod.POST,
         authority = authority(RUNTIME_AUTHORITY_HEADER, runtimeGrantToken),
         body = jsonBody(T3VoiceBackgroundThreadTurnJson.encodeCreate(input)),
@@ -471,6 +644,24 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
       T3VoiceBackgroundThreadTurnJson::decodeAudio,
     )
   }
+
+  fun newDraftDispositionCall(
+    origin: String,
+    operationGrantToken: String,
+    operationId: String,
+  ): T3VoiceBackgroundThreadCall<T3VoiceBackgroundThreadTurnDispositionResult> =
+    jsonCall(
+      T3VoiceBackgroundHttpRequest(
+        origin = origin,
+        path = operationPath(operationId, "disposition"),
+        method = T3VoiceBackgroundHttpMethod.POST,
+        authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
+        body = jsonBody(T3VoiceBackgroundThreadTurnJson.encodeDraftDisposition()),
+        maximumRequestBytes = MAXIMUM_JSON_BYTES,
+        maximumResponseBytes = MAXIMUM_JSON_RESPONSE_BYTES,
+      ),
+      T3VoiceBackgroundThreadTurnJson::decodeDisposition,
+    )
 
   fun uploadAudio(
     origin: String,
@@ -523,14 +714,31 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
     operationGrantToken: String,
     operationId: String,
     sequence: Long,
+    speechPlanId: String,
+    highestStartedSegment: Int?,
+    highestDrainedSegment: Int?,
+    segmentDispositions: List<T3VoiceBackgroundSpeechDisposition>,
   ): T3VoiceBackgroundThreadTurnResult<T3VoiceBackgroundThreadTurnSnapshot> =
-    newAcknowledgeCall(origin, operationGrantToken, operationId, sequence).execute()
+    newAcknowledgeCall(
+      origin,
+      operationGrantToken,
+      operationId,
+      sequence,
+      speechPlanId,
+      highestStartedSegment,
+      highestDrainedSegment,
+      segmentDispositions,
+    ).execute()
 
   fun newAcknowledgeCall(
     origin: String,
     operationGrantToken: String,
     operationId: String,
     sequence: Long,
+    speechPlanId: String,
+    highestStartedSegment: Int?,
+    highestDrainedSegment: Int?,
+    segmentDispositions: List<T3VoiceBackgroundSpeechDisposition>,
   ): T3VoiceBackgroundThreadCall<T3VoiceBackgroundThreadTurnSnapshot> =
     jsonCall(
       T3VoiceBackgroundHttpRequest(
@@ -538,7 +746,13 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
         path = operationPath(operationId, "events/ack"),
         method = T3VoiceBackgroundHttpMethod.POST,
         authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
-        body = jsonBody(T3VoiceBackgroundThreadTurnJson.encodeAcknowledgement(sequence)),
+        body = jsonBody(T3VoiceBackgroundThreadTurnJson.encodeAcknowledgement(
+          sequence,
+          speechPlanId,
+          highestStartedSegment,
+          highestDrainedSegment,
+          segmentDispositions,
+        )),
         maximumRequestBytes = MAXIMUM_JSON_BYTES,
         maximumResponseBytes = MAXIMUM_JSON_RESPONSE_BYTES,
       ),
@@ -605,6 +819,38 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
       T3VoiceBackgroundThreadTurnJson::decodeCancel,
     )
 
+  fun newDraftCall(
+    origin: String,
+    operationGrantToken: String,
+    operationId: String,
+  ): T3VoiceBackgroundThreadCall<T3VoiceBackgroundThreadDraft> = jsonCall(
+    T3VoiceBackgroundHttpRequest(
+      origin = origin,
+      path = operationPath(operationId, "draft"),
+      method = T3VoiceBackgroundHttpMethod.GET,
+      authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
+      maximumResponseBytes = MAXIMUM_JSON_RESPONSE_BYTES,
+    ),
+    T3VoiceBackgroundThreadTurnJson::decodeDraft,
+  )
+
+  fun newConsumeDraftCall(
+    origin: String,
+    operationGrantToken: String,
+    operationId: String,
+  ): T3VoiceBackgroundThreadCall<T3VoiceBackgroundThreadDraftConsumeResult> = jsonCall(
+    T3VoiceBackgroundHttpRequest(
+      origin = origin,
+      path = operationPath(operationId, "draft/consume"),
+      method = T3VoiceBackgroundHttpMethod.POST,
+      authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
+      body = jsonBody(JSONObject().toString().toByteArray(Charsets.UTF_8)),
+      maximumRequestBytes = MAXIMUM_JSON_BYTES,
+      maximumResponseBytes = MAXIMUM_JSON_RESPONSE_BYTES,
+    ),
+    T3VoiceBackgroundThreadTurnJson::decodeDraftConsume,
+  )
+
   private fun <A> jsonCall(
     request: T3VoiceBackgroundHttpRequest,
     decode: (ByteArray) -> A,
@@ -632,7 +878,7 @@ internal class T3VoiceBackgroundThreadTurnDelegate(
   private fun operationPath(operationId: String, suffix: String): String {
     require(operationId.matches(OPERATION_ID_PATTERN)) { "Invalid native thread operation ID." }
     require(suffix.matches(SUFFIX_PATTERN)) { "Invalid native thread operation path." }
-    return "/api/voice/native/thread-turns/$operationId/$suffix"
+    return "/api/voice/runtime/thread-turns/$operationId/$suffix"
   }
 
   private fun authority(name: String, token: String) = T3VoiceBackgroundAuthority(name, token)

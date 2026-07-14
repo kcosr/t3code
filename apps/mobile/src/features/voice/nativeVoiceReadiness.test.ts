@@ -32,8 +32,8 @@ describe("native voice readiness", () => {
     expect(
       resolveNativeVoiceReadiness(
         {
-          voiceBackgroundControlsEnabled: true,
-          voiceBackgroundDefaultMode: "realtime",
+          voiceNotificationControlsEnabled: true,
+          voiceNotificationDefaultMode: "realtime",
           voiceAudioRouteId: "speaker",
           voiceAutoListenEnabled: true,
         },
@@ -59,8 +59,8 @@ describe("native voice readiness", () => {
     expect(
       resolveNativeVoiceReadiness(
         {
-          voiceBackgroundControlsEnabled: true,
-          voiceBackgroundDefaultMode: "thread",
+          voiceNotificationControlsEnabled: true,
+          voiceNotificationDefaultMode: "thread",
           voiceThreadTarget: {
             environmentId: "environment-2",
             threadId: "thread-1",
@@ -81,8 +81,8 @@ describe("native voice readiness", () => {
     expect(
       resolveNativeVoiceReadiness(
         {
-          voiceBackgroundControlsEnabled: true,
-          voiceBackgroundDefaultMode: "thread",
+          voiceNotificationControlsEnabled: true,
+          voiceNotificationDefaultMode: "thread",
           voiceThreadTarget: {
             environmentId: "environment-1",
             threadId: "thread-1",
@@ -103,8 +103,8 @@ describe("native voice readiness", () => {
     expect(
       resolveNativeVoiceReadiness(
         {
-          voiceBackgroundControlsEnabled: true,
-          voiceBackgroundDefaultMode: "realtime",
+          voiceNotificationControlsEnabled: true,
+          voiceNotificationDefaultMode: "realtime",
         },
         "environment-1",
         {

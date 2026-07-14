@@ -97,8 +97,7 @@ class T3VoiceBackgroundThreadExecutionTest {
     val desired = readiness()
     val installed = activeAuthority()
     val active = T3VoiceBackgroundThreadOperationState.Active(
-      T3VoiceBackgroundThreadClaim("runtime-1", 4, "https://example.test",
-        "project-1", "thread-1", "client-1"),
+      claim(),
       "operation-1", NOW + 50_000, "child-secret",
       acknowledgedCursor = 0,
       snapshot = T3VoiceBackgroundSnapshot(
@@ -126,8 +125,7 @@ class T3VoiceBackgroundThreadExecutionTest {
 
   @Test fun `acknowledged parent revocation releases exact local child fence`() {
     val state = T3VoiceBackgroundThreadOperationState.Prepared(
-      T3VoiceBackgroundThreadClaim("runtime-1", 4, "https://example.test",
-        "project-1", "thread-1", "client-1"),
+      claim(),
     )
     assertTrue(T3VoiceBackgroundThreadRevocationPolicy.matches(
       state, T3VoicePendingRuntimeRevocation("runtime-1", "https://example.test")))
@@ -227,9 +225,7 @@ class T3VoiceBackgroundThreadExecutionTest {
 
   @Test fun `stop after acknowledge preserves durable operation cursor invariant`() {
     val active = T3VoiceBackgroundThreadOperationState.Active(
-      T3VoiceBackgroundThreadClaim(
-        "runtime-1", 4, "https://example.test", "project-1", "thread-1", "client-1",
-      ),
+      claim(),
       "operation-1",
       NOW + 50_000,
       "child-secret",
@@ -420,9 +416,7 @@ class T3VoiceBackgroundThreadExecutionTest {
     val recording = T3VoiceRecordingResult(
       "recording-1", "file:///cache/recording-1.m4a", 1_000, 128,
     )
-    val claim = T3VoiceBackgroundThreadClaim(
-      "runtime-1", 4, "https://example.test", "project-1", "thread-1", "client-1",
-    )
+    val claim = claim()
     val active = T3VoiceBackgroundThreadOperationState.Active(
       claim, "operation-1", NOW + 10_000, "child", 0, recording = recording,
       snapshot = T3VoiceBackgroundSnapshot(
@@ -442,9 +436,7 @@ class T3VoiceBackgroundThreadExecutionTest {
   }
 
   @Test fun `stored operation recovery distinguishes unstarted active work`() {
-    val claim = T3VoiceBackgroundThreadClaim(
-      "runtime-1", 4, "https://example.test", "project-1", "thread-1", "client-1",
-    )
+    val claim = claim()
     val active = T3VoiceBackgroundThreadOperationState.Active(
       claim, "operation-1", NOW, "child", 0,
       snapshot = T3VoiceBackgroundSnapshot(
@@ -505,9 +497,7 @@ class T3VoiceBackgroundThreadExecutionTest {
 
   @Test fun `cancellation authority survives mode change and process recovery`() {
     val targetDigest = DIGEST
-    val claim = T3VoiceBackgroundThreadClaim(
-      "runtime-1", 4, "https://example.test", "project-1", "thread-1", "client-1",
-    )
+    val claim = claim()
     val active = T3VoiceBackgroundThreadOperationState.Active(
       claim, "operation-1", NOW + 10_000, "child", 0, cancelRequested = true,
       snapshot = T3VoiceBackgroundSnapshot(
@@ -586,9 +576,33 @@ class T3VoiceBackgroundThreadExecutionTest {
     readiness().copy(targetId = targetId), "runtime-1", "https://example.test",
     T3VoiceRuntimeGrantOperation.THREAD_TURN_START, targetIdentityDigest,
   )
+  private fun claim() = T3VoiceBackgroundThreadClaim(
+    runtimeId = "runtime-1",
+    runtimeInstanceId = "instance-1",
+    readinessGeneration = 4,
+    modeSessionId = "mode-1",
+    environmentOrigin = "https://example.test",
+    projectId = "project-1",
+    threadId = "thread-1",
+    clientOperationId = "client-1",
+    submissionPolicy = "auto-submit",
+    speechPlanId = "speech-1",
+    draftContext = null,
+  )
   private fun snapshot(phase: String, last: Long, ack: Long, dispatched: Boolean) =
-    T3VoiceBackgroundThreadTurnSnapshot("operation-1", "runtime-1", 4, "project-1", "thread-1",
-      "default", true, phase, "message-1", "turn-1", last, ack, null, dispatched, NOW + 50_000)
+    T3VoiceBackgroundThreadTurnSnapshot(
+      operationId = "operation-1", runtimeId = "runtime-1", generation = 4,
+      runtimeInstanceId = "instance-1", modeSessionId = "mode-1",
+      turnClientOperationId = "client-operation-1", submissionPolicy = "auto-submit",
+      speechPlanId = "speech-1", projectId = "project-1", threadId = "thread-1",
+      speechPreset = "default", autoRearm = true, phase = phase, messageId = "message-1",
+      turnId = "turn-1", assistantMessageIds = emptyList(), highestAdvertisedSegment = null,
+      highestStartedSegment = null, highestDrainedSegment = null, segmentDispositions = emptyList(),
+      lastSequence = last, acknowledgedSequence = ack, speechTerminal = null,
+      dispatchAccepted = dispatched, detachedAtEpochMillis = null,
+      operationTokenExpiresAtEpochMillis = NOW + 40_000,
+      retentionExpiresAtEpochMillis = NOW + 50_000,
+    )
   private fun createResult(snapshot: T3VoiceBackgroundThreadTurnSnapshot) =
     T3VoiceBackgroundThreadTurnCreateResult(snapshot,
       T3VoiceBackgroundThreadTurnGrant("child", NOW + 40_000))

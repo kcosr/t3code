@@ -2113,7 +2113,9 @@ const make = Effect.gen(function* () {
           ),
         );
       yield* persistHandoffOutcome(settled);
-      yield* nativeControlGrants.revokeSession(VoiceSessionId.make(settled.realtimeSessionId));
+      yield* nativeControlGrants.releaseSessionControl(
+        VoiceSessionId.make(settled.realtimeSessionId),
+      );
       yield* endTerminalProviderSession(
         VoiceSessionId.make(settled.realtimeSessionId),
         "handed-off-to-thread-voice",

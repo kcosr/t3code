@@ -10,6 +10,7 @@ import {
   VoiceNativeRuntimeId,
   VoicePlaybackId,
   VoiceRequestId,
+  VoiceRuntimeProvisioningOperationId,
   VoiceSessionId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -31,6 +32,9 @@ const SESSION_ID = VoiceSessionId.make("voice-session-1");
 const CONFIRMATION_ID = VoiceConfirmationId.make("confirmation-1");
 const CLIENT_ACTION_ID = VoiceClientActionId.make("client-action-1");
 const NATIVE_RUNTIME_ID = VoiceNativeRuntimeId.make("native-runtime-1");
+const PROVISIONING_OPERATION_ID = VoiceRuntimeProvisioningOperationId.make(
+  "provision-android-main-3",
+);
 const PROJECT_ID = ProjectId.make("project-1");
 const THREAD_ID = ThreadId.make("thread-1");
 const threadGrantTarget = (autoRearm: boolean) => ({
@@ -99,7 +103,9 @@ describe("makeVoiceHttpClient", () => {
               token: "narrow-runtime-token",
               runtimeId: NATIVE_RUNTIME_ID,
               generation: 3,
+              provisioningOperationId: "provision-android-main-3",
               target: threadGrantTarget(true),
+              issuedAt: "2026-07-10T20:00:00.000Z",
               expiresAt: "2026-08-10T20:00:00.000Z",
             });
       };
@@ -110,6 +116,7 @@ describe("makeVoiceHttpClient", () => {
 
       const grant = yield* client.provisionNativeRuntimeGrant(NATIVE_RUNTIME_ID, {
         generation: 3,
+        provisioningOperationId: PROVISIONING_OPERATION_ID,
         target: threadGrantTarget(true),
       });
       const revoked = yield* client.revokeNativeRuntimeGrant(NATIVE_RUNTIME_ID);
@@ -126,7 +133,7 @@ describe("makeVoiceHttpClient", () => {
           ? new TextDecoder().decode(provisionBody)
           : provisionBody,
       ).toBe(
-        '{"generation":3,"target":{"mode":"thread","environmentId":"environment-voice-test","projectId":"project-1","threadId":"thread-1","speechPreset":"default","autoRearm":true,"endpointPolicy":{"endSilenceMs":2200,"noSpeechTimeoutMs":null,"maximumUtteranceMs":600000},"speechEnabled":true,"rearmGuardMs":500}}',
+        '{"generation":3,"provisioningOperationId":"provision-android-main-3","target":{"mode":"thread","environmentId":"environment-voice-test","projectId":"project-1","threadId":"thread-1","speechPreset":"default","autoRearm":true,"endpointPolicy":{"endSilenceMs":2200,"noSpeechTimeoutMs":null,"maximumUtteranceMs":600000},"speechEnabled":true,"rearmGuardMs":500}}',
       );
     }),
   );
@@ -149,13 +156,16 @@ describe("makeVoiceHttpClient", () => {
             token: "narrow-runtime-token",
             runtimeId: NATIVE_RUNTIME_ID,
             generation: 3,
+            provisioningOperationId: "provision-android-main-3",
             target: threadGrantTarget(false),
+            issuedAt: "2026-07-10T20:00:00.000Z",
             expiresAt: "2026-08-10T20:00:00.000Z",
           }),
       });
 
       yield* client.provisionNativeRuntimeGrant(NATIVE_RUNTIME_ID, {
         generation: 3,
+        provisioningOperationId: PROVISIONING_OPERATION_ID,
         target: threadGrantTarget(false),
       });
 
@@ -486,7 +496,7 @@ describe("makeVoiceHttpClient", () => {
       const acknowledged = yield* client.acknowledgeNativeHandoffAction(
         "native-token",
         CLIENT_ACTION_ID,
-        { outcome: "succeeded", state: "listening" },
+        { outcome: "succeeded", state: "accepted" },
       );
 
       expect(pending.actions).toHaveLength(1);
@@ -498,7 +508,7 @@ describe("makeVoiceHttpClient", () => {
           "content-type": "application/json",
         },
       ]);
-      expect(requests[1]?.init?.body).toBe('{"outcome":"succeeded","state":"listening"}');
+      expect(requests[1]?.init?.body).toBe('{"outcome":"succeeded","state":"accepted"}');
     }),
   );
 

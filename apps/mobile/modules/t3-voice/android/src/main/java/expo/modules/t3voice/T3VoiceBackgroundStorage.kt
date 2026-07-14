@@ -187,6 +187,13 @@ internal data class T3VoiceRuntimeGrant(
   val token: String,
 )
 
+internal data class T3VoiceRuntimeGrantActivation(
+  val grant: T3VoiceRuntimeGrant,
+  val target: VoiceRuntimeTarget.Thread?,
+  val provisioningOperationId: String,
+  val issuedAtEpochMillis: Long,
+)
+
 internal sealed interface T3VoiceRuntimeGrantLoadResult {
   data object Missing : T3VoiceRuntimeGrantLoadResult
 

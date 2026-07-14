@@ -1,4 +1,36 @@
 import type { PermissionResponse } from "expo";
+import type {
+  VoiceCommandReceipt,
+  VoiceDraftArtifact,
+  VoiceDraftArtifactAcknowledgement,
+  VoiceDraftArtifactRead,
+  VoiceRuntimeAttachRequest,
+  VoiceRuntimeAttachmentUpdate,
+  VoiceRuntimeAuthorityReservation,
+  VoiceRuntimeAuthorityClearCommand,
+  VoiceRuntimeConsumerLease,
+  VoiceRuntimeCursor,
+  VoiceRuntimeDescriptor,
+  VoiceRuntimeEvent,
+  VoiceRuntimeRebase,
+  VoiceRuntimeSnapshot,
+  VoiceRuntimeCommand,
+  VoiceRuntimePresentationAction,
+  VoiceRuntimePresentationActionAcknowledgement,
+  VoiceRuntimePresentationActionClaim,
+  VoiceNativeRuntimeTarget,
+} from "@t3tools/contracts";
+
+export type T3VoiceRuntimeReadDelivery =
+  | { readonly type: "events"; readonly events: ReadonlyArray<VoiceRuntimeEvent> }
+  | VoiceRuntimeRebase;
+
+export interface T3VoiceRuntimeWakeEvent {
+  readonly runtimeId: string;
+  readonly runtimeInstanceId: string;
+  readonly generation: number;
+  readonly sequence: number;
+}
 
 export interface T3VoiceEventSubscription {
   readonly remove: () => void;
@@ -174,6 +206,9 @@ export interface T3VoiceBackgroundRuntimeGrantInput {
   readonly environmentOrigin: string;
   readonly operation: T3VoiceBackgroundGrantOperation;
   readonly targetIdentity: string;
+  readonly target: VoiceNativeRuntimeTarget;
+  readonly provisioningOperationId: string;
+  readonly issuedAt: string;
   readonly expiresAtEpochMillis: number;
   readonly token: string;
 }
@@ -463,9 +498,49 @@ export interface T3VoiceNativeModule {
       eventName: "readinessDisabled",
       listener: (event: T3VoiceReadinessDisabledEvent) => void,
     ): T3VoiceEventSubscription;
+    (
+      eventName: "voiceRuntimeWake",
+      listener: (event: T3VoiceRuntimeWakeEvent) => void,
+    ): T3VoiceEventSubscription;
   };
   readonly getMediaCapabilitiesAsync: () => Promise<T3VoiceMediaCapabilities>;
   readonly getStateAsync: () => Promise<T3VoiceRuntimeState>;
+  readonly describeVoiceRuntimeAsync: () => Promise<VoiceRuntimeDescriptor>;
+  readonly getVoiceRuntimeSnapshotAsync: () => Promise<VoiceRuntimeSnapshot>;
+  readonly configureVoiceRuntimeAuthorityAsync: (
+    input: VoiceRuntimeAuthorityReservation,
+  ) => Promise<VoiceRuntimeSnapshot>;
+  readonly clearVoiceRuntimeAuthorityAsync: (
+    input: VoiceRuntimeAuthorityClearCommand,
+  ) => Promise<VoiceRuntimeSnapshot>;
+  readonly attachVoiceRuntimeAsync: (
+    input: VoiceRuntimeAttachRequest,
+  ) => Promise<VoiceRuntimeConsumerLease>;
+  readonly updateVoiceRuntimeAttachmentAsync: (
+    input: VoiceRuntimeAttachmentUpdate,
+  ) => Promise<VoiceRuntimeConsumerLease>;
+  readonly detachVoiceRuntimeAsync: (input: VoiceRuntimeConsumerLease) => Promise<void>;
+  readonly readVoiceRuntimeAsync: (input: {
+    readonly lease: VoiceRuntimeConsumerLease;
+    readonly after: VoiceRuntimeCursor | null;
+  }) => Promise<T3VoiceRuntimeReadDelivery>;
+  readonly acknowledgeVoiceRuntimeAsync: (input: {
+    readonly lease: VoiceRuntimeConsumerLease;
+    readonly through: VoiceRuntimeCursor;
+  }) => Promise<void>;
+  readonly dispatchVoiceRuntimeAsync: (input: VoiceRuntimeCommand) => Promise<VoiceCommandReceipt>;
+  readonly readVoiceRuntimeDraftArtifactAsync: (
+    input: VoiceDraftArtifactRead,
+  ) => Promise<VoiceDraftArtifact>;
+  readonly acknowledgeVoiceRuntimeDraftArtifactAsync: (
+    input: VoiceDraftArtifactAcknowledgement,
+  ) => Promise<void>;
+  readonly claimVoiceRuntimePresentationActionAsync: (
+    input: VoiceRuntimePresentationActionClaim,
+  ) => Promise<VoiceRuntimePresentationAction>;
+  readonly acknowledgeVoiceRuntimePresentationActionAsync: (
+    input: VoiceRuntimePresentationActionAcknowledgement,
+  ) => Promise<void>;
   readonly prepareBackgroundVoiceReadinessAsync: (
     input: T3VoiceBackgroundReadinessPrepareInput,
   ) => Promise<T3VoiceBackgroundPreparedReadiness>;

@@ -59,6 +59,16 @@ const thread = (archivedAt: string | null = null) =>
     archivedAt,
   }) as const;
 
+const threadRuntimeSettings = {
+  endpointPolicy: {
+    endSilenceMs: 2_200,
+    noSpeechTimeoutMs: null,
+    maximumUtteranceMs: 600_000,
+  },
+  speechEnabled: true,
+  rearmGuardMs: 500,
+} as const;
+
 describe("resolveNativeVoiceRuntimeTarget", () => {
   it("keeps the active Realtime conversation without listing or creating another", async () => {
     const voice = client([]);
@@ -79,7 +89,7 @@ describe("resolveNativeVoiceRuntimeTarget", () => {
       focus: { type: "thread", projectId: PROJECT_ID, threadId: THREAD_ID },
     });
     expect(result.targetIdentity).toBe(
-      '{"mode":"realtime","conversation":{"type":"continue","conversationId":"conversation-1"},"focus":{"type":"thread","projectId":"project-1","threadId":"thread-1"}}',
+      '{"conversation":{"conversationId":"conversation-1","type":"continue"},"focus":{"projectId":"project-1","threadId":"thread-1","type":"thread"},"mode":"realtime"}',
     );
     expect(nativeVoiceRuntimeReadinessTargetId(result.target)).toBe("conversation-1");
     expect(voice.creates()).toBe(0);
@@ -147,14 +157,20 @@ describe("resolveNativeVoiceRuntimeTarget", () => {
       },
       threads: [thread()],
       autoRearm: true,
+      ...threadRuntimeSettings,
     });
+    expect(result.targetIdentity).toBe(
+      '{"autoRearm":true,"endpointPolicy":{"endSilenceMs":2200,"maximumUtteranceMs":600000,"noSpeechTimeoutMs":null},"environmentId":"environment-1","mode":"thread","projectId":"project-1","rearmGuardMs":500,"speechEnabled":true,"speechPreset":"default","threadId":"thread-1"}',
+    );
 
     expect(result.target).toEqual({
       mode: "thread",
+      environmentId: ENVIRONMENT_ID,
       projectId: PROJECT_ID,
       threadId: THREAD_ID,
       speechPreset: "default",
       autoRearm: true,
+      ...threadRuntimeSettings,
     });
     expect(nativeVoiceRuntimeReadinessTargetId(result.target)).toBe("project-1/thread-1");
     expect(nativeVoiceRuntimeReadinessTargetId(result.target)).not.toContain(
@@ -178,6 +194,7 @@ describe("resolveNativeVoiceRuntimeTarget", () => {
         },
         threads: [thread("2026-07-12T05:00:00.000Z")],
         autoRearm: true,
+        ...threadRuntimeSettings,
       }),
     ).rejects.toBeInstanceOf(NativeVoiceRuntimeTargetUnavailableError);
   });

@@ -18,9 +18,19 @@ internal enum class T3VoiceRuntimePhase {
   REALTIME,
 }
 
+internal enum class T3VoiceOperationOwnerDomain {
+  COMPOSER_DICTATION,
+  MANUAL_PLAYBACK,
+  THREAD_MODE,
+  REALTIME_HANDOFF,
+  CUE,
+}
+
 internal data class T3VoiceOperationOwner(
   val id: String,
   val generation: Long,
+  val domain: T3VoiceOperationOwnerDomain,
+  val operationId: String,
 )
 
 internal data class T3VoiceRuntimeState(
@@ -166,6 +176,20 @@ internal sealed interface T3VoiceRuntimeEvent {
         "reason" to reason,
       )
   }
+
+  data class VoiceRuntimeWake(
+    val runtimeId: String,
+    val runtimeInstanceId: String,
+    val generation: Long,
+    val sequence: Long,
+  ) : T3VoiceRuntimeEvent {
+    override fun toEventBody(): Map<String, Any> = mapOf(
+      "runtimeId" to runtimeId,
+      "runtimeInstanceId" to runtimeInstanceId,
+      "generation" to generation.toDouble(),
+      "sequence" to sequence.toDouble(),
+    )
+  }
 }
 
 internal object T3VoiceStateStore {
@@ -193,6 +217,7 @@ internal object T3VoiceStateStore {
     MutableStateFlow<T3VoiceRuntimeEvent.RecordingTerminated?>(null)
   private val mutablePlaybackTermination =
     MutableStateFlow<T3VoiceRuntimeEvent.PlaybackTerminated?>(null)
+  private var nativeHandoffRecordingTermination: T3VoiceRuntimeEvent.RecordingTerminated? = null
   private val mutableThreadVoiceHandoff =
     MutableStateFlow<T3VoiceRuntimeEvent.ThreadVoiceHandoff?>(null)
   private val adoptedThreadVoiceHandoffRecordingIds = mutableSetOf<String>()
@@ -210,15 +235,27 @@ internal object T3VoiceStateStore {
     mutableThreadVoiceHandoff.asStateFlow()
 
   @Synchronized
-  fun publishThreadVoiceHandoff(event: T3VoiceRuntimeEvent.ThreadVoiceHandoff) {
+  fun publishThreadVoiceHandoff(
+    event: T3VoiceRuntimeEvent.ThreadVoiceHandoff,
+  ): T3VoiceRuntimeEvent.RecordingTerminated? {
+    val previous = mutableThreadVoiceHandoff.value
+    val displacedTermination = nativeHandoffRecordingTermination?.takeIf {
+      previous?.recordingId == it.recordingId && previous.recordingId != event.recordingId
+    }
+    if (displacedTermination != null) nativeHandoffRecordingTermination = null
+    previous?.let { adoptedThreadVoiceHandoffRecordingIds.remove(it.recordingId) }
     adoptedThreadVoiceHandoffRecordingIds.remove(event.recordingId)
     threadVoiceHandoffAdoptionClaims.clear()
     mutableThreadVoiceHandoff.value = event
+    return displacedTermination
   }
 
   @Synchronized
   fun clearThreadVoiceHandoff(actionId: String) {
     val current = mutableThreadVoiceHandoff.value?.takeIf { it.actionId == actionId } ?: return
+    if (nativeHandoffRecordingTermination?.recordingId == current.recordingId) {
+      nativeHandoffRecordingTermination = null
+    }
     adoptedThreadVoiceHandoffRecordingIds.remove(current.recordingId)
     threadVoiceHandoffAdoptionClaims.remove(actionId)
     mutableThreadVoiceHandoff.compareAndSet(current, null)
@@ -226,7 +263,15 @@ internal object T3VoiceStateStore {
 
   @Synchronized
   fun beginThreadVoiceHandoffAdoption(actionId: String, protectUntilEpochMillis: Long): Boolean {
-    mutableThreadVoiceHandoff.value?.takeIf { it.actionId == actionId } ?: return false
+    val handoff = mutableThreadVoiceHandoff.value?.takeIf { it.actionId == actionId } ?: return false
+    if (mutableRecordingTermination.value != null) return false
+    val terminal = nativeHandoffRecordingTermination
+      ?.takeIf { it.recordingId == handoff.recordingId }
+    if (terminal == null && mutableState.value.activeRecordingId != handoff.recordingId) return false
+    if (terminal != null) {
+      nativeHandoffRecordingTermination = null
+      mutableRecordingTermination.value = terminal
+    }
     threadVoiceHandoffAdoptionClaims[actionId] = protectUntilEpochMillis
     return true
   }
@@ -264,7 +309,8 @@ internal object T3VoiceStateStore {
     val current = mutableThreadVoiceHandoff.value ?: return null
     val recordingStillAdoptable =
       mutableState.value.activeRecordingId == current.recordingId ||
-        mutableRecordingTermination.value?.recordingId == current.recordingId
+        mutableRecordingTermination.value?.recordingId == current.recordingId ||
+        nativeHandoffRecordingTermination?.recordingId == current.recordingId
     if (recordingStillAdoptable) return current
     adoptedThreadVoiceHandoffRecordingIds.remove(current.recordingId)
     threadVoiceHandoffAdoptionClaims.remove(current.actionId)
@@ -329,9 +375,19 @@ internal object T3VoiceStateStore {
   }
 
   @Synchronized
-  fun claimRecording(recordingId: String): T3VoiceOperationOwner? {
-    if (mutableRecordingTermination.value != null) return null
-    val owner = T3VoiceOperationOwner(recordingId, nextOperationGeneration.incrementAndGet())
+  fun claimRecording(
+    recordingId: String,
+    domain: T3VoiceOperationOwnerDomain,
+    operationId: String,
+  ): T3VoiceOperationOwner? {
+    if (domain == T3VoiceOperationOwnerDomain.COMPOSER_DICTATION &&
+      mutableRecordingTermination.value != null) return null
+    val owner = T3VoiceOperationOwner(
+      recordingId,
+      nextOperationGeneration.incrementAndGet(),
+      domain,
+      operationId,
+    )
     return owner.takeIf {
       claimIdle {
         it.copy(
@@ -377,16 +433,34 @@ internal object T3VoiceStateStore {
     event: T3VoiceRuntimeEvent.RecordingTerminated,
   ): Boolean {
     val terminated = releaseRecording(owner)
-    if (terminated) mutableRecordingTermination.value = event
+    if (terminated) {
+      when (owner.domain) {
+        T3VoiceOperationOwnerDomain.COMPOSER_DICTATION -> mutableRecordingTermination.value = event
+        T3VoiceOperationOwnerDomain.REALTIME_HANDOFF -> nativeHandoffRecordingTermination = event
+        else -> Unit
+      }
+    }
     return terminated
   }
 
   @Synchronized
+  fun pendingNativeHandoffRecordingTermination(
+    recordingId: String,
+  ): T3VoiceRuntimeEvent.RecordingTerminated? =
+    nativeHandoffRecordingTermination?.takeIf { it.recordingId == recordingId }
+
+  @Synchronized
+  fun clearNativeHandoffRecordingTermination(recordingId: String) {
+    if (nativeHandoffRecordingTermination?.recordingId == recordingId) {
+      nativeHandoffRecordingTermination = null
+    }
+  }
+
+  @Synchronized
   fun clearRecordingTermination(recordingId: String) {
-    mutableRecordingTermination.compareAndSet(
-      mutableRecordingTermination.value?.takeIf { it.recordingId == recordingId },
-      null,
-    )
+    val current = mutableRecordingTermination.value?.takeIf { it.recordingId == recordingId }
+      ?: return
+    if (!mutableRecordingTermination.compareAndSet(current, null)) return
     val handoff = mutableThreadVoiceHandoff.value?.takeIf { it.recordingId == recordingId }
     if (handoff != null) {
       threadVoiceHandoffAdoptionClaims.remove(handoff.actionId)
@@ -396,9 +470,19 @@ internal object T3VoiceStateStore {
   }
 
   @Synchronized
-  fun claimPlayback(playbackId: String): T3VoiceOperationOwner? {
-    if (mutablePlaybackTermination.value != null) return null
-    val owner = T3VoiceOperationOwner(playbackId, nextOperationGeneration.incrementAndGet())
+  fun claimPlayback(
+    playbackId: String,
+    domain: T3VoiceOperationOwnerDomain,
+    operationId: String,
+  ): T3VoiceOperationOwner? {
+    if (domain == T3VoiceOperationOwnerDomain.MANUAL_PLAYBACK &&
+      mutablePlaybackTermination.value != null) return null
+    val owner = T3VoiceOperationOwner(
+      playbackId,
+      nextOperationGeneration.incrementAndGet(),
+      domain,
+      operationId,
+    )
     return owner.takeIf {
       claimIdle {
         it.copy(
@@ -435,7 +519,9 @@ internal object T3VoiceStateStore {
     event: T3VoiceRuntimeEvent.PlaybackTerminated,
   ): Boolean {
     val terminated = releasePlayback(owner)
-    if (terminated) mutablePlaybackTermination.value = event
+    if (terminated && owner.domain == T3VoiceOperationOwnerDomain.MANUAL_PLAYBACK) {
+      mutablePlaybackTermination.value = event
+    }
     return terminated
   }
 

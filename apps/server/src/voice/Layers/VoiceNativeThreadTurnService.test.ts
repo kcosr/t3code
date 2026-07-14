@@ -18,6 +18,7 @@ import {
   VoiceTurnClientOperationId,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
+import { appendSpeechText } from "@t3tools/shared/speechChunker";
 import * as NodeFS from "node:fs";
 import * as NodeCrypto from "node:crypto";
 import * as Clock from "effect/Clock";
@@ -47,6 +48,7 @@ import { VoiceNativeRuntimeGrantRegistry } from "../Services/VoiceNativeRuntimeG
 import { VoiceNativeThreadTurnService } from "../Services/VoiceNativeThreadTurnService.ts";
 import { voiceProviderRegistryLayer } from "../Services/VoiceProviderRegistry.ts";
 import { VoiceNativeThreadTurnServiceLive } from "./VoiceNativeThreadTurnService.ts";
+import { __testing } from "./VoiceNativeThreadTurnService.ts";
 
 const authSessionId = AuthSessionId.make("native-thread-service-auth");
 const runtimeId = VoiceNativeRuntimeId.make("native-thread-service-runtime");
@@ -180,7 +182,7 @@ const makeTestLayer = Effect.fn("test.makeNativeThreadTurnServiceLayer")(functio
 });
 
 const initialize = Effect.gen(function* () {
-  yield* runMigrations({ toMigrationInclusive: 47 });
+  yield* runMigrations({ toMigrationInclusive: 51 });
   const sql = yield* SqlClient.SqlClient;
   const now = yield* Clock.currentTimeMillis;
   yield* sql`INSERT INTO auth_sessions (
@@ -190,10 +192,10 @@ const initialize = Effect.gen(function* () {
     '2026-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z'
   )`;
   yield* sql`INSERT INTO voice_native_runtime_grants (
-    token_hash, runtime_id, generation, auth_session_id, granted_scopes_json,
+    token_hash, provisioning_operation_id, runtime_id, generation, auth_session_id, granted_scopes_json,
     target_json, expires_at, created_at
   ) VALUES (
-    'runtime-hash', ${runtimeId}, 1, ${authSessionId}, '[]',
+    'runtime-hash', 'thread-turn-service-provision', ${runtimeId}, 1, ${authSessionId}, '[]',
     ${encodeRuntimeTarget({
       mode: "thread",
       environmentId,
@@ -231,6 +233,56 @@ const create = (
   });
 
 describe.sequential("VoiceNativeThreadTurnService", () => {
+  it.effect("resumes speech segmentation after a persisted pre-restart segment", () =>
+    Effect.gen(function* () {
+      const test = yield* makeTestLayer("never");
+      yield* Effect.gen(function* () {
+        yield* initialize;
+        const store = yield* VoiceNativeThreadTurnStore;
+        const operation = yield* create("restart-segmentation");
+        const priorText = "This sentence was advertised before restart.";
+        expect(
+          yield* store.putSpeechSegmentAndEvent({
+            operationId: operation.snapshot.operationId,
+            segmentIndex: 0,
+            assistantMessageId: MessageId.make("restart-assistant"),
+            startOffset: 0,
+            endOffset: priorText.length,
+            finalSegment: false,
+            sourceEventSequence: 10,
+            sourceTextSha256: NodeCrypto.createHash("sha256").update(priorText).digest("hex"),
+            createdAt: "2026-07-13T12:00:01.000Z",
+          }),
+        ).toBe("inserted");
+
+        const persisted = yield* store.listSpeechSegments(operation.snapshot.operationId);
+        const restored = __testing.restoreSpeechCursor(persisted);
+        expect(restored).toMatchObject({
+          state: { nextIndex: 1, finished: false },
+          emittedOffset: priorText.length,
+        });
+        if (restored === undefined) return;
+        const resumed = appendSpeechText(
+          restored.state,
+          " The response continued after restart.",
+          true,
+        );
+        expect(resumed.segments).toEqual([
+          {
+            index: 1,
+            text: "The response continued after restart.",
+            finalSegment: false,
+          },
+        ]);
+        expect(yield* store.getSpeechSegment(operation.snapshot.operationId, 0)).toMatchObject({
+          segmentIndex: 0,
+          startOffset: 0,
+          endOffset: priorText.length,
+        });
+      }).pipe(Effect.provide(test.layer));
+    }),
+  );
+
   it.effect("returns one stable child grant for an idempotent create replay", () =>
     Effect.gen(function* () {
       const test = yield* makeTestLayer("never");

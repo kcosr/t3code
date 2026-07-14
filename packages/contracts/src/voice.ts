@@ -16,6 +16,7 @@ import {
   VoiceConversationId,
   VoiceMediaTicketId,
   VoiceNativeRuntimeId,
+  VoiceRuntimeProvisioningOperationId,
   VoiceNativeThreadTurnOperationId,
   VoicePlaybackId,
   VoiceRequestId,
@@ -465,6 +466,7 @@ export type VoiceNativeThreadTurnCancelResult = typeof VoiceNativeThreadTurnCanc
 
 export const VoiceNativeRuntimeGrantProvisionInput = Schema.Struct({
   generation: PositiveInt,
+  provisioningOperationId: VoiceRuntimeProvisioningOperationId,
   target: VoiceNativeRuntimeTarget,
 });
 export type VoiceNativeRuntimeGrantProvisionInput =
@@ -474,7 +476,9 @@ export const VoiceNativeRuntimeGrant = Schema.Struct({
   token: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
   runtimeId: VoiceNativeRuntimeId,
   generation: PositiveInt,
+  provisioningOperationId: VoiceRuntimeProvisioningOperationId,
   target: VoiceNativeRuntimeTarget,
+  issuedAt: IsoDateTime,
   expiresAt: IsoDateTime,
 });
 export type VoiceNativeRuntimeGrant = typeof VoiceNativeRuntimeGrant.Type;
@@ -734,7 +738,7 @@ export const VoiceClientActionAckInput = Schema.Union([
     leaseGeneration: PositiveInt,
     action: Schema.Literal("handoff-to-thread-voice"),
     outcome: Schema.Literal("succeeded"),
-    state: Schema.Literal("listening"),
+    state: Schema.Literal("accepted"),
   }),
   Schema.Struct({
     leaseGeneration: PositiveInt,
@@ -772,7 +776,7 @@ export type VoiceNativeHandoffActionListResult = typeof VoiceNativeHandoffAction
 export const VoiceNativeHandoffActionAckInput = Schema.Union([
   Schema.Struct({
     outcome: Schema.Literal("succeeded"),
-    state: Schema.Literal("listening"),
+    state: Schema.Literal("accepted"),
   }),
   Schema.Struct({
     outcome: Schema.Literal("failed"),

@@ -45,8 +45,8 @@ export interface Preferences {
   readonly voiceSubmissionTimeoutMs?: number;
   readonly voiceResponseTimeoutMs?: number;
   readonly voiceMode?: "off" | "realtime" | "thread";
-  readonly voiceBackgroundControlsEnabled?: boolean;
-  readonly voiceBackgroundDefaultMode?: "realtime" | "thread";
+  readonly voiceNotificationControlsEnabled?: boolean;
+  readonly voiceNotificationDefaultMode?: "realtime" | "thread";
   readonly voiceThreadTarget?: {
     readonly environmentId: string;
     readonly threadId: string;
@@ -114,8 +114,8 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     voiceSubmissionTimeoutMs?: number;
     voiceResponseTimeoutMs?: number;
     voiceMode?: "off" | "realtime" | "thread";
-    voiceBackgroundControlsEnabled?: boolean;
-    voiceBackgroundDefaultMode?: "realtime" | "thread";
+    voiceNotificationControlsEnabled?: boolean;
+    voiceNotificationDefaultMode?: "realtime" | "thread";
     voiceThreadTarget?: {
       readonly environmentId: string;
       readonly threadId: string;
@@ -207,14 +207,14 @@ function sanitizePreferences(parsed: Preferences): Preferences {
   ) {
     preferences.voiceMode = parsed.voiceMode;
   }
-  if (typeof parsed.voiceBackgroundControlsEnabled === "boolean") {
-    preferences.voiceBackgroundControlsEnabled = parsed.voiceBackgroundControlsEnabled;
+  if (typeof parsed.voiceNotificationControlsEnabled === "boolean") {
+    preferences.voiceNotificationControlsEnabled = parsed.voiceNotificationControlsEnabled;
   }
   if (
-    parsed.voiceBackgroundDefaultMode === "realtime" ||
-    parsed.voiceBackgroundDefaultMode === "thread"
+    parsed.voiceNotificationDefaultMode === "realtime" ||
+    parsed.voiceNotificationDefaultMode === "thread"
   ) {
-    preferences.voiceBackgroundDefaultMode = parsed.voiceBackgroundDefaultMode;
+    preferences.voiceNotificationDefaultMode = parsed.voiceNotificationDefaultMode;
   }
   const voiceThreadTarget = parsed.voiceThreadTarget;
   if (

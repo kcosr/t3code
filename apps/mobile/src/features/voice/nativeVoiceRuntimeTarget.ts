@@ -33,9 +33,23 @@ export class NativeVoiceRuntimeTargetUnavailableError extends Data.TaggedError(
   }
 }
 
-export const canonicalNativeVoiceRuntimeTargetIdentity = Schema.encodeSync(
-  Schema.fromJsonString(VoiceNativeRuntimeTarget),
-);
+const encodeNativeVoiceRuntimeTarget = Schema.encodeSync(VoiceNativeRuntimeTarget);
+
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, canonicalValue(entry)]),
+  );
+}
+
+export function canonicalNativeVoiceRuntimeTargetIdentity(
+  target: VoiceNativeRuntimeTargetType,
+): string {
+  return JSON.stringify(canonicalValue(encodeNativeVoiceRuntimeTarget(target)));
+}
 
 export interface ResolvedNativeVoiceRuntimeTarget {
   readonly target: VoiceNativeRuntimeTargetType;
@@ -101,9 +115,8 @@ function withIdentity(target: VoiceNativeRuntimeTargetType): ResolvedNativeVoice
   return { target, targetIdentity: canonicalNativeVoiceRuntimeTargetIdentity(target) };
 }
 
-export async function resolveNativeVoiceRuntimeTarget(input: {
+type ResolveNativeVoiceRuntimeTargetInput = {
   readonly client: NativeRuntimeTargetClient;
-  readonly mode: "realtime" | "thread";
   readonly environmentId: EnvironmentId;
   readonly activeConversationId: VoiceConversationId | null;
   readonly focus: {
@@ -114,7 +127,23 @@ export async function resolveNativeVoiceRuntimeTarget(input: {
   readonly threadTarget: PersistedVoiceThreadTarget | null | undefined;
   readonly threads: ReadonlyArray<NativeRuntimeThreadShell>;
   readonly autoRearm: boolean;
-}): Promise<ResolvedNativeVoiceRuntimeTarget> {
+} & (
+  | { readonly mode: "realtime" }
+  | {
+      readonly mode: "thread";
+      readonly endpointPolicy: {
+        readonly endSilenceMs: number;
+        readonly noSpeechTimeoutMs: number | null;
+        readonly maximumUtteranceMs: number;
+      };
+      readonly speechEnabled: boolean;
+      readonly rearmGuardMs: number;
+    }
+);
+
+export async function resolveNativeVoiceRuntimeTarget(
+  input: ResolveNativeVoiceRuntimeTargetInput,
+): Promise<ResolvedNativeVoiceRuntimeTarget> {
   if (input.mode === "realtime") {
     const conversationId = await resolveRealtimeConversationId(input);
     const focus =
@@ -149,9 +178,13 @@ export async function resolveNativeVoiceRuntimeTarget(input: {
   }
   return withIdentity({
     mode: "thread",
+    environmentId: input.environmentId,
     projectId: thread.projectId,
     threadId: thread.id,
     speechPreset: "default",
     autoRearm: input.autoRearm,
+    endpointPolicy: input.endpointPolicy,
+    speechEnabled: input.speechEnabled,
+    rearmGuardMs: input.rearmGuardMs,
   });
 }

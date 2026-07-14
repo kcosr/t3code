@@ -16,8 +16,6 @@ import {
   serializeComposerFileLink,
   type ComposerTrigger,
 } from "@t3tools/shared/composerTrigger";
-import type { VoiceThreadModePauseReason } from "@t3tools/shared/voiceThreadMode";
-import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import type { ReactNode } from "react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
@@ -69,21 +67,8 @@ import { useComposerPathSearch } from "../../state/use-composer-path-search";
 import { mobilePreferencesAtom } from "../../state/preferences";
 import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerCommandPopover";
 import { useComposerDictation } from "../voice/useComposerDictation";
-import { shouldShowAutoListenPauseAlert } from "../voice/autoListenPausePresentation";
-import {
-  activateAutoListenWithAudioHandoff,
-  dictationResumeTransition,
-  interruptTraditionalAudioForRealtime,
-  runExclusiveTraditionalAudioTransition,
-  startManualDictationWithAudioHandoff,
-} from "../voice/traditionalAudioHandoff";
-import { useMasterVoice } from "../voice/MasterVoiceProvider";
 import { resolveVoicePreferences } from "../voice/voicePreferences";
-import { useAutoListenController } from "../voice/useAutoListenController";
-import {
-  NativeThreadCommandActivationCoordinator,
-  shouldStartNativeThreadCommand,
-} from "../voice/nativeVoiceReadiness";
+import { useThreadVoiceComposerController } from "./useThreadVoiceComposerController";
 
 /**
  * Height of the collapsed composer (pill + vertical padding, excluding safe-area inset).
@@ -96,42 +81,6 @@ export const COMPOSER_COLLAPSED_CHROME = 60;
  * Used by the parent to compute the larger feed bottom inset when the composer is focused.
  */
 export const COMPOSER_EXPANDED_CHROME = 174;
-
-function autoListenPauseMessage(reason: VoiceThreadModePauseReason): string {
-  switch (reason) {
-    case "permission":
-      return "Microphone permission is unavailable.";
-    case "audio-route":
-      return "The selected audio route is unavailable.";
-    case "no-speech":
-    case "empty-transcript":
-      return "No speech was recognized.";
-    case "recording-failed":
-      return "Recording could not continue.";
-    case "transcription-failed":
-      return "Transcription failed.";
-    case "transcription-timeout":
-      return "Transcription timed out.";
-    case "submission-failed":
-      return "The message could not be sent.";
-    case "submission-timeout":
-      return "Sending the message timed out.";
-    case "interaction-required":
-      return "The thread needs approval or user input.";
-    case "response-timeout":
-      return "The thread response timed out.";
-    case "playback-cancelled":
-      return "Spoken response playback was stopped.";
-    case "playback-failed":
-      return "Spoken response playback failed.";
-    case "user":
-    case "disabled":
-    case "target-changed":
-    case "realtime-active":
-    case "lifecycle":
-      return "Auto Listen stopped.";
-  }
-}
 
 export interface ThreadComposerProps {
   readonly draftMessage: string;
@@ -364,246 +313,23 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     onChangeDraftMessage: props.onChangeDraftMessage,
     voicePreferences,
   });
-  const realtimeVoice = useMasterVoice();
-  const realtimeInUse =
-    realtimeVoice.phase === "active" ||
-    realtimeVoice.phase === "starting" ||
-    realtimeVoice.phase === "stopping";
-  const dictationWasActiveRef = useRef(false);
-  const traditionalAudioTransitionLockRef = useRef({ active: false });
-  const canStartAutoListen =
-    dictation.available &&
-    props.draftMessage.trim().length === 0 &&
-    props.draftAttachments.length === 0 &&
-    !props.interactionRequired;
-  const autoListen = useAutoListenController({
-    environmentId: props.environmentId,
-    threadId: props.selectedThread.id,
-    preferences: voicePreferences,
+  const {
+    realtimeInUse,
+    autoListenState,
+    autoListenActive,
+    canStartAutoListen,
+    toggleDictation,
+    toggleAutoListenOperation,
+    submitAutoListenReview,
+  } = useThreadVoiceComposerController({
+    props,
+    dictation,
+    voicePreferences,
+    spokenResponsesEnabled,
     persistedTargetGeneration: AsyncResult.isSuccess(preferencesResult)
       ? (preferencesResult.value.voiceThreadTarget?.generation ?? 0)
       : 0,
-    activeThreadBusy: props.activeThreadBusy,
-    threadMessages: props.threadMessages,
-    interactionRequired: props.interactionRequired,
-    canStartFromComposer: canStartAutoListen,
-    dictation,
-    speech: {
-      ...props.speechPlayback,
-      playbackRequired: spokenResponsesEnabled,
-    },
-    realtimePhase: realtimeVoice.phase,
-    stopRealtime: realtimeVoice.stop,
-    onSendVoiceMessage: props.onSendVoiceMessage,
   });
-  const {
-    state: autoListenState,
-    active: autoListenActive,
-    activate: activateAutoListen,
-    adoptHandoffRecording,
-    deactivateForManualDictation: deactivateAutoListenForManualDictation,
-    stopToDraft: stopAutoListenToDraft,
-    pause: pauseAutoListen,
-    submitReview: submitAutoListenReview,
-  } = autoListen;
-  const autoListenAlertCycleRef = useRef(0);
-  const nativeThreadActivationRef = useRef(new NativeThreadCommandActivationCoordinator());
-  const handoffAdoptionsRef = useRef(new Set<string>());
-
-  useEffect(() => {
-    const command = realtimeVoice.nativeThreadCommand;
-    if (
-      command === null ||
-      !shouldStartNativeThreadCommand({
-        captureReady: dictation.available,
-        command,
-        environmentId: props.environmentId,
-        threadId: props.selectedThread.id,
-      })
-    ) {
-      return;
-    }
-    nativeThreadActivationRef.current.start(
-      command.commandId,
-      () => activateAutoListen(true),
-      realtimeVoice.completeNativeThreadCommand,
-    );
-  }, [
-    dictation.available,
-    props.environmentId,
-    props.selectedThread.id,
-    realtimeVoice.nativeThreadCommand,
-  ]);
-
-  useEffect(() => {
-    const handoff = realtimeVoice.threadVoiceHandoff;
-    if (
-      handoff === null ||
-      handoff.environmentId !== props.environmentId ||
-      handoff.threadId !== props.selectedThread.id
-    ) {
-      return;
-    }
-    if (handoffAdoptionsRef.current.has(handoff.actionId)) return;
-    const releaseAdoption = realtimeVoice.beginThreadVoiceHandoffAdoption(handoff.actionId);
-    if (releaseAdoption === null) return;
-    handoffAdoptionsRef.current.add(handoff.actionId);
-    void (async () => {
-      const native = getT3VoiceNativeModule();
-      if (native === null) return;
-      for (;;) {
-        try {
-          if (
-            !(await native.beginThreadVoiceHandoffAdoptionAsync({ actionId: handoff.actionId }))
-          ) {
-            return;
-          }
-          break;
-        } catch {
-          await new Promise((resolve) => setTimeout(resolve, 250));
-        }
-      }
-      let adopted = false;
-      try {
-        adopted = await dictation.adopt(handoff.recordingId);
-      } catch {
-        await realtimeVoice.settleThreadVoiceHandoff(handoff.actionId, "failed");
-        return;
-      }
-      if (!adopted) {
-        await realtimeVoice.settleThreadVoiceHandoff(handoff.actionId, "failed");
-        return;
-      }
-      try {
-        if (handoff.autoRearm) adoptHandoffRecording(handoff.recordingId);
-        void native
-          .recordThreadVoiceHandoffClientStageAsync({ stage: "composer-adopted" })
-          .catch(() => undefined);
-      } finally {
-        for (;;) {
-          try {
-            await realtimeVoice.settleThreadVoiceHandoff(handoff.actionId, "adopted");
-            break;
-          } catch {
-            await new Promise((resolve) => setTimeout(resolve, 1_000));
-          }
-        }
-      }
-    })()
-      .finally(() => {
-        releaseAdoption();
-        handoffAdoptionsRef.current.delete(handoff.actionId);
-      })
-      .catch(() => undefined);
-  }, [
-    adoptHandoffRecording,
-    dictation,
-    props.environmentId,
-    props.selectedThread.id,
-    realtimeVoice,
-  ]);
-
-  useEffect(() => {
-    if (
-      autoListenState.phase !== "paused" ||
-      autoListenState.cycle <= autoListenAlertCycleRef.current
-    ) {
-      return;
-    }
-    autoListenAlertCycleRef.current = autoListenState.cycle;
-    const reason = autoListenState.pauseReason;
-    if (!shouldShowAutoListenPauseAlert(reason)) return;
-    Alert.alert("Auto Listen paused", autoListenPauseMessage(reason));
-  }, [autoListenState]);
-
-  useEffect(() => {
-    const transition = dictationResumeTransition(dictationWasActiveRef.current, dictation.phase);
-    dictationWasActiveRef.current = transition.wasActive;
-    if (transition.resume) props.speechPlayback.resumeAfterDictation();
-  }, [dictation.phase, props.speechPlayback.resumeAfterDictation]);
-
-  useEffect(() => {
-    if (realtimeVoice.phase === "idle" || realtimeVoice.phase === "error") {
-      props.speechPlayback.resumeAfterRealtime();
-    }
-  }, [props.speechPlayback.resumeAfterRealtime, realtimeVoice.phase]);
-
-  useEffect(
-    () =>
-      realtimeVoice.registerTraditionalAudioInterruption(async () => {
-        const restoreAutoListen = autoListenActive;
-        pauseAutoListen("realtime-active");
-        return interruptTraditionalAudioForRealtime({
-          cancelDictation: dictation.cancelForRealtime,
-          interruptPlayback: props.speechPlayback.interruptForRealtime,
-          rollback: () => {
-            props.speechPlayback.resumeAfterRealtime();
-            if (restoreAutoListen) void activateAutoListen(true);
-          },
-        });
-      }),
-    [
-      activateAutoListen,
-      autoListenActive,
-      dictation.cancelForRealtime,
-      pauseAutoListen,
-      props.speechPlayback.interruptForRealtime,
-      props.speechPlayback.resumeAfterRealtime,
-      realtimeVoice.registerTraditionalAudioInterruption,
-    ],
-  );
-
-  const toggleDictation = useCallback(async () => {
-    await runExclusiveTraditionalAudioTransition(
-      traditionalAudioTransitionLockRef.current,
-      async () => {
-        if (dictation.phase === "recording" && !autoListenActive) {
-          await dictation.stop();
-          return;
-        }
-        await startManualDictationWithAudioHandoff({
-          autoListenActive,
-          deactivateAutoListen: deactivateAutoListenForManualDictation,
-          stopRealtime: realtimeVoice.stop,
-          interruptPlayback: props.speechPlayback.interrupt,
-          startDictation: async () => (await dictation.start()) !== null,
-          resumePlayback: props.speechPlayback.resumeAfterDictation,
-        });
-      },
-    );
-  }, [
-    autoListenActive,
-    deactivateAutoListenForManualDictation,
-    dictation.phase,
-    dictation.start,
-    dictation.stop,
-    props.speechPlayback.interrupt,
-    props.speechPlayback.resumeAfterDictation,
-    realtimeVoice.stop,
-  ]);
-
-  const toggleAutoListenOperation = useCallback(async () => {
-    await runExclusiveTraditionalAudioTransition(
-      traditionalAudioTransitionLockRef.current,
-      async () => {
-        if (autoListenActive) {
-          if (await stopAutoListenToDraft()) return;
-          await deactivateAutoListenForManualDictation();
-          return;
-        }
-        await activateAutoListenWithAudioHandoff({
-          releaseManualDictation: dictation.cancelForRealtime,
-          activateAutoListen: () => activateAutoListen(true),
-        });
-      },
-    );
-  }, [
-    activateAutoListen,
-    autoListenActive,
-    deactivateAutoListenForManualDictation,
-    dictation.cancelForRealtime,
-    stopAutoListenToDraft,
-  ]);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
   const canSend = hasContent;

@@ -1,5 +1,6 @@
 import {
   EnvironmentId,
+  MessageId,
   ProjectId,
   ThreadId,
   VoiceClientActionId,
@@ -43,7 +44,6 @@ async function realtimeAuthority(
     environmentOrigin: "https://termstation",
     operation: "realtime-start",
     readinessEnabled: true,
-    environmentOrigin: "https://termstation",
     token: `presentation-token-${generation}`,
     issuedAt: "2026-07-13T12:00:00.000Z",
     expiresAt: "2026-07-13T13:00:00.000Z",
@@ -56,12 +56,19 @@ async function configuredRuntime(): Promise<FakeVoiceRuntime> {
   return runtime;
 }
 
-function binding(runtime: VoiceRuntime, onError = vi.fn()) {
+function binding(
+  runtime: VoiceRuntime,
+  onError = vi.fn(),
+  onRebase: NonNullable<
+    ConstructorParameters<typeof VoiceRuntimePresentationBinding>[0]["onRebase"]
+  > = vi.fn(),
+) {
   let command = 0;
   return new VoiceRuntimePresentationBinding({
     runtime,
     createCommandId: () => VoiceRuntimeCommandId.make(`presentation-command-${++command}`),
     onError,
+    onRebase,
     leaseRenewalMs: 60_000,
   });
 }
@@ -159,6 +166,34 @@ describe("VoiceRuntimePresentationBinding", () => {
     await firstHandle.release();
   });
 
+  it("releases a local action on election loss and offers it to the elected presentation", async () => {
+    const runtime = await configuredRuntime();
+    const first = binding(runtime);
+    const second = binding(runtime);
+    const firstHandle = first.acquire("foreground-active");
+    await firstHandle.ready;
+    const actionId = VoiceClientActionId.make("presentation-election-action");
+    runtime.seedPresentationAction({
+      actionId,
+      action: "navigate-thread",
+      projectId: ProjectId.make("presentation-project"),
+      threadId: ThreadId.make("presentation-thread"),
+      expiresAt: "2026-07-13T13:00:00.000Z",
+    });
+    await vi.waitFor(() => expect(first.getSnapshot().presentationAction?.actionId).toBe(actionId));
+
+    const secondHandle = second.acquire("foreground-active");
+    await secondHandle.ready;
+    await vi.waitFor(() => expect(first.getSnapshot().presentationAction).toBeNull());
+    await vi.waitFor(() =>
+      expect(second.getSnapshot().presentationAction?.actionId).toBe(actionId),
+    );
+
+    second.completePresentationAction(actionId, { outcome: "succeeded" });
+    await secondHandle.release();
+    await firstHandle.release();
+  });
+
   it("surfaces and completes presentation actions through binding state", async () => {
     const runtime = await configuredRuntime();
     const presentation = binding(runtime);
@@ -182,7 +217,134 @@ describe("VoiceRuntimePresentationBinding", () => {
     await handle.release();
   });
 
-  it("surfaces draft artifacts and discards an unresolved draft on detach", async () => {
+  it("offers durable presentation actions that predate the first attachment", async () => {
+    const runtime = await configuredRuntime();
+    const onRebase = vi.fn();
+    const actionId = VoiceClientActionId.make("presentation-seeded-before-attach");
+    runtime.seedPresentationAction({
+      actionId,
+      action: "navigate-thread",
+      projectId: ProjectId.make("presentation-project"),
+      threadId: ThreadId.make("presentation-thread"),
+      expiresAt: "2026-07-13T13:00:00.000Z",
+    });
+    const presentation = binding(runtime, vi.fn(), onRebase);
+    const handle = presentation.acquire("foreground-active");
+    await handle.ready;
+
+    await vi.waitFor(() =>
+      expect(presentation.getSnapshot().presentationAction?.actionId).toBe(actionId),
+    );
+    expect(onRebase).toHaveBeenCalledWith(
+      expect.objectContaining({
+        presentationActions: [expect.objectContaining({ actionId })],
+      }),
+    );
+    presentation.completePresentationAction(actionId, { outcome: "succeeded" });
+    await handle.release();
+  });
+
+  it("replays durable thread receipts and Realtime terminal summaries after reattachment", async () => {
+    const runtime = await configuredRuntime();
+    const onRebase = vi.fn();
+    const modeSessionId = VoiceModeSessionId.make("presentation-terminal-mode");
+    const receipt = {
+      runtimeId,
+      runtimeInstanceId,
+      runtimeGeneration: 1,
+      modeSessionId,
+      turnClientOperationId: VoiceTurnClientOperationId.make("presentation-terminal-turn"),
+      turnOperationId: null,
+      target: {
+        environmentId,
+        projectId: ProjectId.make("presentation-terminal-project"),
+        threadId: ThreadId.make("presentation-terminal-thread"),
+      },
+      userMessageId: null,
+      turnId: null,
+      assistantMessageIds: [MessageId.make("presentation-assistant-message")],
+      speechPlanId: null,
+      highestAdvertisedSegment: null,
+      highestStartedSegment: null,
+      highestDrainedSegment: null,
+      segmentDispositions: [],
+      speechTerminal: "no-speech" as const,
+      terminalOutcome: "completed" as const,
+      createdAt: "2026-07-13T12:00:00.000Z",
+      expiresAt: "2026-07-13T13:00:00.000Z",
+    };
+    const summary = {
+      runtimeId,
+      runtimeInstanceId,
+      runtimeGeneration: 1,
+      modeSessionId,
+      conversationId,
+      sessionId: null,
+      outcome: "stopped" as const,
+      reason: "user-stop",
+      lastConnectedAt: "2026-07-13T12:00:00.000Z",
+      terminalAt: "2026-07-13T12:01:00.000Z",
+      serverCleanupPending: false,
+      expiresAt: "2026-07-13T13:00:00.000Z",
+    };
+    runtime.seedThreadReceipt(receipt);
+    runtime.seedRealtimeSummary(summary);
+    const presentation = binding(runtime, vi.fn(), onRebase);
+
+    const first = presentation.acquire("foreground-active");
+    await first.ready;
+    await first.release();
+    const second = presentation.acquire("foreground-active");
+    await second.ready;
+
+    expect(onRebase).toHaveBeenCalledTimes(2);
+    expect(onRebase).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        threadReceipts: [receipt],
+        realtimeTerminalSummaries: [summary],
+      }),
+    );
+    expect(onRebase).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        threadReceipts: [receipt],
+        realtimeTerminalSummaries: [summary],
+      }),
+    );
+    await second.release();
+  });
+
+  it("releases an unresolved action claim on detach and re-offers it on reattach", async () => {
+    const runtime = await configuredRuntime();
+    const actionId = VoiceClientActionId.make("presentation-reoffered-action");
+    runtime.seedPresentationAction({
+      actionId,
+      action: "navigate-thread",
+      projectId: ProjectId.make("presentation-project"),
+      threadId: ThreadId.make("presentation-thread"),
+      expiresAt: "2026-07-13T13:00:00.000Z",
+    });
+    const presentation = binding(runtime);
+    const first = presentation.acquire("foreground-active");
+    await first.ready;
+    await vi.waitFor(() =>
+      expect(presentation.getSnapshot().presentationAction?.actionId).toBe(actionId),
+    );
+
+    await first.release();
+    expect(presentation.getSnapshot().presentationAction).toBeNull();
+
+    const second = presentation.acquire("foreground-active");
+    await second.ready;
+    await vi.waitFor(() =>
+      expect(presentation.getSnapshot().presentationAction?.actionId).toBe(actionId),
+    );
+    presentation.completePresentationAction(actionId, { outcome: "succeeded" });
+    await second.release();
+  });
+
+  it("releases an unresolved draft on detach and re-offers it on reattach", async () => {
     const runtime = await configuredRuntime();
     const presentation = binding(runtime);
     const handle = presentation.acquire("foreground-active");
@@ -219,6 +381,14 @@ describe("VoiceRuntimePresentationBinding", () => {
       phase: "detached",
       draftArtifact: null,
     });
+
+    const replacement = presentation.acquire("foreground-active");
+    await replacement.ready;
+    await vi.waitFor(() =>
+      expect(presentation.getSnapshot().draftArtifact?.handle.artifactId).toBe(artifactId),
+    );
+    presentation.completeDraftArtifact(artifactId, "appended");
+    await replacement.release();
   });
 
   it("does not attach when an async factory resolves after its presentation released", async () => {

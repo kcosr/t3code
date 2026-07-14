@@ -54,10 +54,12 @@ export type {
   T3VoiceRuntimeErrorEvent,
   T3VoiceRuntimePhase,
   T3VoiceRuntimeState,
+  T3VoiceRuntimeReadDelivery,
+  T3VoiceRuntimeWakeEvent,
 } from "./T3Voice.types";
 
 const NATIVE_MODULE_NAME = "T3Voice";
-const NATIVE_REVISION = 13;
+const NATIVE_REVISION = 14;
 
 let resolvedModule: T3VoiceNativeModule | null | undefined;
 

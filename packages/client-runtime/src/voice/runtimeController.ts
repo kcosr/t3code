@@ -36,12 +36,18 @@ export interface VoiceRuntimeControllerOptions {
   readonly createCommandId: () => string;
   readonly onState: (state: VoiceRuntimeControllerState) => void;
   readonly onEvent?: (event: VoiceRuntimeEvent) => Promise<void> | void;
+  readonly onRebase?: (rebase: VoiceRuntimeRebase) => Promise<void> | void;
   readonly onPresentationAction?: (
     action: VoiceRuntimePresentationAction,
   ) => Promise<{ readonly outcome: "succeeded" | "failed"; readonly message?: string }>;
   readonly onDraftArtifact?: (artifact: VoiceDraftArtifact) => Promise<"appended" | "discarded">;
   readonly onError?: (error: unknown) => void;
   readonly leaseRenewalMs?: number;
+}
+
+/** Local presentation ownership ended before a durable action was explicitly completed. */
+export class VoiceRuntimePresentationReleasedError extends Error {
+  override readonly name = "VoiceRuntimePresentationReleasedError";
 }
 
 function cursorFromSnapshot(snapshot: VoiceRuntimeSnapshot): VoiceRuntimeCursor {
@@ -86,6 +92,7 @@ export class VoiceRuntimeController {
   private stateValue: VoiceRuntimeControllerState | null = null;
   private unsubscribe: (() => void) | null = null;
   private deliveryQueue: Promise<void> = Promise.resolve();
+  private presentationQueue: Promise<void> = Promise.resolve();
   private lifecycleQueue: Promise<void> = Promise.resolve();
   private renewalEpoch = 0;
   private subscriptionRestartPending = false;
@@ -118,7 +125,7 @@ export class VoiceRuntimeController {
       try {
         // Subscribe before the authoritative follow-up snapshot so an operation
         // transition cannot fall into an attach/snapshot race.
-        this.subscribe(lease, initialCursor);
+        this.subscribe(lease, null);
 
         const current = await this.options.runtime.getSnapshot();
         const currentCursor = cursorFromSnapshot(current);
@@ -219,7 +226,7 @@ export class VoiceRuntimeController {
       });
   }
 
-  private subscribe(lease: VoiceRuntimeConsumerLease, after: VoiceRuntimeCursor): void {
+  private subscribe(lease: VoiceRuntimeConsumerLease, after: VoiceRuntimeCursor | null): void {
     this.unsubscribe = this.options.runtime.subscribe({ lease, after }, (delivery) =>
       this.enqueueDelivery(delivery),
     );
@@ -238,30 +245,36 @@ export class VoiceRuntimeController {
 
     let snapshot = current.snapshot;
     let lease = current.lease;
+    let becameElected = false;
     if (event.kind === "state-changed") snapshot = event.snapshot;
     if (event.kind === "presentation-election") {
+      const previousElection = lease.election;
       lease = {
         ...lease,
         election: event.election.electedLeaseId === lease.leaseId ? "elected" : "standby",
       };
+      becameElected = previousElection !== "elected" && lease.election === "elected";
     }
     this.setState({ ...current, snapshot, lease });
 
     await this.options.onEvent?.(event);
-    if (event.kind === "presentation-action") {
-      await this.consumePresentationAction(event.action);
-    }
+    if (event.kind === "presentation-action") this.enqueuePresentationAction(event.action);
     await this.options.runtime.acknowledge({ lease: this.requireState().lease, through: cursor });
     const committed = this.requireState();
     this.setState({ ...committed, cursor });
+    if (becameElected) {
+      this.unsubscribe?.();
+      this.subscribe(this.requireState().lease, null);
+    }
   }
 
   private async applyRebase(rebase: VoiceRuntimeRebase): Promise<void> {
+    await this.options.onRebase?.(rebase);
     let current = this.requireState();
     if (rebase.reason === "cursor-too-old") {
       this.setState({ ...current, snapshot: rebase.snapshot });
       for (const action of rebase.presentationActions) {
-        await this.consumePresentationAction(action);
+        this.enqueuePresentationAction(action);
       }
       await this.options.runtime.acknowledge({
         lease: this.requireState().lease,
@@ -286,7 +299,7 @@ export class VoiceRuntimeController {
     this.scheduleRenewal();
     await this.options.runtime.detach(previous).catch(() => undefined);
     for (const action of rebase.presentationActions) {
-      await this.consumePresentationAction(action);
+      this.enqueuePresentationAction(action);
     }
     await this.options.runtime.acknowledge({
       lease: this.requireState().lease,
@@ -335,6 +348,7 @@ export class VoiceRuntimeController {
       });
       this.markPresentationActionCompleted(claimed.actionId);
     } catch (error) {
+      if (error instanceof VoiceRuntimePresentationReleasedError) return;
       if (claimed.action === "realtime-confirmation-required") throw error;
       try {
         await this.options.runtime.acknowledgePresentationAction({
@@ -350,6 +364,14 @@ export class VoiceRuntimeController {
       this.markPresentationActionCompleted(claimed.actionId);
       this.reportError(error);
     }
+  }
+
+  private enqueuePresentationAction(action: VoiceRuntimePresentationAction): void {
+    this.presentationQueue = this.presentationQueue
+      .then(() => this.consumePresentationAction(action))
+      .catch((error: unknown) => {
+        if (!(error instanceof VoiceRuntimePresentationReleasedError)) this.reportError(error);
+      });
   }
 
   private markPresentationActionCompleted(actionId: string): void {

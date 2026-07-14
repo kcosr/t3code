@@ -7,11 +7,16 @@ import org.json.JSONObject
 
 internal data class T3VoiceBackgroundThreadClaim(
   val runtimeId: String,
+  val runtimeInstanceId: String,
   val readinessGeneration: Long,
+  val modeSessionId: String,
   val environmentOrigin: String,
   val projectId: String,
   val threadId: String,
   val clientOperationId: String,
+  val submissionPolicy: String,
+  val speechPlanId: String,
+  val draftContext: VoiceRuntimeDraftContext?,
 )
 
 internal sealed interface T3VoiceBackgroundThreadOperationState {
@@ -32,6 +37,8 @@ internal sealed interface T3VoiceBackgroundThreadOperationState {
     val recording: T3VoiceRecordingResult? = null,
     val detached: Boolean = false,
     val cancelRequested: Boolean = false,
+    val draftDispositionPending: Boolean = false,
+    val draftConsumePending: Boolean = false,
     val snapshot: T3VoiceBackgroundSnapshot,
   ) : T3VoiceBackgroundThreadOperationState
 }
@@ -110,6 +117,36 @@ internal class T3VoiceBackgroundThreadOperationStore(
     }
   }
 
+  @Synchronized fun prepareDraftDisposition(
+    expectedClientOperationId: String,
+    context: VoiceRuntimeDraftContext,
+  ): T3VoiceBackgroundThreadOperationUpdateResult {
+    val loaded = when (val result = load()) {
+      T3VoiceBackgroundThreadOperationLoadResult.Missing ->
+        return T3VoiceBackgroundThreadOperationUpdateResult.Missing
+      T3VoiceBackgroundThreadOperationLoadResult.Locked ->
+        return T3VoiceBackgroundThreadOperationUpdateResult.Locked
+      is T3VoiceBackgroundThreadOperationLoadResult.Available -> result
+    }
+    val active = loaded.state as? T3VoiceBackgroundThreadOperationState.Active
+      ?: return T3VoiceBackgroundThreadOperationUpdateResult.IdentityMismatch
+    if (active.claim.clientOperationId != expectedClientOperationId ||
+      active.claim.submissionPolicy != "auto-submit" || active.claim.draftContext != null ||
+      context.projectId != active.claim.projectId || context.threadId != active.claim.threadId) {
+      return T3VoiceBackgroundThreadOperationUpdateResult.IdentityMismatch
+    }
+    val updated = active.copy(
+      claim = active.claim.copy(submissionPolicy = "draft", draftContext = context),
+      draftDispositionPending = true,
+    )
+    return try {
+      writeActiveUnchecked(updated)
+      T3VoiceBackgroundThreadOperationUpdateResult.Updated(updated)
+    } catch (_: Throwable) {
+      T3VoiceBackgroundThreadOperationUpdateResult.Locked
+    }
+  }
+
   private fun writeActiveUnchecked(state: T3VoiceBackgroundThreadOperationState.Active) {
     require(state.token.isNotBlank() && state.token.none(Char::isWhitespace))
     require(state.acknowledgedCursor in 0..state.snapshot.eventCursor)
@@ -125,6 +162,8 @@ internal class T3VoiceBackgroundThreadOperationStore(
       KEY_RECORDING_BYTES to state.recording?.byteLength?.toString(),
       KEY_DETACHED to state.detached.toString(),
       KEY_CANCEL_REQUESTED to state.cancelRequested.toString(),
+      KEY_DRAFT_DISPOSITION_PENDING to state.draftDispositionPending.toString(),
+      KEY_DRAFT_CONSUME_PENDING to state.draftConsumePending.toString(),
       KEY_SNAPSHOT to encodeSnapshot(state.snapshot),
       KEY_IV to Base64.getEncoder().encodeToString(encrypted.initializationVector),
       KEY_CIPHERTEXT to Base64.getEncoder().encodeToString(encrypted.ciphertext),
@@ -138,9 +177,13 @@ internal class T3VoiceBackgroundThreadOperationStore(
       } else T3VoiceBackgroundThreadOperationLoadResult.Missing
     return try {
       val claim = T3VoiceBackgroundThreadClaim(
-        required(KEY_RUNTIME), required(KEY_GENERATION).toLong(), required(KEY_ORIGIN),
-        required(KEY_PROJECT), required(KEY_THREAD), required(KEY_CLIENT_OPERATION),
+        required(KEY_RUNTIME), required(KEY_RUNTIME_INSTANCE), required(KEY_GENERATION).toLong(),
+        required(KEY_MODE_SESSION), required(KEY_ORIGIN), required(KEY_PROJECT),
+        required(KEY_THREAD), required(KEY_CLIENT_OPERATION), required(KEY_SUBMISSION_POLICY),
+        required(KEY_SPEECH_PLAN), draftContextOrNull(),
       )
+      require(claim.submissionPolicy in setOf("auto-submit", "draft"))
+      require((claim.submissionPolicy == "draft") == (claim.draftContext != null))
       val state = when (phase) {
         "prepared" -> {
           require((ACTIVE_KEYS - KEY_CANCEL_REQUESTED).all { storage.getString(it) == null })
@@ -155,6 +198,8 @@ internal class T3VoiceBackgroundThreadOperationStore(
             required(KEY_ACKNOWLEDGED_CURSOR).toLong(),
             recordingOrNull(), required(KEY_DETACHED).toBooleanStrict(),
             required(KEY_CANCEL_REQUESTED).toBooleanStrict(),
+            required(KEY_DRAFT_DISPOSITION_PENDING).toBooleanStrict(),
+            required(KEY_DRAFT_CONSUME_PENDING).toBooleanStrict(),
             decodeSnapshot(required(KEY_SNAPSHOT)),
           )
           val token = cipher.decrypt(
@@ -190,18 +235,33 @@ internal class T3VoiceBackgroundThreadOperationStore(
   private fun writeBase(phase: String, claim: T3VoiceBackgroundThreadClaim, extra: Map<String, String?>) {
     check(storage.put(mapOf(
       KEY_PHASE to phase, KEY_RUNTIME to claim.runtimeId,
+      KEY_RUNTIME_INSTANCE to claim.runtimeInstanceId,
       KEY_GENERATION to claim.readinessGeneration.toString(),
+      KEY_MODE_SESSION to claim.modeSessionId,
       KEY_ORIGIN to T3VoiceBackgroundOriginPolicy.normalize(claim.environmentOrigin),
       KEY_PROJECT to claim.projectId, KEY_THREAD to claim.threadId,
       KEY_CLIENT_OPERATION to claim.clientOperationId,
+      KEY_SUBMISSION_POLICY to claim.submissionPolicy,
+      KEY_SPEECH_PLAN to claim.speechPlanId,
+      KEY_DRAFT_ENVIRONMENT to claim.draftContext?.environmentId,
+      KEY_DRAFT_PROJECT to claim.draftContext?.projectId,
+      KEY_DRAFT_THREAD to claim.draftContext?.threadId,
+      KEY_DRAFT_COMPOSER_REVISION to claim.draftContext?.composerRevision,
     ) + ACTIVE_KEYS.associateWith { extra[it] })) { "Could not persist native thread operation." }
   }
 
   private fun metadataBytes(state: T3VoiceBackgroundThreadOperationState.Active): ByteArray =
     listOf("t3-voice-thread-operation-v1", state.claim.runtimeId,
+      state.claim.runtimeInstanceId,
       state.claim.readinessGeneration.toString(),
+      state.claim.modeSessionId,
       T3VoiceBackgroundOriginPolicy.normalize(state.claim.environmentOrigin),
       state.claim.projectId, state.claim.threadId, state.claim.clientOperationId,
+      state.claim.submissionPolicy, state.claim.speechPlanId,
+      state.claim.draftContext?.environmentId.orEmpty(),
+      state.claim.draftContext?.projectId.orEmpty(),
+      state.claim.draftContext?.threadId.orEmpty(),
+      state.claim.draftContext?.composerRevision.orEmpty(),
       state.operationId, state.expiresAtEpochMillis.toString(),
       state.acknowledgedCursor.toString(),
       state.recording?.recordingId.orEmpty(), state.recording?.uri.orEmpty(),
@@ -209,6 +269,8 @@ internal class T3VoiceBackgroundThreadOperationStore(
       state.recording?.byteLength?.toString().orEmpty(),
       state.detached.toString(),
       state.cancelRequested.toString(),
+      state.draftDispositionPending.toString(),
+      state.draftConsumePending.toString(),
       encodeSnapshot(state.snapshot),
     ).joinToString("\n").toByteArray(StandardCharsets.UTF_8)
 
@@ -218,6 +280,15 @@ internal class T3VoiceBackgroundThreadOperationStore(
     if (values.all { it == null }) return null
     require(values.all { it != null })
     return T3VoiceRecordingResult(values[0]!!, values[1]!!, values[2]!!.toLong(), values[3]!!.toLong())
+  }
+
+  private fun draftContextOrNull(): VoiceRuntimeDraftContext? {
+    val values = listOf(
+      KEY_DRAFT_ENVIRONMENT, KEY_DRAFT_PROJECT, KEY_DRAFT_THREAD, KEY_DRAFT_COMPOSER_REVISION,
+    ).map(storage::getString)
+    if (values.all { it == null }) return null
+    require(values.all { !it.isNullOrBlank() })
+    return VoiceRuntimeDraftContext(values[0]!!, values[1]!!, values[2]!!, values[3]!!)
   }
 
   private fun encodeSnapshot(snapshot: T3VoiceBackgroundSnapshot): String = JSONObject()
@@ -259,11 +330,19 @@ internal class T3VoiceBackgroundThreadOperationStore(
   private companion object {
     const val KEY_PHASE = "thread_operation_phase"
     const val KEY_RUNTIME = "thread_operation_runtime"
+    const val KEY_RUNTIME_INSTANCE = "thread_operation_runtime_instance"
     const val KEY_GENERATION = "thread_operation_generation"
+    const val KEY_MODE_SESSION = "thread_operation_mode_session"
     const val KEY_ORIGIN = "thread_operation_origin"
     const val KEY_PROJECT = "thread_operation_project"
     const val KEY_THREAD = "thread_operation_thread"
     const val KEY_CLIENT_OPERATION = "thread_operation_client_id"
+    const val KEY_SUBMISSION_POLICY = "thread_operation_submission_policy"
+    const val KEY_SPEECH_PLAN = "thread_operation_speech_plan"
+    const val KEY_DRAFT_ENVIRONMENT = "thread_operation_draft_environment"
+    const val KEY_DRAFT_PROJECT = "thread_operation_draft_project"
+    const val KEY_DRAFT_THREAD = "thread_operation_draft_thread"
+    const val KEY_DRAFT_COMPOSER_REVISION = "thread_operation_draft_composer_revision"
     const val KEY_OPERATION = "thread_operation_id"
     const val KEY_EXPIRES = "thread_operation_expires"
     const val KEY_ACKNOWLEDGED_CURSOR = "thread_operation_acknowledged_cursor"
@@ -275,15 +354,20 @@ internal class T3VoiceBackgroundThreadOperationStore(
     const val KEY_CIPHERTEXT = "thread_operation_ciphertext"
     const val KEY_DETACHED = "thread_operation_detached"
     const val KEY_CANCEL_REQUESTED = "thread_operation_cancel_requested"
+    const val KEY_DRAFT_DISPOSITION_PENDING = "thread_operation_draft_disposition_pending"
+    const val KEY_DRAFT_CONSUME_PENDING = "thread_operation_draft_consume_pending"
     const val KEY_SNAPSHOT = "thread_operation_snapshot"
     val ACTIVE_KEYS =
       setOf(
         KEY_OPERATION, KEY_EXPIRES, KEY_ACKNOWLEDGED_CURSOR, KEY_RECORDING_ID, KEY_RECORDING_URI,
         KEY_RECORDING_DURATION, KEY_RECORDING_BYTES, KEY_IV, KEY_CIPHERTEXT, KEY_DETACHED,
-        KEY_CANCEL_REQUESTED, KEY_SNAPSHOT,
+        KEY_CANCEL_REQUESTED, KEY_SNAPSHOT, KEY_DRAFT_DISPOSITION_PENDING,
+        KEY_DRAFT_CONSUME_PENDING,
       )
     val ALL_KEYS = ACTIVE_KEYS + setOf(KEY_PHASE, KEY_RUNTIME, KEY_GENERATION, KEY_ORIGIN,
-      KEY_PROJECT, KEY_THREAD, KEY_CLIENT_OPERATION)
+      KEY_RUNTIME_INSTANCE, KEY_MODE_SESSION, KEY_PROJECT, KEY_THREAD, KEY_CLIENT_OPERATION,
+      KEY_SUBMISSION_POLICY, KEY_SPEECH_PLAN, KEY_DRAFT_ENVIRONMENT, KEY_DRAFT_PROJECT,
+      KEY_DRAFT_THREAD, KEY_DRAFT_COMPOSER_REVISION)
     val SNAPSHOT_FIELDS = setOf("runtimeId", "readinessGeneration", "mode", "phase", "operationId",
       "operationGeneration", "recordingId", "dispatchAcknowledged", "eventCursor",
       "playbackCursor", "highestAdvertisedSpeechSegment", "finalSpeechSegment", "speechTerminal",

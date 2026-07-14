@@ -3,6 +3,7 @@ import type {
   AuthSessionId,
   VoiceNativeRuntimeId,
   VoiceNativeRuntimeTarget,
+  VoiceRuntimeProvisioningOperationId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
@@ -11,19 +12,35 @@ import type { PersistenceSqlError } from "../Errors.ts";
 
 export interface PersistedVoiceNativeRuntimeGrant {
   readonly tokenHash: string;
+  readonly provisioningOperationId: VoiceRuntimeProvisioningOperationId;
   readonly runtimeId: VoiceNativeRuntimeId;
   readonly generation: number;
   readonly authSessionId: AuthSessionId;
   readonly grantedScopes: ReadonlySet<AuthEnvironmentScope>;
   readonly target: VoiceNativeRuntimeTarget;
+  readonly issuedAt: number;
+  readonly expiresAt: number;
+}
+
+export type PersistedVoiceNativeRuntimeGrantReplacement = Omit<
+  PersistedVoiceNativeRuntimeGrant,
+  "issuedAt"
+>;
+
+export interface VoiceNativeRuntimeGrantReplacementResult {
+  readonly status: "issued" | "existing";
+  readonly issuedAt: number;
   readonly expiresAt: number;
 }
 
 export interface VoiceNativeRuntimeGrantRepositoryShape {
   readonly replace: (
-    grant: PersistedVoiceNativeRuntimeGrant,
+    grant: PersistedVoiceNativeRuntimeGrantReplacement,
     now: number,
-  ) => Effect.Effect<"issued" | "refreshed" | "stale", PersistenceSqlError>;
+  ) => Effect.Effect<
+    VoiceNativeRuntimeGrantReplacementResult | { readonly status: "stale" },
+    PersistenceSqlError
+  >;
   readonly findActive: (
     tokenHash: string,
     now: number,
@@ -39,8 +56,7 @@ export interface VoiceNativeRuntimeGrantRepositoryShape {
     },
     now: number,
   ) => Effect.Effect<
-    | { readonly status: "issued" | "existing"; readonly expiresAt: number }
-    | { readonly status: "stale" },
+    VoiceNativeRuntimeGrantReplacementResult | { readonly status: "stale" },
     PersistenceSqlError
   >;
   readonly revokeRuntime: (

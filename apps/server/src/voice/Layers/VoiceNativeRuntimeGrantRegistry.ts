@@ -1,10 +1,9 @@
 import * as Clock from "effect/Clock";
-import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
-import * as Encoding from "effect/Encoding";
 import * as Layer from "effect/Layer";
 import * as NodeCrypto from "node:crypto";
 
+import { ServerSecretStore } from "../../auth/ServerSecretStore.ts";
 import { VoiceNativeRuntimeGrantRepository } from "../../persistence/Services/VoiceNativeRuntimeGrants.ts";
 import { VoiceNativeRealtimeStartRepository } from "../../persistence/Services/VoiceNativeRealtimeStarts.ts";
 import { VoiceNativeThreadTurnStore } from "../../persistence/Services/VoiceNativeThreadTurns.ts";
@@ -15,8 +14,29 @@ import {
   type VoiceNativeRuntimeGrantRegistryShape,
 } from "../Services/VoiceNativeRuntimeGrantRegistry.ts";
 
+const TOKEN_KEY_NAME = "voice-native-runtime-grant-token-hmac-v1";
+
+const canonicalJson = (value: unknown): string => {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("Canonical JSON numbers must be finite");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object") {
+    return `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
+      .join(",")}}`;
+  }
+  throw new TypeError(`Unsupported canonical JSON value: ${typeof value}`);
+};
+
 const make = Effect.gen(function* () {
-  const crypto = yield* Crypto.Crypto;
+  const secretStore = yield* ServerSecretStore;
+  const tokenKey = yield* secretStore.getOrCreateRandom(TOKEN_KEY_NAME, 32).pipe(Effect.orDie);
   const repository = yield* VoiceNativeRuntimeGrantRepository;
   const realtimeStarts = yield* VoiceNativeRealtimeStartRepository;
   const childGrants = yield* VoiceNativeControlGrantRegistry;
@@ -25,9 +45,19 @@ const make = Effect.gen(function* () {
 
   const issue: VoiceNativeRuntimeGrantRegistryShape["issue"] = (scope) =>
     Effect.gen(function* () {
-      const token = yield* crypto
-        .randomBytes(32)
-        .pipe(Effect.map(Encoding.encodeBase64Url), Effect.orDie);
+      const token = NodeCrypto.createHmac("sha256", tokenKey)
+        .update(
+          canonicalJson({
+            authSessionId: scope.authSessionId,
+            generation: scope.generation,
+            grantedScopes: [...scope.grantedScopes].sort(),
+            provisioningOperationId: scope.provisioningOperationId,
+            runtimeId: scope.runtimeId,
+            target: scope.target,
+            version: 1,
+          }),
+        )
+        .digest("base64url");
       const now = yield* Clock.currentTimeMillis;
       const replacement = yield* repository.replace({ tokenHash: hash(token), ...scope }, now).pipe(
         Effect.mapError(
@@ -41,7 +71,7 @@ const make = Effect.gen(function* () {
             }),
         ),
       );
-      if (replacement === "stale") {
+      if (replacement.status === "stale") {
         return yield* new VoiceError({
           reason: "invalid-phase",
           operation: "native-runtime-grant.issue",
@@ -49,22 +79,12 @@ const make = Effect.gen(function* () {
           retryable: false,
         });
       }
-      if (replacement === "issued") {
-        yield* Effect.all(
-          [
-            childGrants.revokeRuntime(scope.authSessionId, scope.runtimeId),
-            realtimeStarts.revokeRuntime(scope.authSessionId, scope.runtimeId).pipe(Effect.orDie),
-          ],
-          { discard: true },
-        ).pipe(
-          Effect.catchCause(() =>
-            Effect.logWarning("Could not purge derived native voice control grants", {
-              runtimeId: scope.runtimeId,
-            }),
-          ),
-        );
-      }
-      return { token, refreshed: replacement === "refreshed" };
+      return {
+        token,
+        replayed: replacement.status === "existing",
+        issuedAt: replacement.issuedAt,
+        expiresAt: replacement.expiresAt,
+      };
     });
 
   return VoiceNativeRuntimeGrantRegistry.of({
@@ -158,4 +178,4 @@ export const VoiceNativeRuntimeGrantRegistryLive = Layer.effect(
   make,
 );
 
-export const __testing = { make };
+export const __testing = { canonicalJson, make };

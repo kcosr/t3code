@@ -63,9 +63,9 @@ internal object T3VoiceBackgroundThreadAuthorityPolicy {
       snapshot.threadId == authority.selectedThreadId &&
       snapshot.operationId.isNotBlank() && clientOperationId.isNotBlank() &&
       snapshot.acknowledgedSequence <= snapshot.lastSequence &&
-      snapshot.expiresAtEpochMillis > nowMillis &&
+      snapshot.retentionExpiresAtEpochMillis > nowMillis &&
       result.operationGrant.expiresAtEpochMillis > nowMillis &&
-      result.operationGrant.expiresAtEpochMillis <= snapshot.expiresAtEpochMillis
+      result.operationGrant.expiresAtEpochMillis <= snapshot.operationTokenExpiresAtEpochMillis
   }
 
   fun cancellationAuthority(
@@ -160,11 +160,22 @@ internal object T3VoiceBackgroundThreadAuthorityPolicy {
 internal data class T3VoiceBackgroundThreadAttempt(
   val authority: T3VoiceBackgroundThreadAuthority,
   val clientOperationId: String,
+  var runtimeInstanceId: String = "",
+  var modeSessionId: String = "",
+  var submissionPolicy: String = "auto-submit",
+  var speechPlanId: String = "",
+  var draftContext: VoiceRuntimeDraftContext? = null,
+  var highestStartedSegment: Int? = null,
+  var highestDrainedSegment: Int? = null,
+  val segmentDispositions: MutableList<T3VoiceBackgroundSpeechDisposition> = mutableListOf(),
   var operationId: String? = null,
   var operationGrantToken: String? = null,
   var acknowledgedCursor: Long = 0,
   var recording: T3VoiceRecordingResult? = null,
   var polling: Boolean = false,
+  var draftFetching: Boolean = false,
+  var draftDispositionPending: Boolean = false,
+  var draftConsumePending: Boolean = false,
   var acknowledging: Boolean = false,
   val pendingSpeech: java.util.TreeMap<Int, ByteArray> = java.util.TreeMap(),
   var playingSegment: Int? = null,

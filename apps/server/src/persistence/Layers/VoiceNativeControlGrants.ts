@@ -58,12 +58,14 @@ const make = Effect.gen(function* () {
         readonly sessionClose: number;
         readonly runtimeId: string | null;
         readonly runtimeGeneration: number | null;
+        readonly runtimeActive: number;
       }>`
         SELECT child.auth_session_id AS "authSessionId", child.session_id AS "sessionId",
           child.lease_generation AS "leaseGeneration", child.expires_at AS "expiresAt",
           child.session_control AS "sessionControl", child.handoff_actions AS "handoffActions",
           child.webrtc_signaling AS "webrtcSignaling", child.session_close AS "sessionClose",
           child.runtime_id AS "runtimeId", child.runtime_generation AS "runtimeGeneration"
+          , CASE WHEN runtime.token_hash IS NULL THEN 0 ELSE 1 END AS "runtimeActive"
         FROM voice_native_control_grants AS child
         LEFT JOIN voice_native_runtime_grants AS runtime
           ON runtime.auth_session_id = child.auth_session_id
@@ -74,9 +76,9 @@ const make = Effect.gen(function* () {
         WHERE child.token_hash = ${tokenHash}
           AND (
             child.runtime_id IS NULL OR (
-              runtime.token_hash IS NOT NULL
-              AND auth.revoked_at IS NULL
+              auth.revoked_at IS NULL
               AND auth.expires_at > ${nowIso}
+              AND (runtime.token_hash IS NOT NULL OR child.session_close = 1)
             )
           )
         LIMIT 1
@@ -86,9 +88,11 @@ const make = Effect.gen(function* () {
       const capabilities = new Set<
         "session-control" | "handoff-actions" | "webrtc-signaling" | "session-close"
       >();
-      if (row.sessionControl === 1) capabilities.add("session-control");
-      if (row.handoffActions === 1) capabilities.add("handoff-actions");
-      if (row.webrtcSignaling === 1) capabilities.add("webrtc-signaling");
+      if (row.runtimeId === null || row.runtimeActive === 1) {
+        if (row.sessionControl === 1) capabilities.add("session-control");
+        if (row.handoffActions === 1) capabilities.add("handoff-actions");
+        if (row.webrtcSignaling === 1) capabilities.add("webrtc-signaling");
+      }
       if (row.sessionClose === 1) capabilities.add("session-close");
       return {
         tokenHash,

@@ -70,7 +70,7 @@ const withServer = (run: (baseUrl: string) => Promise<void>) => {
       Effect.succeed({
         actionId,
         actionSequence: input.actionSequence,
-        outcome: input.outcome,
+        outcome: input.action === "navigate-thread" ? input.outcome : "succeeded",
         replayed: false,
       }),
     updateFocus: (_token, _sessionId, input) =>

@@ -8,18 +8,27 @@ import {
   ThreadId,
   VoiceConversationId,
   VoiceNativeRuntimeId,
+  VoiceModeSessionId,
+  VoiceRuntimeInstanceId,
+  VoiceRuntimeProvisioningOperationId,
+  VoiceSpeechPlanId,
   VoiceSessionId,
+  VoiceThreadTurnOperationId,
+  VoiceTurnClientOperationId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
 import * as Layer from "effect/Layer";
+import * as NodeCrypto from "node:crypto";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { ServerSecretStore } from "../../auth/ServerSecretStore.ts";
 import { VoiceNativeControlGrantRepositoryLive } from "../../persistence/Layers/VoiceNativeControlGrants.ts";
 import { VoiceNativeRealtimeStartRepository } from "../../persistence/Services/VoiceNativeRealtimeStarts.ts";
 import { VoiceNativeRuntimeGrantRepositoryLive } from "../../persistence/Layers/VoiceNativeRuntimeGrants.ts";
 import { VoiceNativeRealtimeStartRepositoryLive } from "../../persistence/Layers/VoiceNativeRealtimeStarts.ts";
 import { VoiceNativeThreadTurnStoreLive } from "../../persistence/Layers/VoiceNativeThreadTurns.ts";
+import { VoiceNativeThreadTurnStore } from "../../persistence/Services/VoiceNativeThreadTurns.ts";
 import { runMigrations } from "../../persistence/Migrations.ts";
 import * as NodeSqliteClient from "../../persistence/NodeSqliteClient.ts";
 import { VoiceNativeControlGrantRegistryLive } from "../Services/VoiceNativeControlGrantRegistry.ts";
@@ -39,7 +48,13 @@ const persistence = Layer.mergeAll(
   ),
   sqlite,
 );
-const testLayer = persistence.pipe(Layer.provideMerge(NodeServices.layer));
+const secretStore = Layer.succeed(ServerSecretStore, {
+  getOrCreateRandom: () => Effect.succeed(new Uint8Array(32).fill(0x5a)),
+} as unknown as ServerSecretStore["Service"]);
+const testLayer = persistence.pipe(
+  Layer.provideMerge(NodeServices.layer),
+  Layer.provideMerge(secretStore),
+);
 
 const runtimeId = VoiceNativeRuntimeId.make("android-main");
 const authSessionId = AuthSessionId.make("auth-main");
@@ -65,21 +80,38 @@ const insertActiveAuthSession = (sessionId = authSessionId) =>
 
 it.effect("hashes, rotates, expires, and auth-fences runtime grants", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 48 });
+    yield* runMigrations({ toMigrationInclusive: 51 });
     yield* insertActiveAuthSession();
     const registry = yield* __testing.make;
     const realtimeStarts = yield* VoiceNativeRealtimeStartRepository;
+    const threadTurns = yield* VoiceNativeThreadTurnStore;
     const now = yield* Clock.currentTimeMillis;
     const first = yield* registry.issue({
       authSessionId,
       runtimeId,
       generation: 1,
+      provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-main-1"),
       grantedScopes: new Set([AuthVoiceUseScope]),
       target,
       expiresAt: now + 60_000,
     });
     expect(first.token).not.toContain("auth-main");
-    expect(first.refreshed).toBe(false);
+    expect(first.replayed).toBe(false);
+    expect(first.issuedAt).toBe(now);
+    const sql = yield* SqlClient.SqlClient;
+    expect(
+      yield* sql<{
+        readonly tokenHash: string;
+        readonly provisioningOperationId: string;
+      }>`SELECT token_hash AS "tokenHash",
+          provisioning_operation_id AS "provisioningOperationId"
+        FROM voice_native_runtime_grants`,
+    ).toEqual([
+      {
+        tokenHash: NodeCrypto.createHash("sha256").update(first.token).digest("hex"),
+        provisioningOperationId: "provision-main-1",
+      },
+    ]);
     expect(yield* registry.authorize(first.token)).toMatchObject({
       runtimeId,
       generation: 1,
@@ -89,35 +121,62 @@ it.effect("hashes, rotates, expires, and auth-fences runtime grants", () =>
       operationKey: "native-start-generation-1",
       authSessionId,
       runtimeId,
+      runtimeInstanceId: VoiceRuntimeInstanceId.make("runtime-instance-realtime-1"),
       runtimeGeneration: 1,
+      modeSessionId: VoiceModeSessionId.make("mode-session-realtime-1"),
       clientOperationId: "generation-1",
       conversationId: target.conversation.conversationId,
       claimExpiresAt: now + 30_000,
       expiresAt: now + 60_000,
       now,
     });
+    const threadOperationId = VoiceThreadTurnOperationId.make("native-thread-operation-1");
+    const threadTokenHash = "native-thread-operation-token-hash";
+    yield* threadTurns.claim({
+      operationId: threadOperationId,
+      authSessionId,
+      runtimeId,
+      runtimeInstanceId: VoiceRuntimeInstanceId.make("runtime-instance-1"),
+      runtimeGeneration: 1,
+      modeSessionId: VoiceModeSessionId.make("mode-session-1"),
+      turnClientOperationId: VoiceTurnClientOperationId.make("turn-client-operation-1"),
+      projectId: ProjectId.make("project-main"),
+      threadId: ThreadId.make("thread-main"),
+      speechPreset: "default",
+      autoRearm: true,
+      submissionPolicy: "auto-submit",
+      speechPlanId: VoiceSpeechPlanId.make("speech-plan-main"),
+      tokenHash: threadTokenHash,
+      operationTokenExpiresAt: now + 60_000,
+      retentionExpiresAt: now + 120_000,
+      nowEpochMillis: now,
+      now: new Date(now).toISOString(),
+    });
+    expect(yield* threadTurns.authorize(threadOperationId, threadTokenHash, now)).toBeDefined();
 
     const second = yield* registry.issue({
       authSessionId,
       runtimeId,
       generation: 2,
+      provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-main-2"),
       grantedScopes: new Set([AuthVoiceUseScope]),
       target,
       expiresAt: now + 60_000,
     });
     expect(yield* registry.authorize(first.token)).toBeUndefined();
     expect(yield* registry.authorize(second.token)).toMatchObject({ generation: 2 });
-    const sql = yield* SqlClient.SqlClient;
     expect(
       yield* sql`SELECT 1 FROM voice_native_realtime_starts
         WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`,
     ).toHaveLength(0);
+    expect(yield* threadTurns.authorize(threadOperationId, threadTokenHash, now)).toBeUndefined();
     expect(
       yield* Effect.flip(
         registry.issue({
           authSessionId,
           runtimeId,
           generation: 1,
+          provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-main-1"),
           grantedScopes: new Set([AuthVoiceUseScope]),
           target,
           expiresAt: now + 60_000,
@@ -129,7 +188,9 @@ it.effect("hashes, rotates, expires, and auth-fences runtime grants", () =>
       operationKey: "native-start-generation-2",
       authSessionId,
       runtimeId,
+      runtimeInstanceId: VoiceRuntimeInstanceId.make("runtime-instance-realtime-2"),
       runtimeGeneration: 2,
+      modeSessionId: VoiceModeSessionId.make("mode-session-realtime-2"),
       clientOperationId: "generation-2",
       conversationId: target.conversation.conversationId,
       claimExpiresAt: now + 30_000,
@@ -145,66 +206,73 @@ it.effect("hashes, rotates, expires, and auth-fences runtime grants", () =>
   }).pipe(Effect.provide(testLayer)),
 );
 
-it.effect("refreshes an identical generation without revoking its child authority", () =>
-  Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 48 });
-    yield* insertActiveAuthSession();
-    const runtimeGrants = yield* __testing.make;
-    const childGrants = yield* VoiceNativeControlGrantRegistry;
-    const now = yield* Clock.currentTimeMillis;
-    const first = yield* runtimeGrants.issue({
-      authSessionId,
-      runtimeId,
-      generation: 1,
-      grantedScopes: new Set([AuthVoiceUseScope]),
-      target,
-      expiresAt: now + 60_000,
-    });
-    const child = yield* childGrants.issue({
-      authSessionId,
-      runtimeId,
-      runtimeGeneration: 1,
-      sessionId: VoiceSessionId.make("same-generation-child"),
-      leaseGeneration: 1,
-      expiresAt: now + 60_000,
-      capabilities: new Set(["session-control", "webrtc-signaling"]),
-    });
-
-    const refreshed = yield* runtimeGrants.issue({
-      authSessionId,
-      runtimeId,
-      generation: 1,
-      grantedScopes: new Set([AuthVoiceUseScope]),
-      target,
-      expiresAt: now + 120_000,
-    });
-    expect(refreshed.refreshed).toBe(true);
-    expect(refreshed.token).not.toBe(first.token);
-    expect(yield* runtimeGrants.authorize(first.token)).toBeUndefined();
-    expect(yield* runtimeGrants.authorize(refreshed.token)).toMatchObject({
-      generation: 1,
-      expiresAt: now + 120_000,
-    });
-    expect(yield* childGrants.authorize(child)).toBeDefined();
-
-    const mismatch = yield* runtimeGrants
-      .issue({
+it.effect(
+  "replays an identical generation without rotating token, expiry, or child authority",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations({ toMigrationInclusive: 51 });
+      yield* insertActiveAuthSession();
+      const runtimeGrants = yield* __testing.make;
+      const childGrants = yield* VoiceNativeControlGrantRegistry;
+      const now = yield* Clock.currentTimeMillis;
+      const first = yield* runtimeGrants.issue({
         authSessionId,
         runtimeId,
         generation: 1,
-        grantedScopes: new Set(),
+        provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-main-1"),
+        grantedScopes: new Set([AuthVoiceUseScope]),
+        target,
+        expiresAt: now + 60_000,
+      });
+      const child = yield* childGrants.issue({
+        authSessionId,
+        runtimeId,
+        runtimeGeneration: 1,
+        sessionId: VoiceSessionId.make("same-generation-child"),
+        leaseGeneration: 1,
+        expiresAt: now + 60_000,
+        capabilities: new Set(["session-control", "webrtc-signaling"]),
+      });
+
+      const refreshed = yield* runtimeGrants.issue({
+        authSessionId,
+        runtimeId,
+        generation: 1,
+        provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-main-1"),
+        grantedScopes: new Set([AuthVoiceUseScope]),
         target,
         expiresAt: now + 120_000,
-      })
-      .pipe(Effect.flip);
-    expect(mismatch).toMatchObject({ reason: "invalid-phase" });
-    expect(yield* runtimeGrants.authorize(refreshed.token)).toBeDefined();
-  }).pipe(Effect.provide(testLayer)),
+      });
+      expect(refreshed.replayed).toBe(true);
+      expect(refreshed.token).toBe(first.token);
+      expect(refreshed.issuedAt).toBe(first.issuedAt);
+      expect(refreshed.expiresAt).toBe(now + 60_000);
+      expect(yield* runtimeGrants.authorize(first.token)).toBeDefined();
+      expect(yield* runtimeGrants.authorize(refreshed.token)).toMatchObject({
+        generation: 1,
+        expiresAt: now + 60_000,
+      });
+      expect(yield* childGrants.authorize(child)).toBeDefined();
+
+      const mismatch = yield* runtimeGrants
+        .issue({
+          authSessionId,
+          runtimeId,
+          generation: 1,
+          provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-main-other"),
+          grantedScopes: new Set([AuthVoiceUseScope]),
+          target,
+          expiresAt: now + 120_000,
+        })
+        .pipe(Effect.flip);
+      expect(mismatch).toMatchObject({ reason: "invalid-phase" });
+      expect(yield* runtimeGrants.authorize(refreshed.token)).toBeDefined();
+    }).pipe(Effect.provide(testLayer)),
 );
 
 it.effect("atomically rotates runtime authority to a replay-stable thread credential", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 48 });
+    yield* runMigrations({ toMigrationInclusive: 51 });
     const transitionAuthSessionId = AuthSessionId.make("auth-transition");
     const transitionRuntimeId = VoiceNativeRuntimeId.make("android-transition");
     yield* insertActiveAuthSession(transitionAuthSessionId);
@@ -214,6 +282,7 @@ it.effect("atomically rotates runtime authority to a replay-stable thread creden
       authSessionId: transitionAuthSessionId,
       runtimeId: transitionRuntimeId,
       generation: 1,
+      provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-transition-1"),
       grantedScopes: new Set([AuthVoiceUseScope]),
       target,
       expiresAt: now + 60_000,
@@ -274,7 +343,7 @@ it.effect("atomically rotates runtime authority to a replay-stable thread creden
 
 it.effect("rejects a stale generation when child authority is issued after rotation", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 48 });
+    yield* runMigrations({ toMigrationInclusive: 51 });
     yield* insertActiveAuthSession();
     const registry = yield* __testing.make;
     const childGrants = yield* VoiceNativeControlGrantRegistry;
@@ -283,6 +352,7 @@ it.effect("rejects a stale generation when child authority is issued after rotat
       authSessionId,
       runtimeId,
       generation: 1,
+      provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-main-1"),
       grantedScopes: new Set([AuthVoiceUseScope]),
       target,
       expiresAt: now + 60_000,
@@ -291,6 +361,7 @@ it.effect("rejects a stale generation when child authority is issued after rotat
       authSessionId,
       runtimeId,
       generation: 2,
+      provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-main-2"),
       grantedScopes: new Set([AuthVoiceUseScope]),
       target,
       expiresAt: now + 60_000,
@@ -313,7 +384,7 @@ it.effect("rejects a stale generation when child authority is issued after rotat
 
 it.effect("immediately fences an existing child grant when its parent generation changes", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 48 });
+    yield* runMigrations({ toMigrationInclusive: 51 });
     yield* insertActiveAuthSession();
     const runtimeGrants = yield* __testing.make;
     const childGrants = yield* VoiceNativeControlGrantRegistry;
@@ -322,6 +393,7 @@ it.effect("immediately fences an existing child grant when its parent generation
       authSessionId,
       runtimeId,
       generation: 1,
+      provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-main-1"),
       grantedScopes: new Set([AuthVoiceUseScope]),
       target,
       expiresAt: now + 60_000,
@@ -347,7 +419,7 @@ it.effect("immediately fences an existing child grant when its parent generation
 
 it.effect("rejects a runtime token after durable parent revocation across restart", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 48 });
+    yield* runMigrations({ toMigrationInclusive: 51 });
     yield* insertActiveAuthSession();
     const beforeRestart = yield* __testing.make;
     const now = yield* Clock.currentTimeMillis;
@@ -355,6 +427,7 @@ it.effect("rejects a runtime token after durable parent revocation across restar
       authSessionId,
       runtimeId,
       generation: 1,
+      provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-main-1"),
       grantedScopes: new Set([AuthVoiceUseScope]),
       target,
       expiresAt: now + 60_000,
@@ -370,7 +443,7 @@ it.effect("rejects a runtime token after durable parent revocation across restar
 
 it.effect("reports durable revocation success when derived thread cleanup fails", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 48 });
+    yield* runMigrations({ toMigrationInclusive: 51 });
     yield* insertActiveAuthSession();
     const registry = yield* __testing.make;
     const now = yield* Clock.currentTimeMillis;
@@ -378,6 +451,7 @@ it.effect("reports durable revocation success when derived thread cleanup fails"
       authSessionId,
       runtimeId,
       generation: 1,
+      provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-main-1"),
       grantedScopes: new Set([AuthVoiceUseScope]),
       target,
       expiresAt: now + 60_000,

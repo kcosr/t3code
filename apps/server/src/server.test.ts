@@ -2,7 +2,7 @@ import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeCrypto from "node:crypto";
-import { fileURLToPath } from "node:url";
+import * as NodeURL from "node:url";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import {
@@ -1469,7 +1469,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       });
       const fileSystem = yield* FileSystem.FileSystem;
       const fixture = yield* fileSystem.readFile(
-        fileURLToPath(
+        NodeURL.fileURLToPath(
           new URL("./voice/Services/fixtures/silence-aac-lc-mono.m4a", import.meta.url),
         ),
       );
@@ -3272,8 +3272,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(conversationResponse.status, 200);
 
       const runtimeId = "android-server-test";
+      const provisioningOperationId = "provision-android-server-test-1";
       const provisionBody = jsonRequestBody({
         generation: 1,
+        provisioningOperationId,
         target: {
           mode: "realtime",
           conversation: { type: "continue", conversationId: conversation.conversationId },
@@ -3292,12 +3294,16 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         readonly token: string;
         readonly runtimeId: string;
         readonly generation: number;
+        readonly provisioningOperationId: string;
         readonly target: unknown;
+        readonly issuedAt: string;
         readonly expiresAt: string;
       }>(provisionResponse);
       assert.equal(provisionResponse.status, 200);
       assert.equal(provisioned.runtimeId, runtimeId);
       assert.equal(provisioned.generation, 1);
+      assert.equal(provisioned.provisioningOperationId, provisioningOperationId);
+      assert.isFalse(Number.isNaN(Date.parse(provisioned.issuedAt)));
       assert.isTrue(provisioned.token.length > 20);
 
       const retryResponse = yield* fetchEffect(`/api/voice/native-runtimes/${runtimeId}/grant`, {
@@ -3307,7 +3313,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       });
       const retried = yield* responseJsonEffect<{ readonly token: string }>(retryResponse);
       assert.equal(retryResponse.status, 200);
-      assert.notEqual(retried.token, provisioned.token);
+      assert.equal(retried.token, provisioned.token);
 
       const revokeResponse = yield* fetchEffect(`/api/voice/native-runtimes/${runtimeId}/grant`, {
         method: "DELETE",

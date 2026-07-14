@@ -27,11 +27,11 @@ export function resolveNativeVoiceReadiness(
   environmentId: string | null,
   context: NativeVoiceReadinessContext,
 ): T3VoiceReadinessSnapshot {
-  if (preferences?.voiceBackgroundControlsEnabled !== true || environmentId === null) {
+  if (preferences?.voiceNotificationControlsEnabled !== true || environmentId === null) {
     return disabledNativeVoiceReadiness();
   }
 
-  const mode = preferences.voiceBackgroundDefaultMode ?? "realtime";
+  const mode = preferences.voiceNotificationDefaultMode ?? "realtime";
   const target = preferences.voiceThreadTarget;
   const targetId =
     mode === "thread" &&

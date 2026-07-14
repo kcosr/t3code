@@ -3,7 +3,9 @@ import { expect, it } from "@effect/vitest";
 import {
   AuthSessionId,
   VoiceConversationId,
+  VoiceModeSessionId,
   VoiceNativeRuntimeId,
+  VoiceRuntimeInstanceId,
   VoiceSessionId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -25,7 +27,9 @@ const input = {
   operationKey: "native:runtime:1:start-digest",
   authSessionId: AuthSessionId.make("auth-native-start"),
   runtimeId: VoiceNativeRuntimeId.make("runtime-native-start"),
+  runtimeInstanceId: VoiceRuntimeInstanceId.make("runtime-instance-native-start"),
   runtimeGeneration: 1,
+  modeSessionId: VoiceModeSessionId.make("mode-session-native-start"),
   clientOperationId: "start-client-operation",
   conversationId: VoiceConversationId.make("conversation-native-start"),
   claimExpiresAt: 61_000,
@@ -35,7 +39,7 @@ const input = {
 
 it.effect("durably fences unbound and bound native Realtime start replays", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 46 });
+    yield* runMigrations({ toMigrationInclusive: 51 });
     const repository = yield* VoiceNativeRealtimeStartRepository;
     expect(yield* repository.claim(input)).toEqual({ status: "claimed" });
 
@@ -46,27 +50,40 @@ it.effect("durably fences unbound and bound native Realtime start replays", () =
     });
 
     const sessionId = VoiceSessionId.make("native-start-session");
-    expect(yield* repository.bindSession(input.operationKey, sessionId, 3_000)).toBe(true);
-    expect(yield* repository.bindSession(input.operationKey, sessionId, 4_000)).toBe(true);
+    expect(yield* repository.bindSession(input.operationKey, sessionId, 7, 3_000)).toBe(true);
+    expect(yield* repository.bindSession(input.operationKey, sessionId, 7, 4_000)).toBe(true);
+    expect(yield* repository.bindSession(input.operationKey, sessionId, 8, 4_000)).toBe(false);
     expect(
       yield* repository.bindSession(
         input.operationKey,
         VoiceSessionId.make("different-session"),
+        7,
         4_000,
       ),
     ).toBe(false);
+    expect(yield* repository.findBySession(sessionId, 4_000)).toMatchObject({
+      runtimeInstanceId: input.runtimeInstanceId,
+      modeSessionId: input.modeSessionId,
+      leaseGeneration: 7,
+    });
+    expect(yield* repository.findBySession(sessionId, input.expiresAt)).toBeUndefined();
 
     const afterRestart = yield* repository.claim({ ...input, now: 5_000 });
     expect(afterRestart).toMatchObject({
       status: "existing",
-      record: { sessionId },
+      record: {
+        sessionId,
+        runtimeInstanceId: input.runtimeInstanceId,
+        modeSessionId: input.modeSessionId,
+        leaseGeneration: 7,
+      },
     });
   }).pipe(Effect.provide(layer)),
 );
 
 it.effect("refuses a late bind after an ambiguous claim lease expires", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 46 });
+    yield* runMigrations({ toMigrationInclusive: 51 });
     const repository = yield* VoiceNativeRealtimeStartRepository;
     const late = {
       ...input,
@@ -78,6 +95,7 @@ it.effect("refuses a late bind after an ambiguous claim lease expires", () =>
       yield* repository.bindSession(
         late.operationKey,
         VoiceSessionId.make("late-session"),
+        7,
         late.claimExpiresAt + 1,
       ),
     ).toBe(false);
@@ -90,7 +108,7 @@ it.effect("refuses a late bind after an ambiguous claim lease expires", () =>
 
 it.effect("reclaims retryable failures while replaying terminal failures", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 46 });
+    yield* runMigrations({ toMigrationInclusive: 51 });
     const repository = yield* VoiceNativeRealtimeStartRepository;
     const failed = {
       ...input,
@@ -159,7 +177,7 @@ it.effect("reclaims retryable failures while replaying terminal failures", () =>
 
 it.effect("serializes concurrent claims to one durable owner", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 46 });
+    yield* runMigrations({ toMigrationInclusive: 51 });
     const repository = yield* VoiceNativeRealtimeStartRepository;
     const concurrent = {
       ...input,

@@ -112,6 +112,8 @@ class T3VoiceModule : Module() {
                 is T3VoiceRuntimeEvent.ThreadVoiceHandoff -> Unit
                 is T3VoiceRuntimeEvent.ReadinessDisabled ->
                   sendEvent(READINESS_DISABLED_EVENT, event.toEventBody())
+                is T3VoiceRuntimeEvent.VoiceRuntimeWake ->
+                  sendEvent(VOICE_RUNTIME_WAKE_EVENT, event.toEventBody())
               }
             }
           }
@@ -188,10 +190,11 @@ class T3VoiceModule : Module() {
         THREAD_VOICE_HANDOFF_EVENT,
         VOICE_COMMAND_EVENT,
         READINESS_DISABLED_EVENT,
+        VOICE_RUNTIME_WAKE_EVENT,
       )
 
       Constants(
-        "nativeRevision" to 13,
+        "nativeRevision" to 14,
       )
 
       OnCreate {
@@ -241,6 +244,205 @@ class T3VoiceModule : Module() {
 
       AsyncFunction("getStateAsync") {
         T3VoiceStateStore.state.value.toEventBody()
+      }
+
+      AsyncFunction("describeVoiceRuntimeAsync") {
+        VoiceRuntimeBridge.descriptorBody()
+      }
+
+      AsyncFunction("getVoiceRuntimeSnapshotAsync") { promise: Promise ->
+        withBinder(promise, "voice-runtime-snapshot-failed") { service, settlement ->
+          settlement.resolve(VoiceRuntimeBridge.snapshotBody(service.voiceRuntimeSnapshot()))
+        }
+      }
+
+      AsyncFunction("configureVoiceRuntimeAuthorityAsync") {
+        input: Map<String, Any?>, promise: Promise,
+        ->
+        val authority = VoiceRuntimeBridge.parseAuthority(input)
+        withBinder(promise, "voice-runtime-authority-failed") { service, settlement ->
+          settlement.resolve(
+            VoiceRuntimeBridge.snapshotBody(
+              service.configureVoiceRuntimeAuthority(authority),
+            ),
+          )
+        }
+      }
+
+      AsyncFunction("clearVoiceRuntimeAuthorityAsync") {
+        input: Map<String, Any?>, promise: Promise,
+        ->
+        val (commandId, identity) = VoiceRuntimeBridge.parseAuthorityClear(input)
+        withBinder(promise, "voice-runtime-authority-clear-failed") { service, settlement ->
+          settlement.resolve(
+            VoiceRuntimeBridge.snapshotBody(service.clearVoiceRuntimeAuthority(commandId, identity)),
+          )
+        }
+      }
+
+      AsyncFunction("attachVoiceRuntimeAsync") { input: Map<String, Any?>, promise: Promise ->
+        requireExactKeys(
+          input,
+          setOf("runtimeId", "runtimeInstanceId", "generation", "presentation"),
+        )
+        withBinder(promise, "voice-runtime-attach-failed") { service, settlement ->
+          val snapshot = service.voiceRuntimeSnapshot()
+          check(requireText(input, "runtimeId", 192) == snapshot.identity.runtimeId)
+          check(requireText(input, "runtimeInstanceId", 192) == snapshot.identity.runtimeInstanceId)
+          check(requireLong(input, "generation") == snapshot.identity.generation)
+          settlement.resolve(
+            VoiceRuntimeBridge.leaseBody(
+              service.attachVoiceRuntime(
+                VoiceRuntimeBridge.parsePresentation(requireText(input, "presentation", 32)),
+              ),
+            ),
+          )
+        }
+      }
+
+      AsyncFunction("updateVoiceRuntimeAttachmentAsync") {
+        input: Map<String, Any?>, promise: Promise,
+        ->
+        requireExactKeys(input, setOf("lease", "presentation"))
+        @Suppress("UNCHECKED_CAST")
+        val lease = VoiceRuntimeBridge.parseLease(
+          input["lease"] as? Map<String, Any?> ?: error("lease must be an object."),
+        )
+        val presentation =
+          VoiceRuntimeBridge.parsePresentation(requireText(input, "presentation", 32))
+        withBinder(promise, "voice-runtime-attachment-update-failed") { service, settlement ->
+          settlement.resolve(
+            VoiceRuntimeBridge.leaseBody(service.updateVoiceRuntimeAttachment(lease, presentation)),
+          )
+        }
+      }
+
+      AsyncFunction("detachVoiceRuntimeAsync") { input: Map<String, Any?>, promise: Promise ->
+        withBinder(promise, "voice-runtime-detach-failed") { service, settlement ->
+          service.detachVoiceRuntime(VoiceRuntimeBridge.parseLease(input))
+          settlement.resolve()
+        }
+      }
+
+      AsyncFunction("readVoiceRuntimeAsync") { input: Map<String, Any?>, promise: Promise ->
+        requireExactKeys(input, setOf("lease", "after"))
+        @Suppress("UNCHECKED_CAST")
+        val leaseInput = input["lease"] as? Map<String, Any?>
+          ?: error("lease must be an object.")
+        @Suppress("UNCHECKED_CAST")
+        val cursorInput = input["after"] as? Map<String, Any?>
+        withBinder(promise, "voice-runtime-read-failed") { service, settlement ->
+          settlement.resolve(
+            VoiceRuntimeBridge.deliveryBody(
+              service.readVoiceRuntime(
+                VoiceRuntimeBridge.parseLease(leaseInput),
+                cursorInput?.let(VoiceRuntimeBridge::parseCursor),
+              ),
+            ),
+          )
+        }
+      }
+
+      AsyncFunction("acknowledgeVoiceRuntimeAsync") {
+        input: Map<String, Any?>, promise: Promise,
+        ->
+        requireExactKeys(input, setOf("lease", "through"))
+        @Suppress("UNCHECKED_CAST")
+        val lease = VoiceRuntimeBridge.parseLease(
+          input["lease"] as? Map<String, Any?> ?: error("lease must be an object."),
+        )
+        @Suppress("UNCHECKED_CAST")
+        val through = VoiceRuntimeBridge.parseCursor(
+          input["through"] as? Map<String, Any?> ?: error("through must be an object."),
+        )
+        withBinder(promise, "voice-runtime-acknowledgement-failed") { service, settlement ->
+          service.acknowledgeVoiceRuntime(lease, through)
+          settlement.resolve()
+        }
+      }
+
+      AsyncFunction("dispatchVoiceRuntimeAsync") { input: Map<String, Any?>, promise: Promise ->
+        val command = VoiceRuntimeBridge.parseCommand(input)
+        withBinder(promise, "voice-runtime-command-failed") { service, settlement ->
+          settlement.resolve(
+            VoiceRuntimeBridge.receiptBody(service.dispatchVoiceRuntime(command)),
+          )
+        }
+      }
+
+      AsyncFunction("readVoiceRuntimeDraftArtifactAsync") {
+        input: Map<String, Any?>, promise: Promise,
+        ->
+        requireExactKeys(input, setOf("lease", "artifactId"))
+        @Suppress("UNCHECKED_CAST")
+        val lease = VoiceRuntimeBridge.parseLease(
+          input["lease"] as? Map<String, Any?> ?: error("lease must be an object."),
+        )
+        val artifactId = requireText(input, "artifactId", 256)
+        withBinder(promise, "voice-runtime-draft-read-failed") { service, settlement ->
+          settlement.resolve(VoiceRuntimeBridge.draftBody(service.readVoiceRuntimeDraft(lease, artifactId)))
+        }
+      }
+
+      AsyncFunction("acknowledgeVoiceRuntimeDraftArtifactAsync") {
+        input: Map<String, Any?>, promise: Promise,
+        ->
+        requireExactKeys(input, setOf("lease", "artifactId", "outcome"))
+        @Suppress("UNCHECKED_CAST")
+        val lease = VoiceRuntimeBridge.parseLease(
+          input["lease"] as? Map<String, Any?> ?: error("lease must be an object."),
+        )
+        val outcome = requireText(input, "outcome", 32)
+        require(outcome in setOf("appended", "discarded"))
+        withBinder(promise, "voice-runtime-draft-ack-failed") { service, settlement ->
+          service.acknowledgeVoiceRuntimeDraft(
+            lease,
+            requireText(input, "artifactId", 256),
+            outcome,
+          )
+          settlement.resolve()
+        }
+      }
+
+      AsyncFunction("claimVoiceRuntimePresentationActionAsync") {
+        input: Map<String, Any?>, promise: Promise,
+        ->
+        requireExactKeys(input, setOf("lease", "actionId"))
+        @Suppress("UNCHECKED_CAST")
+        val lease = VoiceRuntimeBridge.parseLease(
+          input["lease"] as? Map<String, Any?> ?: error("lease must be an object."),
+        )
+        withBinder(promise, "voice-runtime-action-claim-failed") { service, settlement ->
+          settlement.resolve(VoiceRuntimeBridge.presentationActionBody(
+            service.claimVoiceRuntimePresentationAction(
+              lease,
+              requireText(input, "actionId", 256),
+            ),
+          ))
+        }
+      }
+
+      AsyncFunction("acknowledgeVoiceRuntimePresentationActionAsync") {
+        input: Map<String, Any?>, promise: Promise,
+        ->
+        require(input.keys == setOf("lease", "actionId", "outcome") ||
+          input.keys == setOf("lease", "actionId", "outcome", "message"))
+        @Suppress("UNCHECKED_CAST")
+        val lease = VoiceRuntimeBridge.parseLease(
+          input["lease"] as? Map<String, Any?> ?: error("lease must be an object."),
+        )
+        val outcome = requireText(input, "outcome", 32)
+        require(outcome in setOf("succeeded", "failed"))
+        input["message"]?.let { require(it is String && it.isNotBlank() && it.length <= 512) }
+        withBinder(promise, "voice-runtime-action-ack-failed") { service, settlement ->
+          service.acknowledgeVoiceRuntimePresentationAction(
+            lease,
+            requireText(input, "actionId", 256),
+            outcome,
+            input["message"] as? String,
+          )
+          settlement.resolve()
+        }
       }
 
       AsyncFunction("prepareBackgroundVoiceReadinessAsync") {
@@ -327,7 +529,7 @@ class T3VoiceModule : Module() {
         @Suppress("UNCHECKED_CAST")
         val readiness = parseReadinessConfig(readinessInput as Map<String, Any?>)
         @Suppress("UNCHECKED_CAST")
-        val grant = parseRuntimeGrant(grantInput as Map<String, Any?>)
+        val activation = parseRuntimeGrant(grantInput as Map<String, Any?>)
         val expectedGeneration = requireLong(input, "expectedGeneration")
         withBinder(promise, "voice-readiness-activate-failed") { service, settlement ->
           settlement.resolve(
@@ -335,7 +537,7 @@ class T3VoiceModule : Module() {
               service.activateBackgroundVoiceReadiness(
                 readiness,
                 expectedGeneration,
-                grant,
+                activation,
               ),
             ),
           )
@@ -433,7 +635,7 @@ class T3VoiceModule : Module() {
         @Suppress("UNCHECKED_CAST")
         val grant = parseRuntimeGrant(grantInput as Map<String, Any?>)
         withBinder(promise, "voice-runtime-grant-install-failed") { service, settlement ->
-          settlement.resolve(authorityBody(service.installBackgroundVoiceRuntimeGrant(grant)))
+          settlement.resolve(authorityBody(service.installBackgroundVoiceRuntimeGrant(grant.grant)))
         }
       }
 
@@ -1104,24 +1306,38 @@ class T3VoiceModule : Module() {
     )
   }
 
-  private fun parseRuntimeGrant(input: Map<String, Any?>): T3VoiceRuntimeGrant {
+  private fun parseRuntimeGrant(input: Map<String, Any?>): T3VoiceRuntimeGrantActivation {
     requireExactKeys(input, RUNTIME_GRANT_FIELDS)
     val targetIdentityDigest =
       T3VoiceRuntimeTargetIdentity.digest(
         requireText(input, "targetIdentity", MAXIMUM_TARGET_IDENTITY_LENGTH),
       )
-    return T3VoiceRuntimeGrant(
+    val operation =
+      T3VoiceRuntimeGrantOperation.fromWireValue(requireText(input, "operation", 64))
+    @Suppress("UNCHECKED_CAST")
+    val targetInput = input["target"] as? Map<String, Any?>
+      ?: throw IllegalArgumentException("target must be an object.")
+    val target = when (operation) {
+      T3VoiceRuntimeGrantOperation.THREAD_TURN_START -> VoiceRuntimeBridge.parseThreadTarget(targetInput)
+      T3VoiceRuntimeGrantOperation.REALTIME_START -> null
+    }
+    val grant = T3VoiceRuntimeGrant(
       metadata =
         T3VoiceRuntimeGrantMetadata(
           runtimeId = requireText(input, "runtimeId", 128),
           readinessGeneration = requireLong(input, "readinessGeneration"),
           environmentOrigin = requireText(input, "environmentOrigin", 2_048),
-          operation =
-            T3VoiceRuntimeGrantOperation.fromWireValue(requireText(input, "operation", 64)),
+          operation = operation,
           targetIdentityDigest = targetIdentityDigest,
           expiresAtEpochMillis = requireLong(input, "expiresAtEpochMillis"),
         ),
       token = requireText(input, "token", 128),
+    )
+    return T3VoiceRuntimeGrantActivation(
+      grant,
+      target,
+      requireText(input, "provisioningOperationId", 256),
+      java.time.Instant.parse(requireText(input, "issuedAt", 64)).toEpochMilli(),
     )
   }
 
@@ -1244,6 +1460,7 @@ class T3VoiceModule : Module() {
     private const val THREAD_VOICE_HANDOFF_EVENT = "threadVoiceHandoff"
     private const val VOICE_COMMAND_EVENT = "voiceCommand"
     private const val READINESS_DISABLED_EVENT = "readinessDisabled"
+    private const val VOICE_RUNTIME_WAKE_EVENT = "voiceRuntimeWake"
     private const val BINDER_CONNECTION_TIMEOUT_MS = 5_000L
     private const val MAXIMUM_TARGET_IDENTITY_LENGTH = 4_096
     private val READINESS_FIELDS =
@@ -1263,6 +1480,9 @@ class T3VoiceModule : Module() {
         "environmentOrigin",
         "operation",
         "targetIdentity",
+        "target",
+        "provisioningOperationId",
+        "issuedAt",
         "expiresAtEpochMillis",
         "token",
       )

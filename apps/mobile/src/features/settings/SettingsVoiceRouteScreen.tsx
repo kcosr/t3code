@@ -46,8 +46,8 @@ export function SettingsVoiceRouteScreen() {
   const ready = AsyncResult.isSuccess(preferencesResult);
   const stored = ready ? preferencesResult.value : {};
   const voice = resolveVoicePreferences(stored);
-  const backgroundControlsEnabled = stored.voiceBackgroundControlsEnabled === true;
-  const backgroundDefaultMode = stored.voiceBackgroundDefaultMode ?? "realtime";
+  const notificationControlsEnabled = stored.voiceNotificationControlsEnabled === true;
+  const notificationDefaultMode = stored.voiceNotificationDefaultMode ?? "realtime";
   const target = stored.voiceThreadTarget;
   const backgroundThreadTargetValid =
     target != null &&
@@ -110,9 +110,9 @@ export function SettingsVoiceRouteScreen() {
       setNotificationPermission("unavailable");
     }
   };
-  const setBackgroundControlsEnabled = async (enabled: boolean) => {
+  const setNotificationControlsEnabled = async (enabled: boolean) => {
     if (!enabled) {
-      savePreferences({ voiceBackgroundControlsEnabled: false });
+      savePreferences({ voiceNotificationControlsEnabled: false });
       return;
     }
     const native = getT3VoiceNativeModule();
@@ -130,13 +130,13 @@ export function SettingsVoiceRouteScreen() {
       if (!microphone.granted || !notification.granted) {
         Alert.alert(
           "Permissions required",
-          "Background voice controls need microphone and notification access.",
+          "Notification and headset controls need microphone and notification access.",
         );
         return;
       }
-      savePreferences({ voiceBackgroundControlsEnabled: true });
+      savePreferences({ voiceNotificationControlsEnabled: true });
     } catch {
-      Alert.alert("Background voice controls unavailable", "Permissions could not be verified.");
+      Alert.alert("Voice controls unavailable", "Permissions could not be verified.");
     }
   };
   const copyDiagnostics = async () => {
@@ -208,20 +208,20 @@ export function SettingsVoiceRouteScreen() {
         </SettingsSection>
 
         {Platform.OS === "android" ? (
-          <SettingsSection title="Background controls">
+          <SettingsSection title="Notification and headset">
             <SettingsSwitchRow
               disabled={!ready}
               icon="headphones"
-              label="Background voice controls"
-              value={backgroundControlsEnabled}
-              onValueChange={(value) => void setBackgroundControlsEnabled(value)}
+              label="Voice controls"
+              value={notificationControlsEnabled}
+              onValueChange={(value) => void setNotificationControlsEnabled(value)}
             />
             <SettingsRow
-              disabled={!ready || !backgroundControlsEnabled}
+              disabled={!ready || !notificationControlsEnabled}
               icon="waveform.circle"
               label="Default voice mode"
               value={
-                backgroundDefaultMode === "realtime"
+                notificationDefaultMode === "realtime"
                   ? "Realtime"
                   : backgroundThreadTargetValid
                     ? "Active thread"
@@ -236,14 +236,14 @@ export function SettingsVoiceRouteScreen() {
                   [
                     {
                       text: "Realtime",
-                      onPress: () => savePreferences({ voiceBackgroundDefaultMode: "realtime" }),
+                      onPress: () => savePreferences({ voiceNotificationDefaultMode: "realtime" }),
                     },
                     ...(backgroundThreadTargetValid
                       ? [
                           {
                             text: "Active thread",
                             onPress: () =>
-                              savePreferences({ voiceBackgroundDefaultMode: "thread" as const }),
+                              savePreferences({ voiceNotificationDefaultMode: "thread" as const }),
                           },
                         ]
                       : []),
@@ -355,7 +355,7 @@ export function SettingsVoiceRouteScreen() {
           {Platform.OS === "android" ? (
             <SettingsRow
               icon="bell"
-              label="Background voice notification"
+              label="Voice notification"
               value={
                 notificationPermission === "checking"
                   ? "Checking"

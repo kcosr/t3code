@@ -430,3 +430,5 @@ export function useComposerDictation(input: {
     adopt,
   };
 }
+
+export type ReturnTypeOfComposerDictation = ReturnType<typeof useComposerDictation>;

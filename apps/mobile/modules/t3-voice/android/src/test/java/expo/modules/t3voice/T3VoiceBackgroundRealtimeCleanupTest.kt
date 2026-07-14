@@ -211,6 +211,7 @@ internal class T3VoiceBackgroundRealtimeCleanupTest {
           sequence = 0,
         ),
       closed = closed,
+      replayed = false,
     )
 
   private class MemoryStore : T3VoiceBackgroundKeyValueStore {

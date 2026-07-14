@@ -35,6 +35,7 @@ import {
   VoiceNativeThreadTurnStore,
   type PersistedVoiceNativeThreadTurn,
   type VoiceNativeThreadTurnReceiptCorrelation,
+  type VoiceNativeThreadTurnSpeechSegmentRecord,
   type VoiceNativeThreadTurnEventWithoutSequence,
 } from "../../persistence/Services/VoiceNativeThreadTurns.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -126,6 +127,29 @@ const snapshot = (
 
 const terminalPhase = (phase: PersistedVoiceNativeThreadTurn["phase"]) =>
   phase === "completed" || phase === "failed" || phase === "cancelled" || phase === "draft-ready";
+
+const restoreSpeechCursor = (segments: ReadonlyArray<VoiceNativeThreadTurnSpeechSegmentRecord>) => {
+  let endOffset = 0;
+  for (const [index, segment] of segments.entries()) {
+    if (
+      segment.segmentIndex !== index ||
+      segment.startOffset < endOffset ||
+      segment.endOffset <= segment.startOffset ||
+      (segment.finalSegment && index !== segments.length - 1)
+    )
+      return undefined;
+    endOffset = segment.endOffset;
+  }
+  const last = segments.at(-1);
+  return {
+    state: {
+      buffer: "",
+      nextIndex: segments.length,
+      finished: last?.finalSegment ?? false,
+    },
+    emittedOffset: last?.endOffset ?? 0,
+  };
+};
 
 const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
@@ -248,9 +272,21 @@ const make = Effect.gen(function* () {
   const monitorLoop = Effect.fn("VoiceNativeThreadTurnService.monitor")(function* (
     operationId: VoiceThreadTurnOperationId,
   ) {
+    const persistedSegments = yield* store
+      .listSpeechSegments(operationId)
+      .pipe(Effect.mapError(repositoryFailure("thread-turn.speech-recovery")));
+    const restored = restoreSpeechCursor(persistedSegments);
+    if (restored === undefined)
+      return yield* voiceError(
+        "invalid-context",
+        "thread-turn.speech-recovery",
+        "Persisted speech cursor is inconsistent",
+        false,
+      );
     let priorText = "";
-    let chunker = initialSpeechChunkerState();
-    let emittedOffset = 0;
+    let chunker = persistedSegments.length === 0 ? initialSpeechChunkerState() : restored.state;
+    let emittedOffset = restored.emittedOffset;
+    let recoveryPending = persistedSegments.length > 0;
     let revisedNonPrefix = false;
     let attention: "approval" | "user-input" | undefined;
     while (true) {
@@ -389,6 +425,36 @@ const make = Effect.gen(function* () {
           .pipe(Effect.mapError(repositoryFailure("thread-turn.message")));
         if (Option.isSome(assistant)) {
           const text = assistant.value.text;
+          if (recoveryPending) {
+            if (text.length < emittedOffset) {
+              yield* Effect.sleep("50 millis");
+              continue;
+            }
+            const persistedText = yield* Effect.forEach(
+              persistedSegments,
+              (segment) =>
+                store
+                  .getSpeechSegmentText(operationId, segment.segmentIndex)
+                  .pipe(Effect.mapError(repositoryFailure("thread-turn.speech-recovery"))),
+              { concurrency: 1 },
+            );
+            const inconsistent = persistedSegments.some(
+              (segment, index) =>
+                segment.assistantMessageId !== assistant.value.messageId ||
+                segment.endOffset > text.length ||
+                persistedText[index] === undefined ||
+                text.slice(segment.startOffset, segment.endOffset) !== persistedText[index],
+            );
+            if (inconsistent)
+              return yield* voiceError(
+                "invalid-context",
+                "thread-turn.speech-recovery",
+                "Persisted speech identity does not match the canonical assistant response",
+                false,
+              );
+            priorText = text.slice(0, emittedOffset);
+            recoveryPending = false;
+          }
           const previousText = priorText;
           const prefixUpdate = text.startsWith(priorText);
           const delta = prefixUpdate ? text.slice(priorText.length) : "";
@@ -403,9 +469,10 @@ const make = Effect.gen(function* () {
             continue;
           }
           if (!prefixUpdate) revisedNonPrefix = true;
-          const chunked = revisedNonPrefix
-            ? { state: chunker, segments: [] }
-            : appendSpeechText(chunker, delta, terminal);
+          const chunked =
+            revisedNonPrefix || chunker.finished
+              ? { state: chunker, segments: [] }
+              : appendSpeechText(chunker, delta, terminal);
           chunker = chunked.state;
           for (const segment of chunked.segments) {
             const startOffset = text.indexOf(segment.text, emittedOffset);
@@ -1409,6 +1476,17 @@ const make = Effect.gen(function* () {
     return yield* hydrateSnapshot(yield* load(normalizedOperationId));
   });
 
+  yield* Clock.currentTimeMillis.pipe(
+    Effect.flatMap((now) => store.listRecoverableOperationIds(now)),
+    Effect.mapError(repositoryFailure("thread-turn.monitor-recovery")),
+    Effect.flatMap((operationIds) =>
+      Effect.forEach(operationIds, ensureMonitor, { discard: true }),
+    ),
+    Effect.catchCause((cause) =>
+      Effect.logError("Native thread voice monitor recovery failed", { cause }),
+    ),
+  );
+
   yield* maintain().pipe(
     Effect.ignoreCause({ log: true }),
     Effect.repeat(Schedule.spaced("1 minute")),
@@ -1452,3 +1530,5 @@ const make = Effect.gen(function* () {
 });
 
 export const VoiceNativeThreadTurnServiceLive = Layer.effect(VoiceNativeThreadTurnService, make);
+
+export const __testing = { restoreSpeechCursor };

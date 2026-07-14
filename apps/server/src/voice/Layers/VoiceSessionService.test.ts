@@ -2031,7 +2031,7 @@ it.effect("keeps provider media alive until a terminal handoff is acknowledged",
           created.state.sessionId,
           created.state.leaseGeneration + 1,
           fixture.actionId,
-          { outcome: "succeeded", state: "listening" },
+          { outcome: "succeeded", state: "accepted" },
         )
         .pipe(Effect.flip);
       expect(wrongLease.reason).toBe("authorization-revoked");
@@ -2042,7 +2042,7 @@ it.effect("keeps provider media alive until a terminal handoff is acknowledged",
         fixture.actionId,
         {
           outcome: "succeeded",
-          state: "listening",
+          state: "accepted",
         },
       );
       expect(acknowledgement).toEqual({
@@ -2122,7 +2122,7 @@ it.effect("acknowledgement wins immediately before the provider drain deadline",
         created.state.sessionId,
         created.state.leaseGeneration,
         fixture.actionId,
-        { outcome: "succeeded", state: "listening" },
+        { outcome: "succeeded", state: "accepted" },
       );
       yield* Effect.yieldNow;
       yield* TestClock.adjust("1 millis");
@@ -2235,7 +2235,7 @@ it.effect("journals and revokes a handoff that expires during native acknowledge
             created.state.sessionId,
             created.state.leaseGeneration,
             fixture.actionId,
-            { outcome: "succeeded", state: "listening" },
+            { outcome: "succeeded", state: "accepted" },
           )
           .pipe(Effect.flip);
       expect((yield* acknowledge()).reason).toBe("invalid-phase");

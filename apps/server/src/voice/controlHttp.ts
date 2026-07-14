@@ -165,11 +165,12 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
               authSessionId: principal.sessionId,
               runtimeId: args.params.runtimeId,
               generation: args.payload.generation,
+              provisioningOperationId: args.payload.provisioningOperationId,
               grantedScopes: new Set(principal.scopes),
               target,
               expiresAt: DateTime.toEpochMillis(expiresAt),
             });
-            if (!issued.refreshed) {
+            if (!issued.replayed) {
               yield* sessions.revokeNativeRuntime(principal.sessionId, args.params.runtimeId);
             }
             return issued;
@@ -178,8 +179,10 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
             token: grant.token,
             runtimeId: args.params.runtimeId,
             generation: args.payload.generation,
+            provisioningOperationId: args.payload.provisioningOperationId,
             target,
-            expiresAt: DateTime.formatIso(expiresAt),
+            issuedAt: DateTime.formatIso(DateTime.makeUnsafe(grant.issuedAt)),
+            expiresAt: DateTime.formatIso(DateTime.makeUnsafe(grant.expiresAt)),
           };
         }),
       )

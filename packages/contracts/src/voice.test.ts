@@ -46,14 +46,19 @@ describe("voice contracts", () => {
     } as const;
     const values = [
       [VoiceNativeRuntimeTarget, target],
-      [VoiceNativeRuntimeGrantProvisionInput, { generation: 3, target }],
+      [
+        VoiceNativeRuntimeGrantProvisionInput,
+        { generation: 3, provisioningOperationId: "provision-android-main-3", target },
+      ],
       [
         VoiceNativeRuntimeGrant,
         {
           token: "runtime-token",
           runtimeId: "android-main",
           generation: 3,
+          provisioningOperationId: "provision-android-main-3",
           target,
+          issuedAt: "2026-07-13T00:00:00.000Z",
           expiresAt: "2026-07-14T00:00:00.000Z",
         },
       ],
@@ -272,9 +277,9 @@ describe("voice contracts", () => {
         leaseGeneration: 2,
         action: "handoff-to-thread-voice",
         outcome: "succeeded",
-        state: "listening",
+        state: "accepted",
       }),
-    ).toMatchObject({ action: "handoff-to-thread-voice", state: "listening" });
+    ).toMatchObject({ action: "handoff-to-thread-voice", state: "accepted" });
   });
 
   it("preserves partial transcript boundaries and normalizes final transcripts", () => {
@@ -545,14 +550,14 @@ describe("voice contracts", () => {
     expect(
       decodeUnknownSync(VoiceNativeHandoffActionAckInput)({
         outcome: "succeeded",
-        state: "listening",
+        state: "accepted",
       }),
-    ).toEqual({ outcome: "succeeded", state: "listening" });
+    ).toEqual({ outcome: "succeeded", state: "accepted" });
     expect(() =>
       decodeUnknownSync(VoiceNativeHandoffActionAckInput)(
         {
           outcome: "succeeded",
-          state: "listening",
+          state: "accepted",
           leaseGeneration: 2,
         },
         { onExcessProperty: "error" },

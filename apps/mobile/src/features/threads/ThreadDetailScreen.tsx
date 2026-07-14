@@ -282,9 +282,9 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     historyReady: contentPresentationKind === "ready",
     latestAssistant,
     realtimeActive:
-      realtimeVoice.phase === "starting" ||
-      realtimeVoice.phase === "active" ||
-      realtimeVoice.phase === "stopping",
+      realtimeVoice.suppressAutomaticThreadSpeech ||
+      (latestAssistant !== null &&
+        realtimeVoice.nativeAssistantMessageIds.has(String(latestAssistant.id))),
   });
   const handleSpeechPlaybackToggle = speechPlayback.onToggle;
   const composerChrome = composerExpanded ? COMPOSER_EXPANDED_CHROME : COMPOSER_COLLAPSED_CHROME;

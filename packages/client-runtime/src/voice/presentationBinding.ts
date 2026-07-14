@@ -9,12 +9,14 @@ import type {
   VoiceRuntimePresentationAction,
   VoiceRuntimePresentationActionAcknowledgement,
   VoiceRuntimePresentationState,
+  VoiceRuntimeRebase,
   VoiceRuntimeSnapshot,
 } from "@t3tools/contracts";
 
 import type { VoiceRuntime, VoiceRuntimeFactory } from "./runtime.ts";
 import {
   VoiceRuntimeController,
+  VoiceRuntimePresentationReleasedError,
   type VoiceRuntimeCommandRequest,
   type VoiceRuntimeControllerState,
 } from "./runtimeController.ts";
@@ -40,6 +42,7 @@ export interface VoiceRuntimePresentationBindingOptions {
   readonly runtime: VoiceRuntime | VoiceRuntimeFactory;
   readonly createCommandId: () => string;
   readonly onEvent?: (event: VoiceRuntimeEvent) => Promise<void> | void;
+  readonly onRebase?: (rebase: VoiceRuntimeRebase) => Promise<void> | void;
   readonly onError?: (error: unknown) => void;
   readonly leaseRenewalMs?: number;
 }
@@ -53,11 +56,13 @@ export interface VoiceRuntimePresentationHandle {
 interface PendingPresentationAction {
   readonly action: VoiceRuntimePresentationAction;
   readonly resolve: (result: PresentationActionResult) => void;
+  readonly reject: (error: unknown) => void;
 }
 
 interface PendingDraftArtifact {
   readonly artifact: VoiceDraftArtifact;
   readonly resolve: (outcome: VoiceDraftArtifactAcknowledgement["outcome"]) => void;
+  readonly reject: (error: unknown) => void;
 }
 
 type PresentationActionResult = Pick<
@@ -165,7 +170,7 @@ export class VoiceRuntimePresentationBinding {
           controllerState.snapshot.runtimeInstanceId !== snapshot.runtimeInstanceId ||
           controllerState.snapshot.generation !== snapshot.generation)
       ) {
-        this.settlePendingPresentation();
+        this.releasePendingPresentation();
         await controller.stop();
         this.publish({ controller: null });
         await this.reconcileDesiredPresentation();
@@ -237,7 +242,7 @@ export class VoiceRuntimePresentationBinding {
         return;
       }
       this.publish({ phase: "detaching" });
-      this.settlePendingPresentation();
+      this.releasePendingPresentation();
       await controller.stop();
       this.publish({ phase: "detached", controller: null, error: null });
       return;
@@ -304,6 +309,7 @@ export class VoiceRuntimePresentationBinding {
       runtime,
       createCommandId: this.options.createCommandId,
       onState: (state) => {
+        if (state.lease.election !== "elected") this.releasePendingPresentation();
         this.publish({
           phase: this.stateValue.phase === "detaching" ? "detaching" : "attached",
           controller: state,
@@ -311,6 +317,7 @@ export class VoiceRuntimePresentationBinding {
         });
       },
       ...(this.options.onEvent === undefined ? {} : { onEvent: this.options.onEvent }),
+      ...(this.options.onRebase === undefined ? {} : { onRebase: this.options.onRebase }),
       onPresentationAction: (action) => this.presentAction(action),
       onDraftArtifact: (artifact) => this.presentDraftArtifact(artifact),
       onError: (error) => {
@@ -329,8 +336,8 @@ export class VoiceRuntimePresentationBinding {
     if (this.pendingPresentationAction !== null) {
       return Promise.reject(new Error("Another voice presentation action is already pending."));
     }
-    return new Promise((resolve) => {
-      this.pendingPresentationAction = { action, resolve };
+    return new Promise((resolve, reject) => {
+      this.pendingPresentationAction = { action, resolve, reject };
       this.publish({ presentationAction: action });
     });
   }
@@ -341,22 +348,25 @@ export class VoiceRuntimePresentationBinding {
     if (this.pendingDraftArtifact !== null) {
       return Promise.reject(new Error("Another voice draft artifact is already pending."));
     }
-    return new Promise((resolve) => {
-      this.pendingDraftArtifact = { artifact, resolve };
+    return new Promise((resolve, reject) => {
+      this.pendingDraftArtifact = { artifact, resolve, reject };
       this.publish({ draftArtifact: artifact });
     });
   }
 
-  private settlePendingPresentation(): void {
+  private releasePendingPresentation(): void {
     const action = this.pendingPresentationAction;
     if (action !== null) {
-      this.completePresentationAction(action.action.actionId, {
-        outcome: "failed",
-        message: "The presentation detached before completing the action.",
-      });
+      this.pendingPresentationAction = null;
+      this.publish({ presentationAction: null });
+      action.reject(new VoiceRuntimePresentationReleasedError());
     }
     const draft = this.pendingDraftArtifact;
-    if (draft !== null) this.completeDraftArtifact(draft.artifact.handle.artifactId, "discarded");
+    if (draft !== null) {
+      this.pendingDraftArtifact = null;
+      this.publish({ draftArtifact: null });
+      draft.reject(new VoiceRuntimePresentationReleasedError());
+    }
   }
 
   private publish(update: Partial<VoiceRuntimePresentationBindingSnapshot>): void {

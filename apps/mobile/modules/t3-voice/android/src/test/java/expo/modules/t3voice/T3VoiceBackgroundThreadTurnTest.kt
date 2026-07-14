@@ -119,8 +119,15 @@ internal class T3VoiceBackgroundThreadTurnTest {
         T3VoiceBackgroundThreadTurnHttp { request ->
           requests += request
           when {
-            request.path == "/api/voice/native/thread-turns" -> jsonSuccess(createResponse())
+            request.path == "/api/voice/runtime/thread-turns" -> jsonSuccess(createResponse())
             request.path.endsWith("/audio") -> jsonSuccess(audioResponse())
+            request.path.endsWith("/disposition") ->
+              jsonSuccess(
+                JSONObject().put(
+                  "snapshot",
+                  snapshot(0).put("submissionPolicy", "draft"),
+                ).bytes(),
+              )
             request.path.endsWith("/events") -> jsonSuccess(eventsResponse(JSONArray(), 0))
             request.path.endsWith("/events/ack") -> jsonSuccess(acknowledgementResponse())
             request.path.contains("/speech/") ->
@@ -128,6 +135,8 @@ internal class T3VoiceBackgroundThreadTurnTest {
                 200, "audio/pcm", byteArrayOf(1, 0, 2, 0),
                 mapOf("x-t3-audio-format" to "s16le;rate=24000;channels=1"),
               )
+            request.path.endsWith("/draft/consume") -> jsonSuccess(draftConsumeResponse())
+            request.path.endsWith("/draft") -> jsonSuccess(draftResponse())
             request.path.endsWith("/cancel") -> jsonSuccess(cancelResponse())
             else -> error("Unexpected request: ${request.path}")
           }
@@ -138,8 +147,15 @@ internal class T3VoiceBackgroundThreadTurnTest {
       delegate.create(
         ORIGIN,
         "runtime-secret",
-        T3VoiceBackgroundThreadTurnCreateInput("runtime-1", 3, "client-operation-1"),
+        createInput(),
       ) is T3VoiceBackgroundThreadTurnResult.Success,
+    )
+    assertTrue(
+      delegate.newDraftDispositionCall(
+        ORIGIN,
+        "operation-secret",
+        "operation-1",
+      ).execute() is T3VoiceBackgroundThreadTurnResult.Success,
     )
     assertTrue(
       delegate.uploadAudio(
@@ -154,11 +170,21 @@ internal class T3VoiceBackgroundThreadTurnTest {
         T3VoiceBackgroundThreadTurnResult.Success,
     )
     assertTrue(
-      delegate.acknowledge(ORIGIN, "operation-secret", "operation-1", 12) is
+      delegate.acknowledge(
+        ORIGIN, "operation-secret", "operation-1", 12, "speech-1", null, null, emptyList(),
+      ) is
         T3VoiceBackgroundThreadTurnResult.Success,
     )
     assertTrue(
       delegate.speech(ORIGIN, "operation-secret", "operation-1", 4) is
+        T3VoiceBackgroundThreadTurnResult.Success,
+    )
+    assertTrue(
+      delegate.newDraftCall(ORIGIN, "operation-secret", "operation-1").execute() is
+        T3VoiceBackgroundThreadTurnResult.Success,
+    )
+    assertTrue(
+      delegate.newConsumeDraftCall(ORIGIN, "operation-secret", "operation-1").execute() is
         T3VoiceBackgroundThreadTurnResult.Success,
     )
     assertTrue(
@@ -169,10 +195,13 @@ internal class T3VoiceBackgroundThreadTurnTest {
     assertEquals(
       listOf(
         T3VoiceBackgroundHttpMethod.POST,
+        T3VoiceBackgroundHttpMethod.POST,
         T3VoiceBackgroundHttpMethod.PUT,
         T3VoiceBackgroundHttpMethod.GET,
         T3VoiceBackgroundHttpMethod.POST,
         T3VoiceBackgroundHttpMethod.GET,
+        T3VoiceBackgroundHttpMethod.GET,
+        T3VoiceBackgroundHttpMethod.POST,
         T3VoiceBackgroundHttpMethod.POST,
       ),
       requests.map(T3VoiceBackgroundHttpRequest::method),
@@ -183,28 +212,43 @@ internal class T3VoiceBackgroundThreadTurnTest {
     assertTrue(requests.drop(1).all { it.authority.token == "operation-secret" })
     assertEquals(
       listOf(
-        "/api/voice/native/thread-turns",
-        "/api/voice/native/thread-turns/operation-1/audio",
-        "/api/voice/native/thread-turns/operation-1/events",
-        "/api/voice/native/thread-turns/operation-1/events/ack",
-        "/api/voice/native/thread-turns/operation-1/speech/4",
-        "/api/voice/native/thread-turns/operation-1/cancel",
+        "/api/voice/runtime/thread-turns",
+        "/api/voice/runtime/thread-turns/operation-1/disposition",
+        "/api/voice/runtime/thread-turns/operation-1/audio",
+        "/api/voice/runtime/thread-turns/operation-1/events",
+        "/api/voice/runtime/thread-turns/operation-1/events/ack",
+        "/api/voice/runtime/thread-turns/operation-1/speech/4",
+        "/api/voice/runtime/thread-turns/operation-1/draft",
+        "/api/voice/runtime/thread-turns/operation-1/draft/consume",
+        "/api/voice/runtime/thread-turns/operation-1/cancel",
       ),
       requests.map(T3VoiceBackgroundHttpRequest::path),
     )
     assertEquals(
       mapOf("afterSequence" to "12", "waitMilliseconds" to "30000"),
-      requests[2].queryParameters,
+      requests[3].queryParameters,
     )
-    assertEquals("audio/mp4", requests[1].body?.contentType)
+    assertEquals("application/json", requests[1].body?.contentType)
+    assertEquals(setOf("submissionPolicy"), bodyFields(requests[1]))
+    assertEquals("audio/mp4", requests[2].body?.contentType)
     assertEquals(
-      setOf("runtimeId", "generation", "clientOperationId"),
+      setOf(
+        "runtimeId", "runtimeInstanceId", "generation", "modeSessionId",
+        "turnClientOperationId", "submissionPolicy", "speechPlanId",
+      ),
       bodyFields(requests[0]),
     )
-    assertEquals(setOf("acknowledgedSequence"), bodyFields(requests[3]))
-    assertEquals(setOf("reason"), bodyFields(requests[5]))
-    assertEquals(64L * 1_024L * 1_024L, requests[1].maximumRequestBytes)
-    assertEquals(16 * 1_024 * 1_024, requests[4].maximumResponseBytes)
+    assertEquals(
+      setOf(
+        "acknowledgedSequence", "speechPlanId", "highestStartedSegment",
+        "highestDrainedSegment", "segmentDispositions",
+      ),
+      bodyFields(requests[4]),
+    )
+    assertEquals(emptySet<String>(), bodyFields(requests[7]))
+    assertEquals(setOf("reason"), bodyFields(requests[8]))
+    assertEquals(64L * 1_024L * 1_024L, requests[2].maximumRequestBytes)
+    assertEquals(16 * 1_024 * 1_024, requests[5].maximumResponseBytes)
   }
 
   @Test
@@ -212,12 +256,12 @@ internal class T3VoiceBackgroundThreadTurnTest {
     val url =
       T3VoiceBackgroundOriginPolicy.endpoint(
         ORIGIN,
-        "/api/voice/native/thread-turns/operation-1/events",
+        "/api/voice/runtime/thread-turns/operation-1/events",
         mapOf("z" to "a b+c/?", "afterSequence" to "12"),
       )
 
     assertEquals(
-      "https://environment.example.test/api/voice/native/thread-turns/operation-1/events" +
+      "https://environment.example.test/api/voice/runtime/thread-turns/operation-1/events" +
         "?afterSequence=12&z=a%20b%2Bc%2F%3F",
       url.toString(),
     )
@@ -239,7 +283,7 @@ internal class T3VoiceBackgroundThreadTurnTest {
       ).create(
         ORIGIN,
         "runtime-secret",
-        T3VoiceBackgroundThreadTurnCreateInput("runtime-1", 1, "client-operation-1"),
+        createInput(generation = 1),
       ) as T3VoiceBackgroundThreadTurnResult.Failure
     assertEquals(T3VoiceBackgroundHttpFailureKind.PERMANENT, wrongJson.kind)
 
@@ -249,7 +293,7 @@ internal class T3VoiceBackgroundThreadTurnTest {
       ).create(
         ORIGIN,
         "runtime-secret",
-        T3VoiceBackgroundThreadTurnCreateInput("runtime-1", 1, "client-operation-1"),
+        createInput(generation = 1),
       ) as T3VoiceBackgroundThreadTurnResult.Failure
     assertEquals(T3VoiceBackgroundHttpFailureKind.PERMANENT, malformedJson.kind)
 
@@ -304,11 +348,13 @@ internal class T3VoiceBackgroundThreadTurnTest {
     }
     assertThrows(IllegalArgumentException::class.java) {
       T3VoiceBackgroundThreadTurnJson.encodeCreate(
-        T3VoiceBackgroundThreadTurnCreateInput("r".repeat(129), 1, "client-operation-1"),
+        createInput(runtimeId = "r".repeat(129), generation = 1),
       )
     }
     assertThrows(IllegalArgumentException::class.java) {
-      T3VoiceBackgroundThreadTurnJson.encodeAcknowledgement(9_007_199_254_740_992L)
+      T3VoiceBackgroundThreadTurnJson.encodeAcknowledgement(
+        9_007_199_254_740_992L, "speech-1", null, null, emptyList(),
+      )
     }
     assertFalse(T3VoiceBackgroundThreadTurnJson.encodeCancel().toString(Charsets.UTF_8).contains("token"))
   }
@@ -346,6 +392,15 @@ internal class T3VoiceBackgroundThreadTurnTest {
   private fun cancelResponse(): ByteArray =
     JSONObject().put("snapshot", snapshot()).put("cancelled", true).bytes()
 
+  private fun draftResponse(): ByteArray = JSONObject()
+    .put("operationId", "operation-1")
+    .put("transcript", "draft transcript")
+    .put("expiresAt", "2026-08-13T12:30:00Z")
+    .bytes()
+
+  private fun draftConsumeResponse(): ByteArray =
+    JSONObject().put("snapshot", snapshot()).put("consumed", true).bytes()
+
   private fun eventsResponse(events: JSONArray, lastSequence: Long): ByteArray =
     JSONObject()
       .put("snapshot", snapshot(lastSequence = lastSequence))
@@ -356,19 +411,44 @@ internal class T3VoiceBackgroundThreadTurnTest {
     JSONObject()
       .put("operationId", "operation-1")
       .put("runtimeId", "runtime-1")
+      .put("runtimeInstanceId", "instance-1")
       .put("generation", 3)
+      .put("modeSessionId", "mode-1")
+      .put("turnClientOperationId", "client-operation-1")
+      .put("submissionPolicy", "auto-submit")
+      .put("speechPlanId", "speech-1")
       .put("projectId", "project-1")
       .put("threadId", "thread-1")
       .put("speechPreset", "default")
       .put("autoRearm", true)
       .put("phase", "created")
-      .put("messageId", JSONObject.NULL)
+      .put("userMessageId", JSONObject.NULL)
       .put("turnId", JSONObject.NULL)
+      .put("assistantMessageIds", JSONArray())
+      .put("highestAdvertisedSegment", JSONObject.NULL)
+      .put("highestStartedSegment", JSONObject.NULL)
+      .put("highestDrainedSegment", JSONObject.NULL)
+      .put("segmentDispositions", JSONArray())
       .put("lastSequence", lastSequence)
       .put("acknowledgedSequence", 0)
       .put("speechTerminal", JSONObject.NULL)
       .put("dispatchAccepted", false)
-      .put("expiresAt", "2026-07-13T12:30:00Z")
+      .put("detachedAt", JSONObject.NULL)
+      .put("operationTokenExpiresAt", "2026-07-13T12:30:00Z")
+      .put("retentionExpiresAt", "2026-08-13T12:30:00Z")
+
+  private fun createInput(
+    runtimeId: String = "runtime-1",
+    generation: Long = 3,
+  ) = T3VoiceBackgroundThreadTurnCreateInput(
+    runtimeId,
+    "instance-1",
+    generation,
+    "mode-1",
+    "client-operation-1",
+    "auto-submit",
+    "speech-1",
+  )
 
   private fun event(sequence: Long, type: String): JSONObject =
     JSONObject()

@@ -3,6 +3,7 @@ import { RemoteEnvironmentAuthFetchError } from "@t3tools/client-runtime/rpc";
 import {
   ProjectId,
   ThreadId,
+  EnvironmentId,
   VoiceNativeRuntimeId,
   type VoiceNativeRuntimeGrant,
 } from "@t3tools/contracts";
@@ -28,13 +29,22 @@ import {
 const RUNTIME_ID = VoiceNativeRuntimeId.make("runtime-1");
 const PROJECT_ID = ProjectId.make("project-1");
 const THREAD_ID = ThreadId.make("thread-1");
+const ISSUED_AT = "2026-07-13T10:00:00.000Z";
 const EXPIRES_AT = "2026-08-12T10:00:00.000Z";
 const target = {
   mode: "thread" as const,
+  environmentId: EnvironmentId.make("environment-1"),
   projectId: PROJECT_ID,
   threadId: THREAD_ID,
   speechPreset: "default" as const,
   autoRearm: true,
+  endpointPolicy: {
+    endSilenceMs: 2_200,
+    noSpeechTimeoutMs: 60_000,
+    maximumUtteranceMs: 600_000,
+  },
+  speechEnabled: true,
+  rearmGuardMs: 500,
 };
 const resolvedTarget: ResolvedNativeVoiceRuntimeTarget = {
   target,
@@ -55,7 +65,9 @@ function grant(token = "runtime-secret"): VoiceNativeRuntimeGrant {
     token,
     runtimeId: RUNTIME_ID,
     generation: 7,
+    provisioningOperationId: `provision-${RUNTIME_ID}-7`,
     target,
+    issuedAt: ISSUED_AT,
     expiresAt: EXPIRES_AT,
   };
 }
@@ -527,13 +539,20 @@ describe("NativeVoiceRuntimeProvisioningCoordinator", () => {
       operation: "thread-turn-start",
       targetIdentity: resolvedTarget.targetIdentity,
     });
-    expect(provision).toHaveBeenCalledWith(RUNTIME_ID, { generation: 7, target });
+    expect(provision).toHaveBeenCalledWith(RUNTIME_ID, {
+      generation: 7,
+      provisioningOperationId: `provision-${RUNTIME_ID}-7`,
+      target,
+    });
     expect(activate).toHaveBeenCalledWith({
       runtimeId: RUNTIME_ID,
       readinessGeneration: 7,
       environmentOrigin: "https://termstation",
       operation: "thread-turn-start",
       targetIdentity: resolvedTarget.targetIdentity,
+      target,
+      provisioningOperationId: `provision-${RUNTIME_ID}-7`,
+      issuedAt: ISSUED_AT,
       expiresAtEpochMillis: Date.parse(EXPIRES_AT),
       token: "runtime-secret",
     });
@@ -561,12 +580,16 @@ describe("NativeVoiceRuntimeProvisioningCoordinator", () => {
     expect(prepare).toHaveBeenCalledOnce();
     expect(provision).toHaveBeenCalledTimes(2);
     expect(provision.mock.calls.map((call) => call[1].generation)).toEqual([7, 7]);
+    expect(provision.mock.calls.map((call) => call[1].provisioningOperationId)).toEqual([
+      `provision-${RUNTIME_ID}-7`,
+      `provision-${RUNTIME_ID}-7`,
+    ]);
     expect(activate).toHaveBeenCalledOnce();
     expect(disable).toHaveBeenCalledOnce();
   });
 
-  it("retries native activation at the same generation with a freshly rotated token", async () => {
-    const issuedTokens = ["first-token", "rotated-token"];
+  it("retries native activation with the same deterministic provisioning identity", async () => {
+    const issuedTokens = ["stable-token", "stable-token"];
     const { client, provision } = makeClient({
       provision: (attempt) => Promise.resolve(grant(issuedTokens[attempt - 1])),
     });
@@ -584,6 +607,10 @@ describe("NativeVoiceRuntimeProvisioningCoordinator", () => {
     });
 
     expect(provision).toHaveBeenCalledTimes(2);
+    expect(provision.mock.calls.map((call) => call[1].provisioningOperationId)).toEqual([
+      `provision-${RUNTIME_ID}-7`,
+      `provision-${RUNTIME_ID}-7`,
+    ]);
     expect(activate.mock.calls.map((call) => call[0].token)).toEqual(issuedTokens);
     expect(disable).toHaveBeenCalledOnce();
   });

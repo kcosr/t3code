@@ -1,8 +1,10 @@
 import type {
   AuthSessionId,
   VoiceConversationId,
+  VoiceModeSessionId,
   VoiceNativeRuntimeId,
   VoicePublicErrorReason,
+  VoiceRuntimeInstanceId,
   VoiceSessionId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -14,10 +16,13 @@ export interface PersistedVoiceNativeRealtimeStart {
   readonly operationKey: string;
   readonly authSessionId: AuthSessionId;
   readonly runtimeId: VoiceNativeRuntimeId;
+  readonly runtimeInstanceId: VoiceRuntimeInstanceId;
   readonly runtimeGeneration: number;
+  readonly modeSessionId: VoiceModeSessionId;
   readonly clientOperationId: string;
   readonly conversationId: VoiceConversationId;
   readonly sessionId: VoiceSessionId | null;
+  readonly leaseGeneration: number | null;
   readonly failure: {
     readonly reason: VoicePublicErrorReason;
     readonly operation: string;
@@ -30,7 +35,7 @@ export interface PersistedVoiceNativeRealtimeStart {
 
 export interface VoiceNativeRealtimeStartRepositoryShape {
   readonly claim: (
-    input: Omit<PersistedVoiceNativeRealtimeStart, "sessionId" | "failure"> & {
+    input: Omit<PersistedVoiceNativeRealtimeStart, "sessionId" | "leaseGeneration" | "failure"> & {
       readonly now: number;
     },
   ) => Effect.Effect<
@@ -42,8 +47,13 @@ export interface VoiceNativeRealtimeStartRepositoryShape {
   readonly bindSession: (
     operationKey: string,
     sessionId: VoiceSessionId,
+    leaseGeneration: number,
     now: number,
   ) => Effect.Effect<boolean, PersistenceSqlError>;
+  readonly findBySession: (
+    sessionId: VoiceSessionId,
+    now: number,
+  ) => Effect.Effect<PersistedVoiceNativeRealtimeStart | undefined, PersistenceSqlError>;
   /** Persist only authoritative no-session outcomes. Retryable failures can be reclaimed by claim. */
   readonly fail: (
     operationKey: string,

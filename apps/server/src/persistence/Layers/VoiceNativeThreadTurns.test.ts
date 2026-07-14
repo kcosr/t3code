@@ -19,11 +19,17 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
 import * as NodeSqliteClient from "../NodeSqliteClient.ts";
+import { VoiceNativeRuntimeGrantRepository } from "../Services/VoiceNativeRuntimeGrants.ts";
 import { VoiceNativeThreadTurnStore } from "../Services/VoiceNativeThreadTurns.ts";
+import { VoiceNativeRuntimeGrantRepositoryLive } from "./VoiceNativeRuntimeGrants.ts";
 import { VoiceNativeThreadTurnStoreLive } from "./VoiceNativeThreadTurns.ts";
 
 const sqlite = NodeSqliteClient.layerMemory();
-const testLayer = VoiceNativeThreadTurnStoreLive.pipe(Layer.provideMerge(sqlite));
+const testLayer = Layer.mergeAll(
+  sqlite,
+  VoiceNativeThreadTurnStoreLive.pipe(Layer.provide(sqlite)),
+  VoiceNativeRuntimeGrantRepositoryLive.pipe(Layer.provide(sqlite)),
+);
 const authSessionId = AuthSessionId.make("native-thread-auth");
 const runtimeId = VoiceNativeRuntimeId.make("native-thread-runtime");
 const runtimeInstanceId = VoiceRuntimeInstanceId.make("native-thread-runtime-instance");
@@ -32,7 +38,7 @@ const nowIso = "2026-07-13T12:00:00.000Z";
 const now = Date.parse(nowIso);
 
 const initialize = Effect.gen(function* () {
-  yield* runMigrations({ toMigrationInclusive: 47 });
+  yield* runMigrations({ toMigrationInclusive: 51 });
   const sql = yield* SqlClient.SqlClient;
   yield* sql`DELETE FROM voice_native_thread_turn_operations`;
   yield* sql`DELETE FROM voice_native_runtime_grants`;
@@ -44,10 +50,10 @@ const initialize = Effect.gen(function* () {
     '2026-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z'
   )`;
   yield* sql`INSERT INTO voice_native_runtime_grants (
-    token_hash, runtime_id, generation, auth_session_id, granted_scopes_json,
+    token_hash, provisioning_operation_id, runtime_id, generation, auth_session_id, granted_scopes_json,
     target_json, expires_at, created_at
   ) VALUES (
-    'runtime-token-hash', ${runtimeId}, 3, ${authSessionId}, '[]',
+    'runtime-token-hash', 'thread-turn-store-provision', ${runtimeId}, 3, ${authSessionId}, '[]',
     '{"mode":"thread","projectId":"project","threadId":"thread","speechPreset":"default","autoRearm":true}',
     ${now + 60_000}, ${now}
   )`;
@@ -83,7 +89,7 @@ const ackInput = (acknowledgedSequence: number) => ({
 });
 
 describe.sequential("VoiceNativeThreadTurnStore", () => {
-  it.effect("claims idempotently, rotates the child token, and fences stale generations", () =>
+  it.effect("claims idempotently and keeps the rotated child token independently bounded", () =>
     Effect.gen(function* () {
       yield* initialize;
       const store = yield* VoiceNativeThreadTurnStore;
@@ -119,7 +125,7 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
         WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`;
       expect(
         yield* store.authorize(operationId, "rotated-operation-token-hash", now),
-      ).toBeUndefined();
+      ).toMatchObject({ operationId, runtimeGeneration: 3 });
     }).pipe(Effect.provide(testLayer)),
   );
 
@@ -136,10 +142,11 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.effect("keeps an admitted child usable after ordinary parent grant expiry", () =>
+  it.effect("keeps an admitted child usable after the expired parent row is purged", () =>
     Effect.gen(function* () {
       yield* initialize;
       const store = yield* VoiceNativeThreadTurnStore;
+      const runtimeGrants = yield* VoiceNativeRuntimeGrantRepository;
       const sql = yield* SqlClient.SqlClient;
       yield* store.claim({
         ...claimInput,
@@ -147,13 +154,22 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
       });
       yield* sql`UPDATE voice_native_runtime_grants SET expires_at = ${now - 1}
         WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`;
+      yield* runtimeGrants.findActive("unrelated-runtime-token", now);
+      expect(
+        yield* sql<{ readonly count: number }>`SELECT count(*) AS count
+          FROM voice_native_runtime_grants WHERE auth_session_id = ${authSessionId}`,
+      ).toEqual([{ count: 0 }]);
 
       expect(yield* store.authorize(operationId, claimInput.tokenHash, now)).toMatchObject({
         operationId,
       });
+      expect(
+        yield* store.readEventPage(operationId, claimInput.tokenHash, now, 0, 100),
+      ).toMatchObject({ operation: { operationId } });
       expect(yield* store.acknowledge(operationId, claimInput.tokenHash, ackInput(1), now)).toBe(
         "acknowledged",
       );
+      expect(yield* store.detach(operationId, claimInput.tokenHash, now, nowIso)).toBe("detached");
     }).pipe(Effect.provide(testLayer)),
   );
 
@@ -329,7 +345,10 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
         const sql = yield* SqlClient.SqlClient;
         yield* sql`UPDATE voice_native_runtime_grants SET generation = 4
         WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`;
-        expect(yield* store.authorize(operationId, claimInput.tokenHash, now)).toBeUndefined();
+        expect(yield* store.authorize(operationId, claimInput.tokenHash, now)).toMatchObject({
+          operationId,
+          runtimeGeneration: 3,
+        });
 
         const segment = {
           operationId,
@@ -433,7 +452,7 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.effect("fences a transcription lease when runtime takeover wins before dispatch", () =>
+  it.effect("keeps an admitted transcription lease valid across runtime rotation", () =>
     Effect.gen(function* () {
       yield* initialize;
       const store = yield* VoiceNativeThreadTurnStore;
@@ -456,9 +475,9 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
         WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`;
       expect(
         yield* store.beginDispatch(operationId, claimInput.tokenHash, "lease", now, nowIso),
-      ).toBe(false);
+      ).toBe(true);
       expect(yield* store.get(operationId)).toMatchObject({
-        phase: "transcribing",
+        phase: "dispatching",
       });
     }).pipe(Effect.provide(testLayer)),
   );
@@ -979,7 +998,7 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.effect("preserves dispatching and accepted work after child capability expiry", () =>
+  it.effect("preserves leased dispatching work and expires accepted work with its capability", () =>
     Effect.gen(function* () {
       yield* initialize;
       const store = yield* VoiceNativeThreadTurnStore;
@@ -1012,11 +1031,25 @@ describe.sequential("VoiceNativeThreadTurnStore", () => {
           messageId: MessageId.make("expiry-message"),
         }),
       ).toBe(true);
-      expect(yield* store.expireAndPurge(now + 102, nowIso, now - 1)).toEqual([]);
+      expect(yield* store.listRecoverableOperationIds(now + 50)).toEqual([operationId]);
+      expect(yield* store.expireAndPurge(now + 102, nowIso, now - 1)).toEqual([operationId]);
+      expect(yield* store.listRecoverableOperationIds(now + 102)).toEqual([]);
       expect(yield* store.get(operationId)).toMatchObject({
-        phase: "waiting",
+        phase: "failed",
         dispatchAccepted: true,
       });
+      const replacementOperationId = VoiceThreadTurnOperationId.make(
+        "native-thread-operation-after-expiry",
+      );
+      expect(
+        yield* store.claim({
+          ...claimInput,
+          operationId: replacementOperationId,
+          turnClientOperationId: VoiceTurnClientOperationId.make("client-operation-after-expiry"),
+          tokenHash: "operation-token-hash-after-expiry",
+          nowEpochMillis: now + 102,
+        }),
+      ).toMatchObject({ status: "claimed", operation: { operationId: replacementOperationId } });
     }).pipe(Effect.provide(testLayer)),
   );
 
