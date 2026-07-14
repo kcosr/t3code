@@ -26,7 +26,11 @@ internal class VoiceRuntimeRealtimeEngineTest {
   private val cues = FakeCues()
   private val handoff = FakeHandoff()
   private val presentation = mutableListOf<VoiceRuntimeRealtimeAction>()
+  private val retractedPresentation = mutableListOf<Pair<VoiceRuntimeRealtimeFence, String>>()
   private var presentationWriteResult = VoiceRuntimeRetentionWriteResult.INSERTED
+  private var presentationEntered = CountDownLatch(0)
+  private var presentationRelease = CountDownLatch(0)
+  private val finalizationResults = mutableListOf<VoiceRuntimeRealtimeFinalizationResult>()
   private var repository: VoiceRuntimeRealtimeCheckpointRepository =
     VoiceRuntimeMemoryRealtimeCheckpointRepository()
 
@@ -463,6 +467,52 @@ internal class VoiceRuntimeRealtimeEngineTest {
   }
 
   @Test
+  fun `late presentation publication is retracted with its exact fence after stop wins`() {
+    val engine = connectedEngine()
+    server.actionValues += VoiceRuntimeRealtimeAction.NavigateThread(
+      7, now, "action-1", "project-1", "thread-1", now + 60_000,
+    )
+    blockPresentation()
+    val pollResult = AtomicReference<Boolean>()
+    val pollThread = Thread { pollResult.set(engine.pollActions(fence)) }
+    pollThread.start()
+    assertTrue(awaitPresentation())
+
+    val stopThread = Thread {
+      engine.stop("stop-during-presentation", fence, VoiceRuntimeRealtimeStopPolicy.IMMEDIATE)
+    }
+    stopThread.start()
+    stopThread.join(1_000)
+    assertFalse("Stop waited for presentation retention.", stopThread.isAlive)
+
+    releasePresentation()
+    pollThread.join(1_000)
+
+    assertFalse(pollThread.isAlive)
+    assertFalse(pollResult.get())
+    assertTrue(presentation.isEmpty())
+    assertEquals(listOf(fence to "action-1"), retractedPresentation)
+  }
+
+  @Test
+  fun `presentation publication is retracted when checkpoint admission cannot persist`() {
+    val durable = VoiceRuntimeMemoryRealtimeCheckpointRepository()
+    val failing = FailingSaveRepository(durable)
+    repository = failing
+    val engine = connectedEngine()
+    server.actionValues += VoiceRuntimeRealtimeAction.NavigateThread(
+      7, now, "action-1", "project-1", "thread-1", now + 60_000,
+    )
+    failing.failNextSave = true
+
+    expectThrows<IllegalStateException> { engine.pollActions(fence) }
+
+    assertTrue(presentation.isEmpty())
+    assertEquals(listOf(fence to "action-1"), retractedPresentation)
+    assertNull(durable.load()?.pendingAction)
+  }
+
+  @Test
   fun `repeated close failure projects one pending terminal then completion update`() {
     val engine = connectedEngine()
     server.closeSucceeds = false
@@ -497,20 +547,101 @@ internal class VoiceRuntimeRealtimeEngineTest {
   }
 
   @Test
-  fun `expired finalization authority converges instead of retrying forever`() {
-    val engine = connectedEngine()
+  fun `expired parent authority does not prevent child-grant source cleanup`() {
+    val shortAuthority = authority.copy(expiresAtEpochMillis = now + 100)
+    val engine = connectedEngine(shortAuthority)
     server.closeSucceeds = false
     engine.stop("stop-1", fence, VoiceRuntimeRealtimeStopPolicy.IMMEDIATE)
     cues.completeEnded()
     val closeCount = server.closeCount
 
-    now = authority.expiresAtEpochMillis
+    now = shortAuthority.expiresAtEpochMillis
+    server.closeSucceeds = true
     val result = engine.reconcileFinalization()
 
     assertTrue(result is VoiceRuntimeRealtimeFinalizationResult.Completed)
-    assertEquals(closeCount, server.closeCount)
+    assertEquals(closeCount + 1, server.closeCount)
+    assertEquals("control-token", server.lastCloseAuthorityToken)
     assertNull(repository.loadFinalization())
     assertFalse(engine.isOperational())
+  }
+
+  @Test
+  fun `source close ignores expired handoff grant after activation`() {
+    server.transitionGrantExpiresAtEpochMillis = now + 100
+    val engine = connectedEngine()
+    server.closeSucceeds = false
+    server.actionValues += VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
+      12, now, "handoff-1", "project-1", "thread-1", true, now + 60_000,
+    )
+    assertTrue(engine.pollActions(fence))
+    peer.completeDrain()
+    cues.completeEnded()
+    assertEquals(
+      VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING,
+      repository.loadFinalization()?.stage,
+    )
+
+    now += 100
+    server.closeSucceeds = true
+    val result = engine.reconcileFinalization()
+
+    assertTrue(result is VoiceRuntimeRealtimeFinalizationResult.Completed)
+    assertTrue(handoff.activated)
+    assertEquals(2, server.closeCount)
+    assertNull(repository.loadFinalization())
+  }
+
+  @Test
+  fun `handoff commit can recover after source control grant expires`() {
+    server.transitionGrantExpiresAtEpochMillis = now + 600_000
+    val engine = connectedEngine()
+    server.commitSucceeds = false
+    server.actionValues += VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
+      12, now, "handoff-1", "project-1", "thread-1", true, now + 60_000,
+    )
+    assertTrue(engine.pollActions(fence))
+    peer.completeDrain()
+    cues.completeEnded()
+    assertEquals(
+      VoiceRuntimeRealtimeFinalizationStage.HANDOFF_COMMIT_PENDING,
+      repository.loadFinalization()?.stage,
+    )
+
+    now = startResult().controlGrant.expiresAtEpochMillis
+    server.commitSucceeds = true
+    val result = engine.reconcileFinalization()
+
+    assertTrue(result is VoiceRuntimeRealtimeFinalizationResult.Completed)
+    assertTrue(handoff.activated)
+    assertEquals(0, server.closeCount)
+    assertEquals("thread-token", server.lastCommitAuthorityToken)
+    val terminal = repository.terminals(now).single()
+    assertEquals(VoiceRuntimeRealtimeTerminalOutcome.COMPLETED, terminal.outcome)
+    assertTrue(terminal.serverCleanupPending)
+  }
+
+  @Test
+  fun `expired transition grant converges before handoff commit while control grant remains live`() {
+    server.transitionGrantExpiresAtEpochMillis = now + 100
+    val engine = connectedEngine()
+    server.commitSucceeds = false
+    server.actionValues += VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
+      12, now, "handoff-1", "project-1", "thread-1", true, now + 60_000,
+    )
+    assertTrue(engine.pollActions(fence))
+    peer.completeDrain()
+    cues.completeEnded()
+    val commitCount = server.commitCount
+
+    now += 100
+    server.commitSucceeds = true
+    val result = engine.reconcileFinalization()
+
+    assertTrue(result is VoiceRuntimeRealtimeFinalizationResult.Completed)
+    assertEquals(commitCount, server.commitCount)
+    assertFalse(handoff.activated)
+    assertNull(repository.loadFinalization())
   }
 
   @Test
@@ -552,6 +683,70 @@ internal class VoiceRuntimeRealtimeEngineTest {
     assertEquals(VoiceRuntimeRealtimeTerminalOutcome.COMPLETED, terminal.outcome)
     assertEquals("thread-handoff", terminal.reason)
     assertFalse(terminal.serverCleanupPending)
+  }
+
+  @Test
+  fun `handoff preparation does not hold engine monitor and stale preparation cannot drain`() {
+    val engine = connectedEngine()
+    server.actionValues += VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
+      12, now, "handoff-1", "project-1", "thread-1", true, now + 60_000,
+    )
+    handoff.blockPrepare()
+    val pollResult = AtomicReference<Boolean>()
+    val pollThread = Thread { pollResult.set(engine.pollActions(fence)) }
+    pollThread.start()
+    assertTrue(handoff.awaitPrepare())
+
+    val stopThread = Thread {
+      engine.stop("stop-during-prepare", fence, VoiceRuntimeRealtimeStopPolicy.IMMEDIATE)
+    }
+    stopThread.start()
+    stopThread.join(1_000)
+    assertFalse("Stop waited for handoff preparation.", stopThread.isAlive)
+
+    handoff.releasePrepare()
+    pollThread.join(1_000)
+
+    assertFalse(pollThread.isAlive)
+    assertFalse(pollResult.get())
+    assertFalse(trace.contains("peer-drain"))
+    assertNull(engine.snapshot()?.pendingHandoffExchange)
+    assertTrue(trace.contains("handoff-rollback"))
+  }
+
+  @Test
+  fun `synchronous finalization completion is reported after the engine monitor is released`() {
+    val callbackBlocked = AtomicReference(false)
+    lateinit var engine: VoiceRuntimeRealtimeEngine
+    engine = engine(
+      finalizationSink = VoiceRuntimeRealtimeFinalizationSink { result ->
+        val probe = Thread { engine.isOperational() }
+        probe.start()
+        probe.join(1_000)
+        callbackBlocked.set(probe.isAlive)
+        finalizationResults += result
+      },
+    )
+    assertTrue(engine.start("start-1", fence) is VoiceRuntimeRealtimeCommandResult.Accepted)
+    peer.deliverOffer("offer")
+    engine.onPeerConnected(fence, "session-1")
+    cues.completeReady()
+    engine.stop("stop-1", fence, VoiceRuntimeRealtimeStopPolicy.IMMEDIATE)
+
+    cues.completeEnded()
+
+    assertFalse(callbackBlocked.get())
+    assertTrue(finalizationResults.single() is VoiceRuntimeRealtimeFinalizationResult.Completed)
+  }
+
+  @Test
+  fun `idle reconciliation is reported instead of being discarded`() {
+    val engine = engine()
+
+    val result = engine.reconcileFinalization()
+
+    assertEquals(VoiceRuntimeRealtimeFinalizationResult.Idle, result)
+    assertEquals(listOf(VoiceRuntimeRealtimeFinalizationResult.Idle), finalizationResults)
   }
 
   @Test
@@ -637,6 +832,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
     expectThrows<IllegalStateException> { engine.pollActions(fence) }
 
     assertTrue(trace.contains("handoff-prepare"))
+    assertTrue(trace.contains("handoff-rollback"))
     assertFalse(trace.contains("peer-drain"))
     assertFalse(trace.contains("handoff-commit"))
     assertNull(durable.load()?.pendingHandoffExchange)
@@ -757,8 +953,9 @@ internal class VoiceRuntimeRealtimeEngineTest {
       peer,
       cues,
       handoff,
-      VoiceRuntimeRealtimePresentationSink { VoiceRuntimeRetentionWriteResult.INSERTED },
+      presentationSink(),
       repository,
+      VoiceRuntimeRealtimeFinalizationSink {},
     )
 
     val terminal = replacement.recoverInterrupted(identity.copy(runtimeInstanceId = "instance-2"))
@@ -772,24 +969,26 @@ internal class VoiceRuntimeRealtimeEngineTest {
   private val trace = mutableListOf<String>()
   private val projectedTerminals = mutableListOf<VoiceRuntimeRealtimeTerminalSummary>()
 
-  private fun engine() = VoiceRuntimeRealtimeEngine(
-    authority,
+  private fun engine(
+    engineAuthority: VoiceRuntimeRealtimeAuthority = authority,
+    finalizationSink: VoiceRuntimeRealtimeFinalizationSink =
+      VoiceRuntimeRealtimeFinalizationSink { finalizationResults += it },
+  ) = VoiceRuntimeRealtimeEngine(
+    engineAuthority,
     { now },
     server,
     peer,
     cues,
     handoff,
-    VoiceRuntimeRealtimePresentationSink { action ->
-      presentationWriteResult.also { result ->
-        if (result == VoiceRuntimeRetentionWriteResult.INSERTED ||
-          result == VoiceRuntimeRetentionWriteResult.UPDATED) presentation += action
-      }
-    },
+    presentationSink(),
     repository,
+    finalizationSink,
     terminalSink = VoiceRuntimeRealtimeTerminalSink { projectedTerminals += it },
   )
 
-  private fun connectedEngine(): VoiceRuntimeRealtimeEngine = engine().also {
+  private fun connectedEngine(
+    engineAuthority: VoiceRuntimeRealtimeAuthority = authority,
+  ): VoiceRuntimeRealtimeEngine = engine(engineAuthority).also {
     assertTrue(it.start("start-1", fence) is VoiceRuntimeRealtimeCommandResult.Accepted)
     peer.deliverOffer("offer")
     it.onPeerConnected(fence, "session-1")
@@ -803,8 +1002,13 @@ internal class VoiceRuntimeRealtimeEngineTest {
     peer.reset()
     cues.reset()
     handoff.activated = false
+    handoff.reset()
     presentation.clear()
+    retractedPresentation.clear()
     presentationWriteResult = VoiceRuntimeRetentionWriteResult.INSERTED
+    presentationEntered = CountDownLatch(0)
+    presentationRelease = CountDownLatch(0)
+    finalizationResults.clear()
     projectedTerminals.clear()
     repository = VoiceRuntimeMemoryRealtimeCheckpointRepository()
   }
@@ -831,7 +1035,10 @@ internal class VoiceRuntimeRealtimeEngineTest {
 
   private inner class FakeServer : VoiceRuntimeRealtimeServer {
     var startCount = 0
+    var commitCount = 0
     var closeCount = 0
+    var lastCommitAuthorityToken: String? = null
+    var lastCloseAuthorityToken: String? = null
     var lastCloseOperationId: String? = null
     var lastCloseControlToken: String? = null
     var actionsCount = 0
@@ -839,6 +1046,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
     var commitFailureRetryable = true
     var closeSucceeds = true
     var closeFailureRetryable = true
+    var transitionGrantExpiresAtEpochMillis = now + 300_000
     var startResponse = startResult()
     val actionValues = mutableListOf<VoiceRuntimeRealtimeAction>()
     var heartbeatResult: VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeHeartbeatResult> =
@@ -879,7 +1087,10 @@ internal class VoiceRuntimeRealtimeEngineTest {
 
     fun reset() {
       startCount = 0
+      commitCount = 0
       closeCount = 0
+      lastCommitAuthorityToken = null
+      lastCloseAuthorityToken = null
       lastCloseOperationId = null
       lastCloseControlToken = null
       actionsCount = 0
@@ -888,6 +1099,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
       commitFailureRetryable = true
       closeSucceeds = true
       closeFailureRetryable = true
+      transitionGrantExpiresAtEpochMillis = now + 300_000
       startResponse = startResult()
       heartbeatResult = VoiceRuntimeRealtimeRemoteResult.Success(heartbeat("live"))
       actionsEntered = CountDownLatch(0)
@@ -990,7 +1202,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
         action.autoRearm,
         VoiceRuntimeRealtimeTransitionGrant(
           "thread-token",
-          now + 300_000,
+          transitionGrantExpiresAtEpochMillis,
           identity.generation + 1,
           plan.threadModeSessionId,
           VoiceRuntimeRealtimeThreadTarget(
@@ -1014,6 +1226,8 @@ internal class VoiceRuntimeRealtimeEngineTest {
       session: VoiceRuntimeRealtimeStartResult,
       exchange: VoiceRuntimeRealtimeHandoffExchangeResult,
     ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeHandoffCommitResult> {
+      commitCount++
+      lastCommitAuthorityToken = authority.runtimeToken
       trace += "handoff-commit"
       return if (commitSucceeds) VoiceRuntimeRealtimeRemoteResult.Success(
         VoiceRuntimeRealtimeHandoffCommitResult(
@@ -1035,6 +1249,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
       clientOperationId: String,
     ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeCloseResult> {
       closeCount++
+      lastCloseAuthorityToken = authority.runtimeToken
       lastCloseOperationId = clientOperationId
       lastCloseControlToken = session.controlGrant.token
       closeEntered.countDown()
@@ -1124,6 +1339,25 @@ internal class VoiceRuntimeRealtimeEngineTest {
     var prepareSucceeds = true
     var activateSucceeds = true
     var throwOnActivate = false
+    private var prepareEntered = CountDownLatch(0)
+    private var prepareRelease = CountDownLatch(0)
+
+    fun blockPrepare() {
+      prepareEntered = CountDownLatch(1)
+      prepareRelease = CountDownLatch(1)
+    }
+
+    fun awaitPrepare(): Boolean = prepareEntered.await(1, TimeUnit.SECONDS)
+
+    fun releasePrepare() = prepareRelease.countDown()
+
+    fun reset() {
+      prepareSucceeds = true
+      activateSucceeds = true
+      throwOnActivate = false
+      prepareEntered = CountDownLatch(0)
+      prepareRelease = CountDownLatch(0)
+    }
 
     override fun plan(
       source: VoiceRuntimeRealtimeCheckpoint,
@@ -1139,8 +1373,15 @@ internal class VoiceRuntimeRealtimeEngineTest {
     )
 
     override fun prepare(result: VoiceRuntimeRealtimeHandoffExchangeResult): Boolean {
+      prepareEntered.countDown()
+      check(prepareRelease.await(2, TimeUnit.SECONDS)) { "Timed out waiting to release prepare." }
       trace += "handoff-prepare"
       return prepareSucceeds
+    }
+
+    override fun rollback(result: VoiceRuntimeRealtimeHandoffExchangeResult): Boolean {
+      trace += "handoff-rollback"
+      return true
     }
 
     override fun activate(result: VoiceRuntimeRealtimeHandoffExchangeResult): Boolean {
@@ -1154,6 +1395,41 @@ internal class VoiceRuntimeRealtimeEngineTest {
       return true
     }
   }
+
+  private fun presentationSink() = object : VoiceRuntimeRealtimePresentationSink {
+    override fun publish(
+      fence: VoiceRuntimeRealtimeFence,
+      action: VoiceRuntimeRealtimeAction,
+    ): VoiceRuntimeRetentionWriteResult {
+      presentationEntered.countDown()
+      check(presentationRelease.await(2, TimeUnit.SECONDS)) {
+        "Timed out waiting to release presentation retention."
+      }
+      return presentationWriteResult.also { result ->
+        if (result == VoiceRuntimeRetentionWriteResult.INSERTED ||
+          result == VoiceRuntimeRetentionWriteResult.UPDATED) presentation += action
+      }
+    }
+
+    override fun retract(
+      fence: VoiceRuntimeRealtimeFence,
+      action: VoiceRuntimeRealtimeAction,
+    ): VoiceRuntimeRetentionRemovalResult {
+      val removed = presentation.remove(action)
+      retractedPresentation += fence to actionId(action)
+      return if (removed) VoiceRuntimeRetentionRemovalResult.REMOVED
+      else VoiceRuntimeRetentionRemovalResult.MISSING
+    }
+  }
+
+  private fun blockPresentation() {
+    presentationEntered = CountDownLatch(1)
+    presentationRelease = CountDownLatch(1)
+  }
+
+  private fun awaitPresentation(): Boolean = presentationEntered.await(1, TimeUnit.SECONDS)
+
+  private fun releasePresentation() = presentationRelease.countDown()
 
   private class FailingSaveRepository(
     private val delegate: VoiceRuntimeRealtimeCheckpointRepository,

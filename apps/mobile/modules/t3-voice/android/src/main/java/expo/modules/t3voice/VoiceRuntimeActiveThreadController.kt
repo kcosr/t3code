@@ -99,8 +99,15 @@ internal data class VoiceRuntimeCanonicalInstallCheckpoint(
   val activeModeSessionId: String?,
   val activeTurnClientOperationId: String?,
   val localRetentionPriorPhase: VoiceThreadPhase?,
+  val lastRealtimeSession: VoiceRuntimeObservedRealtimeSession?,
   val drafts: List<VoiceRuntimeStoredDraft>,
   val retention: VoiceRuntimeRetentionCheckpoint,
+)
+
+internal data class VoiceRuntimeObservedRealtimeSession(
+  val identity: VoiceRuntimeIdentity,
+  val modeSessionId: String,
+  val conversationId: String,
 )
 
 internal class VoiceRuntimeActiveThreadController(
@@ -164,6 +171,9 @@ internal class VoiceRuntimeActiveThreadController(
   private var activeModeSessionId: String? = null
   private var activeTurnClientOperationId: String? = null
   private var localRetentionPriorPhase: VoiceThreadPhase? = null
+  private var lastRealtimeSession: VoiceRuntimeObservedRealtimeSession? = null
+  private val projectedRealtimeTerminals =
+    mutableMapOf<VoiceRuntimeRetainedRecordKey.RealtimeTerminal, VoiceRuntimeRealtimeTerminalSummary>()
 
   @Synchronized
   fun snapshot(): VoiceRuntimeSnapshot = journal.snapshot
@@ -178,6 +188,7 @@ internal class VoiceRuntimeActiveThreadController(
       activeModeSessionId = activeModeSessionId,
       activeTurnClientOperationId = activeTurnClientOperationId,
       localRetentionPriorPhase = localRetentionPriorPhase,
+      lastRealtimeSession = lastRealtimeSession,
       drafts = checkNotNull(drafts.checkpoint()) {
         "Voice runtime draft checkpoint is unavailable."
       },
@@ -191,16 +202,23 @@ internal class VoiceRuntimeActiveThreadController(
     checkpoint: VoiceRuntimeCanonicalInstallCheckpoint,
     failedProvisioningOperationId: String,
   ): Boolean {
-    if (!drafts.restore(checkpoint.drafts)) return false
-    if (!retained.restore(checkpoint.retention)) return false
-    authority.restore(checkpoint.authority, failedProvisioningOperationId)
+    val draftsRestored = runCatching { drafts.restore(checkpoint.drafts) }.getOrDefault(false)
+    val retentionRestored = runCatching { retained.restore(checkpoint.retention) }.getOrDefault(false)
+    val authorityRestored = runCatching {
+      authority.restore(checkpoint.authority, failedProvisioningOperationId)
+    }.isSuccess
+    var memoryRestored = true
     identity = checkpoint.identity
-    journal.replaceSnapshot(checkpoint.snapshot)
-    presentationActions.restore(checkpoint.presentationActions)
+    runCatching { journal.replaceSnapshot(checkpoint.snapshot) }
+      .onFailure { memoryRestored = false }
+    runCatching { presentationActions.restore(checkpoint.presentationActions) }
+      .onFailure { memoryRestored = false }
     activeModeSessionId = checkpoint.activeModeSessionId
     activeTurnClientOperationId = checkpoint.activeTurnClientOperationId
     localRetentionPriorPhase = checkpoint.localRetentionPriorPhase
-    return true
+    lastRealtimeSession = checkpoint.lastRealtimeSession
+    projectedRealtimeTerminals.clear()
+    return draftsRestored && retentionRestored && authorityRestored && memoryRestored
   }
 
   @Synchronized
@@ -256,7 +274,11 @@ internal class VoiceRuntimeActiveThreadController(
     if (replayed) return journal.snapshot
     identity = reservation.identity
     drafts.rebind(identity, target, now())
-    if (activateRetentionScope) requireNotNull(retained.activateScope(identity, true, now())) {
+    if (activateRetentionScope) requireNotNull(retained.activateScope(
+      identity,
+      VoiceRuntimeRetentionScope.Thread(target.environmentId),
+      now(),
+    )) {
       "Voice runtime retention scope is unavailable."
     }
     val recoveredActions = retained.actions(now()).filter(::actionMatchesCurrentContext)
@@ -299,7 +321,11 @@ internal class VoiceRuntimeActiveThreadController(
         if (!VoiceRuntimeHandoffActivationPolicy.accepted(receipt)) {
           throw VoiceRuntimeHandoffActivationRejected(receipt)
         }
-        checkNotNull(retained.activateScope(identity, true, now())) {
+        checkNotNull(retained.activateScope(
+          identity,
+          VoiceRuntimeRetentionScope.Thread(target.environmentId),
+          now(),
+        )) {
           "Voice runtime retention scope is unavailable."
         }
       }
@@ -329,10 +355,18 @@ internal class VoiceRuntimeActiveThreadController(
     val (_, replayed) = authority.configure(reservation, fingerprint)
     if (replayed) return journal.snapshot
     identity = reservation.identity
-    requireNotNull(retained.activateScope(identity, false, now())) {
+    requireNotNull(retained.activateScope(
+      identity,
+      VoiceRuntimeRetentionScope.Realtime(target.environmentId),
+      now(),
+    )) {
       "Voice runtime retention scope is unavailable."
     }
-    presentationActions.replace(emptyList())
+    presentationActions.replace(
+      retained.actions(now()).filter { it.identity == identity }.map { it.action },
+    )
+    lastRealtimeSession = null
+    projectedRealtimeTerminals.clear()
     appendState("authority-configured") {
       it.copy(
         identity = identity,
@@ -361,6 +395,11 @@ internal class VoiceRuntimeActiveThreadController(
       return
     }
     if (checkpoint.fence.identity != identity || checkpoint.target != target) return
+    lastRealtimeSession = VoiceRuntimeObservedRealtimeSession(
+      checkpoint.fence.identity,
+      checkpoint.fence.modeSessionId,
+      checkpoint.target.conversationId,
+    )
     val media = when (checkpoint.phase) {
       VoiceRealtimePhase.CUEING -> VoiceRuntimeMediaOwner.Cue(checkpoint.fence.modeSessionId)
       VoiceRealtimePhase.NEGOTIATING,
@@ -388,6 +427,7 @@ internal class VoiceRuntimeActiveThreadController(
 
   @Synchronized
   fun publishRealtimePresentationAction(
+    fence: VoiceRuntimeRealtimeFence,
     action: VoiceRuntimeRealtimeAction,
   ): VoiceRuntimeRetentionWriteResult {
     val projected = when (action) {
@@ -405,15 +445,18 @@ internal class VoiceRuntimeActiveThreadController(
       )
       else -> return VoiceRuntimeRetentionWriteResult.UNAVAILABLE
     }
-    val modeSessionId = (journal.snapshot.operation as? VoiceRuntimeOperation.Realtime)?.modeSessionId
+    val operation = journal.snapshot.operation as? VoiceRuntimeOperation.Realtime
       ?: return VoiceRuntimeRetentionWriteResult.UNAVAILABLE
-    val retainedAction = retainedAction(modeSessionId, projected)
+    if (fence.identity != identity || fence.modeSessionId != operation.modeSessionId) {
+      return VoiceRuntimeRetentionWriteResult.UNAVAILABLE
+    }
+    val retainedAction = retainedAction(fence.modeSessionId, projected)
     val retainedResult = retained.publishAction(retainedAction)
     if (!retainedResult.isSuccess()) return retainedResult
     presentationActions.publish(projected)
     journal.append(
       kind = "presentation-action",
-      rootOperationId = (journal.snapshot.operation as? VoiceRuntimeOperation.Realtime)?.modeSessionId,
+      rootOperationId = fence.modeSessionId,
       occurredAtEpochMillis = now(),
       presentationAction = projected,
     )
@@ -421,13 +464,51 @@ internal class VoiceRuntimeActiveThreadController(
   }
 
   @Synchronized
+  fun retractRealtimePresentationAction(
+    fence: VoiceRuntimeRealtimeFence,
+    action: VoiceRuntimeRealtimeAction,
+  ): VoiceRuntimeRetentionRemovalResult {
+    val projected = when (action) {
+      is VoiceRuntimeRealtimeAction.NavigateThread -> VoiceRuntimePresentationAction.NavigateThread(
+        action.actionId, action.projectId, action.threadId, action.expiresAtEpochMillis,
+      )
+      is VoiceRuntimeRealtimeAction.ConfirmationRequired ->
+        VoiceRuntimePresentationAction.RealtimeConfirmationRequired(
+          action.actionId,
+          action.confirmationId,
+          action.toolCallId,
+          action.tool,
+          action.summary,
+          action.expiresAtEpochMillis,
+        )
+      else -> return VoiceRuntimeRetentionRemovalResult.MISSING
+    }
+    val expected = VoiceRuntimeRetainedPresentationAction(fence.identity, fence.modeSessionId, projected)
+    val removed = retained.retractAction(expected)
+    if (removed != VoiceRuntimeRetentionRemovalResult.REMOVED) return removed
+    presentationActions.live().firstOrNull { it == projected }?.let {
+      runCatching { presentationActions.remove(it.actionId) }
+    }
+    return removed
+  }
+
+  @Synchronized
   fun publishRealtimeTerminal(summary: VoiceRuntimeRealtimeTerminalSummary): Boolean {
     if (!terminalMatchesCurrentScope(summary)) return false
+    if (summary !in retainedRealtimeTerminals()) return false
     if (summary.identity.generation == identity.generation) {
-      val operation = journal.snapshot.operation as? VoiceRuntimeOperation.Realtime ?: return false
-      if (operation.modeSessionId != summary.modeSessionId ||
-        operation.conversationId != summary.conversationId) return false
+      val operation = journal.snapshot.operation as? VoiceRuntimeOperation.Realtime
+      val matchesLive = operation?.modeSessionId == summary.modeSessionId &&
+        operation.conversationId == summary.conversationId
+      val matchesLast = lastRealtimeSession?.let {
+        it.identity == summary.identity && it.modeSessionId == summary.modeSessionId &&
+          it.conversationId == summary.conversationId
+      } == true
+      if (!matchesLive && !matchesLast) return false
     }
+    val terminalKey = summary.retainedKey()
+    if (projectedRealtimeTerminals[terminalKey] == summary) return true
+    projectedRealtimeTerminals[terminalKey] = summary
     journal.append(
       kind = "realtime-terminal",
       rootOperationId = summary.modeSessionId,
@@ -448,6 +529,8 @@ internal class VoiceRuntimeActiveThreadController(
     activeModeSessionId = null
     activeTurnClientOperationId = null
     localRetentionPriorPhase = null
+    lastRealtimeSession = null
+    projectedRealtimeTerminals.clear()
     appendState("authority-cleared", commandId) {
       it.copy(
         availability = VoiceRuntimeAvailability.LOCKED,
@@ -489,14 +572,15 @@ internal class VoiceRuntimeActiveThreadController(
   fun deliver(
     lease: VoiceRuntimeConsumerLease,
     after: VoiceRuntimeCursor?,
-  ): VoiceRuntimeDelivery = when (val delivery = deliveryGate.deliver(lease, after)) {
-    is VoiceRuntimeDelivery.Events -> delivery
-    is VoiceRuntimeDelivery.Rebase -> delivery.copy(
-      threadReceipts = retained.receipts(identity.runtimeId, identity.generation, now()),
-      realtimeTerminalSummaries = retainedRealtimeTerminals(),
-      draftArtifacts = drafts.handles(now()).filter { it.identity == identity },
-      presentationActions = retained.actions(now()).filter(::actionMatchesCurrentContext).map { it.action },
-    )
+  ): VoiceRuntimeDelivery {
+    consumers.requireLease(lease)
+    projectDurableRealtimeTerminals()
+    return when (val delivery = deliveryGate.deliver(lease, after)) {
+      is VoiceRuntimeDelivery.Events -> delivery.copy(
+        events = filterDurableEvents(delivery.events),
+      )
+      is VoiceRuntimeDelivery.Rebase -> enrichRebase(delivery)
+    }
   }
 
   @Synchronized
@@ -690,9 +774,9 @@ internal class VoiceRuntimeActiveThreadController(
     requireFence(candidate.runtimeId, candidate.runtimeInstanceId, candidate.generation)
     when (key) {
       is VoiceRuntimeRetainedRecordKey.ThreadReceipt -> {
-        if (key.identity.runtimeId != identity.runtimeId ||
-          key.identity.generation != identity.generation) {
-          throw VoiceRuntimeFenceException("Retained record belongs to another authority generation.")
+        val receipt = retained.receipt(key, now()) ?: return
+        if (!receiptMatchesCurrentScope(receipt)) {
+          throw VoiceRuntimeFenceException("Retained record belongs to another authority scope.")
         }
         retained.acknowledgeReceipt(key)
       }
@@ -923,22 +1007,50 @@ internal class VoiceRuntimeActiveThreadController(
 
   private fun rebaseFor(candidate: VoiceRuntimeIdentity): VoiceRuntimeDelivery.Rebase? {
     if (candidate.runtimeId != identity.runtimeId || candidate.runtimeInstanceId != identity.runtimeInstanceId) {
-      return (journal.read(candidate.toCursor()) as VoiceRuntimeDelivery.Rebase).copy(
-        realtimeTerminalSummaries = retainedRealtimeTerminals(),
-      )
+      return enrichRebase(journal.read(candidate.toCursor()) as VoiceRuntimeDelivery.Rebase)
     }
     if (candidate.generation != identity.generation) {
-      return (journal.read(candidate.toCursor()) as VoiceRuntimeDelivery.Rebase).copy(
-        realtimeTerminalSummaries = retainedRealtimeTerminals(),
-      )
+      return enrichRebase(journal.read(candidate.toCursor()) as VoiceRuntimeDelivery.Rebase)
     }
     return null
   }
+
+  private fun enrichRebase(rebase: VoiceRuntimeDelivery.Rebase): VoiceRuntimeDelivery.Rebase = rebase.copy(
+    threadReceipts = retainedThreadReceipts(),
+    realtimeTerminalSummaries = retainedRealtimeTerminals(),
+    draftArtifacts = drafts.handles(now()).filter { it.identity == identity },
+    presentationActions = retained.actions(now()).filter(::actionMatchesCurrentContext).map { it.action },
+  )
+
+  private fun retainedThreadReceipts(): List<VoiceRuntimeThreadReceipt> {
+    val environmentId = currentEnvironmentId() ?: return emptyList()
+    return retained.receipts(identity, environmentId, now())
+      .sortedWith(compareBy({ it.createdAtEpochMillis }, { it.turnClientOperationId }))
+  }
+
+  private fun receiptMatchesCurrentScope(receipt: VoiceRuntimeThreadReceipt): Boolean =
+    receipt.identity.runtimeId == identity.runtimeId &&
+      receipt.identity.generation <= identity.generation &&
+      receipt.environmentId == currentEnvironmentId()
 
   private fun retainedRealtimeTerminals(): List<VoiceRuntimeRealtimeTerminalSummary> =
     realtimeTerminals(now())
       .filter(::terminalMatchesCurrentScope)
       .sortedWith(compareBy({ it.terminalAtEpochMillis }, { it.modeSessionId }))
+
+  private fun projectDurableRealtimeTerminals() {
+    retainedRealtimeTerminals().forEach { summary ->
+      val key = summary.retainedKey()
+      if (projectedRealtimeTerminals[key] == summary) return@forEach
+      projectedRealtimeTerminals[key] = summary
+      journal.append(
+        kind = "realtime-terminal",
+        rootOperationId = summary.modeSessionId,
+        occurredAtEpochMillis = summary.terminalAtEpochMillis,
+        realtimeTerminalSummary = summary,
+      )
+    }
+  }
 
   private fun acknowledgeRealtimeTerminal(
     key: VoiceRuntimeRetainedRecordKey.RealtimeTerminal,
@@ -952,15 +1064,39 @@ internal class VoiceRuntimeActiveThreadController(
     return realtimeTerminalAcknowledgement(key)
   }
 
-  private fun terminalMatchesCurrentScope(summary: VoiceRuntimeRealtimeTerminalSummary): Boolean {
-    val environmentId = when (val target = journal.snapshot.target) {
-      is VoiceRuntimeTarget.Realtime -> target.environmentId
-      is VoiceRuntimeTarget.Thread -> target.environmentId
-      null -> return false
+  private fun filterDurableEvents(events: List<VoiceRuntimeEvent>): List<VoiceRuntimeEvent> {
+    val receipts = retainedThreadReceipts().toSet()
+    val terminals = retainedRealtimeTerminals().toSet()
+    val actions = retained.actions(now()).filter(::actionMatchesCurrentContext).toSet()
+    return events.filter { event ->
+      event.threadReceipt?.let { return@filter it in receipts }
+      event.realtimeTerminalSummary?.let { return@filter it in terminals }
+      event.presentationAction?.let { action ->
+        val modeSessionId = event.rootOperationId ?: return@filter false
+        val eventIdentity = VoiceRuntimeIdentity(
+          event.cursor.runtimeId,
+          event.cursor.runtimeInstanceId,
+          event.cursor.generation,
+        )
+        return@filter VoiceRuntimeRetainedPresentationAction(
+          eventIdentity, modeSessionId, action,
+        ) in actions
+      }
+      true
     }
+  }
+
+  private fun terminalMatchesCurrentScope(summary: VoiceRuntimeRealtimeTerminalSummary): Boolean {
+    val environmentId = currentEnvironmentId() ?: return false
     return summary.identity.runtimeId == identity.runtimeId &&
       summary.identity.generation <= identity.generation &&
       summary.environmentId == environmentId
+  }
+
+  private fun currentEnvironmentId(): String? = when (val target = journal.snapshot.target) {
+    is VoiceRuntimeTarget.Realtime -> target.environmentId
+    is VoiceRuntimeTarget.Thread -> target.environmentId
+    null -> null
   }
 
   private fun actionMatchesCurrentContext(
@@ -972,8 +1108,10 @@ internal class VoiceRuntimeActiveThreadController(
         action.artifact.identity == identity && action.artifact.modeSessionId == retainedAction.modeSessionId
       is VoiceRuntimePresentationAction.NavigateThread,
       is VoiceRuntimePresentationAction.RealtimeConfirmationRequired,
-      -> (journal.snapshot.operation as? VoiceRuntimeOperation.Realtime)?.modeSessionId ==
-        retainedAction.modeSessionId
+      -> retainedAction.modeSessionId == (
+        (journal.snapshot.operation as? VoiceRuntimeOperation.Realtime)?.modeSessionId
+          ?: lastRealtimeSession?.modeSessionId
+      )
     }
   }
 
@@ -1073,3 +1211,6 @@ internal class VoiceRuntimeActiveThreadController(
     T3VoiceRuntimeTargetIdentity.digest(VoiceRuntimeBridge.canonicalRealtimeTargetIdentity(target))
 
 }
+
+private fun VoiceRuntimeRealtimeTerminalSummary.retainedKey() =
+  VoiceRuntimeRetainedRecordKey.RealtimeTerminal(identity, modeSessionId)

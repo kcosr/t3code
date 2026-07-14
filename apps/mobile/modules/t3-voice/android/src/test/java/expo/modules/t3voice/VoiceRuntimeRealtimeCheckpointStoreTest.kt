@@ -157,7 +157,7 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
   }
 
   @Test
-  fun `full terminal retention rejects new summary without eviction until exact ack or expiry`() {
+  fun `full terminal retention converges by retaining the newest exact summaries`() {
     val storage = MemoryStore()
     val repository =
       VoiceRuntimeDurableRealtimeCheckpointRepository(storage, AuthenticatedTestCipher())
@@ -168,9 +168,7 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
     repository.publishTerminal(
       terminal(64, expiresAt = 12_000).copy(reason = "replacement"),
     )
-    expectThrows<VoiceRuntimeRetentionCapacityException> {
-      repository.publishTerminal(terminal(65, expiresAt = 12_000))
-    }
+    repository.publishTerminal(terminal(65, expiresAt = 12_000))
 
     val restarted =
       VoiceRuntimeDurableRealtimeCheckpointRepository(storage, AuthenticatedTestCipher())
@@ -179,17 +177,42 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
     assertEquals(64, values.size)
     assertEquals(1, values.count { it.modeSessionId == "mode-64" })
     assertEquals("replacement", values.single { it.modeSessionId == "mode-64" }.reason)
+    assertTrue(values.none { it.modeSessionId == "mode-1" })
+    assertTrue(values.any { it.modeSessionId == "mode-65" })
     val acknowledged = values.single { it.modeSessionId == "mode-42" }
     assertTrue(restarted.acknowledgeTerminal(VoiceRuntimeRetainedRecordKey.RealtimeTerminal(
       acknowledged.identity, acknowledged.modeSessionId,
     )))
-    restarted.publishTerminal(terminal(65, expiresAt = 12_000))
+    restarted.publishTerminal(terminal(66, expiresAt = 12_000))
     assertEquals(64, restarted.terminals(100).size)
     assertFalse(restarted.acknowledgeTerminal(VoiceRuntimeRetainedRecordKey.RealtimeTerminal(
       acknowledged.identity.copy(runtimeInstanceId = "wrong-process"), acknowledged.modeSessionId,
     )))
     assertTrue(restarted.terminals(12_000).isEmpty())
     assertFalse(storage.values.values.any { CONTROL_TOKEN in it || TRANSITION_TOKEN in it })
+  }
+
+  @Test
+  fun `finalization atomically reserves terminal capacity and cannot wedge future starts`() {
+    val storage = MemoryStore()
+    val cipher = AuthenticatedTestCipher()
+    val repository = VoiceRuntimeDurableRealtimeCheckpointRepository(storage, cipher, 2)
+    repository.publishTerminal(terminal(1, expiresAt = 10_000))
+    repository.publishTerminal(terminal(2, expiresAt = 10_000))
+    val checkpoint = checkpoint()
+    val finalization = finalization(checkpoint)
+    repository.save(checkpoint)
+
+    repository.installFinalization(checkpoint, finalization)
+
+    assertEquals(listOf("mode-2"), repository.terminals(100).map { it.modeSessionId })
+    repository.publishTerminal(terminal(3, expiresAt = 10_000))
+    repository.clearFinalization(finalization.fence, finalization.session.state.sessionId)
+    repository.save(checkpoint.copy(rootCommandId = "future-start"))
+
+    assertEquals(listOf("mode-2", "mode-3"), repository.terminals(100).map { it.modeSessionId })
+    assertEquals("future-start", repository.load()?.rootCommandId)
+    assertNull(repository.loadFinalization())
   }
 
   @Test
@@ -277,7 +300,6 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
       fence = checkpoint.fence,
       sourceTarget = checkpoint.target,
       sourceEnvironmentOrigin = "https://environment.example.test",
-      sourceAuthorityExpiresAtEpochMillis = 9_000,
       rootCommandId = checkpoint.rootCommandId,
       session = VoiceRuntimeRealtimeStartResult(
         VoiceRuntimeRealtimeSessionState(

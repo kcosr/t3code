@@ -266,6 +266,16 @@ internal class VoiceRuntimeAuthorityStore(
   }
 
   @Synchronized
+  fun discardPreparedTransition(expected: VoiceRuntimePersistedAuthority): Boolean {
+    val prepared = loadPreparedTransition() ?: return false
+    if (prepared != expected) return false
+    check(storage.clear(PREPARED_TRANSITION_KEYS)) {
+      "Could not clear prepared handoff authority."
+    }
+    return true
+  }
+
+  @Synchronized
   fun beginRefresh(): VoiceRuntimeRefreshAttempt {
     val authority = loadIgnoringExpiry()
       ?: error("Canonical voice runtime authority is unavailable for refresh.")
@@ -438,6 +448,9 @@ internal class VoiceRuntimeAuthorityStore(
         .mapValues { requireNotNull(it.value) },
     )
   }
+
+  @Synchronized
+  fun inspectPreparedTransition(): VoiceRuntimePersistedAuthority? = loadPreparedTransition()
 
   private fun prefixedTransitionValues(values: Map<String, String>): Map<String, String> =
     values.mapKeys { (key) -> "$PREPARED_TRANSITION_PREFIX$key" }

@@ -82,10 +82,14 @@ internal class VoiceRuntimeDurabilityTest {
     assertEquals(VoiceRuntimeRetentionWriteResult.INSERTED, repository.publishAction(retainedAction))
 
     val restarted = VoiceRuntimeDurableJournalRepository(storage, now = { now })
-    assertEquals(listOf(receipt), restarted.receipts("runtime-1", 4, 1_500))
+    assertEquals(listOf(receipt), restarted.receipts(
+      VoiceRuntimeIdentity("runtime-1", "instance-1", 4), "environment-1", 1_500,
+    ))
     assertEquals(listOf(retainedAction), restarted.actions(1_500))
     now = 2_000
-    assertTrue(restarted.receipts("runtime-1", 4, now).isEmpty())
+    assertTrue(restarted.receipts(
+      VoiceRuntimeIdentity("runtime-1", "instance-1", 4), "environment-1", now,
+    ).isEmpty())
     assertTrue(restarted.actions(now).isEmpty())
   }
 
@@ -153,14 +157,18 @@ internal class VoiceRuntimeDurabilityTest {
     assertEquals(VoiceRuntimeRetentionWriteResult.FULL, repository.publishAction(nextAction))
 
     val restarted = VoiceRuntimeDurableJournalRepository(storage, now = { now })
-    assertEquals(256, restarted.receipts("runtime-1", 4, now).size)
+    assertEquals(256, restarted.receipts(
+      VoiceRuntimeIdentity("runtime-1", "instance-1", 4), "environment-1", now,
+    ).size)
     assertEquals(64, restarted.actions(now).size)
     val acknowledged = receipt(42, 2_000)
     assertTrue(restarted.acknowledgeReceipt(VoiceRuntimeRetainedRecordKey.ThreadReceipt(
       acknowledged.identity, acknowledged.modeSessionId, acknowledged.turnClientOperationId,
     )))
     assertEquals(VoiceRuntimeRetentionWriteResult.INSERTED, restarted.publishReceipt(nextReceipt))
-    assertEquals(256, restarted.receipts("runtime-1", 4, now).size)
+    assertEquals(256, restarted.receipts(
+      VoiceRuntimeIdentity("runtime-1", "instance-1", 4), "environment-1", now,
+    ).size)
     assertEquals(
       VoiceRuntimeRetentionRemovalResult.REMOVED,
       restarted.removeAction(retainedAction(
@@ -171,7 +179,9 @@ internal class VoiceRuntimeDurabilityTest {
     assertEquals(64, restarted.actions(now).size)
 
     now = 2_000
-    assertTrue(restarted.receipts("runtime-1", 4, now).isEmpty())
+    assertTrue(restarted.receipts(
+      VoiceRuntimeIdentity("runtime-1", "instance-1", 4), "environment-1", now,
+    ).isEmpty())
     assertTrue(restarted.actions(now).isEmpty())
   }
 
@@ -193,7 +203,9 @@ internal class VoiceRuntimeDurabilityTest {
     )
     assertEquals(VoiceRuntimeRetentionAdmission.UNAVAILABLE, repository.actionCapacity(1_000))
     expectThrows<VoiceRuntimeDurableStateCorruptionException> {
-      repository.receipts("runtime-1", 4, 1_000)
+      repository.receipts(
+        VoiceRuntimeIdentity("runtime-1", "instance-1", 4), "environment-1", 1_000,
+      )
     }
     expectThrows<VoiceRuntimeDurableStateCorruptionException> { repository.actions(1_000) }
     assertEquals("not-json", storage.values["voice_runtime_thread_receipts"])
@@ -216,7 +228,7 @@ internal class VoiceRuntimeDurabilityTest {
   }
 
   @Test
-  fun `thread scope retains current generation receipts and only rebinds review actions`() {
+  fun `thread scope retains unacknowledged receipts through prior generations and only rebinds review actions`() {
     val storage = MemoryStore()
     val repository = VoiceRuntimeDurableJournalRepository(storage, now = { 1_000 })
     val oldInstance = VoiceRuntimeIdentity("runtime-1", "old-instance", 4)
@@ -224,6 +236,10 @@ internal class VoiceRuntimeDurabilityTest {
     val priorGeneration = VoiceRuntimeIdentity("runtime-1", "old-instance", 3)
     repository.publishReceipt(receipt(1, 2_000).copy(identity = oldInstance))
     repository.publishReceipt(receipt(2, 2_000).copy(identity = priorGeneration))
+    repository.publishReceipt(receipt(3, 2_000).copy(
+      identity = VoiceRuntimeIdentity("runtime-1", "future-instance", 5),
+    ))
+    repository.publishReceipt(receipt(4, 2_000).copy(environmentId = "other-environment"))
     val review = retainedAction(
       VoiceRuntimePresentationAction.ReviewDraft(
         "review-artifact-1",
@@ -245,12 +261,21 @@ internal class VoiceRuntimeDurabilityTest {
     listOf(review, navigate, priorConfirmation).forEach(repository::publishAction)
 
     assertEquals(
-      VoiceRuntimeRetentionScopeResult(receiptsRetired = 1, actionsRetired = 2, actionsRebound = 1),
-      repository.activateScope(newInstance, retainThreadPresentation = true, nowEpochMillis = 1_000),
+      VoiceRuntimeRetentionScopeResult(receiptsRetired = 2, actionsRetired = 2, actionsRebound = 1),
+      repository.activateScope(
+        newInstance, VoiceRuntimeRetentionScope.Thread("environment-1"), 1_000,
+      ),
     )
 
     val restarted = VoiceRuntimeDurableJournalRepository(storage, now = { 1_000 })
-    assertEquals(listOf(receipt(1, 2_000).copy(identity = oldInstance)), restarted.receipts("runtime-1", 4, 1_000))
+    assertEquals(
+      listOf(
+        receipt(2, 2_000).copy(identity = priorGeneration),
+        receipt(1, 2_000).copy(identity = oldInstance),
+      ).sortedBy { it.turnClientOperationId },
+      restarted.receipts(newInstance, "environment-1", 1_000)
+        .sortedBy { it.turnClientOperationId },
+    )
     val recovered = restarted.actions(1_000).single()
     assertEquals(newInstance, recovered.identity)
     assertTrue(recovered.action is VoiceRuntimePresentationAction.ReviewDraft)
@@ -262,7 +287,7 @@ internal class VoiceRuntimeDurabilityTest {
   }
 
   @Test
-  fun `realtime scope retires every presentation action and prior authority receipts`() {
+  fun `realtime scope retires stale actions but preserves prior generation receipts`() {
     val repository = VoiceRuntimeMemoryJournalRepository()
     val oldIdentity = VoiceRuntimeIdentity("runtime-1", "old-instance", 4)
     val current = VoiceRuntimeIdentity("runtime-1", "new-instance", 5)
@@ -273,10 +298,15 @@ internal class VoiceRuntimeDurabilityTest {
     ))
 
     assertEquals(
-      VoiceRuntimeRetentionScopeResult(receiptsRetired = 1, actionsRetired = 1, actionsRebound = 0),
-      repository.activateScope(current, retainThreadPresentation = false, nowEpochMillis = 1_000),
+      VoiceRuntimeRetentionScopeResult(receiptsRetired = 0, actionsRetired = 1, actionsRebound = 0),
+      repository.activateScope(
+        current, VoiceRuntimeRetentionScope.Realtime("environment-1"), 1_000,
+      ),
     )
-    assertTrue(repository.receipts("runtime-1", 5, 1_000).isEmpty())
+    assertEquals(
+      listOf(receipt(1, 2_000).copy(identity = oldIdentity)),
+      repository.receipts(current, "environment-1", 1_000),
+    )
     assertTrue(repository.actions(1_000).isEmpty())
   }
 
@@ -305,11 +335,46 @@ internal class VoiceRuntimeDurabilityTest {
     )
     assertNull(repository.activateScope(
       VoiceRuntimeIdentity("runtime-1", "instance-2", 5),
-      retainThreadPresentation = false,
-      nowEpochMillis = 1_000,
+      VoiceRuntimeRetentionScope.Realtime("environment-1"),
+      1_000,
     ))
     storage.acceptWrites = true
     assertEquals(before, repository.checkpoint())
+  }
+
+  @Test
+  fun `presentation retraction removes only the exact fenced action payload`() {
+    val storage = MemoryStore()
+    val repository = VoiceRuntimeDurableJournalRepository(storage, now = { 1_000 })
+    val identity = VoiceRuntimeIdentity("runtime-1", "instance-1", 4)
+    val original = retainedAction(
+      VoiceRuntimePresentationAction.NavigateThread(
+        "navigate", "project", "old-thread", 2_000,
+      ),
+      identity,
+    )
+    val replacement = original.copy(
+      action = VoiceRuntimePresentationAction.NavigateThread(
+        "navigate", "project", "new-thread", 3_000,
+      ),
+    )
+    repository.publishAction(original)
+    repository.publishAction(replacement)
+
+    assertEquals(
+      VoiceRuntimeRetentionRemovalResult.MISSING,
+      repository.retractAction(original),
+    )
+    assertEquals(listOf(replacement), repository.actions(1_000))
+    assertEquals(
+      VoiceRuntimeRetentionRemovalResult.MISSING,
+      repository.retractAction(original.copy(identity = identity.copy(runtimeInstanceId = "stale"))),
+    )
+    assertEquals(
+      VoiceRuntimeRetentionRemovalResult.REMOVED,
+      repository.retractAction(replacement),
+    )
+    assertTrue(repository.actions(1_000).isEmpty())
   }
 
   @Test

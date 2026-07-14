@@ -221,7 +221,7 @@ class VoiceRuntimeActiveThreadControllerTest {
   @Test
   fun rebaseContainsDurableReceiptsDraftsAndActionsAndJournalEmitsWakeCursor() {
     val drafts = VoiceRuntimeMemoryDraftRepository()
-    val retained = VoiceRuntimeMemoryJournalRepository()
+    val retained = VoiceRuntimeMemoryJournalRepository(now = { now })
     val wakes = mutableListOf<VoiceRuntimeCursor>()
     val local = VoiceRuntimeActiveThreadController(
       "runtime", "instance", { now }, { installed }, execution,
@@ -255,13 +255,15 @@ class VoiceRuntimeActiveThreadControllerTest {
         receipt.identity, receipt.modeSessionId, receipt.turnClientOperationId,
       ),
     )
-    assertTrue(retained.receipts("runtime", 1, now).isEmpty())
+    assertTrue(retained.receipts(
+      VoiceRuntimeIdentity("runtime", "instance", 1), "environment", now,
+    ).isEmpty())
   }
 
   @Test
   fun canonicalInstallCheckpointRestoresAuthorityIdentityJournalClaimsAndRetentionExactly() {
     val drafts = VoiceRuntimeMemoryDraftRepository()
-    val retained = VoiceRuntimeMemoryJournalRepository()
+    val retained = VoiceRuntimeMemoryJournalRepository(now = { now })
     val local = VoiceRuntimeActiveThreadController(
       "runtime", "instance", { now }, { installed }, execution,
       drafts = drafts, retained = retained,
@@ -311,6 +313,49 @@ class VoiceRuntimeActiveThreadControllerTest {
 
     assertTrue(controller.restoreCanonicalInstall(checkpoint, "unused-provisioning"))
     assertEquals(checkpoint, controller.checkpointCanonicalInstall())
+  }
+
+  @Test
+  fun canonicalInstallRollbackRestoresMemoryAndAuthorityWhenBothDurableRestoresFail() {
+    val draftDelegate = VoiceRuntimeMemoryDraftRepository()
+    var draftRestoreAttempted = false
+    val failingDrafts = object : VoiceRuntimeDraftRepository by draftDelegate {
+      override fun restore(checkpoint: List<VoiceRuntimeStoredDraft>): Boolean {
+        draftRestoreAttempted = true
+        return false
+      }
+    }
+    val retentionDelegate = VoiceRuntimeMemoryJournalRepository()
+    var retentionRestoreAttempted = false
+    val failingRetention = object : VoiceRuntimeJournalRepository by retentionDelegate {
+      override fun restore(checkpoint: VoiceRuntimeRetentionCheckpoint): Boolean {
+        retentionRestoreAttempted = true
+        return false
+      }
+    }
+    val local = VoiceRuntimeActiveThreadController(
+      "runtime", "instance", { now }, { installed }, execution,
+      drafts = failingDrafts, retained = failingRetention,
+    )
+    val target = target()
+    val digest = local.targetDigest(target)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    local.configureAuthority(reservation(digest), target, "generation-1")
+    local.dispatch(start())
+    val checkpoint = local.checkpointCanonicalInstall()
+    local.observeRuntime(VoiceRuntimeExecutionSnapshot(
+      runtimeId = "runtime",
+      readinessGeneration = 1,
+      mode = VoiceRuntimeExecutionMode.THREAD,
+      phase = VoiceRuntimePhase.IDLE,
+    ))
+
+    assertFalse(local.restoreCanonicalInstall(checkpoint, "failed-provisioning"))
+    assertTrue(draftRestoreAttempted)
+    assertTrue(retentionRestoreAttempted)
+    assertEquals(checkpoint.snapshot, local.snapshot())
+    local.refreshAuthority(reservation(digest))
+    assertEquals(checkpoint.identity, local.snapshot().identity)
   }
 
   @Test
@@ -450,6 +495,7 @@ class VoiceRuntimeActiveThreadControllerTest {
       currentIdentity.copy(generation = 2), "live-mode",
     )))
     val live = realtimeSummary(currentIdentity, "live-mode")
+    repository.publishTerminal(live)
     assertTrue(local.publishRealtimeTerminal(live))
     val events = local.deliver(lease, cursorBeforeTerminal) as VoiceRuntimeDelivery.Events
     assertEquals(1, events.events.size)
@@ -463,6 +509,215 @@ class VoiceRuntimeActiveThreadControllerTest {
     assertEquals("stopped", summaryBody["outcome"])
     assertEquals("user-stop", summaryBody["reason"])
     assertFalse(eventBody.toString().contains("control-token"))
+  }
+
+  @Test
+  fun sameGenerationRealtimeTerminalSurvivesNullStateOrderingAndProjectsIntoEventReadsOnce() {
+    val realtimeTarget = VoiceRuntimeTarget.Realtime("environment", "conversation")
+    val identity = VoiceRuntimeIdentity("runtime", "instance", 1)
+    val repository = VoiceRuntimeMemoryRealtimeCheckpointRepository()
+    val local = VoiceRuntimeActiveThreadController(
+      "runtime", "instance", { now }, { installed }, execution,
+      realtimeTerminals = repository::terminals,
+      realtimeTerminalAcknowledgement = repository::acknowledgeTerminal,
+    )
+    val digest = local.targetDigest(realtimeTarget)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    local.configureRealtimeAuthority(reservation(digest), realtimeTarget, "realtime")
+    local.observeRealtime(VoiceRuntimeRealtimeCheckpoint(
+      VoiceRuntimeRealtimeFence(identity, "mode"),
+      realtimeTarget,
+      "start",
+      VoiceRealtimePhase.CONNECTED,
+      "session",
+      1,
+      VoiceRuntimeRealtimeControlGrant("control", 5_000, 15, 30),
+    ))
+    val lease = local.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
+    val beforeTerminal = local.snapshot().cursor()
+    local.observeRealtime(null)
+    val terminal = realtimeSummary(identity, "mode")
+    repository.publishTerminal(terminal)
+
+    val delivery = local.deliver(lease, beforeTerminal) as VoiceRuntimeDelivery.Events
+    assertEquals(terminal, delivery.events.single { it.kind == "realtime-terminal" }.realtimeTerminalSummary)
+    assertTrue(local.publishRealtimeTerminal(terminal))
+    val beforeUpdate = local.snapshot().cursor()
+    val updatedTerminal = terminal.copy(serverCleanupPending = true, expiresAtEpochMillis = 20_000)
+    repository.publishTerminal(updatedTerminal)
+    assertTrue(local.publishRealtimeTerminal(updatedTerminal))
+    val updatedDelivery = local.deliver(lease, beforeUpdate) as VoiceRuntimeDelivery.Events
+    assertEquals(
+      updatedTerminal,
+      updatedDelivery.events.single { it.kind == "realtime-terminal" }.realtimeTerminalSummary,
+    )
+    val afterProjection = local.deliver(lease, local.snapshot().cursor()) as VoiceRuntimeDelivery.Events
+    assertTrue(afterProjection.events.isEmpty())
+
+    local.acknowledgeRetainedRecord(
+      identity,
+      VoiceRuntimeRetainedRecordKey.RealtimeTerminal(identity, "mode"),
+    )
+    assertTrue(repository.terminals(now).isEmpty())
+    val replayAfterAcknowledgement =
+      local.deliver(lease, beforeTerminal) as VoiceRuntimeDelivery.Events
+    assertTrue(replayAfterAcknowledgement.events.none { it.realtimeTerminalSummary != null })
+  }
+
+  @Test
+  fun processRestorationRebindsPendingRealtimePresentationActionsBeforeCheckpointRecovery() {
+    val retained = VoiceRuntimeMemoryJournalRepository(now = { now })
+    val realtimeTarget = VoiceRuntimeTarget.Realtime("environment", "conversation")
+    val oldIdentity = VoiceRuntimeIdentity("runtime", "old-instance", 1)
+    val oldController = VoiceRuntimeActiveThreadController(
+      "runtime", "old-instance", { now }, { installed }, execution, retained = retained,
+    )
+    val digest = oldController.targetDigest(realtimeTarget)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    oldController.configureRealtimeAuthority(
+      VoiceRuntimeAuthorityReservation(
+        oldIdentity, "old-provision", 0, digest, "token", 1_000, 5_000,
+      ),
+      realtimeTarget,
+      "old-process",
+    )
+    oldController.observeRealtime(VoiceRuntimeRealtimeCheckpoint(
+      VoiceRuntimeRealtimeFence(oldIdentity, "mode"),
+      realtimeTarget,
+      "start",
+      VoiceRealtimePhase.CONNECTED,
+      "session",
+      1,
+      VoiceRuntimeRealtimeControlGrant("control", 5_000, 15, 30),
+    ))
+    val oldFence = VoiceRuntimeRealtimeFence(oldIdentity, "mode")
+    assertEquals(VoiceRuntimeRetentionWriteResult.INSERTED, oldController.publishRealtimePresentationAction(
+      oldFence,
+      VoiceRuntimeRealtimeAction.NavigateThread(
+        1, now, "navigate", "project", "thread", 5_000,
+      ),
+    ))
+    assertEquals(VoiceRuntimeRetentionWriteResult.INSERTED, oldController.publishRealtimePresentationAction(
+      oldFence,
+      VoiceRuntimeRealtimeAction.ConfirmationRequired(
+        2, now, "confirm", "confirmation", "tool-call", "send_message", "Send", 5_000,
+      ),
+    ))
+
+    val newIdentity = VoiceRuntimeIdentity("runtime", "new-instance", 1)
+    val restored = VoiceRuntimeActiveThreadController(
+      "runtime", "new-instance", { now }, { installed }, execution, retained = retained,
+    )
+    restored.configureRealtimeAuthority(
+      VoiceRuntimeAuthorityReservation(
+        newIdentity, "new-provision", 0, digest, "token", 1_000, 5_000,
+      ),
+      realtimeTarget,
+      "new-process",
+    )
+    assertEquals(setOf(newIdentity), retained.actions(now).map { it.identity }.toSet())
+    restored.observeRealtime(VoiceRuntimeRealtimeCheckpoint(
+      VoiceRuntimeRealtimeFence(newIdentity, "mode"),
+      realtimeTarget,
+      "start",
+      VoiceRealtimePhase.CONNECTED,
+      "session",
+      1,
+      VoiceRuntimeRealtimeControlGrant("control", 5_000, 15, 30),
+    ))
+    val lease = restored.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
+    val rebase = restored.deliver(lease, null) as VoiceRuntimeDelivery.Rebase
+    assertEquals(setOf("navigate", "confirm"), rebase.presentationActions.map { it.actionId }.toSet())
+  }
+
+  @Test
+  fun realtimePresentationRetractionCannotRemoveAReplacementOrAnotherFence() {
+    val retained = VoiceRuntimeMemoryJournalRepository(now = { now })
+    val realtimeTarget = VoiceRuntimeTarget.Realtime("environment", "conversation")
+    val identity = VoiceRuntimeIdentity("runtime", "instance", 1)
+    val local = VoiceRuntimeActiveThreadController(
+      "runtime", "instance", { now }, { installed }, execution, retained = retained,
+    )
+    val digest = local.targetDigest(realtimeTarget)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    local.configureRealtimeAuthority(reservation(digest), realtimeTarget, "realtime")
+    val fence = VoiceRuntimeRealtimeFence(identity, "mode")
+    local.observeRealtime(VoiceRuntimeRealtimeCheckpoint(
+      fence, realtimeTarget, "start", VoiceRealtimePhase.CONNECTED, "session", 1,
+      VoiceRuntimeRealtimeControlGrant("control", 5_000, 15, 30),
+    ))
+    val original = VoiceRuntimeRealtimeAction.NavigateThread(
+      1, now, "navigate", "project", "old-thread", 5_000,
+    )
+    val replacement = original.copy(threadId = "new-thread", expiresAtEpochMillis = 6_000)
+    val beforePublication = local.snapshot().cursor()
+    assertEquals(
+      VoiceRuntimeRetentionWriteResult.INSERTED,
+      local.publishRealtimePresentationAction(fence, original),
+    )
+    assertEquals(
+      VoiceRuntimeRetentionWriteResult.UPDATED,
+      local.publishRealtimePresentationAction(fence, replacement),
+    )
+
+    assertEquals(
+      VoiceRuntimeRetentionRemovalResult.MISSING,
+      local.retractRealtimePresentationAction(
+        fence.copy(identity = identity.copy(runtimeInstanceId = "stale")), replacement,
+      ),
+    )
+    assertEquals(
+      VoiceRuntimeRetentionRemovalResult.MISSING,
+      local.retractRealtimePresentationAction(fence, original),
+    )
+    assertEquals("new-thread", (
+      retained.actions(now).single().action as VoiceRuntimePresentationAction.NavigateThread
+    ).threadId)
+    assertEquals(
+      VoiceRuntimeRetentionRemovalResult.REMOVED,
+      local.retractRealtimePresentationAction(fence, replacement),
+    )
+    assertTrue(retained.actions(now).isEmpty())
+    val delivery = local.deliver(
+      local.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE),
+      beforePublication,
+    ) as VoiceRuntimeDelivery.Events
+    assertTrue(delivery.events.none { it.presentationAction != null })
+  }
+
+  @Test
+  fun priorGenerationThreadReceiptRemainsInRebaseUntilExactAcknowledgement() {
+    val retained = VoiceRuntimeMemoryJournalRepository(now = { now })
+    val local = VoiceRuntimeActiveThreadController(
+      "runtime", "instance", { now }, { installed }, execution, retained = retained,
+    )
+    val target = target()
+    val digest = local.targetDigest(target)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    local.configureAuthority(reservation(digest), target, "generation-1")
+    val oldIdentity = VoiceRuntimeIdentity("runtime", "instance", 1)
+    val receipt = VoiceRuntimeThreadReceipt(
+      oldIdentity, "old-mode", "old-client", "old-operation", "environment", "project", "thread",
+      "message", "turn", listOf("assistant"), "speech", 2, 2, 2,
+      listOf(VoiceRuntimeSpeechDisposition(2, "drained")), "completed", "completed", 1_000, 5_000,
+    )
+    assertEquals(VoiceRuntimeRetentionWriteResult.INSERTED, local.publishThreadReceipt(receipt))
+    val replacement = VoiceRuntimeAuthorityReservation(
+      VoiceRuntimeIdentity("runtime", "instance", 2),
+      "generation-2", 1, digest, "token-2", 1_000, 5_000,
+    )
+    installed = VoiceRuntimeInstalledAuthority("runtime", 2, digest, "token-2", 5_000)
+    local.configureAuthority(replacement, target, "generation-2")
+    val lease = local.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
+
+    val rebase = local.deliver(lease, null) as VoiceRuntimeDelivery.Rebase
+    assertEquals(listOf(receipt), rebase.threadReceipts)
+    assertEquals(2, rebase.threadReceipts.single().highestDrainedSegment)
+    local.acknowledgeRetainedRecord(
+      replacement.identity,
+      VoiceRuntimeRetainedRecordKey.ThreadReceipt(oldIdentity, "old-mode", "old-client"),
+    )
+    assertTrue((local.deliver(lease, null) as VoiceRuntimeDelivery.Rebase).threadReceipts.isEmpty())
   }
 
   @Test

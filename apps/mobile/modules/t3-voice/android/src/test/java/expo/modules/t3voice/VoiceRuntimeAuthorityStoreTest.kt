@@ -184,6 +184,44 @@ internal class VoiceRuntimeAuthorityStoreTest {
   }
 
   @Test
+  fun `handoff authority is discarded only for the exact prepared transition`() {
+    val storage = MemoryRuntimeStorage()
+    val cipher = AuthorityTestCipher()
+    val store = VoiceRuntimeAuthorityStore(storage, cipher, now = { 1_000 })
+    val current = authority()
+    store.prepareRefreshCredential(fence(), true)
+    store.activate(current) {}
+    val target = VoiceRuntimeTarget.Thread(
+      "environment-1", "project-2", "thread-2", "default", true,
+      2_200, null, 600_000, true, 500,
+    )
+    val prepared = current.copy(
+      generation = current.generation + 1,
+      provisioningOperationId = "handoff-action-1",
+      targetDigest = T3VoiceRuntimeTargetIdentity.digest(
+        VoiceRuntimeBridge.canonicalThreadTargetIdentity(target),
+      ),
+      target = target,
+      readinessEnabled = false,
+      token = "transition-secret-token",
+      issuedAtEpochMillis = 0,
+    )
+    store.prepareTransition(prepared)
+
+    assertFalse(store.discardPreparedTransition(prepared.copy(token = "other-token")))
+    store.activatePreparedTransition(prepared) {}
+    assertEquals(prepared, (store.load() as VoiceRuntimeAuthorityLoadResult.Available).authority)
+
+    store.clear()
+    store.prepareRefreshCredential(fence(), true)
+    store.activate(current) {}
+    store.prepareTransition(prepared)
+    assertTrue(store.discardPreparedTransition(prepared))
+    assertFalse(store.discardPreparedTransition(prepared))
+    assertEquals(current, (store.load() as VoiceRuntimeAuthorityLoadResult.Available).authority)
+  }
+
+  @Test
   fun `readiness preparation persists only encrypted raw refresh authority`() {
     val storage = MemoryRuntimeStorage()
     val store = refreshStore(storage)

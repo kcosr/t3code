@@ -73,6 +73,18 @@ internal data class VoiceRuntimeRetentionScopeResult(
   val actionsRebound: Int,
 )
 
+internal sealed interface VoiceRuntimeRetentionScope {
+  val environmentId: String
+
+  data class Thread(
+    override val environmentId: String,
+  ) : VoiceRuntimeRetentionScope
+
+  data class Realtime(
+    override val environmentId: String,
+  ) : VoiceRuntimeRetentionScope
+}
+
 internal data class VoiceRuntimeRetentionCheckpoint(
   val receipts: List<VoiceRuntimeThreadReceipt>,
   val actions: List<VoiceRuntimeRetainedPresentationAction>,
@@ -84,7 +96,15 @@ internal interface VoiceRuntimeJournalRepository {
     nowEpochMillis: Long,
   ): VoiceRuntimeRetentionAdmission
   fun publishReceipt(receipt: VoiceRuntimeThreadReceipt): VoiceRuntimeRetentionWriteResult
-  fun receipts(runtimeId: String, generation: Long, nowEpochMillis: Long): List<VoiceRuntimeThreadReceipt>
+  fun receipts(
+    identity: VoiceRuntimeIdentity,
+    environmentId: String,
+    nowEpochMillis: Long,
+  ): List<VoiceRuntimeThreadReceipt>
+  fun receipt(
+    key: VoiceRuntimeRetainedRecordKey.ThreadReceipt,
+    nowEpochMillis: Long,
+  ): VoiceRuntimeThreadReceipt?
   fun acknowledgeReceipt(key: VoiceRuntimeRetainedRecordKey.ThreadReceipt): Boolean
   fun actionAdmission(
     key: VoiceRuntimePresentationRetentionKey,
@@ -94,11 +114,14 @@ internal interface VoiceRuntimeJournalRepository {
   fun publishAction(
     action: VoiceRuntimeRetainedPresentationAction,
   ): VoiceRuntimeRetentionWriteResult
+  fun retractAction(
+    expected: VoiceRuntimeRetainedPresentationAction,
+  ): VoiceRuntimeRetentionRemovalResult
   fun removeAction(key: VoiceRuntimePresentationRetentionKey): VoiceRuntimeRetentionRemovalResult
   fun actions(nowEpochMillis: Long): List<VoiceRuntimeRetainedPresentationAction>
   fun activateScope(
     identity: VoiceRuntimeIdentity,
-    retainThreadPresentation: Boolean,
+    scope: VoiceRuntimeRetentionScope,
     nowEpochMillis: Long,
   ): VoiceRuntimeRetentionScopeResult?
   fun checkpoint(): VoiceRuntimeRetentionCheckpoint?
@@ -192,8 +215,8 @@ internal class VoiceRuntimeDurableJournalRepository(
 
   @Synchronized
   override fun receipts(
-    runtimeId: String,
-    generation: Long,
+    identity: VoiceRuntimeIdentity,
+    environmentId: String,
     nowEpochMillis: Long,
   ): List<VoiceRuntimeThreadReceipt> {
     val current = receiptValues()
@@ -201,7 +224,24 @@ internal class VoiceRuntimeDurableJournalRepository(
     if (live.size != current.size) {
       write(KEY_RECEIPTS, JSONArray().also { array -> live.forEach { array.put(receiptJson(it)) } })
     }
-    return live.filter { it.identity.runtimeId == runtimeId && it.identity.generation == generation }
+    return live.filter {
+      it.identity.runtimeId == identity.runtimeId &&
+        it.identity.generation <= identity.generation &&
+        it.environmentId == environmentId
+    }
+  }
+
+  @Synchronized
+  override fun receipt(
+    key: VoiceRuntimeRetainedRecordKey.ThreadReceipt,
+    nowEpochMillis: Long,
+  ): VoiceRuntimeThreadReceipt? {
+    val current = receiptValues()
+    val live = current.filter { it.expiresAtEpochMillis > nowEpochMillis }
+    if (live.size != current.size) {
+      write(KEY_RECEIPTS, JSONArray().also { array -> live.forEach { array.put(receiptJson(it)) } })
+    }
+    return live.firstOrNull { it.matches(key) }
   }
 
   @Synchronized
@@ -253,6 +293,19 @@ internal class VoiceRuntimeDurableJournalRepository(
   }.getOrDefault(VoiceRuntimeRetentionWriteResult.UNAVAILABLE)
 
   @Synchronized
+  override fun retractAction(
+    expected: VoiceRuntimeRetainedPresentationAction,
+  ): VoiceRuntimeRetentionRemovalResult = runCatching {
+    val current = actionValues()
+    val installed = current.firstOrNull { it.key == expected.key }
+      ?: return@runCatching VoiceRuntimeRetentionRemovalResult.MISSING
+    if (installed != expected) return@runCatching VoiceRuntimeRetentionRemovalResult.MISSING
+    val values = current.filterNot { it.key == expected.key }
+    write(KEY_ACTIONS, JSONArray().also { array -> values.forEach { array.put(actionJson(it)) } })
+    VoiceRuntimeRetentionRemovalResult.REMOVED
+  }.getOrDefault(VoiceRuntimeRetentionRemovalResult.UNAVAILABLE)
+
+  @Synchronized
   override fun removeAction(
     key: VoiceRuntimePresentationRetentionKey,
   ): VoiceRuntimeRetentionRemovalResult = runCatching {
@@ -276,28 +329,23 @@ internal class VoiceRuntimeDurableJournalRepository(
   @Synchronized
   override fun activateScope(
     identity: VoiceRuntimeIdentity,
-    retainThreadPresentation: Boolean,
+    scope: VoiceRuntimeRetentionScope,
     nowEpochMillis: Long,
   ): VoiceRuntimeRetentionScopeResult? = runCatching {
     val currentReceipts = receiptValues().filter { it.expiresAtEpochMillis > nowEpochMillis }
     val receipts = currentReceipts.filter {
-      it.identity.runtimeId == identity.runtimeId && it.identity.generation == identity.generation
+      it.identity.runtimeId == identity.runtimeId &&
+        it.identity.generation <= identity.generation &&
+        it.environmentId == scope.environmentId
     }
     val currentActions = actionValues().filter { it.action.expiresAtEpochMillis > nowEpochMillis }
-    var rebound = 0
-    val actions = currentActions.mapNotNull { retained ->
-      val sameAuthority = retained.identity.runtimeId == identity.runtimeId &&
-        retained.identity.generation == identity.generation
-      val retain = sameAuthority && retainThreadPresentation &&
-        retained.action is VoiceRuntimePresentationAction.ReviewDraft
-      if (!retain) return@mapNotNull null
-      if (retained.identity == identity) retained else retained.rebind(identity).also { rebound += 1 }
-    }
+    val scopedActions = scopeActions(currentActions, identity, scope)
+    val actions = scopedActions.actions
     writeAll(receipts, actions)
     VoiceRuntimeRetentionScopeResult(
       receiptsRetired = currentReceipts.size - receipts.size,
       actionsRetired = currentActions.size - actions.size,
-      actionsRebound = rebound,
+      actionsRebound = scopedActions.rebound,
     )
   }.getOrNull()
 
@@ -566,11 +614,22 @@ internal class VoiceRuntimeMemoryJournalRepository(
     return if (existing) VoiceRuntimeRetentionWriteResult.UPDATED
     else VoiceRuntimeRetentionWriteResult.INSERTED
   }
-  override fun receipts(runtimeId: String, generation: Long, nowEpochMillis: Long) =
+  override fun receipts(
+    identity: VoiceRuntimeIdentity,
+    environmentId: String,
+    nowEpochMillis: Long,
+  ) =
     receiptValues.values.filter {
-      it.identity.runtimeId == runtimeId && it.identity.generation == generation &&
-        it.expiresAtEpochMillis > nowEpochMillis
+      it.identity.runtimeId == identity.runtimeId &&
+        it.identity.generation <= identity.generation &&
+        it.environmentId == environmentId && it.expiresAtEpochMillis > nowEpochMillis
     }
+  override fun receipt(
+    key: VoiceRuntimeRetainedRecordKey.ThreadReceipt,
+    nowEpochMillis: Long,
+  ) = receiptValues.values.firstOrNull { it.expiresAtEpochMillis > nowEpochMillis &&
+    it.identity == key.identity && it.modeSessionId == key.modeSessionId &&
+    it.turnClientOperationId == key.turnClientOperationId }
   override fun acknowledgeReceipt(key: VoiceRuntimeRetainedRecordKey.ThreadReceipt): Boolean =
     receiptValues.entries.removeAll { it.value.identity == key.identity &&
       it.value.modeSessionId == key.modeSessionId &&
@@ -598,6 +657,13 @@ internal class VoiceRuntimeMemoryJournalRepository(
     return if (existing) VoiceRuntimeRetentionWriteResult.UPDATED
     else VoiceRuntimeRetentionWriteResult.INSERTED
   }
+  override fun retractAction(
+    expected: VoiceRuntimeRetainedPresentationAction,
+  ): VoiceRuntimeRetentionRemovalResult {
+    if (actionValues[expected.key] != expected) return VoiceRuntimeRetentionRemovalResult.MISSING
+    actionValues.remove(expected.key)
+    return VoiceRuntimeRetentionRemovalResult.REMOVED
+  }
   override fun removeAction(key: VoiceRuntimePresentationRetentionKey) =
     if (actionValues.remove(key) != null) VoiceRuntimeRetentionRemovalResult.REMOVED
     else VoiceRuntimeRetentionRemovalResult.MISSING
@@ -605,31 +671,30 @@ internal class VoiceRuntimeMemoryJournalRepository(
     actionValues.values.filter { it.action.expiresAtEpochMillis > nowEpochMillis }
   override fun activateScope(
     identity: VoiceRuntimeIdentity,
-    retainThreadPresentation: Boolean,
+    scope: VoiceRuntimeRetentionScope,
     nowEpochMillis: Long,
   ): VoiceRuntimeRetentionScopeResult {
-    val receiptBefore = receiptValues.size
-    receiptValues.entries.removeAll {
-      it.value.expiresAtEpochMillis <= nowEpochMillis ||
-        it.value.identity.runtimeId != identity.runtimeId ||
-        it.value.identity.generation != identity.generation
+    val currentReceipts = receiptValues.values.filter { it.expiresAtEpochMillis > nowEpochMillis }
+    val receipts = currentReceipts.filter {
+      it.identity.runtimeId == identity.runtimeId &&
+        it.identity.generation <= identity.generation &&
+        it.environmentId == scope.environmentId
     }
-    val actionBefore = actionValues.size
-    var rebound = 0
-    val retainedActions = actionValues.values.mapNotNull { retained ->
-      val keep = retained.action.expiresAtEpochMillis > nowEpochMillis &&
-        retained.identity.runtimeId == identity.runtimeId &&
-        retained.identity.generation == identity.generation && retainThreadPresentation &&
-        retained.action is VoiceRuntimePresentationAction.ReviewDraft
-      if (!keep) null else if (retained.identity == identity) retained
-      else retained.rebind(identity).also { rebound += 1 }
+    val currentActions = actionValues.values.filter { it.action.expiresAtEpochMillis > nowEpochMillis }
+    val scopedActions = scopeActions(currentActions, identity, scope)
+    receiptValues.clear()
+    receipts.forEach { receipt ->
+      receiptValues[
+        "${receipt.identity.runtimeId}:${receipt.identity.runtimeInstanceId}:" +
+          "${receipt.identity.generation}:${receipt.modeSessionId}:${receipt.turnClientOperationId}"
+      ] = receipt
     }
     actionValues.clear()
-    retainedActions.forEach { actionValues[it.key] = it }
+    scopedActions.actions.forEach { actionValues[it.key] = it }
     return VoiceRuntimeRetentionScopeResult(
-      receiptBefore - receiptValues.size,
-      actionBefore - actionValues.size,
-      rebound,
+      currentReceipts.size - receipts.size,
+      currentActions.size - scopedActions.actions.size,
+      scopedActions.rebound,
     )
   }
   override fun checkpoint() = VoiceRuntimeRetentionCheckpoint(
@@ -672,4 +737,43 @@ private fun VoiceRuntimeRetainedPresentationAction.rebind(
     else -> value
   }
   return copy(identity = identity, action = reboundAction)
+}
+
+private data class VoiceRuntimeScopedActions(
+  val actions: List<VoiceRuntimeRetainedPresentationAction>,
+  val rebound: Int,
+)
+
+private fun scopeActions(
+  current: List<VoiceRuntimeRetainedPresentationAction>,
+  identity: VoiceRuntimeIdentity,
+  scope: VoiceRuntimeRetentionScope,
+): VoiceRuntimeScopedActions {
+  var rebound = 0
+  val retainedByKey = linkedMapOf<
+    VoiceRuntimePresentationRetentionKey,
+    VoiceRuntimeRetainedPresentationAction
+  >()
+  current.forEach { retained ->
+    val sameGeneration = retained.identity.runtimeId == identity.runtimeId &&
+      retained.identity.generation == identity.generation
+    val keep = sameGeneration && when (scope) {
+      is VoiceRuntimeRetentionScope.Thread ->
+        retained.action is VoiceRuntimePresentationAction.ReviewDraft
+      is VoiceRuntimeRetentionScope.Realtime ->
+        retained.action is VoiceRuntimePresentationAction.NavigateThread ||
+          retained.action is VoiceRuntimePresentationAction.RealtimeConfirmationRequired
+    }
+    if (!keep) return@forEach
+    val reboundAction = if (retained.identity == identity) retained else {
+      rebound += 1
+      retained.rebind(identity)
+    }
+    val existing = retainedByKey[reboundAction.key]
+    require(existing == null || existing == reboundAction) {
+      "Conflicting voice presentation actions cannot be rebound to one runtime fence."
+    }
+    retainedByKey[reboundAction.key] = reboundAction
+  }
+  return VoiceRuntimeScopedActions(retainedByKey.values.toList(), rebound)
 }
