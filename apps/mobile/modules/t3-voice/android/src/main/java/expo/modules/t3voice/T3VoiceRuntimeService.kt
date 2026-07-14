@@ -1176,8 +1176,11 @@ class T3VoiceRuntimeService : Service() {
   private lateinit var voiceRuntimeRealtimeRepository: VoiceRuntimeRealtimeCheckpointRepository
   private var voiceRuntimeRealtimeEngine: VoiceRuntimeRealtimeEngine? = null
   private val voiceRuntimeRealtimeServer = VoiceRuntimeRealtimeHttpGateway()
-  private val voiceRuntimeRealtimeHeartbeatIo: ExecutorService = Executors.newSingleThreadExecutor()
-  private val voiceRuntimeRealtimeActionIo: ExecutorService = Executors.newSingleThreadExecutor()
+  private val voiceRuntimeRealtimeHeartbeatIo: ExecutorService = Executors.newCachedThreadPool()
+  private val voiceRuntimeRealtimeActionIo: ExecutorService = Executors.newCachedThreadPool()
+  private val voiceRuntimeRealtimeOfferIo: ExecutorService = Executors.newCachedThreadPool()
+  private val voiceRuntimeRealtimeStartIo: ExecutorService = Executors.newCachedThreadPool()
+  private val voiceRuntimeRealtimeCleanupIo: ExecutorService = Executors.newCachedThreadPool()
   private val voiceRuntimeRealtimeControlIo: ExecutorService = Executors.newSingleThreadExecutor()
   private var voiceRuntimeRealtimeHeartbeatTask: Runnable? = null
   private var voiceRuntimeRealtimeActionTask: Runnable? = null
@@ -1317,61 +1320,64 @@ class T3VoiceRuntimeService : Service() {
         },
         onTerminated = terminated@{ sessionId, outcome, code, retryable, diagnosticGeneration ->
           if (serviceDestroyed) return@terminated
-          synchronized(operationLock) {
-            val canonical = voiceRuntimeRealtimeEngine?.snapshot()?.takeIf {
-              it.fence.modeSessionId == sessionId
-            }
-            if (canonical != null) {
-              T3VoiceStateStore.terminateRealtime(
-                T3VoiceRuntimeEvent.RealtimeTerminated(
-                  nativeSessionId = sessionId,
-                  outcome = outcome,
-                  code = code,
-                  retryable = retryable,
-                ),
-              )
-              canonical.serverSessionId?.let { serverSessionId ->
-                val engine = voiceRuntimeRealtimeEngine
-                voiceRuntimeRealtimeControlIo.submit {
-                  runCatching {
-                    engine?.onPeerTerminated(canonical.fence, serverSessionId, code)
+          mainHandler.post {
+            if (serviceDestroyed) return@post
+            synchronized(operationLock) {
+              val canonical = voiceRuntimeRealtimeEngine?.snapshot()?.takeIf {
+                it.fence.modeSessionId == sessionId
+              }
+              if (canonical != null) {
+                T3VoiceStateStore.terminateRealtime(
+                  T3VoiceRuntimeEvent.RealtimeTerminated(
+                    nativeSessionId = sessionId,
+                    outcome = outcome,
+                    code = code,
+                    retryable = retryable,
+                  ),
+                )
+                canonical.serverSessionId?.let { serverSessionId ->
+                  val engine = voiceRuntimeRealtimeEngine
+                  voiceRuntimeRealtimeControlIo.submit {
+                    runCatching {
+                      engine?.onPeerTerminated(canonical.fence, serverSessionId, code)
+                    }
                   }
                 }
+                updateRuntimeControlSurfacesLocked()
+                return@synchronized
               }
-              updateRuntimeControlSurfacesLocked()
-              return@synchronized
-            }
-            cancelRealtimeReadyCueLocked(sessionId)
-            val terminated =
-              T3VoiceStateStore.terminateRealtime(
-                T3VoiceRuntimeEvent.RealtimeTerminated(
-                  nativeSessionId = sessionId,
-                  outcome = outcome,
-                  code = code,
-                  retryable = retryable,
-                ),
-              )
-            if (terminated) {
-              if (!awaitingHandoffAction) {
-                runtimeRealtimeAttempt?.takeIf {
-                  it.serverSession?.state?.sessionId == sessionId
-                }?.let {
-                  abandonRuntimeRealtimeLocked(it, closeServer = true)
+              cancelRealtimeReadyCueLocked(sessionId)
+              val terminated =
+                T3VoiceStateStore.terminateRealtime(
+                  T3VoiceRuntimeEvent.RealtimeTerminated(
+                    nativeSessionId = sessionId,
+                    outcome = outcome,
+                    code = code,
+                    retryable = retryable,
+                  ),
+                )
+              if (terminated) {
+                if (!awaitingHandoffAction) {
+                  runtimeRealtimeAttempt?.takeIf {
+                    it.serverSession?.state?.sessionId == sessionId
+                  }?.let {
+                    abandonRuntimeRealtimeLocked(it, closeServer = true)
+                  }
                 }
-              }
-              runtimeControlHeartbeat.stop()
-              if (!handoffInProgress && !awaitingHandoffAction) {
-                if (outcome == "ended" && cueSettings.enabled) {
-                  beginRealtimeEndedCueLocked(sessionId)
-                } else {
-                  stopRuntimeForegroundLocked()
+                runtimeControlHeartbeat.stop()
+                if (!handoffInProgress && !awaitingHandoffAction) {
+                  if (outcome == "ended" && cueSettings.enabled) {
+                    beginRealtimeEndedCueLocked(sessionId)
+                  } else {
+                    stopRuntimeForegroundLocked()
+                  }
                 }
+                T3VoiceDiagnostics.record(
+                  diagnosticGeneration,
+                  T3VoiceDiagnosticCategory.LIFECYCLE,
+                  T3VoiceDiagnosticCode.FOREGROUND_RELEASED,
+                )
               }
-              T3VoiceDiagnostics.record(
-                diagnosticGeneration,
-                T3VoiceDiagnosticCategory.LIFECYCLE,
-                T3VoiceDiagnosticCode.FOREGROUND_RELEASED,
-              )
             }
           }
         },
@@ -2111,6 +2117,9 @@ class T3VoiceRuntimeService : Service() {
     runtimeThreadCancellationIo.shutdownNow()
     voiceRuntimeRealtimeHeartbeatIo.shutdownNow()
     voiceRuntimeRealtimeActionIo.shutdownNow()
+    voiceRuntimeRealtimeOfferIo.shutdownNow()
+    voiceRuntimeRealtimeStartIo.shutdownNow()
+    voiceRuntimeRealtimeCleanupIo.shutdownNow()
     voiceRuntimeRealtimeControlIo.shutdownNow()
     releaseWakeLockLocked()
     releaseMediaSessionLocked()
@@ -4264,17 +4273,35 @@ class T3VoiceRuntimeService : Service() {
         }
         if (Thread.holdsLock(operationLock)) deliver() else mainHandler.post(deliver)
       },
+      remoteDispatcher = VoiceRuntimeRealtimeRemoteDispatcher { block ->
+        runCatching {
+          voiceRuntimeRealtimeCleanupIo.submit {
+            if (!serviceDestroyed) block()
+          }
+        }
+      },
     )
     voiceRuntimeRealtimeEngine = engine
-    val recovered = runCatching { engine.recoverInterrupted(identity) }.getOrElse {
-      voiceRuntimeAuthorityStore.clear()
-      VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
-      voiceRuntimeRealtimeEngine = null
-      return
-    }
-    if (recovered == null) engine.snapshot()?.let {
-      voiceRuntimeController.observeRealtime(it)
-      scheduleVoiceRuntimeRealtimeTasksLocked(engine, it)
+    voiceRuntimeRealtimeCleanupIo.submit {
+      val recovery = runCatching { engine.recoverInterrupted(identity) }
+      mainHandler.post {
+        if (serviceDestroyed) return@post
+        synchronized(operationLock) {
+          if (voiceRuntimeRealtimeEngine !== engine) return@synchronized
+          if (recovery.isFailure) {
+            voiceRuntimeAuthorityStore.clear()
+            VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
+            voiceRuntimeRealtimeEngine = null
+            return@synchronized
+          }
+          if (recovery.getOrNull() != null) return@synchronized
+          engine.snapshot()?.let {
+            voiceRuntimeController.observeRealtime(it)
+            scheduleVoiceRuntimeRealtimeTasksLocked(engine, it)
+          }
+          updateRuntimeControlSurfacesLocked()
+        }
+      }
     }
   }
 
@@ -4291,8 +4318,13 @@ class T3VoiceRuntimeService : Service() {
         diagnosticGeneration,
         readinessConfig.audioRouteId,
         object : T3VoiceWebRtcResultCallback<String> {
-          override fun onSuccess(result: String) = onOffer(result)
-          override fun onFailure(code: String, message: String, cause: Throwable?) = onFailure(code)
+          override fun onSuccess(result: String) {
+            dispatchVoiceRuntimeRealtimeOffer { onOffer(result) }
+          }
+
+          override fun onFailure(code: String, message: String, cause: Throwable?) {
+            dispatchVoiceRuntimeRealtimeOffer { onFailure(code) }
+          }
         },
       )
       keepServiceStarted(ACTION_START_REALTIME, modeSessionId)
@@ -4308,7 +4340,9 @@ class T3VoiceRuntimeService : Service() {
         sdp,
         object : T3VoiceWebRtcResultCallback<Unit> {
           override fun onSuccess(result: Unit) = Unit
-          override fun onFailure(code: String, message: String, cause: Throwable?) = onFailure(code)
+          override fun onFailure(code: String, message: String, cause: Throwable?) {
+            dispatchVoiceRuntimeRealtimeOffer { onFailure(code) }
+          }
         },
       )
     }.isSuccess
@@ -4329,12 +4363,21 @@ class T3VoiceRuntimeService : Service() {
     }
   }
 
+  private fun dispatchVoiceRuntimeRealtimeOffer(block: () -> Unit) {
+    if (serviceDestroyed) return
+    runCatching {
+      voiceRuntimeRealtimeOfferIo.submit {
+        if (!serviceDestroyed) block()
+      }
+    }
+  }
+
   private fun realtimeCuePort(): VoiceRuntimeRealtimeCues = object : VoiceRuntimeRealtimeCues {
     override fun ready(generation: Long, onComplete: () -> Unit): Boolean {
       if (!cueSettings.enabled) return false
       val cueGeneration = ++nextCueGeneration
       return cueCoordinator.requestReady(cueGeneration) {
-        mainHandler.post { if (!serviceDestroyed) onComplete() }
+        dispatchVoiceRuntimeRealtimeControl(onComplete)
       }
     }
 
@@ -4342,7 +4385,16 @@ class T3VoiceRuntimeService : Service() {
       if (!cueSettings.enabled) return false
       val cueGeneration = ++nextCueGeneration
       return cueCoordinator.requestEnded(cueGeneration) {
-        mainHandler.post { if (!serviceDestroyed) onComplete() }
+        dispatchVoiceRuntimeRealtimeControl(onComplete)
+      }
+    }
+  }
+
+  private fun dispatchVoiceRuntimeRealtimeControl(block: () -> Unit) {
+    if (serviceDestroyed) return
+    runCatching {
+      voiceRuntimeRealtimeControlIo.submit {
+        if (!serviceDestroyed) block()
       }
     }
   }
@@ -4474,7 +4526,10 @@ class T3VoiceRuntimeService : Service() {
         VoiceRealtimePhase.FAILED,
         VoiceRealtimePhase.CANCELLED,
       )) return
-    if (voiceRuntimeRealtimeHeartbeatTask == null) {
+    if (
+      checkpoint.phase in setOf(VoiceRealtimePhase.CONNECTED, VoiceRealtimePhase.RETRYING) &&
+        voiceRuntimeRealtimeHeartbeatTask == null
+    ) {
       val interval = checkpoint.controlGrant?.heartbeatIntervalSeconds?.times(1_000L) ?: 15_000L
       lateinit var task: Runnable
       task = Runnable {
@@ -4482,6 +4537,7 @@ class T3VoiceRuntimeService : Service() {
           runCatching { engine.heartbeat(checkpoint.fence) }
           mainHandler.post {
             synchronized(operationLock) {
+              if (voiceRuntimeRealtimeHeartbeatTask !== task) return@synchronized
               if (voiceRuntimeRealtimeEngine === engine && engine.snapshot() != null) {
                 mainHandler.postDelayed(task, interval)
               } else voiceRuntimeRealtimeHeartbeatTask = null
@@ -4492,13 +4548,17 @@ class T3VoiceRuntimeService : Service() {
       voiceRuntimeRealtimeHeartbeatTask = task
       mainHandler.postDelayed(task, interval)
     }
-    if (voiceRuntimeRealtimeActionTask == null) {
+    if (
+      checkpoint.phase == VoiceRealtimePhase.CONNECTED &&
+        voiceRuntimeRealtimeActionTask == null
+    ) {
       lateinit var task: Runnable
       task = Runnable {
         voiceRuntimeRealtimeActionIo.submit {
           runCatching { engine.pollActions(checkpoint.fence) }
           mainHandler.post {
             synchronized(operationLock) {
+              if (voiceRuntimeRealtimeActionTask !== task) return@synchronized
               if (voiceRuntimeRealtimeEngine === engine && engine.snapshot() != null) {
                 mainHandler.postDelayed(task, 100)
               } else voiceRuntimeRealtimeActionTask = null
@@ -4511,10 +4571,15 @@ class T3VoiceRuntimeService : Service() {
     }
     val deadline = checkpoint.drainDeadlineAtEpochMillis
     if (deadline != null && voiceRuntimeRealtimeDrainTask == null) {
-      val task = Runnable {
-        synchronized(operationLock) {
+      lateinit var task: Runnable
+      task = Runnable {
+        val shouldRun = synchronized(operationLock) {
+          if (voiceRuntimeRealtimeDrainTask !== task) return@synchronized false
           voiceRuntimeRealtimeDrainTask = null
-          if (voiceRuntimeRealtimeEngine === engine) {
+          voiceRuntimeRealtimeEngine === engine
+        }
+        if (shouldRun) {
+          dispatchVoiceRuntimeRealtimeControl {
             runCatching { engine.onDrainDeadline(checkpoint.fence) }
           }
         }
@@ -4714,7 +4779,7 @@ class T3VoiceRuntimeService : Service() {
       ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
         ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
     )
-    voiceRuntimeRealtimeControlIo.submit {
+    voiceRuntimeRealtimeStartIo.submit {
       runCatching {
         engine.start(
           "notification-start-${UUID.randomUUID()}",

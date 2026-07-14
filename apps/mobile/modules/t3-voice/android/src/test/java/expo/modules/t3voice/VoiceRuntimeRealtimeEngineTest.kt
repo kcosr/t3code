@@ -1,5 +1,8 @@
 package expo.modules.t3voice
 
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -51,6 +54,225 @@ internal class VoiceRuntimeRealtimeEngineTest {
     assertTrue(peer.inputReady)
     assertEquals(VoiceRealtimePhase.CONNECTED, engine.snapshot()?.phase)
     assertEquals(now, engine.snapshot()?.lastConnectedAtEpochMillis)
+  }
+
+  @Test
+  fun `blocked action poll does not delay offer or snapshot`() {
+    val engine = engine()
+    assertTrue(engine.start("start-1", fence) is VoiceRuntimeRealtimeCommandResult.Accepted)
+    server.blockActions()
+    val pollResult = AtomicReference<Boolean>()
+    val pollThread = Thread { pollResult.set(engine.pollActions(fence)) }
+    pollThread.start()
+    assertTrue(server.awaitActions())
+
+    val offerThread = Thread { peer.deliverOffer("offer") }
+    offerThread.start()
+    offerThread.join(1_000)
+
+    assertFalse("Offer processing waited for the action long poll.", offerThread.isAlive)
+    assertEquals(VoiceRealtimePhase.NEGOTIATING, engine.snapshot()?.phase)
+    assertTrue(trace.contains("server-offer"))
+    server.releaseActions()
+    pollThread.join(1_000)
+    assertFalse(pollThread.isAlive)
+    assertTrue(pollResult.get())
+  }
+
+  @Test
+  fun `stop cancels preparing session while server start is blocked`() {
+    val engine = engine()
+    server.blockStart()
+    val startResult = AtomicReference<VoiceRuntimeRealtimeCommandResult>()
+    val startThread = Thread { startResult.set(engine.start("start-1", fence)) }
+    startThread.start()
+    assertTrue(server.awaitStart())
+    assertEquals(VoiceRealtimePhase.PREPARING, engine.snapshot()?.phase)
+
+    assertEquals(
+      VoiceRuntimeRealtimeCommandResult.Accepted(false),
+      engine.stop("stop-preparing", fence, VoiceRuntimeRealtimeStopPolicy.IMMEDIATE),
+    )
+    assertNull(engine.snapshot())
+
+    server.releaseStart()
+    startThread.join(1_000)
+    assertFalse(startThread.isAlive)
+    assertEquals(
+      VoiceRuntimeRealtimeCommandResult.Rejected("start-cancelled"),
+      startResult.get(),
+    )
+    assertTrue(trace.contains("server-close"))
+  }
+
+  @Test
+  fun `same command retry adopts one in-flight server start without closing it`() {
+    val engine = engine()
+    server.blockStart()
+    val firstResult = AtomicReference<VoiceRuntimeRealtimeCommandResult>()
+    val firstThread = Thread { firstResult.set(engine.start("start-1", fence)) }
+    firstThread.start()
+    assertTrue(server.awaitStart())
+
+    assertEquals(
+      VoiceRuntimeRealtimeCommandResult.Accepted(adopted = true),
+      engine.start("start-1", fence),
+    )
+    server.releaseStart()
+    firstThread.join(1_000)
+
+    assertFalse(firstThread.isAlive)
+    assertEquals(VoiceRuntimeRealtimeCommandResult.Accepted(false), firstResult.get())
+    assertEquals(1, server.startCount)
+    assertFalse(trace.contains("server-close"))
+  }
+
+  @Test
+  fun `failed late close after preparing cancellation remains durable`() {
+    val engine = engine()
+    server.closeSucceeds = false
+    server.blockStart()
+    val startThread = Thread { engine.start("start-1", fence) }
+    startThread.start()
+    assertTrue(server.awaitStart())
+    engine.stop("stop-preparing", fence, VoiceRuntimeRealtimeStopPolicy.IMMEDIATE)
+
+    server.releaseStart()
+    startThread.join(1_000)
+    assertFalse(startThread.isAlive)
+    val terminal = repository.terminals(now).single()
+    assertTrue(terminal.serverCleanupPending)
+    assertEquals("session-1", terminal.sessionId)
+  }
+
+  @Test
+  fun `failed late close is republished after cancellation terminal acknowledgement`() {
+    val engine = engine()
+    server.closeSucceeds = false
+    server.blockStart()
+    val startThread = Thread { engine.start("start-1", fence) }
+    startThread.start()
+    assertTrue(server.awaitStart())
+    engine.stop("stop-preparing", fence, VoiceRuntimeRealtimeStopPolicy.IMMEDIATE)
+    assertTrue(repository.acknowledgeTerminal(
+      VoiceRuntimeRetainedRecordKey.RealtimeTerminal(identity, fence.modeSessionId),
+    ))
+
+    server.releaseStart()
+    startThread.join(1_000)
+
+    assertFalse(startThread.isAlive)
+    val terminal = repository.terminals(now).single()
+    assertTrue(terminal.serverCleanupPending)
+    assertEquals("session-1", terminal.sessionId)
+    assertEquals(2, projectedTerminals.size)
+  }
+
+  @Test
+  fun `same command retry after preparing cancellation does not start another session`() {
+    val engine = engine()
+    server.blockStart()
+    val startThread = Thread { engine.start("start-1", fence) }
+    startThread.start()
+    assertTrue(server.awaitStart())
+    engine.stop("stop-preparing", fence, VoiceRuntimeRealtimeStopPolicy.IMMEDIATE)
+
+    assertEquals(
+      VoiceRuntimeRealtimeCommandResult.Rejected("start-cancelled"),
+      engine.start("start-1", fence),
+    )
+    server.releaseStart()
+    startThread.join(1_000)
+
+    assertFalse(startThread.isAlive)
+    assertEquals(1, server.startCount)
+  }
+
+  @Test
+  fun `invalid successful start response is closed`() {
+    val engine = engine()
+    server.startResponse = startResult().copy(
+      state = startResult().state.copy(conversationId = "wrong-conversation"),
+    )
+
+    assertEquals(
+      VoiceRuntimeRealtimeCommandResult.Rejected("invalid-start-response"),
+      engine.start("start-1", fence),
+    )
+
+    assertTrue(trace.contains("server-close"))
+    assertNull(engine.snapshot())
+  }
+
+  @Test
+  fun `heartbeat cannot bypass signaling or ready cue`() {
+    val engine = engine()
+    assertTrue(engine.start("start-1", fence) is VoiceRuntimeRealtimeCommandResult.Accepted)
+    server.heartbeatResult = VoiceRuntimeRealtimeRemoteResult.Failure("network", true)
+    assertFalse(engine.heartbeat(fence))
+    assertEquals(VoiceRealtimePhase.NEGOTIATING, engine.snapshot()?.phase)
+
+    peer.deliverOffer("offer")
+    engine.onPeerConnected(fence, "session-1")
+    assertFalse(engine.heartbeat(fence))
+    assertEquals(VoiceRealtimePhase.CUEING, engine.snapshot()?.phase)
+    cues.completeReady()
+    assertEquals(VoiceRealtimePhase.CONNECTED, engine.snapshot()?.phase)
+  }
+
+  @Test
+  fun `stop completes while action poll is blocked and discards its late response`() {
+    val engine = connectedEngine()
+    server.actionValues += VoiceRuntimeRealtimeAction.NavigateThread(
+      7,
+      now,
+      "late-action",
+      "project-1",
+      "thread-1",
+      now + 60_000,
+    )
+    server.blockActions()
+    val pollResult = AtomicReference<Boolean>()
+    val pollThread = Thread { pollResult.set(engine.pollActions(fence)) }
+    pollThread.start()
+    assertTrue(server.awaitActions())
+
+    assertEquals(
+      VoiceRuntimeRealtimeCommandResult.Accepted(false),
+      engine.stop("stop-while-polling", fence, VoiceRuntimeRealtimeStopPolicy.IMMEDIATE),
+    )
+    cues.completeEnded()
+    assertNull(engine.snapshot())
+
+    server.releaseActions()
+    pollThread.join(1_000)
+    assertFalse(pollThread.isAlive)
+    assertFalse(pollResult.get())
+    assertTrue(presentation.isEmpty())
+  }
+
+  @Test
+  fun `shutdown cleanup does not hold engine monitor while server close is blocked`() {
+    val engine = connectedEngine()
+    server.blockClose()
+    assertEquals(
+      VoiceRuntimeRealtimeCommandResult.Accepted(false),
+      engine.stop("stop-1", fence, VoiceRuntimeRealtimeStopPolicy.IMMEDIATE),
+    )
+    val finishThread = Thread { cues.completeEnded() }
+    finishThread.start()
+    assertTrue(server.awaitClose())
+
+    assertEquals(VoiceRealtimePhase.STOPPING, engine.snapshot()?.phase)
+    assertEquals(
+      VoiceRuntimeRealtimeCommandResult.Accepted(false),
+      engine.stop("stop-2", fence, VoiceRuntimeRealtimeStopPolicy.IMMEDIATE),
+    )
+
+    server.releaseClose()
+    finishThread.join(1_000)
+    assertFalse(finishThread.isAlive)
+    assertNull(engine.snapshot())
   }
 
   @Test
@@ -415,23 +637,72 @@ internal class VoiceRuntimeRealtimeEngineTest {
     var startCount = 0
     var actionsCount = 0
     var commitSucceeds = true
+    var closeSucceeds = true
+    var startResponse = startResult()
     val actionValues = mutableListOf<VoiceRuntimeRealtimeAction>()
     var heartbeatResult: VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeHeartbeatResult> =
       VoiceRuntimeRealtimeRemoteResult.Success(heartbeat("live"))
+    private var actionsEntered = CountDownLatch(0)
+    private var actionsRelease = CountDownLatch(0)
+    private var startEntered = CountDownLatch(0)
+    private var startRelease = CountDownLatch(0)
+    private var closeEntered = CountDownLatch(0)
+    private var closeRelease = CountDownLatch(0)
+
+    fun blockStart() {
+      startEntered = CountDownLatch(1)
+      startRelease = CountDownLatch(1)
+    }
+
+    fun awaitStart(): Boolean = startEntered.await(1, TimeUnit.SECONDS)
+
+    fun releaseStart() = startRelease.countDown()
+
+    fun blockClose() {
+      closeEntered = CountDownLatch(1)
+      closeRelease = CountDownLatch(1)
+    }
+
+    fun awaitClose(): Boolean = closeEntered.await(1, TimeUnit.SECONDS)
+
+    fun releaseClose() = closeRelease.countDown()
+
+    fun blockActions() {
+      actionsEntered = CountDownLatch(1)
+      actionsRelease = CountDownLatch(1)
+    }
+
+    fun awaitActions(): Boolean = actionsEntered.await(1, TimeUnit.SECONDS)
+
+    fun releaseActions() = actionsRelease.countDown()
 
     fun reset() {
       startCount = 0
       actionsCount = 0
       actionValues.clear()
       commitSucceeds = true
+      closeSucceeds = true
+      startResponse = startResult()
       heartbeatResult = VoiceRuntimeRealtimeRemoteResult.Success(heartbeat("live"))
+      actionsEntered = CountDownLatch(0)
+      actionsRelease = CountDownLatch(0)
+      startEntered = CountDownLatch(0)
+      startRelease = CountDownLatch(0)
+      closeEntered = CountDownLatch(0)
+      closeRelease = CountDownLatch(0)
     }
 
-    override fun start(authority: VoiceRuntimeRealtimeAuthority, fence: VoiceRuntimeRealtimeFence, clientOperationId: String) =
-      VoiceRuntimeRealtimeRemoteResult.Success(startResult()).also {
-        startCount++
-        trace += "server-start"
-      }
+    override fun start(
+      authority: VoiceRuntimeRealtimeAuthority,
+      fence: VoiceRuntimeRealtimeFence,
+      clientOperationId: String,
+    ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeStartResult> {
+      startEntered.countDown()
+      check(startRelease.await(2, TimeUnit.SECONDS)) { "Timed out waiting to release start." }
+      startCount++
+      trace += "server-start"
+      return VoiceRuntimeRealtimeRemoteResult.Success(startResponse)
+    }
 
     override fun offer(
       authority: VoiceRuntimeRealtimeAuthority,
@@ -455,12 +726,17 @@ internal class VoiceRuntimeRealtimeEngineTest {
       session: VoiceRuntimeRealtimeStartResult,
       afterSequence: Long,
       waitMilliseconds: Long,
-    ) = VoiceRuntimeRealtimeRemoteResult.Success(
-      VoiceRuntimeRealtimeActionsResult(
-        session.state,
-        actionValues.filter { it.sequence > afterSequence },
-      ),
-    ).also { actionsCount++ }
+    ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeActionsResult> {
+      actionsEntered.countDown()
+      check(actionsRelease.await(2, TimeUnit.SECONDS)) { "Timed out waiting to release actions." }
+      actionsCount++
+      return VoiceRuntimeRealtimeRemoteResult.Success(
+        VoiceRuntimeRealtimeActionsResult(
+          session.state,
+          actionValues.filter { it.sequence > afterSequence },
+        ),
+      )
+    }
 
     override fun acknowledgeAction(
       authority: VoiceRuntimeRealtimeAuthority,
@@ -548,9 +824,16 @@ internal class VoiceRuntimeRealtimeEngineTest {
       fence: VoiceRuntimeRealtimeFence,
       session: VoiceRuntimeRealtimeStartResult,
       clientOperationId: String,
-    ) = VoiceRuntimeRealtimeRemoteResult.Success(
-      VoiceRuntimeRealtimeCloseResult(session.state.copy(phase = "ended"), true, false),
-    ).also { trace += "server-close" }
+    ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeCloseResult> {
+      closeEntered.countDown()
+      check(closeRelease.await(2, TimeUnit.SECONDS)) { "Timed out waiting to release close." }
+      trace += "server-close"
+      return if (closeSucceeds) {
+        VoiceRuntimeRealtimeRemoteResult.Success(
+          VoiceRuntimeRealtimeCloseResult(session.state.copy(phase = "ended"), true, false),
+        )
+      } else VoiceRuntimeRealtimeRemoteResult.Failure("close-failed", true)
+    }
   }
 
   private inner class FakePeer : VoiceRuntimeRealtimePeer {

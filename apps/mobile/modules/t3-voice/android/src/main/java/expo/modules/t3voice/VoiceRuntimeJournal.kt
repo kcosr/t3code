@@ -78,16 +78,24 @@ internal class VoiceRuntimeIdempotencyLedger<T>(private val capacity: Int) {
 
   private val outcomes = linkedMapOf<String, VoiceRuntimeStoredOutcome<T>>()
 
-  fun resolve(id: String, fingerprint: String, create: () -> T): Pair<T, Boolean> {
+  fun replay(id: String, fingerprint: String): T? {
+    val existing = outcomes[id] ?: return null
+    if (existing.fingerprint != fingerprint) throw VoiceRuntimeIdempotencyConflictException()
+    return existing.value
+  }
+
+  fun record(id: String, fingerprint: String, value: T) {
     val existing = outcomes[id]
-    if (existing != null) {
-      if (existing.fingerprint != fingerprint) throw VoiceRuntimeIdempotencyConflictException()
-      return existing.value to true
+    if (existing != null && existing.fingerprint != fingerprint) {
+      throw VoiceRuntimeIdempotencyConflictException()
     }
-    return create().also {
-      outcomes[id] = VoiceRuntimeStoredOutcome(fingerprint, it)
-      while (outcomes.size > capacity) outcomes.remove(outcomes.keys.first())
-    } to false
+    outcomes[id] = VoiceRuntimeStoredOutcome(fingerprint, value)
+    while (outcomes.size > capacity) outcomes.remove(outcomes.keys.first())
+  }
+
+  fun resolve(id: String, fingerprint: String, create: () -> T): Pair<T, Boolean> {
+    replay(id, fingerprint)?.let { return it to true }
+    return create().also { record(id, fingerprint, it) } to false
   }
 
   fun forget(id: String) {
