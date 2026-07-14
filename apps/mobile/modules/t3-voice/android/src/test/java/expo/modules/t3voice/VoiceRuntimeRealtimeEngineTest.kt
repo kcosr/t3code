@@ -264,6 +264,12 @@ internal class VoiceRuntimeRealtimeEngineTest {
     assertTrue(server.awaitClose())
 
     assertEquals(VoiceRealtimePhase.STOPPING, engine.snapshot()?.phase)
+    val terminationThread = Thread {
+      engine.onPeerTerminated(fence, "session-1", "peer-closed")
+    }
+    terminationThread.start()
+    terminationThread.join(1_000)
+    assertFalse("Intentional peer termination launched another close.", terminationThread.isAlive)
     assertEquals(
       VoiceRuntimeRealtimeCommandResult.Accepted(false),
       engine.stop("stop-2", fence, VoiceRuntimeRealtimeStopPolicy.IMMEDIATE),
@@ -273,6 +279,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
     finishThread.join(1_000)
     assertFalse(finishThread.isAlive)
     assertNull(engine.snapshot())
+    assertEquals(1, server.closeCount)
   }
 
   @Test
@@ -635,6 +642,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
 
   private inner class FakeServer : VoiceRuntimeRealtimeServer {
     var startCount = 0
+    var closeCount = 0
     var actionsCount = 0
     var commitSucceeds = true
     var closeSucceeds = true
@@ -678,6 +686,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
 
     fun reset() {
       startCount = 0
+      closeCount = 0
       actionsCount = 0
       actionValues.clear()
       commitSucceeds = true
@@ -825,6 +834,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
       session: VoiceRuntimeRealtimeStartResult,
       clientOperationId: String,
     ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeCloseResult> {
+      closeCount++
       closeEntered.countDown()
       check(closeRelease.await(2, TimeUnit.SECONDS)) { "Timed out waiting to release close." }
       trace += "server-close"

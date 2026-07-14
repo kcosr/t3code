@@ -427,7 +427,8 @@ internal class VoiceRuntimeRealtimeEngine(
     sessionId: String,
     failureCode: String,
   ) {
-    if (runCatching { requireActive(fence, sessionId) }.isFailure) return
+    val current = runCatching { requireActive(fence, sessionId) }.getOrNull() ?: return
+    if (current.phase in SHUTDOWN_PHASES) return
     fail(failureCode)
   }
 
@@ -912,7 +913,7 @@ internal class VoiceRuntimeRealtimeEngine(
 
   private fun fail(code: String) {
     val current = checkpoint ?: return
-    if (current.phase == VoiceRealtimePhase.FAILED) return
+    if (current.phase in SHUTDOWN_PHASES) return
     peer.setInputReady(current.fence.modeSessionId, false)
     peer.close(current.fence.modeSessionId)
     val session = restoredSession(current)

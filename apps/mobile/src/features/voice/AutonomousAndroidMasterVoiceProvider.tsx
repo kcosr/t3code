@@ -436,15 +436,31 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
       kind: "update-realtime-focus",
       modeSessionId: runtimeSnapshot.operation.modeSessionId,
       focus,
-    }).catch(() => {
-      if (focusDispatchRef.current === key) focusDispatchRef.current = null;
-      if (presentationWaitScopeRef.current === lifecycle && !lifecycle.disposed) {
-        setCommandState({
-          pendingLabel: null,
-          error: "Voice thread focus could not be updated.",
-        });
-      }
-    });
+    }).then(
+      () => {
+        if (
+          focusDispatchRef.current === key &&
+          presentationWaitScopeRef.current === lifecycle &&
+          !lifecycle.disposed
+        ) {
+          setCommandState((current) =>
+            current.error === "Voice thread focus could not be updated."
+              ? { ...current, error: null }
+              : current,
+          );
+        }
+      },
+      () => {
+        if (focusDispatchRef.current !== key) return;
+        focusDispatchRef.current = null;
+        if (presentationWaitScopeRef.current === lifecycle && !lifecycle.disposed) {
+          setCommandState({
+            pendingLabel: null,
+            error: "Voice thread focus could not be updated.",
+          });
+        }
+      },
+    );
   }, [dispatch, props.focus, runtimeSnapshot]);
 
   const stop = useCallback(async (): Promise<void> => {
