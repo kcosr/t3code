@@ -101,6 +101,13 @@ const withServer = (run: (baseUrl: string) => Promise<void>) => {
         },
         replayed: false,
       }),
+    commitHandoff: (_token, _sessionId, actionId, input) =>
+      Effect.succeed({
+        actionId,
+        actionSequence: input.actionSequence,
+        committed: true as const,
+        replayed: false,
+      }),
     close: () =>
       Effect.succeed({ state: { ...state, phase: "ended" }, closed: true, replayed: false }),
   });
@@ -127,6 +134,7 @@ const post = (baseUrl: string, path: string, body: unknown, runtime = false) =>
     method: "POST",
     headers: {
       "content-type": "application/json",
+      "x-t3-voice-runtime-protocol-major": "1",
       [runtime ? "x-t3-voice-runtime" : "x-t3-voice-control"]: runtime
         ? "runtime-token"
         : "control-token",
@@ -173,7 +181,12 @@ describe("Realtime runtime HTTP", () => {
           afterSequence: "0",
           waitMilliseconds: "0",
         })}`,
-        { headers: { "x-t3-voice-control": "control-token" } },
+        {
+          headers: {
+            "x-t3-voice-control": "control-token",
+            "x-t3-voice-runtime-protocol-major": "1",
+          },
+        },
       );
       expect(actions.status).toBe(200);
       const acknowledged = await post(
@@ -183,6 +196,7 @@ describe("Realtime runtime HTTP", () => {
           ...fence,
           clientOperationId: "ack-http",
           actionSequence: 1,
+          action: "navigate-thread",
           outcome: "succeeded",
         },
       );
@@ -194,6 +208,7 @@ describe("Realtime runtime HTTP", () => {
           headers: {
             "content-type": "application/json",
             "x-t3-voice-control": "control-token",
+            "x-t3-voice-runtime-protocol-major": "1",
           },
           body: JSON.stringify({ ...fence, clientOperationId: "focus-http", focus: null }),
         },
@@ -220,11 +235,44 @@ describe("Realtime runtime HTTP", () => {
         },
       );
       expect(handoff.status).toBe(200);
+      const committed = await fetch(
+        `${baseUrl}/api/voice/runtime/realtime-sessions/${sessionId}/handoffs/handoff-http/commit`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-t3-voice-transition": "transition-token",
+            "x-t3-voice-runtime-protocol-major": "1",
+          },
+          body: JSON.stringify({
+            ...fence,
+            actionSequence: 2,
+            nextGeneration: 3,
+            threadModeSessionId: VoiceModeSessionId.make("thread-mode-http"),
+          }),
+        },
+      );
+      expect(committed.status).toBe(200);
+      expect(await committed.json()).toMatchObject({ committed: true, replayed: false });
       const close = await post(baseUrl, `/api/voice/runtime/realtime-sessions/${sessionId}/close`, {
         ...fence,
         clientOperationId: "close-http",
       });
       expect(close.status).toBe(200);
+
+      const incompatible = await fetch(
+        `${baseUrl}/api/voice/runtime/realtime-sessions/${sessionId}/actions?${new URLSearchParams({
+          ...Object.fromEntries(Object.entries(fence).map(([key, value]) => [key, String(value)])),
+          afterSequence: "0",
+          waitMilliseconds: "0",
+        })}`,
+        { headers: { "x-t3-voice-control": "control-token" } },
+      );
+      expect(incompatible.status).toBe(426);
+      expect(await incompatible.json()).toEqual({
+        code: "voice_runtime_protocol_incompatible",
+        requiredMajor: 1,
+      });
 
       for (const legacy of [
         "/api/voice/native/realtime-sessions",

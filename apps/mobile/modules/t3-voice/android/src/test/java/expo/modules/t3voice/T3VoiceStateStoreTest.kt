@@ -408,11 +408,11 @@ class T3VoiceStateStoreTest {
     assertEquals(event, T3VoiceStateStore.pendingThreadVoiceHandoff())
     assertEquals(
       terminal,
-      T3VoiceStateStore.pendingNativeHandoffRecordingTermination(event.recordingId),
+      T3VoiceStateStore.pendingRealtimeHandoffRecordingTermination(event.recordingId),
     )
     assertTrue(T3VoiceStateStore.beginThreadVoiceHandoffAdoption(event.actionId, 10_000))
     assertEquals(terminal, T3VoiceStateStore.recordingTermination.value)
-    assertNull(T3VoiceStateStore.pendingNativeHandoffRecordingTermination(event.recordingId))
+    assertNull(T3VoiceStateStore.pendingRealtimeHandoffRecordingTermination(event.recordingId))
   }
 
   @Test
@@ -455,7 +455,7 @@ class T3VoiceStateStoreTest {
     assertEquals(composerTerminal, T3VoiceStateStore.recordingTermination.value)
     assertEquals(
       handoffTerminal,
-      T3VoiceStateStore.pendingNativeHandoffRecordingTermination(event.recordingId),
+      T3VoiceStateStore.pendingRealtimeHandoffRecordingTermination(event.recordingId),
     )
     assertFalse(T3VoiceStateStore.isThreadVoiceHandoffAdoptionClaimed(event.actionId, 9_000))
   }
@@ -489,7 +489,7 @@ class T3VoiceStateStoreTest {
     val replacement = first.copy(actionId = "second-action", recordingId = "second-recording")
 
     assertEquals(terminal, T3VoiceStateStore.publishThreadVoiceHandoff(replacement))
-    assertNull(T3VoiceStateStore.pendingNativeHandoffRecordingTermination(first.recordingId))
+    assertNull(T3VoiceStateStore.pendingRealtimeHandoffRecordingTermination(first.recordingId))
     assertEquals(replacement, T3VoiceStateStore.threadVoiceHandoff.value)
   }
 
@@ -527,7 +527,7 @@ class T3VoiceStateStoreTest {
     T3VoiceStateStore.clearThreadVoiceHandoff(event.actionId)
 
     assertNull(T3VoiceStateStore.threadVoiceHandoff.value)
-    assertNull(T3VoiceStateStore.pendingNativeHandoffRecordingTermination(event.recordingId))
+    assertNull(T3VoiceStateStore.pendingRealtimeHandoffRecordingTermination(event.recordingId))
   }
 
   private fun claimComposerRecording(recordingId: String): T3VoiceOperationOwner? =

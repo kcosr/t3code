@@ -3,6 +3,8 @@ package expo.modules.t3voice
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.Semaphore
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -209,6 +211,42 @@ class T3VoicePcmPlayerTest {
     assertEquals(listOf(true), firstOutput.releaseFlushes)
     assertEquals(1, secondOutput.releaseCount)
     assertEquals(listOf(false), secondOutput.releaseFlushes)
+    player.release()
+  }
+
+  @Test
+  fun rawPcmProducerBackpressuresAndCancellationReleasesIt() {
+    val output = BlockingWriteOutput()
+    val player = T3VoicePcmPlayer(
+      onChunkConsumed = { _, _ -> },
+      onFinished = {},
+      onError = { _, _ -> },
+      outputFactory = T3VoicePcmOutputFactory { _, _ -> output },
+      clock = ImmediatePlaybackClock,
+      limits = T3VoicePcmLimits(
+        maximumQueuedBytes = 2,
+        maximumQueuedChunks = 1,
+      ),
+    )
+    player.start("stream", 24_000, 1)
+    player.enqueuePcmBlocking("stream", 0, byteArrayOf(0, 0))
+    assertTrue(output.writeEntered.await(2, TimeUnit.SECONDS))
+    player.enqueuePcmBlocking("stream", 1, byteArrayOf(0, 0))
+    val producerFailure = AtomicReference<Throwable?>()
+    val producer = thread(start = true) {
+      runCatching {
+        player.enqueuePcmBlocking("stream", 2, byteArrayOf(0, 0))
+      }.onFailure(producerFailure::set)
+    }
+    Thread.sleep(50)
+    assertTrue("producer should wait for bounded queue capacity", producer.isAlive)
+
+    player.cancel("stream")
+    producer.join(2_000)
+    assertFalse(producer.isAlive)
+    assertTrue(producerFailure.get() is IllegalStateException)
+    output.allowWriteToComplete.countDown()
+    assertTrue(output.writeExited.await(2, TimeUnit.SECONDS))
     player.release()
   }
 

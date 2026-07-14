@@ -27,6 +27,7 @@ describe("desktop local connection identity", () => {
   it("does not classify the primary environment as desktop-local", () => {
     const target = new PrimaryConnectionTarget({
       environmentId: EnvironmentId.make("environment-primary"),
+      voiceRuntimeProtocolMajor: 1,
       httpBaseUrl: "http://127.0.0.1:3773",
       label: "This device",
       wsBaseUrl: "ws://127.0.0.1:3773",

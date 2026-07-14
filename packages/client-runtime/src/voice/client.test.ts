@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import { vi } from "vitest";
 import {
   EnvironmentId,
   ProjectId,
@@ -7,13 +8,15 @@ import {
   VoiceConfirmationId,
   VoiceConversationId,
   VoiceMediaTicketId,
-  VoiceNativeRuntimeId,
+  VoiceRuntimeId,
+  VoiceRuntimeGrantProvisionInput,
   VoicePlaybackId,
   VoiceRequestId,
   VoiceRuntimeProvisioningOperationId,
   VoiceSessionId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import {
@@ -31,7 +34,9 @@ const PLAYBACK_ID = VoicePlaybackId.make("playback-1");
 const SESSION_ID = VoiceSessionId.make("voice-session-1");
 const CONFIRMATION_ID = VoiceConfirmationId.make("confirmation-1");
 const CLIENT_ACTION_ID = VoiceClientActionId.make("client-action-1");
-const NATIVE_RUNTIME_ID = VoiceNativeRuntimeId.make("native-runtime-1");
+const RUNTIME_ID = VoiceRuntimeId.make("runtime-1");
+const TARGET_DIGEST = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const REFRESH_CREDENTIAL_HASH = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const PROVISIONING_OPERATION_ID = VoiceRuntimeProvisioningOperationId.make(
   "provision-android-main-3",
 );
@@ -52,18 +57,24 @@ const threadGrantTarget = (autoRearm: boolean) => ({
   speechEnabled: true,
   rearmGuardMs: 500,
 });
+const decodeGrantProvisionBody = Schema.decodeUnknownSync(
+  Schema.fromJsonString(VoiceRuntimeGrantProvisionInput),
+);
 
 const preparedConnection = (
   httpAuthorization: PreparedHttpAuthorization | null,
+  voiceRuntimeProtocolMajor = 1,
 ): PreparedConnection => ({
   environmentId: ENVIRONMENT_ID,
   label: "Voice test",
+  voiceRuntimeProtocolMajor,
   httpBaseUrl: "https://environment.example.test/base-path",
   socketUrl: "wss://environment.example.test/ws",
   httpAuthorization,
   target: new PrimaryConnectionTarget({
     environmentId: ENVIRONMENT_ID,
     label: "Voice test",
+    voiceRuntimeProtocolMajor: 1,
     httpBaseUrl: "https://environment.example.test",
     wsBaseUrl: "wss://environment.example.test",
   }),
@@ -86,25 +97,42 @@ const jsonResponse = (value: unknown): Response =>
   });
 
 describe("makeVoiceHttpClient", () => {
-  it.effect("provisions and revokes native runtime authority through the typed API", () =>
+  it("refuses an incompatible environment before issuing any voice request", () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+
+    expect(() =>
+      makeVoiceHttpClient({
+        prepared: preparedConnection(null, 2),
+        fetch,
+      }),
+    ).toThrow("Voice requires runtime protocol major 1");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.effect("provisions and revokes runtime authority through the canonical typed API", () =>
     Effect.gen(function* () {
       const requests: Array<{
         readonly url: string;
         readonly method: string;
         readonly body: BodyInit | null | undefined;
+        readonly headers: HeadersInit | undefined;
       }> = [];
       const fetch: typeof globalThis.fetch = async (resource, init) => {
         const url = String(resource);
         const method = init?.method ?? "GET";
-        requests.push({ url, method, body: init?.body });
+        requests.push({ url, method, body: init?.body, headers: init?.headers });
         return method === "DELETE"
-          ? jsonResponse({ runtimeId: NATIVE_RUNTIME_ID, revoked: true })
+          ? jsonResponse({ runtimeId: RUNTIME_ID, revoked: true })
           : jsonResponse({
               token: "narrow-runtime-token",
-              runtimeId: NATIVE_RUNTIME_ID,
+              runtimeId: RUNTIME_ID,
               generation: 3,
               provisioningOperationId: "provision-android-main-3",
+              targetDigest: TARGET_DIGEST,
               target: threadGrantTarget(true),
+              operation: "thread-turn-start",
+              readinessEnabled: true,
+              refreshRotationCounter: 0,
               issuedAt: "2026-07-10T20:00:00.000Z",
               expiresAt: "2026-08-10T20:00:00.000Z",
             });
@@ -114,31 +142,50 @@ describe("makeVoiceHttpClient", () => {
         fetch,
       });
 
-      const grant = yield* client.provisionNativeRuntimeGrant(NATIVE_RUNTIME_ID, {
+      const grant = yield* client.provisionVoiceRuntimeGrant(RUNTIME_ID, {
+        expectedCurrentGeneration: 2,
         generation: 3,
         provisioningOperationId: PROVISIONING_OPERATION_ID,
+        targetDigest: TARGET_DIGEST,
         target: threadGrantTarget(true),
+        operation: "thread-turn-start",
+        readinessEnabled: true,
+        refreshCredentialHash: REFRESH_CREDENTIAL_HASH,
       });
-      const revoked = yield* client.revokeNativeRuntimeGrant(NATIVE_RUNTIME_ID);
+      const revoked = yield* client.revokeVoiceRuntimeGrant(RUNTIME_ID);
 
       expect(grant.token).toBe("narrow-runtime-token");
-      expect(revoked).toEqual({ runtimeId: NATIVE_RUNTIME_ID, revoked: true });
+      expect(revoked).toEqual({ runtimeId: RUNTIME_ID, revoked: true });
       expect(requests.map(({ url, method }) => `${method} ${url}`)).toEqual([
-        `PUT https://environment.example.test/api/voice/native-runtimes/${NATIVE_RUNTIME_ID}/grant`,
-        `DELETE https://environment.example.test/api/voice/native-runtimes/${NATIVE_RUNTIME_ID}/grant`,
+        `PUT https://environment.example.test/api/voice/runtime/runtimes/${RUNTIME_ID}/grant`,
+        `DELETE https://environment.example.test/api/voice/runtime/runtimes/${RUNTIME_ID}/grant`,
       ]);
       const provisionBody = requests[0]?.body;
-      expect(
+      const encodedProvisionBody =
         provisionBody instanceof Uint8Array
           ? new TextDecoder().decode(provisionBody)
-          : provisionBody,
-      ).toBe(
-        '{"generation":3,"provisioningOperationId":"provision-android-main-3","target":{"mode":"thread","environmentId":"environment-voice-test","projectId":"project-1","threadId":"thread-1","speechPreset":"default","autoRearm":true,"endpointPolicy":{"endSilenceMs":2200,"noSpeechTimeoutMs":null,"maximumUtteranceMs":600000},"speechEnabled":true,"rearmGuardMs":500}}',
-      );
+          : provisionBody;
+      expect(
+        decodeGrantProvisionBody(String(encodedProvisionBody), { onExcessProperty: "error" }),
+      ).toEqual({
+        expectedCurrentGeneration: 2,
+        generation: 3,
+        provisioningOperationId: "provision-android-main-3",
+        targetDigest: TARGET_DIGEST,
+        operation: "thread-turn-start",
+        target: threadGrantTarget(true),
+        readinessEnabled: true,
+        refreshCredentialHash: REFRESH_CREDENTIAL_HASH,
+      });
+      expect(
+        requests.map(({ headers }) =>
+          new Headers(headers).get("x-t3-voice-runtime-protocol-major"),
+        ),
+      ).toEqual(["1", "1"]);
     }),
   );
 
-  it.effect("signs native runtime provisioning with the exact PUT URL", () =>
+  it.effect("signs runtime provisioning with the exact canonical PUT URL", () =>
     Effect.gen(function* () {
       const proofs: Array<{ readonly method: string; readonly url: string }> = [];
       const signer = ManagedRelayDpopSigner.of({
@@ -154,25 +201,34 @@ describe("makeVoiceHttpClient", () => {
         fetch: async () =>
           jsonResponse({
             token: "narrow-runtime-token",
-            runtimeId: NATIVE_RUNTIME_ID,
+            runtimeId: RUNTIME_ID,
             generation: 3,
             provisioningOperationId: "provision-android-main-3",
+            targetDigest: TARGET_DIGEST,
             target: threadGrantTarget(false),
+            operation: "thread-turn-start",
+            readinessEnabled: false,
+            refreshRotationCounter: 0,
             issuedAt: "2026-07-10T20:00:00.000Z",
             expiresAt: "2026-08-10T20:00:00.000Z",
           }),
       });
 
-      yield* client.provisionNativeRuntimeGrant(NATIVE_RUNTIME_ID, {
+      yield* client.provisionVoiceRuntimeGrant(RUNTIME_ID, {
+        expectedCurrentGeneration: 2,
         generation: 3,
         provisioningOperationId: PROVISIONING_OPERATION_ID,
+        targetDigest: TARGET_DIGEST,
         target: threadGrantTarget(false),
+        operation: "thread-turn-start",
+        readinessEnabled: false,
+        refreshCredentialHash: null,
       });
 
       expect(proofs).toEqual([
         {
           method: "PUT",
-          url: `https://environment.example.test/api/voice/native-runtimes/${NATIVE_RUNTIME_ID}/grant`,
+          url: `https://environment.example.test/api/voice/runtime/runtimes/${RUNTIME_ID}/grant`,
         },
       ]);
     }),
@@ -381,7 +437,7 @@ describe("makeVoiceHttpClient", () => {
             },
             expiresAt: "2026-07-10T20:55:00.000Z",
             heartbeatIntervalSeconds: 10,
-            nativeControlGrant: {
+            runtimeControlGrant: {
               token: "native-control-token",
               sessionId: SESSION_ID,
               leaseGeneration: 1,
@@ -457,58 +513,6 @@ describe("makeVoiceHttpClient", () => {
           ? new TextDecoder().decode(clientActionBody)
           : clientActionBody,
       ).toBe('{"leaseGeneration":1,"action":"activate-thread","outcome":"succeeded"}');
-    }),
-  );
-
-  it.effect("uses the native control grant for durable handoff poll and acknowledgement", () =>
-    Effect.gen(function* () {
-      const requests: Array<{
-        readonly url: string;
-        readonly init?: RequestInit;
-      }> = [];
-      const client = makeVoiceHttpClient({
-        prepared: preparedConnection({ _tag: "Bearer", token: "main-token" }),
-        fetch: (async (url: string | URL | Request, init?: RequestInit) => {
-          requests.push({ url: String(url), ...(init === undefined ? {} : { init }) });
-          return String(url).endsWith("/ack")
-            ? jsonResponse({
-                actionId: CLIENT_ACTION_ID,
-                action: "handoff-to-thread-voice",
-                outcome: "succeeded",
-              })
-            : jsonResponse({
-                actions: [
-                  {
-                    actionId: CLIENT_ACTION_ID,
-                    sessionId: SESSION_ID,
-                    leaseGeneration: 1,
-                    projectId: PROJECT_ID,
-                    threadId: THREAD_ID,
-                    autoRearm: true,
-                    expiresAt: "2026-07-10T20:55:00.000Z",
-                  },
-                ],
-              });
-        }) as typeof fetch,
-      });
-
-      const pending = yield* client.listNativeHandoffActions("native-token");
-      const acknowledged = yield* client.acknowledgeNativeHandoffAction(
-        "native-token",
-        CLIENT_ACTION_ID,
-        { outcome: "succeeded", state: "accepted" },
-      );
-
-      expect(pending.actions).toHaveLength(1);
-      expect(acknowledged.action).toBe("handoff-to-thread-voice");
-      expect(requests.map((request) => request.init?.headers)).toEqual([
-        { "x-t3-voice-control": "native-token" },
-        {
-          "x-t3-voice-control": "native-token",
-          "content-type": "application/json",
-        },
-      ]);
-      expect(requests[1]?.init?.body).toBe('{"outcome":"succeeded","state":"accepted"}');
     }),
   );
 

@@ -21,6 +21,7 @@ const preparedConnection = (
   httpAuthorization: PreparedHttpAuthorization | null,
 ): PreparedConnection => ({
   environmentId: ENVIRONMENT_ID,
+  voiceRuntimeProtocolMajor: 1,
   label: "History test",
   httpBaseUrl: "https://environment.example.test/base-path",
   socketUrl: "wss://environment.example.test/ws",
@@ -28,6 +29,7 @@ const preparedConnection = (
   target: new PrimaryConnectionTarget({
     environmentId: ENVIRONMENT_ID,
     label: "History test",
+    voiceRuntimeProtocolMajor: 1,
     httpBaseUrl: "https://environment.example.test",
     wsBaseUrl: "wss://environment.example.test",
   }),

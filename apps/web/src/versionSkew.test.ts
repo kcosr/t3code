@@ -35,6 +35,7 @@ describe("versionSkew", () => {
             arch: "arm64",
           },
           serverVersion: "9.9.9",
+          voiceRuntimeProtocolMajor: 1,
           capabilities: {
             repositoryIdentity: true,
           },
@@ -42,6 +43,7 @@ describe("versionSkew", () => {
       }),
     ).toMatchObject({
       serverVersion: "9.9.9",
+      voiceRuntimeProtocolMajor: 1,
     });
   });
 

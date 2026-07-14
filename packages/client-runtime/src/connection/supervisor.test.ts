@@ -33,6 +33,7 @@ import * as ConnectionWakeups from "./wakeups.ts";
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
   label: "Test environment",
+  voiceRuntimeProtocolMajor: 1,
   httpBaseUrl: "https://environment.example.test",
   wsBaseUrl: "wss://environment.example.test",
 });
@@ -53,6 +54,7 @@ const RELAY_ENTRY: ConnectionCatalogEntry = {
 };
 
 const PREPARED_CONNECTION: PreparedConnection = {
+  voiceRuntimeProtocolMajor: 1,
   environmentId: TARGET.environmentId,
   label: TARGET.label,
   httpBaseUrl: TARGET.httpBaseUrl,

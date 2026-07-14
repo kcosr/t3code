@@ -2,8 +2,8 @@ import {
   VoiceTranscriptionStreamEvent,
   VoiceSpeechRequest,
   VoiceTranscriptionMetadata,
-  VoiceNativeHandoffActionListResult,
-  VoiceClientActionAckResult,
+  VOICE_RUNTIME_PROTOCOL_HEADER,
+  VOICE_RUNTIME_PROTOCOL_MAJOR,
   type ProjectId,
   type ThreadId,
   type VoiceConfirmationDecision,
@@ -12,6 +12,7 @@ import {
   type VoiceCapabilities,
   type VoiceClientActionAckInput,
   type VoiceClientActionId,
+  type VoiceClientActionAckResult,
   type VoiceConversationClearContextResult,
   type VoiceConversationClearContextInput,
   type VoiceConversationCreateInput,
@@ -25,12 +26,10 @@ import {
   type VoiceConversationUpdateInput,
   type VoiceMediaTicket,
   type VoiceMediaTicketRequest,
-  type VoiceNativeRuntimeGrant,
-  type VoiceNativeRuntimeGrantProvisionInput,
-  type VoiceNativeRuntimeGrantRevocationResult,
-  type VoiceNativeRuntimeId,
-  type VoiceNativeHandoffActionAckInput,
-  type VoiceNativeHandoffActionListResult as VoiceNativeHandoffActionListResultType,
+  type VoiceRuntimeGrant,
+  type VoiceRuntimeGrantProvisionInput,
+  type VoiceRuntimeGrantRevocationResult,
+  type VoiceRuntimeId,
   type VoiceSessionCloseResult,
   type VoiceSessionCreateInput,
   type VoiceSessionCreateResult,
@@ -63,6 +62,7 @@ import {
   buildEnvironmentAuthHeaders,
   withEnvironmentCredentials,
 } from "../state/environmentHttpAuth.ts";
+import { assertVoiceRuntimeProtocolAvailable } from "./protocol.ts";
 
 const DEFAULT_VOICE_HTTP_TIMEOUT_MS = 30_000;
 const DEFAULT_VOICE_MEDIA_TIMEOUT_MS = 5 * 60_000;
@@ -74,9 +74,6 @@ const encodeTranscriptionMetadata = Schema.encodeSync(
   Schema.fromJsonString(VoiceTranscriptionMetadata),
 );
 const encodeSpeechRequest = Schema.encodeSync(Schema.fromJsonString(VoiceSpeechRequest));
-const decodeNativeHandoffActions = Schema.decodeUnknownEffect(VoiceNativeHandoffActionListResult);
-const decodeNativeHandoffActionAck = Schema.decodeUnknownEffect(VoiceClientActionAckResult);
-const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 
 export class VoiceHttpResponseError extends Data.TaggedError("VoiceHttpResponseError")<{
   readonly method: "GET" | "POST";
@@ -128,17 +125,17 @@ export class VoiceUriUploadUnavailableError extends Data.TaggedError(
   }
 }
 
-export class VoiceNativeControlDecodeError extends Data.TaggedError(
-  "VoiceNativeControlDecodeError",
+export class VoiceRuntimeControlDecodeError extends Data.TaggedError(
+  "VoiceRuntimeControlDecodeError",
 )<{
   readonly requestUrl: string;
   readonly cause: unknown;
 }> {}
 
-export type VoiceNativeControlRequestError =
+export type VoiceRuntimeControlRequestError =
   | RemoteEnvironmentRequestError
   | VoiceHttpResponseError
-  | VoiceNativeControlDecodeError;
+  | VoiceRuntimeControlDecodeError;
 
 export type VoiceMediaStreamError =
   | RemoteEnvironmentRequestError
@@ -186,13 +183,13 @@ export interface VoiceSpeechInput {
 }
 
 export interface VoiceHttpClient {
-  readonly provisionNativeRuntimeGrant: (
-    runtimeId: VoiceNativeRuntimeId,
-    input: VoiceNativeRuntimeGrantProvisionInput,
-  ) => Effect.Effect<VoiceNativeRuntimeGrant, RemoteEnvironmentRequestError>;
-  readonly revokeNativeRuntimeGrant: (
-    runtimeId: VoiceNativeRuntimeId,
-  ) => Effect.Effect<VoiceNativeRuntimeGrantRevocationResult, RemoteEnvironmentRequestError>;
+  readonly provisionVoiceRuntimeGrant: (
+    runtimeId: VoiceRuntimeId,
+    input: VoiceRuntimeGrantProvisionInput,
+  ) => Effect.Effect<VoiceRuntimeGrant, RemoteEnvironmentRequestError>;
+  readonly revokeVoiceRuntimeGrant: (
+    runtimeId: VoiceRuntimeId,
+  ) => Effect.Effect<VoiceRuntimeGrantRevocationResult, RemoteEnvironmentRequestError>;
   readonly createSession: (
     input: VoiceSessionCreateInput,
   ) => Effect.Effect<VoiceSessionCreateResult, RemoteEnvironmentRequestError>;
@@ -231,14 +228,6 @@ export interface VoiceHttpClient {
     actionId: VoiceClientActionId,
     input: VoiceClientActionAckInput,
   ) => Effect.Effect<VoiceClientActionAckResult, RemoteEnvironmentRequestError>;
-  readonly listNativeHandoffActions: (
-    nativeControlToken: string,
-  ) => Effect.Effect<VoiceNativeHandoffActionListResultType, VoiceNativeControlRequestError>;
-  readonly acknowledgeNativeHandoffAction: (
-    nativeControlToken: string,
-    actionId: VoiceClientActionId,
-    input: VoiceNativeHandoffActionAckInput,
-  ) => Effect.Effect<VoiceClientActionAckResult, VoiceNativeControlRequestError>;
   readonly capabilities: () => Effect.Effect<VoiceCapabilities, RemoteEnvironmentRequestError>;
   readonly createConversation: (
     input: VoiceConversationCreateInput,
@@ -448,6 +437,7 @@ const decodeTranscriptionLines = <E>(lines: Stream.Stream<string, E>, requestUrl
   );
 
 export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpClient => {
+  assertVoiceRuntimeProtocolAvailable(input.prepared);
   const signer = Option.fromNullishOr(input.signer);
   const timeoutMs = input.timeoutMs ?? DEFAULT_VOICE_HTTP_TIMEOUT_MS;
   const mediaTimeoutMs = input.timeoutMs ?? DEFAULT_VOICE_MEDIA_TIMEOUT_MS;
@@ -467,82 +457,77 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
       timeoutMs,
       ...request,
     });
-  const nativeControl = <A>(request: {
-    readonly method: "GET" | "POST";
-    readonly pathname: string;
-    readonly token: string;
-    readonly body?: unknown;
-    readonly decode: (value: unknown) => Effect.Effect<A, Schema.SchemaError>;
-  }): Effect.Effect<A, VoiceNativeControlRequestError> => {
-    const requestUrl = environmentEndpointUrl(input.prepared.httpBaseUrl, request.pathname);
-    return executeEnvironmentHttpRequest(
-      requestUrl,
-      timeoutMs,
-      Effect.tryPromise({
-        try: (signal) =>
-          input.fetch(requestUrl, {
-            method: request.method,
-            headers: {
-              "x-t3-voice-control": request.token,
-              ...(request.body === undefined ? {} : { "content-type": "application/json" }),
-            },
-            ...(request.body === undefined ? {} : { body: encodeUnknownJson(request.body) }),
-            signal,
-          }),
-        catch: (cause) =>
-          new RemoteEnvironmentAuthFetchError({
-            message: `Failed to fetch native voice control endpoint ${requestUrl}.`,
-            cause,
-          }),
-      }),
-    ).pipe(
-      Effect.flatMap((response): Effect.Effect<A, VoiceNativeControlRequestError> => {
-        if (!response.ok) {
-          return Effect.fail(
-            new VoiceHttpResponseError({
-              method: request.method,
-              requestUrl,
-              status: response.status,
-            }),
-          );
-        }
-        return Effect.tryPromise({
-          try: () => response.json(),
-          catch: (cause) => new VoiceNativeControlDecodeError({ requestUrl, cause }),
-        }).pipe(
-          Effect.flatMap((value) =>
-            request
-              .decode(value)
-              .pipe(
-                Effect.mapError(
-                  (cause) => new VoiceNativeControlDecodeError({ requestUrl, cause }),
-                ),
-              ),
-          ),
-        );
-      }),
-    );
-  };
-
   return {
-    provisionNativeRuntimeGrant: (runtimeId, payload) =>
-      control({
+    provisionVoiceRuntimeGrant: (runtimeId, payload) => {
+      if (payload.operation === "realtime-start" && payload.readinessEnabled) {
+        return control({
+          method: "PUT",
+          pathname: `/api/voice/runtime/runtimes/${runtimeId}/grant`,
+          run: (client, headers) =>
+            client.voice.provisionVoiceRuntimeGrant({
+              headers: {
+                ...headers,
+                [VOICE_RUNTIME_PROTOCOL_HEADER]: String(VOICE_RUNTIME_PROTOCOL_MAJOR),
+              },
+              params: { runtimeId },
+              payload,
+            }),
+        });
+      }
+      if (payload.operation === "realtime-start" && !payload.readinessEnabled) {
+        return control({
+          method: "PUT",
+          pathname: `/api/voice/runtime/runtimes/${runtimeId}/grant`,
+          run: (client, headers) =>
+            client.voice.provisionVoiceRuntimeGrant({
+              headers: {
+                ...headers,
+                [VOICE_RUNTIME_PROTOCOL_HEADER]: String(VOICE_RUNTIME_PROTOCOL_MAJOR),
+              },
+              params: { runtimeId },
+              payload,
+            }),
+        });
+      }
+      if (payload.operation === "thread-turn-start" && payload.readinessEnabled) {
+        return control({
+          method: "PUT",
+          pathname: `/api/voice/runtime/runtimes/${runtimeId}/grant`,
+          run: (client, headers) =>
+            client.voice.provisionVoiceRuntimeGrant({
+              headers: {
+                ...headers,
+                [VOICE_RUNTIME_PROTOCOL_HEADER]: String(VOICE_RUNTIME_PROTOCOL_MAJOR),
+              },
+              params: { runtimeId },
+              payload,
+            }),
+        });
+      }
+      return control({
         method: "PUT",
-        pathname: `/api/voice/native-runtimes/${runtimeId}/grant`,
+        pathname: `/api/voice/runtime/runtimes/${runtimeId}/grant`,
         run: (client, headers) =>
-          client.voice.provisionNativeVoiceRuntimeGrant({
-            headers,
+          client.voice.provisionVoiceRuntimeGrant({
+            headers: {
+              ...headers,
+              [VOICE_RUNTIME_PROTOCOL_HEADER]: String(VOICE_RUNTIME_PROTOCOL_MAJOR),
+            },
             params: { runtimeId },
             payload,
           }),
-      }),
-    revokeNativeRuntimeGrant: (runtimeId) =>
+      });
+    },
+    revokeVoiceRuntimeGrant: (runtimeId) =>
       control({
         method: "DELETE",
-        pathname: `/api/voice/native-runtimes/${runtimeId}/grant`,
+        pathname: `/api/voice/runtime/runtimes/${runtimeId}/grant`,
         run: (client, headers) =>
-          client.voice.revokeNativeVoiceRuntimeGrant({
-            headers,
+          client.voice.revokeVoiceRuntimeGrant({
+            headers: {
+              ...headers,
+              [VOICE_RUNTIME_PROTOCOL_HEADER]: String(VOICE_RUNTIME_PROTOCOL_MAJOR),
+            },
             params: { runtimeId },
           }),
       }),
@@ -650,21 +635,6 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
                   params: { sessionId, actionId },
                   payload,
                 }),
-      }),
-    listNativeHandoffActions: (nativeControlToken) =>
-      nativeControl({
-        method: "GET",
-        pathname: "/api/voice/native/handoff-actions",
-        token: nativeControlToken,
-        decode: decodeNativeHandoffActions,
-      }),
-    acknowledgeNativeHandoffAction: (nativeControlToken, actionId, payload) =>
-      nativeControl({
-        method: "POST",
-        pathname: `/api/voice/native/handoff-actions/${actionId}/ack`,
-        token: nativeControlToken,
-        body: payload,
-        decode: decodeNativeHandoffActionAck,
       }),
     decideConfirmation: (sessionId, confirmationId, decision) =>
       control({

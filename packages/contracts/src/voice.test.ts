@@ -7,20 +7,16 @@ import {
   VoiceConversationTranscriptQuery,
   VoiceConversationUpdateInput,
   VoiceMediaTicketRequest,
-  VoiceNativeControlGrant,
-  VoiceNativeHandoffActionAckInput,
-  VoiceNativeHandoffActionListResult,
-  VoiceNativeHeartbeatInput,
-  VoiceNativeHeartbeatResult,
-  VoiceNativeRealtimeStartInput,
-  VoiceNativeRuntimeGrant,
-  VoiceNativeRuntimeGrantProvisionInput,
-  VoiceNativeRuntimeGrantRevocationResult,
-  VoiceNativeRuntimeTarget,
-  VoiceNativeThreadTurnCreateInput,
-  VoiceNativeThreadTurnEventsAckInput,
-  VoiceNativeThreadTurnEventsQuery,
-  VoiceNativeThreadTurnEvent,
+  VoiceRuntimeControlGrant,
+  VoiceRuntimeHandoffActionAckInput,
+  VoiceRuntimeHandoffActionListResult,
+  VoiceRuntimeHeartbeatInput,
+  VoiceRuntimeHeartbeatResult,
+  VoiceRuntimeRealtimeStartInput,
+  VoiceThreadTurnCreateInput,
+  VoiceThreadTurnEventsAckInput,
+  VoiceThreadTurnEventsQuery,
+  VoiceThreadTurnEvent,
   VoiceSpeechRequest,
   VoiceSessionCreateInput,
   VoiceSessionCreateResult,
@@ -38,33 +34,10 @@ const encodeSync = Schema.encodeSync;
 const decodeWebRtcOffer = decodeUnknownSync(VoiceWebRtcOffer);
 
 describe("voice contracts", () => {
-  it("strictly round-trips exact native runtime authority contracts", () => {
-    const target = {
-      mode: "realtime",
-      conversation: { type: "continue", conversationId: "voice-conversation-native" },
-      focus: { type: "none" },
-    } as const;
+  it("strictly round-trips the runtime Realtime start input", () => {
     const values = [
-      [VoiceNativeRuntimeTarget, target],
       [
-        VoiceNativeRuntimeGrantProvisionInput,
-        { generation: 3, provisioningOperationId: "provision-android-main-3", target },
-      ],
-      [
-        VoiceNativeRuntimeGrant,
-        {
-          token: "runtime-token",
-          runtimeId: "android-main",
-          generation: 3,
-          provisioningOperationId: "provision-android-main-3",
-          target,
-          issuedAt: "2026-07-13T00:00:00.000Z",
-          expiresAt: "2026-07-14T00:00:00.000Z",
-        },
-      ],
-      [VoiceNativeRuntimeGrantRevocationResult, { runtimeId: "android-main", revoked: true }],
-      [
-        VoiceNativeRealtimeStartInput,
+        VoiceRuntimeRealtimeStartInput,
         { runtimeId: "android-main", generation: 3, clientOperationId: "start-1" },
       ],
     ] as const;
@@ -75,28 +48,18 @@ describe("voice contracts", () => {
         decodeUnknownSync(schema)({ ...value, extra: true }, { onExcessProperty: "error" }),
       ).toThrow();
     }
-    expect(() =>
-      decodeUnknownSync(VoiceNativeRuntimeTarget)(
-        {
-          mode: "realtime",
-          conversation: { type: "new-durable" },
-          focus: { type: "none" },
-        },
-        { onExcessProperty: "error" },
-      ),
-    ).toThrow();
   });
 
-  it("strictly round-trips native thread turn inputs and sanitized events", () => {
+  it("strictly round-trips runtime Thread turn inputs and sanitized events", () => {
     const values = [
       [
-        VoiceNativeThreadTurnCreateInput,
+        VoiceThreadTurnCreateInput,
         { runtimeId: "android-main", generation: 3, clientOperationId: "turn-1" },
       ],
-      [VoiceNativeThreadTurnEventsQuery, { afterSequence: 2, waitMilliseconds: 10_000 }],
-      [VoiceNativeThreadTurnEventsAckInput, { acknowledgedSequence: 4 }],
+      [VoiceThreadTurnEventsQuery, { afterSequence: 2, waitMilliseconds: 10_000 }],
+      [VoiceThreadTurnEventsAckInput, { acknowledgedSequence: 4 }],
       [
-        VoiceNativeThreadTurnEvent,
+        VoiceThreadTurnEvent,
         {
           type: "speech-ready",
           sequence: 5,
@@ -485,14 +448,14 @@ describe("voice contracts", () => {
       heartbeatIntervalSeconds: 10,
       failureGraceSeconds: 30,
     };
-    expect(decodeUnknownSync(VoiceNativeControlGrant)(grant)).toEqual(grant);
+    expect(decodeUnknownSync(VoiceRuntimeControlGrant)(grant)).toEqual(grant);
     expect(() =>
-      decodeUnknownSync(VoiceNativeControlGrant)({
+      decodeUnknownSync(VoiceRuntimeControlGrant)({
         ...grant,
         token: "x".repeat(129),
       }),
     ).toThrow();
-    expect(decodeUnknownSync(VoiceNativeHeartbeatInput)({ leaseGeneration: 2 })).toEqual({
+    expect(decodeUnknownSync(VoiceRuntimeHeartbeatInput)({ leaseGeneration: 2 })).toEqual({
       leaseGeneration: 2,
     });
     const heartbeat = {
@@ -503,7 +466,7 @@ describe("voice contracts", () => {
       handoffPending: false,
       expiresAt: grant.expiresAt,
     } as const;
-    expect(decodeUnknownSync(VoiceNativeHeartbeatResult)(heartbeat)).toEqual(heartbeat);
+    expect(decodeUnknownSync(VoiceRuntimeHeartbeatResult)(heartbeat)).toEqual(heartbeat);
     const createResult = {
       state: {
         sessionId: grant.sessionId,
@@ -516,16 +479,16 @@ describe("voice contracts", () => {
       transport: { kind: "webrtc-sdp-v1", signalingPath: "/offer" },
       expiresAt: grant.expiresAt,
       heartbeatIntervalSeconds: 10,
-      nativeControlGrant: grant,
+      runtimeControlGrant: grant,
     } as const;
     expect(decodeUnknownSync(VoiceSessionCreateResult)(createResult)).toMatchObject({
-      nativeControlGrant: grant,
+      runtimeControlGrant: grant,
     });
 
     for (const [schema, value] of [
-      [VoiceNativeControlGrant, { ...grant, extra: true }],
-      [VoiceNativeHeartbeatInput, { leaseGeneration: 2, extra: true }],
-      [VoiceNativeHeartbeatResult, { ...heartbeat, extra: true }],
+      [VoiceRuntimeControlGrant, { ...grant, extra: true }],
+      [VoiceRuntimeHeartbeatInput, { leaseGeneration: 2, extra: true }],
+      [VoiceRuntimeHeartbeatResult, { ...heartbeat, extra: true }],
       [VoiceSessionCreateResult, { ...createResult, extra: true }],
     ] as const) {
       expect(() => decodeUnknownSync(schema)(value, { onExcessProperty: "error" })).toThrow();
@@ -546,15 +509,15 @@ describe("voice contracts", () => {
         },
       ],
     };
-    expect(decodeUnknownSync(VoiceNativeHandoffActionListResult)(result)).toEqual(result);
+    expect(decodeUnknownSync(VoiceRuntimeHandoffActionListResult)(result)).toEqual(result);
     expect(
-      decodeUnknownSync(VoiceNativeHandoffActionAckInput)({
+      decodeUnknownSync(VoiceRuntimeHandoffActionAckInput)({
         outcome: "succeeded",
         state: "accepted",
       }),
     ).toEqual({ outcome: "succeeded", state: "accepted" });
     expect(() =>
-      decodeUnknownSync(VoiceNativeHandoffActionAckInput)(
+      decodeUnknownSync(VoiceRuntimeHandoffActionAckInput)(
         {
           outcome: "succeeded",
           state: "accepted",

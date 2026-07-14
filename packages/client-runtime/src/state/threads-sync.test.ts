@@ -38,6 +38,7 @@ import {
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
   label: "Test environment",
+  voiceRuntimeProtocolMajor: 1,
   httpBaseUrl: "https://environment.example.test",
   wsBaseUrl: "wss://environment.example.test",
 });
@@ -45,6 +46,7 @@ const THREAD_ID = ThreadId.make("thread-1");
 const CACHED_SNAPSHOT_SEQUENCE = 7;
 const PREPARED: PreparedConnection = {
   environmentId: TARGET.environmentId,
+  voiceRuntimeProtocolMajor: 1,
   label: TARGET.label,
   httpBaseUrl: TARGET.httpBaseUrl,
   socketUrl: TARGET.wsBaseUrl,

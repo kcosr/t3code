@@ -1,4 +1,4 @@
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, VoiceRuntimeProtocolMajor } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
 const ConnectionTargetBase = {
@@ -10,6 +10,7 @@ export class PrimaryConnectionTarget extends Schema.TaggedClass<PrimaryConnectio
   "PrimaryConnectionTarget",
   {
     ...ConnectionTargetBase,
+    voiceRuntimeProtocolMajor: VoiceRuntimeProtocolMajor,
     httpBaseUrl: Schema.String,
     wsBaseUrl: Schema.String,
   },
@@ -116,6 +117,7 @@ export type PreparedHttpAuthorization =
 export interface PreparedConnection {
   readonly environmentId: EnvironmentId;
   readonly label: string;
+  readonly voiceRuntimeProtocolMajor: number;
   readonly httpBaseUrl: string;
   readonly socketUrl: string;
   readonly httpAuthorization: PreparedHttpAuthorization | null;

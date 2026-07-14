@@ -2,7 +2,6 @@ import * as Schema from "effect/Schema";
 
 import {
   CommandId,
-  EnvironmentId,
   IsoDateTime,
   MessageId,
   NonNegativeInt,
@@ -15,9 +14,8 @@ import {
   VoiceConversationEntryId,
   VoiceConversationId,
   VoiceMediaTicketId,
-  VoiceNativeRuntimeId,
-  VoiceRuntimeProvisioningOperationId,
-  VoiceNativeThreadTurnOperationId,
+  VoiceRuntimeId,
+  VoiceThreadTurnOperationId,
   VoicePlaybackId,
   VoiceRequestId,
   VoiceSessionId,
@@ -270,7 +268,7 @@ export const VoiceSessionState = Schema.Struct({
 });
 export type VoiceSessionState = typeof VoiceSessionState.Type;
 
-export const VoiceNativeControlGrant = Schema.Struct({
+export const VoiceRuntimeControlGrant = Schema.Struct({
   token: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
   sessionId: VoiceSessionId,
   leaseGeneration: PositiveInt,
@@ -278,51 +276,12 @@ export const VoiceNativeControlGrant = Schema.Struct({
   heartbeatIntervalSeconds: PositiveInt,
   failureGraceSeconds: PositiveInt,
 });
-export type VoiceNativeControlGrant = typeof VoiceNativeControlGrant.Type;
+export type VoiceRuntimeControlGrant = typeof VoiceRuntimeControlGrant.Type;
 
 export const VoiceSpeechPreset = Schema.Literals(["default", "warm"]);
 export type VoiceSpeechPreset = typeof VoiceSpeechPreset.Type;
 
-export const VoiceNativeRuntimeTarget = Schema.Union([
-  Schema.Struct({
-    mode: Schema.Literal("realtime"),
-    conversation: Schema.Struct({
-      type: Schema.Literal("continue"),
-      conversationId: VoiceConversationId,
-    }),
-    focus: Schema.Union([
-      Schema.Struct({ type: Schema.Literal("none") }),
-      Schema.Struct({ type: Schema.Literal("project"), projectId: ProjectId }),
-      Schema.Struct({
-        type: Schema.Literal("thread"),
-        projectId: ProjectId,
-        threadId: ThreadId,
-      }),
-    ]),
-  }),
-  Schema.Struct({
-    mode: Schema.Literal("thread"),
-    environmentId: EnvironmentId,
-    projectId: ProjectId,
-    threadId: ThreadId,
-    speechPreset: VoiceSpeechPreset,
-    autoRearm: Schema.Boolean,
-    endpointPolicy: Schema.Struct({
-      endSilenceMs: Schema.Int.check(Schema.isBetween({ minimum: 100, maximum: 30_000 })),
-      noSpeechTimeoutMs: Schema.NullOr(
-        Schema.Int.check(Schema.isBetween({ minimum: 100, maximum: 30 * 60_000 })),
-      ),
-      maximumUtteranceMs: Schema.Int.check(
-        Schema.isBetween({ minimum: 1_000, maximum: 60 * 60_000 }),
-      ),
-    }),
-    speechEnabled: Schema.Boolean,
-    rearmGuardMs: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 60_000 })),
-  }),
-]);
-export type VoiceNativeRuntimeTarget = typeof VoiceNativeRuntimeTarget.Type;
-
-export const VoiceNativeThreadTurnPhase = Schema.Literals([
+export const VoiceThreadTurnPhase = Schema.Literals([
   "created",
   "transcribing",
   "dispatching",
@@ -333,24 +292,24 @@ export const VoiceNativeThreadTurnPhase = Schema.Literals([
   "failed",
   "cancelled",
 ]);
-export type VoiceNativeThreadTurnPhase = typeof VoiceNativeThreadTurnPhase.Type;
+export type VoiceThreadTurnPhase = typeof VoiceThreadTurnPhase.Type;
 
-export const VoiceNativeThreadTurnCreateInput = Schema.Struct({
-  runtimeId: VoiceNativeRuntimeId,
+export const VoiceThreadTurnCreateInput = Schema.Struct({
+  runtimeId: VoiceRuntimeId,
   generation: PositiveInt,
   clientOperationId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
 });
-export type VoiceNativeThreadTurnCreateInput = typeof VoiceNativeThreadTurnCreateInput.Type;
+export type VoiceThreadTurnCreateInput = typeof VoiceThreadTurnCreateInput.Type;
 
-export const VoiceNativeThreadTurnSnapshot = Schema.Struct({
-  operationId: VoiceNativeThreadTurnOperationId,
-  runtimeId: VoiceNativeRuntimeId,
+export const VoiceThreadTurnSnapshot = Schema.Struct({
+  operationId: VoiceThreadTurnOperationId,
+  runtimeId: VoiceRuntimeId,
   generation: PositiveInt,
   projectId: ProjectId,
   threadId: ThreadId,
   speechPreset: VoiceSpeechPreset,
   autoRearm: Schema.Boolean,
-  phase: VoiceNativeThreadTurnPhase,
+  phase: VoiceThreadTurnPhase,
   messageId: Schema.NullOr(MessageId),
   turnId: Schema.NullOr(TurnId),
   lastSequence: NonNegativeInt,
@@ -359,58 +318,58 @@ export const VoiceNativeThreadTurnSnapshot = Schema.Struct({
   dispatchAccepted: Schema.Boolean,
   expiresAt: IsoDateTime,
 });
-export type VoiceNativeThreadTurnSnapshot = typeof VoiceNativeThreadTurnSnapshot.Type;
+export type VoiceThreadTurnSnapshot = typeof VoiceThreadTurnSnapshot.Type;
 
-export const VoiceNativeThreadTurnCreateResult = Schema.Struct({
-  snapshot: VoiceNativeThreadTurnSnapshot,
+export const VoiceThreadTurnCreateResult = Schema.Struct({
+  snapshot: VoiceThreadTurnSnapshot,
   operationGrant: Schema.Struct({
     token: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
     expiresAt: IsoDateTime,
   }),
 });
-export type VoiceNativeThreadTurnCreateResult = typeof VoiceNativeThreadTurnCreateResult.Type;
+export type VoiceThreadTurnCreateResult = typeof VoiceThreadTurnCreateResult.Type;
 
-export const VoiceNativeThreadTurnAudioResult = Schema.Struct({
-  snapshot: VoiceNativeThreadTurnSnapshot,
+export const VoiceThreadTurnAudioResult = Schema.Struct({
+  snapshot: VoiceThreadTurnSnapshot,
   disposition: Schema.Literals(["processing", "already-dispatched", "terminal"]),
 });
-export type VoiceNativeThreadTurnAudioResult = typeof VoiceNativeThreadTurnAudioResult.Type;
+export type VoiceThreadTurnAudioResult = typeof VoiceThreadTurnAudioResult.Type;
 
-const VoiceNativeThreadTurnEventBase = {
+const VoiceThreadTurnEventBase = {
   sequence: PositiveInt,
   occurredAt: IsoDateTime,
 };
-export const VoiceNativeThreadTurnEvent = Schema.Union([
+export const VoiceThreadTurnEvent = Schema.Union([
   Schema.Struct({
-    ...VoiceNativeThreadTurnEventBase,
+    ...VoiceThreadTurnEventBase,
     type: Schema.Literal("phase"),
-    phase: VoiceNativeThreadTurnPhase,
+    phase: VoiceThreadTurnPhase,
   }),
   Schema.Struct({
-    ...VoiceNativeThreadTurnEventBase,
+    ...VoiceThreadTurnEventBase,
     type: Schema.Literal("dispatch-correlation"),
     commandId: CommandId,
     messageId: MessageId,
     turnId: Schema.NullOr(TurnId),
   }),
   Schema.Struct({
-    ...VoiceNativeThreadTurnEventBase,
+    ...VoiceThreadTurnEventBase,
     type: Schema.Literal("speech-ready"),
     segmentIndex: NonNegativeInt,
     finalSegment: Schema.Boolean,
   }),
   Schema.Struct({
-    ...VoiceNativeThreadTurnEventBase,
+    ...VoiceThreadTurnEventBase,
     type: Schema.Literal("speech-terminal"),
     outcome: Schema.Literals(["completed", "no-speech", "failed"]),
   }),
   Schema.Struct({
-    ...VoiceNativeThreadTurnEventBase,
+    ...VoiceThreadTurnEventBase,
     type: Schema.Literal("attention-required"),
     attention: Schema.Literals(["approval", "user-input"]),
   }),
   Schema.Struct({
-    ...VoiceNativeThreadTurnEventBase,
+    ...VoiceThreadTurnEventBase,
     type: Schema.Literal("failure"),
     code: Schema.Literals([
       "audio-invalid",
@@ -424,94 +383,68 @@ export const VoiceNativeThreadTurnEvent = Schema.Union([
     retryable: Schema.Boolean,
   }),
   Schema.Struct({
-    ...VoiceNativeThreadTurnEventBase,
+    ...VoiceThreadTurnEventBase,
     type: Schema.Literal("terminal"),
     outcome: Schema.Literals(["completed", "failed", "cancelled"]),
   }),
 ]);
-export type VoiceNativeThreadTurnEvent = typeof VoiceNativeThreadTurnEvent.Type;
+export type VoiceThreadTurnEvent = typeof VoiceThreadTurnEvent.Type;
 
-export const VoiceNativeThreadTurnEventsQuery = Schema.Struct({
+export const VoiceThreadTurnEventsQuery = Schema.Struct({
   afterSequence: NonNegativeInt,
   waitMilliseconds: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 30_000 })),
 });
-export type VoiceNativeThreadTurnEventsQuery = typeof VoiceNativeThreadTurnEventsQuery.Type;
+export type VoiceThreadTurnEventsQuery = typeof VoiceThreadTurnEventsQuery.Type;
 
-export const VoiceNativeThreadTurnEventsResult = Schema.Struct({
-  snapshot: VoiceNativeThreadTurnSnapshot,
-  events: Schema.Array(VoiceNativeThreadTurnEvent).check(Schema.isMaxLength(100)),
+export const VoiceThreadTurnEventsResult = Schema.Struct({
+  snapshot: VoiceThreadTurnSnapshot,
+  events: Schema.Array(VoiceThreadTurnEvent).check(Schema.isMaxLength(100)),
 });
-export type VoiceNativeThreadTurnEventsResult = typeof VoiceNativeThreadTurnEventsResult.Type;
+export type VoiceThreadTurnEventsResult = typeof VoiceThreadTurnEventsResult.Type;
 
-export const VoiceNativeThreadTurnEventsAckInput = Schema.Struct({
+export const VoiceThreadTurnEventsAckInput = Schema.Struct({
   acknowledgedSequence: NonNegativeInt,
 });
-export type VoiceNativeThreadTurnEventsAckInput = typeof VoiceNativeThreadTurnEventsAckInput.Type;
+export type VoiceThreadTurnEventsAckInput = typeof VoiceThreadTurnEventsAckInput.Type;
 
-export const VoiceNativeThreadTurnEventsAckResult = Schema.Struct({
-  snapshot: VoiceNativeThreadTurnSnapshot,
+export const VoiceThreadTurnEventsAckResult = Schema.Struct({
+  snapshot: VoiceThreadTurnSnapshot,
 });
-export type VoiceNativeThreadTurnEventsAckResult = typeof VoiceNativeThreadTurnEventsAckResult.Type;
+export type VoiceThreadTurnEventsAckResult = typeof VoiceThreadTurnEventsAckResult.Type;
 
-export const VoiceNativeThreadTurnCancelInput = Schema.Struct({
+export const VoiceThreadTurnCancelInput = Schema.Struct({
   reason: Schema.Literal("user-request"),
 });
-export type VoiceNativeThreadTurnCancelInput = typeof VoiceNativeThreadTurnCancelInput.Type;
+export type VoiceThreadTurnCancelInput = typeof VoiceThreadTurnCancelInput.Type;
 
-export const VoiceNativeThreadTurnCancelResult = Schema.Struct({
-  snapshot: VoiceNativeThreadTurnSnapshot,
+export const VoiceThreadTurnCancelResult = Schema.Struct({
+  snapshot: VoiceThreadTurnSnapshot,
   cancelled: Schema.Boolean,
 });
-export type VoiceNativeThreadTurnCancelResult = typeof VoiceNativeThreadTurnCancelResult.Type;
+export type VoiceThreadTurnCancelResult = typeof VoiceThreadTurnCancelResult.Type;
 
-export const VoiceNativeRuntimeGrantProvisionInput = Schema.Struct({
-  generation: PositiveInt,
-  provisioningOperationId: VoiceRuntimeProvisioningOperationId,
-  target: VoiceNativeRuntimeTarget,
-});
-export type VoiceNativeRuntimeGrantProvisionInput =
-  typeof VoiceNativeRuntimeGrantProvisionInput.Type;
-
-export const VoiceNativeRuntimeGrant = Schema.Struct({
-  token: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
-  runtimeId: VoiceNativeRuntimeId,
-  generation: PositiveInt,
-  provisioningOperationId: VoiceRuntimeProvisioningOperationId,
-  target: VoiceNativeRuntimeTarget,
-  issuedAt: IsoDateTime,
-  expiresAt: IsoDateTime,
-});
-export type VoiceNativeRuntimeGrant = typeof VoiceNativeRuntimeGrant.Type;
-
-export const VoiceNativeRuntimeGrantRevocationResult = Schema.Struct({
-  runtimeId: VoiceNativeRuntimeId,
-  revoked: Schema.Boolean,
-});
-export type VoiceNativeRuntimeGrantRevocationResult =
-  typeof VoiceNativeRuntimeGrantRevocationResult.Type;
-
-export const VoiceNativeRealtimeStartInput = Schema.Struct({
-  runtimeId: VoiceNativeRuntimeId,
+export const VoiceRuntimeRealtimeStartInput = Schema.Struct({
+  runtimeId: VoiceRuntimeId,
   generation: PositiveInt,
   clientOperationId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
 });
-export type VoiceNativeRealtimeStartInput = typeof VoiceNativeRealtimeStartInput.Type;
+export type VoiceRuntimeRealtimeStartInput = typeof VoiceRuntimeRealtimeStartInput.Type;
 
 export const VoiceSessionCreateResult = Schema.Struct({
   state: VoiceSessionState,
   transport: VoiceMediaTransport,
   expiresAt: IsoDateTime,
   heartbeatIntervalSeconds: PositiveInt,
-  nativeControlGrant: VoiceNativeControlGrant,
+  runtimeControlGrant: VoiceRuntimeControlGrant,
 });
 export type VoiceSessionCreateResult = typeof VoiceSessionCreateResult.Type;
 
-export const VoiceNativeHeartbeatInput = Schema.Struct({
+export const VoiceRuntimeHeartbeatInput = Schema.Struct({
   leaseGeneration: PositiveInt,
 });
-export type VoiceNativeHeartbeatInput = typeof VoiceNativeHeartbeatInput.Type;
+export type VoiceRuntimeHeartbeatInput = typeof VoiceRuntimeHeartbeatInput.Type;
 
-export const VoiceNativeHeartbeatResult = Schema.Struct({
+export const VoiceRuntimeHeartbeatResult = Schema.Struct({
   sessionId: VoiceSessionId,
   leaseGeneration: PositiveInt,
   phase: VoiceSessionPhase,
@@ -519,7 +452,7 @@ export const VoiceNativeHeartbeatResult = Schema.Struct({
   handoffPending: Schema.Boolean,
   expiresAt: IsoDateTime,
 });
-export type VoiceNativeHeartbeatResult = typeof VoiceNativeHeartbeatResult.Type;
+export type VoiceRuntimeHeartbeatResult = typeof VoiceRuntimeHeartbeatResult.Type;
 
 export const VoiceSessionLeaseInput = Schema.Struct({
   leaseGeneration: PositiveInt,
@@ -757,7 +690,7 @@ export const VoiceClientActionAckResult = Schema.Struct({
 });
 export type VoiceClientActionAckResult = typeof VoiceClientActionAckResult.Type;
 
-export const VoiceNativeHandoffAction = Schema.Struct({
+export const VoiceRuntimeHandoffAction = Schema.Struct({
   actionId: VoiceClientActionId,
   sessionId: VoiceSessionId,
   leaseGeneration: PositiveInt,
@@ -766,14 +699,14 @@ export const VoiceNativeHandoffAction = Schema.Struct({
   autoRearm: Schema.Boolean,
   expiresAt: IsoDateTime,
 });
-export type VoiceNativeHandoffAction = typeof VoiceNativeHandoffAction.Type;
+export type VoiceRuntimeHandoffAction = typeof VoiceRuntimeHandoffAction.Type;
 
-export const VoiceNativeHandoffActionListResult = Schema.Struct({
-  actions: Schema.Array(VoiceNativeHandoffAction),
+export const VoiceRuntimeHandoffActionListResult = Schema.Struct({
+  actions: Schema.Array(VoiceRuntimeHandoffAction),
 });
-export type VoiceNativeHandoffActionListResult = typeof VoiceNativeHandoffActionListResult.Type;
+export type VoiceRuntimeHandoffActionListResult = typeof VoiceRuntimeHandoffActionListResult.Type;
 
-export const VoiceNativeHandoffActionAckInput = Schema.Union([
+export const VoiceRuntimeHandoffActionAckInput = Schema.Union([
   Schema.Struct({
     outcome: Schema.Literal("succeeded"),
     state: Schema.Literal("accepted"),
@@ -784,7 +717,7 @@ export const VoiceNativeHandoffActionAckInput = Schema.Union([
     reason: VoiceHandoffFailureReason,
   }),
 ]);
-export type VoiceNativeHandoffActionAckInput = typeof VoiceNativeHandoffActionAckInput.Type;
+export type VoiceRuntimeHandoffActionAckInput = typeof VoiceRuntimeHandoffActionAckInput.Type;
 
 export const VoiceConfirmationDecision = Schema.Literals(["approve", "reject"]);
 export type VoiceConfirmationDecision = typeof VoiceConfirmationDecision.Type;

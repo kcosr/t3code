@@ -127,8 +127,8 @@ class T3VoiceRuntimeServiceInstrumentedTest {
     firstBinder.prepareRealtimeSession(
       nativeSessionId = sessionId,
       environmentOrigin = "https://127.0.0.1",
-      nativeControlGrant =
-        T3VoiceNativeControlGrant(
+      runtimeControlGrant =
+        VoiceRuntimeControlGrant(
           token = "instrumentation-only-token",
           sessionId = sessionId,
           leaseGeneration = 1,

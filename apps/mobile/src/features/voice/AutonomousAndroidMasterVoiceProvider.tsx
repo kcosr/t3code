@@ -2,6 +2,7 @@ import {
   VoiceModeSessionId,
   type EnvironmentId,
   type VoiceConversationId,
+  type VoiceRuntimeRetainedRecordAcknowledgement,
   type VoiceRuntimeSnapshot,
 } from "@t3tools/contracts";
 import type { VoiceHttpClient, VoiceRuntimeCommandRequest } from "@t3tools/client-runtime/voice";
@@ -27,6 +28,8 @@ import { useNavigation } from "@react-navigation/native";
 import { uuidv4 } from "../../lib/uuid";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import { useThreadShells } from "../../state/entities";
+import { appAtomRegistry } from "../../state/atom-registry";
+import { environmentThreadDetails } from "../../state/threads";
 import { prepareConnectionOnDemand, usePreparedConnection } from "../../state/session";
 import { androidVoiceRuntimeFactory } from "./androidVoiceRuntime";
 import {
@@ -54,23 +57,117 @@ import {
 import { resolveVoicePreferences } from "./voicePreferences";
 import { NativeVoiceReceiptIndex } from "./nativeVoiceReceiptIndex";
 import {
+  type NativeVoiceReceiptProjectionSource,
+  waitForNativeVoiceReceiptProjection,
+} from "./nativeVoiceReceiptProjection";
+import {
   VoicePresentationGenerationWaitScope,
   waitForVoicePresentationGeneration,
 } from "./voicePresentationGeneration";
 import { VoiceConversationBrowser } from "./VoiceConversationBrowser";
 
 const nativeReceiptIndex = new NativeVoiceReceiptIndex();
+const nativeReceiptProjectionSource: NativeVoiceReceiptProjectionSource = {
+  read: (receipt) =>
+    appAtomRegistry.get(
+      environmentThreadDetails.messagesAtom({
+        environmentId: receipt.target.environmentId,
+        threadId: receipt.target.threadId,
+      }),
+    ),
+  subscribe: (receipt, listener) =>
+    appAtomRegistry.subscribe(
+      environmentThreadDetails.messagesAtom({
+        environmentId: receipt.target.environmentId,
+        threadId: receipt.target.threadId,
+      }),
+      listener,
+    ),
+};
+
+const acknowledgeRetainedRecord = (
+  current: Omit<VoiceRuntimeRetainedRecordAcknowledgement, "record">,
+  record: VoiceRuntimeRetainedRecordAcknowledgement["record"],
+): Promise<void> => {
+  const native = getT3VoiceNativeModule();
+  if (native === null) throw new Error("The Android voice runtime is not available.");
+  return native.acknowledgeVoiceRuntimeRetainedRecordAsync({
+    runtimeId: current.runtimeId,
+    runtimeInstanceId: current.runtimeInstanceId,
+    authorityGeneration: current.authorityGeneration,
+    record,
+  });
+};
 
 export const autonomousAndroidVoiceBinding = new VoiceRuntimePresentationBinding({
   runtime: androidVoiceRuntimeFactory,
   createCommandId: uuidv4,
-  onEvent: (event) => {
+  onEvent: async (event) => {
     if (event.kind === "thread-receipt") {
       nativeReceiptIndex.recordReceipts([event.receipt]);
+      await waitForNativeVoiceReceiptProjection(event.receipt, nativeReceiptProjectionSource);
+      await acknowledgeRetainedRecord(
+        {
+          runtimeId: event.runtimeId,
+          runtimeInstanceId: event.runtimeInstanceId,
+          authorityGeneration: event.authorityGeneration,
+        },
+        {
+          kind: "thread-receipt",
+          sourceRuntimeId: event.receipt.runtimeId,
+          sourceRuntimeInstanceId: event.receipt.runtimeInstanceId,
+          sourceRuntimeGeneration: event.receipt.runtimeGeneration,
+          modeSessionId: event.receipt.modeSessionId,
+          turnClientOperationId: event.receipt.turnClientOperationId,
+        },
+      );
+    }
+    if (event.kind === "realtime-terminal") {
+      await acknowledgeRetainedRecord(
+        {
+          runtimeId: event.runtimeId,
+          runtimeInstanceId: event.runtimeInstanceId,
+          authorityGeneration: event.authorityGeneration,
+        },
+        {
+          kind: "realtime-terminal",
+          sourceRuntimeId: event.summary.runtimeId,
+          sourceRuntimeInstanceId: event.summary.runtimeInstanceId,
+          sourceRuntimeGeneration: event.summary.runtimeGeneration,
+          modeSessionId: event.summary.modeSessionId,
+        },
+      );
     }
   },
-  onRebase: (rebase) => {
+  onRebase: async (rebase) => {
     nativeReceiptIndex.recordReceipts(rebase.threadReceipts);
+    const current = {
+      runtimeId: rebase.cursor.runtimeId,
+      runtimeInstanceId: rebase.cursor.runtimeInstanceId,
+      authorityGeneration: rebase.cursor.generation,
+    };
+    await Promise.all([
+      ...rebase.threadReceipts.map(async (receipt) => {
+        await waitForNativeVoiceReceiptProjection(receipt, nativeReceiptProjectionSource);
+        await acknowledgeRetainedRecord(current, {
+          kind: "thread-receipt",
+          sourceRuntimeId: receipt.runtimeId,
+          sourceRuntimeInstanceId: receipt.runtimeInstanceId,
+          sourceRuntimeGeneration: receipt.runtimeGeneration,
+          modeSessionId: receipt.modeSessionId,
+          turnClientOperationId: receipt.turnClientOperationId,
+        });
+      }),
+      ...rebase.realtimeTerminalSummaries.map((summary) =>
+        acknowledgeRetainedRecord(current, {
+          kind: "realtime-terminal",
+          sourceRuntimeId: summary.runtimeId,
+          sourceRuntimeInstanceId: summary.runtimeInstanceId,
+          sourceRuntimeGeneration: summary.runtimeGeneration,
+          modeSessionId: summary.modeSessionId,
+        }),
+      ),
+    ]);
   },
 });
 
@@ -121,7 +218,9 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
   latestRef.current = { preferences, threadShells, environmentId, focus: props.focus, prepared };
 
   provisioningRef.current ??= new NativeVoiceRuntimeProvisioningCoordinator(
-    makeNativeVoiceRuntimeProvisioningAdapter(native, uuidv4),
+    makeNativeVoiceRuntimeProvisioningAdapter(native, uuidv4, async (authority) => {
+      await autonomousAndroidVoiceBinding.configureAuthority(authority);
+    }),
   );
 
   useEffect(() => {
@@ -246,7 +345,6 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
           epoch: provisioningEpochRef.current,
           readiness,
           environmentOrigin: new URL(connection.httpBaseUrl).origin,
-          operation: mode === "realtime" ? "realtime-start" : "thread-turn-start",
           resolvedTarget: target,
         });
         lifecycle.throwIfDisposed();

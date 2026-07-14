@@ -2,13 +2,13 @@ import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell
 import type { VoiceHttpClient } from "@t3tools/client-runtime/voice";
 import {
   VOICE_CONVERSATION_LIST_PAGE_MAX_ENTRIES,
-  VoiceNativeRuntimeTarget,
+  VoiceRuntimeTarget,
   type EnvironmentId,
   type ProjectId,
   type ThreadId,
   type VoiceConversationId,
   type VoiceConversationSummary,
-  type VoiceNativeRuntimeTarget as VoiceNativeRuntimeTargetType,
+  type VoiceRuntimeTarget as VoiceRuntimeTargetType,
 } from "@t3tools/contracts";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
@@ -33,7 +33,7 @@ export class NativeVoiceRuntimeTargetUnavailableError extends Data.TaggedError(
   }
 }
 
-const encodeNativeVoiceRuntimeTarget = Schema.encodeSync(VoiceNativeRuntimeTarget);
+const encodeVoiceRuntimeTarget = Schema.encodeSync(VoiceRuntimeTarget);
 
 function canonicalValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalValue);
@@ -45,20 +45,18 @@ function canonicalValue(value: unknown): unknown {
   );
 }
 
-export function canonicalNativeVoiceRuntimeTargetIdentity(
-  target: VoiceNativeRuntimeTargetType,
-): string {
-  return JSON.stringify(canonicalValue(encodeNativeVoiceRuntimeTarget(target)));
+export function canonicalNativeVoiceRuntimeTargetIdentity(target: VoiceRuntimeTargetType): string {
+  return JSON.stringify(canonicalValue(encodeVoiceRuntimeTarget(target)));
 }
 
 export interface ResolvedNativeVoiceRuntimeTarget {
-  readonly target: VoiceNativeRuntimeTargetType;
+  readonly target: VoiceRuntimeTargetType;
   readonly targetIdentity: string;
 }
 
-export function nativeVoiceRuntimeReadinessTargetId(target: VoiceNativeRuntimeTargetType): string {
+export function nativeVoiceRuntimeReadinessTargetId(target: VoiceRuntimeTargetType): string {
   return target.mode === "realtime"
-    ? String(target.conversation.conversationId)
+    ? String(target.conversationId)
     : `${target.projectId}/${target.threadId}`;
 }
 
@@ -111,7 +109,7 @@ async function resolveRealtimeConversationId(input: {
   return created.conversationId;
 }
 
-function withIdentity(target: VoiceNativeRuntimeTargetType): ResolvedNativeVoiceRuntimeTarget {
+function withIdentity(target: VoiceRuntimeTargetType): ResolvedNativeVoiceRuntimeTarget {
   return { target, targetIdentity: canonicalNativeVoiceRuntimeTargetIdentity(target) };
 }
 
@@ -146,18 +144,10 @@ export async function resolveNativeVoiceRuntimeTarget(
 ): Promise<ResolvedNativeVoiceRuntimeTarget> {
   if (input.mode === "realtime") {
     const conversationId = await resolveRealtimeConversationId(input);
-    const focus =
-      input.focus?.environmentId === input.environmentId
-        ? {
-            type: "thread" as const,
-            projectId: input.focus.projectId,
-            threadId: input.focus.threadId,
-          }
-        : { type: "none" as const };
     return withIdentity({
       mode: "realtime",
-      conversation: { type: "continue", conversationId },
-      focus,
+      environmentId: input.environmentId,
+      conversationId,
     });
   }
 

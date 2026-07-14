@@ -100,7 +100,10 @@ internal class VoiceRuntimeActiveThreadController(
   private val drafts: VoiceRuntimeDraftRepository = VoiceRuntimeMemoryDraftRepository(),
   private val retained: VoiceRuntimeJournalRepository = VoiceRuntimeMemoryJournalRepository(),
   private val realtimeTerminals: (Long) -> List<VoiceRuntimeRealtimeTerminalSummary> = { emptyList() },
+  private val realtimeTerminalAcknowledgement:
+    (VoiceRuntimeRetainedRecordKey.RealtimeTerminal) -> Boolean = { false },
   private val onJournalChanged: (VoiceRuntimeCursor) -> Unit = {},
+  initialGeneration: Long? = null,
   journalCapacity: Int = 256,
   idempotencyCapacity: Int = 512,
   leaseDurationMillis: Long = 30_000,
@@ -109,7 +112,9 @@ internal class VoiceRuntimeActiveThreadController(
   private var identity = VoiceRuntimeIdentity(
     runtimeId,
     runtimeInstanceId,
-    (initiallyInstalled?.generation?.minus(1))?.coerceAtLeast(0) ?: 0,
+    initialGeneration
+      ?: (initiallyInstalled?.generation?.minus(1))?.coerceAtLeast(0)
+      ?: 0,
   )
   private val journal = VoiceRuntimeJournal(
     VoiceRuntimeSnapshot(
@@ -127,7 +132,13 @@ internal class VoiceRuntimeActiveThreadController(
     journalCapacity,
     onJournalChanged,
   )
-  private val consumers = VoiceRuntimeConsumerRegistry({ identity }, now, leaseDurationMillis)
+  private val consumers = VoiceRuntimeConsumerRegistry({ identity }, now, leaseDurationMillis) { election ->
+    journal.append(
+      kind = "presentation-election",
+      occurredAtEpochMillis = election.changedAtEpochMillis,
+      presentationElection = election,
+    )
+  }
   private val deliveryGate = VoiceRuntimeDeliveryGate(consumers, journal)
   private val presentationActions = VoiceRuntimePresentationActionStore(consumers, now)
   private val draftReaders = mutableMapOf<String, String>()
@@ -143,6 +154,37 @@ internal class VoiceRuntimeActiveThreadController(
 
   @Synchronized
   fun snapshot(): VoiceRuntimeSnapshot = journal.snapshot
+
+  @Synchronized
+  fun validateAuthorityReplacement(
+    reservation: VoiceRuntimeAuthorityReservation,
+    target: VoiceRuntimeTarget.Thread,
+  ) {
+    if (targetDigest(target) != reservation.targetDigest) {
+      throw VoiceRuntimeFenceException("Authority target digest does not match its target.")
+    }
+    if (reservation.identity.runtimeId != identity.runtimeId ||
+      reservation.identity.runtimeInstanceId != identity.runtimeInstanceId ||
+      reservation.expectedCurrentGeneration != identity.generation ||
+      reservation.identity.generation != identity.generation + 1 ||
+      reservation.issuedAtEpochMillis > now() ||
+      reservation.expiresAtEpochMillis <= now()) {
+      throw VoiceRuntimeFenceException("Authority replacement fence is stale.")
+    }
+    val replacingRealtime = journal.snapshot.operation is VoiceRuntimeOperation.Realtime
+    if (!replacingRealtime && (journal.snapshot.operation != VoiceRuntimeOperation.None ||
+      journal.snapshot.mediaOwner != VoiceRuntimeMediaOwner.None)) {
+      throw VoiceRuntimeFenceException("Active voice work must stop before authority replacement.")
+    }
+  }
+
+  @Synchronized
+  fun refreshAuthority(reservation: VoiceRuntimeAuthorityReservation): VoiceRuntimeSnapshot {
+    requireInstalledAuthority(reservation)
+    authority.refresh(reservation)
+    appendState("authority-refreshed") { it.copy(failureCode = null) }
+    return journal.snapshot
+  }
 
   @Synchronized
   fun configureAuthority(
@@ -165,14 +207,12 @@ internal class VoiceRuntimeActiveThreadController(
     if (replayed) return journal.snapshot
     identity = reservation.identity
     drafts.rebind(identity, target, now())
-    val recoveredActions = retained.actions(now()).filter { action ->
-      action.artifact?.identity?.let { it == identity } ?: true
-    }
+    val recoveredActions = retained.actions(now()).filter(::actionMatchesCurrentIdentity)
     val reviewIds = recoveredActions.mapTo(mutableSetOf()) { it.actionId }
     val reconstructed = drafts.handles(now()).filter { it.identity == identity }.mapNotNull { handle ->
       val actionId = "review-${handle.artifactId}"
-      if (actionId in reviewIds) null else VoiceRuntimePresentationAction(
-        actionId, "review-draft", handle.expiresAtEpochMillis, artifact = handle,
+      if (actionId in reviewIds) null else VoiceRuntimePresentationAction.ReviewDraft(
+        actionId, handle, handle.expiresAtEpochMillis,
       ).also(retained::publishAction)
     }
     presentationActions.replace(recoveredActions + reconstructed)
@@ -188,6 +228,37 @@ internal class VoiceRuntimeActiveThreadController(
       )
     }
     return journal.snapshot
+  }
+
+  @Synchronized
+  fun activateHandoffAuthority(
+    reservation: VoiceRuntimeAuthorityReservation,
+    target: VoiceRuntimeTarget.Thread,
+    fingerprint: String,
+    command: VoiceRuntimeThreadCommand.Start,
+  ): VoiceRuntimeCommandReceipt {
+    val priorAuthority = authority.checkpoint()
+    val priorIdentity = identity
+    val priorSnapshot = journal.snapshot
+    val priorModeSessionId = activeModeSessionId
+    val priorTurnClientOperationId = activeTurnClientOperationId
+    return try {
+      configureAuthority(reservation, target, fingerprint)
+      dispatch(command).also { receipt ->
+        if (!VoiceRuntimeHandoffActivationPolicy.accepted(receipt)) {
+          throw VoiceRuntimeHandoffActivationRejected(receipt)
+        }
+      }
+    } catch (cause: Throwable) {
+      authority.restore(priorAuthority, reservation.provisioningOperationId)
+      commands.forget(command.commandId)
+      identity = priorIdentity
+      activeModeSessionId = priorModeSessionId
+      activeTurnClientOperationId = priorTurnClientOperationId
+      journal.replaceSnapshot(priorSnapshot)
+      presentationActions.replace(retained.actions(now()).filter(::actionMatchesCurrentIdentity))
+      throw cause
+    }
   }
 
   @Synchronized
@@ -262,20 +333,19 @@ internal class VoiceRuntimeActiveThreadController(
   }
 
   @Synchronized
-  fun publishRealtimePresentationAction(action: T3VoiceBackgroundRealtimeAction) {
+  fun publishRealtimePresentationAction(action: VoiceRuntimeRealtimeAction) {
     val projected = when (action) {
-      is T3VoiceBackgroundRealtimeAction.NavigateThread -> VoiceRuntimePresentationAction(
-        action.actionId, "navigate-thread", action.expiresAtEpochMillis,
-        action.projectId, action.threadId,
+      is VoiceRuntimeRealtimeAction.NavigateThread -> VoiceRuntimePresentationAction.NavigateThread(
+        action.actionId, action.projectId, action.threadId, action.expiresAtEpochMillis,
       )
-      is T3VoiceBackgroundRealtimeAction.ConfirmationRequired -> VoiceRuntimePresentationAction(
+      is VoiceRuntimeRealtimeAction.ConfirmationRequired ->
+        VoiceRuntimePresentationAction.RealtimeConfirmationRequired(
         action.actionId,
-        "realtime-confirmation-required",
+        action.confirmationId,
+        action.toolCallId,
+        action.tool,
+        action.summary,
         action.expiresAtEpochMillis,
-        confirmationId = action.confirmationId,
-        toolCallId = action.toolCallId,
-        tool = action.tool,
-        summary = action.summary,
       )
       else -> return
     }
@@ -361,9 +431,7 @@ internal class VoiceRuntimeActiveThreadController(
       threadReceipts = retained.receipts(identity.runtimeId, identity.generation, now()),
       realtimeTerminalSummaries = retainedRealtimeTerminals(),
       draftArtifacts = drafts.handles(now()).filter { it.identity == identity },
-      presentationActions = retained.actions(now()).filter { action ->
-        action.artifact?.identity?.let { it == identity } ?: true
-      },
+      presentationActions = retained.actions(now()).filter(::actionMatchesCurrentIdentity),
     )
   }
 
@@ -380,11 +448,10 @@ internal class VoiceRuntimeActiveThreadController(
   fun publishDraft(handle: VoiceRuntimeDraftHandle, transcript: String) {
     require(handle.identity == identity)
     drafts.publish(VoiceRuntimeStoredDraft(handle, transcript))
-    val action = VoiceRuntimePresentationAction(
+    val action = VoiceRuntimePresentationAction.ReviewDraft(
       actionId = "review-${handle.artifactId}",
-      kind = "review-draft",
-      expiresAtEpochMillis = handle.expiresAtEpochMillis,
       artifact = handle,
+      expiresAtEpochMillis = handle.expiresAtEpochMillis,
     )
     presentationActions.publish(action)
     retained.publishAction(action)
@@ -474,6 +541,21 @@ internal class VoiceRuntimeActiveThreadController(
   }
 
   @Synchronized
+  fun acknowledgeRetainedRecord(
+    candidate: VoiceRuntimeIdentity,
+    key: VoiceRuntimeRetainedRecordKey,
+  ) {
+    requireFence(candidate.runtimeId, candidate.runtimeInstanceId, candidate.generation)
+    if (key.identity.runtimeId != identity.runtimeId || key.identity.generation != identity.generation) {
+      throw VoiceRuntimeFenceException("Retained record belongs to another authority generation.")
+    }
+    when (key) {
+      is VoiceRuntimeRetainedRecordKey.ThreadReceipt -> retained.acknowledgeReceipt(key)
+      is VoiceRuntimeRetainedRecordKey.RealtimeTerminal -> acknowledgeRealtimeTerminal(key)
+    }
+  }
+
+  @Synchronized
   fun claimPresentationAction(
     lease: VoiceRuntimeConsumerLease,
     actionId: String,
@@ -498,7 +580,7 @@ internal class VoiceRuntimeActiveThreadController(
   }
 
   @Synchronized
-  fun observeBackground(snapshot: T3VoiceBackgroundSnapshot) {
+  fun observeRuntime(snapshot: VoiceRuntimeExecutionSnapshot) {
     if (snapshot.runtimeId != identity.runtimeId || snapshot.readinessGeneration != identity.generation) {
       return
     }
@@ -510,13 +592,13 @@ internal class VoiceRuntimeActiveThreadController(
     } else {
       VoiceRuntimeReadiness.Ready(VoiceRuntimeMode.THREAD)
     }
-    appendState("background-state") {
+    appendState("runtime-state") {
       it.copy(
         availability = VoiceRuntimeAvailability.READY,
         operation = operation,
         mediaOwner = media,
         readiness = readiness,
-        failureCode = if (snapshot.phase == T3VoiceBackgroundPhase.FAILED) {
+        failureCode = if (snapshot.phase == VoiceRuntimePhase.FAILED) {
           "native-thread-failed"
         } else null,
       )
@@ -701,9 +783,18 @@ internal class VoiceRuntimeActiveThreadController(
 
   private fun retainedRealtimeTerminals(): List<VoiceRuntimeRealtimeTerminalSummary> =
     realtimeTerminals(now())
-      .filter { it.identity == identity }
+      .filter {
+        it.identity.runtimeId == identity.runtimeId && it.identity.generation == identity.generation
+      }
       .sortedWith(compareBy({ it.terminalAtEpochMillis }, { it.modeSessionId }))
-      .takeLast(MAXIMUM_REALTIME_TERMINAL_SUMMARIES)
+
+  private fun acknowledgeRealtimeTerminal(
+    key: VoiceRuntimeRetainedRecordKey.RealtimeTerminal,
+  ): Boolean = realtimeTerminalAcknowledgement(key)
+
+  private fun actionMatchesCurrentIdentity(action: VoiceRuntimePresentationAction): Boolean =
+    (action as? VoiceRuntimePresentationAction.ReviewDraft)?.artifact?.identity
+      ?.let { it == identity } ?: true
 
   private fun requireFence(runtimeId: String, runtimeInstanceId: String, generation: Long) {
     if (runtimeId != identity.runtimeId || runtimeInstanceId != identity.runtimeInstanceId ||
@@ -717,23 +808,23 @@ internal class VoiceRuntimeActiveThreadController(
     activeModeSessionId == command.modeSessionId &&
       activeTurnClientOperationId == turnClientOperationId(command)
 
-  private fun operationFrom(snapshot: T3VoiceBackgroundSnapshot): VoiceRuntimeOperation {
-    if (snapshot.mode != T3VoiceBackgroundMode.THREAD ||
-      snapshot.phase in setOf(T3VoiceBackgroundPhase.IDLE, T3VoiceBackgroundPhase.LOCKED)) {
+  private fun operationFrom(snapshot: VoiceRuntimeExecutionSnapshot): VoiceRuntimeOperation {
+    if (snapshot.mode != VoiceRuntimeExecutionMode.THREAD ||
+      snapshot.phase in setOf(VoiceRuntimePhase.IDLE, VoiceRuntimePhase.LOCKED)) {
       return VoiceRuntimeOperation.None
     }
     val mode = activeModeSessionId ?: return VoiceRuntimeOperation.None
     val phase = when (snapshot.phase) {
-      T3VoiceBackgroundPhase.RECORDING -> VoiceThreadOrdinaryPhase.RECORDING
-      T3VoiceBackgroundPhase.FINALIZED -> VoiceThreadOrdinaryPhase.FINALIZING
-      T3VoiceBackgroundPhase.UPLOADING -> VoiceThreadOrdinaryPhase.UPLOADING
-      T3VoiceBackgroundPhase.TRANSCRIBING -> VoiceThreadOrdinaryPhase.TRANSCRIBING
-      T3VoiceBackgroundPhase.WAITING -> VoiceThreadOrdinaryPhase.WAITING
-      T3VoiceBackgroundPhase.PLAYING -> VoiceThreadOrdinaryPhase.PLAYING
-      T3VoiceBackgroundPhase.PLAYBACK_DRAINED -> VoiceThreadOrdinaryPhase.PLAYBACK_DRAINED
-      T3VoiceBackgroundPhase.REARMING -> VoiceThreadOrdinaryPhase.REARMING
-      T3VoiceBackgroundPhase.FAILED -> VoiceThreadOrdinaryPhase.FAILED
-      T3VoiceBackgroundPhase.ATTENTION_REQUIRED -> return VoiceRuntimeOperation.ThreadTurn(
+      VoiceRuntimePhase.RECORDING -> VoiceThreadOrdinaryPhase.RECORDING
+      VoiceRuntimePhase.FINALIZED -> VoiceThreadOrdinaryPhase.FINALIZING
+      VoiceRuntimePhase.UPLOADING -> VoiceThreadOrdinaryPhase.UPLOADING
+      VoiceRuntimePhase.TRANSCRIBING -> VoiceThreadOrdinaryPhase.TRANSCRIBING
+      VoiceRuntimePhase.WAITING -> VoiceThreadOrdinaryPhase.WAITING
+      VoiceRuntimePhase.PLAYING -> VoiceThreadOrdinaryPhase.PLAYING
+      VoiceRuntimePhase.PLAYBACK_DRAINED -> VoiceThreadOrdinaryPhase.PLAYBACK_DRAINED
+      VoiceRuntimePhase.REARMING -> VoiceThreadOrdinaryPhase.REARMING
+      VoiceRuntimePhase.FAILED -> VoiceThreadOrdinaryPhase.FAILED
+      VoiceRuntimePhase.ATTENTION_REQUIRED -> return VoiceRuntimeOperation.ThreadTurn(
         mode,
         VoiceThreadPhase.AttentionRequired(
           VoiceThreadPhase.AttentionRequired.Reason.USER_INPUT,
@@ -751,13 +842,13 @@ internal class VoiceRuntimeActiveThreadController(
     )
   }
 
-  private fun mediaFrom(snapshot: T3VoiceBackgroundSnapshot): VoiceRuntimeMediaOwner =
+  private fun mediaFrom(snapshot: VoiceRuntimeExecutionSnapshot): VoiceRuntimeMediaOwner =
     when (snapshot.phase) {
-      T3VoiceBackgroundPhase.RECORDING -> VoiceRuntimeMediaOwner.Recorder(
+      VoiceRuntimePhase.RECORDING -> VoiceRuntimeMediaOwner.Recorder(
         "thread-mode",
         snapshot.operationId ?: "pending",
       )
-      T3VoiceBackgroundPhase.PLAYING -> VoiceRuntimeMediaOwner.Player(
+      VoiceRuntimePhase.PLAYING -> VoiceRuntimeMediaOwner.Player(
         "thread-mode",
         snapshot.operationId ?: "pending",
       )
@@ -784,7 +875,4 @@ internal class VoiceRuntimeActiveThreadController(
   internal fun targetDigest(target: VoiceRuntimeTarget.Realtime): String =
     T3VoiceRuntimeTargetIdentity.digest(VoiceRuntimeBridge.canonicalRealtimeTargetIdentity(target))
 
-  private companion object {
-    const val MAXIMUM_REALTIME_TERMINAL_SUMMARIES = 64
-  }
 }

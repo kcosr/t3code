@@ -18,6 +18,13 @@ internal enum class VoiceRuntimePresentation { FOREGROUND_ACTIVE, VISIBLE_INACTI
 internal enum class VoiceRuntimeElection { ELECTED, STANDBY }
 internal enum class VoiceRuntimeMode { REALTIME, THREAD }
 
+internal data class VoiceRuntimePresentationElection(
+  val electedLeaseId: String?,
+  val electedAttachOrdinal: Long?,
+  val eligibleConsumerCount: Int,
+  val changedAtEpochMillis: Long,
+)
+
 internal sealed interface VoiceRuntimeTarget {
   data class Realtime(val environmentId: String, val conversationId: String) : VoiceRuntimeTarget
   data class Thread(
@@ -118,6 +125,7 @@ internal data class VoiceRuntimeEvent(
   val realtimeTerminalSummary: VoiceRuntimeRealtimeTerminalSummary? = null,
   val draftArtifact: VoiceRuntimeDraftHandle? = null,
   val presentationAction: VoiceRuntimePresentationAction? = null,
+  val presentationElection: VoiceRuntimePresentationElection? = null,
 )
 
 internal data class VoiceRuntimeCommandReceipt(
@@ -128,6 +136,22 @@ internal data class VoiceRuntimeCommandReceipt(
   val outcome: VoiceRuntimeCommandOutcome,
   val cursor: VoiceRuntimeCursor,
 )
+
+internal sealed interface VoiceRuntimeRetainedRecordKey {
+  val identity: VoiceRuntimeIdentity
+  val modeSessionId: String
+
+  data class ThreadReceipt(
+    override val identity: VoiceRuntimeIdentity,
+    override val modeSessionId: String,
+    val turnClientOperationId: String,
+  ) : VoiceRuntimeRetainedRecordKey
+
+  data class RealtimeTerminal(
+    override val identity: VoiceRuntimeIdentity,
+    override val modeSessionId: String,
+  ) : VoiceRuntimeRetainedRecordKey
+}
 
 internal sealed interface VoiceRuntimeCommandOutcome {
   data object Accepted : VoiceRuntimeCommandOutcome
@@ -158,3 +182,5 @@ internal class VoiceRuntimeFenceException(message: String) : IllegalStateExcepti
 internal class VoiceRuntimeIdempotencyConflictException : IllegalStateException("Idempotency conflict.")
 internal class VoiceRuntimeNotElectedException : IllegalStateException("Consumer is not elected.")
 internal class VoiceRuntimeExpiredException : IllegalStateException("Resource expired.")
+internal class VoiceRuntimeRetentionCapacityException(recordKind: String, capacity: Int) :
+  IllegalStateException("Voice runtime $recordKind retention capacity $capacity is full.")

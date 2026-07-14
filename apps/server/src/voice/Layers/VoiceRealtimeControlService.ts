@@ -1,11 +1,12 @@
 import {
   VoiceClientActionId,
-  VoiceNativeRuntimeId,
+  VoiceRuntimeId,
   type VoiceThreadRuntimeTarget,
   type VoiceRuntimeRealtimeAction,
   type VoiceRuntimeRealtimeActionAckResult,
   type VoiceRuntimeRealtimeCloseResult,
   type VoiceRuntimeRealtimeFocusResult,
+  type VoiceRuntimeRealtimeHandoffCommitResult,
   type VoiceRuntimeRealtimeHandoffExchangeResult,
   type VoiceRuntimeRealtimeSessionCreateResult,
   type VoiceRuntimeRealtimeWebRtcAnswer,
@@ -21,11 +22,11 @@ import * as Semaphore from "effect/Semaphore";
 import * as NodeCrypto from "node:crypto";
 
 import { ServerSecretStore } from "../../auth/ServerSecretStore.ts";
-import { VoiceNativeRealtimeStartRepository } from "../../persistence/Services/VoiceNativeRealtimeStarts.ts";
+import { VoiceRuntimeRealtimeStartRepository } from "../../persistence/Services/VoiceRuntimeRealtimeStarts.ts";
 import { VoiceRealtimeTransitionGrantRepository } from "../../persistence/Services/VoiceRealtimeTransitionGrants.ts";
 import { VoiceError } from "../Errors.ts";
-import { VoiceNativeControlGrantRegistry } from "../Services/VoiceNativeControlGrantRegistry.ts";
-import { VoiceNativeRuntimeGrantRegistry } from "../Services/VoiceNativeRuntimeGrantRegistry.ts";
+import { VoiceRuntimeControlGrantRegistry } from "../Services/VoiceRuntimeControlGrantRegistry.ts";
+import { VoiceRuntimeGrantRegistry } from "../Services/VoiceRuntimeGrantRegistry.ts";
 import {
   VoiceRealtimeControlService,
   type VoiceRealtimeControlServiceShape,
@@ -63,11 +64,6 @@ const operationError = (
   detail: string,
   retryable = false,
 ) => new VoiceError({ reason, operation, detail, retryable });
-
-const isExpiredHandoffAcknowledgement = (error: VoiceError): boolean =>
-  error.reason === "invalid-phase" &&
-  error.operation === "session.client-action" &&
-  error.detail === "Voice handoff action has expired";
 
 const canonicalFence = (input: {
   readonly runtimeId: string;
@@ -135,9 +131,9 @@ export const protectRealtimeStartCriticalSection = <A, E, R>(effect: Effect.Effe
   effect.pipe(Effect.uninterruptible);
 
 const make = Effect.gen(function* () {
-  const runtimeGrants = yield* VoiceNativeRuntimeGrantRegistry;
-  const controlGrants = yield* VoiceNativeControlGrantRegistry;
-  const starts = yield* VoiceNativeRealtimeStartRepository;
+  const runtimeGrants = yield* VoiceRuntimeGrantRegistry;
+  const controlGrants = yield* VoiceRuntimeControlGrantRegistry;
+  const starts = yield* VoiceRuntimeRealtimeStartRepository;
   const transitions = yield* VoiceRealtimeTransitionGrantRepository;
   const sessions = yield* VoiceSessionService;
   const secretStore = yield* ServerSecretStore;
@@ -328,16 +324,13 @@ const make = Effect.gen(function* () {
         grant.generation,
         operationIdentity,
       )}`;
-      const focus = grant.target.focus;
       const createInput = {
         mode: "realtime-agent" as const,
         conversation: {
           type: "continue" as const,
-          conversationId: grant.target.conversation.conversationId,
+          conversationId: grant.target.conversationId,
           takeover: false,
         },
-        ...(focus.type === "none" ? {} : { projectId: focus.projectId }),
-        ...(focus.type === "thread" ? { threadId: focus.threadId } : {}),
         media: {
           transports: ["webrtc-sdp-v1" as const],
           audioFormats: ["audio/pcm;rate=24000;encoding=s16le;channels=1" as const],
@@ -356,7 +349,7 @@ const make = Effect.gen(function* () {
           runtimeGeneration: grant.generation,
           modeSessionId: input.modeSessionId,
           clientOperationId: operationIdentity,
-          conversationId: grant.target.conversation.conversationId,
+          conversationId: grant.target.conversationId,
           claimExpiresAt: Math.min(grant.expiresAt, now + START_CLAIM_MILLIS),
           expiresAt: grant.expiresAt,
           now,
@@ -397,7 +390,7 @@ const make = Effect.gen(function* () {
       const principal = {
         sessionId: grant.authSessionId,
         scopes: grant.grantedScopes,
-        nativeRuntime: {
+        runtimeAuthority: {
           runtimeId: grant.runtimeId,
           generation: grant.generation,
         },
@@ -494,7 +487,7 @@ const make = Effect.gen(function* () {
         },
         expiresAt: created.success.expiresAt,
         heartbeatIntervalSeconds: created.success.heartbeatIntervalSeconds,
-        controlGrant: created.success.nativeControlGrant,
+        controlGrant: created.success.runtimeControlGrant,
       };
       return result;
     }).pipe(protectRealtimeStartCriticalSection);
@@ -731,8 +724,6 @@ const make = Effect.gen(function* () {
               ),
             ),
           );
-        const isStoredReceiptReplay = stored !== undefined;
-        let binding: SessionBinding | undefined;
         let receipt = stored;
         let replayed = stored !== undefined;
         if (receipt !== undefined) {
@@ -756,7 +747,6 @@ const make = Effect.gen(function* () {
           }
         } else {
           const authorized = yield* requireControl(token, sessionId, input, "handoff-actions");
-          binding = authorized.binding;
           const events = yield* sessions.events(authorized.grant.authSessionId, sessionId, 0, 0);
           const event = events.events.find(
             (candidate) =>
@@ -810,7 +800,8 @@ const make = Effect.gen(function* () {
             targetGeneration: input.nextGeneration,
             modeSessionId: input.threadModeSessionId,
             target,
-            expiresAt: authorized.grant.expiresAt,
+            expiresAt: Math.min(Date.parse(action.expiresAt), now + 60_000),
+            authorityExpiresAt: authorized.grant.expiresAt,
           };
           const claimed = yield* transitions
             .claim(candidate, now)
@@ -835,55 +826,6 @@ const make = Effect.gen(function* () {
             claimed.status === "existing" ? claimed.record : { ...candidate, consumedAt: null };
           replayed = claimed.status === "existing";
         }
-        const activated = yield* runtimeGrants.activateTransition(transitionToken, {
-          authSessionId: receipt.authSessionId,
-          runtimeId: VoiceNativeRuntimeId.make(receipt.runtimeId),
-          sourceGeneration: receipt.sourceGeneration,
-          targetGeneration: receipt.targetGeneration,
-          target: receipt.target,
-        });
-        const acknowledged = yield* sessions
-          .acknowledgeNativeHandoffAction(
-            receipt.authSessionId,
-            sessionId,
-            input.leaseGeneration,
-            actionId,
-            { outcome: "succeeded", state: "accepted" },
-          )
-          .pipe(Effect.result);
-        if (Result.isFailure(acknowledged)) {
-          if (
-            isStoredReceiptReplay &&
-            activated.replayed &&
-            isExpiredHandoffAcknowledgement(acknowledged.failure)
-          ) {
-            yield* sessions.reconcileActivatedNativeHandoff(
-              receipt.authSessionId,
-              sessionId,
-              input.leaseGeneration,
-              actionId,
-              {
-                projectId: receipt.target.projectId,
-                threadId: receipt.target.threadId,
-              },
-            );
-          } else {
-            return yield* acknowledged.failure;
-          }
-        }
-        const consumed = yield* transitions
-          .consume(transitionTokenHash, now)
-          .pipe(
-            Effect.mapError((cause) =>
-              operationError(
-                "provider-unavailable",
-                "runtime-realtime.handoff",
-                `Realtime handoff transition receipt could not be finalized: ${String(cause)}`,
-                true,
-              ),
-            ),
-          );
-        binding?.acknowledgedActionSequences.add(receipt.actionSequence);
         return {
           actionId,
           actionSequence: receipt.actionSequence,
@@ -892,21 +834,92 @@ const make = Effect.gen(function* () {
           autoRearm: receipt.target.autoRearm,
           transitionGrant: {
             token: transitionToken,
-            expiresAt: DateTime.formatIso(DateTime.makeUnsafe(activated.expiresAt)),
+            expiresAt: DateTime.formatIso(DateTime.makeUnsafe(receipt.authorityExpiresAt)),
             generation: input.nextGeneration,
             modeSessionId: input.threadModeSessionId,
             target: receipt.target,
           },
-          replayed:
-            replayed ||
-            activated.replayed ||
-            consumed.status === "already-consumed" ||
-            consumed.status === "missing",
+          replayed,
         } satisfies VoiceRuntimeRealtimeHandoffExchangeResult;
       }).pipe(Effect.uninterruptible),
       (value) => ({ ...value, replayed: true as const }),
     ).pipe(Effect.uninterruptible);
   };
+
+  const commitHandoff: VoiceRealtimeControlServiceShape["commitHandoff"] = (
+    transitionToken,
+    sessionId,
+    actionId,
+    input,
+  ) =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const tokenHash = NodeCrypto.createHash("sha256").update(transitionToken).digest("hex");
+      const receipt = yield* transitions
+        .findByToken(tokenHash, now)
+        .pipe(
+          Effect.mapError((cause) =>
+            operationError(
+              "provider-unavailable",
+              "runtime-realtime.handoff-commit",
+              `Realtime transition authority storage is unavailable: ${String(cause)}`,
+              true,
+            ),
+          ),
+        );
+      if (
+        receipt === undefined ||
+        receipt.sourceSessionId !== sessionId ||
+        receipt.actionId !== actionId ||
+        receipt.sourceLeaseGeneration !== input.leaseGeneration ||
+        receipt.runtimeId !== input.runtimeId ||
+        receipt.runtimeInstanceId !== input.runtimeInstanceId ||
+        receipt.sourceGeneration !== input.generation ||
+        receipt.targetGeneration !== input.nextGeneration ||
+        receipt.modeSessionId !== input.threadModeSessionId ||
+        receipt.actionSequence !== input.actionSequence
+      )
+        return yield* operationError(
+          "authorization-revoked",
+          "runtime-realtime.handoff-commit",
+          "Realtime transition authority does not match this commit",
+        );
+      const activated = yield* runtimeGrants.activateTransition(transitionToken, {
+        authSessionId: receipt.authSessionId,
+        runtimeId: VoiceRuntimeId.make(receipt.runtimeId),
+        sourceGeneration: receipt.sourceGeneration,
+        targetGeneration: receipt.targetGeneration,
+        target: receipt.target,
+        authorityExpiresAt: receipt.authorityExpiresAt,
+      });
+      const acknowledged = yield* sessions
+        .acknowledgeRuntimeHandoffAction(
+          receipt.authSessionId,
+          sessionId,
+          input.leaseGeneration,
+          actionId,
+          { outcome: "succeeded", state: "accepted" },
+        )
+        .pipe(Effect.result);
+      if (Result.isFailure(acknowledged)) {
+        yield* sessions
+          .reconcileActivatedRuntimeHandoff(
+            receipt.authSessionId,
+            sessionId,
+            input.leaseGeneration,
+            actionId,
+            { projectId: receipt.target.projectId, threadId: receipt.target.threadId },
+          )
+          .pipe(Effect.result);
+      }
+      bindings.get(sessionId)?.acknowledgedActionSequences.add(receipt.actionSequence);
+      return {
+        actionId,
+        actionSequence: receipt.actionSequence,
+        committed: true,
+        replayed: activated.replayed || receipt.consumedAt !== null,
+      } satisfies VoiceRuntimeRealtimeHandoffCommitResult;
+    }).pipe(Effect.uninterruptible);
 
   const close: VoiceRealtimeControlServiceShape["close"] = (token, sessionId, input) =>
     runCached<VoiceRuntimeRealtimeCloseResult>(
@@ -935,6 +948,7 @@ const make = Effect.gen(function* () {
     acknowledgeAction,
     updateFocus,
     exchangeHandoff,
+    commitHandoff,
     close,
   });
 });

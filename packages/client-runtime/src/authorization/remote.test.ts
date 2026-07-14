@@ -250,6 +250,7 @@ describe("remote environment authorization", () => {
               arch: "x64",
             },
             serverVersion: "0.0.0-test",
+            voiceRuntimeProtocolMajor: 1,
             capabilities: {
               repositoryIdentity: true,
             },

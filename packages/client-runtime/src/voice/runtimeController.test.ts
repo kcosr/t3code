@@ -38,6 +38,7 @@ async function configuredRuntime() {
     environmentOrigin: "https://termstation",
     operation: "realtime-start",
     readinessEnabled: true,
+    refreshRotationCounter: 0,
     token: "runtime-controller-token",
     issuedAt: "2026-07-13T12:00:00.000Z",
     expiresAt: "2026-07-13T13:00:00.000Z",

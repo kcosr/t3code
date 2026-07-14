@@ -313,6 +313,7 @@ describe("mobile cloud link environment client", () => {
               label: "Desktop",
               platform: { os: "darwin", arch: "arm64" },
               serverVersion: "0.0.0-test",
+              voiceRuntimeProtocolMajor: 1,
               capabilities: { repositoryIdentity: true },
             },
           }),
@@ -379,6 +380,7 @@ describe("mobile cloud link environment client", () => {
               label: "Desktop",
               platform: { os: "darwin", arch: "arm64" },
               serverVersion: "0.0.0-test",
+              voiceRuntimeProtocolMajor: 1,
               capabilities: { repositoryIdentity: true },
             },
           }),
@@ -419,6 +421,7 @@ describe("mobile cloud link environment client", () => {
                 label: "Desktop",
                 platform: { os: "darwin", arch: "arm64" },
                 serverVersion: "0.0.0-test",
+                voiceRuntimeProtocolMajor: 1,
                 capabilities: { repositoryIdentity: true },
               },
             }),
@@ -441,6 +444,7 @@ describe("mobile cloud link environment client", () => {
               label: "Desktop",
               platform: { os: "darwin", arch: "arm64" },
               serverVersion: "0.0.0-test",
+              voiceRuntimeProtocolMajor: 1,
               capabilities: { repositoryIdentity: true },
             }),
           );
@@ -577,6 +581,7 @@ describe("mobile cloud link environment client", () => {
                 label: "Other Desktop",
                 platform: { os: "darwin", arch: "arm64" },
                 serverVersion: "0.0.0-test",
+                voiceRuntimeProtocolMajor: 1,
                 capabilities: { repositoryIdentity: true },
               },
             }),
@@ -847,6 +852,7 @@ describe("mobile cloud link environment client", () => {
                 label: "Desktop",
                 platform: { os: "darwin", arch: "arm64" },
                 serverVersion: "0.0.0-test",
+                voiceRuntimeProtocolMajor: 1,
                 capabilities: { repositoryIdentity: true },
               }),
             );
@@ -934,6 +940,7 @@ describe("mobile cloud link environment client", () => {
                 label: "Rotated Desktop",
                 platform: { os: "darwin", arch: "arm64" },
                 serverVersion: "0.0.0-test",
+                voiceRuntimeProtocolMajor: 1,
                 capabilities: { repositoryIdentity: true },
               }),
             );
@@ -1141,6 +1148,7 @@ describe("mobile cloud link environment client", () => {
                       label: "Other Desktop",
                       platform: { os: "darwin", arch: "arm64" },
                       serverVersion: "0.0.0-test",
+                      voiceRuntimeProtocolMajor: 1,
                       capabilities: { repositoryIdentity: true },
                     })
                   : Response.json({

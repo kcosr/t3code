@@ -31,14 +31,14 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
   @Test
   fun `all pending action variants round trip with strict tagged schemas`() {
     val actions = listOf(
-      T3VoiceBackgroundRealtimeAction.NavigateThread(
+      VoiceRuntimeRealtimeAction.NavigateThread(
         12, 1_200, "action-nav", "project-1", "thread-1", 9_000,
       ),
-      T3VoiceBackgroundRealtimeAction.HandoffToThreadVoice(
+      VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
         12, 1_200, "action-handoff", "project-1", "thread-1", true, 9_000,
       ),
-      T3VoiceBackgroundRealtimeAction.StopRealtimeVoice(12, 1_200),
-      T3VoiceBackgroundRealtimeAction.ConfirmationRequired(
+      VoiceRuntimeRealtimeAction.StopRealtimeVoice(12, 1_200),
+      VoiceRuntimeRealtimeAction.ConfirmationRequired(
         12, 1_200, "action-confirm", "confirmation-1", "tool-call-1", "send_message",
         "Send a synchronous message", 9_000,
       ),
@@ -97,25 +97,38 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
   }
 
   @Test
-  fun `terminal summaries survive restart prune expiry deduplicate and stay bounded`() {
+  fun `full terminal retention rejects new summary without eviction until exact ack or expiry`() {
     val storage = MemoryStore()
     val repository =
       VoiceRuntimeDurableRealtimeCheckpointRepository(storage, AuthenticatedTestCipher())
     repository.publishTerminal(terminal(0, expiresAt = 50))
-    repeat(66) { index ->
+    repeat(64) { index ->
       repository.publishTerminal(terminal(index + 1, expiresAt = 10_000))
     }
     repository.publishTerminal(
-      terminal(66, expiresAt = 12_000).copy(reason = "replacement"),
+      terminal(64, expiresAt = 12_000).copy(reason = "replacement"),
     )
+    expectThrows<VoiceRuntimeRetentionCapacityException> {
+      repository.publishTerminal(terminal(65, expiresAt = 12_000))
+    }
 
     val restarted =
       VoiceRuntimeDurableRealtimeCheckpointRepository(storage, AuthenticatedTestCipher())
     val values = restarted.terminals(100)
 
     assertEquals(64, values.size)
-    assertEquals(1, values.count { it.modeSessionId == "mode-66" })
-    assertEquals("replacement", values.single { it.modeSessionId == "mode-66" }.reason)
+    assertEquals(1, values.count { it.modeSessionId == "mode-64" })
+    assertEquals("replacement", values.single { it.modeSessionId == "mode-64" }.reason)
+    val acknowledged = values.single { it.modeSessionId == "mode-42" }
+    assertTrue(restarted.acknowledgeTerminal(VoiceRuntimeRetainedRecordKey.RealtimeTerminal(
+      acknowledged.identity, acknowledged.modeSessionId,
+    )))
+    restarted.publishTerminal(terminal(65, expiresAt = 12_000))
+    assertEquals(64, restarted.terminals(100).size)
+    assertFalse(restarted.acknowledgeTerminal(VoiceRuntimeRetainedRecordKey.RealtimeTerminal(
+      acknowledged.identity.copy(runtimeInstanceId = "wrong-process"), acknowledged.modeSessionId,
+    )))
+    assertTrue(restarted.terminals(12_000).isEmpty())
     assertFalse(storage.values.values.any { CONTROL_TOKEN in it || TRANSITION_TOKEN in it })
   }
 
@@ -137,13 +150,13 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
 
   private fun checkpoint(): VoiceRuntimeRealtimeCheckpoint {
     val identity = VoiceRuntimeIdentity("runtime-1", "process-1", 7)
-    val target = T3VoiceBackgroundRealtimeThreadTarget(
+    val target = VoiceRuntimeRealtimeThreadTarget(
       environmentId = "environment-1",
       projectId = "project-1",
       threadId = "thread-1",
       speechPreset = "default",
       autoRearm = true,
-      endpointPolicy = T3VoiceBackgroundRealtimeEndpointPolicy(2_200, 60_000, 600_000),
+      endpointPolicy = VoiceRuntimeRealtimeEndpointPolicy(2_200, 60_000, 600_000),
       speechEnabled = true,
       rearmGuardMs = 500,
     )
@@ -154,7 +167,7 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
       phase = VoiceRealtimePhase.DRAINING,
       serverSessionId = "session-1",
       leaseGeneration = 3,
-      controlGrant = T3VoiceBackgroundRealtimeControlGrant(
+      controlGrant = VoiceRuntimeRealtimeControlGrant(
         CONTROL_TOKEN,
         expiresAtEpochMillis = 8_000,
         heartbeatIntervalSeconds = 15,
@@ -162,17 +175,17 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
       ),
       lastActionSequence = 10,
       lastConnectedAtEpochMillis = 1_500,
-      pendingAction = T3VoiceBackgroundRealtimeAction.ConfirmationRequired(
+      pendingAction = VoiceRuntimeRealtimeAction.ConfirmationRequired(
         11, 1_800, "action-confirm", "confirmation-1", "tool-call-1", "send_message",
         "Send a synchronous message", 9_000,
       ),
-      pendingHandoffExchange = T3VoiceBackgroundRealtimeHandoffExchangeResult(
+      pendingHandoffExchange = VoiceRuntimeRealtimeHandoffExchangeResult(
         actionId = "action-handoff",
         actionSequence = 10,
         projectId = "project-1",
         threadId = "thread-1",
         autoRearm = true,
-        transitionGrant = T3VoiceBackgroundRealtimeTransitionGrant(
+        transitionGrant = VoiceRuntimeRealtimeTransitionGrant(
           token = TRANSITION_TOKEN,
           expiresAtEpochMillis = 8_500,
           generation = 8,
@@ -207,7 +220,16 @@ internal class VoiceRuntimeRealtimeCheckpointStoreTest {
     }
   }
 
-  private class MemoryStore : T3VoiceBackgroundKeyValueStore {
+  private inline fun <reified T : Throwable> expectThrows(block: () -> Unit) {
+    try {
+      block()
+      fail("Expected ${T::class.java.simpleName}")
+    } catch (cause: Throwable) {
+      if (cause !is T) throw cause
+    }
+  }
+
+  private class MemoryStore : VoiceRuntimeKeyValueStore {
     val values = linkedMapOf<String, String>()
     var putCount = 0
 

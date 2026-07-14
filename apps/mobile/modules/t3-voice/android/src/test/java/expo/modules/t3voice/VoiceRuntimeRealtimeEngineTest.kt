@@ -22,8 +22,9 @@ internal class VoiceRuntimeRealtimeEngineTest {
   private val peer = FakePeer()
   private val cues = FakeCues()
   private val handoff = FakeHandoff()
-  private val presentation = mutableListOf<T3VoiceBackgroundRealtimeAction>()
-  private var repository = VoiceRuntimeMemoryRealtimeCheckpointRepository()
+  private val presentation = mutableListOf<VoiceRuntimeRealtimeAction>()
+  private var repository: VoiceRuntimeRealtimeCheckpointRepository =
+    VoiceRuntimeMemoryRealtimeCheckpointRepository()
 
   @Test
   fun `capture stays disabled until peer connection and ready cue complete`() {
@@ -78,7 +79,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
   @Test
   fun `presentation actions hold the ordered cursor until focus and ack succeed`() {
     val engine = connectedEngine()
-    server.actionValues += T3VoiceBackgroundRealtimeAction.NavigateThread(
+    server.actionValues += VoiceRuntimeRealtimeAction.NavigateThread(
       7,
       now,
       "action-1",
@@ -86,7 +87,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
       "thread-1",
       now + 60_000,
     )
-    server.actionValues += T3VoiceBackgroundRealtimeAction.ConfirmationRequired(
+    server.actionValues += VoiceRuntimeRealtimeAction.ConfirmationRequired(
       9,
       now,
       "action-2",
@@ -110,7 +111,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
         "ack-1",
         "action-1",
         VoiceRuntimeRealtimePresentationDecision.Navigate(
-          T3VoiceBackgroundRealtimeActionOutcome.SUCCEEDED,
+          VoiceRuntimeRealtimeActionOutcome.SUCCEEDED,
           null,
         ),
       ),
@@ -136,9 +137,9 @@ internal class VoiceRuntimeRealtimeEngineTest {
   }
 
   @Test
-  fun `handoff exchanges authority before bounded drain and activates after close`() {
+  fun `handoff reserves before drain and commits after media release before activation`() {
     val engine = connectedEngine()
-    server.actionValues += T3VoiceBackgroundRealtimeAction.HandoffToThreadVoice(
+    server.actionValues += VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
       12,
       now,
       "handoff-1",
@@ -151,22 +152,132 @@ internal class VoiceRuntimeRealtimeEngineTest {
     assertTrue(engine.pollActions(fence))
     assertEquals(VoiceRealtimePhase.DRAINING, engine.snapshot()?.phase)
     assertFalse(peer.inputReady)
-    assertEquals(listOf("handoff-exchange", "input:false", "peer-drain"), trace.takeLast(3))
+    assertEquals(
+      listOf("handoff-exchange", "handoff-prepare", "input:false", "peer-drain"),
+      trace.takeLast(4),
+    )
     assertEquals(12L, engine.snapshot()?.lastActionSequence)
     assertFalse(handoff.activated)
 
     peer.completeDrain()
     assertEquals(VoiceRealtimePhase.STOPPING, engine.snapshot()?.phase)
-    assertEquals(listOf("peer-close", "server-close", "cue-ended"), trace.takeLast(3))
+    assertEquals(listOf("peer-close", "cue-ended"), trace.takeLast(2))
     assertFalse(handoff.activated)
 
     cues.completeEnded()
+    assertEquals(
+      listOf("handoff-commit", "server-close", "handoff-activate"),
+      trace.takeLast(3),
+    )
     assertTrue(handoff.activated)
     assertNull(engine.snapshot())
     val terminal = repository.terminals(now).single()
     assertEquals(VoiceRuntimeRealtimeTerminalOutcome.COMPLETED, terminal.outcome)
     assertEquals("thread-handoff", terminal.reason)
     assertFalse(terminal.serverCleanupPending)
+  }
+
+  @Test
+  fun `failed handoff commit retains the transition and recovery retries before closing`() {
+    val engine = connectedEngine()
+    server.commitSucceeds = false
+    server.actionValues += VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
+      12, now, "handoff-1", "project-1", "thread-1", true, now + 60_000,
+    )
+
+    assertTrue(engine.pollActions(fence))
+    peer.completeDrain()
+    cues.completeEnded()
+
+    assertEquals("handoff-commit", trace.last())
+    assertFalse(trace.contains("server-close"))
+    assertFalse(handoff.activated)
+    assertEquals(VoiceRealtimePhase.STOPPING, engine.snapshot()?.phase)
+    assertTrue(repository.terminals(now).isEmpty())
+
+    server.commitSucceeds = true
+    val recovered = engine().recoverInterrupted(identity)
+
+    assertEquals(VoiceRuntimeRealtimeTerminalOutcome.COMPLETED, recovered?.outcome)
+    assertEquals(listOf("handoff-commit", "server-close", "handoff-activate"), trace.takeLast(3))
+    assertTrue(handoff.activated)
+  }
+
+  @Test
+  fun `failed local handoff preparation never commits server authority`() {
+    val engine = connectedEngine()
+    handoff.prepareSucceeds = false
+    server.actionValues += VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
+      12, now, "handoff-1", "project-1", "thread-1", true, now + 60_000,
+    )
+
+    assertFalse(engine.pollActions(fence))
+
+    assertTrue(trace.contains("handoff-prepare"))
+    assertFalse(trace.contains("handoff-commit"))
+    assertFalse(handoff.activated)
+    assertEquals("handoff-admission-failed", repository.terminals(now).single().reason)
+  }
+
+  @Test
+  fun `prepared handoff does not drain or commit when checkpoint persistence fails`() {
+    val durable = VoiceRuntimeMemoryRealtimeCheckpointRepository()
+    val failing = FailingSaveRepository(durable)
+    repository = failing
+    val engine = connectedEngine()
+    server.actionValues += VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
+      12, now, "handoff-1", "project-1", "thread-1", true, now + 60_000,
+    )
+    failing.failNextSave = true
+
+    expectThrows<IllegalStateException> { engine.pollActions(fence) }
+
+    assertTrue(trace.contains("handoff-prepare"))
+    assertFalse(trace.contains("peer-drain"))
+    assertFalse(trace.contains("handoff-commit"))
+    assertNull(durable.load()?.pendingHandoffExchange)
+  }
+
+  @Test
+  fun `prepared handoff retries commit and activation after interruption`() {
+    val first = connectedEngine()
+    server.actionValues += VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
+      12, now, "handoff-1", "project-1", "thread-1", true, now + 60_000,
+    )
+    assertTrue(first.pollActions(fence))
+    peer.completeDrain()
+    handoff.throwOnActivate = true
+    expectThrows<IllegalStateException> { cues.completeEnded() }
+    assertEquals(VoiceRealtimePhase.STOPPING, first.snapshot()?.phase)
+
+    handoff.throwOnActivate = false
+    val replacement = engine()
+    val recovered = replacement.recoverInterrupted(identity)
+
+    assertEquals(VoiceRuntimeRealtimeTerminalOutcome.COMPLETED, recovered?.outcome)
+    assertTrue(handoff.activated)
+    assertTrue(trace.count { it == "handoff-commit" } >= 2)
+  }
+
+  @Test
+  fun `post-commit activation failure retains prepared handoff for restart`() {
+    val first = connectedEngine()
+    server.actionValues += VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
+      12, now, "handoff-1", "project-1", "thread-1", true, now + 60_000,
+    )
+    assertTrue(first.pollActions(fence))
+    peer.completeDrain()
+    handoff.activateSucceeds = false
+    cues.completeEnded()
+
+    assertEquals(VoiceRealtimePhase.STOPPING, first.snapshot()?.phase)
+    assertTrue(repository.terminals(now).isEmpty())
+
+    handoff.activateSucceeds = true
+    val replacement = engine()
+    val recovered = replacement.recoverInterrupted(identity)
+    assertEquals(VoiceRuntimeRealtimeTerminalOutcome.COMPLETED, recovered?.outcome)
+    assertTrue(handoff.activated)
   }
 
   @Test
@@ -184,7 +295,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
 
     resetFakes()
     val draining = connectedEngine()
-    server.actionValues += T3VoiceBackgroundRealtimeAction.StopRealtimeVoice(3, now)
+    server.actionValues += VoiceRuntimeRealtimeAction.StopRealtimeVoice(3, now)
     assertTrue(draining.pollActions(fence))
     assertEquals(VoiceRealtimePhase.DRAINING, draining.snapshot()?.phase)
     assertTrue(trace.contains("peer-drain"))
@@ -194,7 +305,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
   @Test
   fun `drain deadline forces shutdown when the peer never completes`() {
     val engine = connectedEngine()
-    server.actionValues += T3VoiceBackgroundRealtimeAction.StopRealtimeVoice(3, now)
+    server.actionValues += VoiceRuntimeRealtimeAction.StopRealtimeVoice(3, now)
     assertTrue(engine.pollActions(fence))
     assertFalse(engine.onDrainDeadline(fence, now + 2_499))
     assertFalse(trace.contains("peer-close"))
@@ -280,8 +391,8 @@ internal class VoiceRuntimeRealtimeEngineTest {
     repository = VoiceRuntimeMemoryRealtimeCheckpointRepository()
   }
 
-  private fun startResult() = T3VoiceBackgroundRealtimeStartResult(
-    T3VoiceBackgroundRealtimeSessionState(
+  private fun startResult() = VoiceRuntimeRealtimeStartResult(
+    VoiceRuntimeRealtimeSessionState(
       "session-1",
       "conversation-1",
       "signaling",
@@ -290,10 +401,10 @@ internal class VoiceRuntimeRealtimeEngineTest {
     ),
     "/api/voice/runtime/realtime-sessions/session-1/webrtc-offer",
     now + 600_000,
-    T3VoiceBackgroundRealtimeControlGrant("control-token", now + 300_000, 15, 45),
+    VoiceRuntimeRealtimeControlGrant("control-token", now + 300_000, 15, 45),
   )
 
-  private fun heartbeat(disposition: String) = T3VoiceBackgroundRealtimeHeartbeatResult(
+  private fun heartbeat(disposition: String) = VoiceRuntimeRealtimeHeartbeatResult(
     startResult().state.copy(phase = if (disposition == "live") "listening" else "ended"),
     disposition,
     false,
@@ -303,14 +414,16 @@ internal class VoiceRuntimeRealtimeEngineTest {
   private inner class FakeServer : VoiceRuntimeRealtimeServer {
     var startCount = 0
     var actionsCount = 0
-    val actionValues = mutableListOf<T3VoiceBackgroundRealtimeAction>()
-    var heartbeatResult: VoiceRuntimeRealtimeRemoteResult<T3VoiceBackgroundRealtimeHeartbeatResult> =
+    var commitSucceeds = true
+    val actionValues = mutableListOf<VoiceRuntimeRealtimeAction>()
+    var heartbeatResult: VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeHeartbeatResult> =
       VoiceRuntimeRealtimeRemoteResult.Success(heartbeat("live"))
 
     fun reset() {
       startCount = 0
       actionsCount = 0
       actionValues.clear()
+      commitSucceeds = true
       heartbeatResult = VoiceRuntimeRealtimeRemoteResult.Success(heartbeat("live"))
     }
 
@@ -323,27 +436,27 @@ internal class VoiceRuntimeRealtimeEngineTest {
     override fun offer(
       authority: VoiceRuntimeRealtimeAuthority,
       fence: VoiceRuntimeRealtimeFence,
-      session: T3VoiceBackgroundRealtimeStartResult,
+      session: VoiceRuntimeRealtimeStartResult,
       clientOperationId: String,
       sdp: String,
     ) = VoiceRuntimeRealtimeRemoteResult.Success(
-      T3VoiceBackgroundRealtimeAnswer("session-1", 2, "answer-sdp", false),
+      VoiceRuntimeRealtimeAnswer("session-1", 2, "answer-sdp", false),
     ).also { trace += "server-offer" }
 
     override fun heartbeat(
       authority: VoiceRuntimeRealtimeAuthority,
       fence: VoiceRuntimeRealtimeFence,
-      session: T3VoiceBackgroundRealtimeStartResult,
+      session: VoiceRuntimeRealtimeStartResult,
     ) = heartbeatResult
 
     override fun actions(
       authority: VoiceRuntimeRealtimeAuthority,
       fence: VoiceRuntimeRealtimeFence,
-      session: T3VoiceBackgroundRealtimeStartResult,
+      session: VoiceRuntimeRealtimeStartResult,
       afterSequence: Long,
       waitMilliseconds: Long,
     ) = VoiceRuntimeRealtimeRemoteResult.Success(
-      T3VoiceBackgroundRealtimeActionsResult(
+      VoiceRuntimeRealtimeActionsResult(
         session.state,
         actionValues.filter { it.sequence > afterSequence },
       ),
@@ -352,19 +465,19 @@ internal class VoiceRuntimeRealtimeEngineTest {
     override fun acknowledgeAction(
       authority: VoiceRuntimeRealtimeAuthority,
       fence: VoiceRuntimeRealtimeFence,
-      session: T3VoiceBackgroundRealtimeStartResult,
-      action: T3VoiceBackgroundRealtimeAction,
+      session: VoiceRuntimeRealtimeStartResult,
+      action: VoiceRuntimeRealtimeAction,
       clientOperationId: String,
       decision: VoiceRuntimeRealtimePresentationDecision,
     ) = VoiceRuntimeRealtimeRemoteResult.Success(
-      T3VoiceBackgroundRealtimeActionAckResult(
+      VoiceRuntimeRealtimeActionAckResult(
         actionId(action),
         action.sequence,
         when (decision) {
           is VoiceRuntimeRealtimePresentationDecision.Navigate -> decision.outcome
           is VoiceRuntimeRealtimePresentationDecision.Confirmation ->
-            if (decision.decision == "approve") T3VoiceBackgroundRealtimeActionOutcome.SUCCEEDED
-            else T3VoiceBackgroundRealtimeActionOutcome.FAILED
+            if (decision.decision == "approve") VoiceRuntimeRealtimeActionOutcome.SUCCEEDED
+            else VoiceRuntimeRealtimeActionOutcome.FAILED
         },
         false,
       ),
@@ -373,32 +486,32 @@ internal class VoiceRuntimeRealtimeEngineTest {
     override fun updateFocus(
       authority: VoiceRuntimeRealtimeAuthority,
       fence: VoiceRuntimeRealtimeFence,
-      session: T3VoiceBackgroundRealtimeStartResult,
+      session: VoiceRuntimeRealtimeStartResult,
       clientOperationId: String,
-      focus: T3VoiceBackgroundRealtimeFocus?,
+      focus: VoiceRuntimeRealtimeFocus?,
     ) = VoiceRuntimeRealtimeRemoteResult.Success(
-      T3VoiceBackgroundRealtimeFocusResult(session.state, focus, false),
+      VoiceRuntimeRealtimeFocusResult(session.state, focus, false),
     ).also { trace += "focus:${focus?.projectId}:${focus?.threadId}" }
 
     override fun exchangeHandoff(
       authority: VoiceRuntimeRealtimeAuthority,
       fence: VoiceRuntimeRealtimeFence,
-      session: T3VoiceBackgroundRealtimeStartResult,
-      action: T3VoiceBackgroundRealtimeAction.HandoffToThreadVoice,
+      session: VoiceRuntimeRealtimeStartResult,
+      action: VoiceRuntimeRealtimeAction.HandoffToThreadVoice,
       plan: VoiceRuntimeRealtimeHandoffPlan,
     ) = VoiceRuntimeRealtimeRemoteResult.Success(
-      T3VoiceBackgroundRealtimeHandoffExchangeResult(
+      VoiceRuntimeRealtimeHandoffExchangeResult(
         action.actionId,
         action.sequence,
         action.projectId,
         action.threadId,
         action.autoRearm,
-        T3VoiceBackgroundRealtimeTransitionGrant(
+        VoiceRuntimeRealtimeTransitionGrant(
           "thread-token",
           now + 300_000,
           identity.generation + 1,
           plan.threadModeSessionId,
-          T3VoiceBackgroundRealtimeThreadTarget(
+          VoiceRuntimeRealtimeThreadTarget(
             plan.environmentId,
             action.projectId,
             action.threadId,
@@ -413,13 +526,30 @@ internal class VoiceRuntimeRealtimeEngineTest {
       ),
     ).also { trace += "handoff-exchange" }
 
+    override fun commitHandoff(
+      authority: VoiceRuntimeRealtimeAuthority,
+      fence: VoiceRuntimeRealtimeFence,
+      session: VoiceRuntimeRealtimeStartResult,
+      exchange: VoiceRuntimeRealtimeHandoffExchangeResult,
+    ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeHandoffCommitResult> {
+      trace += "handoff-commit"
+      return if (commitSucceeds) VoiceRuntimeRealtimeRemoteResult.Success(
+        VoiceRuntimeRealtimeHandoffCommitResult(
+          exchange.actionId,
+          exchange.actionSequence,
+          true,
+          false,
+        ),
+      ) else VoiceRuntimeRealtimeRemoteResult.Failure("handoff-commit-failed", true)
+    }
+
     override fun close(
       authority: VoiceRuntimeRealtimeAuthority,
       fence: VoiceRuntimeRealtimeFence,
-      session: T3VoiceBackgroundRealtimeStartResult,
+      session: VoiceRuntimeRealtimeStartResult,
       clientOperationId: String,
     ) = VoiceRuntimeRealtimeRemoteResult.Success(
-      T3VoiceBackgroundRealtimeCloseResult(session.state.copy(phase = "ended"), true, false),
+      VoiceRuntimeRealtimeCloseResult(session.state.copy(phase = "ended"), true, false),
     ).also { trace += "server-close" }
   }
 
@@ -496,32 +626,59 @@ internal class VoiceRuntimeRealtimeEngineTest {
 
   private inner class FakeHandoff : VoiceRuntimeRealtimeHandoffCoordinator {
     var activated = false
+    var prepareSucceeds = true
+    var activateSucceeds = true
+    var throwOnActivate = false
 
     override fun plan(
       source: VoiceRuntimeRealtimeCheckpoint,
-      action: T3VoiceBackgroundRealtimeAction.HandoffToThreadVoice,
+      action: VoiceRuntimeRealtimeAction.HandoffToThreadVoice,
     ) = VoiceRuntimeRealtimeHandoffPlan(
       "handoff-operation-${action.sequence}",
       "thread-mode-${action.sequence}",
       source.target.environmentId,
       "default",
-      T3VoiceBackgroundRealtimeEndpointPolicy(2_200, null, 600_000),
+      VoiceRuntimeRealtimeEndpointPolicy(2_200, null, 600_000),
       true,
       250,
     )
 
-    override fun activate(result: T3VoiceBackgroundRealtimeHandoffExchangeResult): Boolean {
+    override fun prepare(result: VoiceRuntimeRealtimeHandoffExchangeResult): Boolean {
+      trace += "handoff-prepare"
+      return prepareSucceeds
+    }
+
+    override fun activate(result: VoiceRuntimeRealtimeHandoffExchangeResult): Boolean {
+      if (throwOnActivate) throw IllegalStateException("simulated process interruption")
+      if (!activateSucceeds) {
+        trace += "handoff-activate-failed"
+        return false
+      }
       activated = true
       trace += "handoff-activate"
       return true
     }
   }
 
-  private fun actionId(action: T3VoiceBackgroundRealtimeAction) = when (action) {
-    is T3VoiceBackgroundRealtimeAction.NavigateThread -> action.actionId
-    is T3VoiceBackgroundRealtimeAction.HandoffToThreadVoice -> action.actionId
-    is T3VoiceBackgroundRealtimeAction.ConfirmationRequired -> action.actionId
-    is T3VoiceBackgroundRealtimeAction.StopRealtimeVoice -> "stop"
+  private class FailingSaveRepository(
+    private val delegate: VoiceRuntimeRealtimeCheckpointRepository,
+  ) : VoiceRuntimeRealtimeCheckpointRepository by delegate {
+    var failNextSave = false
+
+    override fun save(checkpoint: VoiceRuntimeRealtimeCheckpoint) {
+      if (failNextSave) {
+        failNextSave = false
+        throw IllegalStateException("simulated checkpoint failure")
+      }
+      delegate.save(checkpoint)
+    }
+  }
+
+  private fun actionId(action: VoiceRuntimeRealtimeAction) = when (action) {
+    is VoiceRuntimeRealtimeAction.NavigateThread -> action.actionId
+    is VoiceRuntimeRealtimeAction.HandoffToThreadVoice -> action.actionId
+    is VoiceRuntimeRealtimeAction.ConfirmationRequired -> action.actionId
+    is VoiceRuntimeRealtimeAction.StopRealtimeVoice -> "stop"
   }
 
   private inline fun <reified T : Throwable> expectThrows(block: () -> Unit) {

@@ -85,12 +85,14 @@ class TestWebSocket {
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
   label: "Test environment",
+  voiceRuntimeProtocolMajor: 1,
   httpBaseUrl: "https://environment.example.test",
   wsBaseUrl: "wss://environment.example.test",
 });
 
 const PREPARED: PreparedConnection = {
   environmentId: TARGET.environmentId,
+  voiceRuntimeProtocolMajor: 1,
   label: TARGET.label,
   httpBaseUrl: TARGET.httpBaseUrl,
   socketUrl: "wss://environment.example.test/ws?wsTicket=test",
@@ -102,6 +104,7 @@ const SERVER_CONFIG: ServerConfigType = {
   environment: {
     environmentId: TARGET.environmentId,
     label: TARGET.label,
+    voiceRuntimeProtocolMajor: 1,
     platform: {
       os: "darwin",
       arch: "arm64",

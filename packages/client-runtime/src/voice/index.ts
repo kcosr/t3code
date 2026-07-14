@@ -4,3 +4,4 @@ export * from "./runtimeController.ts";
 export * from "./fakeRuntime.ts";
 export * from "./runtimeConformance.ts";
 export * from "./presentationBinding.ts";
+export * from "./protocol.ts";

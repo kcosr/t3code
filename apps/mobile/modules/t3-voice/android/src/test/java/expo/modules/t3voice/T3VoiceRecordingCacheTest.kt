@@ -114,7 +114,7 @@ class T3VoiceRecordingCacheTest {
       val restartedRegistry = T3VoiceCompletedRecordingRegistry(cache)
       assertTrue(restartedRegistry.restore(recording))
       var durableStateCleared = false
-      assertTrue(T3VoiceBackgroundThreadLocalCleanupCoordinator.complete(
+      assertTrue(VoiceRuntimeThreadLocalCleanupCoordinator.complete(
         deleteRecording = {
           runCatching {
             restartedRegistry.delete(recording.recordingId, recording.uri)

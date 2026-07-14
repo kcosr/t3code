@@ -57,6 +57,7 @@ async function configureThreadRuntime(runtime: FakeVoiceRuntime) {
     environmentOrigin: "https://termstation",
     operation: "thread-turn-start",
     readinessEnabled: true,
+    refreshRotationCounter: 0,
     token: "thread-token",
     issuedAt: "2020-01-01T00:00:00.000Z",
     expiresAt: "2099-01-01T00:00:00.000Z",

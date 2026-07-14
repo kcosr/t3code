@@ -4,14 +4,14 @@ import * as DateTime from "effect/DateTime";
 import { __testing } from "./controlHttp.ts";
 
 describe("voice capability descriptors", () => {
-  it("caps native runtime authority at the earlier parent-session expiry", () => {
+  it("caps runtime authority at the earlier parent-session expiry", () => {
     const now = DateTime.makeUnsafe("2026-07-13T00:00:00.000Z");
     expect(
       DateTime.formatIso(
-        __testing.nativeRuntimeExpiresAt(now, DateTime.makeUnsafe("2026-07-13T03:00:00.000Z")),
+        __testing.runtimeAuthorityExpiresAt(now, DateTime.makeUnsafe("2026-07-13T03:00:00.000Z")),
       ),
     ).toBe("2026-07-13T03:00:00.000Z");
-    expect(DateTime.formatIso(__testing.nativeRuntimeExpiresAt(now))).toBe(
+    expect(DateTime.formatIso(__testing.runtimeAuthorityExpiresAt(now))).toBe(
       "2026-08-12T00:00:00.000Z",
     );
   });

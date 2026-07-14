@@ -494,7 +494,7 @@ internal class T3VoiceWebRtcSession(
     return true
   }
 
-  fun failNativeControl(sessionId: String, retryable: Boolean) {
+  fun failRuntimeControl(sessionId: String, retryable: Boolean) {
     fail(
       sessionId,
       ERROR_NATIVE_CONTROL_LOST,

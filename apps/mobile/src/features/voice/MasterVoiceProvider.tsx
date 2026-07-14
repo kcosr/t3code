@@ -68,7 +68,6 @@ import {
 import {
   makeNativeVoiceRuntimeProvisioningAdapter,
   NativeVoiceRuntimeReplacementDeferredError,
-  nativeVoiceRuntimeRefreshAt,
   NativeVoiceRuntimeProvisioningCoordinator,
   resolveNativeVoiceRuntimeRevocationEndpoint,
 } from "./nativeVoiceRuntimeProvisioning";
@@ -217,11 +216,6 @@ export function UiAttachedMasterVoiceProvider(props: {
   const [readinessRetry, setReadinessRetry] = useState(0);
   const runtimeRef = useRef<MasterVoiceRuntime | null>(null);
   const nativeProvisioningEpochRef = useRef(0);
-  const nativeGrantRefreshRequestedRef = useRef(false);
-  const nativeGrantRefreshScheduleRef = useRef<{
-    readonly key: string;
-    readonly refreshAtEpochMillis: number;
-  } | null>(null);
   const cleanupCoordinatorsRef = useRef(new Map<EnvironmentId, RealtimeServerCleanupCoordinator>());
   const controllerHandoffsRef = useRef(new Map<EnvironmentId, RealtimeControllerHandoff>());
   const startInFlightRef = useRef(false);
@@ -413,7 +407,7 @@ export function UiAttachedMasterVoiceProvider(props: {
     const refreshOwnership = async (): Promise<string | null> => {
       const [state, ownership, persisted] = await Promise.all([
         native.getStateAsync(),
-        native.getBackgroundVoiceOwnershipAsync(),
+        native.getVoiceRuntimeOwnershipAsync(),
         realtimeVoiceAttachmentStore.load().catch(() => null),
       ]);
       if (disposed) return null;
@@ -488,7 +482,9 @@ export function UiAttachedMasterVoiceProvider(props: {
   const nativeProvisioning = useMemo(() => {
     if (native === null) return null;
     return new NativeVoiceRuntimeProvisioningCoordinator(
-      makeNativeVoiceRuntimeProvisioningAdapter(native, uuidv4),
+      makeNativeVoiceRuntimeProvisioningAdapter(native, uuidv4, async (authority) => {
+        await native.configureVoiceRuntimeAuthorityAsync(authority);
+      }),
     );
   }, [native]);
 
@@ -1232,7 +1228,6 @@ export function UiAttachedMasterVoiceProvider(props: {
     const readiness = nativeReadiness;
     let disposed = false;
     let registeredGeneration: number | null = null;
-    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
     let canonicalLease: VoiceRuntimeConsumerLease | null = null;
     let canonicalLeaseTimer: ReturnType<typeof setInterval> | null = null;
     let canonicalLeaseQueue = Promise.resolve();
@@ -1394,8 +1389,6 @@ export function UiAttachedMasterVoiceProvider(props: {
             environmentOrigin: conversationConnection.environmentOrigin,
           });
           nativeOperationsRef.current.assertCurrent(epoch);
-          nativeGrantRefreshRequestedRef.current = false;
-          nativeGrantRefreshScheduleRef.current = null;
           return;
         }
         const authorityReadiness = readinessToPersist.enabled
@@ -1429,42 +1422,13 @@ export function UiAttachedMasterVoiceProvider(props: {
           epoch: provisioningEpoch,
           readiness: exactReadiness,
           environmentOrigin: new URL(prepared.httpBaseUrl).origin,
-          operation:
-            resolvedTarget.target.mode === "realtime" ? "realtime-start" : "thread-turn-start",
           resolvedTarget,
-          refreshRequested: nativeGrantRefreshRequestedRef.current,
           resolvePendingRevocationEndpoint: resolveNativeRevocationEndpoint,
           retireUnresolvableRevocation: true,
         });
         nativeOperationsRef.current.assertCurrent(epoch);
         nativeReconciliationBackoffRef.current.reset();
-        if (nativeGrantRefreshRequestedRef.current) {
-          nativeGrantRefreshRequestedRef.current = false;
-          nativeGrantRefreshScheduleRef.current = null;
-        }
-        const expiresAtEpochMillis = Date.parse(provisioned.expiresAt);
-        const refreshKey = `${provisioned.runtimeId}:${provisioned.readinessGeneration}:${expiresAtEpochMillis}`;
-        const existingSchedule = nativeGrantRefreshScheduleRef.current;
-        const schedule =
-          existingSchedule?.key === refreshKey
-            ? existingSchedule
-            : {
-                key: refreshKey,
-                refreshAtEpochMillis: nativeVoiceRuntimeRefreshAt(expiresAtEpochMillis, Date.now()),
-              };
-        nativeGrantRefreshScheduleRef.current = schedule;
-        const scheduleRefresh = () => {
-          if (disposed) return;
-          const remaining = schedule.refreshAtEpochMillis - Date.now();
-          if (remaining > 0) {
-            refreshTimer = setTimeout(scheduleRefresh, Math.min(remaining, 2_147_000_000));
-            return;
-          }
-          nativeGrantRefreshRequestedRef.current = true;
-          setReadinessRetry((current) => current + 1);
-        };
-        scheduleRefresh();
-        nativeReadinessGenerationRef.current = provisioned.readinessGeneration;
+        nativeReadinessGenerationRef.current = provisioned.generation;
         if (resolvedTarget.target.mode === "thread") {
           const runtimeSnapshot = await native.getVoiceRuntimeSnapshotAsync();
           canonicalLease = await native.attachVoiceRuntimeAsync({
@@ -1480,9 +1444,7 @@ export function UiAttachedMasterVoiceProvider(props: {
           }, 10_000);
         }
         if (disposed) return;
-        const generation = nativeControllerGenerationRef.current.register(
-          provisioned.readinessGeneration,
-        );
+        const generation = nativeControllerGenerationRef.current.register(provisioned.generation);
         registeredGeneration = generation;
         await native.registerVoiceControllerAsync({ controllerGeneration: generation });
         nativeOperationsRef.current.assertCurrent(epoch);
@@ -1523,7 +1485,6 @@ export function UiAttachedMasterVoiceProvider(props: {
 
     return () => {
       disposed = true;
-      if (refreshTimer !== null) clearTimeout(refreshTimer);
       if (canonicalLeaseTimer !== null) clearInterval(canonicalLeaseTimer);
       const leaseToDetach = canonicalLease;
       canonicalLease = null;

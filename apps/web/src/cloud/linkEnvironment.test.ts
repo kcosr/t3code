@@ -98,6 +98,7 @@ function registryLayer(options?: {
       const target = new PrimaryConnectionTarget({
         environmentId: EnvironmentId.make(TARGET.environmentId),
         label: TARGET.label,
+        voiceRuntimeProtocolMajor: 1,
         httpBaseUrl: TARGET.httpBaseUrl,
         wsBaseUrl: TARGET.wsBaseUrl,
       });

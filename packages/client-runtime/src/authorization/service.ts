@@ -33,6 +33,7 @@ export interface RelayEnvironmentAuthorization {
 export interface AuthorizedRemoteEnvironment {
   readonly environmentId: EnvironmentId;
   readonly label: string;
+  readonly voiceRuntimeProtocolMajor: number;
   readonly httpBaseUrl: string;
   readonly socketUrl: string;
   readonly httpAuthorization: PreparedHttpAuthorization;
@@ -128,6 +129,7 @@ export const make = Effect.gen(function* () {
       return {
         environmentId: descriptor.environmentId,
         label: descriptor.label,
+        voiceRuntimeProtocolMajor: descriptor.voiceRuntimeProtocolMajor,
         httpBaseUrl: input.httpBaseUrl,
         socketUrl,
         httpAuthorization: {
@@ -198,10 +200,20 @@ export const make = Effect.gen(function* () {
         });
         const cachedSocket = yield* createDpopSocketUrl(cached.value).pipe(Effect.result);
         if (Result.isSuccess(cachedSocket)) {
+          const descriptor = yield* fetchDescriptor(cached.value.endpoint.httpBaseUrl).pipe(
+            Effect.provideService(HttpClient.HttpClient, httpClient),
+          );
+          if (descriptor.environmentId !== input.expectedEnvironmentId) {
+            return yield* environmentMismatchError({
+              expected: input.expectedEnvironmentId,
+              actual: descriptor.environmentId,
+            });
+          }
           yield* resetCachedEndpointFailures(input.expectedEnvironmentId);
           return {
             environmentId: cached.value.environmentId,
-            label: cached.value.label,
+            label: descriptor.label,
+            voiceRuntimeProtocolMajor: descriptor.voiceRuntimeProtocolMajor,
             httpBaseUrl: cached.value.endpoint.httpBaseUrl,
             socketUrl: cachedSocket.success,
             httpAuthorization: {
@@ -282,6 +294,7 @@ export const make = Effect.gen(function* () {
       return {
         environmentId: descriptor.environmentId,
         label: descriptor.label,
+        voiceRuntimeProtocolMajor: descriptor.voiceRuntimeProtocolMajor,
         httpBaseUrl: bootstrap.endpoint.httpBaseUrl,
         socketUrl,
         httpAuthorization: {

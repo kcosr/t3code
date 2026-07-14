@@ -121,6 +121,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
         Effect.succeed({
           environmentId: input.expectedEnvironmentId,
           label: "Authorized bearer environment",
+          voiceRuntimeProtocolMajor: 1,
           httpBaseUrl: input.httpBaseUrl,
           socketUrl: "wss://authorized.example.test/ws?wsTicket=bearer",
           httpAuthorization: {
@@ -135,6 +136,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
           Effect.as({
             environmentId: input.expectedEnvironmentId,
             label: "Authorized relay environment",
+            voiceRuntimeProtocolMajor: 1,
             httpBaseUrl: ENDPOINT.httpBaseUrl,
             socketUrl: "wss://authorized.example.test/ws?wsTicket=dpop",
             httpAuthorization: {
@@ -208,6 +210,7 @@ describe("ConnectionResolver", () => {
       const target = new PrimaryConnectionTarget({
         environmentId: ENVIRONMENT_ID,
         label: "Primary",
+        voiceRuntimeProtocolMajor: 1,
         httpBaseUrl: "http://127.0.0.1:3777",
         wsBaseUrl: "ws://127.0.0.1:3777",
       });
@@ -215,6 +218,7 @@ describe("ConnectionResolver", () => {
       expect(yield* broker.prepare(catalogEntry(target))).toEqual({
         environmentId: ENVIRONMENT_ID,
         label: "Primary",
+        voiceRuntimeProtocolMajor: 1,
         httpBaseUrl: "http://127.0.0.1:3777",
         socketUrl: "ws://127.0.0.1:3777/ws",
         httpAuthorization: null,
@@ -233,6 +237,7 @@ describe("ConnectionResolver", () => {
             Effect.as({
               environmentId: input.expectedEnvironmentId,
               label: "Primary",
+              voiceRuntimeProtocolMajor: 1,
               httpBaseUrl: input.httpBaseUrl,
               socketUrl: "ws://127.0.0.1:3777/ws?wsTicket=desktop",
               httpAuthorization: {
@@ -246,6 +251,7 @@ describe("ConnectionResolver", () => {
       const target = new PrimaryConnectionTarget({
         environmentId: ENVIRONMENT_ID,
         label: "Primary",
+        voiceRuntimeProtocolMajor: 1,
         httpBaseUrl: "http://127.0.0.1:3777",
         wsBaseUrl: "ws://127.0.0.1:3777",
       });
@@ -281,6 +287,7 @@ describe("ConnectionResolver", () => {
             Effect.as({
               environmentId: input.expectedEnvironmentId,
               label: "Saved",
+              voiceRuntimeProtocolMajor: 1,
               httpBaseUrl: input.httpBaseUrl,
               socketUrl: "wss://environment.example.test/ws?wsTicket=ticket",
               httpAuthorization: {
@@ -338,6 +345,7 @@ describe("ConnectionResolver", () => {
             Effect.as({
               environmentId: input.expectedEnvironmentId,
               label: "Cloud",
+              voiceRuntimeProtocolMajor: 1,
               httpBaseUrl: ENDPOINT.httpBaseUrl,
               socketUrl: "wss://environment.example.test/ws?wsTicket=dpop",
               httpAuthorization: {
@@ -375,6 +383,7 @@ describe("ConnectionResolver", () => {
             Effect.as({
               environmentId: input.expectedEnvironmentId,
               label: "Cloud",
+              voiceRuntimeProtocolMajor: 1,
               httpBaseUrl: ENDPOINT.httpBaseUrl,
               socketUrl: "wss://environment.example.test/ws?wsTicket=dpop",
               httpAuthorization: {

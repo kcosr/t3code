@@ -44,6 +44,7 @@ describe("SSH environment IPC", () => {
           label: "Remote Devbox",
           platform: { os: "linux", arch: "x64" },
           serverVersion: "1.2.3",
+          voiceRuntimeProtocolMajor: 1,
           capabilities: { repositoryIdentity: true },
         });
       }),
@@ -59,6 +60,7 @@ describe("SSH environment IPC", () => {
         label: "Remote Devbox",
         platform: { os: "linux", arch: "x64" },
         serverVersion: "1.2.3",
+        voiceRuntimeProtocolMajor: 1,
         capabilities: { repositoryIdentity: true },
       });
       assert.deepEqual(requestUrls, ["http://127.0.0.1:41773/.well-known/t3/environment"]);

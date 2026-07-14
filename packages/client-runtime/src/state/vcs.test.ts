@@ -23,6 +23,7 @@ import { makeCachedVcsRefsChanges } from "./vcs.ts";
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
   label: "Test environment",
+  voiceRuntimeProtocolMajor: 1,
   httpBaseUrl: "https://environment.example.test",
   wsBaseUrl: "wss://environment.example.test",
 });

@@ -7,8 +7,8 @@ import type {
   VoiceClientActionAckInput,
   VoiceClientActionAckResult,
   VoiceClientActionId,
-  VoiceNativeHandoffAction,
-  VoiceNativeHandoffActionAckInput,
+  VoiceRuntimeHandoffAction,
+  VoiceRuntimeHandoffActionAckInput,
   VoiceConversationClearContextResult,
   VoiceConversationId,
   VoiceSessionCloseResult,
@@ -30,8 +30,8 @@ import type { VoiceError } from "../Errors.ts";
 export interface VoiceSessionPrincipal {
   readonly sessionId: AuthSessionId;
   readonly scopes: ReadonlySet<AuthEnvironmentScope>;
-  readonly nativeRuntime?: {
-    readonly runtimeId: import("@t3tools/contracts").VoiceNativeRuntimeId;
+  readonly runtimeAuthority?: {
+    readonly runtimeId: import("@t3tools/contracts").VoiceRuntimeId;
     readonly generation: number;
   };
 }
@@ -77,9 +77,9 @@ export interface VoiceSessionServiceShape {
     waitMilliseconds: number,
   ) => Effect.Effect<VoiceSessionEventsResult, VoiceError>;
   readonly revokeAuthSession: (ownerAuthSessionId: AuthSessionId) => Effect.Effect<void>;
-  readonly revokeNativeRuntime: (
+  readonly revokeRuntimeAuthority: (
     ownerAuthSessionId: AuthSessionId,
-    runtimeId: import("@t3tools/contracts").VoiceNativeRuntimeId,
+    runtimeId: import("@t3tools/contracts").VoiceRuntimeId,
   ) => Effect.Effect<void>;
   readonly deleteConversation: (
     conversationId: VoiceConversationId,
@@ -106,15 +106,15 @@ export interface VoiceSessionServiceShape {
     sessionId: VoiceSessionId,
     leaseGeneration: number,
     limit: number,
-  ) => Effect.Effect<ReadonlyArray<VoiceNativeHandoffAction>, VoiceError>;
-  readonly acknowledgeNativeHandoffAction: (
+  ) => Effect.Effect<ReadonlyArray<VoiceRuntimeHandoffAction>, VoiceError>;
+  readonly acknowledgeRuntimeHandoffAction: (
     ownerAuthSessionId: AuthSessionId,
     sessionId: VoiceSessionId,
     leaseGeneration: number,
     actionId: VoiceClientActionId,
-    input: VoiceNativeHandoffActionAckInput,
+    input: VoiceRuntimeHandoffActionAckInput,
   ) => Effect.Effect<VoiceClientActionAckResult, VoiceError>;
-  readonly reconcileActivatedNativeHandoff: (
+  readonly reconcileActivatedRuntimeHandoff: (
     ownerAuthSessionId: AuthSessionId,
     sessionId: VoiceSessionId,
     leaseGeneration: number,

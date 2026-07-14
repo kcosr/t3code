@@ -50,14 +50,6 @@ export const VoiceConversationEntryId = TrimmedNonEmptyString.check(Schema.isMax
 );
 export type VoiceConversationEntryId = typeof VoiceConversationEntryId.Type;
 
-export const VoiceNativeRuntimeId = TrimmedNonEmptyString.check(Schema.isMaxLength(128)).pipe(
-  Schema.brand("VoiceNativeRuntimeId"),
-);
-export type VoiceNativeRuntimeId = typeof VoiceNativeRuntimeId.Type;
-export const VoiceNativeThreadTurnOperationId = TrimmedNonEmptyString.check(
-  Schema.isMaxLength(192),
-).pipe(Schema.brand("VoiceNativeThreadTurnOperationId"));
-export type VoiceNativeThreadTurnOperationId = typeof VoiceNativeThreadTurnOperationId.Type;
 export const VoiceRuntimeId = TrimmedNonEmptyString.check(Schema.isMaxLength(128)).pipe(
   Schema.brand("VoiceRuntimeId"),
 );

@@ -394,18 +394,18 @@ export class RealtimeVoiceController {
       this.ensureCurrentStart(generation);
       nativeSessionId = serverSession.state.sessionId;
       this.startingNativeSessionId = nativeSessionId;
-      let nativeControlGrant: VoiceSessionCreateResult["nativeControlGrant"] | null =
-        serverSession.nativeControlGrant;
+      let runtimeControlGrant: VoiceSessionCreateResult["runtimeControlGrant"] | null =
+        serverSession.runtimeControlGrant;
       let nativeOffer;
       try {
         nativeOffer = await this.native.prepareRealtimeSessionAsync({
           nativeSessionId,
           environmentOrigin: this.environmentOrigin,
           audioRouteId: this.preferredAudioRouteId(),
-          nativeControlGrant,
+          runtimeControlGrant,
         });
       } finally {
-        nativeControlGrant = null;
+        runtimeControlGrant = null;
         serverSession = null;
       }
       this.ensureCurrentStart(generation);

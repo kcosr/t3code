@@ -28,6 +28,7 @@ export interface PersistedVoiceRealtimeTransitionGrant {
   readonly modeSessionId: VoiceModeSessionId;
   readonly target: VoiceThreadRuntimeTarget;
   readonly expiresAt: number;
+  readonly authorityExpiresAt: number;
   readonly consumedAt: number | null;
 }
 
@@ -41,7 +42,7 @@ export interface VoiceRealtimeTransitionGrantRepositoryShape {
     | { readonly status: "mismatch" },
     PersistenceSqlError
   >;
-  readonly findActive: (
+  readonly findByToken: (
     tokenHash: string,
     now: number,
   ) => Effect.Effect<PersistedVoiceRealtimeTransitionGrant | undefined, PersistenceSqlError>;
@@ -49,15 +50,6 @@ export interface VoiceRealtimeTransitionGrantRepositoryShape {
     operationKey: string,
     now: number,
   ) => Effect.Effect<PersistedVoiceRealtimeTransitionGrant | undefined, PersistenceSqlError>;
-  readonly consume: (
-    tokenHash: string,
-    now: number,
-  ) => Effect.Effect<
-    | { readonly status: "consumed"; readonly record: PersistedVoiceRealtimeTransitionGrant }
-    | { readonly status: "already-consumed" }
-    | { readonly status: "missing" },
-    PersistenceSqlError
-  >;
   readonly revoke: (operationKey: string) => Effect.Effect<void, PersistenceSqlError>;
   readonly purgeExpired: (now: number) => Effect.Effect<void, PersistenceSqlError>;
 }

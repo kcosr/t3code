@@ -256,6 +256,26 @@ class T3VoiceModule : Module() {
         }
       }
 
+      AsyncFunction("prepareVoiceRuntimeAuthorityAsync") {
+        input: Map<String, Any?>, promise: Promise,
+        ->
+        val (readiness, preparation) = parseAuthorityPreparation(input)
+        withBinder(promise, "voice-runtime-authority-prepare-failed") { service, settlement ->
+          val result = service.prepareVoiceRuntimeAuthority(readiness, preparation)
+          settlement.resolve(authorityPreparationBody(result))
+        }
+      }
+
+      AsyncFunction("inspectVoiceRuntimeAuthorityAsync") {
+        promise: Promise,
+        ->
+        withBinder(promise, "voice-runtime-authority-inspection-failed") { service, settlement ->
+          settlement.resolve(
+            service.inspectVoiceRuntimeAuthority()?.let(::authorityInspectionBody),
+          )
+        }
+      }
+
       AsyncFunction("configureVoiceRuntimeAuthorityAsync") {
         input: Map<String, Any?>, promise: Promise,
         ->
@@ -361,6 +381,18 @@ class T3VoiceModule : Module() {
         }
       }
 
+      AsyncFunction("acknowledgeVoiceRuntimeRetainedRecordAsync") {
+        input: Map<String, Any?>, promise: Promise,
+        ->
+        val (identity, key) = VoiceRuntimeBridge.parseRetainedRecordAcknowledgement(input)
+        withBinder(promise, "voice-runtime-retained-acknowledgement-failed") {
+          service, settlement,
+          ->
+          service.acknowledgeVoiceRuntimeRetainedRecord(identity, key)
+          settlement.resolve()
+        }
+      }
+
       AsyncFunction("dispatchVoiceRuntimeAsync") { input: Map<String, Any?>, promise: Promise ->
         val command = VoiceRuntimeBridge.parseCommand(input)
         withBinder(promise, "voice-runtime-command-failed") { service, settlement ->
@@ -445,149 +477,42 @@ class T3VoiceModule : Module() {
         }
       }
 
-      AsyncFunction("prepareBackgroundVoiceReadinessAsync") {
-        input: Map<String, Any?>,
-        promise: Promise,
-        ->
-        requireExactKeys(
-          input,
-          setOf("readiness", "runtimeId", "environmentOrigin", "operation", "targetIdentity"),
-        )
-        val readinessInput =
-          input["readiness"] as? Map<*, *>
-            ?: throw IllegalArgumentException("readiness must be an object.")
-        @Suppress("UNCHECKED_CAST")
-        val readiness = parseReadinessConfig(readinessInput as Map<String, Any?>)
-        val runtimeId = requireText(input, "runtimeId", 128)
-        val environmentOrigin = requireText(input, "environmentOrigin", 2_048)
-        val operation =
-          T3VoiceRuntimeGrantOperation.fromWireValue(requireText(input, "operation", 64))
-        val targetIdentityDigest =
-          T3VoiceRuntimeTargetIdentity.digest(
-            requireText(input, "targetIdentity", MAXIMUM_TARGET_IDENTITY_LENGTH),
-          )
-        withBinder(promise, "voice-readiness-prepare-failed") { service, settlement ->
-          val prepared =
-            service.prepareBackgroundVoiceReadiness(
-              readiness,
-              runtimeId,
-              environmentOrigin,
-              operation,
-              targetIdentityDigest,
-            )
-          settlement.resolve(
-            mapOf(
-              "runtimeId" to prepared.runtimeId,
-              "readiness" to readinessBody(prepared.config),
-              "environmentOrigin" to prepared.environmentOrigin,
-              "operation" to prepared.operation.wireValue,
-            ),
-          )
-        }
-      }
-
-      AsyncFunction("inspectBackgroundVoiceAuthorityAsync") {
-        input: Map<String, Any?>,
-        promise: Promise,
-        ->
-        requireExactKeys(input, setOf("readiness", "environmentOrigin", "operation", "targetIdentity"))
-        val readinessInput =
-          input["readiness"] as? Map<*, *>
-            ?: throw IllegalArgumentException("readiness must be an object.")
-        @Suppress("UNCHECKED_CAST")
-        val readiness = parseReadinessConfig(readinessInput as Map<String, Any?>)
-        val environmentOrigin = requireText(input, "environmentOrigin", 2_048)
-        val operation =
-          T3VoiceRuntimeGrantOperation.fromWireValue(requireText(input, "operation", 64))
-        val targetIdentityDigest =
-          T3VoiceRuntimeTargetIdentity.digest(
-            requireText(input, "targetIdentity", MAXIMUM_TARGET_IDENTITY_LENGTH),
-          )
-        withBinder(promise, "voice-authority-inspection-failed") { service, settlement ->
-          settlement.resolve(
-            service.inspectBackgroundVoiceAuthority(
-              readiness,
-              environmentOrigin,
-              operation,
-              targetIdentityDigest,
-            )?.let(::authorityBody),
-          )
-        }
-      }
-
-      AsyncFunction("activateBackgroundVoiceReadinessAsync") {
-        input: Map<String, Any?>,
-        promise: Promise,
-        ->
-        requireExactKeys(input, setOf("readiness", "expectedGeneration", "grant"))
-        val readinessInput =
-          input["readiness"] as? Map<*, *>
-            ?: throw IllegalArgumentException("readiness must be an object.")
-        val grantInput =
-          input["grant"] as? Map<*, *>
-            ?: throw IllegalArgumentException("grant must be an object.")
-        @Suppress("UNCHECKED_CAST")
-        val readiness = parseReadinessConfig(readinessInput as Map<String, Any?>)
-        @Suppress("UNCHECKED_CAST")
-        val activation = parseRuntimeGrant(grantInput as Map<String, Any?>)
-        val expectedGeneration = requireLong(input, "expectedGeneration")
-        withBinder(promise, "voice-readiness-activate-failed") { service, settlement ->
-          settlement.resolve(
-            readinessBody(
-              service.activateBackgroundVoiceReadiness(
-                readiness,
-                expectedGeneration,
-                activation,
-              ),
-            ),
-          )
-        }
-      }
-
-      AsyncFunction("disableBackgroundVoiceReadinessAsync") { promise: Promise ->
+      AsyncFunction("disableVoiceRuntimeReadinessAsync") { promise: Promise ->
         withBinder(promise, "voice-readiness-disable-failed") { service, settlement ->
-          val disabled = service.disableBackgroundVoiceReadiness()
-          settlement.resolve(
-            mapOf(
-              "runtimeId" to disabled.runtimeId,
-              "readiness" to readinessBody(disabled.config),
-            ),
-          )
+          service.disableRuntimeVoiceReadiness()
+          settlement.resolve(VoiceRuntimeBridge.snapshotBody(service.voiceRuntimeSnapshot()))
         }
       }
 
-      AsyncFunction("disableBackgroundVoiceReadinessIfIdleAsync") {
+      AsyncFunction("clearVoiceRuntimeAuthorityIfIdleAsync") {
         input: Map<String, Any?>,
         promise: Promise,
         ->
-        requireExactKeys(input, setOf("expectedRuntimeId", "expectedGeneration"))
-        val runtimeId = input["expectedRuntimeId"]?.let { requireText(input, "expectedRuntimeId", 128) }
-        val generation = optionalLong(input, "expectedGeneration")
+        requireExactKeys(input, setOf("runtimeId", "generation"))
+        val runtimeId = input["runtimeId"]?.let { requireText(input, "runtimeId", 128) }
+        val generation = optionalLong(input, "generation")
         withBinder(promise, "voice-readiness-disable-failed") { service, settlement ->
           settlement.resolve(
-            service.disableBackgroundVoiceReadinessIfIdle(runtimeId, generation)?.let { disabled ->
-              mapOf(
-                "runtimeId" to disabled.runtimeId,
-                "readiness" to readinessBody(disabled.config),
-              )
+            service.disableRuntimeVoiceReadinessIfIdle(runtimeId, generation)?.let {
+              VoiceRuntimeBridge.snapshotBody(service.voiceRuntimeSnapshot())
             },
           )
         }
       }
 
-      AsyncFunction("getPendingBackgroundVoiceRuntimeRevocationAsync") { promise: Promise ->
+      AsyncFunction("getPendingVoiceRuntimeAuthorityRevocationAsync") { promise: Promise ->
         withBinder(promise, "voice-runtime-revocation-read-failed") { service, settlement ->
           settlement.resolve(service.pendingRuntimeRevocation()?.let(::runtimeRevocationBody))
         }
       }
 
-      AsyncFunction("getBackgroundVoiceOwnershipAsync") { promise: Promise ->
+      AsyncFunction("getVoiceRuntimeOwnershipAsync") { promise: Promise ->
         withBinder(promise, "voice-ownership-read-failed") { service, settlement ->
-          settlement.resolve(service.backgroundVoiceOwnership())
+          settlement.resolve(service.runtimeVoiceOwnership())
         }
       }
 
-      AsyncFunction("acknowledgeBackgroundVoiceRuntimeRevocationAsync") {
+      AsyncFunction("acknowledgeVoiceRuntimeAuthorityRevocationAsync") {
         input: Map<String, Any?>,
         promise: Promise,
         ->
@@ -595,7 +520,7 @@ class T3VoiceModule : Module() {
         val expected =
           T3VoicePendingRuntimeRevocation(
             requireText(input, "runtimeId", 128),
-            T3VoiceBackgroundOriginPolicy.normalize(
+            VoiceRuntimeOriginPolicy.normalize(
               requireText(input, "environmentOrigin", 2_048),
             ),
           )
@@ -604,38 +529,9 @@ class T3VoiceModule : Module() {
           settlement,
           ->
           check(service.acknowledgeRuntimeRevocation(expected)) {
-            "The pending background voice runtime revocation is stale."
+            "The pending runtime voice runtime revocation is stale."
           }
           settlement.resolve()
-        }
-      }
-
-      AsyncFunction("beginBackgroundVoiceGrantRefreshAsync") {
-        input: Map<String, Any?>,
-        promise: Promise,
-        ->
-        requireExactKeys(
-          input,
-          setOf("runtimeId", "readinessGeneration", "environmentOrigin", "operation", "targetIdentity"),
-        )
-        val metadata = parseRuntimeGrantMetadata(input, expiresAtEpochMillis = 1)
-        withBinder(promise, "voice-runtime-grant-refresh-begin-failed") { service, settlement ->
-          settlement.resolve(authorityBody(service.beginBackgroundVoiceGrantRefresh(metadata)))
-        }
-      }
-
-      AsyncFunction("installBackgroundVoiceRuntimeGrantAsync") {
-        input: Map<String, Any?>,
-        promise: Promise,
-        ->
-        requireExactKeys(input, setOf("grant"))
-        val grantInput =
-          input["grant"] as? Map<*, *>
-            ?: throw IllegalArgumentException("grant must be an object.")
-        @Suppress("UNCHECKED_CAST")
-        val grant = parseRuntimeGrant(grantInput as Map<String, Any?>)
-        withBinder(promise, "voice-runtime-grant-install-failed") { service, settlement ->
-          settlement.resolve(authorityBody(service.installBackgroundVoiceRuntimeGrant(grant.grant)))
         }
       }
 
@@ -920,15 +816,15 @@ class T3VoiceModule : Module() {
       AsyncFunction("prepareRealtimeSessionAsync") { input: Map<String, Any>, promise: Promise ->
         requireExactKeys(
           input,
-          setOf("nativeSessionId", "environmentOrigin", "audioRouteId", "nativeControlGrant"),
+          setOf("nativeSessionId", "environmentOrigin", "audioRouteId", "runtimeControlGrant"),
         )
         val nativeSessionId = requireIdentifier(input, "nativeSessionId")
         val environmentOrigin = requireText(input, "environmentOrigin", 2_048)
         val audioRouteId = requireText(input, "audioRouteId", 64)
         @Suppress("UNCHECKED_CAST")
         val grantInput =
-          input["nativeControlGrant"] as? Map<String, Any>
-            ?: error("nativeControlGrant is required.")
+          input["runtimeControlGrant"] as? Map<String, Any>
+            ?: error("runtimeControlGrant is required.")
         requireExactKeys(
           grantInput,
           setOf(
@@ -942,8 +838,8 @@ class T3VoiceModule : Module() {
         )
         val grantSessionId = requireIdentifier(grantInput, "sessionId")
         check(grantSessionId == nativeSessionId) { "Native control grant session does not match." }
-        val nativeControlGrant =
-          T3VoiceNativeControlGrant(
+        val runtimeControlGrant =
+          VoiceRuntimeControlGrant(
             token = requireText(grantInput, "token", 128),
             sessionId = grantSessionId,
             leaseGeneration = requireLong(grantInput, "leaseGeneration"),
@@ -954,16 +850,16 @@ class T3VoiceModule : Module() {
             failureGraceMillis =
               Math.multiplyExact(requireLong(grantInput, "failureGraceSeconds"), 1_000L),
           )
-        check(nativeControlGrant.leaseGeneration > 0) { "leaseGeneration must be positive." }
-        check(nativeControlGrant.heartbeatIntervalMillis > 0) {
+        check(runtimeControlGrant.leaseGeneration > 0) { "leaseGeneration must be positive." }
+        check(runtimeControlGrant.heartbeatIntervalMillis > 0) {
           "heartbeatIntervalSeconds must be positive."
         }
-        check(nativeControlGrant.failureGraceMillis > 0) {
+        check(runtimeControlGrant.failureGraceMillis > 0) {
           "failureGraceSeconds must be positive."
         }
         if (
           runCatching {
-              T3VoiceNativeControlOriginPolicy.heartbeatUrl(environmentOrigin, nativeSessionId)
+              VoiceRuntimeControlOriginPolicy.heartbeatUrl(environmentOrigin, nativeSessionId)
             }
             .isFailure
         ) {
@@ -981,7 +877,7 @@ class T3VoiceModule : Module() {
               nativeSessionId,
               environmentOrigin,
               audioRouteId,
-              nativeControlGrant,
+              runtimeControlGrant,
               object : T3VoiceWebRtcResultCallback<String> {
                 override fun onSuccess(result: String) {
                   settlement.resolve(
@@ -1306,38 +1202,69 @@ class T3VoiceModule : Module() {
     )
   }
 
-  private fun parseRuntimeGrant(input: Map<String, Any?>): T3VoiceRuntimeGrantActivation {
-    requireExactKeys(input, RUNTIME_GRANT_FIELDS)
-    val targetIdentityDigest =
-      T3VoiceRuntimeTargetIdentity.digest(
-        requireText(input, "targetIdentity", MAXIMUM_TARGET_IDENTITY_LENGTH),
-      )
-    val operation =
-      T3VoiceRuntimeGrantOperation.fromWireValue(requireText(input, "operation", 64))
+  private fun parseAuthorityPreparation(
+    input: Map<String, Any?>,
+  ): Pair<T3VoiceReadinessConfig, VoiceRuntimeAuthorityPreparation> {
+    requireExactKeys(input, AUTHORITY_PREPARATION_FIELDS)
+    @Suppress("UNCHECKED_CAST")
+    val readiness = parseReadinessConfig(
+      input["readiness"] as? Map<String, Any?>
+        ?: throw IllegalArgumentException("readiness must be an object."),
+    )
     @Suppress("UNCHECKED_CAST")
     val targetInput = input["target"] as? Map<String, Any?>
       ?: throw IllegalArgumentException("target must be an object.")
+    val operation = T3VoiceRuntimeGrantOperation.fromWireValue(requireText(input, "operation", 64))
     val target = when (operation) {
+      T3VoiceRuntimeGrantOperation.REALTIME_START -> VoiceRuntimeBridge.parseRealtimeTarget(targetInput)
       T3VoiceRuntimeGrantOperation.THREAD_TURN_START -> VoiceRuntimeBridge.parseThreadTarget(targetInput)
-      T3VoiceRuntimeGrantOperation.REALTIME_START -> null
     }
-    val grant = T3VoiceRuntimeGrant(
-      metadata =
-        T3VoiceRuntimeGrantMetadata(
-          runtimeId = requireText(input, "runtimeId", 128),
-          readinessGeneration = requireLong(input, "readinessGeneration"),
-          environmentOrigin = requireText(input, "environmentOrigin", 2_048),
-          operation = operation,
-          targetIdentityDigest = targetIdentityDigest,
-          expiresAtEpochMillis = requireLong(input, "expiresAtEpochMillis"),
-        ),
-      token = requireText(input, "token", 128),
-    )
-    return T3VoiceRuntimeGrantActivation(
-      grant,
-      target,
+    return readiness to VoiceRuntimeAuthorityPreparation(
+      requireText(input, "runtimeId", 128),
+      requireText(input, "runtimeInstanceId", 128),
       requireText(input, "provisioningOperationId", 256),
-      java.time.Instant.parse(requireText(input, "issuedAt", 64)).toEpochMilli(),
+      requireLong(input, "expectedCurrentGeneration"),
+      requireLong(input, "generation"),
+      requireText(input, "targetDigest", 64),
+      target,
+      operation,
+      requireText(input, "environmentOrigin", 2_048),
+      readiness.enabled,
+    )
+  }
+
+  private fun authorityPreparationBody(
+    result: VoiceRuntimeAuthorityPreparationResult,
+  ): Map<String, Any?> = authorityReservationBody(result.preparation) + mapOf(
+    "state" to "prepared",
+    "refreshCredentialHash" to result.refreshCredentialHash,
+  )
+
+  private fun authorityReservationBody(
+    input: VoiceRuntimeAuthorityPreparation,
+  ): Map<String, Any?> = mapOf(
+    "runtimeId" to input.runtimeId,
+    "runtimeInstanceId" to input.runtimeInstanceId,
+    "provisioningOperationId" to input.provisioningOperationId,
+    "expectedCurrentGeneration" to input.expectedCurrentGeneration.toDouble(),
+    "generation" to input.generation.toDouble(),
+    "targetDigest" to input.targetDigest,
+    "target" to VoiceRuntimeBridge.targetBody(input.target),
+    "operation" to input.operation.wireValue,
+    "environmentOrigin" to VoiceRuntimeOriginPolicy.normalize(input.environmentOrigin),
+    "readinessEnabled" to input.readinessEnabled,
+  )
+
+  private fun authorityInspectionBody(
+    inspection: VoiceRuntimeAuthorityInspection,
+  ): Map<String, Any?> {
+    val input = inspection.preparation
+    return authorityReservationBody(input) + mapOf(
+      "state" to inspection.state,
+      "refreshCredentialHash" to inspection.refreshCredentialHash,
+      "issuedAt" to inspection.issuedAtEpochMillis?.let { java.time.Instant.ofEpochMilli(it).toString() },
+      "expiresAt" to inspection.expiresAtEpochMillis?.let { java.time.Instant.ofEpochMilli(it).toString() },
+      "refreshRotationCounter" to inspection.refreshRotationCounter?.toDouble(),
     )
   }
 
@@ -1357,7 +1284,7 @@ class T3VoiceModule : Module() {
       expiresAtEpochMillis = expiresAtEpochMillis,
     )
 
-  private fun authorityBody(snapshot: T3VoiceBackgroundAuthoritySnapshot): Map<String, Any?> =
+  private fun authorityBody(snapshot: VoiceRuntimeAuthoritySnapshot): Map<String, Any?> =
     mapOf(
       "state" to snapshot.state.wireValue,
       "runtimeId" to snapshot.runtimeId,
@@ -1373,7 +1300,7 @@ class T3VoiceModule : Module() {
   ): Map<String, Any> =
     mapOf(
       "runtimeId" to revocation.runtimeId,
-      "environmentOrigin" to T3VoiceBackgroundOriginPolicy.normalize(revocation.environmentOrigin),
+      "environmentOrigin" to VoiceRuntimeOriginPolicy.normalize(revocation.environmentOrigin),
     )
 
   private fun readinessBody(snapshot: T3VoiceReadinessConfig): Map<String, Any?> =
@@ -1473,18 +1400,10 @@ class T3VoiceModule : Module() {
         "microphonePermissionGranted",
         "notificationPermissionGranted",
       )
-    private val RUNTIME_GRANT_FIELDS =
-      setOf(
-        "runtimeId",
-        "readinessGeneration",
-        "environmentOrigin",
-        "operation",
-        "targetIdentity",
-        "target",
-        "provisioningOperationId",
-        "issuedAt",
-        "expiresAtEpochMillis",
-        "token",
-      )
+    private val AUTHORITY_PREPARATION_FIELDS = setOf(
+      "readiness", "runtimeId", "runtimeInstanceId", "provisioningOperationId",
+      "expectedCurrentGeneration", "generation", "targetDigest", "target", "operation",
+      "environmentOrigin",
+    )
   }
 }

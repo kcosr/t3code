@@ -1,7 +1,7 @@
 package expo.modules.t3voice
 
 internal class VoiceRuntimeRealtimeHttpGateway(
-  private val delegate: T3VoiceBackgroundRealtimeDelegate = T3VoiceBackgroundRealtimeDelegate(),
+  private val delegate: VoiceRuntimeRealtimeDelegate = VoiceRuntimeRealtimeDelegate(),
 ) : VoiceRuntimeRealtimeServer {
   override fun start(
     authority: VoiceRuntimeRealtimeAuthority,
@@ -10,26 +10,26 @@ internal class VoiceRuntimeRealtimeHttpGateway(
   ) = delegate.start(
     authority.environmentOrigin,
     authority.runtimeToken,
-    T3VoiceBackgroundRealtimeStartInput(fence.toTransport(), clientOperationId),
+    VoiceRuntimeRealtimeStartInput(fence.toTransport(), clientOperationId),
   ).toRuntimeResult()
 
   override fun offer(
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
-    session: T3VoiceBackgroundRealtimeStartResult,
+    session: VoiceRuntimeRealtimeStartResult,
     clientOperationId: String,
     sdp: String,
   ) = delegate.offer(
     authority.environmentOrigin,
     session.controlGrant.token,
     session.state.sessionId,
-    T3VoiceBackgroundRealtimeOfferInput(session.leaseFence(fence), clientOperationId, sdp),
+    VoiceRuntimeRealtimeOfferInput(session.leaseFence(fence), clientOperationId, sdp),
   ).toRuntimeResult()
 
   override fun heartbeat(
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
-    session: T3VoiceBackgroundRealtimeStartResult,
+    session: VoiceRuntimeRealtimeStartResult,
   ) = delegate.heartbeat(
     authority.environmentOrigin,
     session.controlGrant.token,
@@ -40,14 +40,14 @@ internal class VoiceRuntimeRealtimeHttpGateway(
   override fun actions(
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
-    session: T3VoiceBackgroundRealtimeStartResult,
+    session: VoiceRuntimeRealtimeStartResult,
     afterSequence: Long,
     waitMilliseconds: Long,
   ) = delegate.actions(
     authority.environmentOrigin,
     session.controlGrant.token,
     session.state.sessionId,
-    T3VoiceBackgroundRealtimeActionsQuery(
+    VoiceRuntimeRealtimeActionsQuery(
       session.leaseFence(fence),
       afterSequence,
       waitMilliseconds,
@@ -57,14 +57,14 @@ internal class VoiceRuntimeRealtimeHttpGateway(
   override fun acknowledgeAction(
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
-    session: T3VoiceBackgroundRealtimeStartResult,
-    action: T3VoiceBackgroundRealtimeAction,
+    session: VoiceRuntimeRealtimeStartResult,
+    action: VoiceRuntimeRealtimeAction,
     clientOperationId: String,
     decision: VoiceRuntimeRealtimePresentationDecision,
-  ): VoiceRuntimeRealtimeRemoteResult<T3VoiceBackgroundRealtimeActionAckResult> {
+  ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeActionAckResult> {
     val actionId = when (action) {
-      is T3VoiceBackgroundRealtimeAction.NavigateThread -> action.actionId
-      is T3VoiceBackgroundRealtimeAction.ConfirmationRequired -> action.actionId
+      is VoiceRuntimeRealtimeAction.NavigateThread -> action.actionId
+      is VoiceRuntimeRealtimeAction.ConfirmationRequired -> action.actionId
       else -> return VoiceRuntimeRealtimeRemoteResult.Failure("unsupported-action-ack", false)
     }
     return delegate.acknowledgeAction(
@@ -74,7 +74,7 @@ internal class VoiceRuntimeRealtimeHttpGateway(
       actionId,
       when (decision) {
         is VoiceRuntimeRealtimePresentationDecision.Navigate ->
-          T3VoiceBackgroundRealtimeActionAckInput.NavigateThread(
+          VoiceRuntimeRealtimeActionAckInput.NavigateThread(
             session.leaseFence(fence),
             clientOperationId,
             action.sequence,
@@ -82,7 +82,7 @@ internal class VoiceRuntimeRealtimeHttpGateway(
             decision.message,
           )
         is VoiceRuntimeRealtimePresentationDecision.Confirmation ->
-          T3VoiceBackgroundRealtimeActionAckInput.ConfirmationRequired(
+          VoiceRuntimeRealtimeActionAckInput.ConfirmationRequired(
             session.leaseFence(fence),
             clientOperationId,
             action.sequence,
@@ -96,14 +96,14 @@ internal class VoiceRuntimeRealtimeHttpGateway(
   override fun updateFocus(
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
-    session: T3VoiceBackgroundRealtimeStartResult,
+    session: VoiceRuntimeRealtimeStartResult,
     clientOperationId: String,
-    focus: T3VoiceBackgroundRealtimeFocus?,
+    focus: VoiceRuntimeRealtimeFocus?,
   ) = delegate.updateFocus(
     authority.environmentOrigin,
     session.controlGrant.token,
     session.state.sessionId,
-    T3VoiceBackgroundRealtimeFocusInput(
+    VoiceRuntimeRealtimeFocusInput(
       session.leaseFence(fence),
       clientOperationId,
       focus,
@@ -113,15 +113,15 @@ internal class VoiceRuntimeRealtimeHttpGateway(
   override fun exchangeHandoff(
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
-    session: T3VoiceBackgroundRealtimeStartResult,
-    action: T3VoiceBackgroundRealtimeAction.HandoffToThreadVoice,
+    session: VoiceRuntimeRealtimeStartResult,
+    action: VoiceRuntimeRealtimeAction.HandoffToThreadVoice,
     plan: VoiceRuntimeRealtimeHandoffPlan,
   ) = delegate.exchangeHandoff(
     authority.environmentOrigin,
     session.controlGrant.token,
     session.state.sessionId,
     action.actionId,
-    T3VoiceBackgroundRealtimeHandoffExchangeInput(
+    VoiceRuntimeRealtimeHandoffExchangeInput(
       session.leaseFence(fence),
       plan.clientOperationId,
       action.sequence,
@@ -135,37 +135,55 @@ internal class VoiceRuntimeRealtimeHttpGateway(
     ),
   ).toRuntimeResult()
 
+  override fun commitHandoff(
+    authority: VoiceRuntimeRealtimeAuthority,
+    fence: VoiceRuntimeRealtimeFence,
+    session: VoiceRuntimeRealtimeStartResult,
+    exchange: VoiceRuntimeRealtimeHandoffExchangeResult,
+  ) = delegate.commitHandoff(
+    authority.environmentOrigin,
+    exchange.transitionGrant.token,
+    session.state.sessionId,
+    exchange.actionId,
+    VoiceRuntimeRealtimeHandoffCommitInput(
+      session.leaseFence(fence),
+      exchange.actionSequence,
+      exchange.transitionGrant.generation,
+      exchange.transitionGrant.modeSessionId,
+    ),
+  ).toRuntimeResult()
+
   override fun close(
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
-    session: T3VoiceBackgroundRealtimeStartResult,
+    session: VoiceRuntimeRealtimeStartResult,
     clientOperationId: String,
   ) = delegate.close(
     authority.environmentOrigin,
     session.controlGrant.token,
     session.state.sessionId,
-    T3VoiceBackgroundRealtimeCloseInput(session.leaseFence(fence), clientOperationId),
+    VoiceRuntimeRealtimeCloseInput(session.leaseFence(fence), clientOperationId),
   ).toRuntimeResult()
 
-  private fun VoiceRuntimeRealtimeFence.toTransport() = T3VoiceBackgroundRealtimeFence(
+  private fun VoiceRuntimeRealtimeFence.toTransport() = VoiceRealtimeTransportFence(
     identity.runtimeId,
     identity.runtimeInstanceId,
     identity.generation,
     modeSessionId,
   )
 
-  private fun T3VoiceBackgroundRealtimeStartResult.leaseFence(fence: VoiceRuntimeRealtimeFence) =
-    T3VoiceBackgroundRealtimeLeaseFence(fence.toTransport(), state.leaseGeneration)
+  private fun VoiceRuntimeRealtimeStartResult.leaseFence(fence: VoiceRuntimeRealtimeFence) =
+    VoiceRuntimeRealtimeLeaseFence(fence.toTransport(), state.leaseGeneration)
 
-  private fun <T> T3VoiceBackgroundRealtimeResult<T>.toRuntimeResult():
+  private fun <T> VoiceRuntimeRealtimeResult<T>.toRuntimeResult():
     VoiceRuntimeRealtimeRemoteResult<T> = when (this) {
-    is T3VoiceBackgroundRealtimeResult.Success -> VoiceRuntimeRealtimeRemoteResult.Success(value)
-    is T3VoiceBackgroundRealtimeResult.Failure -> VoiceRuntimeRealtimeRemoteResult.Failure(
+    is VoiceRuntimeRealtimeResult.Success -> VoiceRuntimeRealtimeRemoteResult.Success(value)
+    is VoiceRuntimeRealtimeResult.Failure -> VoiceRuntimeRealtimeRemoteResult.Failure(
       "http-${kind.name.lowercase().replace('_', '-')}",
       kind in setOf(
-        T3VoiceBackgroundHttpFailureKind.RETRYABLE,
-        T3VoiceBackgroundHttpFailureKind.CONFLICT,
-        T3VoiceBackgroundHttpFailureKind.CANCELLED,
+        VoiceRuntimeHttpFailureKind.RETRYABLE,
+        VoiceRuntimeHttpFailureKind.CONFLICT,
+        VoiceRuntimeHttpFailureKind.CANCELLED,
       ),
     )
   }

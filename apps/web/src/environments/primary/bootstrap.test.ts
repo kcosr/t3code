@@ -23,6 +23,7 @@ const BASE_ENVIRONMENT = {
     arch: "arm64",
   },
   serverVersion: "0.0.0-test",
+  voiceRuntimeProtocolMajor: 1,
   capabilities: {
     repositoryIdentity: true,
   },
@@ -88,6 +89,7 @@ describe("environmentBootstrap", () => {
         arch: "arm64",
       },
       serverVersion: "0.0.0-test",
+      voiceRuntimeProtocolMajor: 1,
       capabilities: {
         repositoryIdentity: true,
       },

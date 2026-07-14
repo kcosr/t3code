@@ -5,6 +5,7 @@ import {
   VoiceRuntimeRealtimeCloseInput,
   VoiceRuntimeRealtimeFocusInput,
   VoiceRuntimeRealtimeHandoffExchangeInput,
+  VoiceRuntimeRealtimeHandoffCommitInput,
   VoiceRuntimeRealtimeHeartbeatInput,
   VoiceRuntimeRealtimeSessionCreateInput,
   VoiceRuntimeRealtimeWebRtcOfferInput,
@@ -20,9 +21,11 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstab
 
 import type { VoiceError } from "./Errors.ts";
 import { VoiceRealtimeControlService } from "./Services/VoiceRealtimeControlService.ts";
+import { voiceRuntimeProtocolResponse } from "./runtimeProtocolHttp.ts";
 
 const RUNTIME_HEADER = "x-t3-voice-runtime";
 const CONTROL_HEADER = "x-t3-voice-control";
+const TRANSITION_HEADER = "x-t3-voice-transition";
 const JSON_LIMIT = 128 * 1_024;
 const noStore = {
   "cache-control": "no-store",
@@ -94,6 +97,7 @@ const decodeHeartbeat = decoder(VoiceRuntimeRealtimeHeartbeatInput);
 const decodeAck = decoder(VoiceRuntimeRealtimeActionAckInput);
 const decodeFocus = decoder(VoiceRuntimeRealtimeFocusInput);
 const decodeHandoff = decoder(VoiceRuntimeRealtimeHandoffExchangeInput);
+const decodeHandoffCommit = decoder(VoiceRuntimeRealtimeHandoffCommitInput);
 const decodeClose = decoder(VoiceRuntimeRealtimeCloseInput);
 const decodeSessionId = Schema.decodeUnknownEffect(VoiceSessionId);
 const decodeActionId = Schema.decodeUnknownEffect(VoiceClientActionId);
@@ -101,6 +105,8 @@ const decodeActionsQuery = Schema.decodeUnknownEffect(VoiceRuntimeRealtimeAction
 
 const routeContext = Effect.fn("voice.runtime-realtime.http.context")(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
+  const incompatible = voiceRuntimeProtocolResponse(request);
+  if (incompatible !== undefined) return { incompatible };
   const route = yield* HttpRouter.RouteContext;
   const token = request.headers[CONTROL_HEADER];
   const sessionId = yield* decodeSessionId(route.params.sessionId).pipe(Effect.option);
@@ -114,6 +120,8 @@ const createRoute = HttpRouter.add(
   "/api/voice/runtime/realtime-sessions",
   Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
+    const incompatible = voiceRuntimeProtocolResponse(request);
+    if (incompatible !== undefined) return incompatible;
     const token = request.headers[RUNTIME_HEADER];
     if (token === undefined) return unauthorized();
     const input = yield* decodeCreate(request);
@@ -130,6 +138,7 @@ const offerRoute = HttpRouter.add(
   "/api/voice/runtime/realtime-sessions/:sessionId/webrtc-offer",
   Effect.gen(function* () {
     const context = yield* routeContext();
+    if (context !== undefined && "incompatible" in context) return context.incompatible;
     if (context === undefined) return unauthorized();
     const input = yield* decodeOffer(context.request);
     if (Option.isNone(input)) return invalidRequest();
@@ -145,6 +154,7 @@ const heartbeatRoute = HttpRouter.add(
   "/api/voice/runtime/realtime-sessions/:sessionId/heartbeat",
   Effect.gen(function* () {
     const context = yield* routeContext();
+    if (context !== undefined && "incompatible" in context) return context.incompatible;
     if (context === undefined) return unauthorized();
     const input = yield* decodeHeartbeat(context.request);
     if (Option.isNone(input)) return invalidRequest();
@@ -160,6 +170,7 @@ const actionsRoute = HttpRouter.add(
   "/api/voice/runtime/realtime-sessions/:sessionId/actions",
   Effect.gen(function* () {
     const context = yield* routeContext();
+    if (context !== undefined && "incompatible" in context) return context.incompatible;
     if (context === undefined) return unauthorized();
     const url = new URL(context.request.url, "http://runtime.invalid");
     const query = yield* decodeActionsQuery(
@@ -187,6 +198,7 @@ const acknowledgeActionRoute = HttpRouter.add(
   "/api/voice/runtime/realtime-sessions/:sessionId/actions/:actionId/ack",
   Effect.gen(function* () {
     const context = yield* routeContext();
+    if (context !== undefined && "incompatible" in context) return context.incompatible;
     if (context === undefined) return unauthorized();
     const actionId = yield* decodeActionId(context.route.params.actionId).pipe(Effect.option);
     const input = yield* decodeAck(context.request);
@@ -203,6 +215,7 @@ const focusRoute = HttpRouter.add(
   "/api/voice/runtime/realtime-sessions/:sessionId/focus",
   Effect.gen(function* () {
     const context = yield* routeContext();
+    if (context !== undefined && "incompatible" in context) return context.incompatible;
     if (context === undefined) return unauthorized();
     const input = yield* decodeFocus(context.request);
     if (Option.isNone(input)) return invalidRequest();
@@ -218,6 +231,7 @@ const handoffRoute = HttpRouter.add(
   "/api/voice/runtime/realtime-sessions/:sessionId/handoffs/:actionId/exchange",
   Effect.gen(function* () {
     const context = yield* routeContext();
+    if (context !== undefined && "incompatible" in context) return context.incompatible;
     if (context === undefined) return unauthorized();
     const actionId = yield* decodeActionId(context.route.params.actionId).pipe(Effect.option);
     const input = yield* decodeHandoff(context.request);
@@ -229,11 +243,38 @@ const handoffRoute = HttpRouter.add(
   }),
 );
 
+const handoffCommitRoute = HttpRouter.add(
+  "POST",
+  "/api/voice/runtime/realtime-sessions/:sessionId/handoffs/:actionId/commit",
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const incompatible = voiceRuntimeProtocolResponse(request);
+    if (incompatible !== undefined) return incompatible;
+    const route = yield* HttpRouter.RouteContext;
+    const token = request.headers[TRANSITION_HEADER];
+    const sessionId = yield* decodeSessionId(route.params.sessionId).pipe(Effect.option);
+    const actionId = yield* decodeActionId(route.params.actionId).pipe(Effect.option);
+    const input = yield* decodeHandoffCommit(request);
+    if (
+      token === undefined ||
+      Option.isNone(sessionId) ||
+      Option.isNone(actionId) ||
+      Option.isNone(input)
+    )
+      return token === undefined ? unauthorized() : invalidRequest();
+    const result = yield* (yield* VoiceRealtimeControlService)
+      .commitHandoff(token, sessionId.value, actionId.value, input.value)
+      .pipe(Effect.result);
+    return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
+  }),
+);
+
 const closeRoute = HttpRouter.add(
   "POST",
   "/api/voice/runtime/realtime-sessions/:sessionId/close",
   Effect.gen(function* () {
     const context = yield* routeContext();
+    if (context !== undefined && "incompatible" in context) return context.incompatible;
     if (context === undefined) return unauthorized();
     const input = yield* decodeClose(context.request);
     if (Option.isNone(input)) return invalidRequest();
@@ -252,5 +293,6 @@ export const voiceRealtimeControlRoutesLayer = Layer.mergeAll(
   acknowledgeActionRoute,
   focusRoute,
   handoffRoute,
+  handoffCommitRoute,
   closeRoute,
 );

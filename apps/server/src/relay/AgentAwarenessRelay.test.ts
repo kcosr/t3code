@@ -487,6 +487,7 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
             arch: "arm64",
           },
           serverVersion: "0.0.0-test",
+          voiceRuntimeProtocolMajor: 1,
           capabilities: {
             repositoryIdentity: true,
           },
@@ -620,6 +621,7 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
             arch: "arm64",
           },
           serverVersion: "0.0.0-test",
+          voiceRuntimeProtocolMajor: 1,
           capabilities: {
             repositoryIdentity: true,
           },

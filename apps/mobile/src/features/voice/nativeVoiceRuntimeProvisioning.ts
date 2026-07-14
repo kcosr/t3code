@@ -1,90 +1,77 @@
-import type { VoiceHttpClient } from "@t3tools/client-runtime/voice";
 import {
-  VoiceNativeRuntimeId,
+  computeVoiceRuntimeTargetDigest,
+  type VoiceHttpClient,
+} from "@t3tools/client-runtime/voice";
+import {
+  VoiceRuntimeId,
+  VoiceRuntimeInstanceId,
   VoiceRuntimeProvisioningOperationId,
-  type VoiceNativeRuntimeTarget,
+  VoiceRuntimeCredentialHash,
+  VoiceRuntimeTargetDigest,
+  type VoiceRuntimeAuthorityReservation,
+  type VoiceRuntimeGrant,
 } from "@t3tools/contracts";
 import type {
-  T3VoiceBackgroundAuthoritySnapshot,
-  T3VoiceBackgroundGrantOperation,
-  T3VoiceBackgroundOwnership,
-  T3VoiceBackgroundRuntimeGrantInput,
-  T3VoiceBackgroundRuntimeRevocation,
   T3VoiceNativeModule,
   T3VoiceReadinessSnapshot,
+  T3VoiceRuntimeAuthorityRevocation,
+  T3VoiceRuntimeAuthoritySnapshot,
+  T3VoiceRuntimeGrantOperation,
+  T3VoiceRuntimeOwnership,
 } from "@t3tools/mobile-voice-native";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
-import {
-  canonicalNativeVoiceRuntimeTargetIdentity,
-  type ResolvedNativeVoiceRuntimeTarget,
-} from "./nativeVoiceRuntimeTarget";
+import type { ResolvedNativeVoiceRuntimeTarget } from "./nativeVoiceRuntimeTarget";
 
 export type NativeRuntimeGrantClient = Pick<
   VoiceHttpClient,
-  "provisionNativeRuntimeGrant" | "revokeNativeRuntimeGrant"
+  "provisionVoiceRuntimeGrant" | "revokeVoiceRuntimeGrant"
 >;
 
 export interface NativeVoiceRuntimeReservation {
-  readonly runtimeId: VoiceNativeRuntimeId;
-  readonly readinessGeneration: number;
+  readonly runtimeId: VoiceRuntimeId;
+  readonly runtimeInstanceId: VoiceRuntimeInstanceId;
+  readonly provisioningOperationId: VoiceRuntimeProvisioningOperationId;
+  readonly expectedCurrentGeneration: number;
+  readonly generation: number;
+  readonly targetDigest: VoiceRuntimeTargetDigest;
+  readonly refreshCredentialHash: VoiceRuntimeCredentialHash | null;
 }
 
 export interface NativeVoiceRuntimeProvisioningAdapter {
-  /** Returns exact matching sanitized native authority without mutating it. */
-  readonly inspect: (input: {
-    readonly readiness: T3VoiceReadinessSnapshot;
-    readonly environmentOrigin: string;
-    readonly operation: T3VoiceBackgroundGrantOperation;
-    readonly targetIdentity: string;
-  }) => Promise<T3VoiceBackgroundAuthoritySnapshot | null>;
+  readonly inspect: () => Promise<T3VoiceRuntimeAuthoritySnapshot | null>;
   /**
    * Reserves native readiness state. Repeating an identical epoch after a failed
-   * request must return the same runtime ID and readiness generation.
+   * request must return the same authority reservation and credential hash.
    */
   readonly prepare: (input: {
     readonly epoch: number;
     readonly readiness: T3VoiceReadinessSnapshot;
     readonly environmentOrigin: string;
-    readonly operation: T3VoiceBackgroundGrantOperation;
-    readonly targetIdentity: string;
+    readonly operation: T3VoiceRuntimeGrantOperation;
+    readonly resolvedTarget: ResolvedNativeVoiceRuntimeTarget;
   }) => Promise<NativeVoiceRuntimeReservation>;
-  /** Atomically stores the credential and publishes the prepared readiness state. */
-  readonly activate: (input: T3VoiceBackgroundRuntimeGrantInput) => Promise<void>;
-  /** Marks an exact active authority refresh as recoverable before the server PUT. */
-  readonly beginRefresh: (input: {
-    readonly runtimeId: VoiceNativeRuntimeId;
-    readonly readinessGeneration: number;
-    readonly environmentOrigin: string;
-    readonly operation: T3VoiceBackgroundGrantOperation;
-    readonly targetIdentity: string;
-  }) => Promise<T3VoiceBackgroundAuthoritySnapshot>;
-  /** Atomically replaces an exact authority's encrypted token and expiry. */
-  readonly installRefresh: (
-    input: T3VoiceBackgroundRuntimeGrantInput,
-  ) => Promise<T3VoiceBackgroundAuthoritySnapshot>;
+  readonly activate: (input: VoiceRuntimeAuthorityReservation) => Promise<void>;
   /** Stops native work and clears credentials before server authority is revoked. */
   readonly disable: (input: {
     readonly epoch: number;
-  }) => Promise<{ readonly runtimeId: VoiceNativeRuntimeId | null }>;
+  }) => Promise<{ readonly runtimeId: VoiceRuntimeId | null }>;
   /** Atomically disables only the exact idle authority observed by React. */
   readonly disableIfIdle: (input: {
-    readonly expectedRuntimeId: VoiceNativeRuntimeId | null;
+    readonly expectedRuntimeId: VoiceRuntimeId | null;
     readonly expectedGeneration: number | null;
   }) => Promise<boolean>;
-  readonly ownership: () => Promise<T3VoiceBackgroundOwnership | null>;
-  readonly pendingRevocation: () => Promise<T3VoiceBackgroundRuntimeRevocation | null>;
-  readonly acknowledgeRevocation: (input: T3VoiceBackgroundRuntimeRevocation) => Promise<void>;
+  readonly ownership: () => Promise<T3VoiceRuntimeOwnership | null>;
+  readonly pendingRevocation: () => Promise<T3VoiceRuntimeAuthorityRevocation | null>;
+  readonly acknowledgeRevocation: (input: T3VoiceRuntimeAuthorityRevocation) => Promise<void>;
 }
 
 export interface NativeVoiceRuntimeProvisioningInput {
   readonly epoch: number;
   readonly readiness: T3VoiceReadinessSnapshot;
   readonly environmentOrigin: string;
-  readonly operation: T3VoiceBackgroundGrantOperation;
   readonly resolvedTarget: ResolvedNativeVoiceRuntimeTarget;
-  readonly refreshRequested?: boolean;
   readonly resolvePendingRevocationEndpoint?: (
     environmentOrigin: string,
   ) => Promise<NativeVoiceRuntimeRevocationEndpointResolution>;
@@ -93,93 +80,82 @@ export interface NativeVoiceRuntimeProvisioningInput {
 
 export function makeNativeVoiceRuntimeProvisioningAdapter(
   native: T3VoiceNativeModule,
-  createRuntimeId: () => string,
+  createId: () => string,
+  activateAuthority: (input: VoiceRuntimeAuthorityReservation) => Promise<void>,
 ): NativeVoiceRuntimeProvisioningAdapter {
-  let prepared: {
-    readonly runtimeId: VoiceNativeRuntimeId;
-    readonly generation: number;
-    readonly readiness: T3VoiceReadinessSnapshot;
-  } | null = null;
   return {
-    inspect: async (input) => {
-      const result = await native.inspectBackgroundVoiceAuthorityAsync(input);
-      if (result?.state === "prepared") {
-        prepared = {
-          runtimeId: VoiceNativeRuntimeId.make(result.runtimeId),
-          generation: result.readiness.generation,
-          readiness: input.readiness,
-        };
-      } else {
-        prepared = null;
-      }
-      return result;
-    },
-    prepare: async ({ readiness, environmentOrigin, operation, targetIdentity }) => {
-      const result = await native.prepareBackgroundVoiceReadinessAsync({
+    inspect: () => native.inspectVoiceRuntimeAuthorityAsync(),
+    prepare: async ({ readiness, environmentOrigin, operation, resolvedTarget }) => {
+      const snapshot = await native.getVoiceRuntimeSnapshotAsync();
+      const expectedCurrentGeneration = snapshot.generation;
+      const generation = expectedCurrentGeneration + 1;
+      const targetDigest = VoiceRuntimeTargetDigest.make(
+        await computeVoiceRuntimeTargetDigest(resolvedTarget.target),
+      );
+      const provisioningOperationId = VoiceRuntimeProvisioningOperationId.make(createId());
+      const input = {
         readiness,
-        runtimeId: createRuntimeId(),
+        runtimeId: snapshot.runtimeId,
+        runtimeInstanceId: snapshot.runtimeInstanceId,
+        provisioningOperationId,
+        expectedCurrentGeneration,
+        generation,
+        targetDigest,
+        target: resolvedTarget.target,
         environmentOrigin,
         operation,
-        targetIdentity,
-      });
-      const runtimeId = VoiceNativeRuntimeId.make(result.runtimeId);
-      prepared = {
-        runtimeId,
-        generation: result.readiness.generation,
-        readiness,
       };
-      return { runtimeId, readinessGeneration: result.readiness.generation };
-    },
-    activate: async (grant) => {
-      const reservation = prepared;
+      const result = await native.prepareVoiceRuntimeAuthorityAsync(input);
       if (
-        reservation === null ||
-        reservation.runtimeId !== grant.runtimeId ||
-        reservation.generation !== grant.readinessGeneration
+        result.runtimeId !== input.runtimeId ||
+        result.runtimeInstanceId !== input.runtimeInstanceId ||
+        result.provisioningOperationId !== input.provisioningOperationId ||
+        result.expectedCurrentGeneration !== input.expectedCurrentGeneration ||
+        result.generation !== input.generation ||
+        result.targetDigest !== input.targetDigest ||
+        result.readinessEnabled !== input.readiness.enabled
       ) {
         throw new InvalidNativeVoiceRuntimeProvisioningResultError();
       }
-      await native.activateBackgroundVoiceReadinessAsync({
-        readiness: reservation.readiness,
-        expectedGeneration: reservation.generation,
-        grant,
-      });
-      prepared = null;
-    },
-    beginRefresh: (input) => native.beginBackgroundVoiceGrantRefreshAsync(input),
-    installRefresh: async (grant) => native.installBackgroundVoiceRuntimeGrantAsync({ grant }),
-    disable: async () => {
-      prepared = null;
-      const disabled = await native.disableBackgroundVoiceReadinessAsync();
       return {
-        runtimeId:
-          disabled.runtimeId === null ? null : VoiceNativeRuntimeId.make(disabled.runtimeId),
+        runtimeId: VoiceRuntimeId.make(result.runtimeId),
+        runtimeInstanceId: VoiceRuntimeInstanceId.make(result.runtimeInstanceId),
+        provisioningOperationId: VoiceRuntimeProvisioningOperationId.make(
+          result.provisioningOperationId,
+        ),
+        expectedCurrentGeneration: result.expectedCurrentGeneration,
+        generation: result.generation,
+        targetDigest: VoiceRuntimeTargetDigest.make(result.targetDigest),
+        refreshCredentialHash:
+          result.refreshCredentialHash === null
+            ? null
+            : VoiceRuntimeCredentialHash.make(result.refreshCredentialHash),
+      };
+    },
+    activate: activateAuthority,
+    disable: async () => {
+      const disabled = await native.disableVoiceRuntimeReadinessAsync();
+      return {
+        runtimeId: VoiceRuntimeId.make(disabled.runtimeId),
       };
     },
     disableIfIdle: async (input) => {
-      const expected =
-        input.expectedRuntimeId === null && prepared !== null
-          ? {
-              expectedRuntimeId: prepared.runtimeId,
-              expectedGeneration: prepared.generation,
-            }
-          : input;
-      const disabled = await native.disableBackgroundVoiceReadinessIfIdleAsync(expected);
+      const disabled = await native.clearVoiceRuntimeAuthorityIfIdleAsync({
+        runtimeId: input.expectedRuntimeId,
+        generation: input.expectedGeneration,
+      });
       if (disabled === null) return false;
-      prepared = null;
       return true;
     },
-    ownership: () => native.getBackgroundVoiceOwnershipAsync(),
-    pendingRevocation: () => native.getPendingBackgroundVoiceRuntimeRevocationAsync(),
-    acknowledgeRevocation: (input) =>
-      native.acknowledgeBackgroundVoiceRuntimeRevocationAsync(input),
+    ownership: () => native.getVoiceRuntimeOwnershipAsync(),
+    pendingRevocation: () => native.getPendingVoiceRuntimeAuthorityRevocationAsync(),
+    acknowledgeRevocation: (input) => native.acknowledgeVoiceRuntimeAuthorityRevocationAsync(input),
   };
 }
 
 export interface NativeVoiceRuntimeProvisioningResult {
-  readonly runtimeId: VoiceNativeRuntimeId;
-  readonly readinessGeneration: number;
-  readonly expiresAt: string;
+  readonly runtimeId: VoiceRuntimeId;
+  readonly generation: number;
 }
 
 export type NativeVoiceRuntimeRevocationEndpointResolution =
@@ -294,13 +270,20 @@ const encodeProvisioningIntent = Schema.encodeSync(
 );
 
 function activationIntent(input: NativeVoiceRuntimeProvisioningInput): string {
+  const operation = grantOperationForTarget(input.resolvedTarget.target);
   return encodeProvisioningIntent({
     kind: "activate",
     readiness: input.readiness,
     environmentOrigin: new URL(input.environmentOrigin).origin,
-    operation: input.operation,
+    operation,
     targetIdentity: input.resolvedTarget.targetIdentity,
   });
+}
+
+function grantOperationForTarget(
+  target: ResolvedNativeVoiceRuntimeTarget["target"],
+): T3VoiceRuntimeGrantOperation {
+  return target.mode === "realtime" ? "realtime-start" : "thread-turn-start";
 }
 
 function assertValidEpoch(epoch: number): void {
@@ -312,39 +295,26 @@ function assertValidEpoch(epoch: number): void {
 function assertValidReservation(reservation: NativeVoiceRuntimeReservation): void {
   if (
     String(reservation.runtimeId).length === 0 ||
-    !Number.isSafeInteger(reservation.readinessGeneration) ||
-    reservation.readinessGeneration < 1
+    String(reservation.runtimeInstanceId).length === 0 ||
+    !Number.isSafeInteger(reservation.expectedCurrentGeneration) ||
+    reservation.expectedCurrentGeneration < 0 ||
+    reservation.generation !== reservation.expectedCurrentGeneration + 1
   ) {
     throw new InvalidNativeVoiceRuntimeProvisioningResultError();
   }
 }
 
-function provisioningOperationId(
-  reservation: NativeVoiceRuntimeReservation,
-): VoiceRuntimeProvisioningOperationId {
-  return VoiceRuntimeProvisioningOperationId.make(
-    `provision-${reservation.runtimeId}-${reservation.readinessGeneration}`,
+function authorityMatches(
+  authority: T3VoiceRuntimeAuthoritySnapshot,
+  input: NativeVoiceRuntimeProvisioningInput,
+  targetDigest: VoiceRuntimeTargetDigest,
+): boolean {
+  return (
+    authority.environmentOrigin === new URL(input.environmentOrigin).origin &&
+    authority.operation === grantOperationForTarget(input.resolvedTarget.target) &&
+    authority.targetDigest === targetDigest &&
+    authority.readinessEnabled === input.readiness.enabled
   );
-}
-
-function targetMatches(actual: VoiceNativeRuntimeTarget, expectedIdentity: string): boolean {
-  return canonicalNativeVoiceRuntimeTargetIdentity(actual) === expectedIdentity;
-}
-
-export function nativeVoiceRuntimeRefreshAt(
-  expiresAtEpochMillis: number,
-  nowEpochMillis: number,
-): number {
-  if (
-    !Number.isSafeInteger(expiresAtEpochMillis) ||
-    !Number.isSafeInteger(nowEpochMillis) ||
-    expiresAtEpochMillis <= nowEpochMillis
-  ) {
-    return nowEpochMillis;
-  }
-  const remaining = expiresAtEpochMillis - nowEpochMillis;
-  const refreshLead = Math.min(24 * 60 * 60 * 1_000, Math.max(60_000, remaining * 0.2));
-  return Math.max(nowEpochMillis, expiresAtEpochMillis - refreshLead);
 }
 
 /**
@@ -392,25 +362,15 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
       await this.reconcilePendingRevocationBeforeProvision(client, input);
       this.assertCurrent(input.epoch);
 
-      const expectedIdentity = canonicalNativeVoiceRuntimeTargetIdentity(
-        input.resolvedTarget.target,
+      const targetDigest = VoiceRuntimeTargetDigest.make(
+        await computeVoiceRuntimeTargetDigest(input.resolvedTarget.target),
       );
-      if (expectedIdentity !== input.resolvedTarget.targetIdentity) {
-        throw new InvalidNativeVoiceRuntimeProvisioningResultError();
-      }
-
-      const adopted = await this.native.inspect({
-        readiness: input.readiness,
-        environmentOrigin: input.environmentOrigin,
-        operation: input.operation,
-        targetIdentity: input.resolvedTarget.targetIdentity,
-      });
+      const inspected = await this.native.inspect();
+      const adopted =
+        inspected !== null && authorityMatches(inspected, input, targetDigest) ? inspected : null;
       this.assertCurrent(input.epoch);
       if (adopted?.state === "active") {
         const result = this.resultFromSnapshot(adopted);
-        if (input.refreshRequested === true || adopted.refreshPending) {
-          return this.refresh(client, input, intent, adopted);
-        }
         this.active = {
           epoch: input.epoch,
           intent,
@@ -432,8 +392,18 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
       let reservation: NativeVoiceRuntimeReservation | null =
         adopted?.state === "prepared"
           ? {
-              runtimeId: VoiceNativeRuntimeId.make(adopted.runtimeId),
-              readinessGeneration: adopted.readiness.generation,
+              runtimeId: VoiceRuntimeId.make(adopted.runtimeId),
+              runtimeInstanceId: VoiceRuntimeInstanceId.make(adopted.runtimeInstanceId),
+              provisioningOperationId: VoiceRuntimeProvisioningOperationId.make(
+                adopted.provisioningOperationId,
+              ),
+              expectedCurrentGeneration: adopted.expectedCurrentGeneration,
+              generation: adopted.generation,
+              targetDigest: VoiceRuntimeTargetDigest.make(adopted.targetDigest),
+              refreshCredentialHash:
+                adopted.refreshCredentialHash === null
+                  ? null
+                  : VoiceRuntimeCredentialHash.make(adopted.refreshCredentialHash),
             }
           : null;
       try {
@@ -441,34 +411,52 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
           epoch: input.epoch,
           readiness: input.readiness,
           environmentOrigin: input.environmentOrigin,
-          operation: input.operation,
-          targetIdentity: input.resolvedTarget.targetIdentity,
+          operation: grantOperationForTarget(input.resolvedTarget.target),
+          resolvedTarget: input.resolvedTarget,
         });
         assertValidReservation(reservation);
+        if ((reservation.refreshCredentialHash !== null) !== input.readiness.enabled) {
+          throw new InvalidNativeVoiceRuntimeProvisioningResultError();
+        }
         this.assertCurrent(input.epoch);
 
         const grant = await this.issueGrant(client, input, reservation);
         this.assertCurrent(input.epoch);
 
-        const expiresAtEpochMillis = Date.parse(grant.expiresAt);
-        await this.native.activate({
+        const activation = {
           runtimeId: grant.runtimeId,
-          readinessGeneration: grant.generation,
+          runtimeInstanceId: reservation.runtimeInstanceId,
+          expectedCurrentGeneration: reservation.expectedCurrentGeneration,
+          generation: grant.generation,
           environmentOrigin: input.environmentOrigin,
-          operation: input.operation,
-          targetIdentity: input.resolvedTarget.targetIdentity,
-          target: input.resolvedTarget.target,
+          targetDigest: grant.targetDigest,
+          readinessEnabled: input.readiness.enabled,
           provisioningOperationId: grant.provisioningOperationId,
           issuedAt: grant.issuedAt,
-          expiresAtEpochMillis,
+          expiresAt: grant.expiresAt,
+          refreshRotationCounter: grant.refreshRotationCounter,
           token: grant.token,
-        });
+        } as const;
+        if (grant.operation === "realtime-start" && grant.target.mode === "realtime") {
+          await this.native.activate({
+            ...activation,
+            operation: "realtime-start",
+            target: grant.target,
+          });
+        } else if (grant.operation === "thread-turn-start" && grant.target.mode === "thread") {
+          await this.native.activate({
+            ...activation,
+            operation: "thread-turn-start",
+            target: grant.target,
+          });
+        } else {
+          throw new InvalidNativeVoiceRuntimeProvisioningResultError();
+        }
         this.assertCurrent(input.epoch);
 
         const result = {
           runtimeId: grant.runtimeId,
-          readinessGeneration: grant.generation,
-          expiresAt: grant.expiresAt,
+          generation: grant.generation,
         } satisfies NativeVoiceRuntimeProvisioningResult;
         this.active = {
           epoch: input.epoch,
@@ -561,8 +549,8 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
         expectedRuntimeId:
           ownership?.runtimeId === null || ownership?.runtimeId === undefined
             ? null
-            : VoiceNativeRuntimeId.make(ownership.runtimeId),
-        expectedGeneration: ownership?.readinessGeneration ?? null,
+            : VoiceRuntimeId.make(ownership.runtimeId),
+        expectedGeneration: ownership?.generation ?? null,
       });
       this.assertCurrent(epoch);
       if (!disabled) return false;
@@ -665,9 +653,7 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
         normalizedOrigin,
       );
     }
-    await Effect.runPromise(
-      client.revokeNativeRuntimeGrant(VoiceNativeRuntimeId.make(pending.runtimeId)),
-    );
+    await Effect.runPromise(client.revokeVoiceRuntimeGrant(VoiceRuntimeId.make(pending.runtimeId)));
     await this.native.acknowledgeRevocation(pending);
   }
 
@@ -708,19 +694,70 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
     input: NativeVoiceRuntimeProvisioningInput,
     reservation: NativeVoiceRuntimeReservation,
   ) {
-    const expectedProvisioningOperationId = provisioningOperationId(reservation);
-    const grant = await Effect.runPromise(
-      client.provisionNativeRuntimeGrant(reservation.runtimeId, {
-        generation: reservation.readinessGeneration,
-        provisioningOperationId: expectedProvisioningOperationId,
-        target: input.resolvedTarget.target,
-      }),
+    const base = {
+      expectedCurrentGeneration: reservation.expectedCurrentGeneration,
+      generation: reservation.generation,
+      provisioningOperationId: reservation.provisioningOperationId,
+      targetDigest: reservation.targetDigest,
+    } as const;
+    const target = input.resolvedTarget.target;
+    const refreshCredentialHash = reservation.refreshCredentialHash;
+    let grant: VoiceRuntimeGrant;
+    if (input.readiness.enabled) {
+      if (refreshCredentialHash === null) {
+        throw new InvalidNativeVoiceRuntimeProvisioningResultError();
+      }
+      grant = await Effect.runPromise(
+        target.mode === "realtime"
+          ? client.provisionVoiceRuntimeGrant(reservation.runtimeId, {
+              ...base,
+              operation: "realtime-start",
+              target,
+              readinessEnabled: true,
+              refreshCredentialHash,
+            })
+          : client.provisionVoiceRuntimeGrant(reservation.runtimeId, {
+              ...base,
+              operation: "thread-turn-start",
+              target,
+              readinessEnabled: true,
+              refreshCredentialHash,
+            }),
+      );
+    } else {
+      grant = await Effect.runPromise(
+        target.mode === "realtime"
+          ? client.provisionVoiceRuntimeGrant(reservation.runtimeId, {
+              ...base,
+              operation: "realtime-start",
+              target,
+              readinessEnabled: false,
+              refreshCredentialHash: null,
+            })
+          : client.provisionVoiceRuntimeGrant(reservation.runtimeId, {
+              ...base,
+              operation: "thread-turn-start",
+              target,
+              readinessEnabled: false,
+              refreshCredentialHash: null,
+            }),
+      );
+    }
+    const expectedOperation = grantOperationForTarget(target);
+    const responseTargetDigest = VoiceRuntimeTargetDigest.make(
+      await computeVoiceRuntimeTargetDigest(grant.target),
     );
     if (
       grant.runtimeId !== reservation.runtimeId ||
-      grant.generation !== reservation.readinessGeneration ||
-      grant.provisioningOperationId !== expectedProvisioningOperationId ||
-      !targetMatches(grant.target, input.resolvedTarget.targetIdentity) ||
+      grant.generation !== reservation.generation ||
+      grant.provisioningOperationId !== reservation.provisioningOperationId ||
+      grant.targetDigest !== reservation.targetDigest ||
+      grant.operation !== expectedOperation ||
+      grant.target.mode !== target.mode ||
+      responseTargetDigest !== reservation.targetDigest ||
+      grant.readinessEnabled !== input.readiness.enabled ||
+      !Number.isSafeInteger(grant.refreshRotationCounter) ||
+      grant.refreshRotationCounter < 0 ||
       !Number.isFinite(Date.parse(grant.issuedAt)) ||
       !Number.isFinite(Date.parse(grant.expiresAt))
     ) {
@@ -747,8 +784,8 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
         known?.runtimeId ??
         (ownership?.runtimeId === null || ownership?.runtimeId === undefined
           ? null
-          : VoiceNativeRuntimeId.make(ownership.runtimeId)),
-      expectedGeneration: known?.readinessGeneration ?? ownership?.readinessGeneration ?? null,
+          : VoiceRuntimeId.make(ownership.runtimeId)),
+      expectedGeneration: known?.generation ?? ownership?.generation ?? null,
     });
   }
 
@@ -764,72 +801,20 @@ export class NativeVoiceRuntimeProvisioningCoordinator {
         known?.runtimeId ??
         (ownership?.runtimeId === null || ownership?.runtimeId === undefined
           ? null
-          : VoiceNativeRuntimeId.make(ownership.runtimeId)),
-      expectedGeneration: known?.readinessGeneration ?? ownership?.readinessGeneration ?? null,
+          : VoiceRuntimeId.make(ownership.runtimeId)),
+      expectedGeneration: known?.generation ?? ownership?.generation ?? null,
     });
   }
 
   private resultFromSnapshot(
-    snapshot: T3VoiceBackgroundAuthoritySnapshot,
+    snapshot: T3VoiceRuntimeAuthoritySnapshot,
   ): NativeVoiceRuntimeProvisioningResult {
-    if (
-      snapshot.state !== "active" ||
-      snapshot.expiresAtEpochMillis === null ||
-      !Number.isSafeInteger(snapshot.expiresAtEpochMillis) ||
-      snapshot.expiresAtEpochMillis <= 0
-    ) {
+    if (snapshot.state !== "active" || !Number.isFinite(Date.parse(snapshot.expiresAt))) {
       throw new InvalidNativeVoiceRuntimeProvisioningResultError();
     }
     return {
-      runtimeId: VoiceNativeRuntimeId.make(snapshot.runtimeId),
-      readinessGeneration: snapshot.readiness.generation,
-      expiresAt: new Date(snapshot.expiresAtEpochMillis).toISOString(),
+      runtimeId: VoiceRuntimeId.make(snapshot.runtimeId),
+      generation: snapshot.generation,
     };
-  }
-
-  private async refresh(
-    client: NativeRuntimeGrantClient,
-    input: NativeVoiceRuntimeProvisioningInput,
-    intent: string,
-    snapshot: T3VoiceBackgroundAuthoritySnapshot,
-  ): Promise<NativeVoiceRuntimeProvisioningResult> {
-    const reservation = {
-      runtimeId: VoiceNativeRuntimeId.make(snapshot.runtimeId),
-      readinessGeneration: snapshot.readiness.generation,
-    } satisfies NativeVoiceRuntimeReservation;
-    if (!snapshot.refreshPending) {
-      await this.native.beginRefresh({
-        runtimeId: reservation.runtimeId,
-        readinessGeneration: reservation.readinessGeneration,
-        environmentOrigin: input.environmentOrigin,
-        operation: input.operation,
-        targetIdentity: input.resolvedTarget.targetIdentity,
-      });
-    }
-    this.assertCurrent(input.epoch);
-    const grant = await this.issueGrant(client, input, reservation);
-    this.assertCurrent(input.epoch);
-    const installed = await this.native.installRefresh({
-      runtimeId: grant.runtimeId,
-      readinessGeneration: grant.generation,
-      environmentOrigin: input.environmentOrigin,
-      operation: input.operation,
-      targetIdentity: input.resolvedTarget.targetIdentity,
-      target: input.resolvedTarget.target,
-      provisioningOperationId: grant.provisioningOperationId,
-      issuedAt: grant.issuedAt,
-      expiresAtEpochMillis: Date.parse(grant.expiresAt),
-      token: grant.token,
-    });
-    this.assertCurrent(input.epoch);
-    const result = this.resultFromSnapshot(installed);
-    this.active = {
-      epoch: input.epoch,
-      intent,
-      client,
-      environmentOrigin: new URL(input.environmentOrigin).origin,
-      result,
-    };
-    return result;
   }
 }

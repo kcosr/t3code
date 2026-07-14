@@ -133,6 +133,7 @@ export const make = Effect.gen(function* () {
       arch: platformArch(hostArchitecture),
     },
     serverVersion: packageJson.version,
+    voiceRuntimeProtocolMajor: 1,
     capabilities: {
       repositoryIdentity: true,
     },

@@ -7,7 +7,7 @@ import * as Stream from "effect/Stream";
 
 import { SessionStore } from "../../auth/SessionStore.ts";
 import { VoiceSessionService } from "../Services/VoiceSessionService.ts";
-import { VoiceNativeRuntimeGrantRegistry } from "../Services/VoiceNativeRuntimeGrantRegistry.ts";
+import { VoiceRuntimeGrantRegistry } from "../Services/VoiceRuntimeGrantRegistry.ts";
 import { VoiceSessionLifecycleLive } from "./VoiceSessionLifecycle.ts";
 
 it.effect("terminates voice state when an authenticated client is removed", () =>
@@ -22,7 +22,7 @@ it.effect("terminates voice state when an authenticated client is removed", () =
       Layer.mock(VoiceSessionService)({
         revokeAuthSession: (owner) => Deferred.succeed(revoked, owner).pipe(Effect.asVoid),
       }),
-      Layer.mock(VoiceNativeRuntimeGrantRegistry)({
+      Layer.mock(VoiceRuntimeGrantRegistry)({
         revokeAuthSession: () => Effect.void,
       }),
     );

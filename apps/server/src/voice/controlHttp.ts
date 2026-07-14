@@ -4,9 +4,15 @@ import {
   AuthVoiceManageScope,
   AuthVoiceUseScope,
   EnvironmentResourceNotFoundError,
+  EnvironmentVoiceRuntimeProtocolIncompatibleError,
   EnvironmentVoiceOperationError,
   EnvironmentHttpApi,
   type VoiceCapabilityDescriptor,
+  type VoiceRuntimeGrant,
+  type VoiceRuntimeGrantOperation,
+  VoiceRuntimeId,
+  type VoiceRuntimeTarget,
+  VOICE_RUNTIME_PROTOCOL_MAJOR,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -22,11 +28,12 @@ import {
   requireEnvironmentScope,
 } from "../auth/http.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
+import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
 import { VoiceCredentialStore } from "./Services/VoiceCredentialStore.ts";
 import { VoiceConversationService } from "./Services/VoiceConversationService.ts";
 import { VoiceMediaTicketRegistry } from "./Services/VoiceMediaTicketRegistry.ts";
 import { VoiceSessionService } from "./Services/VoiceSessionService.ts";
-import { VoiceNativeRuntimeGrantRegistry } from "./Services/VoiceNativeRuntimeGrantRegistry.ts";
+import { VoiceRuntimeGrantRegistry } from "./Services/VoiceRuntimeGrantRegistry.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import type { VoiceError } from "./Errors.ts";
 
@@ -44,6 +51,21 @@ const failVoiceOperation = (error: VoiceError) =>
       ),
     ),
   );
+
+const requireVoiceRuntimeProtocol = (value: string | undefined) =>
+  value === String(VOICE_RUNTIME_PROTOCOL_MAJOR)
+    ? Effect.void
+    : currentEnvironmentTraceId.pipe(
+        Effect.flatMap((traceId) =>
+          Effect.fail(
+            new EnvironmentVoiceRuntimeProtocolIncompatibleError({
+              code: "voice_runtime_protocol_incompatible",
+              requiredMajor: VOICE_RUNTIME_PROTOCOL_MAJOR,
+              traceId,
+            }),
+          ),
+        ),
+      );
 
 const failVoiceConversationOperation = (
   error: VoiceError,
@@ -97,7 +119,10 @@ const descriptor = (
   }
 };
 
-const nativeRuntimeExpiresAt = (now: DateTime.DateTime, principalExpiresAt?: DateTime.DateTime) =>
+const runtimeAuthorityExpiresAt = (
+  now: DateTime.DateTime,
+  principalExpiresAt?: DateTime.DateTime,
+) =>
   DateTime.makeUnsafe(
     Math.min(
       DateTime.toEpochMillis(DateTime.addDuration(now, "30 days")),
@@ -105,7 +130,40 @@ const nativeRuntimeExpiresAt = (now: DateTime.DateTime, principalExpiresAt?: Dat
     ),
   );
 
-export const __testing = { descriptor, nativeRuntimeExpiresAt };
+const runtimeGrantResponse = (input: {
+  readonly token: string;
+  readonly runtimeId: VoiceRuntimeId;
+  readonly generation: number;
+  readonly provisioningOperationId: VoiceRuntimeGrant["provisioningOperationId"];
+  readonly target: VoiceRuntimeTarget;
+  readonly targetDigest: VoiceRuntimeGrant["targetDigest"];
+  readonly operation: VoiceRuntimeGrantOperation;
+  readonly readinessEnabled: boolean;
+  readonly refreshRotationCounter: number;
+  readonly issuedAt: number;
+  readonly expiresAt: number;
+}): VoiceRuntimeGrant | undefined => {
+  const base = {
+    token: input.token,
+    runtimeId: input.runtimeId,
+    generation: input.generation,
+    provisioningOperationId: input.provisioningOperationId,
+    targetDigest: input.targetDigest,
+    readinessEnabled: input.readinessEnabled,
+    refreshRotationCounter: input.refreshRotationCounter,
+    issuedAt: DateTime.formatIso(DateTime.makeUnsafe(input.issuedAt)),
+    expiresAt: DateTime.formatIso(DateTime.makeUnsafe(input.expiresAt)),
+  };
+  if (input.target.mode === "realtime" && input.operation === "realtime-start") {
+    return { ...base, target: input.target, operation: input.operation };
+  }
+  if (input.target.mode === "thread" && input.operation === "thread-turn-start") {
+    return { ...base, target: input.target, operation: input.operation };
+  }
+  return undefined;
+};
+
+export const __testing = { descriptor, runtimeAuthorityExpiresAt };
 
 export const voiceControlHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
@@ -116,21 +174,26 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
     const credentials = yield* VoiceCredentialStore;
     const tickets = yield* VoiceMediaTicketRegistry;
     const sessions = yield* VoiceSessionService;
-    const nativeRuntimeGrants = yield* VoiceNativeRuntimeGrantRegistry;
+    const runtimeAuthorityGrants = yield* VoiceRuntimeGrantRegistry;
     const projectionQuery = yield* ProjectionSnapshotQuery;
+    const environmentId = yield* (yield* ServerEnvironment).getEnvironmentId;
 
     return handlers
       .handle(
-        "provisionNativeVoiceRuntimeGrant",
-        Effect.fn("environment.voice.provisionNativeRuntimeGrant")(function* (args) {
+        "provisionVoiceRuntimeGrant",
+        Effect.fn("environment.voice.provisionRuntimeGrant")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireVoiceRuntimeProtocol(args.headers["x-t3-voice-runtime-protocol-major"]);
           const principal = yield* requireEnvironmentScope(AuthVoiceUseScope);
           yield* requireEnvironmentScope(AuthOrchestrationReadScope);
           yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
           const target = args.payload.target;
+          if (target.environmentId !== environmentId) {
+            return yield* failEnvironmentInvalidRequest("native_voice_target_invalid");
+          }
           if (target.mode === "realtime") {
             const conversation = yield* conversations
-              .get(target.conversation.conversationId)
+              .get(target.conversationId)
               .pipe(Effect.catch(failVoiceOperation));
             if (Option.isNone(conversation) || conversation.value.retention !== "durable") {
               return yield* failEnvironmentInvalidRequest("native_voice_target_invalid");
@@ -143,63 +206,95 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
             if (Option.isNone(thread) || thread.value.projectId !== target.projectId) {
               return yield* failEnvironmentInvalidRequest("native_voice_target_invalid");
             }
-          } else if (target.focus.type === "thread") {
-            const thread = yield* projectionQuery
-              .getThreadShellById(target.focus.threadId)
-              .pipe(Effect.catch((error) => failEnvironmentInternal("internal_error", error)));
-            if (Option.isNone(thread) || thread.value.projectId !== target.focus.projectId) {
-              return yield* failEnvironmentInvalidRequest("native_voice_target_invalid");
-            }
-          } else if (target.mode === "realtime" && target.focus.type === "project") {
-            const project = yield* projectionQuery
-              .getProjectShellById(target.focus.projectId)
-              .pipe(Effect.catch((error) => failEnvironmentInternal("internal_error", error)));
-            if (Option.isNone(project)) {
-              return yield* failEnvironmentInvalidRequest("native_voice_target_invalid");
-            }
           }
           const now = yield* DateTime.now;
-          const expiresAt = nativeRuntimeExpiresAt(now, principal.expiresAt);
+          const expiresAt = runtimeAuthorityExpiresAt(now, principal.expiresAt);
           const grant = yield* Effect.gen(function* () {
-            const issued = yield* nativeRuntimeGrants.issue({
+            const issued = yield* runtimeAuthorityGrants.issue({
               authSessionId: principal.sessionId,
-              runtimeId: args.params.runtimeId,
+              runtimeId: VoiceRuntimeId.make(args.params.runtimeId),
               generation: args.payload.generation,
+              expectedCurrentGeneration: args.payload.expectedCurrentGeneration,
               provisioningOperationId: args.payload.provisioningOperationId,
               grantedScopes: new Set(principal.scopes),
               target,
+              targetDigest: args.payload.targetDigest,
+              operation: args.payload.operation,
+              readinessEnabled: args.payload.readinessEnabled,
+              refreshCredentialHash: args.payload.refreshCredentialHash,
               expiresAt: DateTime.toEpochMillis(expiresAt),
             });
             if (!issued.replayed) {
-              yield* sessions.revokeNativeRuntime(principal.sessionId, args.params.runtimeId);
+              yield* sessions.revokeRuntimeAuthority(
+                principal.sessionId,
+                VoiceRuntimeId.make(args.params.runtimeId),
+              );
             }
             return issued;
           }).pipe(Effect.uninterruptible, Effect.catch(failVoiceOperation));
-          return {
+          const response = runtimeGrantResponse({
             token: grant.token,
-            runtimeId: args.params.runtimeId,
+            runtimeId: VoiceRuntimeId.make(args.params.runtimeId),
             generation: args.payload.generation,
             provisioningOperationId: args.payload.provisioningOperationId,
-            target,
-            issuedAt: DateTime.formatIso(DateTime.makeUnsafe(grant.issuedAt)),
-            expiresAt: DateTime.formatIso(DateTime.makeUnsafe(grant.expiresAt)),
-          };
+            target: args.payload.target,
+            targetDigest: args.payload.targetDigest,
+            operation: args.payload.operation,
+            readinessEnabled: args.payload.readinessEnabled,
+            refreshRotationCounter: grant.refreshRotationCounter,
+            issuedAt: grant.issuedAt,
+            expiresAt: grant.expiresAt,
+          });
+          return response ?? (yield* failEnvironmentInvalidRequest("native_voice_target_invalid"));
         }),
       )
       .handle(
-        "revokeNativeVoiceRuntimeGrant",
-        Effect.fn("environment.voice.revokeNativeRuntimeGrant")(function* (args) {
+        "revokeVoiceRuntimeGrant",
+        Effect.fn("environment.voice.revokeRuntimeGrant")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireVoiceRuntimeProtocol(args.headers["x-t3-voice-runtime-protocol-major"]);
           const principal = yield* requireEnvironmentScope(AuthVoiceUseScope);
           const revoked = yield* Effect.gen(function* () {
-            const result = yield* nativeRuntimeGrants.revokeRuntime(
+            const result = yield* runtimeAuthorityGrants.revokeRuntime(
               principal.sessionId,
-              args.params.runtimeId,
+              VoiceRuntimeId.make(args.params.runtimeId),
             );
-            yield* sessions.revokeNativeRuntime(principal.sessionId, args.params.runtimeId);
+            yield* sessions.revokeRuntimeAuthority(
+              principal.sessionId,
+              VoiceRuntimeId.make(args.params.runtimeId),
+            );
             return result;
           }).pipe(Effect.uninterruptible);
           return { runtimeId: args.params.runtimeId, revoked };
+        }),
+      )
+      .handle(
+        "refreshVoiceRuntimeGrant",
+        Effect.fn("environment.voice.refreshRuntimeGrant")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireVoiceRuntimeProtocol(args.headers["x-t3-voice-runtime-protocol-major"]);
+          const now = yield* DateTime.now;
+          const refreshed = yield* runtimeAuthorityGrants
+            .refresh(args.headers["x-t3-voice-refresh"], {
+              runtimeId: VoiceRuntimeId.make(args.params.runtimeId),
+              ...args.payload,
+              expiresAt: DateTime.toEpochMillis(DateTime.addDuration(now, "30 days")),
+            })
+            .pipe(Effect.catch(failVoiceOperation));
+          const response = runtimeGrantResponse({
+            token: refreshed.token,
+            runtimeId: VoiceRuntimeId.make(args.params.runtimeId),
+            generation: refreshed.generation,
+            provisioningOperationId: refreshed.provisioningOperationId,
+            target: refreshed.target,
+            targetDigest: refreshed.targetDigest,
+            operation: refreshed.operation,
+            readinessEnabled: refreshed.readinessEnabled,
+            refreshRotationCounter: refreshed.refreshRotationCounter,
+            issuedAt: refreshed.issuedAt,
+            expiresAt: refreshed.expiresAt,
+          });
+          return response ?? (yield* failEnvironmentInvalidRequest("native_voice_target_invalid"));
         }),
       )
       .handle(

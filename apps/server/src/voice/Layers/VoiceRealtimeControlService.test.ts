@@ -8,35 +8,34 @@ import {
   VoiceClientActionId,
   VoiceConversationId,
   VoiceModeSessionId,
-  VoiceNativeRuntimeId,
   VoiceRuntimeId,
   VoiceRuntimeInstanceId,
   VoiceRuntimeProvisioningOperationId,
   VoiceSessionId,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 
 import { ServerSecretStore } from "../../auth/ServerSecretStore.ts";
 import {
-  VoiceNativeRealtimeStartRepository,
-  type PersistedVoiceNativeRealtimeStart,
-} from "../../persistence/Services/VoiceNativeRealtimeStarts.ts";
+  VoiceRuntimeRealtimeStartRepository,
+  type PersistedVoiceRuntimeRealtimeStart,
+} from "../../persistence/Services/VoiceRuntimeRealtimeStarts.ts";
 import {
   VoiceRealtimeTransitionGrantRepository,
   type PersistedVoiceRealtimeTransitionGrant,
 } from "../../persistence/Services/VoiceRealtimeTransitionGrants.ts";
 import { VoiceError } from "../Errors.ts";
-import { VoiceNativeControlGrantRegistry } from "../Services/VoiceNativeControlGrantRegistry.ts";
-import { VoiceNativeRuntimeGrantRegistry } from "../Services/VoiceNativeRuntimeGrantRegistry.ts";
-import type { VoiceNativeRuntimeGrantScope } from "../Services/VoiceNativeRuntimeGrantRegistry.ts";
+import { VoiceRuntimeControlGrantRegistry } from "../Services/VoiceRuntimeControlGrantRegistry.ts";
+import { VoiceRuntimeGrantRegistry } from "../Services/VoiceRuntimeGrantRegistry.ts";
+import type { VoiceRuntimeGrantScope } from "../Services/VoiceRuntimeGrantRegistry.ts";
 import { VoiceRealtimeControlService } from "../Services/VoiceRealtimeControlService.ts";
 import { VoiceSessionService } from "../Services/VoiceSessionService.ts";
 import { VoiceRealtimeControlServiceLive } from "./VoiceRealtimeControlService.ts";
 
 const runtimeId = VoiceRuntimeId.make("runtime-one");
-const nativeRuntimeId = VoiceNativeRuntimeId.make("runtime-one");
 const runtimeInstanceId = VoiceRuntimeInstanceId.make("instance-one");
 const modeSessionId = VoiceModeSessionId.make("mode-one");
 const sessionId = VoiceSessionId.make("session-one");
@@ -79,6 +78,13 @@ const handoffExchangeInput = {
   rearmGuardMs: 500,
 } as const;
 
+const handoffCommitInput = {
+  ...fence,
+  actionSequence: 6,
+  nextGeneration: 4,
+  threadModeSessionId: VoiceModeSessionId.make("thread-mode-one"),
+} as const;
+
 const makeFixture = Effect.gen(function* () {
   const createCalls = yield* Ref.make(0);
   const resumeCalls = yield* Ref.make(0);
@@ -87,7 +93,7 @@ const makeFixture = Effect.gen(function* () {
   const closeCalls = yield* Ref.make(0);
   const ackCalls = yield* Ref.make<Array<string>>([]);
   const handoffPending = yield* Ref.make(true);
-  const startRecord = yield* Ref.make<PersistedVoiceNativeRealtimeStart | undefined>(undefined);
+  const startRecord = yield* Ref.make<PersistedVoiceRuntimeRealtimeStart | undefined>(undefined);
   const transitionRecord = yield* Ref.make<PersistedVoiceRealtimeTransitionGrant | undefined>(
     undefined,
   );
@@ -100,17 +106,22 @@ const makeFixture = Effect.gen(function* () {
     ReadonlySet<"session-control" | "handoff-actions" | "webrtc-signaling" | "session-close">
   >(new Set(["session-control", "handoff-actions", "webrtc-signaling", "session-close"]));
 
-  const runtimeGrant: VoiceNativeRuntimeGrantScope = {
+  const runtimeGrant: VoiceRuntimeGrantScope = {
     authSessionId,
-    runtimeId: nativeRuntimeId,
+    runtimeId,
     generation: 3,
     provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-one"),
     grantedScopes: new Set(),
     target: {
       mode: "realtime" as const,
-      conversation: { type: "continue" as const, conversationId },
-      focus: { type: "none" as const },
+      environmentId: EnvironmentId.make("environment-one"),
+      conversationId,
     },
+    targetDigest:
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as VoiceRuntimeGrantScope["targetDigest"],
+    operation: "realtime-start",
+    readinessEnabled: false,
+    refreshRotationCounter: 0,
     expiresAt,
   };
   const controlGrant = {
@@ -118,7 +129,7 @@ const makeFixture = Effect.gen(function* () {
     sessionId,
     leaseGeneration: 7,
     expiresAt,
-    runtimeId: nativeRuntimeId,
+    runtimeId,
     runtimeGeneration: 3,
   };
   const state = {
@@ -134,7 +145,7 @@ const makeFixture = Effect.gen(function* () {
     transport: { kind: "webrtc-sdp-v1" as const, signalingPath: "/legacy" },
     expiresAt: "2099-01-01T00:00:00.000Z",
     heartbeatIntervalSeconds: 10,
-    nativeControlGrant: {
+    runtimeControlGrant: {
       token: controlToken,
       sessionId,
       leaseGeneration: 7,
@@ -186,12 +197,12 @@ const makeFixture = Effect.gen(function* () {
     },
   ];
 
-  const startRepository = VoiceNativeRealtimeStartRepository.of({
+  const startRepository = VoiceRuntimeRealtimeStartRepository.of({
     claim: (input) =>
       Effect.gen(function* () {
         const current = yield* Ref.get(startRecord);
         if (current !== undefined) return { status: "existing" as const, record: current };
-        const record: PersistedVoiceNativeRealtimeStart = {
+        const record: PersistedVoiceRuntimeRealtimeStart = {
           ...input,
           sessionId: null,
           leaseGeneration: null,
@@ -234,21 +245,14 @@ const makeFixture = Effect.gen(function* () {
           ? { status: "existing" as const, record: current }
           : { status: "mismatch" as const };
       }),
-    findActive: () => Ref.get(transitionRecord),
+    findByToken: (tokenHash) =>
+      Ref.get(transitionRecord).pipe(
+        Effect.map((current) => (current?.tokenHash === tokenHash ? current : undefined)),
+      ),
     findByOperationKey: (operationKey) =>
       Ref.get(transitionRecord).pipe(
         Effect.map((current) => (current?.operationKey === operationKey ? current : undefined)),
       ),
-    consume: (tokenHash, now) =>
-      Effect.gen(function* () {
-        const current = yield* Ref.get(transitionRecord);
-        if (current === undefined || current.tokenHash !== tokenHash)
-          return { status: "missing" as const };
-        if (current.consumedAt !== null) return { status: "already-consumed" as const };
-        const consumed = { ...current, consumedAt: now };
-        yield* Ref.set(transitionRecord, consumed);
-        return { status: "consumed" as const, record: consumed };
-      }),
     revoke: () => Ref.set(transitionRecord, undefined),
     purgeExpired: () => Effect.void,
   });
@@ -299,7 +303,7 @@ const makeFixture = Effect.gen(function* () {
             : [],
         ),
       ),
-    acknowledgeNativeHandoffAction: (_owner, _sessionId, _generation, actionId) =>
+    acknowledgeRuntimeHandoffAction: (_owner, _sessionId, _generation, actionId) =>
       Effect.gen(function* () {
         const failure = yield* Ref.get(handoffAcknowledgementFailure);
         if (failure !== undefined) return yield* failure;
@@ -310,7 +314,7 @@ const makeFixture = Effect.gen(function* () {
           outcome: "succeeded" as const,
         };
       }),
-    reconcileActivatedNativeHandoff: (owner, recoveredSessionId, generation, actionId, target) =>
+    reconcileActivatedRuntimeHandoff: (owner, recoveredSessionId, generation, actionId, target) =>
       Ref.update(reconciledHandoffs, (all) => [
         ...all,
         { owner, sessionId: recoveredSessionId, generation, actionId, target },
@@ -334,9 +338,10 @@ const makeFixture = Effect.gen(function* () {
     Layer.provide(
       Layer.mergeAll(
         Layer.succeed(
-          VoiceNativeRuntimeGrantRegistry,
-          VoiceNativeRuntimeGrantRegistry.of({
+          VoiceRuntimeGrantRegistry,
+          VoiceRuntimeGrantRegistry.of({
             issue: () => Effect.die("unused"),
+            refresh: () => Effect.die("unused"),
             authorize: (token) => Effect.succeed(token === runtimeToken ? runtimeGrant : undefined),
             activateTransition: (_token, input) =>
               Effect.gen(function* () {
@@ -345,6 +350,10 @@ const makeFixture = Effect.gen(function* () {
                 }
                 yield* Ref.set(transitionActivated, true);
                 yield* Ref.update(activatedTransitions, (entries) => [...entries, input]);
+                const consumedAt = yield* Clock.currentTimeMillis;
+                yield* Ref.update(transitionRecord, (record) =>
+                  record === undefined ? undefined : { ...record, consumedAt },
+                );
                 yield* Ref.set(controlCapabilities, new Set(["session-close"]));
                 if (yield* Ref.getAndSet(crashAfterTransitionActivation, false)) {
                   return yield* Effect.die("simulated crash after transition activation");
@@ -356,8 +365,8 @@ const makeFixture = Effect.gen(function* () {
           }),
         ),
         Layer.succeed(
-          VoiceNativeControlGrantRegistry,
-          VoiceNativeControlGrantRegistry.of({
+          VoiceRuntimeControlGrantRegistry,
+          VoiceRuntimeControlGrantRegistry.of({
             issue: () => Effect.die("unused"),
             authorize: (token) =>
               token === controlToken
@@ -375,7 +384,7 @@ const makeFixture = Effect.gen(function* () {
             revokeAuthSession: () => Effect.void,
           }),
         ),
-        Layer.succeed(VoiceNativeRealtimeStartRepository, startRepository),
+        Layer.succeed(VoiceRuntimeRealtimeStartRepository, startRepository),
         Layer.succeed(VoiceRealtimeTransitionGrantRepository, transitionRepository),
         Layer.succeed(ServerSecretStore, {
           getOrCreateRandom: () => Effect.succeed(new Uint8Array(32).fill(9)),
@@ -528,14 +537,14 @@ describe("VoiceRealtimeControlService", () => {
       for (const [name, corrupt] of [
         [
           "auth",
-          (record: PersistedVoiceNativeRealtimeStart) => ({
+          (record: PersistedVoiceRuntimeRealtimeStart) => ({
             ...record,
             authSessionId: AuthSessionId.make("different-auth"),
           }),
         ],
         [
           "lease",
-          (record: PersistedVoiceNativeRealtimeStart) => ({
+          (record: PersistedVoiceRuntimeRealtimeStart) => ({
             ...record,
             leaseGeneration: 8,
           }),
@@ -589,6 +598,22 @@ describe("VoiceRealtimeControlService", () => {
           modeSessionId: "thread-mode-one",
         },
       });
+      expect([...(yield* Ref.get(fixture.refs.controlCapabilities))]).toEqual([
+        "session-control",
+        "handoff-actions",
+        "webrtc-signaling",
+        "session-close",
+      ]);
+      expect(yield* Ref.get(fixture.refs.activatedTransitions)).toHaveLength(0);
+      yield* Effect.gen(function* () {
+        const service = yield* VoiceRealtimeControlService;
+        yield* service.commitHandoff(
+          result.transitionGrant.token,
+          sessionId,
+          fixture.ids.handoffAction,
+          handoffCommitInput,
+        );
+      }).pipe(Effect.provide(fixture.layer));
       expect(yield* Ref.get(fixture.refs.activatedTransitions)).toHaveLength(1);
     }),
   );
@@ -646,6 +671,15 @@ describe("VoiceRealtimeControlService", () => {
           targetGeneration: 4,
           modeSessionId: "thread-mode-one",
         });
+        expect(yield* Ref.get(fixture.refs.activatedTransitions)).toEqual([]);
+        expect([...(yield* Ref.get(fixture.refs.controlCapabilities))]).toHaveLength(4);
+        const committed = yield* service.commitHandoff(
+          first.transitionGrant.token,
+          sessionId,
+          fixture.ids.handoffAction,
+          handoffCommitInput,
+        );
+        expect(committed).toMatchObject({ committed: true, replayed: false });
         expect(yield* Ref.get(fixture.refs.activatedTransitions)).toEqual([
           expect.objectContaining({
             sourceGeneration: 3,
@@ -696,11 +730,17 @@ describe("VoiceRealtimeControlService", () => {
       yield* Effect.gen(function* () {
         const service = yield* VoiceRealtimeControlService;
         yield* service.create(runtimeToken, createInput);
-        yield* service.exchangeHandoff(
+        const exchange = yield* service.exchangeHandoff(
           controlToken,
           sessionId,
           fixture.ids.handoffAction,
           handoffExchangeInput,
+        );
+        yield* service.commitHandoff(
+          exchange.transitionGrant.token,
+          sessionId,
+          fixture.ids.handoffAction,
+          handoffCommitInput,
         );
       }).pipe(Effect.provide(fixture.layer));
       expect([...(yield* Ref.get(fixture.refs.controlCapabilities))]).toEqual(["session-close"]);
@@ -726,8 +766,7 @@ describe("VoiceRealtimeControlService", () => {
   it.effect("replays an activated handoff receipt after a crash and action expiry", () =>
     Effect.gen(function* () {
       const fixture = yield* makeFixture;
-      yield* Ref.set(fixture.refs.crashAfterTransitionActivation, true);
-      const crashed = yield* Effect.gen(function* () {
+      const exchange = yield* Effect.gen(function* () {
         const service = yield* VoiceRealtimeControlService;
         yield* service.create(runtimeToken, createInput);
         return yield* service.exchangeHandoff(
@@ -735,6 +774,16 @@ describe("VoiceRealtimeControlService", () => {
           sessionId,
           fixture.ids.handoffAction,
           handoffExchangeInput,
+        );
+      }).pipe(Effect.provide(fixture.layer));
+      yield* Ref.set(fixture.refs.crashAfterTransitionActivation, true);
+      const crashed = yield* Effect.gen(function* () {
+        const service = yield* VoiceRealtimeControlService;
+        return yield* service.commitHandoff(
+          exchange.transitionGrant.token,
+          sessionId,
+          fixture.ids.handoffAction,
+          handoffCommitInput,
         );
       }).pipe(Effect.provide(fixture.layer), Effect.exit);
       expect(crashed._tag).toBe("Failure");
@@ -754,21 +803,17 @@ describe("VoiceRealtimeControlService", () => {
       yield* Ref.set(fixture.refs.handoffPending, false);
       const replay = yield* Effect.gen(function* () {
         const service = yield* VoiceRealtimeControlService;
-        return yield* service.exchangeHandoff(
-          controlToken,
+        return yield* service.commitHandoff(
+          exchange.transitionGrant.token,
           sessionId,
           fixture.ids.handoffAction,
-          handoffExchangeInput,
+          handoffCommitInput,
         );
       }).pipe(Effect.provide(fixture.layer));
 
       expect(replay).toMatchObject({
         replayed: true,
-        transitionGrant: {
-          generation: 4,
-          modeSessionId: "thread-mode-one",
-          target: { projectId: "project-three", threadId: "thread-three" },
-        },
+        committed: true,
       });
       expect((yield* Ref.get(fixture.refs.transitionRecord))?.consumedAt).toEqual(
         expect.any(Number),
@@ -805,11 +850,10 @@ describe("VoiceRealtimeControlService", () => {
     }),
   );
 
-  it.effect("does not suppress other handoff acknowledgement failures on replay", () =>
+  it.effect("keeps commit successful and reconciles after acknowledgement persistence fails", () =>
     Effect.gen(function* () {
       const fixture = yield* makeFixture;
-      yield* Ref.set(fixture.refs.crashAfterTransitionActivation, true);
-      yield* Effect.gen(function* () {
+      const exchange = yield* Effect.gen(function* () {
         const service = yield* VoiceRealtimeControlService;
         yield* service.create(runtimeToken, createInput);
         return yield* service.exchangeHandoff(
@@ -818,7 +862,7 @@ describe("VoiceRealtimeControlService", () => {
           fixture.ids.handoffAction,
           handoffExchangeInput,
         );
-      }).pipe(Effect.provide(fixture.layer), Effect.exit);
+      }).pipe(Effect.provide(fixture.layer));
 
       yield* Ref.set(
         fixture.refs.handoffAcknowledgementFailure,
@@ -831,20 +875,17 @@ describe("VoiceRealtimeControlService", () => {
       );
       const replay = yield* Effect.gen(function* () {
         const service = yield* VoiceRealtimeControlService;
-        return yield* service
-          .exchangeHandoff(controlToken, sessionId, fixture.ids.handoffAction, handoffExchangeInput)
-          .pipe(Effect.result);
+        return yield* service.commitHandoff(
+          exchange.transitionGrant.token,
+          sessionId,
+          fixture.ids.handoffAction,
+          handoffCommitInput,
+        );
       }).pipe(Effect.provide(fixture.layer));
 
-      expect(replay._tag).toBe("Failure");
-      if (replay._tag === "Failure") {
-        expect(replay.failure).toMatchObject({
-          reason: "provider-unavailable",
-          operation: "session.client-action",
-        });
-      }
+      expect(replay).toMatchObject({ committed: true, replayed: false });
       expect(yield* Ref.get(fixture.refs.activatedTransitions)).toHaveLength(1);
-      expect(yield* Ref.get(fixture.refs.reconciledHandoffs)).toEqual([]);
+      expect(yield* Ref.get(fixture.refs.reconciledHandoffs)).toHaveLength(1);
       expect([...(yield* Ref.get(fixture.refs.controlCapabilities))]).toEqual(["session-close"]);
     }),
   );

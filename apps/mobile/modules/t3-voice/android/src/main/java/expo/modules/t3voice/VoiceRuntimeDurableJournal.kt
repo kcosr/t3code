@@ -20,7 +20,7 @@ internal data class VoiceRuntimeThreadReceipt(
   val highestAdvertisedSegment: Int?,
   val highestStartedSegment: Int?,
   val highestDrainedSegment: Int?,
-  val segmentDispositions: List<T3VoiceBackgroundSpeechDisposition>,
+  val segmentDispositions: List<VoiceRuntimeSpeechDisposition>,
   val speechTerminal: String?,
   val terminalOutcome: String?,
   val createdAtEpochMillis: Long,
@@ -30,32 +30,43 @@ internal data class VoiceRuntimeThreadReceipt(
 internal interface VoiceRuntimeJournalRepository {
   fun publishReceipt(receipt: VoiceRuntimeThreadReceipt)
   fun receipts(runtimeId: String, generation: Long, nowEpochMillis: Long): List<VoiceRuntimeThreadReceipt>
+  fun acknowledgeReceipt(key: VoiceRuntimeRetainedRecordKey.ThreadReceipt): Boolean
   fun publishAction(action: VoiceRuntimePresentationAction)
   fun removeAction(actionId: String)
   fun actions(nowEpochMillis: Long): List<VoiceRuntimePresentationAction>
 }
 
 internal class VoiceRuntimeDurableJournalRepository(
-  private val storage: T3VoiceBackgroundKeyValueStore,
+  private val storage: VoiceRuntimeKeyValueStore,
+  private val now: () -> Long = System::currentTimeMillis,
+  private val receiptCapacity: Int = MAXIMUM_RECEIPTS,
+  private val actionCapacity: Int = MAXIMUM_ACTIONS,
 ) : VoiceRuntimeJournalRepository {
-  constructor(context: Context) : this(T3VoiceBackgroundPreferences(context.applicationContext))
+  constructor(context: Context) : this(VoiceRuntimePreferences(context.applicationContext))
+
+  init {
+    require(receiptCapacity > 0)
+    require(actionCapacity > 0)
+  }
 
   @Synchronized
   override fun publishReceipt(receipt: VoiceRuntimeThreadReceipt) {
-    val current = receiptValues()
+    val current = receiptValues().filter { it.expiresAtEpochMillis > now() }
     val existing = current.firstOrNull {
-      it.identity.runtimeId == receipt.identity.runtimeId &&
+      it.identity == receipt.identity &&
         it.modeSessionId == receipt.modeSessionId &&
         it.turnClientOperationId == receipt.turnClientOperationId
     }
     val stable = existing?.let { receipt.copy(createdAtEpochMillis = it.createdAtEpochMillis) } ?: receipt
+    if (existing == null && current.size >= receiptCapacity) {
+      throw VoiceRuntimeRetentionCapacityException("thread receipt", receiptCapacity)
+    }
     val values = current.filterNot {
-      it.identity.runtimeId == stable.identity.runtimeId &&
+      it.identity == stable.identity &&
         it.modeSessionId == stable.modeSessionId &&
         it.turnClientOperationId == stable.turnClientOperationId
     }.plus(stable)
       .sortedWith(compareBy({ it.expiresAtEpochMillis }, { it.turnClientOperationId }))
-      .takeLast(MAXIMUM_RECEIPTS)
     write(KEY_RECEIPTS, JSONArray().also { array -> values.forEach { array.put(receiptJson(it)) } })
   }
 
@@ -74,10 +85,23 @@ internal class VoiceRuntimeDurableJournalRepository(
   }
 
   @Synchronized
+  override fun acknowledgeReceipt(key: VoiceRuntimeRetainedRecordKey.ThreadReceipt): Boolean {
+    val current = receiptValues()
+    val values = current.filterNot { it.matches(key) }
+    if (values.size == current.size) return false
+    write(KEY_RECEIPTS, JSONArray().also { array -> values.forEach { array.put(receiptJson(it)) } })
+    return true
+  }
+
+  @Synchronized
   override fun publishAction(action: VoiceRuntimePresentationAction) {
-    val values = actionValues().filterNot { it.actionId == action.actionId }.plus(action)
+    val current = actionValues().filter { it.expiresAtEpochMillis > now() }
+    if (current.none { it.actionId == action.actionId } && current.size >= actionCapacity) {
+      throw VoiceRuntimeRetentionCapacityException("presentation action", actionCapacity)
+    }
+    val values = current.filter { it.actionId != action.actionId }
+      .plus(action)
       .sortedWith(compareBy({ it.expiresAtEpochMillis }, { it.actionId }))
-      .takeLast(MAXIMUM_ACTIONS)
     write(KEY_ACTIONS, JSONArray().also { array -> values.forEach { array.put(actionJson(it)) } })
   }
 
@@ -97,13 +121,16 @@ internal class VoiceRuntimeDurableJournalRepository(
     return live
   }
 
-  private fun receiptValues(): List<VoiceRuntimeThreadReceipt> = array(KEY_RECEIPTS) { receipt(it) }
-  private fun actionValues(): List<VoiceRuntimePresentationAction> = array(KEY_ACTIONS) { action(it) }
+  private fun receiptValues(): List<VoiceRuntimeThreadReceipt> =
+    array(KEY_RECEIPTS, receiptCapacity) { receipt(it) }
+  private fun actionValues(): List<VoiceRuntimePresentationAction> =
+    array(KEY_ACTIONS, actionCapacity) { action(it) }
 
-  private fun <T> array(key: String, decode: (JSONObject) -> T): List<T> {
+  private fun <T> array(key: String, capacity: Int, decode: (JSONObject) -> T): List<T> {
     val raw = storage.getString(key) ?: return emptyList()
     return try {
       val values = JSONArray(raw)
+      require(values.length() <= capacity)
       buildList(values.length()) {
         for (index in 0 until values.length()) add(decode(values.getJSONObject(index)))
       }
@@ -167,7 +194,7 @@ internal class VoiceRuntimeDurableJournalRepository(
         for (index in 0 until dispositions.length()) {
           val item = dispositions.getJSONObject(index)
           require(item.keys().asSequence().toSet() == setOf("segmentIndex", "disposition"))
-          add(T3VoiceBackgroundSpeechDisposition(item.getInt("segmentIndex"), item.getString("disposition")))
+          add(VoiceRuntimeSpeechDisposition(item.getInt("segmentIndex"), item.getString("disposition")))
         }
       },
       nullableString("speechTerminal"), nullableString("terminalOutcome"),
@@ -176,23 +203,66 @@ internal class VoiceRuntimeDurableJournalRepository(
     )
   }
 
-  private fun actionJson(value: VoiceRuntimePresentationAction): JSONObject = JSONObject()
-    .put("actionId", value.actionId).put("kind", value.kind)
-    .put("expiresAt", Instant.ofEpochMilli(value.expiresAtEpochMillis).toString())
-    .put("projectId", value.projectId ?: JSONObject.NULL)
-    .put("threadId", value.threadId ?: JSONObject.NULL)
-    .put("artifact", value.artifact?.let(::draftHandleJson) ?: JSONObject.NULL)
+  private fun actionJson(value: VoiceRuntimePresentationAction): JSONObject = when (value) {
+    is VoiceRuntimePresentationAction.NavigateThread -> JSONObject()
+      .put("action", "navigate-thread")
+      .put("actionId", value.actionId)
+      .put("projectId", value.projectId)
+      .put("threadId", value.threadId)
+      .put("expiresAt", Instant.ofEpochMilli(value.expiresAtEpochMillis).toString())
+    is VoiceRuntimePresentationAction.ReviewDraft -> JSONObject()
+      .put("action", "review-draft")
+      .put("actionId", value.actionId)
+      .put("artifact", draftHandleJson(value.artifact))
+      .put("expiresAt", Instant.ofEpochMilli(value.expiresAtEpochMillis).toString())
+    is VoiceRuntimePresentationAction.RealtimeConfirmationRequired -> JSONObject()
+      .put("action", "realtime-confirmation-required")
+      .put("actionId", value.actionId)
+      .put("confirmationId", value.confirmationId)
+      .put("toolCallId", value.toolCallId)
+      .put("tool", value.tool)
+      .put("summary", value.summary)
+      .put("expiresAt", Instant.ofEpochMilli(value.expiresAtEpochMillis).toString())
+  }
 
   private fun action(value: JSONObject): VoiceRuntimePresentationAction {
-    require(value.keys().asSequence().toSet() == ACTION_FIELDS)
-    return VoiceRuntimePresentationAction(
-      value.getString("actionId"), value.getString("kind"),
-      Instant.parse(value.getString("expiresAt")).toEpochMilli(),
-      if (value.isNull("projectId")) null else value.getString("projectId"),
-      if (value.isNull("threadId")) null else value.getString("threadId"),
-      if (value.isNull("artifact")) null else draftHandle(value.getJSONObject("artifact")),
-    )
+    return when (value.getString("action")) {
+      "navigate-thread" -> {
+        require(value.keys().asSequence().toSet() == NAVIGATE_ACTION_FIELDS)
+        VoiceRuntimePresentationAction.NavigateThread(
+          value.getString("actionId"),
+          value.getString("projectId"),
+          value.getString("threadId"),
+          Instant.parse(value.getString("expiresAt")).toEpochMilli(),
+        )
+      }
+      "review-draft" -> {
+        require(value.keys().asSequence().toSet() == REVIEW_DRAFT_ACTION_FIELDS)
+        VoiceRuntimePresentationAction.ReviewDraft(
+          value.getString("actionId"),
+          draftHandle(value.getJSONObject("artifact")),
+          Instant.parse(value.getString("expiresAt")).toEpochMilli(),
+        )
+      }
+      "realtime-confirmation-required" -> {
+        require(value.keys().asSequence().toSet() == CONFIRMATION_ACTION_FIELDS)
+        VoiceRuntimePresentationAction.RealtimeConfirmationRequired(
+          value.getString("actionId"),
+          value.getString("confirmationId"),
+          value.getString("toolCallId"),
+          value.getString("tool"),
+          value.getString("summary"),
+          Instant.parse(value.getString("expiresAt")).toEpochMilli(),
+        )
+      }
+      else -> error("Unsupported durable presentation action.")
+    }
   }
+
+  private fun VoiceRuntimeThreadReceipt.matches(
+    key: VoiceRuntimeRetainedRecordKey.ThreadReceipt,
+  ): Boolean = identity == key.identity && modeSessionId == key.modeSessionId &&
+    turnClientOperationId == key.turnClientOperationId
 
   private fun draftHandleJson(value: VoiceRuntimeDraftHandle) = JSONObject()
     .put("artifactId", value.artifactId)
@@ -232,22 +302,40 @@ internal class VoiceRuntimeDurableJournalRepository(
       "highestAdvertisedSegment", "highestStartedSegment", "highestDrainedSegment",
       "segmentDispositions", "speechTerminal", "terminalOutcome", "createdAt", "expiresAt",
     )
-    val ACTION_FIELDS = setOf("actionId", "kind", "expiresAt", "projectId", "threadId", "artifact")
+    val NAVIGATE_ACTION_FIELDS = setOf(
+      "action", "actionId", "projectId", "threadId", "expiresAt",
+    )
+    val REVIEW_DRAFT_ACTION_FIELDS = setOf("action", "actionId", "artifact", "expiresAt")
+    val CONFIRMATION_ACTION_FIELDS = setOf(
+      "action", "actionId", "confirmationId", "toolCallId", "tool", "summary", "expiresAt",
+    )
   }
 }
 
-internal class VoiceRuntimeMemoryJournalRepository : VoiceRuntimeJournalRepository {
+internal class VoiceRuntimeMemoryJournalRepository(
+  private val now: () -> Long = System::currentTimeMillis,
+) : VoiceRuntimeJournalRepository {
   private val receiptValues = linkedMapOf<String, VoiceRuntimeThreadReceipt>()
   private val actionValues = linkedMapOf<String, VoiceRuntimePresentationAction>()
   override fun publishReceipt(receipt: VoiceRuntimeThreadReceipt) {
-    receiptValues["${receipt.identity.runtimeId}:${receipt.modeSessionId}:${receipt.turnClientOperationId}"] = receipt
+    receiptValues[
+      "${receipt.identity.runtimeId}:${receipt.identity.runtimeInstanceId}:" +
+        "${receipt.identity.generation}:${receipt.modeSessionId}:${receipt.turnClientOperationId}"
+    ] = receipt
   }
   override fun receipts(runtimeId: String, generation: Long, nowEpochMillis: Long) =
     receiptValues.values.filter {
       it.identity.runtimeId == runtimeId && it.identity.generation == generation &&
         it.expiresAtEpochMillis > nowEpochMillis
     }
-  override fun publishAction(action: VoiceRuntimePresentationAction) { actionValues[action.actionId] = action }
+  override fun acknowledgeReceipt(key: VoiceRuntimeRetainedRecordKey.ThreadReceipt): Boolean =
+    receiptValues.entries.removeAll { it.value.identity == key.identity &&
+      it.value.modeSessionId == key.modeSessionId &&
+      it.value.turnClientOperationId == key.turnClientOperationId }
+  override fun publishAction(action: VoiceRuntimePresentationAction) {
+    actionValues.entries.removeAll { it.value.expiresAtEpochMillis <= now() }
+    actionValues[action.actionId] = action
+  }
   override fun removeAction(actionId: String) { actionValues.remove(actionId) }
   override fun actions(nowEpochMillis: Long) =
     actionValues.values.filter { it.expiresAtEpochMillis > nowEpochMillis }

@@ -56,7 +56,7 @@ internal data class T3VoicePendingRuntimeRevocation(
 ) {
   init {
     require(runtimeId.isNotBlank() && runtimeId.length <= 128)
-    T3VoiceBackgroundOriginPolicy.normalize(environmentOrigin)
+    VoiceRuntimeOriginPolicy.normalize(environmentOrigin)
   }
 }
 
@@ -65,13 +65,13 @@ internal data class T3VoiceDisabledReadiness(
   val runtimeId: String?,
 )
 
-internal enum class T3VoiceBackgroundAuthorityState(val wireValue: String) {
+internal enum class VoiceRuntimeAuthorityState(val wireValue: String) {
   PREPARED("prepared"),
   ACTIVE("active"),
 }
 
-internal data class T3VoiceBackgroundAuthoritySnapshot(
-  val state: T3VoiceBackgroundAuthorityState,
+internal data class VoiceRuntimeAuthoritySnapshot(
+  val state: VoiceRuntimeAuthorityState,
   val runtimeId: String,
   val config: T3VoiceReadinessConfig,
   val environmentOrigin: String,
@@ -136,7 +136,7 @@ internal class T3VoiceReadinessStore(context: Context) {
     return T3VoicePreparedReadiness(
       read().copy(enabled = true),
       runtimeId,
-      T3VoiceBackgroundOriginPolicy.normalize(environmentOrigin),
+      VoiceRuntimeOriginPolicy.normalize(environmentOrigin),
       operation,
       targetIdentityDigest,
     )
@@ -146,7 +146,7 @@ internal class T3VoiceReadinessStore(context: Context) {
     val config = prepared.config
     require(config.enabled && config.generation > 0)
     require(prepared.runtimeId.isNotBlank() && prepared.runtimeId.length <= 128)
-    val normalizedOrigin = T3VoiceBackgroundOriginPolicy.normalize(prepared.environmentOrigin)
+    val normalizedOrigin = VoiceRuntimeOriginPolicy.normalize(prepared.environmentOrigin)
     require(prepared.targetIdentityDigest.matches(SHA256_HEX_PATTERN))
     check(
       preferences.edit()
@@ -183,7 +183,7 @@ internal class T3VoiceReadinessStore(context: Context) {
     return T3VoicePreparedReadiness(
       config,
       runtimeId,
-      T3VoiceBackgroundOriginPolicy.normalize(origin),
+      VoiceRuntimeOriginPolicy.normalize(origin),
       operation,
       digest,
     )
@@ -202,7 +202,7 @@ internal class T3VoiceReadinessStore(context: Context) {
         .putString(KEY_ACTIVE_RUNTIME_ID, authority.runtimeId)
         .putString(
           KEY_ACTIVE_ENVIRONMENT_ORIGIN,
-          T3VoiceBackgroundOriginPolicy.normalize(authority.environmentOrigin),
+          VoiceRuntimeOriginPolicy.normalize(authority.environmentOrigin),
         )
         .putString(KEY_ACTIVE_OPERATION, authority.operation.wireValue)
         .putString(KEY_ACTIVE_TARGET_DIGEST, authority.targetIdentityDigest)
@@ -220,7 +220,7 @@ internal class T3VoiceReadinessStore(context: Context) {
     val environmentOrigin = preferences.getString(KEY_PENDING_REVOCATION_ENVIRONMENT_ORIGIN, null)
     if (runtimeId === null && environmentOrigin === null) return null
     check(runtimeId !== null && environmentOrigin !== null) {
-      "The pending background voice revocation is incomplete."
+      "The pending runtime voice revocation is incomplete."
     }
     return T3VoicePendingRuntimeRevocation(runtimeId, environmentOrigin)
   }
@@ -254,7 +254,7 @@ internal class T3VoiceReadinessStore(context: Context) {
       edit.putString(KEY_PENDING_REVOCATION_RUNTIME_ID, revocation.runtimeId)
         .putString(
           KEY_PENDING_REVOCATION_ENVIRONMENT_ORIGIN,
-          T3VoiceBackgroundOriginPolicy.normalize(revocation.environmentOrigin),
+          VoiceRuntimeOriginPolicy.normalize(revocation.environmentOrigin),
         )
     }
     check(edit.commit()) { "Could not persist disabled voice authority." }
@@ -301,7 +301,7 @@ internal class T3VoiceReadinessStore(context: Context) {
       edit.putString(KEY_PENDING_REVOCATION_RUNTIME_ID, revocation.runtimeId)
         .putString(
           KEY_PENDING_REVOCATION_ENVIRONMENT_ORIGIN,
-          T3VoiceBackgroundOriginPolicy.normalize(revocation.environmentOrigin),
+          VoiceRuntimeOriginPolicy.normalize(revocation.environmentOrigin),
         )
     }
     check(edit.commit()) { "Could not persist notification-disabled voice authority." }
@@ -350,7 +350,7 @@ internal object T3VoiceReadinessReservationPolicy {
   ): T3VoicePreparedReadiness {
     require(desired.enabled) { "Prepared voice readiness must be enabled." }
     require(proposedRuntimeId.isNotBlank() && proposedRuntimeId.length <= 128)
-    val normalizedOrigin = T3VoiceBackgroundOriginPolicy.normalize(environmentOrigin)
+    val normalizedOrigin = VoiceRuntimeOriginPolicy.normalize(environmentOrigin)
     if (
       prepared != null &&
         prepared.config.sameReservationPayload(desired) &&
@@ -549,7 +549,7 @@ internal object T3VoiceConditionalDisablePolicy {
   }
 }
 
-internal object T3VoiceBackgroundPreparationPolicy {
+internal object VoiceRuntimePreparationPolicy {
   fun canPrepare(
     phase: T3VoiceRuntimePhase,
     realtimeAttemptActive: Boolean,

@@ -85,11 +85,11 @@ describe("resolveNativeVoiceRuntimeTarget", () => {
 
     expect(result.target).toEqual({
       mode: "realtime",
-      conversation: { type: "continue", conversationId: CONVERSATION_ID },
-      focus: { type: "thread", projectId: PROJECT_ID, threadId: THREAD_ID },
+      environmentId: ENVIRONMENT_ID,
+      conversationId: CONVERSATION_ID,
     });
     expect(result.targetIdentity).toBe(
-      '{"conversation":{"conversationId":"conversation-1","type":"continue"},"focus":{"projectId":"project-1","threadId":"thread-1","type":"thread"},"mode":"realtime"}',
+      '{"conversationId":"conversation-1","environmentId":"environment-1","mode":"realtime"}',
     );
     expect(nativeVoiceRuntimeReadinessTargetId(result.target)).toBe("conversation-1");
     expect(voice.creates()).toBe(0);
@@ -117,8 +117,7 @@ describe("resolveNativeVoiceRuntimeTarget", () => {
     });
 
     expect(result.target).toMatchObject({
-      conversation: { conversationId: "durable-old" },
-      focus: { type: "none" },
+      conversationId: "durable-old",
     });
     expect(voice.creates()).toBe(0);
   });
@@ -137,7 +136,7 @@ describe("resolveNativeVoiceRuntimeTarget", () => {
     });
 
     expect(result.target).toMatchObject({
-      conversation: { conversationId: "conversation-created" },
+      conversationId: "conversation-created",
     });
     expect(voice.creates()).toBe(1);
   });

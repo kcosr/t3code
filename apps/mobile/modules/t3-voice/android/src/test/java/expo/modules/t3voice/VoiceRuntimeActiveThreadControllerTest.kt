@@ -18,7 +18,7 @@ class VoiceRuntimeActiveThreadControllerTest {
   )
 
   @Test
-  fun exactAuthorityStartsNativeThreadAndProjectsBackgroundState() {
+  fun exactAuthorityStartsNativeThreadAndProjectsRuntimeState() {
     configure()
     val receipt = controller.dispatch(start())
 
@@ -26,12 +26,12 @@ class VoiceRuntimeActiveThreadControllerTest {
     assertEquals("turn-client", execution.started)
     assertTrue(controller.snapshot().operation is VoiceRuntimeOperation.ThreadTurn)
 
-    controller.observeBackground(
-      T3VoiceBackgroundSnapshot(
+    controller.observeRuntime(
+      VoiceRuntimeExecutionSnapshot(
         runtimeId = "runtime",
         readinessGeneration = 1,
-        mode = T3VoiceBackgroundMode.THREAD,
-        phase = T3VoiceBackgroundPhase.RECORDING,
+        mode = VoiceRuntimeExecutionMode.THREAD,
+        phase = VoiceRuntimePhase.RECORDING,
         operationId = "turn-operation",
         operationGeneration = 1,
         recordingId = "recording",
@@ -41,12 +41,12 @@ class VoiceRuntimeActiveThreadControllerTest {
     assertEquals("turn-operation", operation.turnOperationId)
     assertEquals(VoiceRuntimeMediaOwner.Recorder("thread-mode", "turn-operation"), controller.snapshot().mediaOwner)
 
-    controller.observeBackground(
-      T3VoiceBackgroundSnapshot(
+    controller.observeRuntime(
+      VoiceRuntimeExecutionSnapshot(
         runtimeId = "runtime",
         readinessGeneration = 1,
-        mode = T3VoiceBackgroundMode.THREAD,
-        phase = T3VoiceBackgroundPhase.IDLE,
+        mode = VoiceRuntimeExecutionMode.THREAD,
+        phase = VoiceRuntimePhase.IDLE,
       ),
     )
     assertEquals(VoiceRuntimeReadiness.Ready(VoiceRuntimeMode.THREAD), controller.snapshot().readiness)
@@ -64,6 +64,54 @@ class VoiceRuntimeActiveThreadControllerTest {
     val thrown = controller.dispatch(start(commandId = "thrown"))
     assertTrue(thrown.outcome is VoiceRuntimeCommandOutcome.Rejected)
     assertEquals(VoiceRuntimeOperation.None, controller.snapshot().operation)
+  }
+
+  @Test
+  fun rejectedHandoffStartRollsBackAuthorityAndCanBeRetried() {
+    val source = VoiceRuntimeTarget.Realtime("environment", "conversation")
+    val sourceDigest = controller.targetDigest(source)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, sourceDigest, "token", 5_000)
+    val sourceReservation = reservation(sourceDigest)
+    controller.configureRealtimeAuthority(sourceReservation, source, "source")
+    controller.observeRealtime(
+      VoiceRuntimeRealtimeCheckpoint(
+        VoiceRuntimeRealtimeFence(sourceReservation.identity, "realtime-mode"),
+        source,
+        "start-realtime",
+        VoiceRealtimePhase.STOPPING,
+        "session",
+        1,
+        VoiceRuntimeRealtimeControlGrant("control", 5_000, 15, 45),
+      ),
+    )
+    val before = controller.snapshot()
+    val target = target()
+    val targetDigest = controller.targetDigest(target)
+    val targetReservation = VoiceRuntimeAuthorityReservation(
+      VoiceRuntimeIdentity("runtime", "instance", 2),
+      "handoff",
+      1,
+      targetDigest,
+      "transition-token",
+      1_000,
+      5_000,
+    )
+    installed = VoiceRuntimeInstalledAuthority("runtime", 2, targetDigest, "transition-token", 5_000)
+    val command = VoiceRuntimeThreadCommand.Start(
+      "handoff-start", targetReservation.identity, "thread-mode", "handoff-turn",
+      "auto-submit", null, "stop-conflicting",
+    )
+    execution.startResult = false
+
+    expectThrows<VoiceRuntimeHandoffActivationRejected> {
+      controller.activateHandoffAuthority(targetReservation, target, "handoff", command)
+    }
+    assertEquals(before, controller.snapshot())
+
+    execution.startResult = true
+    val accepted = controller.activateHandoffAuthority(targetReservation, target, "handoff", command)
+    assertTrue(VoiceRuntimeHandoffActivationPolicy.accepted(accepted))
+    assertEquals(2L, controller.snapshot().identity.generation)
   }
 
   @Test
@@ -201,59 +249,94 @@ class VoiceRuntimeActiveThreadControllerTest {
     assertEquals(listOf(handle), rebase.draftArtifacts)
     assertEquals("review-artifact", rebase.presentationActions.single().actionId)
     assertEquals(local.snapshot().cursor(), wakes.last())
+    local.acknowledgeRetainedRecord(
+      VoiceRuntimeIdentity("runtime", "instance", 1),
+      VoiceRuntimeRetainedRecordKey.ThreadReceipt(
+        receipt.identity, receipt.modeSessionId, receipt.turnClientOperationId,
+      ),
+    )
+    assertTrue(retained.receipts("runtime", 1, now).isEmpty())
   }
 
   @Test
-  fun realtimeTerminalsAreExactlyFencedBoundedAndProjectedLive() {
+  fun presentationElectionChangesAreDeliveredToExistingLeases() {
+    configure()
+    val first = controller.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
+    val firstCursor = controller.snapshot().cursor()
+
+    val second = controller.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
+    val firstDelivery = controller.deliver(first, firstCursor) as VoiceRuntimeDelivery.Events
+    val electedSecond = firstDelivery.events.single().presentationElection
+    assertEquals("presentation-election", firstDelivery.events.single().kind)
+    assertEquals(second.leaseId, electedSecond?.electedLeaseId)
+    assertEquals(2, electedSecond?.eligibleConsumerCount)
+
+    val secondCursor = controller.snapshot().cursor()
+    val background = controller.updateAttachment(second, VoiceRuntimePresentation.BACKGROUND)
+    val secondDelivery = controller.deliver(background, secondCursor) as VoiceRuntimeDelivery.Events
+    val electedFirst = secondDelivery.events.single().presentationElection
+    assertEquals(first.leaseId, electedFirst?.electedLeaseId)
+    assertEquals(1, electedFirst?.eligibleConsumerCount)
+
+    @Suppress("UNCHECKED_CAST")
+    val eventBody = (VoiceRuntimeBridge.deliveryBody(secondDelivery)["events"]
+      as List<Map<String, Any?>>).single()
+    @Suppress("UNCHECKED_CAST")
+    val electionBody = eventBody["election"] as Map<String, Any?>
+    assertEquals(first.leaseId, electionBody["electedLeaseId"])
+    assertEquals(1.0, electionBody["eligibleConsumerCount"])
+  }
+
+  @Test
+  fun processDeathRealtimeTerminalRebasesToNewInstanceWithOriginalIdentityUntilAcknowledged() {
     val realtimeTarget = VoiceRuntimeTarget.Realtime("environment", "conversation")
-    val exactIdentity = VoiceRuntimeIdentity("runtime", "instance", 1)
-    val retained = (0 until 70).map { index ->
-      realtimeSummary(
-        exactIdentity,
-        "mode-$index",
-        terminalAtEpochMillis = 1_000L + index,
-      )
-    } + realtimeSummary(
-      exactIdentity.copy(runtimeInstanceId = "stale-instance"),
-      "stale-mode",
-      terminalAtEpochMillis = 2_000,
-    )
+    val currentIdentity = VoiceRuntimeIdentity("runtime", "instance", 1)
+    val previousIdentity = currentIdentity.copy(runtimeInstanceId = "previous-process")
+    val repository = VoiceRuntimeMemoryRealtimeCheckpointRepository()
+    val recovered = realtimeSummary(previousIdentity, "recovered-mode")
+    repository.publishTerminal(recovered)
     val local = VoiceRuntimeActiveThreadController(
       "runtime", "instance", { now }, { installed }, execution,
-      realtimeTerminals = { retained },
+      realtimeTerminals = repository::terminals,
+      realtimeTerminalAcknowledgement = repository::acknowledgeTerminal,
     )
     val digest = local.targetDigest(realtimeTarget)
     installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
     local.configureRealtimeAuthority(reservation(digest), realtimeTarget, "realtime-fingerprint")
+    val lease = local.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
+    val rebase = local.deliver(lease, null) as VoiceRuntimeDelivery.Rebase
+
+    assertEquals(listOf(recovered), rebase.realtimeTerminalSummaries)
+    assertEquals(previousIdentity, rebase.realtimeTerminalSummaries.single().identity)
+    local.acknowledgeRetainedRecord(
+      currentIdentity,
+      VoiceRuntimeRetainedRecordKey.RealtimeTerminal(previousIdentity, "recovered-mode"),
+    )
+    assertTrue(repository.terminals(now).isEmpty())
+    expectThrows<VoiceRuntimeFenceException> {
+      local.acknowledgeRetainedRecord(
+        currentIdentity.copy(generation = 2),
+        VoiceRuntimeRetainedRecordKey.RealtimeTerminal(previousIdentity, "recovered-mode"),
+      )
+    }
+
     local.observeRealtime(
       VoiceRuntimeRealtimeCheckpoint(
-        VoiceRuntimeRealtimeFence(exactIdentity, "live-mode"),
+        VoiceRuntimeRealtimeFence(currentIdentity, "live-mode"),
         realtimeTarget,
         "start-command",
         VoiceRealtimePhase.CONNECTED,
         serverSessionId = "session",
         leaseGeneration = 1,
-        controlGrant = T3VoiceBackgroundRealtimeControlGrant("control-token", 5_000, 15, 30),
+        controlGrant = VoiceRuntimeRealtimeControlGrant("control-token", 5_000, 15, 30),
         lastConnectedAtEpochMillis = now,
       ),
     )
-    val lease = local.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
     val cursorBeforeTerminal = local.snapshot().cursor()
-    val rebase = local.deliver(lease, null) as VoiceRuntimeDelivery.Rebase
-
-    assertEquals(64, rebase.realtimeTerminalSummaries.size)
-    assertEquals("mode-6", rebase.realtimeTerminalSummaries.first().modeSessionId)
-    assertTrue(rebase.realtimeTerminalSummaries.all { it.identity == exactIdentity })
-    val rebaseBody = VoiceRuntimeBridge.deliveryBody(rebase)
-    @Suppress("UNCHECKED_CAST")
-    val rebaseSummaries = rebaseBody["realtimeTerminalSummaries"] as List<Map<String, Any?>>
-    assertEquals("mode-69", rebaseSummaries.last()["modeSessionId"])
-    assertFalse(rebaseBody.toString().contains("control-token"))
-
     assertFalse(local.publishRealtimeTerminal(realtimeSummary(
-      exactIdentity.copy(generation = 2), "live-mode",
+      currentIdentity.copy(generation = 2), "live-mode",
     )))
-    val live = realtimeSummary(exactIdentity, "live-mode")
+    val live = realtimeSummary(currentIdentity, "live-mode")
     assertTrue(local.publishRealtimeTerminal(live))
     val events = local.deliver(lease, cursorBeforeTerminal) as VoiceRuntimeDelivery.Events
     assertEquals(1, events.events.size)

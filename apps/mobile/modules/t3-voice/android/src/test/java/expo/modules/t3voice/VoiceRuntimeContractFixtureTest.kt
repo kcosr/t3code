@@ -71,7 +71,7 @@ internal class VoiceRuntimeContractFixtureTest {
     VoiceRuntimeIdentity("runtime-1", "instance-1", 4),
     "mode-1", "turn-client-1", "operation-1", "environment-1", "project-1", "thread-1",
     "message-1", "turn-1", listOf("assistant-1"), "speech-1", 1, 1, 1,
-    listOf(T3VoiceBackgroundSpeechDisposition(1, "drained")),
+    listOf(VoiceRuntimeSpeechDisposition(1, "drained")),
     "completed", "completed",
     Instant.parse("2026-07-14T00:00:00Z").toEpochMilli(),
     Instant.parse("2026-08-14T00:00:00Z").toEpochMilli(),

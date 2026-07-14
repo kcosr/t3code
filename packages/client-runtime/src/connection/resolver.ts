@@ -66,6 +66,7 @@ const makePrimaryBroker = Effect.fn("clientRuntime.connection.broker.makePrimary
       return {
         environmentId: target.environmentId,
         label: target.label,
+        voiceRuntimeProtocolMajor: target.voiceRuntimeProtocolMajor,
         httpBaseUrl: target.httpBaseUrl,
         socketUrl: primarySocketUrl(target),
         httpAuthorization: null,
@@ -130,6 +131,7 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
     return {
       environmentId: authorized.environmentId,
       label: authorized.label,
+      voiceRuntimeProtocolMajor: authorized.voiceRuntimeProtocolMajor,
       httpBaseUrl: authorized.httpBaseUrl,
       socketUrl: authorized.socketUrl,
       httpAuthorization: authorized.httpAuthorization,
@@ -175,6 +177,7 @@ const makeRelayBroker = Effect.fn("clientRuntime.connection.broker.makeRelay")(f
       return {
         environmentId: authorized.environmentId,
         label: authorized.label,
+        voiceRuntimeProtocolMajor: authorized.voiceRuntimeProtocolMajor,
         httpBaseUrl: authorized.httpBaseUrl,
         socketUrl: authorized.socketUrl,
         httpAuthorization: authorized.httpAuthorization,
@@ -233,6 +236,7 @@ const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(funct
     return {
       environmentId: authorized.environmentId,
       label: authorized.label,
+      voiceRuntimeProtocolMajor: authorized.voiceRuntimeProtocolMajor,
       httpBaseUrl: authorized.httpBaseUrl,
       socketUrl: authorized.socketUrl,
       httpAuthorization: authorized.httpAuthorization,

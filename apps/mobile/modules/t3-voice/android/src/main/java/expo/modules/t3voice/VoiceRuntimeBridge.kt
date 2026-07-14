@@ -9,6 +9,7 @@ internal object VoiceRuntimeBridge {
     val target: VoiceRuntimeTarget,
     val environmentOrigin: String,
     val readinessEnabled: Boolean,
+    val refreshRotationCounter: Long,
     val fingerprint: String,
   )
   fun canonicalRealtimeTargetIdentity(target: VoiceRuntimeTarget.Realtime): String = canonicalJson(
@@ -69,7 +70,7 @@ internal object VoiceRuntimeBridge {
     requireKeys(input, setOf(
       "runtimeId", "runtimeInstanceId", "provisioningOperationId", "expectedCurrentGeneration",
       "generation", "targetDigest", "target", "operation", "environmentOrigin",
-      "readinessEnabled", "token",
+      "readinessEnabled", "token", "refreshRotationCounter",
       "issuedAt", "expiresAt",
     ))
     val operation = text(input, "operation")
@@ -103,12 +104,14 @@ internal object VoiceRuntimeBridge {
       reservation.expiresAtEpochMillis,
       target,
       boolean(input, "readinessEnabled"),
+      long(input, "refreshRotationCounter"),
     ).joinToString("\u0000")
     return ParsedAuthority(
       reservation,
       target,
-      T3VoiceBackgroundOriginPolicy.normalize(text(input, "environmentOrigin")),
+      VoiceRuntimeOriginPolicy.normalize(text(input, "environmentOrigin")),
       boolean(input, "readinessEnabled"),
+      long(input, "refreshRotationCounter"),
       fingerprint,
     )
   }
@@ -339,7 +342,7 @@ internal object VoiceRuntimeBridge {
         val focus = input["focus"]?.let {
           val value = objectValue(input, "focus")
           requireKeys(value, setOf("projectId", "threadId"))
-          T3VoiceBackgroundRealtimeFocus(
+          VoiceRuntimeRealtimeFocus(
             text(value, "projectId"),
             value["threadId"]?.let { text(value, "threadId") },
           )
@@ -453,6 +456,14 @@ internal object VoiceRuntimeBridge {
     event.realtimeTerminalSummary?.let { base["summary"] = realtimeTerminalSummaryBody(it) }
     event.draftArtifact?.let { base["artifact"] = draftHandleBody(it) }
     event.presentationAction?.let { base["action"] = presentationActionBody(it) }
+    event.presentationElection?.let { election ->
+      base["election"] = mapOf(
+        "electedLeaseId" to election.electedLeaseId,
+        "electedAttachOrdinal" to election.electedAttachOrdinal?.toDouble(),
+        "eligibleConsumerCount" to election.eligibleConsumerCount.toDouble(),
+        "changedAt" to iso(election.changedAtEpochMillis),
+      )
+    }
     return base
   }
 
@@ -523,31 +534,81 @@ internal object VoiceRuntimeBridge {
   )
 
   fun presentationActionBody(action: VoiceRuntimePresentationAction): Map<String, Any?> =
-    when (action.kind) {
-      "navigate-thread" -> mapOf(
+    when (action) {
+      is VoiceRuntimePresentationAction.NavigateThread -> mapOf(
         "actionId" to action.actionId,
-        "action" to action.kind,
-        "projectId" to checkNotNull(action.projectId),
-        "threadId" to checkNotNull(action.threadId),
+        "action" to "navigate-thread",
+        "projectId" to action.projectId,
+        "threadId" to action.threadId,
         "expiresAt" to iso(action.expiresAtEpochMillis),
       )
-      "review-draft" -> mapOf(
+      is VoiceRuntimePresentationAction.ReviewDraft -> mapOf(
         "actionId" to action.actionId,
-        "action" to action.kind,
-        "artifact" to draftHandleBody(checkNotNull(action.artifact)),
+        "action" to "review-draft",
+        "artifact" to draftHandleBody(action.artifact),
         "expiresAt" to iso(action.expiresAtEpochMillis),
       )
-      "realtime-confirmation-required" -> mapOf(
+      is VoiceRuntimePresentationAction.RealtimeConfirmationRequired -> mapOf(
         "actionId" to action.actionId,
-        "action" to action.kind,
-        "confirmationId" to checkNotNull(action.confirmationId),
-        "toolCallId" to checkNotNull(action.toolCallId),
-        "tool" to checkNotNull(action.tool),
-        "summary" to checkNotNull(action.summary),
+        "action" to "realtime-confirmation-required",
+        "confirmationId" to action.confirmationId,
+        "toolCallId" to action.toolCallId,
+        "tool" to action.tool,
+        "summary" to action.summary,
         "expiresAt" to iso(action.expiresAtEpochMillis),
       )
-      else -> error("Unsupported native presentation action.")
     }
+
+  fun parseRetainedRecordKey(input: Map<String, Any?>): VoiceRuntimeRetainedRecordKey =
+    when (text(input, "kind")) {
+      "thread-receipt" -> {
+        requireKeys(input, setOf(
+          "kind", "sourceRuntimeId", "sourceRuntimeInstanceId", "sourceRuntimeGeneration",
+          "modeSessionId", "turnClientOperationId",
+        ))
+        val sourceGeneration = long(input, "sourceRuntimeGeneration").also { require(it > 0) }
+        VoiceRuntimeRetainedRecordKey.ThreadReceipt(
+          VoiceRuntimeIdentity(
+            text(input, "sourceRuntimeId"),
+            text(input, "sourceRuntimeInstanceId"),
+            sourceGeneration,
+          ),
+          text(input, "modeSessionId"),
+          text(input, "turnClientOperationId"),
+        )
+      }
+      "realtime-terminal" -> {
+        requireKeys(input, setOf(
+          "kind", "sourceRuntimeId", "sourceRuntimeInstanceId", "sourceRuntimeGeneration",
+          "modeSessionId",
+        ))
+        val sourceGeneration = long(input, "sourceRuntimeGeneration").also { require(it > 0) }
+        VoiceRuntimeRetainedRecordKey.RealtimeTerminal(
+          VoiceRuntimeIdentity(
+            text(input, "sourceRuntimeId"),
+            text(input, "sourceRuntimeInstanceId"),
+            sourceGeneration,
+          ),
+          text(input, "modeSessionId"),
+        )
+      }
+      else -> throw IllegalArgumentException("Unsupported retained voice record kind.")
+    }
+
+  fun parseRetainedRecordAcknowledgement(
+    input: Map<String, Any?>,
+  ): Pair<VoiceRuntimeIdentity, VoiceRuntimeRetainedRecordKey> {
+    requireKeys(input, setOf(
+      "runtimeId", "runtimeInstanceId", "authorityGeneration", "record",
+    ))
+    val record = objectValue(input, "record")
+    val authorityGeneration = long(input, "authorityGeneration").also { require(it > 0) }
+    return VoiceRuntimeIdentity(
+      text(input, "runtimeId"),
+      text(input, "runtimeInstanceId"),
+      authorityGeneration,
+    ) to parseRetainedRecordKey(record)
+  }
 
   private fun outcomeBody(outcome: VoiceRuntimeCommandOutcome): Map<String, Any?> = when (outcome) {
     VoiceRuntimeCommandOutcome.Accepted -> mapOf("type" to "accepted")
@@ -558,7 +619,7 @@ internal object VoiceRuntimeBridge {
     )
   }
 
-  private fun targetBody(target: VoiceRuntimeTarget): Map<String, Any?> = when (target) {
+  fun targetBody(target: VoiceRuntimeTarget): Map<String, Any?> = when (target) {
     is VoiceRuntimeTarget.Realtime -> mapOf(
       "mode" to "realtime",
       "environmentId" to target.environmentId,

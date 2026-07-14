@@ -49,7 +49,7 @@ internal sealed interface VoiceRuntimeNativeCommand {
     override val commandId: String,
     override val identity: VoiceRuntimeIdentity,
     override val modeSessionId: String,
-    val focus: T3VoiceBackgroundRealtimeFocus?,
+    val focus: VoiceRuntimeRealtimeFocus?,
   ) : VoiceRuntimeNativeCommand
 
   data class SetAudioRoute(
@@ -100,11 +100,11 @@ internal data class VoiceRuntimeRealtimeCheckpoint(
   val phase: VoiceRealtimePhase,
   val serverSessionId: String? = null,
   val leaseGeneration: Long? = null,
-  val controlGrant: T3VoiceBackgroundRealtimeControlGrant? = null,
+  val controlGrant: VoiceRuntimeRealtimeControlGrant? = null,
   val lastActionSequence: Long = 0,
   val lastConnectedAtEpochMillis: Long? = null,
-  val pendingAction: T3VoiceBackgroundRealtimeAction? = null,
-  val pendingHandoffExchange: T3VoiceBackgroundRealtimeHandoffExchangeResult? = null,
+  val pendingAction: VoiceRuntimeRealtimeAction? = null,
+  val pendingHandoffExchange: VoiceRuntimeRealtimeHandoffExchangeResult? = null,
   val drainDeadlineAtEpochMillis: Long? = null,
   val muted: Boolean = false,
 ) {
@@ -121,6 +121,7 @@ internal interface VoiceRuntimeRealtimeCheckpointRepository {
   fun clear(fence: VoiceRuntimeRealtimeFence)
   fun publishTerminal(summary: VoiceRuntimeRealtimeTerminalSummary)
   fun terminals(nowEpochMillis: Long): List<VoiceRuntimeRealtimeTerminalSummary>
+  fun acknowledgeTerminal(key: VoiceRuntimeRetainedRecordKey.RealtimeTerminal): Boolean
 }
 
 internal class VoiceRuntimeMemoryRealtimeCheckpointRepository :
@@ -149,6 +150,9 @@ internal class VoiceRuntimeMemoryRealtimeCheckpointRepository :
     terminalValues.removeAll { it.expiresAtEpochMillis <= nowEpochMillis }
     return terminalValues.toList()
   }
+
+  override fun acknowledgeTerminal(key: VoiceRuntimeRetainedRecordKey.RealtimeTerminal): Boolean =
+    terminalValues.removeAll { it.identity == key.identity && it.modeSessionId == key.modeSessionId }
 }
 
 internal sealed interface VoiceRuntimeRealtimeRemoteResult<out T> {
@@ -158,7 +162,7 @@ internal sealed interface VoiceRuntimeRealtimeRemoteResult<out T> {
 
 internal sealed interface VoiceRuntimeRealtimePresentationDecision {
   data class Navigate(
-    val outcome: T3VoiceBackgroundRealtimeActionOutcome,
+    val outcome: VoiceRuntimeRealtimeActionOutcome,
     val message: String?,
   ) : VoiceRuntimeRealtimePresentationDecision
 
@@ -173,61 +177,68 @@ internal interface VoiceRuntimeRealtimeServer {
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
     clientOperationId: String,
-  ): VoiceRuntimeRealtimeRemoteResult<T3VoiceBackgroundRealtimeStartResult>
+  ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeStartResult>
 
   fun offer(
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
-    session: T3VoiceBackgroundRealtimeStartResult,
+    session: VoiceRuntimeRealtimeStartResult,
     clientOperationId: String,
     sdp: String,
-  ): VoiceRuntimeRealtimeRemoteResult<T3VoiceBackgroundRealtimeAnswer>
+  ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeAnswer>
 
   fun heartbeat(
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
-    session: T3VoiceBackgroundRealtimeStartResult,
-  ): VoiceRuntimeRealtimeRemoteResult<T3VoiceBackgroundRealtimeHeartbeatResult>
+    session: VoiceRuntimeRealtimeStartResult,
+  ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeHeartbeatResult>
 
   fun actions(
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
-    session: T3VoiceBackgroundRealtimeStartResult,
+    session: VoiceRuntimeRealtimeStartResult,
     afterSequence: Long,
     waitMilliseconds: Long,
-  ): VoiceRuntimeRealtimeRemoteResult<T3VoiceBackgroundRealtimeActionsResult>
+  ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeActionsResult>
 
   fun acknowledgeAction(
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
-    session: T3VoiceBackgroundRealtimeStartResult,
-    action: T3VoiceBackgroundRealtimeAction,
+    session: VoiceRuntimeRealtimeStartResult,
+    action: VoiceRuntimeRealtimeAction,
     clientOperationId: String,
     decision: VoiceRuntimeRealtimePresentationDecision,
-  ): VoiceRuntimeRealtimeRemoteResult<T3VoiceBackgroundRealtimeActionAckResult>
+  ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeActionAckResult>
 
   fun updateFocus(
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
-    session: T3VoiceBackgroundRealtimeStartResult,
+    session: VoiceRuntimeRealtimeStartResult,
     clientOperationId: String,
-    focus: T3VoiceBackgroundRealtimeFocus?,
-  ): VoiceRuntimeRealtimeRemoteResult<T3VoiceBackgroundRealtimeFocusResult>
+    focus: VoiceRuntimeRealtimeFocus?,
+  ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeFocusResult>
 
   fun exchangeHandoff(
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
-    session: T3VoiceBackgroundRealtimeStartResult,
-    action: T3VoiceBackgroundRealtimeAction.HandoffToThreadVoice,
+    session: VoiceRuntimeRealtimeStartResult,
+    action: VoiceRuntimeRealtimeAction.HandoffToThreadVoice,
     plan: VoiceRuntimeRealtimeHandoffPlan,
-  ): VoiceRuntimeRealtimeRemoteResult<T3VoiceBackgroundRealtimeHandoffExchangeResult>
+  ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeHandoffExchangeResult>
+
+  fun commitHandoff(
+    authority: VoiceRuntimeRealtimeAuthority,
+    fence: VoiceRuntimeRealtimeFence,
+    session: VoiceRuntimeRealtimeStartResult,
+    exchange: VoiceRuntimeRealtimeHandoffExchangeResult,
+  ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeHandoffCommitResult>
 
   fun close(
     authority: VoiceRuntimeRealtimeAuthority,
     fence: VoiceRuntimeRealtimeFence,
-    session: T3VoiceBackgroundRealtimeStartResult,
+    session: VoiceRuntimeRealtimeStartResult,
     clientOperationId: String,
-  ): VoiceRuntimeRealtimeRemoteResult<T3VoiceBackgroundRealtimeCloseResult>
+  ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeCloseResult>
 }
 
 internal interface VoiceRuntimeRealtimePeer {
@@ -253,7 +264,7 @@ internal data class VoiceRuntimeRealtimeHandoffPlan(
   val threadModeSessionId: String,
   val environmentId: String,
   val speechPreset: String,
-  val endpointPolicy: T3VoiceBackgroundRealtimeEndpointPolicy,
+  val endpointPolicy: VoiceRuntimeRealtimeEndpointPolicy,
   val speechEnabled: Boolean,
   val rearmGuardMs: Long,
 )
@@ -261,14 +272,16 @@ internal data class VoiceRuntimeRealtimeHandoffPlan(
 internal interface VoiceRuntimeRealtimeHandoffCoordinator {
   fun plan(
     source: VoiceRuntimeRealtimeCheckpoint,
-    action: T3VoiceBackgroundRealtimeAction.HandoffToThreadVoice,
+    action: VoiceRuntimeRealtimeAction.HandoffToThreadVoice,
   ): VoiceRuntimeRealtimeHandoffPlan
 
-  fun activate(result: T3VoiceBackgroundRealtimeHandoffExchangeResult): Boolean
+  fun prepare(result: VoiceRuntimeRealtimeHandoffExchangeResult): Boolean
+
+  fun activate(result: VoiceRuntimeRealtimeHandoffExchangeResult): Boolean
 }
 
 internal fun interface VoiceRuntimeRealtimePresentationSink {
-  fun publish(action: T3VoiceBackgroundRealtimeAction)
+  fun publish(action: VoiceRuntimeRealtimeAction)
 }
 
 internal fun interface VoiceRuntimeRealtimeStateSink {
@@ -294,7 +307,7 @@ internal class VoiceRuntimeRealtimeEngine(
   private val terminalRetentionMillis: Long = 30L * 24 * 60 * 60 * 1_000,
 ) {
   private var checkpoint = repository.load()
-  private var serverSession: T3VoiceBackgroundRealtimeStartResult? = null
+  private var serverSession: VoiceRuntimeRealtimeStartResult? = null
   private val commands = VoiceRuntimeIdempotencyLedger<VoiceRuntimeRealtimeCommandResult>(256)
 
   init {
@@ -440,30 +453,30 @@ internal class VoiceRuntimeRealtimeEngine(
     val current = requireActive(fence)
     val action = current.pendingAction ?: throw VoiceRuntimeFenceException("No presentation action is pending.")
     val actualId = when (action) {
-      is T3VoiceBackgroundRealtimeAction.NavigateThread -> action.actionId
-      is T3VoiceBackgroundRealtimeAction.ConfirmationRequired -> action.actionId
+      is VoiceRuntimeRealtimeAction.NavigateThread -> action.actionId
+      is VoiceRuntimeRealtimeAction.ConfirmationRequired -> action.actionId
       else -> throw VoiceRuntimeFenceException("Action is not presentation-owned.")
     }
     if (actualId != actionId) throw VoiceRuntimeFenceException("Presentation action is stale.")
     when {
-      action is T3VoiceBackgroundRealtimeAction.NavigateThread &&
+      action is VoiceRuntimeRealtimeAction.NavigateThread &&
         decision !is VoiceRuntimeRealtimePresentationDecision.Navigate ->
         throw VoiceRuntimeFenceException("Realtime action decision kind does not match.")
-      action is T3VoiceBackgroundRealtimeAction.ConfirmationRequired &&
+      action is VoiceRuntimeRealtimeAction.ConfirmationRequired &&
         (decision !is VoiceRuntimeRealtimePresentationDecision.Confirmation ||
           decision.confirmationId != action.confirmationId) ->
         throw VoiceRuntimeFenceException("Realtime confirmation decision is stale.")
     }
     val session = requireSession(current)
-    if (action is T3VoiceBackgroundRealtimeAction.NavigateThread &&
+    if (action is VoiceRuntimeRealtimeAction.NavigateThread &&
       (decision as VoiceRuntimeRealtimePresentationDecision.Navigate).outcome ==
-        T3VoiceBackgroundRealtimeActionOutcome.SUCCEEDED) {
+        VoiceRuntimeRealtimeActionOutcome.SUCCEEDED) {
       val focused = server.updateFocus(
         authority,
         fence,
         session,
         "$commandId.focus",
-        T3VoiceBackgroundRealtimeFocus(action.projectId, action.threadId),
+        VoiceRuntimeRealtimeFocus(action.projectId, action.threadId),
       )
       if (focused !is VoiceRuntimeRealtimeRemoteResult.Success) return false
     }
@@ -484,7 +497,7 @@ internal class VoiceRuntimeRealtimeEngine(
   fun updateFocus(
     fence: VoiceRuntimeRealtimeFence,
     commandId: String,
-    focus: T3VoiceBackgroundRealtimeFocus?,
+    focus: VoiceRuntimeRealtimeFocus?,
   ): Boolean {
     val current = requireActive(fence)
     return server.updateFocus(
@@ -528,19 +541,29 @@ internal class VoiceRuntimeRealtimeEngine(
   @Synchronized
   fun recoverInterrupted(currentIdentity: VoiceRuntimeIdentity): VoiceRuntimeRealtimeTerminalSummary? {
     val stale = checkpoint ?: return null
-    if (stale.fence.identity == currentIdentity) return null
+    if (stale.fence.identity == currentIdentity && stale.pendingHandoffExchange == null) return null
     val session = restoredSession(stale)
+    peer.close(stale.fence.modeSessionId)
+    val exchange = stale.pendingHandoffExchange
+    val recovering = if (exchange == null) stale else stale.copy(
+      phase = VoiceRealtimePhase.STOPPING,
+      drainDeadlineAtEpochMillis = null,
+    ).also(::update)
+    val staleAuthority = authority.copy(identity = stale.fence.identity)
+    val committed = exchange == null || (session != null &&
+      server.commitHandoff(staleAuthority, stale.fence, session, exchange)
+        is VoiceRuntimeRealtimeRemoteResult.Success)
+    if (!committed) return null
     val cleaned = session != null && server.close(
-      authority.copy(identity = stale.fence.identity),
+      staleAuthority,
       stale.fence,
       session,
       "${stale.rootCommandId}.recover-close",
     ) is VoiceRuntimeRealtimeRemoteResult.Success
-    peer.close(stale.fence.modeSessionId)
-    val exchange = stale.pendingHandoffExchange
-    val activated = exchange == null || handoff.activate(exchange)
+    val activated = committed && (exchange == null || handoff.activate(exchange))
+    if (exchange != null && !activated) return null
     return terminal(
-      stale,
+      recovering,
       if (exchange != null && activated) VoiceRuntimeRealtimeTerminalOutcome.COMPLETED
       else if (exchange != null) VoiceRuntimeRealtimeTerminalOutcome.FAILED
       else VoiceRuntimeRealtimeTerminalOutcome.INTERRUPTED,
@@ -606,28 +629,28 @@ internal class VoiceRuntimeRealtimeEngine(
     }
   }
 
-  private fun consumeAction(action: T3VoiceBackgroundRealtimeAction): Boolean {
+  private fun consumeAction(action: VoiceRuntimeRealtimeAction): Boolean {
     val current = requireCheckpoint()
     return when (action) {
-      is T3VoiceBackgroundRealtimeAction.NavigateThread,
-      is T3VoiceBackgroundRealtimeAction.ConfirmationRequired,
+      is VoiceRuntimeRealtimeAction.NavigateThread,
+      is VoiceRuntimeRealtimeAction.ConfirmationRequired,
       -> {
         update(current.copy(pendingAction = action))
         presentation.publish(action)
         true
       }
-      is T3VoiceBackgroundRealtimeAction.StopRealtimeVoice -> {
+      is VoiceRuntimeRealtimeAction.StopRealtimeVoice -> {
         update(current.copy(lastActionSequence = action.sequence))
         beginShutdown(VoiceRuntimeRealtimeStopPolicy.DRAIN, "agent-stop")
         true
       }
-      is T3VoiceBackgroundRealtimeAction.HandoffToThreadVoice -> consumeHandoff(current, action)
+      is VoiceRuntimeRealtimeAction.HandoffToThreadVoice -> consumeHandoff(current, action)
     }
   }
 
   private fun consumeHandoff(
     current: VoiceRuntimeRealtimeCheckpoint,
-    action: T3VoiceBackgroundRealtimeAction.HandoffToThreadVoice,
+    action: VoiceRuntimeRealtimeAction.HandoffToThreadVoice,
   ): Boolean {
     val session = requireSession(current)
     val plan = handoff.plan(current, action)
@@ -637,6 +660,10 @@ internal class VoiceRuntimeRealtimeEngine(
       result.value.autoRearm != action.autoRearm ||
       result.value.transitionGrant.generation != current.fence.identity.generation + 1) {
       fail("handoff-response-mismatch")
+      return false
+    }
+    if (!handoff.prepare(result.value)) {
+      fail("handoff-admission-failed")
       return false
     }
     update(
@@ -671,23 +698,30 @@ internal class VoiceRuntimeRealtimeEngine(
       update(current.copy(phase = VoiceRealtimePhase.STOPPING, drainDeadlineAtEpochMillis = null))
       peer.close(fence.modeSessionId)
       val session = requireSession(current)
-      val closed = server.close(
-        authority,
-        fence,
-        session,
-        "${current.rootCommandId}.close.$reason",
-      ) is VoiceRuntimeRealtimeRemoteResult.Success
       val finish = {
         synchronized(this) {
           val latest = checkpoint?.takeIf { it.fence == fence } ?: return@synchronized
           val exchange = latest.pendingHandoffExchange
+          val committed = exchange == null || (
+            server.commitHandoff(authority, fence, session, exchange)
+              is VoiceRuntimeRealtimeRemoteResult.Success
+          )
+          if (!committed) return@synchronized
+          val closed = server.close(
+            authority,
+            fence,
+            session,
+            "${current.rootCommandId}.close.$reason",
+          ) is VoiceRuntimeRealtimeRemoteResult.Success
           val activated = exchange == null || handoff.activate(exchange)
+          if (exchange != null && !activated) return@synchronized
           terminal(
             latest,
             if (activated && exchange != null) VoiceRuntimeRealtimeTerminalOutcome.COMPLETED
             else if (activated) VoiceRuntimeRealtimeTerminalOutcome.STOPPED
             else VoiceRuntimeRealtimeTerminalOutcome.FAILED,
-            if (activated) reason else "handoff-activation-failed",
+            if (activated) reason
+            else "handoff-activation-failed",
             !closed,
           )
         }
@@ -739,13 +773,13 @@ internal class VoiceRuntimeRealtimeEngine(
   }
 
   private fun update(next: VoiceRuntimeRealtimeCheckpoint) {
-    checkpoint = next
     repository.save(next)
+    checkpoint = next
     stateSink.publish(next)
   }
 
   private fun validStart(
-    result: T3VoiceBackgroundRealtimeStartResult,
+    result: VoiceRuntimeRealtimeStartResult,
     fence: VoiceRuntimeRealtimeFence,
   ): Boolean = result.state.conversationId == authority.target.conversationId &&
     result.state.phase == "signaling" &&
@@ -754,12 +788,12 @@ internal class VoiceRuntimeRealtimeEngine(
     result.expiresAtEpochMillis >= result.controlGrant.expiresAtEpochMillis &&
     fence.identity == authority.identity
 
-  private fun restoredSession(current: VoiceRuntimeRealtimeCheckpoint): T3VoiceBackgroundRealtimeStartResult? {
+  private fun restoredSession(current: VoiceRuntimeRealtimeCheckpoint): VoiceRuntimeRealtimeStartResult? {
     val sessionId = current.serverSessionId ?: return null
     val lease = current.leaseGeneration ?: return null
     val control = current.controlGrant ?: return null
-    return T3VoiceBackgroundRealtimeStartResult(
-      T3VoiceBackgroundRealtimeSessionState(
+    return VoiceRuntimeRealtimeStartResult(
+      VoiceRuntimeRealtimeSessionState(
         sessionId,
         current.target.conversationId,
         "signaling",
@@ -772,7 +806,7 @@ internal class VoiceRuntimeRealtimeEngine(
     )
   }
 
-  private fun requireSession(current: VoiceRuntimeRealtimeCheckpoint): T3VoiceBackgroundRealtimeStartResult =
+  private fun requireSession(current: VoiceRuntimeRealtimeCheckpoint): VoiceRuntimeRealtimeStartResult =
     serverSession ?: restoredSession(current)
     ?: throw VoiceRuntimeFenceException("Realtime server session is unavailable.")
 

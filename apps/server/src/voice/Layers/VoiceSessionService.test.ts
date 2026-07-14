@@ -14,7 +14,7 @@ import {
   VoiceClientActionId,
   VoiceConversationEntryId,
   VoiceConversationId,
-  VoiceNativeRuntimeId,
+  VoiceRuntimeId,
   VoiceRequestId,
   type VoiceConversationSummary,
   VoiceSessionId,
@@ -40,9 +40,9 @@ import {
   VoiceHandoffActionRepository,
 } from "../../persistence/Services/VoiceHandoffActions.ts";
 import {
-  type PersistedVoiceNativeControlGrant,
-  VoiceNativeControlGrantRepository,
-} from "../../persistence/Services/VoiceNativeControlGrants.ts";
+  type PersistedVoiceRuntimeControlGrant,
+  VoiceRuntimeControlGrantRepository,
+} from "../../persistence/Services/VoiceRuntimeControlGrants.ts";
 import { VoiceError } from "../Errors.ts";
 import { VoiceConversationService } from "../Services/VoiceConversationService.ts";
 import type { RealtimeProviderSession, VoiceProviderAdapter } from "../Services/VoiceProvider.ts";
@@ -53,9 +53,9 @@ import {
   VoiceMediaTicketRegistryLive,
 } from "../Services/VoiceMediaTicketRegistry.ts";
 import {
-  VoiceNativeControlGrantRegistry,
-  VoiceNativeControlGrantRegistryLive,
-} from "../Services/VoiceNativeControlGrantRegistry.ts";
+  VoiceRuntimeControlGrantRegistry,
+  VoiceRuntimeControlGrantRegistryLive,
+} from "../Services/VoiceRuntimeControlGrantRegistry.ts";
 import { VoiceSessionService } from "../Services/VoiceSessionService.ts";
 import { VoiceToolExecutor } from "../Services/VoiceToolExecutor.ts";
 import { VoiceContextCompilerLive } from "./VoiceContextCompiler.ts";
@@ -111,14 +111,14 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
   },
   projection: Partial<ProjectionSnapshotQuery["Service"]> = {},
   appendContextOverride?: VoiceConversationService["Service"]["appendContext"],
-  rejectNativeControlGrant = false,
+  rejectRuntimeControlGrant = false,
 ) {
   const appended = yield* Ref.make<Array<VoiceConversationJournalEntry>>([]);
   const conversationEpoch = yield* Ref.make(1);
   const callStarts = yield* Ref.make(0);
   const handoffActions = yield* Ref.make(new Map<string, DurableVoiceHandoffAction>());
-  const nativeControlGrantRecords = yield* Ref.make(
-    new Map<string, PersistedVoiceNativeControlGrant>(),
+  const runtimeControlGrantRecords = yield* Ref.make(
+    new Map<string, PersistedVoiceRuntimeControlGrant>(),
   );
   const contextClears = yield* Ref.make(
     new Map<string, { activeEpoch: number; clearedAt: string }>(),
@@ -194,22 +194,22 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
     appendContextIdempotent: (entry) =>
       append(entry.entryId, entry.expectedEpoch, entry.kind, entry.payload),
   });
-  const nativeControlGrantRepository = VoiceNativeControlGrantRepository.of({
+  const runtimeControlGrantRepository = VoiceRuntimeControlGrantRepository.of({
     insert: (grant, now) =>
-      rejectNativeControlGrant && grant.runtimeId !== undefined
+      rejectRuntimeControlGrant && grant.runtimeId !== undefined
         ? Effect.succeed(false)
-        : Ref.update(nativeControlGrantRecords, (records) => {
+        : Ref.update(runtimeControlGrantRecords, (records) => {
             const active = new Map([...records].filter(([, record]) => record.expiresAt > now));
             return active.set(grant.tokenHash, grant);
           }).pipe(Effect.as(true)),
     findActive: (tokenHash, now) =>
-      Ref.modify(nativeControlGrantRecords, (records) => {
+      Ref.modify(runtimeControlGrantRecords, (records) => {
         const active = new Map([...records].filter(([, record]) => record.expiresAt > now));
         return [active.get(tokenHash), active] as const;
       }),
     releaseSessionControl: (sessionId) =>
       Ref.update(
-        nativeControlGrantRecords,
+        runtimeControlGrantRecords,
         (records) =>
           new Map(
             [...records].map(([tokenHash, record]) => [
@@ -225,7 +225,7 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
       ),
     completeHandoff: (sessionId) =>
       Ref.update(
-        nativeControlGrantRecords,
+        runtimeControlGrantRecords,
         (records) =>
           new Map(
             [...records].flatMap(([tokenHash, record]) => {
@@ -244,18 +244,18 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
       ),
     revokeSession: (sessionId) =>
       Ref.update(
-        nativeControlGrantRecords,
+        runtimeControlGrantRecords,
         (records) => new Map([...records].filter(([, record]) => record.sessionId !== sessionId)),
       ),
     revokeAuthSession: (authSessionId) =>
       Ref.update(
-        nativeControlGrantRecords,
+        runtimeControlGrantRecords,
         (records) =>
           new Map([...records].filter(([, record]) => record.authSessionId !== authSessionId)),
       ),
     revokeRuntime: (authSessionId, runtimeId) =>
       Ref.update(
-        nativeControlGrantRecords,
+        runtimeControlGrantRecords,
         (records) =>
           new Map(
             [...records].filter(
@@ -265,9 +265,9 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
           ),
       ),
   });
-  const nativeControlGrantRepositoryLayer = Layer.succeed(
-    VoiceNativeControlGrantRepository,
-    nativeControlGrantRepository,
+  const runtimeControlGrantRepositoryLayer = Layer.succeed(
+    VoiceRuntimeControlGrantRepository,
+    runtimeControlGrantRepository,
   );
   const dependencies = Layer.mergeAll(
     Layer.succeed(VoiceConversationService, conversations),
@@ -275,8 +275,8 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
     voiceProviderRegistryLayer([provider], new Map([["agent.realtime", provider.id]])),
     VoiceSessionRegistryLive.pipe(Layer.provide(NodeServices.layer)),
     VoiceMediaTicketRegistryLive.pipe(Layer.provide(NodeServices.layer)),
-    VoiceNativeControlGrantRegistryLive.pipe(
-      Layer.provideMerge(Layer.merge(NodeServices.layer, nativeControlGrantRepositoryLayer)),
+    VoiceRuntimeControlGrantRegistryLive.pipe(
+      Layer.provideMerge(Layer.merge(NodeServices.layer, runtimeControlGrantRepositoryLayer)),
     ),
     serverSettingsLayerTest({ voice: voiceSettings }),
     Layer.succeed(VoiceToolExecutor, toolExecutor),
@@ -419,7 +419,7 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
     appended,
     callStarts,
     handoffActions,
-    nativeControlGrantRecords,
+    runtimeControlGrantRecords,
     layer: VoiceSessionServiceLive.pipe(Layer.provideMerge(dependencies)),
   };
 });
@@ -596,19 +596,19 @@ it.effect("rotates the native grant when an idempotent create result is replayed
     const test = yield* makeLayer(provider);
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
-      const grants = yield* VoiceNativeControlGrantRegistry;
+      const grants = yield* VoiceRuntimeControlGrantRegistry;
       const owner = AuthSessionId.make("idempotent-native-owner");
       const first = yield* sessions.create(principal(owner), input(false, "idempotent-native"));
       const replay = yield* sessions.create(principal(owner), input(false, "idempotent-native"));
 
       expect(replay.state.sessionId).toBe(first.state.sessionId);
-      expect(replay.nativeControlGrant.token).not.toBe(first.nativeControlGrant.token);
-      expect(yield* grants.authorize(first.nativeControlGrant.token)).toMatchObject({
+      expect(replay.runtimeControlGrant.token).not.toBe(first.runtimeControlGrant.token);
+      expect(yield* grants.authorize(first.runtimeControlGrant.token)).toMatchObject({
         authSessionId: owner,
         sessionId: first.state.sessionId,
         leaseGeneration: first.state.leaseGeneration,
       });
-      expect(yield* grants.authorize(replay.nativeControlGrant.token)).toMatchObject({
+      expect(yield* grants.authorize(replay.runtimeControlGrant.token)).toMatchObject({
         sessionId: replay.state.sessionId,
         leaseGeneration: replay.state.leaseGeneration,
       });
@@ -638,8 +638,8 @@ it.effect("releases a newly created session when runtime-fenced child issuance i
         .create(
           {
             ...principal(owner),
-            nativeRuntime: {
-              runtimeId: VoiceNativeRuntimeId.make("rejected-runtime"),
+            runtimeAuthority: {
+              runtimeId: VoiceRuntimeId.make("rejected-runtime"),
               generation: 1,
             },
           },
@@ -647,7 +647,7 @@ it.effect("releases a newly created session when runtime-fenced child issuance i
         )
         .pipe(Effect.flip);
       expect(rejected).toMatchObject({ reason: "invalid-phase" });
-      expect((yield* Ref.get(test.nativeControlGrantRecords)).size).toBe(0);
+      expect((yield* Ref.get(test.runtimeControlGrantRecords)).size).toBe(0);
 
       const replacement = yield* sessions.create(
         principal(owner),
@@ -658,7 +658,7 @@ it.effect("releases a newly created session when runtime-fenced child issuance i
   }),
 );
 
-it.effect("terminates every live session owned by an exact revoked native runtime", () =>
+it.effect("terminates every live session owned by an exact revoked runtime authority", () =>
   Effect.gen(function* () {
     const terminated = yield* Ref.make(0);
     const provider: VoiceProviderAdapter = {
@@ -687,11 +687,11 @@ it.effect("terminates every live session owned by an exact revoked native runtim
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const owner = AuthSessionId.make("native-revoke-owner");
-      const revokedRuntimeId = VoiceNativeRuntimeId.make("native-revoke-runtime");
+      const revokedRuntimeId = VoiceRuntimeId.make("native-revoke-runtime");
       const revoked = yield* sessions.create(
         {
           ...principal(owner),
-          nativeRuntime: { runtimeId: revokedRuntimeId, generation: 3 },
+          runtimeAuthority: { runtimeId: revokedRuntimeId, generation: 3 },
         },
         input(false, "native-revoke-session"),
       );
@@ -701,7 +701,7 @@ it.effect("terminates every live session owned by an exact revoked native runtim
         sdp: "fake-offer",
       });
 
-      yield* sessions.revokeNativeRuntime(owner, revokedRuntimeId);
+      yield* sessions.revokeRuntimeAuthority(owner, revokedRuntimeId);
 
       expect((yield* sessions.get(owner, revoked.state.sessionId)).phase).toBe("ended");
       expect(yield* Ref.get(terminated)).toBe(1);
@@ -709,7 +709,7 @@ it.effect("terminates every live session owned by an exact revoked native runtim
         .resumeCreate(
           {
             ...principal(owner),
-            nativeRuntime: { runtimeId: revokedRuntimeId, generation: 3 },
+            runtimeAuthority: { runtimeId: revokedRuntimeId, generation: 3 },
           },
           input(false, "native-revoke-session"),
           revoked.state.sessionId,
@@ -2078,7 +2078,7 @@ it.effect("keeps provider media alive until a terminal handoff is acknowledged",
       });
       expect(yield* Ref.get(fixture.terminated)).toBe(0);
       const wrongLease = yield* sessions
-        .acknowledgeNativeHandoffAction(
+        .acknowledgeRuntimeHandoffAction(
           owner,
           created.state.sessionId,
           created.state.leaseGeneration + 1,
@@ -2087,7 +2087,7 @@ it.effect("keeps provider media alive until a terminal handoff is acknowledged",
         )
         .pipe(Effect.flip);
       expect(wrongLease.reason).toBe("authorization-revoked");
-      const acknowledgement = yield* sessions.acknowledgeNativeHandoffAction(
+      const acknowledgement = yield* sessions.acknowledgeRuntimeHandoffAction(
         owner,
         created.state.sessionId,
         created.state.leaseGeneration,
@@ -2105,7 +2105,7 @@ it.effect("keeps provider media alive until a terminal handoff is acknowledged",
       yield* Effect.yieldNow;
       expect(yield* Ref.get(fixture.terminated)).toBe(1);
       expect(
-        [...(yield* Ref.get(test.nativeControlGrantRecords)).values()].some(
+        [...(yield* Ref.get(test.runtimeControlGrantRecords)).values()].some(
           (grant) => grant.sessionId === created.state.sessionId,
         ),
       ).toBe(false);
@@ -2169,7 +2169,7 @@ it.effect("acknowledgement wins immediately before the provider drain deadline",
       yield* Effect.yieldNow;
       yield* TestClock.adjust("2999 millis");
 
-      yield* sessions.acknowledgeNativeHandoffAction(
+      yield* sessions.acknowledgeRuntimeHandoffAction(
         owner,
         created.state.sessionId,
         created.state.leaseGeneration,
@@ -2181,7 +2181,7 @@ it.effect("acknowledgement wins immediately before the provider drain deadline",
 
       expect(yield* Ref.get(fixture.terminated)).toBe(1);
       expect(
-        [...(yield* Ref.get(test.nativeControlGrantRecords)).values()].some(
+        [...(yield* Ref.get(test.runtimeControlGrantRecords)).values()].some(
           (grant) => grant.sessionId === created.state.sessionId,
         ),
       ).toBe(false);
@@ -2211,7 +2211,7 @@ it.effect(
 
         yield* sessions.close(owner, created.state.sessionId, created.state.leaseGeneration);
 
-        const retained = [...(yield* Ref.get(test.nativeControlGrantRecords)).values()].filter(
+        const retained = [...(yield* Ref.get(test.runtimeControlGrantRecords)).values()].filter(
           (grant) => grant.sessionId === created.state.sessionId,
         );
         expect(retained.length).toBeGreaterThan(0);
@@ -2247,7 +2247,7 @@ it.effect("revokes retained native authority when a terminal handoff expires", (
         outcomeReason: "operation-timeout",
       });
       expect(
-        [...(yield* Ref.get(test.nativeControlGrantRecords)).values()].some(
+        [...(yield* Ref.get(test.runtimeControlGrantRecords)).values()].some(
           (grant) => grant.sessionId === created.state.sessionId,
         ),
       ).toBe(false);
@@ -2282,7 +2282,7 @@ it.effect("journals and revokes a handoff that expires during native acknowledge
 
       const acknowledge = () =>
         sessions
-          .acknowledgeNativeHandoffAction(
+          .acknowledgeRuntimeHandoffAction(
             owner,
             created.state.sessionId,
             created.state.leaseGeneration,
@@ -2297,7 +2297,7 @@ it.effect("journals and revokes a handoff that expires during native acknowledge
         outcomeReason: "operation-timeout",
       });
       expect(
-        [...(yield* Ref.get(test.nativeControlGrantRecords)).values()].some(
+        [...(yield* Ref.get(test.runtimeControlGrantRecords)).values()].some(
           (grant) => grant.sessionId === created.state.sessionId,
         ),
       ).toBe(false);
@@ -2339,7 +2339,7 @@ it.effect("durably reconciles an expired handoff after exact transition activati
       });
 
       const expired = yield* sessions
-        .acknowledgeNativeHandoffAction(
+        .acknowledgeRuntimeHandoffAction(
           owner,
           created.state.sessionId,
           created.state.leaseGeneration,
@@ -2350,7 +2350,7 @@ it.effect("durably reconciles an expired handoff after exact transition activati
       expect(expired.reason).toBe("invalid-phase");
 
       const wrongTarget = yield* sessions
-        .reconcileActivatedNativeHandoff(
+        .reconcileActivatedRuntimeHandoff(
           owner,
           created.state.sessionId,
           created.state.leaseGeneration,
@@ -2363,7 +2363,7 @@ it.effect("durably reconciles an expired handoff after exact transition activati
         .pipe(Effect.flip);
       expect(wrongTarget.reason).toBe("authorization-revoked");
 
-      const reconciled = yield* sessions.reconcileActivatedNativeHandoff(
+      const reconciled = yield* sessions.reconcileActivatedRuntimeHandoff(
         owner,
         created.state.sessionId,
         created.state.leaseGeneration,
@@ -2401,7 +2401,7 @@ it.effect("durably reconciles an expired handoff after exact transition activati
         ),
       });
 
-      yield* sessions.reconcileActivatedNativeHandoff(
+      yield* sessions.reconcileActivatedRuntimeHandoff(
         owner,
         created.state.sessionId,
         created.state.leaseGeneration,
@@ -2413,7 +2413,7 @@ it.effect("durably reconciles an expired handoff after exact transition activati
       ).toHaveLength(2);
 
       expect(
-        yield* sessions.acknowledgeNativeHandoffAction(
+        yield* sessions.acknowledgeRuntimeHandoffAction(
           owner,
           created.state.sessionId,
           created.state.leaseGeneration,
@@ -2462,7 +2462,7 @@ it.effect("records a failed durable handoff when terminal provider output is rej
         outcomeReason: "realtime-release-failed",
       });
       expect(
-        [...(yield* Ref.get(test.nativeControlGrantRecords)).values()].some(
+        [...(yield* Ref.get(test.runtimeControlGrantRecords)).values()].some(
           (grant) => grant.sessionId === created.state.sessionId,
         ),
       ).toBe(false);
@@ -2742,7 +2742,7 @@ it.effect("revokes provider sessions and media tickets with their auth session",
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const mediaTickets = yield* VoiceMediaTicketRegistry;
-      const nativeControlGrants = yield* VoiceNativeControlGrantRegistry;
+      const runtimeControlGrants = yield* VoiceRuntimeControlGrantRegistry;
       const owner = AuthSessionId.make("revoked-owner");
       const created = yield* sessions.create(principal(owner), input(false, "revoked"));
       yield* sessions.offer(owner, created.state.sessionId, {
@@ -2760,7 +2760,7 @@ it.effect("revokes provider sessions and media tickets with their auth session",
       expect((yield* sessions.get(owner, created.state.sessionId)).phase).toBe("ended");
       expect(yield* mediaTickets.consume(ticket.token, "speech-stream")).toBeUndefined();
       expect(
-        yield* nativeControlGrants.authorize(created.nativeControlGrant.token),
+        yield* runtimeControlGrants.authorize(created.runtimeControlGrant.token),
       ).toBeUndefined();
     }).pipe(Effect.provide(test.layer));
   }),

@@ -95,7 +95,7 @@ import { HistoryRuntimeLive } from "./history/runtimeLayer.ts";
 import { voiceControlHttpApiLayer } from "./voice/controlHttp.ts";
 import { voiceMediaRoutesLayer } from "./voice/http.ts";
 import { voiceRealtimeControlRoutesLayer } from "./voice/realtimeControlHttp.ts";
-import { voiceNativeThreadTurnRoutesLayer } from "./voice/nativeThreadTurnHttp.ts";
+import { voiceThreadTurnRoutesLayer } from "./voice/threadTurnHttp.ts";
 import { VoiceRuntimeLive } from "./voice/runtimeLayer.ts";
 import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
@@ -377,7 +377,7 @@ const makeRoutesLayerBase = Layer.mergeAll(
     websocketRpcRouteLayer,
     voiceMediaRoutesLayer,
     voiceRealtimeControlRoutesLayer,
-    voiceNativeThreadTurnRoutesLayer,
+    voiceThreadTurnRoutesLayer,
   ),
   McpHttpServer.layer.pipe(Layer.provide(McpSessionRegistry.layer)),
 ).pipe(Layer.provide(PreviewAutomationBroker.layer), Layer.provide(browserApiCorsLayer));

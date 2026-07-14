@@ -29,15 +29,15 @@ class T3VoiceControlPolicyTest {
 
   @Test
   fun `readiness preparation refuses every active native ownership shape`() {
-    assertTrue(T3VoiceBackgroundPreparationPolicy.canPrepare(
+    assertTrue(VoiceRuntimePreparationPolicy.canPrepare(
       T3VoiceRuntimePhase.IDLE, false, false, false))
-    assertFalse(T3VoiceBackgroundPreparationPolicy.canPrepare(
+    assertFalse(VoiceRuntimePreparationPolicy.canPrepare(
       T3VoiceRuntimePhase.RECORDING, false, false, false))
-    assertFalse(T3VoiceBackgroundPreparationPolicy.canPrepare(
+    assertFalse(VoiceRuntimePreparationPolicy.canPrepare(
       T3VoiceRuntimePhase.IDLE, true, false, false))
-    assertFalse(T3VoiceBackgroundPreparationPolicy.canPrepare(
+    assertFalse(VoiceRuntimePreparationPolicy.canPrepare(
       T3VoiceRuntimePhase.IDLE, false, true, false))
-    assertFalse(T3VoiceBackgroundPreparationPolicy.canPrepare(
+    assertFalse(VoiceRuntimePreparationPolicy.canPrepare(
       T3VoiceRuntimePhase.IDLE, false, false, true))
   }
 

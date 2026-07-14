@@ -31,7 +31,7 @@ import {
   VoiceConversationId,
   VoiceConfirmationId,
   VoiceClientActionId,
-  VoiceNativeRuntimeId,
+  VoiceRuntimeId,
   VoiceSessionId,
 } from "./baseSchemas.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
@@ -71,9 +71,6 @@ import {
   VoiceConversationUpdateInput,
   VoiceMediaTicket,
   VoiceMediaTicketRequest,
-  VoiceNativeRuntimeGrant,
-  VoiceNativeRuntimeGrantProvisionInput,
-  VoiceNativeRuntimeGrantRevocationResult,
   VoicePublicErrorReason,
   VoiceSessionCloseResult,
   VoiceSessionCreateInput,
@@ -88,6 +85,14 @@ import {
   VoiceWebRtcOffer,
 } from "./voice.ts";
 import {
+  VOICE_RUNTIME_PROTOCOL_MAJOR,
+  VoiceRuntimeGrant,
+  VoiceRuntimeGrantProvisionInput,
+  VoiceRuntimeGrantRefreshInput,
+  VoiceRuntimeGrantRefreshResult,
+  VoiceRuntimeGrantRevocationResult,
+} from "./voiceRuntime.ts";
+import {
   HistoryReadInput,
   HistoryReadResult,
   HistoryRequestInvalidReason,
@@ -98,6 +103,17 @@ import {
 const OptionalBearerHeaders = Schema.Struct({
   authorization: Schema.optionalKey(Schema.String),
   dpop: Schema.optionalKey(Schema.String),
+});
+
+const VoiceRuntimeAuthenticatedHeaders = Schema.Struct({
+  authorization: Schema.optionalKey(Schema.String),
+  dpop: Schema.optionalKey(Schema.String),
+  "x-t3-voice-runtime-protocol-major": Schema.optionalKey(Schema.String),
+});
+
+const VoiceRuntimeRefreshHeaders = Schema.Struct({
+  "x-t3-voice-refresh": TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
+  "x-t3-voice-runtime-protocol-major": Schema.optionalKey(Schema.String),
 });
 
 const OptionalDpopProofHeaders = Schema.Struct({
@@ -175,6 +191,22 @@ export class EnvironmentVoiceOperationError extends Schema.TaggedErrorClass<Envi
   [HttpServerRespondable.symbol]() {
     return HttpServerResponse.schemaJson(EnvironmentVoiceOperationError)(this, {
       status: 409,
+    });
+  }
+}
+
+export class EnvironmentVoiceRuntimeProtocolIncompatibleError extends Schema.TaggedErrorClass<EnvironmentVoiceRuntimeProtocolIncompatibleError>()(
+  "EnvironmentVoiceRuntimeProtocolIncompatibleError",
+  {
+    code: Schema.Literal("voice_runtime_protocol_incompatible"),
+    requiredMajor: Schema.Literal(VOICE_RUNTIME_PROTOCOL_MAJOR),
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 426 },
+) {
+  [HttpServerRespondable.symbol]() {
+    return HttpServerResponse.schemaJson(EnvironmentVoiceRuntimeProtocolIncompatibleError)(this, {
+      status: 426,
     });
   }
 }
@@ -639,14 +671,15 @@ export class EnvironmentHistoryHttpApi extends HttpApiGroup.make("history")
 export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
   .add(
     HttpApiEndpoint.put(
-      "provisionNativeVoiceRuntimeGrant",
-      "/api/voice/native-runtimes/:runtimeId/grant",
+      "provisionVoiceRuntimeGrant",
+      "/api/voice/runtime/runtimes/:runtimeId/grant",
       {
-        headers: OptionalBearerHeaders,
-        params: Schema.Struct({ runtimeId: VoiceNativeRuntimeId }),
-        payload: VoiceNativeRuntimeGrantProvisionInput,
-        success: VoiceNativeRuntimeGrant,
+        headers: VoiceRuntimeAuthenticatedHeaders,
+        params: Schema.Struct({ runtimeId: VoiceRuntimeId }),
+        payload: VoiceRuntimeGrantProvisionInput,
+        success: VoiceRuntimeGrant,
         error: [
+          EnvironmentVoiceRuntimeProtocolIncompatibleError,
           EnvironmentRequestInvalidError,
           ...EnvironmentScopedOperationErrors,
           EnvironmentVoiceOperationError,
@@ -656,15 +689,35 @@ export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
   )
   .add(
     HttpApiEndpoint.delete(
-      "revokeNativeVoiceRuntimeGrant",
-      "/api/voice/native-runtimes/:runtimeId/grant",
+      "revokeVoiceRuntimeGrant",
+      "/api/voice/runtime/runtimes/:runtimeId/grant",
       {
-        headers: OptionalBearerHeaders,
-        params: Schema.Struct({ runtimeId: VoiceNativeRuntimeId }),
-        success: VoiceNativeRuntimeGrantRevocationResult,
-        error: EnvironmentScopedOperationErrors,
+        headers: VoiceRuntimeAuthenticatedHeaders,
+        params: Schema.Struct({ runtimeId: VoiceRuntimeId }),
+        success: VoiceRuntimeGrantRevocationResult,
+        error: [
+          EnvironmentVoiceRuntimeProtocolIncompatibleError,
+          ...EnvironmentScopedOperationErrors,
+        ],
       },
     ).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "refreshVoiceRuntimeGrant",
+      "/api/voice/runtime/runtimes/:runtimeId/grant/refresh",
+      {
+        headers: VoiceRuntimeRefreshHeaders,
+        params: Schema.Struct({ runtimeId: VoiceRuntimeId }),
+        payload: VoiceRuntimeGrantRefreshInput,
+        success: VoiceRuntimeGrantRefreshResult,
+        error: [
+          EnvironmentVoiceRuntimeProtocolIncompatibleError,
+          EnvironmentRequestInvalidError,
+          EnvironmentVoiceOperationError,
+        ],
+      },
+    ),
   )
   .add(
     HttpApiEndpoint.post("createSession", "/api/voice/sessions", {

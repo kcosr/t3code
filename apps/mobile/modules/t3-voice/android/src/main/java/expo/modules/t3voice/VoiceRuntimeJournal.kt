@@ -27,6 +27,7 @@ internal class VoiceRuntimeJournal(
     realtimeTerminalSummary: VoiceRuntimeRealtimeTerminalSummary? = null,
     draftArtifact: VoiceRuntimeDraftHandle? = null,
     presentationAction: VoiceRuntimePresentationAction? = null,
+    presentationElection: VoiceRuntimePresentationElection? = null,
     transform: (VoiceRuntimeSnapshot) -> VoiceRuntimeSnapshot = { it },
   ): VoiceRuntimeEvent {
     val nextSequence = snapshot.sequence + 1
@@ -43,6 +44,7 @@ internal class VoiceRuntimeJournal(
       realtimeTerminalSummary = realtimeTerminalSummary,
       draftArtifact = draftArtifact,
       presentationAction = presentationAction,
+      presentationElection = presentationElection,
     )
     events.addLast(event)
     while (events.size > capacity) events.removeFirst()
@@ -86,6 +88,10 @@ internal class VoiceRuntimeIdempotencyLedger<T>(private val capacity: Int) {
       outcomes[id] = VoiceRuntimeStoredOutcome(fingerprint, it)
       while (outcomes.size > capacity) outcomes.remove(outcomes.keys.first())
     } to false
+  }
+
+  fun forget(id: String) {
+    outcomes.remove(id)
   }
 }
 

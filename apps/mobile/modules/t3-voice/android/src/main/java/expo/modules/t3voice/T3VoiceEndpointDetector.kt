@@ -43,8 +43,8 @@ internal data class T3VoiceEndpointDetectionConfig(
     require(noSpeechTimeoutMs == null || noSpeechTimeoutMs in 1_000L..maximumUtteranceMs) {
       "noSpeechTimeoutMs must be null or between 1000 and maximumUtteranceMs"
     }
-    require(maximumUtteranceMs in 1_000L..30L * 60L * 1_000L) {
-      "maximumUtteranceMs must be between 1000 and 1800000"
+    require(maximumUtteranceMs in 1_000L..60L * 60L * 1_000L) {
+      "maximumUtteranceMs must be between 1000 and 3600000"
     }
   }
 }

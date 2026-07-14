@@ -1,39 +1,80 @@
 package expo.modules.t3voice
 
 import java.security.MessageDigest
+import java.nio.charset.StandardCharsets
+import java.util.Base64
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 internal class VoiceRuntimeAuthorityStoreTest {
   @Test
+  fun `legacy v2 authority is retired once while preserving the server generation fence`() {
+    val storage = MemoryRuntimeStorage()
+    val cipher = AuthorityTestCipher()
+    val legacy = authority()
+    storage.values.putAll(legacyV2Values(legacy, cipher))
+    val store = VoiceRuntimeAuthorityStore(storage, cipher, now = { 1_000 })
+
+    val retired = store.retireLegacyV2()
+
+    assertEquals(VoiceRuntimeRetiredAuthorityFence(legacy.runtimeId, legacy.generation), retired)
+    assertEquals(retired, VoiceRuntimeAuthorityStore(storage, cipher, now = { 1_000 }).retireLegacyV2())
+    assertEquals(VoiceRuntimeAuthorityLoadResult.Missing, store.load())
+    val controller = VoiceRuntimeActiveThreadController(
+      legacy.runtimeId,
+      "upgrade-process",
+      { 1_000 },
+      { null },
+      NoopThreadExecution(),
+      initialGeneration = requireNotNull(retired).generation,
+    )
+    assertEquals(legacy.generation, controller.snapshot().identity.generation)
+
+    val replacement = legacy.copy(readinessEnabled = false)
+    store.activate(replacement) {}
+    assertNull(store.retiredFence())
+    assertEquals(
+      replacement,
+      (store.load() as VoiceRuntimeAuthorityLoadResult.Available).authority,
+    )
+  }
+
+  @Test
   fun `exact canonical authority and encrypted token survive restart`() {
-    val storage = MemoryBackgroundStorage()
+    val storage = MemoryRuntimeStorage()
     val cipher = AuthorityTestCipher()
     val expected = authority()
-    VoiceRuntimeAuthorityStore(storage, cipher) { 1_000 }.write(expected)
+    VoiceRuntimeAuthorityStore(storage, cipher, now = { 1_000 }).run {
+      prepareRefreshCredential(fence(), true)
+      activate(expected) {}
+    }
 
     assertFalse(storage.values.values.filterNotNull().any { "secret-token" in it })
-    val loaded = VoiceRuntimeAuthorityStore(storage, cipher) { 1_000 }.load()
+    val loaded = VoiceRuntimeAuthorityStore(storage, cipher, now = { 1_000 }).load()
       as VoiceRuntimeAuthorityLoadResult.Available
     assertEquals(expected, loaded.authority)
   }
 
   @Test
   fun `expired or tampered canonical authority fails closed`() {
-    val storage = MemoryBackgroundStorage()
+    val storage = MemoryRuntimeStorage()
     val cipher = AuthorityTestCipher()
-    VoiceRuntimeAuthorityStore(storage, cipher) { 1_000 }.write(authority())
+    VoiceRuntimeAuthorityStore(storage, cipher, now = { 1_000 }).run {
+      prepareRefreshCredential(fence(), true)
+      activate(authority()) {}
+    }
     assertEquals(
       VoiceRuntimeAuthorityLoadResult.Locked,
-      VoiceRuntimeAuthorityStore(storage, cipher) { 5_000 }.load(),
+      VoiceRuntimeAuthorityStore(storage, cipher, now = { 5_000 }).load(),
     )
 
     storage.values.entries.first { it.key.endsWith("target") }.setValue("{}")
     assertEquals(
       VoiceRuntimeAuthorityLoadResult.Locked,
-      VoiceRuntimeAuthorityStore(storage, cipher) { 1_000 }.load(),
+      VoiceRuntimeAuthorityStore(storage, cipher, now = { 1_000 }).load(),
     )
   }
 
@@ -80,6 +121,177 @@ internal class VoiceRuntimeAuthorityStoreTest {
     assertFalse(VoiceRuntimeAuthorityLifecyclePolicy.shouldClear(true, 0, true))
   }
 
+  @Test
+  fun `failed candidate activation restores exact current authority`() {
+    val storage = MemoryRuntimeStorage()
+    val cipher = AuthorityTestCipher()
+    val store = VoiceRuntimeAuthorityStore(storage, cipher, now = { 1_000 })
+    val current = authority()
+    store.prepareRefreshCredential(fence(), true)
+    store.activate(current) {}
+    val previousBytes = storage.values.toMap()
+    val candidate = current.copy(
+      generation = current.generation + 1,
+      provisioningOperationId = "candidate",
+      readinessEnabled = false,
+      token = "candidate-secret",
+    )
+
+    runCatching {
+      store.activate(candidate) { error("generation CAS rejected") }
+    }
+
+    assertEquals(previousBytes, storage.values)
+    assertEquals(
+      current,
+      (store.load() as VoiceRuntimeAuthorityLoadResult.Available).authority,
+    )
+  }
+
+  @Test
+  fun `handoff authority is encrypted and durable before atomic promotion`() {
+    val storage = MemoryRuntimeStorage()
+    val cipher = AuthorityTestCipher()
+    val store = VoiceRuntimeAuthorityStore(storage, cipher, now = { 1_000 })
+    val current = authority()
+    store.prepareRefreshCredential(fence(), true)
+    store.activate(current) {}
+    val target = VoiceRuntimeTarget.Thread(
+      "environment-1", "project-2", "thread-2", "default", true,
+      2_200, null, 600_000, true, 500,
+    )
+    val prepared = current.copy(
+      generation = current.generation + 1,
+      provisioningOperationId = "handoff-action-1",
+      targetDigest = T3VoiceRuntimeTargetIdentity.digest(
+        VoiceRuntimeBridge.canonicalThreadTargetIdentity(target),
+      ),
+      target = target,
+      readinessEnabled = false,
+      token = "transition-secret-token",
+      issuedAtEpochMillis = 0,
+    )
+
+    store.prepareTransition(prepared)
+
+    assertEquals(current, (store.load() as VoiceRuntimeAuthorityLoadResult.Available).authority)
+    assertFalse(storage.values.values.filterNotNull().any { it == prepared.token })
+    val restarted = VoiceRuntimeAuthorityStore(storage, cipher, now = { 1_000 })
+    runCatching { restarted.activatePreparedTransition(prepared) { error("not admitted") } }
+    assertEquals(current, (restarted.load() as VoiceRuntimeAuthorityLoadResult.Available).authority)
+    restarted.activatePreparedTransition(prepared) {}
+    assertEquals(prepared, (restarted.load() as VoiceRuntimeAuthorityLoadResult.Available).authority)
+  }
+
+  @Test
+  fun `readiness preparation persists only encrypted raw refresh authority`() {
+    val storage = MemoryRuntimeStorage()
+    val store = refreshStore(storage)
+    val expectedFence = fence()
+
+    val prepared = requireNotNull(store.prepareRefreshCredential(expectedFence, true))
+
+    assertTrue(prepared.credentialHash.matches(Regex("^[0-9a-f]{64}$")))
+    assertFalse(storage.values.values.filterNotNull().any { it.contains("AQEBAQ") })
+    assertEquals(
+      prepared,
+      refreshStore(storage).inspectPreparedRefreshCredential(expectedFence),
+    )
+  }
+
+  @Test
+  fun `disabled readiness creates no refresh authority`() {
+    val storage = MemoryRuntimeStorage()
+    val store = refreshStore(storage)
+    store.prepareRefreshCredential(fence(), true)
+
+    assertNull(store.prepareRefreshCredential(fence(), false))
+    assertFalse(store.hasPendingRefresh())
+    assertNull(store.inspectPreparedRefreshCredential(fence()))
+  }
+
+  @Test
+  fun `candidate survives process death and lost response retries exact request`() {
+    val storage = MemoryRuntimeStorage()
+    val store = refreshStore(storage)
+    val initial = authority().copy(refreshRotationCounter = 0)
+    store.prepareRefreshCredential(fence(), true)
+    store.activate(initial) {}
+
+    val first = store.beginRefresh()
+    val recovered = refreshStore(storage).beginRefresh()
+
+    assertEquals(first, recovered)
+    assertTrue(first.currentCredential.matches(Regex("^[A-Za-z0-9_-]{43}$")))
+    assertTrue(first.candidateCredentialHash.matches(Regex("^[0-9a-f]{64}$")))
+    assertFalse(storage.values.values.filterNotNull().any { it == first.currentCredential })
+  }
+
+  @Test
+  fun `refresh promotion atomically replaces grant candidate and counter after expiry`() {
+    val storage = MemoryRuntimeStorage()
+    val store = refreshStore(storage, now = { 1_000 })
+    val initial = authority().copy(expiresAtEpochMillis = 1_500)
+    store.prepareRefreshCredential(fence(), true)
+    store.activate(initial) {}
+    val attempt = store.beginRefresh()
+    val refreshed = initial.copy(
+      token = "rotated-runtime-token",
+      issuedAtEpochMillis = 2_000,
+      expiresAtEpochMillis = 9_000,
+      refreshRotationCounter = 1,
+    )
+
+    refreshStore(storage, now = { 2_000 }).promoteRefresh(attempt, refreshed) {}
+
+    val reloaded = refreshStore(storage, now = { 2_000 })
+    assertEquals(refreshed, (reloaded.load() as VoiceRuntimeAuthorityLoadResult.Available).authority)
+    assertFalse(reloaded.hasPendingRefresh())
+    assertEquals(1, reloaded.beginRefresh().expectedRotationCounter)
+  }
+
+  @Test
+  fun `permanent refresh rejection fences starts and clears waiting state`() {
+    val storage = MemoryRuntimeStorage()
+    val store = refreshStore(storage)
+    val initial = authority()
+    store.prepareRefreshCredential(fence(), true)
+    store.activate(initial) {}
+    val attempt = store.beginRefresh()
+
+    store.rejectRefresh(attempt)
+
+    assertFalse(store.hasPendingRefresh())
+    assertTrue(store.isRefreshRejected())
+    assertEquals(VoiceRuntimeAuthorityLoadResult.Locked, store.load())
+    assertNull(store.loadForRefresh())
+    assertEquals(initial, store.loadRejectedAuthority())
+  }
+
+  private fun refreshStore(
+    storage: MemoryRuntimeStorage,
+    now: () -> Long = { 1_000 },
+  ) = VoiceRuntimeAuthorityStore(
+    storage,
+    AuthorityTestCipher(),
+    now,
+    { bytes -> bytes.fill(1) },
+    { "refresh-request-1" },
+  )
+
+  private fun fence(): VoiceRuntimeAuthorityFence {
+    val expected = authority()
+    return VoiceRuntimeAuthorityFence(
+      expected.runtimeId,
+      expected.generation,
+      expected.provisioningOperationId,
+      expected.targetDigest,
+      expected.target,
+      T3VoiceRuntimeGrantOperation.THREAD_TURN_START,
+      expected.environmentOrigin,
+    )
+  }
+
   private fun authority(): VoiceRuntimePersistedAuthority {
     val target = VoiceRuntimeTarget.Thread(
       "environment-1", "project-1", "thread-1", "default", true,
@@ -96,6 +308,43 @@ internal class VoiceRuntimeAuthorityStoreTest {
       "secret-token",
       500,
       5_000,
+    )
+  }
+
+  private fun legacyV2Values(
+    authority: VoiceRuntimePersistedAuthority,
+    cipher: T3VoiceRuntimeGrantCipher,
+  ): Map<String, String> {
+    val target = when (val value = authority.target) {
+      is VoiceRuntimeTarget.Realtime -> VoiceRuntimeBridge.canonicalRealtimeTargetIdentity(value)
+      is VoiceRuntimeTarget.Thread -> VoiceRuntimeBridge.canonicalThreadTargetIdentity(value)
+    }
+    val metadata = listOf(
+      "t3-canonical-voice-authority-v2",
+      authority.runtimeId,
+      authority.generation,
+      authority.provisioningOperationId,
+      authority.targetDigest,
+      target,
+      authority.environmentOrigin,
+      authority.readinessEnabled,
+      authority.issuedAtEpochMillis,
+      authority.expiresAtEpochMillis,
+    ).joinToString("\n").toByteArray(StandardCharsets.UTF_8)
+    val encrypted = cipher.encrypt(authority.token.toByteArray(StandardCharsets.UTF_8), metadata)
+    return mapOf(
+      "canonical_authority_version" to "t3-canonical-voice-authority-v2",
+      "canonical_authority_runtime_id" to authority.runtimeId,
+      "canonical_authority_generation" to authority.generation.toString(),
+      "canonical_authority_provisioning_operation_id" to authority.provisioningOperationId,
+      "canonical_authority_target_digest" to authority.targetDigest,
+      "canonical_authority_target" to target,
+      "canonical_authority_environment_origin" to authority.environmentOrigin,
+      "canonical_authority_readiness_enabled" to authority.readinessEnabled.toString(),
+      "canonical_authority_issued_at" to authority.issuedAtEpochMillis.toString(),
+      "canonical_authority_expires_at" to authority.expiresAtEpochMillis.toString(),
+      "canonical_authority_iv" to Base64.getEncoder().encodeToString(encrypted.initializationVector),
+      "canonical_authority_ciphertext" to Base64.getEncoder().encodeToString(encrypted.ciphertext),
     )
   }
 

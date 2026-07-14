@@ -14,10 +14,12 @@ internal class VoiceRuntimeConsumerRegistry(
   private val identity: () -> VoiceRuntimeIdentity,
   private val now: () -> Long,
   private val leaseDurationMillis: Long,
+  private val onElectionChanged: (VoiceRuntimePresentationElection) -> Unit = {},
 ) {
   private val leases = linkedMapOf<String, VoiceRuntimeConsumerLease>()
   private var nextLease = 0L
   private var nextOrdinal = 0L
+  private var lastElection = VoiceRuntimePresentationElection(null, null, 0, now())
 
   fun attach(presentation: VoiceRuntimePresentation): VoiceRuntimeConsumerLease {
     expire()
@@ -87,28 +89,53 @@ internal class VoiceRuntimeConsumerRegistry(
   }
 
   private fun elect() {
-    val winner = leases.values
+    val eligible = leases.values
       .filter { it.presentation == VoiceRuntimePresentation.FOREGROUND_ACTIVE }
-      .maxByOrNull { it.attachOrdinal }
+    val winner = eligible.maxByOrNull { it.attachOrdinal }
       ?.leaseId
     leases.replaceAll { id, lease ->
       lease.copy(election = if (id == winner) VoiceRuntimeElection.ELECTED else VoiceRuntimeElection.STANDBY)
     }
+    val elected = winner?.let(leases::getValue)
+    val nextElection = VoiceRuntimePresentationElection(
+      electedLeaseId = winner,
+      electedAttachOrdinal = elected?.attachOrdinal,
+      eligibleConsumerCount = eligible.size,
+      changedAtEpochMillis = now(),
+    )
+    if (nextElection.copy(changedAtEpochMillis = 0) != lastElection.copy(changedAtEpochMillis = 0)) {
+      lastElection = nextElection
+      onElectionChanged(nextElection)
+    }
   }
 }
 
-internal data class VoiceRuntimePresentationAction(
-  val actionId: String,
-  val kind: String,
-  val expiresAtEpochMillis: Long,
-  val projectId: String? = null,
-  val threadId: String? = null,
-  val artifact: VoiceRuntimeDraftHandle? = null,
-  val confirmationId: String? = null,
-  val toolCallId: String? = null,
-  val tool: String? = null,
-  val summary: String? = null,
-)
+internal sealed interface VoiceRuntimePresentationAction {
+  val actionId: String
+  val expiresAtEpochMillis: Long
+
+  data class NavigateThread(
+    override val actionId: String,
+    val projectId: String,
+    val threadId: String,
+    override val expiresAtEpochMillis: Long,
+  ) : VoiceRuntimePresentationAction
+
+  data class ReviewDraft(
+    override val actionId: String,
+    val artifact: VoiceRuntimeDraftHandle,
+    override val expiresAtEpochMillis: Long,
+  ) : VoiceRuntimePresentationAction
+
+  data class RealtimeConfirmationRequired(
+    override val actionId: String,
+    val confirmationId: String,
+    val toolCallId: String,
+    val tool: String,
+    val summary: String,
+    override val expiresAtEpochMillis: Long,
+  ) : VoiceRuntimePresentationAction
+}
 
 internal class VoiceRuntimePresentationActionStore(
   private val consumers: VoiceRuntimeConsumerRegistry,

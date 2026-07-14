@@ -113,37 +113,60 @@ internal class T3VoicePcmPlayer(
     synchronized(lock) {
       val playback = requireActive(playbackId)
       val pcm = decodePcm(pcmBase64)
-      require(pcm.isNotEmpty()) { "PCM chunks must not be empty." }
-      require(pcm.size <= limits.maximumDecodedChunkBytes) { "PCM chunk is too large." }
-      require(pcm.size % playback.bytesPerFrame == 0) { "PCM chunk ended on a partial frame." }
-      check(chunkIndex >= playback.nextChunkIndex) { "PCM chunk $chunkIndex was already consumed." }
-      check(chunkIndex.toLong() - playback.nextChunkIndex <= limits.maximumIndexGap) {
-        "PCM chunk $chunkIndex is too far ahead of the playback cursor."
-      }
-      check(!playback.pending.containsKey(chunkIndex)) { "PCM chunk $chunkIndex was already queued." }
-      val finalIndex = playback.finalChunkIndex
-      check(finalIndex == null || chunkIndex <= finalIndex) {
-        "PCM chunk $chunkIndex is after the declared final chunk $finalIndex."
-      }
-      check(playback.pending.size < limits.maximumQueuedChunks) { "PCM playback queue is full." }
-      check(playback.queuedBytes.toLong() + pcm.size <= limits.maximumQueuedBytes) {
-        "PCM playback queue byte limit was exceeded."
-      }
-      check(playback.acceptedBytes + pcm.size <= limits.maximumTotalBytes) {
-        "PCM playback byte limit was exceeded."
-      }
-      val frames = pcm.size / playback.bytesPerFrame
-      val maximumFrames = playback.sampleRate.toLong() * limits.maximumDurationSeconds
-      check(playback.acceptedFrames + frames <= maximumFrames) {
-        "PCM playback duration limit was exceeded."
-      }
-      playback.pending[chunkIndex] = pcm
-      playback.queuedBytes += pcm.size
-      playback.acceptedBytes += pcm.size
-      playback.acceptedFrames += frames
-      armInactivityTimeoutLocked(playback)
-      scheduleDrainLocked(playback)
+      enqueueDecodedLocked(playback, chunkIndex, pcm, waitForCapacity = false)
     }
+  }
+
+  fun enqueuePcmBlocking(playbackId: String, chunkIndex: Int, pcm: ByteArray) {
+    require(chunkIndex >= 0) { "PCM chunk indexes must be non-negative." }
+    synchronized(lock) {
+      val playback = requireActive(playbackId)
+      enqueueDecodedLocked(playback, chunkIndex, pcm.copyOf(), waitForCapacity = true)
+    }
+  }
+
+  private fun enqueueDecodedLocked(
+    playback: ActivePlayback,
+    chunkIndex: Int,
+    pcm: ByteArray,
+    waitForCapacity: Boolean,
+  ) {
+    require(pcm.isNotEmpty()) { "PCM chunks must not be empty." }
+    require(pcm.size <= limits.maximumDecodedChunkBytes) { "PCM chunk is too large." }
+    require(pcm.size % playback.bytesPerFrame == 0) { "PCM chunk ended on a partial frame." }
+    check(chunkIndex >= playback.nextChunkIndex) { "PCM chunk $chunkIndex was already consumed." }
+    check(chunkIndex.toLong() - playback.nextChunkIndex <= limits.maximumIndexGap) {
+      "PCM chunk $chunkIndex is too far ahead of the playback cursor."
+    }
+    check(!playback.pending.containsKey(chunkIndex)) { "PCM chunk $chunkIndex was already queued." }
+    val finalIndex = playback.finalChunkIndex
+    check(finalIndex == null || chunkIndex <= finalIndex) {
+      "PCM chunk $chunkIndex is after the declared final chunk $finalIndex."
+    }
+    while (waitForCapacity && active === playback && !playback.cancelled &&
+      (playback.pending.size >= limits.maximumQueuedChunks ||
+        playback.queuedBytes.toLong() + pcm.size > limits.maximumQueuedBytes)) {
+      lock.wait()
+    }
+    check(active === playback && !playback.cancelled) { "PCM playback was cancelled." }
+    check(playback.pending.size < limits.maximumQueuedChunks) { "PCM playback queue is full." }
+    check(playback.queuedBytes.toLong() + pcm.size <= limits.maximumQueuedBytes) {
+      "PCM playback queue byte limit was exceeded."
+    }
+    check(playback.acceptedBytes + pcm.size <= limits.maximumTotalBytes) {
+      "PCM playback byte limit was exceeded."
+    }
+    val frames = pcm.size / playback.bytesPerFrame
+    val maximumFrames = playback.sampleRate.toLong() * limits.maximumDurationSeconds
+    check(playback.acceptedFrames + frames <= maximumFrames) {
+      "PCM playback duration limit was exceeded."
+    }
+    playback.pending[chunkIndex] = pcm
+    playback.queuedBytes += pcm.size
+    playback.acceptedBytes += pcm.size
+    playback.acceptedFrames += frames
+    armInactivityTimeoutLocked(playback)
+    scheduleDrainLocked(playback)
   }
 
   fun finish(playbackId: String, finalChunkIndex: Int) {
@@ -241,6 +264,7 @@ internal class T3VoicePcmPlayer(
               Triple(playback, null, isComplete)
             } else {
               playback.queuedBytes -= pcm.size
+              lock.notifyAll()
               val chunkIndex = playback.nextChunkIndex
               playback.nextChunkIndex += 1
               Triple(playback, chunkIndex to pcm, false)

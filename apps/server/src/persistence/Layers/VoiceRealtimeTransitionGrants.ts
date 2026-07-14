@@ -36,6 +36,7 @@ interface Row {
   readonly modeSessionId: string;
   readonly targetJson: string;
   readonly expiresAt: number;
+  readonly authorityExpiresAt: number;
   readonly consumedAt: number | null;
 }
 
@@ -49,7 +50,8 @@ const selectColumns = `operation_key AS "operationKey", token_hash AS "tokenHash
   runtime_id AS "runtimeId", runtime_instance_id AS "runtimeInstanceId",
   source_generation AS "sourceGeneration", target_generation AS "targetGeneration",
   mode_session_id AS "modeSessionId", target_json AS "targetJson",
-  expires_at AS "expiresAt", consumed_at AS "consumedAt"`;
+  expires_at AS "expiresAt", authority_expires_at AS "authorityExpiresAt",
+  consumed_at AS "consumedAt"`;
 const qualifiedSelectColumns = `transition.operation_key AS "operationKey",
   transition.token_hash AS "tokenHash", transition.auth_session_id AS "authSessionId",
   transition.source_control_token_hash AS "sourceControlTokenHash",
@@ -61,7 +63,9 @@ const qualifiedSelectColumns = `transition.operation_key AS "operationKey",
   transition.source_generation AS "sourceGeneration",
   transition.target_generation AS "targetGeneration",
   transition.mode_session_id AS "modeSessionId", transition.target_json AS "targetJson",
-  transition.expires_at AS "expiresAt", transition.consumed_at AS "consumedAt"`;
+  transition.expires_at AS "expiresAt",
+  transition.authority_expires_at AS "authorityExpiresAt",
+  transition.consumed_at AS "consumedAt"`;
 
 const decode = (row: Row): PersistedVoiceRealtimeTransitionGrant => ({
   operationKey: row.operationKey,
@@ -79,6 +83,7 @@ const decode = (row: Row): PersistedVoiceRealtimeTransitionGrant => ({
   modeSessionId: VoiceModeSessionId.make(row.modeSessionId),
   target: decodeTarget(row.targetJson),
   expiresAt: row.expiresAt,
+  authorityExpiresAt: row.authorityExpiresAt,
   consumedAt: row.consumedAt,
 });
 
@@ -100,7 +105,8 @@ const sameIdentity = (
   row.targetGeneration === input.targetGeneration &&
   row.modeSessionId === input.modeSessionId &&
   encodeTarget(row.target) === encodeTarget(input.target) &&
-  row.expiresAt === input.expiresAt;
+  row.expiresAt === input.expiresAt &&
+  row.authorityExpiresAt === input.authorityExpiresAt;
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -135,7 +141,7 @@ const make = Effect.gen(function* () {
             source_session_id,
             source_lease_generation, action_id, action_sequence, runtime_id, runtime_instance_id,
             source_generation, target_generation, mode_session_id, target_json,
-            expires_at, created_at
+            expires_at, authority_expires_at, created_at
           ) VALUES (
             ${input.operationKey}, ${input.tokenHash}, ${input.sourceControlTokenHash},
             ${input.authSessionId},
@@ -143,28 +149,32 @@ const make = Effect.gen(function* () {
             ${input.actionSequence},
             ${input.runtimeId}, ${input.runtimeInstanceId}, ${input.sourceGeneration},
             ${input.targetGeneration}, ${input.modeSessionId}, ${encodeTarget(input.target)},
-            ${input.expiresAt}, ${now}
+            ${input.expiresAt}, ${input.authorityExpiresAt}, ${now}
           )`;
           return { status: "claimed" as const };
         }),
       )
       .pipe(Effect.mapError(toPersistenceSqlError("VoiceRealtimeTransitionGrantRepository.claim")));
 
-  const findActive: VoiceRealtimeTransitionGrantRepositoryShape["findActive"] = (tokenHash, now) =>
+  const findByToken: VoiceRealtimeTransitionGrantRepositoryShape["findByToken"] = (
+    tokenHash,
+    now,
+  ) =>
     Effect.gen(function* () {
       const nowIso = DateTime.formatIso(DateTime.makeUnsafe(now));
       const rows = yield* sql.unsafe<Row>(
         `SELECT ${qualifiedSelectColumns}
          FROM voice_runtime_realtime_transition_grants AS transition
          INNER JOIN auth_sessions AS auth ON auth.session_id = transition.auth_session_id
-         WHERE transition.token_hash = ? AND transition.expires_at > ?
-           AND transition.consumed_at IS NULL AND auth.revoked_at IS NULL
+         WHERE transition.token_hash = ?
+           AND (transition.consumed_at IS NOT NULL OR transition.expires_at > ?)
+           AND transition.authority_expires_at > ? AND auth.revoked_at IS NULL
            AND auth.expires_at > ? LIMIT 1`,
-        [tokenHash, now, nowIso],
+        [tokenHash, now, now, nowIso],
       );
       return rows[0] === undefined ? undefined : decode(rows[0]);
     }).pipe(
-      Effect.mapError(toPersistenceSqlError("VoiceRealtimeTransitionGrantRepository.findActive")),
+      Effect.mapError(toPersistenceSqlError("VoiceRealtimeTransitionGrantRepository.findByToken")),
     );
 
   const findByOperationKey: VoiceRealtimeTransitionGrantRepositoryShape["findByOperationKey"] = (
@@ -177,9 +187,11 @@ const make = Effect.gen(function* () {
         `SELECT ${qualifiedSelectColumns}
          FROM voice_runtime_realtime_transition_grants AS transition
          INNER JOIN auth_sessions AS auth ON auth.session_id = transition.auth_session_id
-         WHERE transition.operation_key = ? AND transition.expires_at > ?
+         WHERE transition.operation_key = ?
+           AND (transition.consumed_at IS NOT NULL OR transition.expires_at > ?)
+           AND transition.authority_expires_at > ?
            AND auth.revoked_at IS NULL AND auth.expires_at > ? LIMIT 1`,
-        [operationKey, now, nowIso],
+        [operationKey, now, now, nowIso],
       );
       return rows[0] === undefined ? undefined : decode(rows[0]);
     }).pipe(
@@ -188,39 +200,6 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const consume: VoiceRealtimeTransitionGrantRepositoryShape["consume"] = (tokenHash, now) =>
-    sql
-      .withTransaction(
-        Effect.gen(function* () {
-          const rows = yield* sql.unsafe<Row>(
-            `SELECT ${selectColumns} FROM voice_runtime_realtime_transition_grants
-             WHERE token_hash = ? LIMIT 1`,
-            [tokenHash],
-          );
-          const existing = rows[0];
-          if (existing === undefined || existing.expiresAt <= now)
-            return { status: "missing" as const };
-          if (existing.consumedAt !== null) return { status: "already-consumed" as const };
-          const nowIso = DateTime.formatIso(DateTime.makeUnsafe(now));
-          const authorized = yield* sql<{ readonly found: number }>`SELECT 1 AS found
-            FROM auth_sessions WHERE session_id = ${existing.authSessionId}
-              AND revoked_at IS NULL AND expires_at > ${nowIso} LIMIT 1`;
-          if (authorized.length === 0) return { status: "missing" as const };
-          yield* sql`UPDATE voice_runtime_realtime_transition_grants
-            SET consumed_at = ${now}
-            WHERE token_hash = ${tokenHash} AND consumed_at IS NULL AND expires_at > ${now}`;
-          const changed = yield* sql<{ readonly count: number }>`SELECT changes() AS count`;
-          if (changed[0]?.count !== 1) return { status: "already-consumed" as const };
-          return {
-            status: "consumed" as const,
-            record: { ...decode(existing), consumedAt: now },
-          };
-        }),
-      )
-      .pipe(
-        Effect.mapError(toPersistenceSqlError("VoiceRealtimeTransitionGrantRepository.consume")),
-      );
-
   const revoke: VoiceRealtimeTransitionGrantRepositoryShape["revoke"] = (operationKey) =>
     sql`DELETE FROM voice_runtime_realtime_transition_grants
       WHERE operation_key = ${operationKey} AND consumed_at IS NULL`.pipe(
@@ -228,16 +207,17 @@ const make = Effect.gen(function* () {
       Effect.mapError(toPersistenceSqlError("VoiceRealtimeTransitionGrantRepository.revoke")),
     );
   const purgeExpired: VoiceRealtimeTransitionGrantRepositoryShape["purgeExpired"] = (now) =>
-    sql`DELETE FROM voice_runtime_realtime_transition_grants WHERE expires_at <= ${now}`.pipe(
+    sql`DELETE FROM voice_runtime_realtime_transition_grants
+      WHERE (consumed_at IS NULL AND expires_at <= ${now})
+        OR (consumed_at IS NOT NULL AND authority_expires_at <= ${now})`.pipe(
       Effect.asVoid,
       Effect.mapError(toPersistenceSqlError("VoiceRealtimeTransitionGrantRepository.purgeExpired")),
     );
 
   return VoiceRealtimeTransitionGrantRepository.of({
     claim,
-    findActive,
+    findByToken,
     findByOperationKey,
-    consume,
     revoke,
     purgeExpired,
   });

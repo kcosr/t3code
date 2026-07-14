@@ -7,13 +7,18 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
-  private val storage: T3VoiceBackgroundKeyValueStore,
+  private val storage: VoiceRuntimeKeyValueStore,
   private val cipher: T3VoiceRuntimeGrantCipher,
+  private val terminalCapacity: Int = MAXIMUM_TERMINALS,
 ) : VoiceRuntimeRealtimeCheckpointRepository {
   constructor(context: Context) : this(
-    T3VoiceBackgroundPreferences(context.applicationContext),
+    VoiceRuntimePreferences(context.applicationContext),
     T3VoiceAndroidKeystoreGrantCipher(KEY_ALIAS),
   )
+
+  init {
+    require(terminalCapacity > 0)
+  }
 
   @Synchronized
   override fun load(): VoiceRuntimeRealtimeCheckpoint? {
@@ -66,10 +71,15 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
   @Synchronized
   override fun publishTerminal(summary: VoiceRuntimeRealtimeTerminalSummary) {
     validateTerminal(summary)
-    val next = loadTerminals()
-      .filterNot {
-        it.identity.runtimeId == summary.identity.runtimeId &&
-          it.modeSessionId == summary.modeSessionId
+    val current = loadTerminals().filter {
+      it.expiresAtEpochMillis > summary.terminalAtEpochMillis
+    }
+    if (current.none { it.identity == summary.identity && it.modeSessionId == summary.modeSessionId } &&
+      current.size >= terminalCapacity) {
+      throw VoiceRuntimeRetentionCapacityException("Realtime terminal", terminalCapacity)
+    }
+    val next = current.filterNot {
+        it.identity == summary.identity && it.modeSessionId == summary.modeSessionId
       }
       .plus(summary)
       .sortedWith(
@@ -79,7 +89,6 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
           { it.modeSessionId },
         ),
       )
-      .takeLast(MAXIMUM_TERMINALS)
     writeTerminals(next)
   }
 
@@ -90,6 +99,19 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     val live = current.filter { it.expiresAtEpochMillis > nowEpochMillis }
     if (live.size != current.size) writeTerminals(live)
     return live
+  }
+
+  @Synchronized
+  override fun acknowledgeTerminal(
+    key: VoiceRuntimeRetainedRecordKey.RealtimeTerminal,
+  ): Boolean {
+    val current = loadTerminals()
+    val next = current.filterNot {
+      it.identity == key.identity && it.modeSessionId == key.modeSessionId
+    }
+    if (next.size == current.size) return false
+    writeTerminals(next)
+    return true
   }
 
   private fun decodeCheckpoint(raw: String): VoiceRuntimeRealtimeCheckpoint {
@@ -193,15 +215,15 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     )
   }
 
-  private fun encodeControlGrant(grant: T3VoiceBackgroundRealtimeControlGrant): JSONObject =
+  private fun encodeControlGrant(grant: VoiceRuntimeRealtimeControlGrant): JSONObject =
     JSONObject()
       .put("expiresAtEpochMillis", grant.expiresAtEpochMillis)
       .put("heartbeatIntervalSeconds", grant.heartbeatIntervalSeconds)
       .put("failureGraceSeconds", grant.failureGraceSeconds)
 
-  private fun decodeControlGrant(value: JSONObject): T3VoiceBackgroundRealtimeControlGrant {
+  private fun decodeControlGrant(value: JSONObject): VoiceRuntimeRealtimeControlGrant {
     value.requireExactFields(CONTROL_GRANT_FIELDS)
-    return T3VoiceBackgroundRealtimeControlGrant(
+    return VoiceRuntimeRealtimeControlGrant(
       token = PENDING_SECRET,
       expiresAtEpochMillis = value.exactLong("expiresAtEpochMillis"),
       heartbeatIntervalSeconds = value.exactLong("heartbeatIntervalSeconds"),
@@ -209,8 +231,8 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     )
   }
 
-  private fun encodeAction(action: T3VoiceBackgroundRealtimeAction): JSONObject = when (action) {
-    is T3VoiceBackgroundRealtimeAction.NavigateThread -> JSONObject()
+  private fun encodeAction(action: VoiceRuntimeRealtimeAction): JSONObject = when (action) {
+    is VoiceRuntimeRealtimeAction.NavigateThread -> JSONObject()
       .put("type", "navigate-thread")
       .put("sequence", action.sequence)
       .put("occurredAtEpochMillis", action.occurredAtEpochMillis)
@@ -218,7 +240,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       .put("projectId", action.projectId)
       .put("threadId", action.threadId)
       .put("expiresAtEpochMillis", action.expiresAtEpochMillis)
-    is T3VoiceBackgroundRealtimeAction.HandoffToThreadVoice -> JSONObject()
+    is VoiceRuntimeRealtimeAction.HandoffToThreadVoice -> JSONObject()
       .put("type", "handoff-to-thread-voice")
       .put("sequence", action.sequence)
       .put("occurredAtEpochMillis", action.occurredAtEpochMillis)
@@ -227,11 +249,11 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       .put("threadId", action.threadId)
       .put("autoRearm", action.autoRearm)
       .put("expiresAtEpochMillis", action.expiresAtEpochMillis)
-    is T3VoiceBackgroundRealtimeAction.StopRealtimeVoice -> JSONObject()
+    is VoiceRuntimeRealtimeAction.StopRealtimeVoice -> JSONObject()
       .put("type", "stop-realtime-voice")
       .put("sequence", action.sequence)
       .put("occurredAtEpochMillis", action.occurredAtEpochMillis)
-    is T3VoiceBackgroundRealtimeAction.ConfirmationRequired -> JSONObject()
+    is VoiceRuntimeRealtimeAction.ConfirmationRequired -> JSONObject()
       .put("type", "confirmation-required")
       .put("sequence", action.sequence)
       .put("occurredAtEpochMillis", action.occurredAtEpochMillis)
@@ -243,12 +265,12 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       .put("expiresAtEpochMillis", action.expiresAtEpochMillis)
   }
 
-  private fun decodeAction(value: JSONObject): T3VoiceBackgroundRealtimeAction {
+  private fun decodeAction(value: JSONObject): VoiceRuntimeRealtimeAction {
     val type = value.getString("type")
     return when (type) {
       "navigate-thread" -> {
         value.requireExactFields(NAVIGATE_ACTION_FIELDS)
-        T3VoiceBackgroundRealtimeAction.NavigateThread(
+        VoiceRuntimeRealtimeAction.NavigateThread(
           value.exactLong("sequence"),
           value.exactLong("occurredAtEpochMillis"),
           value.getString("actionId"),
@@ -259,7 +281,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       }
       "handoff-to-thread-voice" -> {
         value.requireExactFields(HANDOFF_ACTION_FIELDS)
-        T3VoiceBackgroundRealtimeAction.HandoffToThreadVoice(
+        VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
           value.exactLong("sequence"),
           value.exactLong("occurredAtEpochMillis"),
           value.getString("actionId"),
@@ -271,14 +293,14 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       }
       "stop-realtime-voice" -> {
         value.requireExactFields(STOP_ACTION_FIELDS)
-        T3VoiceBackgroundRealtimeAction.StopRealtimeVoice(
+        VoiceRuntimeRealtimeAction.StopRealtimeVoice(
           value.exactLong("sequence"),
           value.exactLong("occurredAtEpochMillis"),
         )
       }
       "confirmation-required" -> {
         value.requireExactFields(CONFIRMATION_ACTION_FIELDS)
-        T3VoiceBackgroundRealtimeAction.ConfirmationRequired(
+        VoiceRuntimeRealtimeAction.ConfirmationRequired(
           value.exactLong("sequence"),
           value.exactLong("occurredAtEpochMillis"),
           value.getString("actionId"),
@@ -294,7 +316,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
   }
 
   private fun encodeHandoffExchange(
-    exchange: T3VoiceBackgroundRealtimeHandoffExchangeResult,
+    exchange: VoiceRuntimeRealtimeHandoffExchangeResult,
   ): JSONObject = JSONObject()
     .put("actionId", exchange.actionId)
     .put("actionSequence", exchange.actionSequence)
@@ -306,9 +328,9 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
 
   private fun decodeHandoffExchange(
     value: JSONObject,
-  ): T3VoiceBackgroundRealtimeHandoffExchangeResult {
+  ): VoiceRuntimeRealtimeHandoffExchangeResult {
     value.requireExactFields(HANDOFF_EXCHANGE_FIELDS)
-    return T3VoiceBackgroundRealtimeHandoffExchangeResult(
+    return VoiceRuntimeRealtimeHandoffExchangeResult(
       actionId = value.getString("actionId"),
       actionSequence = value.exactLong("actionSequence"),
       projectId = value.getString("projectId"),
@@ -320,16 +342,16 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
   }
 
   private fun encodeTransitionGrant(
-    grant: T3VoiceBackgroundRealtimeTransitionGrant,
+    grant: VoiceRuntimeRealtimeTransitionGrant,
   ): JSONObject = JSONObject()
     .put("expiresAtEpochMillis", grant.expiresAtEpochMillis)
     .put("generation", grant.generation)
     .put("modeSessionId", grant.modeSessionId)
     .put("target", encodeThreadTarget(grant.target))
 
-  private fun decodeTransitionGrant(value: JSONObject): T3VoiceBackgroundRealtimeTransitionGrant {
+  private fun decodeTransitionGrant(value: JSONObject): VoiceRuntimeRealtimeTransitionGrant {
     value.requireExactFields(TRANSITION_GRANT_FIELDS)
-    return T3VoiceBackgroundRealtimeTransitionGrant(
+    return VoiceRuntimeRealtimeTransitionGrant(
       token = PENDING_SECRET,
       expiresAtEpochMillis = value.exactLong("expiresAtEpochMillis"),
       generation = value.exactLong("generation"),
@@ -338,7 +360,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     )
   }
 
-  private fun encodeThreadTarget(target: T3VoiceBackgroundRealtimeThreadTarget): JSONObject =
+  private fun encodeThreadTarget(target: VoiceRuntimeRealtimeThreadTarget): JSONObject =
     JSONObject()
       .put("environmentId", target.environmentId)
       .put("projectId", target.projectId)
@@ -349,9 +371,9 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       .put("speechEnabled", target.speechEnabled)
       .put("rearmGuardMs", target.rearmGuardMs)
 
-  private fun decodeThreadTarget(value: JSONObject): T3VoiceBackgroundRealtimeThreadTarget {
+  private fun decodeThreadTarget(value: JSONObject): VoiceRuntimeRealtimeThreadTarget {
     value.requireExactFields(THREAD_TARGET_FIELDS)
-    return T3VoiceBackgroundRealtimeThreadTarget(
+    return VoiceRuntimeRealtimeThreadTarget(
       environmentId = value.getString("environmentId"),
       projectId = value.getString("projectId"),
       threadId = value.getString("threadId"),
@@ -363,15 +385,15 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     )
   }
 
-  private fun encodeEndpointPolicy(policy: T3VoiceBackgroundRealtimeEndpointPolicy): JSONObject =
+  private fun encodeEndpointPolicy(policy: VoiceRuntimeRealtimeEndpointPolicy): JSONObject =
     JSONObject()
       .put("endSilenceMs", policy.endSilenceMs)
       .put("noSpeechTimeoutMs", policy.noSpeechTimeoutMs ?: JSONObject.NULL)
       .put("maximumUtteranceMs", policy.maximumUtteranceMs)
 
-  private fun decodeEndpointPolicy(value: JSONObject): T3VoiceBackgroundRealtimeEndpointPolicy {
+  private fun decodeEndpointPolicy(value: JSONObject): VoiceRuntimeRealtimeEndpointPolicy {
     value.requireExactFields(ENDPOINT_POLICY_FIELDS)
-    return T3VoiceBackgroundRealtimeEndpointPolicy(
+    return VoiceRuntimeRealtimeEndpointPolicy(
       value.exactLong("endSilenceMs"),
       value.nullableLong("noSpeechTimeoutMs"),
       value.exactLong("maximumUtteranceMs"),
@@ -410,24 +432,24 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     }
   }
 
-  private fun validateAction(action: T3VoiceBackgroundRealtimeAction) {
+  private fun validateAction(action: VoiceRuntimeRealtimeAction) {
     require(action.sequence > 0)
     require(action.occurredAtEpochMillis >= 0)
     when (action) {
-      is T3VoiceBackgroundRealtimeAction.NavigateThread -> {
+      is VoiceRuntimeRealtimeAction.NavigateThread -> {
         requireIdentifier(action.actionId, "action ID")
         requireIdentifier(action.projectId, "project ID")
         requireIdentifier(action.threadId, "thread ID")
         require(action.expiresAtEpochMillis > 0)
       }
-      is T3VoiceBackgroundRealtimeAction.HandoffToThreadVoice -> {
+      is VoiceRuntimeRealtimeAction.HandoffToThreadVoice -> {
         requireIdentifier(action.actionId, "action ID")
         requireIdentifier(action.projectId, "project ID")
         requireIdentifier(action.threadId, "thread ID")
         require(action.expiresAtEpochMillis > 0)
       }
-      is T3VoiceBackgroundRealtimeAction.StopRealtimeVoice -> Unit
-      is T3VoiceBackgroundRealtimeAction.ConfirmationRequired -> {
+      is VoiceRuntimeRealtimeAction.StopRealtimeVoice -> Unit
+      is VoiceRuntimeRealtimeAction.ConfirmationRequired -> {
         requireIdentifier(action.actionId, "action ID")
         requireIdentifier(action.confirmationId, "confirmation ID")
         requireIdentifier(action.toolCallId, "tool call ID")
@@ -438,7 +460,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
     }
   }
 
-  private fun validateThreadTarget(target: T3VoiceBackgroundRealtimeThreadTarget) {
+  private fun validateThreadTarget(target: VoiceRuntimeRealtimeThreadTarget) {
     requireIdentifier(target.environmentId, "environment ID")
     requireIdentifier(target.projectId, "project ID")
     requireIdentifier(target.threadId, "thread ID")
@@ -473,7 +495,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
       val root = JSONObject(raw).requireExactFields(TERMINAL_ROOT_FIELDS)
       require(root.getString("version") == VERSION)
       val entries = root.getJSONArray("entries")
-      require(entries.length() <= MAXIMUM_TERMINALS)
+      require(entries.length() <= terminalCapacity)
       buildList(entries.length()) {
         repeat(entries.length()) {
           add(decodeTerminal(entries.getJSONObject(it)).also(::validateTerminal))
@@ -488,7 +510,7 @@ internal class VoiceRuntimeDurableRealtimeCheckpointRepository(
   }
 
   private fun writeTerminals(summaries: List<VoiceRuntimeRealtimeTerminalSummary>) {
-    require(summaries.size <= MAXIMUM_TERMINALS)
+    require(summaries.size <= terminalCapacity)
     if (summaries.isEmpty()) {
       check(storage.clear(setOf(KEY_TERMINALS))) {
         "Could not clear Realtime voice terminal summaries."

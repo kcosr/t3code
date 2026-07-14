@@ -16,6 +16,7 @@ function environmentEntry(environmentId: EnvironmentId, label: string) {
     target: new PrimaryConnectionTarget({
       environmentId,
       label,
+      voiceRuntimeProtocolMajor: 1,
       httpBaseUrl: `https://${environmentId}.example.test`,
       wsBaseUrl: `wss://${environmentId}.example.test`,
     }),

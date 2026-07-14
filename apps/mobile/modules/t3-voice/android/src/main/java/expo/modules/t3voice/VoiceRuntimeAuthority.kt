@@ -10,6 +10,11 @@ internal data class VoiceRuntimeAuthorityReservation(
   val expiresAtEpochMillis: Long,
 )
 
+internal data class VoiceRuntimeAuthorityRegistryCheckpoint(
+  val authority: VoiceRuntimeAuthorityReservation?,
+  val generationFloor: Long,
+)
+
 internal class VoiceRuntimeAuthorityRegistry(
   private val runtimeId: String,
   private val runtimeInstanceId: String,
@@ -62,12 +67,39 @@ internal class VoiceRuntimeAuthorityRegistry(
     return current
   }
 
+  fun refresh(reservation: VoiceRuntimeAuthorityReservation) {
+    requireIdentity(reservation.identity)
+    val current = authority ?: throw VoiceRuntimeExpiredException()
+    if (reservation.identity != current.identity ||
+      reservation.provisioningOperationId != current.provisioningOperationId ||
+      reservation.expectedCurrentGeneration != current.expectedCurrentGeneration ||
+      reservation.targetDigest != current.targetDigest) {
+      throw VoiceRuntimeFenceException("Refreshed authority changed its canonical fence.")
+    }
+    val currentTime = now()
+    require(reservation.issuedAtEpochMillis <= currentTime)
+    require(reservation.expiresAtEpochMillis > currentTime)
+    authority = reservation
+  }
+
   fun clear(identity: VoiceRuntimeIdentity) {
     requireIdentity(identity)
     if (authority?.identity?.generation != identity.generation) {
       throw VoiceRuntimeFenceException("Stale authority clear.")
     }
     authority = null
+  }
+
+  fun checkpoint(): VoiceRuntimeAuthorityRegistryCheckpoint =
+    VoiceRuntimeAuthorityRegistryCheckpoint(authority, generationFloor)
+
+  fun restore(
+    checkpoint: VoiceRuntimeAuthorityRegistryCheckpoint,
+    provisioningOperationId: String,
+  ) {
+    authority = checkpoint.authority
+    generationFloor = checkpoint.generationFloor
+    provisioning.forget(provisioningOperationId)
   }
 
   private fun requireIdentity(identity: VoiceRuntimeIdentity) {

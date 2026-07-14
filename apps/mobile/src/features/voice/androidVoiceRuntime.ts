@@ -28,6 +28,7 @@ type AndroidVoiceRuntimeNative = Pick<
   | "detachVoiceRuntimeAsync"
   | "readVoiceRuntimeAsync"
   | "acknowledgeVoiceRuntimeAsync"
+  | "acknowledgeVoiceRuntimeRetainedRecordAsync"
   | "dispatchVoiceRuntimeAsync"
   | "readVoiceRuntimeDraftArtifactAsync"
   | "acknowledgeVoiceRuntimeDraftArtifactAsync"

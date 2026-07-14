@@ -34,13 +34,13 @@ internal interface VoiceRuntimeDraftRepository {
 }
 
 internal class VoiceRuntimeDurableDraftRepository(
-  private val storage: T3VoiceBackgroundKeyValueStore,
+  private val storage: VoiceRuntimeKeyValueStore,
   private val cipher: T3VoiceRuntimeGrantCipher =
     T3VoiceAndroidKeystoreGrantCipher("t3.voice.runtime.drafts.v1"),
   private val now: () -> Long = System::currentTimeMillis,
 ) : VoiceRuntimeDraftRepository {
   constructor(context: Context) : this(
-    T3VoiceBackgroundPreferences(context.applicationContext),
+    VoiceRuntimePreferences(context.applicationContext),
     T3VoiceAndroidKeystoreGrantCipher("t3.voice.runtime.drafts.v1"),
     System::currentTimeMillis,
   )

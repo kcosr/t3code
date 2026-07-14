@@ -27,7 +27,7 @@ import {
   VoiceTurnClientOperationId,
 } from "./baseSchemas.ts";
 import {
-  VoiceNativeControlGrant,
+  VoiceRuntimeControlGrant,
   VoiceSessionState,
   VoiceSpeechPreset,
   VoiceToolName,
@@ -35,13 +35,21 @@ import {
 } from "./voice.ts";
 
 const RuntimeIdentifier = TrimmedNonEmptyString.check(Schema.isMaxLength(192));
-const RuntimeDigest = TrimmedNonEmptyString.check(Schema.isMaxLength(128));
+export const VoiceRuntimeTargetDigest = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
+export type VoiceRuntimeTargetDigest = typeof VoiceRuntimeTargetDigest.Type;
+export const VoiceRuntimeCredentialHash = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
+export type VoiceRuntimeCredentialHash = typeof VoiceRuntimeCredentialHash.Type;
 const RuntimeToken = TrimmedNonEmptyString.check(Schema.isMaxLength(512));
 const RuntimeFailureCode = TrimmedNonEmptyString.check(Schema.isMaxLength(128));
 const RuntimeFailureMessage = TrimmedNonEmptyString.check(Schema.isMaxLength(512));
 
 export const VoiceRuntimeExecutionModel = Schema.Literals(["autonomous", "ui-attached"]);
 export type VoiceRuntimeExecutionModel = typeof VoiceRuntimeExecutionModel.Type;
+
+export const VOICE_RUNTIME_PROTOCOL_MAJOR = 1 as const;
+export const VOICE_RUNTIME_PROTOCOL_HEADER = "x-t3-voice-runtime-protocol-major" as const;
+export const VoiceRuntimeProtocolMajor = PositiveInt;
+export type VoiceRuntimeProtocolMajor = typeof VoiceRuntimeProtocolMajor.Type;
 
 export const VoiceRuntimePcmFormat = Schema.Struct({
   encoding: Schema.Literal("pcm-s16le"),
@@ -305,9 +313,10 @@ const VoiceRuntimeAuthorityReservationBase = {
   provisioningOperationId: VoiceRuntimeProvisioningOperationId,
   expectedCurrentGeneration: NonNegativeInt,
   generation: PositiveInt,
-  targetDigest: RuntimeDigest,
+  targetDigest: VoiceRuntimeTargetDigest,
   environmentOrigin: Schema.String,
   readinessEnabled: Schema.Boolean,
+  refreshRotationCounter: NonNegativeInt,
   token: RuntimeToken,
   issuedAt: IsoDateTime,
   expiresAt: IsoDateTime,
@@ -326,6 +335,94 @@ export const VoiceRuntimeAuthorityReservation = Schema.Union([
   }),
 ]);
 export type VoiceRuntimeAuthorityReservation = typeof VoiceRuntimeAuthorityReservation.Type;
+
+export const VoiceRuntimeGrantOperation = Schema.Literals(["realtime-start", "thread-turn-start"]);
+export type VoiceRuntimeGrantOperation = typeof VoiceRuntimeGrantOperation.Type;
+
+const VoiceRuntimeGrantProvisionBase = {
+  expectedCurrentGeneration: NonNegativeInt,
+  generation: PositiveInt,
+  provisioningOperationId: VoiceRuntimeProvisioningOperationId,
+  targetDigest: VoiceRuntimeTargetDigest,
+};
+
+export const VoiceRuntimeGrantProvisionInput = Schema.Union([
+  Schema.Struct({
+    ...VoiceRuntimeGrantProvisionBase,
+    operation: Schema.Literal("realtime-start"),
+    target: VoiceRealtimeRuntimeTarget,
+    readinessEnabled: Schema.Literal(true),
+    refreshCredentialHash: VoiceRuntimeCredentialHash,
+  }),
+  Schema.Struct({
+    ...VoiceRuntimeGrantProvisionBase,
+    operation: Schema.Literal("realtime-start"),
+    target: VoiceRealtimeRuntimeTarget,
+    readinessEnabled: Schema.Literal(false),
+    refreshCredentialHash: Schema.Null,
+  }),
+  Schema.Struct({
+    ...VoiceRuntimeGrantProvisionBase,
+    operation: Schema.Literal("thread-turn-start"),
+    target: VoiceThreadRuntimeTarget,
+    readinessEnabled: Schema.Literal(true),
+    refreshCredentialHash: VoiceRuntimeCredentialHash,
+  }),
+  Schema.Struct({
+    ...VoiceRuntimeGrantProvisionBase,
+    operation: Schema.Literal("thread-turn-start"),
+    target: VoiceThreadRuntimeTarget,
+    readinessEnabled: Schema.Literal(false),
+    refreshCredentialHash: Schema.Null,
+  }),
+]);
+export type VoiceRuntimeGrantProvisionInput = typeof VoiceRuntimeGrantProvisionInput.Type;
+
+const VoiceRuntimeGrantBase = {
+  token: RuntimeToken,
+  runtimeId: VoiceRuntimeId,
+  generation: PositiveInt,
+  provisioningOperationId: VoiceRuntimeProvisioningOperationId,
+  targetDigest: VoiceRuntimeTargetDigest,
+  readinessEnabled: Schema.Boolean,
+  refreshRotationCounter: NonNegativeInt,
+  issuedAt: IsoDateTime,
+  expiresAt: IsoDateTime,
+};
+
+export const VoiceRuntimeGrant = Schema.Union([
+  Schema.Struct({
+    ...VoiceRuntimeGrantBase,
+    target: VoiceRealtimeRuntimeTarget,
+    operation: Schema.Literal("realtime-start"),
+  }),
+  Schema.Struct({
+    ...VoiceRuntimeGrantBase,
+    target: VoiceThreadRuntimeTarget,
+    operation: Schema.Literal("thread-turn-start"),
+  }),
+]);
+export type VoiceRuntimeGrant = typeof VoiceRuntimeGrant.Type;
+
+export const VoiceRuntimeGrantRevocationResult = Schema.Struct({
+  runtimeId: VoiceRuntimeId,
+  revoked: Schema.Boolean,
+});
+export type VoiceRuntimeGrantRevocationResult = typeof VoiceRuntimeGrantRevocationResult.Type;
+
+export const VoiceRuntimeGrantRefreshInput = Schema.Struct({
+  refreshRequestId: RuntimeIdentifier,
+  provisioningOperationId: VoiceRuntimeProvisioningOperationId,
+  generation: PositiveInt,
+  operation: VoiceRuntimeGrantOperation,
+  targetDigest: VoiceRuntimeTargetDigest,
+  expectedRotationCounter: NonNegativeInt,
+  candidateCredentialHash: VoiceRuntimeCredentialHash,
+});
+export type VoiceRuntimeGrantRefreshInput = typeof VoiceRuntimeGrantRefreshInput.Type;
+
+export const VoiceRuntimeGrantRefreshResult = VoiceRuntimeGrant;
+export type VoiceRuntimeGrantRefreshResult = typeof VoiceRuntimeGrantRefreshResult.Type;
 
 export const VoiceRuntimeAuthorityClearCommand = Schema.Struct({
   commandId: VoiceRuntimeCommandId,
@@ -383,6 +480,31 @@ export const VoiceRealtimeTerminalSummary = Schema.Struct({
   expiresAt: IsoDateTime,
 });
 export type VoiceRealtimeTerminalSummary = typeof VoiceRealtimeTerminalSummary.Type;
+
+export const VoiceRuntimeRetainedRecordAcknowledgement = Schema.Struct({
+  runtimeId: VoiceRuntimeId,
+  runtimeInstanceId: VoiceRuntimeInstanceId,
+  authorityGeneration: PositiveInt,
+  record: Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literal("thread-receipt"),
+      sourceRuntimeId: VoiceRuntimeId,
+      sourceRuntimeInstanceId: VoiceRuntimeInstanceId,
+      sourceRuntimeGeneration: PositiveInt,
+      modeSessionId: VoiceModeSessionId,
+      turnClientOperationId: VoiceTurnClientOperationId,
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("realtime-terminal"),
+      sourceRuntimeId: VoiceRuntimeId,
+      sourceRuntimeInstanceId: VoiceRuntimeInstanceId,
+      sourceRuntimeGeneration: PositiveInt,
+      modeSessionId: VoiceModeSessionId,
+    }),
+  ]),
+});
+export type VoiceRuntimeRetainedRecordAcknowledgement =
+  typeof VoiceRuntimeRetainedRecordAcknowledgement.Type;
 
 export const VoiceDraftArtifactHandle = Schema.Struct({
   artifactId: VoiceDraftArtifactId,
@@ -704,7 +826,7 @@ export const VoiceRuntimeRealtimeSessionCreateResult = Schema.Struct({
   }),
   expiresAt: IsoDateTime,
   heartbeatIntervalSeconds: PositiveInt,
-  controlGrant: VoiceNativeControlGrant,
+  controlGrant: VoiceRuntimeControlGrant,
 });
 export type VoiceRuntimeRealtimeSessionCreateResult =
   typeof VoiceRuntimeRealtimeSessionCreateResult.Type;
@@ -874,6 +996,24 @@ export const VoiceRuntimeRealtimeHandoffExchangeResult = Schema.Struct({
 });
 export type VoiceRuntimeRealtimeHandoffExchangeResult =
   typeof VoiceRuntimeRealtimeHandoffExchangeResult.Type;
+
+export const VoiceRuntimeRealtimeHandoffCommitInput = Schema.Struct({
+  ...VoiceRuntimeRealtimeLeaseFence,
+  actionSequence: PositiveInt,
+  nextGeneration: PositiveInt,
+  threadModeSessionId: VoiceModeSessionId,
+});
+export type VoiceRuntimeRealtimeHandoffCommitInput =
+  typeof VoiceRuntimeRealtimeHandoffCommitInput.Type;
+
+export const VoiceRuntimeRealtimeHandoffCommitResult = Schema.Struct({
+  actionId: VoiceClientActionId,
+  actionSequence: PositiveInt,
+  committed: Schema.Literal(true),
+  replayed: Schema.Boolean,
+});
+export type VoiceRuntimeRealtimeHandoffCommitResult =
+  typeof VoiceRuntimeRealtimeHandoffCommitResult.Type;
 
 export const VoiceRuntimeRealtimeCloseInput = Schema.Struct({
   ...VoiceRuntimeRealtimeLeaseFence,

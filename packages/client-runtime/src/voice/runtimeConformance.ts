@@ -264,6 +264,7 @@ export function makeFakeVoiceRuntimeConformanceFixture(): VoiceRuntimeConformanc
         environmentOrigin: "https://termstation",
         operation: "realtime-start",
         readinessEnabled: true,
+        refreshRotationCounter: 0,
         token: "test-runtime-token",
         issuedAt: "2020-01-01T00:00:00.000Z",
         expiresAt: "2099-01-01T00:00:00.000Z",

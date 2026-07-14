@@ -293,6 +293,7 @@ const loadPrimaryConnectionRegistration = Effect.fn(
     target: new PrimaryConnectionTarget({
       environmentId: descriptor.environmentId,
       label: descriptor.label,
+      voiceRuntimeProtocolMajor: descriptor.voiceRuntimeProtocolMajor,
       httpBaseUrl: resolved.target.httpBaseUrl,
       wsBaseUrl: resolved.target.wsBaseUrl,
     }),

@@ -153,14 +153,18 @@ class VoiceRuntimeFoundationTest {
     val consumers = VoiceRuntimeConsumerRegistry({ identity }, { now }, 1_000)
     val actions = VoiceRuntimePresentationActionStore(consumers, { now })
     val old = consumers.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
-    actions.publish(VoiceRuntimePresentationAction("action", "navigate-thread", 500))
+    actions.publish(VoiceRuntimePresentationAction.NavigateThread(
+      "action", "project-1", "thread-1", 500,
+    ))
     assertEquals("action", actions.claim("action", old).actionId)
     val replacement = consumers.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
 
     expectThrows<VoiceRuntimeNotElectedException> { actions.acknowledge("action", old) }
     assertEquals("action", actions.claim("action", replacement).actionId)
     actions.acknowledge("action", replacement)
-    actions.publish(VoiceRuntimePresentationAction("expiring", "navigate-thread", 500))
+    actions.publish(VoiceRuntimePresentationAction.NavigateThread(
+      "expiring", "project-1", "thread-1", 500,
+    ))
     now = 500
     expectThrows<VoiceRuntimeExpiredException> { actions.claim("expiring", replacement) }
   }

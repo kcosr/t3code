@@ -10,6 +10,8 @@ import type {
   VoiceRuntimeRealtimeFocusResult,
   VoiceRuntimeRealtimeHandoffExchangeInput,
   VoiceRuntimeRealtimeHandoffExchangeResult,
+  VoiceRuntimeRealtimeHandoffCommitInput,
+  VoiceRuntimeRealtimeHandoffCommitResult,
   VoiceRuntimeRealtimeHeartbeatInput,
   VoiceRuntimeRealtimeHeartbeatResult,
   VoiceRuntimeRealtimeSessionCreateInput,
@@ -60,6 +62,12 @@ export interface VoiceRealtimeControlServiceShape {
     actionId: VoiceClientActionId,
     input: VoiceRuntimeRealtimeHandoffExchangeInput,
   ) => Effect.Effect<VoiceRuntimeRealtimeHandoffExchangeResult, VoiceError>;
+  readonly commitHandoff: (
+    transitionToken: string,
+    sessionId: VoiceSessionId,
+    actionId: VoiceClientActionId,
+    input: VoiceRuntimeRealtimeHandoffCommitInput,
+  ) => Effect.Effect<VoiceRuntimeRealtimeHandoffCommitResult, VoiceError>;
   readonly close: (
     controlToken: string,
     sessionId: VoiceSessionId,

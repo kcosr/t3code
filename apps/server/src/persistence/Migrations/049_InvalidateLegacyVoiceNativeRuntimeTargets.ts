@@ -1,10 +1,46 @@
-import { VoiceNativeRuntimeTarget } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
-const decodeTarget = Schema.decodeUnknownOption(Schema.fromJsonString(VoiceNativeRuntimeTarget));
+// Historical migration schema. The legacy public contract is intentionally no
+// longer exported after the protocol-major cutover.
+const LegacyVoiceNativeRuntimeTarget = Schema.Union([
+  Schema.Struct({
+    mode: Schema.Literal("realtime"),
+    conversation: Schema.Struct({
+      type: Schema.Literal("continue"),
+      conversationId: Schema.String,
+    }),
+    focus: Schema.Union([
+      Schema.Struct({ type: Schema.Literal("none") }),
+      Schema.Struct({ type: Schema.Literal("project"), projectId: Schema.String }),
+      Schema.Struct({
+        type: Schema.Literal("thread"),
+        projectId: Schema.String,
+        threadId: Schema.String,
+      }),
+    ]),
+  }),
+  Schema.Struct({
+    mode: Schema.Literal("thread"),
+    environmentId: Schema.String,
+    projectId: Schema.String,
+    threadId: Schema.String,
+    speechPreset: Schema.Literals(["default", "warm"]),
+    autoRearm: Schema.Boolean,
+    endpointPolicy: Schema.Struct({
+      endSilenceMs: Schema.Number,
+      noSpeechTimeoutMs: Schema.NullOr(Schema.Number),
+      maximumUtteranceMs: Schema.Number,
+    }),
+    speechEnabled: Schema.Boolean,
+    rearmGuardMs: Schema.Number,
+  }),
+]);
+const decodeTarget = Schema.decodeUnknownOption(
+  Schema.fromJsonString(LegacyVoiceNativeRuntimeTarget),
+);
 
 export default Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;

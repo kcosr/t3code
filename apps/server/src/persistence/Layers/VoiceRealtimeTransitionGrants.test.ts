@@ -57,11 +57,12 @@ const record = {
     rearmGuardMs: 500,
   },
   expiresAt: 100_000,
+  authorityExpiresAt: 120_000,
 };
 
-it.effect("persists a hashed exact-scope transition and consumes it once", () =>
+it.effect("persists a bounded hashed transition reservation", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 48 });
+    yield* runMigrations({ toMigrationInclusive: 55 });
     const sql = yield* SqlClient.SqlClient;
     yield* sql`INSERT INTO auth_sessions (
       session_id, subject, scopes, method, client_device_type, issued_at, expires_at
@@ -78,7 +79,7 @@ it.effect("persists a hashed exact-scope transition and consumes it once", () =>
     expect(
       yield* repository.claim({ ...record, operationKey: "different-operation" }, 2_000),
     ).toEqual({ status: "mismatch" });
-    expect(yield* repository.findActive(record.tokenHash, 3_000)).toMatchObject({
+    expect(yield* repository.findByToken(record.tokenHash, 3_000)).toMatchObject({
       runtimeId: record.runtimeId,
       runtimeInstanceId: record.runtimeInstanceId,
       sourceGeneration: 3,
@@ -89,16 +90,7 @@ it.effect("persists a hashed exact-scope transition and consumes it once", () =>
       sourceControlTokenHash: record.sourceControlTokenHash,
       actionSequence: 6,
     });
-    expect(yield* repository.consume(record.tokenHash, 4_000)).toMatchObject({
-      status: "consumed",
-      record: { consumedAt: 4_000 },
-    });
-    expect(yield* repository.consume(record.tokenHash, 5_000)).toEqual({
-      status: "already-consumed",
-    });
-    expect(yield* repository.findActive(record.tokenHash, 5_000)).toBeUndefined();
-    expect(yield* repository.findByOperationKey(record.operationKey, 5_000)).toMatchObject({
-      consumedAt: 4_000,
-    });
+    expect(yield* repository.findByToken(record.tokenHash, 100_000)).toBeUndefined();
+    expect(yield* repository.findByOperationKey(record.operationKey, 100_000)).toBeUndefined();
   }).pipe(Effect.provide(layer)),
 );

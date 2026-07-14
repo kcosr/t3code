@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import * as Schema from "effect/Schema";
 
 import threadFixture from "./fixtures/voice-runtime-thread.json" with { type: "json" };
+import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 
 import {
   VoiceCommandReceipt,
@@ -10,7 +11,12 @@ import {
   VoiceRuntimeAuthorityReservation,
   VoiceRuntimeDescriptor,
   VoiceRuntimeEvent,
+  VoiceRuntimeGrant,
+  VoiceRuntimeGrantProvisionInput,
+  VoiceRuntimeGrantRefreshInput,
+  VoiceRuntimeGrantRevocationResult,
   VoiceRuntimeRebase,
+  VoiceRuntimeRetainedRecordAcknowledgement,
   VoiceRuntimeSnapshot,
   VoiceRuntimeThreadTurnCreateInput,
   VoiceRuntimeThreadTurnDispositionInput,
@@ -63,6 +69,49 @@ const cursor = {
 } as const;
 
 describe("voice runtime contracts", () => {
+  it("requires an advertised positive protocol major without rejecting newer peers", () => {
+    const descriptor = {
+      environmentId: "environment-1",
+      label: "Test environment",
+      platform: { os: "linux", arch: "x64" },
+      serverVersion: "1.0.0",
+      voiceRuntimeProtocolMajor: 2,
+      capabilities: { repositoryIdentity: true },
+    } as const;
+    expect(strictDecode(ExecutionEnvironmentDescriptor, descriptor)).toEqual(descriptor);
+    expect(() =>
+      strictDecode(ExecutionEnvironmentDescriptor, {
+        ...descriptor,
+        voiceRuntimeProtocolMajor: undefined,
+      }),
+    ).toThrow();
+  });
+
+  it("strictly fences retained record acknowledgements to current and source runtime identities", () => {
+    const acknowledgement = {
+      runtimeId: "runtime-1",
+      runtimeInstanceId: "current-instance",
+      authorityGeneration: 4,
+      record: {
+        kind: "realtime-terminal",
+        sourceRuntimeId: "runtime-1",
+        sourceRuntimeInstanceId: "previous-instance",
+        sourceRuntimeGeneration: 4,
+        modeSessionId: "mode-1",
+      },
+    } as const;
+
+    expect(strictDecode(VoiceRuntimeRetainedRecordAcknowledgement, acknowledgement)).toEqual(
+      acknowledgement,
+    );
+    expect(() =>
+      strictDecode(VoiceRuntimeRetainedRecordAcknowledgement, {
+        ...acknowledgement,
+        record: { ...acknowledgement.record, turnClientOperationId: "unexpected" },
+      }),
+    ).toThrow();
+  });
+
   it("shares exact Thread command snapshot event and receipt fixtures with Android", () => {
     const fixture: Record<string, unknown> = threadFixture;
 
@@ -174,11 +223,12 @@ describe("voice runtime contracts", () => {
       provisioningOperationId: "provision-1",
       expectedCurrentGeneration: 3,
       generation: 4,
-      targetDigest: "digest",
+      targetDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       environmentOrigin: "https://termstation",
       target,
       operation: "realtime-start",
       readinessEnabled: true,
+      refreshRotationCounter: 0,
       token: "token",
       issuedAt: "2026-07-14T00:00:00.000Z",
       expiresAt: "2026-07-15T00:00:00.000Z",
@@ -200,6 +250,72 @@ describe("voice runtime contracts", () => {
         authorityGeneration: 4,
         playbackOperationId: "playback-1",
         interruptionPolicy: "reject",
+      }),
+    ).toThrow();
+  });
+
+  it("strictly binds grant provisioning and refresh to one canonical target", () => {
+    const targetDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const refreshCredentialHash =
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const provision = {
+      expectedCurrentGeneration: 3,
+      generation: 4,
+      provisioningOperationId: "provision-4",
+      targetDigest,
+      target,
+      operation: "realtime-start",
+      readinessEnabled: true,
+      refreshCredentialHash,
+    } as const;
+    const grant = {
+      token: "runtime-token",
+      runtimeId: "runtime-1",
+      generation: 4,
+      provisioningOperationId: "provision-4",
+      targetDigest,
+      target,
+      operation: "realtime-start",
+      readinessEnabled: true,
+      refreshRotationCounter: 0,
+      issuedAt: "2026-07-14T00:00:00.000Z",
+      expiresAt: "2026-08-13T00:00:00.000Z",
+    } as const;
+    const refresh = {
+      refreshRequestId: "refresh-1",
+      provisioningOperationId: "provision-4",
+      generation: 4,
+      operation: "realtime-start",
+      targetDigest,
+      expectedRotationCounter: 0,
+      candidateCredentialHash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    } as const;
+
+    expect(strictDecode(VoiceRuntimeGrantProvisionInput, provision)).toEqual(provision);
+    expect(strictDecode(VoiceRuntimeGrant, grant)).toEqual(grant);
+    expect(strictDecode(VoiceRuntimeGrantRefreshInput, refresh)).toEqual(refresh);
+    expect(
+      strictDecode(VoiceRuntimeGrantRevocationResult, {
+        runtimeId: "runtime-1",
+        revoked: true,
+      }),
+    ).toEqual({ runtimeId: "runtime-1", revoked: true });
+    expect(() =>
+      strictDecode(VoiceRuntimeGrantProvisionInput, {
+        ...provision,
+        operation: "thread-turn-start",
+      }),
+    ).toThrow();
+    expect(() =>
+      strictDecode(VoiceRuntimeGrant, {
+        ...grant,
+        operation: "thread-turn-start",
+      }),
+    ).toThrow();
+    expect(() =>
+      strictDecode(VoiceRuntimeGrantProvisionInput, {
+        ...provision,
+        readinessEnabled: false,
       }),
     ).toThrow();
   });

@@ -163,6 +163,7 @@ function makeHarness() {
           target: new PrimaryConnectionTarget({
             environmentId: ENVIRONMENT_ID,
             label: "Environment",
+            voiceRuntimeProtocolMajor: 1,
             httpBaseUrl: "https://example.test",
             wsBaseUrl: "wss://example.test",
           }),

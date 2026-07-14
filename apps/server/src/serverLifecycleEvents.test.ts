@@ -16,6 +16,7 @@ it.effect(
         label: "Test environment",
         platform: { os: "darwin" as const, arch: "arm64" as const },
         serverVersion: "0.0.0-test",
+        voiceRuntimeProtocolMajor: 1,
         capabilities: { repositoryIdentity: true },
       };
 
