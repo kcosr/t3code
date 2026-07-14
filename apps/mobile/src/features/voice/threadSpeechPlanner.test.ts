@@ -7,10 +7,19 @@ import {
   planThreadSpeechToggle,
   restoreThreadSpeechPreference,
   setThreadSpeechEnabled,
+  shouldSuppressThreadSpeechAction,
   updateThreadSpeech,
 } from "./threadSpeechPlanner";
 
 describe("threadSpeechPlanner", () => {
+  it("suppresses queued speech work during Realtime while preserving cancellation", () => {
+    expect(shouldSuppressThreadSpeechAction("start", true)).toBe(true);
+    expect(shouldSuppressThreadSpeechAction("segment", true)).toBe(true);
+    expect(shouldSuppressThreadSpeechAction("finish", true)).toBe(true);
+    expect(shouldSuppressThreadSpeechAction("cancel", true)).toBe(false);
+    expect(shouldSuppressThreadSpeechAction("start", false)).toBe(false);
+  });
+
   it.each([
     [false, false, false],
     [true, false, true],

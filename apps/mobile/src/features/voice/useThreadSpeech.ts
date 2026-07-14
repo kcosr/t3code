@@ -19,6 +19,7 @@ import {
   planThreadSpeechToggle,
   restoreThreadSpeechPreference,
   setThreadSpeechEnabled,
+  shouldSuppressThreadSpeechAction,
   updateThreadSpeech,
   type AssistantSpeechSnapshot,
   type ThreadSpeechAction,
@@ -205,9 +206,23 @@ export function useThreadSpeech(input: {
     async (action: ThreadSpeechAction, generation: number) => {
       if (native === null || prepared === null) return;
       if (operationGenerationRef.current !== generation) throw new Error("Playback was cancelled");
+      if (shouldSuppressThreadSpeechAction(action.type, realtimeActiveRef.current)) return;
       switch (action.type) {
         case "start":
           {
+            const runtime = await native.getStateAsync();
+            const nativeRealtimeActive =
+              runtime.phase === "realtime" || runtime.activeRealtimeSessionId !== null;
+            if (shouldSuppressThreadSpeechAction(action.type, nativeRealtimeActive)) {
+              suspendedForRealtimeRef.current = true;
+              plannerRef.current = interruptThreadSpeech(plannerRef.current, latestRef.current);
+              ++operationGenerationRef.current;
+              if (mountedRef.current) {
+                setPlaying(false);
+                setError(null);
+              }
+              return;
+            }
             const pendingTermination = await native.getPendingPlaybackTerminationAsync();
             if (pendingTermination !== null) await handlePlaybackTerminated(pendingTermination);
             if (pendingPlaybackAcknowledgementRef.current !== null) {

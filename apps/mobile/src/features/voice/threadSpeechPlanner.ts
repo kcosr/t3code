@@ -34,6 +34,11 @@ export type ThreadSpeechAction =
   | { readonly type: "finish"; readonly playbackId: string }
   | { readonly type: "cancel"; readonly playbackId: string };
 
+export const shouldSuppressThreadSpeechAction = (
+  action: ThreadSpeechAction["type"],
+  realtimeActive: boolean,
+): boolean => realtimeActive && action !== "cancel";
+
 export const initialThreadSpeechPlannerState = (): ThreadSpeechPlannerState => ({
   enabled: false,
   baselineMessageId: null,
