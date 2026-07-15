@@ -185,6 +185,81 @@ class VoiceKernelEpochPolicyTest {
     assertEquals(true, registry.admitCueTerminal(independent))
   }
 
+  @Test
+  fun `retire removes a root only when the epoch matches`() {
+    val registry = VoiceKernelEpochRegistry()
+    val first = registry.arm(VoiceKernelEpochRootKind.RECORDING, "runtime-1", 7, "rec-1")
+    val rearmed = registry.arm(VoiceKernelEpochRootKind.RECORDING, "runtime-1", 7, "rec-1")
+
+    registry.retire(first)
+    assertEquals(rearmed, registry.current("rec-1"))
+    assertEquals(1, registry.size())
+
+    registry.retire(rearmed)
+    assertEquals(null, registry.current("rec-1"))
+    assertEquals(0, registry.size())
+    assertEquals(
+      null,
+      registry.currentEpochFor(
+        driverResult(rearmed, VoiceKernelDriver.MEDIA, "RecorderTerminated"),
+      ),
+    )
+  }
+
+  @Test
+  fun `re-armed roots never reuse a retired life's ordinal`() {
+    val registry = VoiceKernelEpochRegistry()
+    val retired = registry.arm(VoiceKernelEpochRootKind.PLAYBACK, "runtime-1", 7, "play-1")
+    registry.retire(retired)
+    val rearmed = registry.arm(VoiceKernelEpochRootKind.PLAYBACK, "runtime-1", 7, "play-1")
+
+    assertEquals(
+      VoiceKernelEpochAdmission.DropStale(VoiceKernelEpochStalenessDimension.ATTEMPT),
+      VoiceKernelEpochPolicy.admit(rearmed, retired),
+    )
+  }
+
+  @Test
+  fun `retire of an unknown root is a no-op`() {
+    val registry = VoiceKernelEpochRegistry()
+    registry.retire(currentEpoch)
+    assertEquals(0, registry.size())
+  }
+
+  @Test
+  fun `registry does not grow once terminal roots retire`() {
+    val registry = VoiceKernelEpochRegistry()
+    val kinds = listOf(
+      VoiceKernelEpochRootKind.THREAD_TURN,
+      VoiceKernelEpochRootKind.REALTIME_MODE,
+      VoiceKernelEpochRootKind.REALTIME_PEER,
+      VoiceKernelEpochRootKind.RECORDING,
+      VoiceKernelEpochRootKind.PLAYBACK,
+      VoiceKernelEpochRootKind.CUE,
+      VoiceKernelEpochRootKind.TIMER,
+      VoiceKernelEpochRootKind.SERVICE,
+    )
+
+    repeat(3) { round ->
+      val epochs = kinds.mapIndexed { index, kind ->
+        registry.arm(kind, "runtime-1", 7, "root-$round-$index")
+      }
+      assertEquals(kinds.size, registry.size())
+      epochs.forEach(registry::retire)
+      assertEquals(0, registry.size())
+    }
+  }
+
+  @Test
+  fun `cue terminal gate never admits after retirement`() {
+    val registry = VoiceKernelEpochRegistry()
+    val cue = registry.arm(VoiceKernelEpochRootKind.CUE, "runtime-1", 7, "cue:recording-ended:r1")
+
+    assertEquals(true, registry.admitCueTerminal(cue))
+    registry.retire(cue)
+    assertEquals(false, registry.admitCueTerminal(cue))
+  }
+
   private fun driverResult(
     epoch: VoiceKernelEpoch,
     driver: VoiceKernelDriver,

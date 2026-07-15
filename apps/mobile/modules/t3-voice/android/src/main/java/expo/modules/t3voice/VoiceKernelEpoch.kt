@@ -72,6 +72,12 @@ internal class VoiceKernelEpochRegistry {
 
   private val entries = mutableMapOf<String, Entry>()
 
+  /**
+   * Registry-global ordinal: every armed life is globally unique, so a root re-armed after
+   * [retire] can never collide with a late result stamped by a retired life.
+   */
+  private var nextAttemptOrdinal = 1L
+
   fun arm(
     kind: VoiceKernelEpochRootKind,
     runtimeInstanceId: String,
@@ -81,17 +87,23 @@ internal class VoiceKernelEpochRegistry {
     require(runtimeInstanceId.isNotBlank()) { "Epoch runtime instance must be non-empty." }
     require(rootOperationId.isNotBlank()) { "Epoch root operation must be non-empty." }
     require(authorityGeneration >= 0) { "Epoch authority generation cannot be negative." }
-    val previous = entries[rootOperationId]
-    val ordinal = previous?.epoch?.attemptOrdinal?.let(::nextOrdinal) ?: 1L
     return VoiceKernelEpoch(
       runtimeInstanceId,
       authorityGeneration,
       rootOperationId,
-      ordinal,
+      nextAttemptOrdinal++,
     ).also { entries[rootOperationId] = Entry(kind, it) }
   }
 
   fun current(rootOperationId: String): VoiceKernelEpoch? = entries[rootOperationId]?.epoch
+
+  /** Removes the root's entry only if it still holds exactly this epoch. */
+  fun retire(epoch: VoiceKernelEpoch) {
+    val entry = entries[epoch.rootOperationId] ?: return
+    if (entry.epoch == epoch) entries.remove(epoch.rootOperationId)
+  }
+
+  fun size(): Int = entries.size
 
   /** Admits the first terminal for each current cue root without a second historical epoch set. */
   fun admitCueTerminal(epoch: VoiceKernelEpoch): Boolean {
@@ -138,7 +150,4 @@ internal class VoiceKernelEpochRegistry {
     VoiceKernelDriver.STORE -> kind != VoiceKernelEpochRootKind.TIMER
     VoiceKernelDriver.HOST -> kind == VoiceKernelEpochRootKind.SERVICE
   }
-
-  private fun nextOrdinal(current: Long): Long =
-    if (current == Long.MAX_VALUE) 1L else current + 1L
 }

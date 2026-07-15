@@ -170,6 +170,15 @@ class T3VoiceRuntimeService : Service() {
       ?: armEpoch(VoiceKernelEpochRootKind.SERVICE, rootOperationId, identity.generation)
   }
 
+  /**
+   * Terminal thread-turn sites only. Receipt-failure paths that null the attempt and
+   * schedule a restore re-arm the SAME clientOperationId and must NOT retire.
+   */
+  private fun retireThreadTurnEpoch(clientOperationId: String) {
+    mailbox.assertKernelThread()
+    epochRegistry.current(clientOperationId)?.let(epochRegistry::retire)
+  }
+
   private fun callbackMessage(payloadKind: String) =
     VoiceKernelMessage.Command(callerIdentity = "runtime-callback", payloadKind = payloadKind)
 
@@ -227,6 +236,9 @@ class T3VoiceRuntimeService : Service() {
         payload.result.getOrThrow()
       }
     }
+    if (result.driver == VoiceKernelDriver.MEDIA && result.resultKind == "CueCompleted") {
+      epochRegistry.retire(result.epoch)
+    }
   }
 
   private fun postCueCompletion(epoch: VoiceKernelEpoch, continuation: () -> Unit) {
@@ -259,7 +271,7 @@ class T3VoiceRuntimeService : Service() {
   ): VoiceKernelCancellationToken {
     val epoch = armEpoch(VoiceKernelEpochRootKind.TIMER, timerId)
     val tick = VoiceKernelMessage.Tick(timerId, epoch)
-    return mailbox.submitDelayed(tick, delayMillis) {
+    val scheduled = mailbox.submitDelayed(tick, delayMillis) {
       handleDriverResult(
         VoiceKernelMessage.DriverResult(
           epoch = tick.epoch,
@@ -271,6 +283,14 @@ class T3VoiceRuntimeService : Service() {
           ),
         ),
       )
+      epochRegistry.retire(tick.epoch)
+    }
+    return VoiceKernelCancellationToken {
+      val cancelled = scheduled.cancel()
+      // The registry is kernel-thread-only; a foreign-thread cancel keeps the entry until
+      // the same timerId re-arms.
+      if (cancelled && mailbox.isKernelThread()) epochRegistry.retire(tick.epoch)
+      cancelled
     }
   }
 
@@ -454,7 +474,10 @@ class T3VoiceRuntimeService : Service() {
                 if (!cleared) {
                   return@clearDerived false
                 }
-                if (activeAttempt != null) runtimeThreadAttempt = null
+                if (activeAttempt != null) {
+                  runtimeThreadAttempt = null
+                  retireThreadTurnEpoch(threadOperation.claim.clientOperationId)
+                }
                 if (runtimeSnapshot.mode == VoiceRuntimeExecutionMode.THREAD) {
                   applyRuntimeEventLocked(VoiceRuntimeExecutionEvent.Stop)
                 }
@@ -1577,6 +1600,8 @@ class T3VoiceRuntimeService : Service() {
         T3VoiceDiagnosticCode.FOREGROUND_RELEASED,
       )
     }
+    epochRegistry.current(event.sessionId)?.let(epochRegistry::retire)
+    mediaDriver.disarmRealtime(event.sessionId)
   }
 
   private fun beginRealtimeReadyCueLocked(sessionId: String) {
@@ -1619,6 +1644,8 @@ class T3VoiceRuntimeService : Service() {
             ) {
               runCatching { realtime.stop(sessionId) }
             }
+            epochRegistry.retire(epoch)
+            mediaDriver.disarmRealtime(sessionId)
             },
           ),
         )
@@ -1627,6 +1654,8 @@ class T3VoiceRuntimeService : Service() {
       if (T3VoiceStateStore.state.value.activeRealtimeSessionId == sessionId) {
         runCatching { realtime.stop(sessionId) }
       }
+      epochRegistry.retire(epoch)
+      mediaDriver.disarmRealtime(sessionId)
     }
   }
 
@@ -3786,6 +3815,7 @@ class T3VoiceRuntimeService : Service() {
       return
     }
     runtimeThreadAttempt = null
+    retireThreadTurnEpoch(attempt.clientOperationId)
     if (runtimeSnapshot.terminalSummary == VoiceRuntimeTerminalSummary.ATTENTION_REQUIRED) {
       T3VoiceStateStore.emit(T3VoiceRuntimeEvent.RuntimeError(
         operation = "runtime-thread",
@@ -3883,6 +3913,7 @@ class T3VoiceRuntimeService : Service() {
       runtimeThreadOperationStore.writeActive(active.copy(detached = true))
     }
     runtimeThreadAttempt = null
+    retireThreadTurnEpoch(attempt.clientOperationId)
     T3VoiceDiagnostics.record(
       0,
       T3VoiceDiagnosticCategory.TERMINAL,
@@ -3964,6 +3995,7 @@ class T3VoiceRuntimeService : Service() {
       return
     }
     runtimeThreadAttempt = null
+    retireThreadTurnEpoch(attempt.clientOperationId)
     val completed = VoiceRuntimeThreadLocalStopCoordinator.complete(
       clearDurableState = {
         runCatching {
@@ -4051,6 +4083,7 @@ class T3VoiceRuntimeService : Service() {
               }
               attempt.stopped = true
               runtimeThreadAttempt = null
+              retireThreadTurnEpoch(attempt.clientOperationId)
               applyRuntimeEventLocked(VoiceRuntimeExecutionEvent.Stop)
               reconcileAfterRuntimeThreadStopLocked(attempt)
             }
@@ -4184,8 +4217,17 @@ class T3VoiceRuntimeService : Service() {
     reduction: VoiceRuntimeRealtimeReduction<T>,
   ): T {
     mailbox.assertKernelThread()
+    val modeSessionBefore = voiceRuntimeRealtimeEngineSlot.snapshot().current
+      ?.state?.checkpoint?.fence?.modeSessionId
     if (voiceRuntimeRealtimeEngineSlot.applyReduction(reduction) == null) {
       return reduction.result
+    }
+    if (modeSessionBefore != null &&
+      realtimeState(engine).checkpoint?.fence?.modeSessionId != modeSessionBefore
+    ) {
+      // The mode root shares its registry key with the canonical peer; both end here.
+      epochRegistry.current(modeSessionBefore)?.let(epochRegistry::retire)
+      mediaDriver.disarmRealtime(modeSessionBefore)
     }
     reduction.effects.forEach { dispatchRealtimeEffect(engine, it) }
     dispatchRealtimeOutputs(engine, reduction.outputs)
@@ -5313,6 +5355,7 @@ class T3VoiceRuntimeService : Service() {
     runtimeThreadAttempt?.let { attempt ->
       attempt.cancelAllCalls()
       attempt.stopped = true
+      retireThreadTurnEpoch(attempt.clientOperationId)
     }
     runtimeThreadAttempt = null
     val persisted = persistedAuthority()
@@ -5839,7 +5882,8 @@ class T3VoiceRuntimeService : Service() {
   ) {
     mailbox.assertKernelThread()
     if (!T3VoiceStateStore.releaseRecording(owner)) return
-    armEpoch(VoiceKernelEpochRootKind.RECORDING, owner.id)
+    epochRegistry.current(owner.id)?.let(epochRegistry::retire)
+    mediaDriver.disarmRecording(owner.id)
     if (recordingOwner == owner) recordingOwner = null
     if (stopForeground) stopRuntimeForegroundLocked()
   }
@@ -5851,7 +5895,8 @@ class T3VoiceRuntimeService : Service() {
   ) {
     mailbox.assertKernelThread()
     if (!T3VoiceStateStore.terminateRecording(owner, event)) return
-    armEpoch(VoiceKernelEpochRootKind.RECORDING, owner.id)
+    epochRegistry.current(owner.id)?.let(epochRegistry::retire)
+    mediaDriver.disarmRecording(owner.id)
     if (recordingOwner == owner) recordingOwner = null
     if (stopForeground) stopRuntimeForegroundLocked()
   }
@@ -5862,7 +5907,8 @@ class T3VoiceRuntimeService : Service() {
   ) {
     mailbox.assertKernelThread()
     if (!T3VoiceStateStore.releasePlayback(owner)) return
-    armEpoch(VoiceKernelEpochRootKind.PLAYBACK, owner.id)
+    epochRegistry.current(owner.id)?.let(epochRegistry::retire)
+    mediaDriver.disarmPlayback(owner.id)
     playbackAudioFocus.stop()
     if (playbackOwner == owner) playbackOwner = null
     if (stopForeground) stopRuntimeForegroundLocked()
@@ -5875,7 +5921,8 @@ class T3VoiceRuntimeService : Service() {
   ) {
     mailbox.assertKernelThread()
     if (!T3VoiceStateStore.terminatePlayback(owner, event)) return
-    armEpoch(VoiceKernelEpochRootKind.PLAYBACK, owner.id)
+    epochRegistry.current(owner.id)?.let(epochRegistry::retire)
+    mediaDriver.disarmPlayback(owner.id)
     playbackAudioFocus.stop()
     if (playbackOwner == owner) playbackOwner = null
     if (stopForeground) stopRuntimeForegroundLocked()

@@ -95,7 +95,17 @@ internal class VoiceMediaDriver<Recorder, Player, Focus, Cues, Router, Realtime>
   @Volatile private var playbackFocusEpoch: VoiceKernelEpoch? = null
   private val rawListener = object : VoiceRawMediaDriverListener {
     override fun onMediaEvent(event: VoiceMediaDriverEvent) {
-      listener.onMediaEvent(epochFor(event), event)
+      val epoch = epochFor(event)
+      if (epoch == null) {
+        T3VoiceDiagnostics.record(
+          generation = 0,
+          category = T3VoiceDiagnosticCategory.KERNEL,
+          code = T3VoiceDiagnosticCode.STALE_DRIVER_RESULT,
+          primaryCount = VoiceKernelEpochStalenessDimension.ROOT_OPERATION.ordinal + 1,
+        )
+        return
+      }
+      listener.onMediaEvent(epoch, event)
     }
 
     override fun onMediaEvent(epoch: VoiceKernelEpoch, event: VoiceMediaDriverEvent) {
@@ -127,6 +137,18 @@ internal class VoiceMediaDriver<Recorder, Player, Focus, Cues, Router, Realtime>
     realtimeEpochs[sessionId] = epoch
   }
 
+  fun disarmRecording(recordingId: String) {
+    recordingEpochs.remove(recordingId)
+  }
+
+  fun disarmPlayback(playbackId: String) {
+    playbackEpochs.remove(playbackId)
+  }
+
+  fun disarmRealtime(sessionId: String) {
+    realtimeEpochs.remove(sessionId)
+  }
+
   fun release() {
     factory.releaseRecorder(recorder)
     factory.releasePlayer(player)
@@ -135,7 +157,8 @@ internal class VoiceMediaDriver<Recorder, Player, Focus, Cues, Router, Realtime>
     if (realtimeDelegate.isInitialized()) factory.releaseRealtime(realtime)
   }
 
-  private fun epochFor(event: VoiceMediaDriverEvent): VoiceKernelEpoch = checkNotNull(
+  /** Null for a disarmed (retired-root) id: the callback is dropped at the driver boundary. */
+  private fun epochFor(event: VoiceMediaDriverEvent): VoiceKernelEpoch? =
     when (event) {
       is VoiceMediaDriverEvent.RecorderTerminated -> recordingEpochs[event.termination.recordingId()]
       is VoiceMediaDriverEvent.PcmChunkConsumed -> playbackEpochs[event.playbackId]
@@ -151,8 +174,7 @@ internal class VoiceMediaDriver<Recorder, Player, Focus, Cues, Router, Realtime>
       is VoiceMediaDriverEvent.RealtimeAudioDevicesChanged -> realtimeEpochs[event.sessionId]
       is VoiceMediaDriverEvent.RealtimeError -> realtimeEpochs[event.sessionId]
       is VoiceMediaDriverEvent.RealtimeTerminated -> realtimeEpochs[event.sessionId]
-    },
-  ) { "Media callback arrived without an armed kernel epoch: ${event::class.java.simpleName}." }
+    }
 }
 
 private fun T3VoiceRecordingTermination.recordingId(): String = when (this) {
