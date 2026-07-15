@@ -854,6 +854,11 @@ All clients use the same server signaling, capability, confirmation, and bounded
 ### Realtime sessions
 
 - `VoiceSessionRegistry` owns one Effect scope per provider session.
+- A continued OpenAI call does not become active until every compiled context item has a T3-owned
+  item ID and a matching `conversation.item.done` acknowledgement. A correlated provider error,
+  sideband closure, or incomplete replay aborts startup and hangs up the provider call.
+- Context replay telemetry records requested and acknowledged item counts without transcript or
+  tool-result content.
 - Ending a T3 session interrupts sideband readers, tool fibers, timers, and provider connections.
 - Native control heartbeats own client liveness in every session phase. Missing heartbeats end the
   session after the bounded failure grace even when provider media was previously active; the
@@ -928,6 +933,8 @@ route changes, numeric media counters, and sanitized errors.
 - phrase chunking, ordered multi-request TTS playback, and cancellation of queued segments;
 - WebRTC multipart negotiation and `Location` call-ID parsing;
 - sideband attach failure cleanup;
+- acknowledged context replay, correlated rejection, incomplete replay cleanup, and continued-call
+  fact recall through the durable journal and compiler;
 - provider event correlation;
 - tool schema validation, authorization, confirmation, durable idempotency, and crash reconciliation;
 - quotas, upload limits, timeouts, and redaction;
@@ -1180,6 +1187,15 @@ No server contract change should be required. If implementation reveals that bou
 cancellation, playback completion, or independent thread cancellation cannot support this mode,
 fix those primitives first rather than adding hands-free-specific server routes.
 
+### Deferred composer continuation
+
+Allow Auto Listen capture to start while the composer already contains text. Capture snapshots the
+existing draft, appends the returned transcription with normalized whitespace, and submits the
+combined text after automatic endpointing. An explicit stop leaves the combined text in the
+composer without submitting it. The merge must preserve edits made while capture or transcription
+is in progress rather than restoring an older draft snapshot. This is deferred product work and is
+not part of the current Auto Listen acceptance criteria.
+
 ### Follow-up verification
 
 - Unit-test every state transition, timeout, cancellation path, and retry limit with a virtual
@@ -1246,3 +1262,83 @@ capture while the activity is backgrounded or the screen is off.
   session.
 - Verify persistent notification controls, process restart behavior, wake-lock release, and
   Realtime network continuity on the connected Android device.
+
+## Draft: Long-History Context and Active-Call Truncation
+
+> **Status:** Draft recommendation. This proposes revising the current rule that disables provider
+> truncation. It does not describe the active implementation until it is accepted and implemented.
+
+T3 should not fail a voice conversation merely because its active provider context became too
+long. It should fail session startup when continuity cannot be established reliably, including
+rejected, unacknowledged, or incomplete history replay. Context capacity and replay integrity are
+different failure classes.
+
+The durable T3 conversation journal remains the source of truth and is never shortened as a side
+effect of provider context management. T3 compiles a bounded initial view from that journal for
+each new provider call. The provider may then truncate only its ephemeral active-call context when
+the new live conversation consumes the available headroom. A later restart recompiles from the
+complete T3 journal rather than inheriting the provider's truncated view.
+
+### Initial OpenAI policy
+
+For `gpt-realtime-2.1`, start with:
+
+- A 64,000-token T3 persisted-history replay budget.
+- An 80,000-token OpenAI post-instructions input limit.
+- OpenAI `retention_ratio` truncation configured to `0.8`.
+- Replay acknowledgement failures treated as fatal session-startup failures.
+
+This starts a continued call with up to 64,000 tokens of persisted history. When the live provider
+conversation reaches the 80,000-token input limit, OpenAI can discard the oldest active-session
+items until approximately 64,000 tokens remain. This restores roughly 16,000 tokens of live-call
+headroom without deleting any T3 journal entries.
+
+The concrete provider configuration is:
+
+```json
+{
+  "truncation": {
+    "type": "retention_ratio",
+    "retention_ratio": 0.8,
+    "token_limits": {
+      "post_instructions": 80000
+    }
+  }
+}
+```
+
+These values are provider policy, not shared protocol constants. Provider adapters should
+eventually advertise their context window, output reserve, instruction and tool allowance, and
+recommended live-conversation reserve. The compiler derives its permitted history budget from
+those capabilities while allowing a lower operator-configured limit.
+
+### Deterministic compilation
+
+The first implementation should extend the existing compiler deterministically rather than add
+model-generated summarization immediately:
+
+1. Always retain continuity instructions and pinned durable memory.
+2. Preserve the newest conversation turns verbatim and in contiguous order.
+3. Treat a tool call and its result as an atomic unit; never retain one without the other.
+4. Compact old verbose tool interactions to the tool name, outcome, important entity IDs, and a
+   concise result.
+5. Remove obsolete status polling, repeated reads, and superseded tool results before ordinary
+   dialogue.
+6. Omit older ordinary dialogue only after reducible tool noise has been removed.
+7. Apply pruning only to the compiled provider view, never to the durable journal.
+
+A later phase may add a durable structured summary for history outside the verbatim window. That
+summary should preserve user facts, decisions, project state, promises, unresolved tasks, and
+important tool outcomes. Raw journal entries remain available for recompilation and audit.
+
+### Verification
+
+- Continue the same durable conversation with facts located before 16,000 and 50,000 tokens and
+  verify that the resumed model recalls them.
+- Grow one active call past its configured input limit and verify that it remains usable after
+  provider truncation.
+- Verify that restarting after provider truncation can recover older facts from the complete T3
+  journal.
+- Verify that tool call/result pairs remain intact after deterministic compaction.
+- Record replay item count, estimated tokens, acknowledgement duration, and truncation events
+  without logging transcript or tool-result content.

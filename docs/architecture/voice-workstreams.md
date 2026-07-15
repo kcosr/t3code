@@ -18,10 +18,10 @@ The current remaining sequence, after the reviewed Android background-control mi
    duration-based call rotation.
 3. Final integrated review, exact Android build/deployment, and deferred device validation for the
    current voice goal.
-4. `feature/voice-runtime-provider` — after compaction work is complete, integrate the separately
-   deployed Voice Runtime as a per-capability provider for bounded STT and streaming TTS. The
-   copied service and integration specifications and required T3 review corrections are in
-   `specs/voice-runtime/`.
+4. `feature/openai-speech-server-provider` — after compaction work is complete, integrate the
+   separately deployed OpenAI-Compatible Speech Server as a per-capability provider for bounded
+   STT and streaming TTS. The current integration handoff is
+   `specs/t3-openai-speech-server-integration.md`.
 
 Pi integration remains deliberately deferred. The completed thread follow-up, conversation
 management, history search, media validation, observability, Auto Listen, Realtime handoff, and

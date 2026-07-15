@@ -185,3 +185,38 @@ command processor. They do not maintain parallel media-transition state machines
 Use separate bounded timeouts for provider tool-result acknowledgement, Realtime teardown, and client-action completion. Server cleanup must not block traditional capture.
 
 A client timeout records a failed handoff outcome but does not undo the completed provider tool call. This keeps resumed conversation history coherent while allowing server teardown and client startup to remain decoupled.
+
+## Addendum: Drain Final Realtime Speech Before Handoff
+
+OpenAI may generate audio and the terminal function call in the same response. Provider
+`response.done` means generation has completed; it does not prove that Android has finished playing
+audio already buffered by WebRTC. Immediately closing the provider and peer connection can therefore
+cut off a short final sentence while it is audible to the user.
+
+The handoff must treat final output drainage as part of the native media transition:
+
+1. Accept, acknowledge, and persist the terminal tool result as described above. The provider
+   terminal latch continues to prohibit another `response.create`, tool call, or assistant turn.
+2. Publish the durable handoff action while the existing Realtime media path remains available for
+   bounded output drainage.
+3. Android enters `handoff-draining` and observes local Realtime playout rather than assuming that
+   provider generation completion means playback completion.
+4. After approximately 300-500 ms of output silence, Android stops Realtime, releases its audio
+   focus, and starts thread capture through one native state-machine transition.
+5. Bound drainage to approximately 2-3 seconds. If output does not become quiet, fade or stop it and
+   proceed so model speech cannot indefinitely block the requested handoff.
+6. Android acknowledges media release and capture startup. Server teardown may complete after that
+   acknowledgement or after its independent maximum deadline.
+
+When no output is buffered, the transition remains immediate. Do not replace output detection with
+an unconditional delay: that would slow silent handoffs and still fail for unusually long buffered
+speech.
+
+The tool instructions should continue to tell the model to invoke the handoff without narrating it;
+the client can provide a deterministic visual state, haptic, or brief earcon. Prompting is only a UX
+optimization, not the correctness mechanism, because mixed audio and function-call output can still
+occur.
+
+This addendum supersedes the earlier recommendation to cancel provider audio immediately after tool
+acceptance. New provider generation is still cancelled or fenced immediately, but audio already in
+the client playout path receives the bounded drain window above.
