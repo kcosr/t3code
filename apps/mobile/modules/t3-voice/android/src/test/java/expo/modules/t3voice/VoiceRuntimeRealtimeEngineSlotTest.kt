@@ -97,6 +97,28 @@ internal class VoiceRuntimeRealtimeEngineSlotTest {
     assertSame(previous, slot.rollback(installation).current?.engine)
   }
 
+  @Test
+  fun `reduction installation uses stable binding identity and live state`() {
+    val slot = VoiceRuntimeRealtimeEngineSlot<Engine>(isActive = Engine::active)
+    val installation = slot.stageIdleInstall(slot.fence(), authority(), Engine())
+    val binding = requireNotNull(slot.commit(installation).current)
+    slot.complete(installation)
+    val checkpoint = VoiceRuntimeRealtimeCheckpoint(
+      VoiceRuntimeRealtimeFence(authority().identity, "mode-1"),
+      authority().target,
+      "start-1",
+      VoiceRealtimePhase.PREPARING,
+    )
+    slot.applyReduction(
+      binding.identityToken,
+      VoiceRuntimeRealtimeReduction(binding.state.copy(checkpoint = checkpoint), result = Unit),
+    )
+
+    assertEquals(checkpoint, slot.snapshot().current?.state?.checkpoint)
+    assertNull(slot.applyReduction(Any(), VoiceRuntimeRealtimeReduction(binding.state, result = Unit)))
+    assertTrue(runCatching { slot.stageIdleClear(slot.fence()) }.isFailure)
+  }
+
   private fun authority(generation: Long = 7) = VoiceRuntimeRealtimeAuthority(
     VoiceRuntimeIdentity("runtime-1", "process-1", generation),
     VoiceRuntimeTarget.Realtime("environment-1", "conversation-1"),

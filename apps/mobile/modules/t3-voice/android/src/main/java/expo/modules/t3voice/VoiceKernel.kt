@@ -13,7 +13,7 @@ interface VoiceKernelReducer {
 }
 
 /**
- * Placeholder for the MediaArbiterState, ThreadModeState, RealtimeState,
- * AuthorityReadinessState, and HostState component slots.
+ * Placeholder for the MediaArbiterState, ThreadModeState, AuthorityReadinessState,
+ * and HostState component slots. RealtimeState is owned by its installed slot binding.
  */
 class VoiceKernelState

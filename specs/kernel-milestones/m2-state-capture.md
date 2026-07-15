@@ -177,3 +177,9 @@ packets**: "No `submitAndAwait`-backed sink is ever invoked while the engine hol
 monitor" — currently guaranteed because presentation publish/retract are only reached
 off-monitor on action IO; M3/M4 must not move engine mutating calls onto the kernel
 thread without re-proving this.
+
+M3 run 2 retires B9: the Realtime engine is now a pure kernel-thread sub-reducer, has
+no monitor or callback sinks, and returns presentation/state/terminal/finalization work
+as effects and outputs. Terminal summary and `realtimeTermination` delivery, plus a
+restart after IMMEDIATE stop, now wait for close completion; `setMuted` receipts report
+admission while the MediaDriver result completes asynchronously.

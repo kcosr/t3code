@@ -1,9 +1,13 @@
 package expo.modules.t3voice
 
-internal data class VoiceRuntimeRealtimeEngineBinding<E : Any>(
+internal class VoiceRuntimeRealtimeEngineBinding<E : Any>(
   val authority: VoiceRuntimeRealtimeAuthority,
   val engine: E,
-)
+  var state: VoiceRuntimeRealtimeState = VoiceRuntimeRealtimeState(),
+) {
+  /** Stable continuation fence; immutable RealtimeState values are never used as identity tokens. */
+  val identityToken: Any = Any()
+}
 
 internal data class VoiceRuntimeRealtimeEngineSlotSnapshot<E : Any>(
   val current: VoiceRuntimeRealtimeEngineBinding<E>?,
@@ -12,6 +16,7 @@ internal data class VoiceRuntimeRealtimeEngineSlotSnapshot<E : Any>(
 
 internal data class VoiceRuntimeRealtimeEngineSlotFence<E : Any>(
   internal val engine: E?,
+  internal val bindingIdentity: Any?,
   val identity: VoiceRuntimeIdentity?,
   val version: Long,
 )
@@ -26,7 +31,10 @@ internal data class VoiceRuntimeRealtimeEngineInstallation(
  */
 internal class VoiceRuntimeRealtimeEngineSlot<E : Any>(
   initial: VoiceRuntimeRealtimeEngineBinding<E>? = null,
-  private val isActive: (E) -> Boolean,
+  private val isActive: (E) -> Boolean = { false },
+  private val isRealtimeStateActive: (VoiceRuntimeRealtimeState) -> Boolean =
+    VoiceRuntimeRealtimeState::isOperational,
+  private val assertKernelThread: () -> Unit = {},
 ) {
   private data class StagedInstallation<E : Any>(
     val installationId: Long,
@@ -45,44 +53,52 @@ internal class VoiceRuntimeRealtimeEngineSlot<E : Any>(
     initial?.let(::validateBinding)
   }
 
-  @Synchronized
-  fun snapshot(): VoiceRuntimeRealtimeEngineSlotSnapshot<E> =
-    VoiceRuntimeRealtimeEngineSlotSnapshot(current, version)
+  fun snapshot(): VoiceRuntimeRealtimeEngineSlotSnapshot<E> {
+    assertKernelThread()
+    return VoiceRuntimeRealtimeEngineSlotSnapshot(current, version)
+  }
 
-  @Synchronized
-  fun fence(): VoiceRuntimeRealtimeEngineSlotFence<E> = currentFence()
+  fun fence(): VoiceRuntimeRealtimeEngineSlotFence<E> {
+    assertKernelThread()
+    return currentFence()
+  }
 
-  @Synchronized
   fun stageIdleInstall(
     expected: VoiceRuntimeRealtimeEngineSlotFence<E>,
     authority: VoiceRuntimeRealtimeAuthority,
     candidateEngine: E,
+    candidateState: VoiceRuntimeRealtimeState = VoiceRuntimeRealtimeState(),
   ): VoiceRuntimeRealtimeEngineInstallation {
+    assertKernelThread()
     check(!isActive(candidateEngine)) { "A candidate Realtime engine must be idle." }
-    val candidate = VoiceRuntimeRealtimeEngineBinding(authority, candidateEngine)
+    check(!isRealtimeStateActive(candidateState)) { "A candidate Realtime state must be idle." }
+    val candidate = VoiceRuntimeRealtimeEngineBinding(authority, candidateEngine, candidateState)
     validateBinding(candidate)
     current?.let { validateReplacement(it.authority, authority) }
     return stageIdleReplacement(expected, candidate)
   }
 
-  @Synchronized
   fun stageRecoveredInstall(
     expected: VoiceRuntimeRealtimeEngineSlotFence<E>,
     authority: VoiceRuntimeRealtimeAuthority,
     candidateEngine: E,
+    candidateState: VoiceRuntimeRealtimeState = VoiceRuntimeRealtimeState(),
   ): VoiceRuntimeRealtimeEngineInstallation {
+    assertKernelThread()
     requireNoInstallation()
     requireFence(expected)
     check(current == null) { "Recovered Realtime state can only enter an empty engine slot." }
-    val candidate = VoiceRuntimeRealtimeEngineBinding(authority, candidateEngine)
+    val candidate = VoiceRuntimeRealtimeEngineBinding(authority, candidateEngine, candidateState)
     validateBinding(candidate)
     return stageIdleReplacement(expected, candidate)
   }
 
-  @Synchronized
   fun stageIdleClear(
     expected: VoiceRuntimeRealtimeEngineSlotFence<E>,
-  ): VoiceRuntimeRealtimeEngineInstallation = stageIdleReplacement(expected, null)
+  ): VoiceRuntimeRealtimeEngineInstallation {
+    assertKernelThread()
+    return stageIdleReplacement(expected, null)
+  }
 
   private fun stageIdleReplacement(
     expected: VoiceRuntimeRealtimeEngineSlotFence<E>,
@@ -91,7 +107,7 @@ internal class VoiceRuntimeRealtimeEngineSlot<E : Any>(
     requireNoInstallation()
     requireFence(expected)
     current?.let {
-      check(!isActive(it.engine)) { "An active Realtime engine cannot be replaced." }
+      check(!bindingIsActive(it)) { "An active Realtime engine cannot be replaced." }
     }
     nextInstallationId += 1
     stagedInstallation = StagedInstallation(
@@ -103,10 +119,10 @@ internal class VoiceRuntimeRealtimeEngineSlot<E : Any>(
     return VoiceRuntimeRealtimeEngineInstallation(nextInstallationId)
   }
 
-  @Synchronized
   fun commit(
     installation: VoiceRuntimeRealtimeEngineInstallation,
   ): VoiceRuntimeRealtimeEngineSlotSnapshot<E> {
+    assertKernelThread()
     val staged = requireInstallation(installation)
     check(staged.committedVersion == null) { "The Realtime engine installation is already committed." }
     check(version == staged.baseVersion) { "The Realtime engine slot changed during installation." }
@@ -117,10 +133,10 @@ internal class VoiceRuntimeRealtimeEngineSlot<E : Any>(
     return snapshot()
   }
 
-  @Synchronized
   fun rollback(
     installation: VoiceRuntimeRealtimeEngineInstallation,
   ): VoiceRuntimeRealtimeEngineSlotSnapshot<E> {
+    assertKernelThread()
     val staged = requireInstallation(installation)
     val committedVersion = staged.committedVersion
     if (committedVersion == null) {
@@ -129,7 +145,7 @@ internal class VoiceRuntimeRealtimeEngineSlot<E : Any>(
     } else {
       check(version == committedVersion) { "The committed Realtime engine installation is stale." }
       requireBinding(current, staged.candidate)
-      check(staged.candidate?.engine?.let(isActive) != true) {
+      check(staged.candidate?.let(::bindingIsActive) != true) {
         "An active candidate Realtime engine cannot be rolled back."
       }
       current = staged.previous
@@ -139,10 +155,10 @@ internal class VoiceRuntimeRealtimeEngineSlot<E : Any>(
     return snapshot()
   }
 
-  @Synchronized
   fun complete(
     installation: VoiceRuntimeRealtimeEngineInstallation,
   ): VoiceRuntimeRealtimeEngineSlotSnapshot<E> {
+    assertKernelThread()
     val staged = requireInstallation(installation)
     val committedVersion = requireNotNull(staged.committedVersion) {
       "The Realtime engine installation has not been committed."
@@ -153,10 +169,10 @@ internal class VoiceRuntimeRealtimeEngineSlot<E : Any>(
     return snapshot()
   }
 
-  @Synchronized
   fun clear(
     expected: VoiceRuntimeRealtimeEngineSlotFence<E>,
   ): VoiceRuntimeRealtimeEngineBinding<E>? {
+    assertKernelThread()
     requireNoInstallation()
     requireFence(expected)
     val removed = current
@@ -165,8 +181,19 @@ internal class VoiceRuntimeRealtimeEngineSlot<E : Any>(
     return removed
   }
 
+  fun applyReduction(
+    bindingIdentity: Any,
+    reduction: VoiceRuntimeRealtimeReduction<*>,
+  ): VoiceRuntimeRealtimeEngineBinding<E>? {
+    assertKernelThread()
+    val binding = current?.takeIf { it.identityToken === bindingIdentity } ?: return null
+    binding.state = reduction.state
+    return binding
+  }
+
   private fun currentFence() = VoiceRuntimeRealtimeEngineSlotFence(
     current?.engine,
+    current?.identityToken,
     current?.authority?.identity,
     version,
   )
@@ -175,7 +202,7 @@ internal class VoiceRuntimeRealtimeEngineSlot<E : Any>(
     val actual = currentFence()
     if (
       expected.version != actual.version ||
-        expected.engine !== actual.engine ||
+        expected.bindingIdentity !== actual.bindingIdentity ||
         expected.identity != actual.identity
     ) {
       throw VoiceRuntimeFenceException("The Realtime engine slot fence is stale.")
@@ -187,7 +214,7 @@ internal class VoiceRuntimeRealtimeEngineSlot<E : Any>(
     expected: VoiceRuntimeRealtimeEngineBinding<E>?,
   ) {
     if (
-      actual?.engine !== expected?.engine ||
+      actual?.identityToken !== expected?.identityToken ||
         actual?.authority != expected?.authority
     ) {
       throw VoiceRuntimeFenceException("The Realtime engine binding changed during installation.")
@@ -207,6 +234,9 @@ internal class VoiceRuntimeRealtimeEngineSlot<E : Any>(
   private fun validateBinding(binding: VoiceRuntimeRealtimeEngineBinding<E>) {
     validateAuthority(binding.authority)
   }
+
+  private fun bindingIsActive(binding: VoiceRuntimeRealtimeEngineBinding<E>) =
+    isActive(binding.engine) || isRealtimeStateActive(binding.state)
 
   private fun validateReplacement(
     installed: VoiceRuntimeRealtimeAuthority,
