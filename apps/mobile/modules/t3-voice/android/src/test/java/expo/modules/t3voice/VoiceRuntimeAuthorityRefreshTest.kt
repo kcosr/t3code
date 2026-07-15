@@ -48,6 +48,34 @@ internal class VoiceRuntimeAuthorityRefreshTest {
   }
 
   @Test
+  fun `delayed disabled recovery confirms exact request with candidate authentication`() {
+    val authority = authority()
+    val attempt = attempt(authority)
+    val expiredCurrent = RefreshHttpsConnection(401, ByteArray(0))
+    val first = VoiceRuntimeAuthorityRefreshClient(
+      VoiceRuntimeHttpTransport { expiredCurrent },
+    ).refresh(authority, attempt)
+    var candidateConnection: RefreshHttpsConnection? = null
+
+    val confirmed = VoiceRuntimeDisabledRefreshReplayPolicy.confirm(first) {
+      val connection = RefreshHttpsConnection(200, responseJson().toByteArray())
+      candidateConnection = connection
+      VoiceRuntimeAuthorityRefreshClient(
+        VoiceRuntimeHttpTransport { connection },
+      ).refresh(authority, attempt, attempt.candidateCredential)
+    }
+
+    assertTrue(confirmed is VoiceRuntimeRefreshResult.Success)
+    assertEquals("old-refresh-credential", expiredCurrent.getRequestProperty("x-t3-voice-refresh"))
+    assertEquals(
+      "candidate-refresh-credential",
+      requireNotNull(candidateConnection).getRequestProperty("x-t3-voice-refresh"),
+    )
+    assertEquals(expiredCurrent.output.toString(Charsets.UTF_8),
+      requireNotNull(candidateConnection).output.toString(Charsets.UTF_8))
+  }
+
+  @Test
   fun `scheduler refreshes before expiry and retries immediately when overdue`() {
     val day = 24L * 60L * 60L * 1_000L
     assertEquals(day, VoiceRuntimeAuthorityRefreshScheduler.delayMillis(3 * day, day))
@@ -88,6 +116,7 @@ internal class VoiceRuntimeAuthorityRefreshTest {
     4,
     "old-refresh-credential",
     "c".repeat(64),
+    "candidate-refresh-credential",
   )
 
   private fun responseJson(): String {

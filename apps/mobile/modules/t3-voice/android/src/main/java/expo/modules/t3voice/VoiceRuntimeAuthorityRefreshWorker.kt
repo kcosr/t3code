@@ -49,7 +49,14 @@ internal class VoiceRuntimeAuthorityRefreshWorker(
     } else {
       authority
     }
-    return when (val result = VoiceRuntimeAuthorityRefreshClient().refresh(requestAuthority, attempt)) {
+    val client = VoiceRuntimeAuthorityRefreshClient()
+    val firstResult = client.refresh(requestAuthority, attempt)
+    val result = if (mode == T3VoiceAuthorityRefreshAdmissionPolicy.Mode.DISABLED_RECOVERY) {
+      VoiceRuntimeDisabledRefreshReplayPolicy.confirm(firstResult) {
+        client.refresh(requestAuthority, attempt, attempt.candidateCredential)
+      }
+    } else firstResult
+    return when (result) {
       is VoiceRuntimeRefreshResult.Success -> {
         if (canRefresh(authority, readinessStore)) {
           val promoted = runCatching { store.promoteRefresh(attempt, result.authority) {} }
@@ -130,6 +137,15 @@ internal class VoiceRuntimeAuthorityRefreshWorker(
       applicationContext.startService(intent)
     }
   }
+}
+
+internal object VoiceRuntimeDisabledRefreshReplayPolicy {
+  fun confirm(
+    firstResult: VoiceRuntimeRefreshResult,
+    candidateAuthentication: () -> VoiceRuntimeRefreshResult,
+  ): VoiceRuntimeRefreshResult =
+    if (firstResult is VoiceRuntimeRefreshResult.Rejected) candidateAuthentication()
+    else firstResult
 }
 
 internal object VoiceRuntimeAuthorityRefreshScheduler {

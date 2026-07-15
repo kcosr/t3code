@@ -3,6 +3,7 @@ package expo.modules.t3voice
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -462,6 +463,71 @@ class T3VoiceBinderOperationDispatcherTest {
     activationPost.join(1_000)
     assertFalse(activationPost.isAlive)
     assertFalse(activationAccepted)
+    assertEquals(T3VoiceBinderOrderingRetention(0, 0), dispatcher.retainedOrderingCounts())
+  }
+
+  @Test
+  fun concurrentRejectedStopsCannotRestoreEachOthersTombstones() {
+    val ordered = ArrayDeque<Runnable>()
+    val stopPostIndex = AtomicInteger()
+    val stopPostEntered = listOf(CountDownLatch(1), CountDownLatch(1))
+    val releaseStopPost = listOf(CountDownLatch(1), CountDownLatch(1))
+    val dispatcher = T3VoiceBinderOperationDispatcher(
+      orderedPost = {
+        ordered.addLast(it)
+        true
+      },
+      interruptPost = {
+        val index = stopPostIndex.getAndIncrement()
+        stopPostEntered[index].countDown()
+        releaseStopPost[index].await()
+        false
+      },
+    )
+    val fence = T3VoiceBinderOperationFence(
+      VoiceRuntimeIdentity("runtime", "instance", 1),
+      "session",
+    )
+    var activationAdmitted = false
+    var firstStopAccepted = true
+    var secondStopAccepted = true
+
+    assertTrue(
+      dispatcher.post(
+        T3VoiceBinderOperationLane.ORDERED,
+        T3VoiceBinderOperationOrdering.Activation(fence),
+      ) { activationAdmitted = it.tryAdmit() },
+    )
+    val firstStopPost = Thread {
+      firstStopAccepted = dispatcher.post(
+        T3VoiceBinderOperationLane.INTERRUPT,
+        T3VoiceBinderOperationOrdering.Stop(fence),
+      ) { assertTrue(it.tryAdmit()) }
+    }
+    val secondStopPost = Thread {
+      secondStopAccepted = dispatcher.post(
+        T3VoiceBinderOperationLane.INTERRUPT,
+        T3VoiceBinderOperationOrdering.Stop(fence),
+      ) { assertTrue(it.tryAdmit()) }
+    }
+
+    firstStopPost.start()
+    assertTrue(stopPostEntered[0].await(1, TimeUnit.SECONDS))
+    secondStopPost.start()
+    assertTrue(stopPostEntered[1].await(1, TimeUnit.SECONDS))
+
+    releaseStopPost[0].countDown()
+    firstStopPost.join(1_000)
+    assertFalse(firstStopPost.isAlive)
+    assertFalse(firstStopAccepted)
+
+    releaseStopPost[1].countDown()
+    secondStopPost.join(1_000)
+    assertFalse(secondStopPost.isAlive)
+    assertFalse(secondStopAccepted)
+
+    ordered.removeFirst().run()
+    assertTrue(activationAdmitted)
     assertEquals(T3VoiceBinderOrderingRetention(0, 0), dispatcher.retainedOrderingCounts())
   }
 

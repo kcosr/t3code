@@ -92,6 +92,7 @@ internal data class VoiceRuntimeRefreshAttempt(
   val expectedRotationCounter: Long,
   val currentCredential: String,
   val candidateCredentialHash: String,
+  val candidateCredential: String,
 )
 
 internal sealed interface VoiceRuntimeAuthorityLoadResult {
@@ -338,7 +339,7 @@ internal class VoiceRuntimeAuthorityStore(
         candidate.requestId != null) { "Canonical refresh candidate is stale." }
       return VoiceRuntimeRefreshAttempt(
         fence, candidate.requestId, authority.refreshRotationCounter,
-        current.credential, candidate.credentialHash,
+        current.credential, candidate.credentialHash, candidate.credential,
       )
     }
     val candidateCredential = generateCredential()
@@ -355,7 +356,7 @@ internal class VoiceRuntimeAuthorityStore(
     check(storage.put(candidate)) { "Could not persist canonical refresh candidate." }
     return VoiceRuntimeRefreshAttempt(
       fence, refreshRequestId, authority.refreshRotationCounter,
-      current.credential, candidateHash,
+      current.credential, candidateHash, candidateCredential,
     )
   }
 
@@ -380,6 +381,7 @@ internal class VoiceRuntimeAuthorityStore(
       authority.refreshRotationCounter,
       current.credential,
       candidate.credentialHash,
+      candidate.credential,
     )
   }
 

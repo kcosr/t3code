@@ -16,6 +16,7 @@ internal class VoiceRuntimeAuthorityRefreshClient(
   fun refresh(
     authority: VoiceRuntimePersistedAuthority,
     attempt: VoiceRuntimeRefreshAttempt,
+    authenticationCredential: String = attempt.currentCredential,
   ): VoiceRuntimeRefreshResult {
     require(authority.readinessEnabled)
     require(authority.runtimeId == attempt.fence.runtimeId)
@@ -39,7 +40,7 @@ internal class VoiceRuntimeAuthorityRefreshClient(
         origin = attempt.fence.environmentOrigin,
         path = "/api/voice/runtime/runtimes/${pathSegment(attempt.fence.runtimeId)}/grant/refresh",
         method = VoiceRuntimeHttpMethod.POST,
-        authority = VoiceRuntimeAuthority(REFRESH_HEADER, attempt.currentCredential),
+        authority = VoiceRuntimeAuthority(REFRESH_HEADER, authenticationCredential),
         body = VoiceRuntimeByteArrayBody(body, "application/json"),
         maximumRequestBytes = MAXIMUM_BODY_BYTES.toLong(),
         maximumResponseBytes = MAXIMUM_BODY_BYTES,
