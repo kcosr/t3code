@@ -1586,12 +1586,15 @@ internal class T3VoiceBinderOperationDispatcher(
         synchronized(lock) { finishRegistration(registration) }
       }
     }
-    val accepted = when (lane) {
+    val postAccepted = when (lane) {
       T3VoiceBinderOperationLane.ORDERED -> orderedPost(runnable)
       T3VoiceBinderOperationLane.INTERRUPT -> interruptPost(runnable)
     }
-    synchronized(lock) {
-      if (accepted) markAccepted(registration) else rollback(registration)
+    val accepted = synchronized(lock) {
+      if (postAccepted) markAccepted(registration)
+      val stopAdmitted = registration.stopTombstone?.postingState == StopPostingState.ACCEPTED
+      if (!postAccepted && !stopAdmitted) rollback(registration)
+      postAccepted || stopAdmitted
     }
     return accepted
   }
@@ -1622,10 +1625,14 @@ internal class T3VoiceBinderOperationDispatcher(
   private fun admit(registration: Registration): Boolean = synchronized(lock) {
     if (registration.finished || registration.admissionAttempted) return@synchronized false
     registration.admissionAttempted = true
-    if (registration.ordering is T3VoiceBinderOperationOrdering.Activation) {
-      !finishActivation(registration, evaluateCancellation = true)
-    } else {
-      true
+    when (registration.ordering) {
+      is T3VoiceBinderOperationOrdering.Activation ->
+        !finishActivation(registration, evaluateCancellation = true)
+      is T3VoiceBinderOperationOrdering.Stop -> {
+        markAccepted(registration)
+        true
+      }
+      null -> true
     }
   }
 
@@ -1657,7 +1664,8 @@ internal class T3VoiceBinderOperationDispatcher(
     pending?.remove(registration.sequence)
     if (pending?.isEmpty() == true) pendingActivations.remove(activation.fence)
     val stopTombstone = stopSequences[activation.fence]
-    val cancelled = evaluateCancellation && stopTombstone != null &&
+    val cancelled = evaluateCancellation &&
+      stopTombstone?.postingState == StopPostingState.ACCEPTED &&
       stopTombstone.sequence > registration.sequence
     if (stopTombstone != null) retireStopIfCovered(activation.fence, stopTombstone)
     return cancelled
