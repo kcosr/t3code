@@ -121,3 +121,59 @@ Steps 1-2 (`feat(voice): capture all runtime state onto the kernel thread`), Ste
 (`feat(voice): delete operationLock and serviceDestroyed`). Tree clean; pc gate follows
 (module tests + androidTest compile; `T3VoiceRuntimeServiceInstrumentedTest` unmodified
 and passing).
+
+## Review amendments (BINDING — supersede conflicting text above)
+
+B1. **Step-0 contradiction resolved**: do NOT call `ensureRuntimeForeground` from the main
+thread. Add a minimal `promoteForegroundOnMainThread(types)` used only by the
+`ACTION_START_*` arms: it calls `startForeground` with a notification built from a
+snapshot model and writes `foregroundServiceTypes` (make that field `@Volatile`). It
+touches NOTHING else (no mediaSession, no wakeLock, no readiness). If the subsequent
+kernel-body admission rejects (stale start), the kernel body runs the existing
+foreground-stop reconciliation. `ensureRuntimeForeground` stays kernel-owned and
+assertion-guarded.
+
+B2. **onDestroy ordering**: enqueue the entire teardown block (:2247-2283 bodies) as the
+FINAL `mailbox.submit { ... }` BEFORE `drainAndQuit()` (quitSafely drains queued
+messages), then executor shutdowns and component releases. The packet's earlier
+"drainAndQuit first" is wrong.
+
+B3. **onCreate coverage**: the recovery/install/startThread tail — including the unlisted
+lock sites :2077 (`reconcilePersistedThreadOperationLocked`) and :2080
+(`startRuntimeThreadLocked` post) — runs inside one `mailbox.submitAndAwait { ... }`
+(legal: onCreate is the main thread). Assertions then hold from first boot.
+
+B4. **Post-drain policy decision**: change `VoiceKernelMailbox.submit`/`submitDelayed` to
+DROP SILENTLY (return a no-op token / false) when not accepting, restoring the old
+`serviceDestroyed`-guard semantics for late WebRTC/PCM/recorder callbacks.
+`submitAndAwait` post-drain still throws (a caller awaiting a result cannot be silently
+dropped). Document both in the mailbox kdoc + tests.
+
+B5. **Add `VoiceKernelMailbox.isKernelThread(): Boolean`** (`Looper.myLooper() ===
+thread.looper`) — required by every inline-if-kernel discriminator.
+
+B6. **Handoff activate (:4332-4365)**: keep the `CountDownLatch` + bounded timeout
+exactly; change only `mainHandler.post(begin)` → `mailbox.submit(begin)` and the :4350
+main-looper self-guard → `mailbox.isKernelThread()`. `submitAndAwait` must NOT be used
+here (completion fires from a later mailbox body; no timeout support).
+
+B7. **Route the lock-free emits** `onRouteChanged` :1271, WebRTC `onError` :1282, PCM
+`onError` emit :2028 through `mailbox.submit` too — `T3VoiceStateStore` is a process
+global; post-teardown emissions must be droppable (see B4), not left as foreign-thread
+writes.
+
+B8. Nice-to-fix items, all mandatory: stickiness cache updated via a single custom setter
+on `readinessConfig` (NOT 16 hand edits) + initialized in onCreate; the periodic tasks
+(:4778-4849) are self-rescheduling `Runnable` loops — convert to token-managed loops
+(field type becomes the cancellation token; store the new token on each reschedule);
+recorder construction drops the `terminalLock = operationLock` ARGUMENT (param name is
+`terminalLock`, default applies) and the serialization-window narrowing is accepted +
+documented; `serviceDestroyed` reads count is 60; preserve the coordinator's
+`check(isIdle())` and `if (!isIdle()) return false` semantics when inlining — only the
+`holdsLock` asserts die.
+
+B9. **Invariant to document in the packet-completion commit and carried to M3/M4
+packets**: "No `submitAndAwait`-backed sink is ever invoked while the engine holds its
+monitor" — currently guaranteed because presentation publish/retract are only reached
+off-monitor on action IO; M3/M4 must not move engine mutating calls onto the kernel
+thread without re-proving this.
