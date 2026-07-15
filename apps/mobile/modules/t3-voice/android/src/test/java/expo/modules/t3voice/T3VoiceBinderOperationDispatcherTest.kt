@@ -579,6 +579,71 @@ class T3VoiceBinderOperationDispatcherTest {
     assertEquals(T3VoiceBinderOrderingRetention(0, 0), dispatcher.retainedOrderingCounts())
   }
 
+  @Test
+  fun registeringLaterStopCannotHideEarlierAcceptedStop() {
+    val ordered = ArrayDeque<Runnable>()
+    val acceptedStop = ArrayDeque<Runnable>()
+    val laterStopPostEntered = CountDownLatch(1)
+    val releaseLaterStopPost = CountDownLatch(1)
+    var stopPostCount = 0
+    val dispatcher = T3VoiceBinderOperationDispatcher(
+      orderedPost = {
+        ordered.addLast(it)
+        true
+      },
+      interruptPost = {
+        stopPostCount += 1
+        if (stopPostCount == 1) {
+          acceptedStop.addLast(it)
+          true
+        } else {
+          laterStopPostEntered.countDown()
+          releaseLaterStopPost.await()
+          false
+        }
+      },
+    )
+    val fence = T3VoiceBinderOperationFence(
+      VoiceRuntimeIdentity("runtime", "instance", 1),
+      "session",
+    )
+    var activationAdmitted = true
+    var laterStopAccepted = true
+
+    assertTrue(
+      dispatcher.post(
+        T3VoiceBinderOperationLane.ORDERED,
+        T3VoiceBinderOperationOrdering.Activation(fence),
+      ) { activationAdmitted = it.tryAdmit() },
+    )
+    assertTrue(
+      dispatcher.post(
+        T3VoiceBinderOperationLane.INTERRUPT,
+        T3VoiceBinderOperationOrdering.Stop(fence),
+      ) { assertTrue(it.tryAdmit()) },
+    )
+    val laterStopPost = Thread {
+      laterStopAccepted = dispatcher.post(
+        T3VoiceBinderOperationLane.INTERRUPT,
+        T3VoiceBinderOperationOrdering.Stop(fence),
+      ) { assertTrue(it.tryAdmit()) }
+    }
+    laterStopPost.start()
+    assertTrue(laterStopPostEntered.await(1, TimeUnit.SECONDS))
+
+    ordered.removeFirst().run()
+    assertFalse(activationAdmitted)
+
+    releaseLaterStopPost.countDown()
+    laterStopPost.join(1_000)
+    assertFalse(laterStopPost.isAlive)
+    assertFalse(laterStopAccepted)
+    assertEquals(T3VoiceBinderOrderingRetention(0, 0), dispatcher.retainedOrderingCounts())
+
+    acceptedStop.removeFirst().run()
+    assertEquals(T3VoiceBinderOrderingRetention(0, 0), dispatcher.retainedOrderingCounts())
+  }
+
   private fun queuedDispatcher(
     ordered: ArrayDeque<Runnable>,
     interrupts: ArrayDeque<Runnable>,

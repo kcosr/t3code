@@ -1562,7 +1562,6 @@ internal class T3VoiceBinderOperationDispatcher(
     val sequence: Long,
     val ordering: T3VoiceBinderOperationOrdering?,
     val stopTombstone: StopTombstone?,
-    val previousStopTombstone: StopTombstone?,
     var admissionAttempted: Boolean = false,
     var finished: Boolean = false,
   )
@@ -1570,7 +1569,7 @@ internal class T3VoiceBinderOperationDispatcher(
   private val lock = Any()
   private var nextSequence = 0L
   private val pendingActivations = mutableMapOf<T3VoiceBinderOperationFence, MutableSet<Long>>()
-  private val stopSequences = mutableMapOf<T3VoiceBinderOperationFence, StopTombstone>()
+  private val stopSequences = mutableMapOf<T3VoiceBinderOperationFence, MutableList<StopTombstone>>()
 
   fun post(
     lane: T3VoiceBinderOperationLane,
@@ -1603,19 +1602,18 @@ internal class T3VoiceBinderOperationDispatcher(
     nextSequence += 1
     val sequence = nextSequence
     var stopTombstone: StopTombstone? = null
-    val previousStopTombstone = when (ordering) {
+    when (ordering) {
       is T3VoiceBinderOperationOrdering.Activation -> {
         pendingActivations.getOrPut(ordering.fence) { mutableSetOf() }.add(sequence)
-        null
       }
       is T3VoiceBinderOperationOrdering.Stop -> {
         val next = StopTombstone(sequence)
         stopTombstone = next
-        stopSequences.put(ordering.fence, next)
+        stopSequences.getOrPut(ordering.fence) { mutableListOf() }.add(next)
       }
-      null -> null
+      null -> Unit
     }
-    return Registration(sequence, ordering, stopTombstone, previousStopTombstone)
+    return Registration(sequence, ordering, stopTombstone)
   }
 
   private fun beforeRun(registration: Registration): Boolean = synchronized(lock) {
@@ -1645,7 +1643,7 @@ internal class T3VoiceBinderOperationDispatcher(
         registration.finished = true
         registration.stopTombstone?.let { tombstone ->
           tombstone.finished = true
-          retireStopIfCovered(ordering.fence, tombstone)
+          pruneStopRegistrations(ordering.fence)
         }
       }
       null -> registration.finished = true
@@ -1663,23 +1661,11 @@ internal class T3VoiceBinderOperationDispatcher(
     val pending = pendingActivations[activation.fence]
     pending?.remove(registration.sequence)
     if (pending?.isEmpty() == true) pendingActivations.remove(activation.fence)
-    val stopTombstone = stopSequences[activation.fence]
-    val cancelled = evaluateCancellation &&
-      stopTombstone?.postingState == StopPostingState.ACCEPTED &&
-      stopTombstone.sequence > registration.sequence
-    if (stopTombstone != null) retireStopIfCovered(activation.fence, stopTombstone)
-    return cancelled
-  }
-
-  private fun retireStopIfCovered(
-    fence: T3VoiceBinderOperationFence,
-    tombstone: StopTombstone,
-  ) {
-    if (stopSequences[fence] === tombstone &&
-      tombstone.postingState == StopPostingState.ACCEPTED && tombstone.finished &&
-      !coversEarlierActivation(fence, tombstone)) {
-      stopSequences.remove(fence, tombstone)
+    val cancelled = evaluateCancellation && stopSequences[activation.fence].orEmpty().any {
+      it.postingState == StopPostingState.ACCEPTED && it.sequence > registration.sequence
     }
+    pruneStopRegistrations(activation.fence)
+    return cancelled
   }
 
   private fun coversEarlierActivation(
@@ -1687,15 +1673,24 @@ internal class T3VoiceBinderOperationDispatcher(
     tombstone: StopTombstone,
   ): Boolean = pendingActivations[fence].orEmpty().any { it < tombstone.sequence }
 
+  private fun pruneStopRegistrations(fence: T3VoiceBinderOperationFence) {
+    val registrations = stopSequences[fence] ?: return
+    registrations.removeAll { tombstone ->
+      when (tombstone.postingState) {
+        StopPostingState.REGISTERING -> false
+        StopPostingState.REJECTED -> true
+        StopPostingState.ACCEPTED -> !coversEarlierActivation(fence, tombstone)
+      }
+    }
+    if (registrations.isEmpty()) stopSequences.remove(fence)
+  }
+
   private fun markAccepted(registration: Registration) {
     val ordering = registration.ordering as? T3VoiceBinderOperationOrdering.Stop ?: return
     val tombstone = registration.stopTombstone ?: return
     if (tombstone.postingState != StopPostingState.REGISTERING) return
     tombstone.postingState = StopPostingState.ACCEPTED
-    if (stopSequences[ordering.fence] == null && coversEarlierActivation(ordering.fence, tombstone)) {
-      stopSequences[ordering.fence] = tombstone
-    }
-    retireStopIfCovered(ordering.fence, tombstone)
+    pruneStopRegistrations(ordering.fence)
   }
 
   private fun rollback(registration: Registration) {
@@ -1705,20 +1700,12 @@ internal class T3VoiceBinderOperationDispatcher(
         val pending = pendingActivations[ordering.fence]
         pending?.remove(registration.sequence)
         if (pending?.isEmpty() == true) pendingActivations.remove(ordering.fence)
-        stopSequences[ordering.fence]?.let { retireStopIfCovered(ordering.fence, it) }
+        pruneStopRegistrations(ordering.fence)
       }
       is T3VoiceBinderOperationOrdering.Stop -> {
         val rejected = registration.stopTombstone
         rejected?.postingState = StopPostingState.REJECTED
-        if (rejected != null && stopSequences[ordering.fence] === rejected) {
-          val previous = registration.previousStopTombstone
-          if (previous?.postingState == StopPostingState.ACCEPTED &&
-            coversEarlierActivation(ordering.fence, previous)) {
-            stopSequences[ordering.fence] = previous
-          } else {
-            stopSequences.remove(ordering.fence, rejected)
-          }
-        }
+        pruneStopRegistrations(ordering.fence)
       }
       null -> Unit
     }
@@ -1727,7 +1714,7 @@ internal class T3VoiceBinderOperationDispatcher(
   internal fun retainedOrderingCounts(): T3VoiceBinderOrderingRetention = synchronized(lock) {
     T3VoiceBinderOrderingRetention(
       pendingActivations.values.sumOf { it.size },
-      stopSequences.size,
+      stopSequences.values.sumOf { it.size },
     )
   }
 }
