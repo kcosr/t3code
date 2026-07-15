@@ -360,6 +360,30 @@ internal class VoiceRuntimeAuthorityStore(
   }
 
   @Synchronized
+  fun resumeDisabledRefresh(): Pair<VoiceRuntimePersistedAuthority, VoiceRuntimeRefreshAttempt>? {
+    val authority = loadIgnoringExpiry() ?: return null
+    require(!authority.readinessEnabled) {
+      "Enabled readiness must use normal refresh admission."
+    }
+    val candidate = readCredential(CANDIDATE_PREFIX) ?: return null
+    val current = requireNotNull(readCredential(CURRENT_PREFIX)) {
+      "Disabled refresh recovery is missing the current credential."
+    }
+    val fence = authority.fence()
+    require(current.fence == fence && current.rotationCounter == authority.refreshRotationCounter)
+    require(candidate.fence == fence &&
+      candidate.rotationCounter == authority.refreshRotationCounter &&
+      candidate.requestId != null)
+    return authority to VoiceRuntimeRefreshAttempt(
+      fence,
+      candidate.requestId,
+      authority.refreshRotationCounter,
+      current.credential,
+      candidate.credentialHash,
+    )
+  }
+
+  @Synchronized
   fun disableReadiness(
     expectedRuntimeId: String,
     expectedGeneration: Long,
@@ -368,13 +392,28 @@ internal class VoiceRuntimeAuthorityStore(
     if (current.runtimeId != expectedRuntimeId || current.generation != expectedGeneration) {
       return null
     }
+    val preserveRefreshRecovery = if (readCredential(CANDIDATE_PREFIX) != null) {
+      val active = requireNotNull(readCredential(CURRENT_PREFIX)) {
+        "In-flight refresh recovery is missing the current credential."
+      }
+      val candidate = requireNotNull(readCredential(CANDIDATE_PREFIX))
+      val fence = current.fence()
+      require(active.fence == fence && active.rotationCounter == current.refreshRotationCounter)
+      require(candidate.fence == fence &&
+        candidate.rotationCounter == current.refreshRotationCounter &&
+        candidate.requestId != null)
+      true
+    } else {
+      false
+    }
     val disabled = current.copy(readinessEnabled = false)
     val encrypted = cipher.encrypt(
       disabled.token.toByteArray(StandardCharsets.UTF_8),
       metadata(disabled),
     )
     check(storage.put(
-      values(disabled, encrypted) + REFRESH_KEYS.associateWith { null },
+      values(disabled, encrypted) +
+        if (preserveRefreshRecovery) emptyMap() else REFRESH_KEYS.associateWith { null },
     )) { "Could not durably disable canonical voice readiness." }
     return disabled
   }
@@ -435,6 +474,11 @@ internal class VoiceRuntimeAuthorityStore(
     val current = requireNotNull(loadIgnoringExpiry())
     require(current.fence() == attempt.fence &&
       current.refreshRotationCounter == attempt.expectedRotationCounter)
+    val candidate = requireNotNull(readCredential(CANDIDATE_PREFIX))
+    require(candidate.fence == attempt.fence &&
+      candidate.requestId == attempt.refreshRequestId &&
+      candidate.rotationCounter == attempt.expectedRotationCounter &&
+      candidate.credentialHash == attempt.candidateCredentialHash)
     val disabled = authority.copy(readinessEnabled = false)
     val encryptedAuthority = cipher.encrypt(
       disabled.token.toByteArray(StandardCharsets.UTF_8),
@@ -459,6 +503,20 @@ internal class VoiceRuntimeAuthorityStore(
     check(storage.put(
       credentialKeys(CANDIDATE_PREFIX).associateWith { null } + (KEY_REFRESH_REJECTED to "1"),
     )) { "Could not fence rejected canonical refresh authority." }
+  }
+
+  @Synchronized
+  fun rejectDisabledRefresh(attempt: VoiceRuntimeRefreshAttempt) {
+    val authority = requireNotNull(loadIgnoringExpiry())
+    require(!authority.readinessEnabled && authority.fence() == attempt.fence)
+    val candidate = requireNotNull(readCredential(CANDIDATE_PREFIX))
+    require(candidate.fence == attempt.fence &&
+      candidate.requestId == attempt.refreshRequestId &&
+      candidate.rotationCounter == attempt.expectedRotationCounter &&
+      candidate.credentialHash == attempt.candidateCredentialHash)
+    check(storage.clear(REFRESH_KEYS)) {
+      "Could not consume rejected disabled refresh recovery."
+    }
   }
 
   @Synchronized

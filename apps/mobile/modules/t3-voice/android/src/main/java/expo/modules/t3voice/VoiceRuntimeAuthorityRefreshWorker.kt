@@ -21,11 +21,35 @@ internal class VoiceRuntimeAuthorityRefreshWorker(
     val store = VoiceRuntimeAuthorityStore(applicationContext)
     val readinessStore = T3VoiceReadinessStore(applicationContext)
     val authority = store.loadForRefresh() ?: return Result.failure()
-    if (!canRefresh(authority, readinessStore)) return Result.failure()
-    val attempt = runCatching { store.beginRefresh() }.getOrElse { return Result.failure() }
-    if (!canRefresh(authority, readinessStore)) return Result.failure()
-    startRuntimeService(T3VoiceRuntimeService.ACTION_AUTHORITY_REFRESH_PENDING)
-    return when (val result = VoiceRuntimeAuthorityRefreshClient().refresh(authority, attempt)) {
+    val mode = T3VoiceAuthorityRefreshAdmissionPolicy.mode(
+      authority,
+      readinessStore.read(),
+      readinessStore.disabledAuthorityFence(),
+      store.hasPendingRefresh(),
+    )
+    val attempt = when (mode) {
+      T3VoiceAuthorityRefreshAdmissionPolicy.Mode.NORMAL ->
+        runCatching { store.beginRefresh() }.getOrElse { return Result.failure() }
+      T3VoiceAuthorityRefreshAdmissionPolicy.Mode.DISABLED_RECOVERY ->
+        runCatching { store.resumeDisabledRefresh() }
+        .getOrNull()
+        ?.takeIf { it.first == authority }
+        ?.second
+        ?: return Result.failure()
+      T3VoiceAuthorityRefreshAdmissionPolicy.Mode.REJECT -> return Result.failure()
+    }
+    if (!canRefresh(authority, readinessStore) &&
+      !isDurablyDisabled(authority, readinessStore)) return Result.failure()
+    if (mode == T3VoiceAuthorityRefreshAdmissionPolicy.Mode.NORMAL) {
+      startRuntimeService(T3VoiceRuntimeService.ACTION_AUTHORITY_REFRESH_PENDING)
+    }
+    val requestAuthority = if (mode ==
+      T3VoiceAuthorityRefreshAdmissionPolicy.Mode.DISABLED_RECOVERY) {
+      authority.copy(readinessEnabled = true)
+    } else {
+      authority
+    }
+    return when (val result = VoiceRuntimeAuthorityRefreshClient().refresh(requestAuthority, attempt)) {
       is VoiceRuntimeRefreshResult.Success -> {
         if (canRefresh(authority, readinessStore)) {
           val promoted = runCatching { store.promoteRefresh(attempt, result.authority) {} }
@@ -56,14 +80,16 @@ internal class VoiceRuntimeAuthorityRefreshWorker(
       }
       is VoiceRuntimeRefreshResult.Retryable ->
         if (isDurablyDisabled(authority, readinessStore)) {
-          VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
-          Result.failure()
+          Result.retry()
         } else {
           Result.retry()
         }
       is VoiceRuntimeRefreshResult.Rejected -> {
         if (isDurablyDisabled(authority, readinessStore)) {
+          runCatching { store.rejectDisabledRefresh(attempt) }
+            .getOrElse { return Result.failure() }
           VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
+          runCatching { startRuntimeService(T3VoiceRuntimeService.ACTION_AUTHORITY_REFRESH_REJECTED) }
           return Result.failure()
         }
         runCatching { store.rejectRefresh(attempt) }.getOrElse { return Result.failure() }
@@ -121,11 +147,12 @@ internal object VoiceRuntimeAuthorityRefreshScheduler {
       return
     }
     val delay = delayMillis(authority.expiresAtEpochMillis, nowEpochMillis)
-    val request = OneTimeWorkRequestBuilder<VoiceRuntimeAuthorityRefreshWorker>()
-      .setInitialDelay(delay, TimeUnit.MILLISECONDS)
-      .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-      .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-      .build()
+    WorkManager.getInstance(context.applicationContext)
+      .enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.REPLACE, request(delay))
+  }
+
+  fun scheduleDisabledRecovery(context: Context) {
+    val request = request(delayMillis = 0)
     WorkManager.getInstance(context.applicationContext)
       .enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.REPLACE, request)
   }
@@ -137,4 +164,11 @@ internal object VoiceRuntimeAuthorityRefreshScheduler {
   internal fun delayMillis(expiresAtEpochMillis: Long, nowEpochMillis: Long): Long =
     (expiresAtEpochMillis - REFRESH_LEAD_MILLIS - nowEpochMillis)
       .coerceAtLeast(MINIMUM_DELAY_MILLIS)
+
+  private fun request(delayMillis: Long) =
+    OneTimeWorkRequestBuilder<VoiceRuntimeAuthorityRefreshWorker>()
+      .setInitialDelay(delayMillis, TimeUnit.MILLISECONDS)
+      .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+      .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+      .build()
 }

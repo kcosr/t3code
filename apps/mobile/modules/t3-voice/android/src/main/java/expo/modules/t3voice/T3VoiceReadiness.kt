@@ -144,6 +144,12 @@ internal object T3VoiceStartupAuthorityFencePolicy {
 }
 
 internal object T3VoiceAuthorityRefreshAdmissionPolicy {
+  enum class Mode {
+    NORMAL,
+    DISABLED_RECOVERY,
+    REJECT,
+  }
+
   fun canRefresh(
     authority: VoiceRuntimePersistedAuthority,
     readiness: T3VoiceReadinessConfig,
@@ -162,6 +168,18 @@ internal object T3VoiceAuthorityRefreshAdmissionPolicy {
     !readiness.enabled &&
       readiness.generation >= authority.generation &&
       disabledFence == T3VoiceDisabledAuthorityFence(authority.runtimeId, authority.generation)
+
+  fun mode(
+    authority: VoiceRuntimePersistedAuthority,
+    readiness: T3VoiceReadinessConfig,
+    disabledFence: T3VoiceDisabledAuthorityFence?,
+    hasPendingRefresh: Boolean,
+  ): Mode = when {
+    canRefresh(authority, readiness, disabledFence) -> Mode.NORMAL
+    isDurablyDisabled(authority, readiness, disabledFence) && hasPendingRefresh ->
+      Mode.DISABLED_RECOVERY
+    else -> Mode.REJECT
+  }
 }
 
 internal object T3VoiceDisabledTerminalCleanupCoordinator {

@@ -389,7 +389,6 @@ internal class VoiceRuntimeAuthorityStoreTest {
     val initial = authority()
     store.prepareRefreshCredential(fence(), true)
     store.activate(initial) {}
-    store.beginRefresh()
 
     val disabled = store.disableReadiness(initial.runtimeId, initial.generation)
 
@@ -424,6 +423,7 @@ internal class VoiceRuntimeAuthorityStoreTest {
     )
     store.prepareRefreshCredential(realtimeFence, true)
     store.activate(realtime) {}
+    val inFlightRefresh = store.beginRefresh()
     val disabled = requireNotNull(
       store.disableReadiness(realtime.runtimeId, realtime.generation),
     )
@@ -448,6 +448,7 @@ internal class VoiceRuntimeAuthorityStoreTest {
       disabled,
       (store.load() as VoiceRuntimeAuthorityLoadResult.Available).authority,
     )
+    assertEquals(inFlightRefresh, requireNotNull(store.resumeDisabledRefresh()).second)
   }
 
   @Test
@@ -465,17 +466,45 @@ internal class VoiceRuntimeAuthorityStoreTest {
       refreshRotationCounter = 1,
     )
     store.disableReadiness(initial.runtimeId, initial.generation)
+    val restarted = refreshStore(storage)
+    val recovered = requireNotNull(restarted.resumeDisabledRefresh())
 
     assertTrue(runCatching { store.promoteRefresh(attempt, refreshed) {} }.isFailure)
+    assertEquals(initial.copy(readinessEnabled = false), recovered.first)
+    assertEquals(attempt, recovered.second)
     assertEquals(
       refreshed.copy(readinessEnabled = false),
-      store.promoteDisabledRefresh(attempt, refreshed),
+      restarted.promoteDisabledRefresh(recovered.second, refreshed),
     )
     assertEquals(
       refreshed.copy(readinessEnabled = false),
-      (store.load() as VoiceRuntimeAuthorityLoadResult.Available).authority,
+      (restarted.load() as VoiceRuntimeAuthorityLoadResult.Available).authority,
     )
-    assertFalse(store.hasPendingRefresh())
+    assertFalse(restarted.hasPendingRefresh())
+  }
+
+  @Test
+  fun `rejected disabled refresh is consumed and cannot replay after restart`() {
+    val storage = MemoryRuntimeStorage()
+    val store = refreshStore(storage)
+    val initial = authority()
+    store.prepareRefreshCredential(fence(), true)
+    store.activate(initial) {}
+    val attempt = store.beginRefresh()
+    val disabled = requireNotNull(
+      store.disableReadiness(initial.runtimeId, initial.generation),
+    )
+
+    store.rejectDisabledRefresh(attempt)
+
+    val restarted = refreshStore(storage)
+    assertNull(restarted.resumeDisabledRefresh())
+    assertFalse(restarted.hasPendingRefresh())
+    assertEquals(
+      disabled,
+      (restarted.load() as VoiceRuntimeAuthorityLoadResult.Available).authority,
+    )
+    assertFalse(restarted.isRefreshRejected())
   }
 
   @Test

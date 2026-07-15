@@ -2238,6 +2238,7 @@ class T3VoiceRuntimeService : Service() {
     createNotificationChannel()
     T3VoiceStateStore.setServiceReady()
     synchronized(operationLock) {
+      scheduleDisabledRefreshRecoveryLocked()
       if (reconcilePersistedThreadOperationLocked()) {
         mainHandler.post {
           if (!serviceDestroyed) synchronized(operationLock) { startRuntimeThreadLocked() }
@@ -5214,7 +5215,12 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun reconcileRejectedAuthorityLocked() {
-    val persisted = voiceRuntimeAuthorityStore.loadRejectedAuthority() ?: return
+    val explicitlyRejected = voiceRuntimeAuthorityStore.loadRejectedAuthority()
+    val persisted = explicitlyRejected ?: voiceRuntimeAuthorityStore.loadForRefresh()?.takeIf {
+      !it.readinessEnabled && !voiceRuntimeAuthorityStore.hasPendingRefresh() &&
+        readinessStore.disabledAuthorityFence() ==
+          T3VoiceDisabledAuthorityFence(it.runtimeId, it.generation)
+    } ?: return
     VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
     cancelVoiceRuntimeThreadRearmLocked()
     if (voiceRuntimeController.isIdle()) {
@@ -5233,6 +5239,8 @@ class T3VoiceRuntimeService : Service() {
     ))
     if (persisted.readinessEnabled) {
       ensureRuntimeForeground(0)
+      updateRuntimeControlSurfacesLocked()
+    } else {
       updateRuntimeControlSurfacesLocked()
     }
   }
@@ -5850,6 +5858,7 @@ class T3VoiceRuntimeService : Service() {
           return
         }
       }
+      scheduleDisabledRefreshRecoveryLocked()
       reconcileReadinessLocked()
       return
     }
@@ -5916,12 +5925,25 @@ class T3VoiceRuntimeService : Service() {
         }
       }
       clearIdleRealtimeEngineLocked()
+    } else {
+      scheduleDisabledRefreshRecoveryLocked()
     }
     controllerCommands.invalidateReadiness()
     T3VoiceStateStore.emit(
       T3VoiceRuntimeEvent.ReadinessDisabled(disabled.generation, "notification"),
     )
     reconcileReadinessLocked()
+  }
+
+  private fun scheduleDisabledRefreshRecoveryLocked() {
+    val authority = voiceRuntimeAuthorityStore.loadForRefresh() ?: return
+    if (!voiceRuntimeAuthorityStore.hasPendingRefresh()) return
+    if (!T3VoiceAuthorityRefreshAdmissionPolicy.isDurablyDisabled(
+        authority,
+        readinessConfig,
+        readinessStore.disabledAuthorityFence(),
+      )) return
+    VoiceRuntimeAuthorityRefreshScheduler.scheduleDisabledRecovery(applicationContext)
   }
 
   private fun keepReadinessServiceStarted() {

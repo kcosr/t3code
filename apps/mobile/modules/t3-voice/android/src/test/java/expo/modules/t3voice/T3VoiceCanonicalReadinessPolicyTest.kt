@@ -386,6 +386,24 @@ internal class T3VoiceCanonicalReadinessPolicyTest {
       T3VoiceReadinessConfig(enabled = false, generation = 7),
       disabledFence,
     ))
+    assertEquals(
+      T3VoiceAuthorityRefreshAdmissionPolicy.Mode.DISABLED_RECOVERY,
+      T3VoiceAuthorityRefreshAdmissionPolicy.mode(
+        authority.copy(readinessEnabled = false),
+        T3VoiceReadinessConfig(enabled = false, generation = 7),
+        disabledFence,
+        hasPendingRefresh = true,
+      ),
+    )
+    assertEquals(
+      T3VoiceAuthorityRefreshAdmissionPolicy.Mode.REJECT,
+      T3VoiceAuthorityRefreshAdmissionPolicy.mode(
+        authority.copy(readinessEnabled = false),
+        T3VoiceReadinessConfig(enabled = false, generation = 7),
+        disabledFence,
+        hasPendingRefresh = false,
+      ),
+    )
     // The worker uses this same admission both before beginning refresh and after
     // a successful response/schedule, so either race observes the durable tombstone.
     assertFalse(T3VoiceAuthorityRefreshAdmissionPolicy.canRefresh(
