@@ -286,3 +286,17 @@ boundary sections.
   `VoiceMediaTicket*`) and `baseSchemas.ts` (`VoiceMediaTicketId`); and
   `VoiceSessionService.ts` is a primary grant-registry consumer (18 call sites) alongside
   the two services already listed.
+- **2026-07-15 — M0 run-1 adjudication record.** Implemented in `f1b2fc75d` + `5bcfb8c41`
+  - `de429079e` on `feature/voice-auth-unification`. Two-panel independent review: server
+    panel complete with zero code defects; clients panel found one HIGH (route/service test
+    coverage deleted wholesale — restored in the fix round with route-level scope-denial,
+    fence-rejection, close-only-admission, and two-level-ownership tests) plus three LOW
+    cleanups, all applied. Two intentional deviations reconciled INTO this spec: (a)
+    close-only admission also admits `handoff-commit` so committed-handoff redelivery reaches
+    the stored exactly-once outcome; (b) on target replacement, session-bound realtime-start
+    rows are marked `close_only` and TTL-reaped rather than purged — required by the
+    close-preservation improvement; the cascade wording "purge" applies only to
+    null-session rows. (c) Credential accessor disambiguation: the shared credential is a
+    React-supplied copy handed over the bridge (`setVoiceRuntimeSessionCredentialAsync`,
+    added in run 1) and persisted natively under the module's existing Keystore cipher;
+    native never reads expo-secure-store's internal format.
