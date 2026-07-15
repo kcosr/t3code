@@ -6,39 +6,169 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VoiceRuntimeRealtimeBinderOffloadTest {
+  private val identity = VoiceRuntimeIdentity("runtime", "instance", 1)
+  private val fence = VoiceRuntimeRealtimeFence(identity, "mode")
+
   @Test
-  fun receiptDoesNotDependOnOffloadedNetworkResult() {
+  fun startReceiptPrecedesRemoteCompletion() {
     val starts = ArrayDeque<Runnable>()
     val controls = ArrayDeque<Runnable>()
     val offload = VoiceRuntimeRealtimeBinderOffload(starts::addLast, controls::addLast)
-    val server = FakeServer(result = false)
-    val engine = FakeEngine(server)
+    val engine = FakeEngine(
+      startAdmission = pendingStart(),
+      startCompletionFailure = VoiceRuntimeFenceException("network failed"),
+    )
 
-    val startResult = offload.submitStart { engine.start() }
-    val controlResult = offload.submitControl { engine.updateFocus() }
+    val result = offload.submitStart(engine::admitStart, engine::completeStart)
 
-    assertEquals(VoiceRuntimeRealtimeCommandResult.Accepted(adopted = false), startResult)
-    assertEquals(VoiceRuntimeRealtimeCommandResult.Accepted(adopted = false), controlResult)
-    assertFalse(server.called)
+    assertEquals(VoiceRuntimeRealtimeCommandResult.Accepted(adopted = false), result)
+    assertEquals(0, engine.startCompletionCount)
+    assertTrue(runCatching { starts.removeFirst().run() }.isFailure)
+    assertEquals(1, engine.startCompletionCount)
+  }
 
-    starts.removeFirst().run()
+  @Test
+  fun noMatchPresentationStillAcknowledgesTheControllerWithoutCallingTheEngine() {
+    val controls = ArrayDeque<Runnable>()
+    val offload = VoiceRuntimeRealtimeBinderOffload({}, controls::addLast)
+    val engine = FakeEngine(acknowledgementFailure = AssertionError("engine must not run"))
+    var controllerAcknowledgements = 0
+    var failures = 0
+
+    offload.submitPresentationAcknowledgement(
+      hasRealtimeMatch = false,
+      operation = engine::acknowledgePresentation,
+      onAcknowledged = { controllerAcknowledgements += 1 },
+      onFailure = { failures += 1 },
+      failure = { VoiceRuntimeFenceException("rejected") },
+    )
+
+    assertEquals(1, controllerAcknowledgements)
+    assertEquals(0, engine.acknowledgementCount)
+    assertEquals(0, failures)
+    assertTrue(controls.isEmpty())
+  }
+
+  @Test
+  fun focusFalseOrThrowingEngineIsObservableAsFailure() {
+    val offload = VoiceRuntimeRealtimeBinderOffload({}, Runnable::run)
+    val rejected = FakeEngine(focusResult = false)
+    val throwing = FakeEngine(focusFailure = VoiceRuntimeFenceException("stale focus"))
+    val failures = mutableListOf<Throwable>()
+
+    assertFalse(offload.submitFocus(rejected::updateFocus, failures::add))
+    assertFalse(offload.submitFocus(throwing::updateFocus, failures::add))
+
+    assertEquals(1, failures.size)
+    assertTrue(failures.single() is VoiceRuntimeFenceException)
+  }
+
+  @Test
+  fun matchedPresentationGatesControllerAcknowledgementOnEngineSuccess() {
+    val controls = ArrayDeque<Runnable>()
+    val offload = VoiceRuntimeRealtimeBinderOffload({}, controls::addLast)
+    val rejected = FakeEngine(acknowledgementResult = false)
+    val throwing = FakeEngine(
+      acknowledgementFailure = VoiceRuntimeFenceException("stale action"),
+    )
+    val accepted = FakeEngine(acknowledgementResult = true)
+    var controllerAcknowledgements = 0
+    val failures = mutableListOf<Throwable>()
+
+    listOf(rejected, throwing, accepted).forEach { engine ->
+      offload.submitPresentationAcknowledgement(
+        hasRealtimeMatch = true,
+        operation = engine::acknowledgePresentation,
+        onAcknowledged = { controllerAcknowledgements += 1 },
+        onFailure = failures::add,
+        failure = { VoiceRuntimeFenceException("rejected action") },
+      )
+    }
+    assertEquals(0, controllerAcknowledgements)
+
     controls.removeFirst().run()
-    assertTrue(server.called)
+    controls.removeFirst().run()
+    controls.removeFirst().run()
+
+    assertEquals(1, controllerAcknowledgements)
+    assertEquals(2, failures.size)
+    assertTrue(failures.all { it is VoiceRuntimeFenceException })
   }
 
-  private class FakeEngine(private val server: FakeServer) {
-    fun start(): Boolean = server.execute()
+  @Test
+  fun startAdmissionPropagatesEngineExceptionsAndPreservesReplay() {
+    val starts = ArrayDeque<Runnable>()
+    val offload = VoiceRuntimeRealtimeBinderOffload(starts::addLast, {})
+    val idempotencyFailure = FakeEngine(
+      startAdmissionFailure = VoiceRuntimeIdempotencyConflictException(),
+    )
+    val fenceFailure = FakeEngine(
+      startAdmissionFailure = VoiceRuntimeFenceException("stale start"),
+    )
+    val replay = FakeEngine(
+      startAdmission = VoiceRuntimeRealtimeStartAdmission.Settled(
+        VoiceRuntimeRealtimeCommandResult.Accepted(adopted = false, replayed = true),
+      ),
+    )
 
-    fun updateFocus(): Boolean = server.execute()
+    assertTrue(
+      runCatching { offload.submitStart(idempotencyFailure::admitStart, idempotencyFailure::completeStart) }
+        .exceptionOrNull() is VoiceRuntimeIdempotencyConflictException,
+    )
+    assertTrue(
+      runCatching { offload.submitStart(fenceFailure::admitStart, fenceFailure::completeStart) }
+        .exceptionOrNull() is VoiceRuntimeFenceException,
+    )
+    assertEquals(
+      VoiceRuntimeRealtimeCommandResult.Accepted(adopted = false, replayed = true),
+      offload.submitStart(replay::admitStart, replay::completeStart),
+    )
+    assertTrue(starts.isEmpty())
   }
 
-  private class FakeServer(private val result: Boolean) {
-    var called = false
+  private fun pendingStart() = VoiceRuntimeRealtimeStartAdmission.Pending(
+    commandId = "start",
+    fingerprint = "start:$fence",
+    fence = fence,
+    result = VoiceRuntimeRealtimeCommandResult.Accepted(adopted = false),
+  )
+
+  private class FakeEngine(
+    private val startAdmission: VoiceRuntimeRealtimeStartAdmission =
+      VoiceRuntimeRealtimeStartAdmission.Settled(
+        VoiceRuntimeRealtimeCommandResult.Accepted(adopted = false),
+      ),
+    private val startAdmissionFailure: Throwable? = null,
+    private val startCompletionFailure: Throwable? = null,
+    private val focusResult: Boolean = true,
+    private val focusFailure: Throwable? = null,
+    private val acknowledgementResult: Boolean = true,
+    private val acknowledgementFailure: Throwable? = null,
+  ) {
+    var startCompletionCount = 0
+      private set
+    var acknowledgementCount = 0
       private set
 
-    fun execute(): Boolean {
-      called = true
-      return result
+    fun admitStart(): VoiceRuntimeRealtimeStartAdmission {
+      startAdmissionFailure?.let { throw it }
+      return startAdmission
+    }
+
+    fun completeStart(@Suppress("UNUSED_PARAMETER") admission: VoiceRuntimeRealtimeStartAdmission.Pending) {
+      startCompletionCount += 1
+      startCompletionFailure?.let { throw it }
+    }
+
+    fun updateFocus(): Boolean {
+      focusFailure?.let { throw it }
+      return focusResult
+    }
+
+    fun acknowledgePresentation(): Boolean {
+      acknowledgementCount += 1
+      acknowledgementFailure?.let { throw it }
+      return acknowledgementResult
     }
   }
 }

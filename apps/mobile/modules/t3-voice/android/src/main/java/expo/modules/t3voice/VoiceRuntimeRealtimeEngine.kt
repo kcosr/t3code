@@ -433,6 +433,21 @@ internal fun interface VoiceRuntimeRealtimeRemoteDispatcher {
   fun dispatch(block: () -> Unit)
 }
 
+internal sealed interface VoiceRuntimeRealtimeStartAdmission {
+  val result: VoiceRuntimeRealtimeCommandResult
+
+  data class Settled(
+    override val result: VoiceRuntimeRealtimeCommandResult,
+  ) : VoiceRuntimeRealtimeStartAdmission
+
+  class Pending internal constructor(
+    internal val commandId: String,
+    internal val fingerprint: String,
+    internal val fence: VoiceRuntimeRealtimeFence,
+    override val result: VoiceRuntimeRealtimeCommandResult.Accepted,
+  ) : VoiceRuntimeRealtimeStartAdmission
+}
+
 internal class VoiceRuntimeRealtimeEngine(
   private val authority: VoiceRuntimeRealtimeAuthority,
   private val now: () -> Long,
@@ -471,31 +486,49 @@ internal class VoiceRuntimeRealtimeEngine(
     commandId: String,
     fence: VoiceRuntimeRealtimeFence,
     activationAdmission: () -> Boolean = { true },
-  ): VoiceRuntimeRealtimeCommandResult {
+  ): VoiceRuntimeRealtimeCommandResult = when (
+    val admission = admitStart(commandId, fence, activationAdmission)
+  ) {
+    is VoiceRuntimeRealtimeStartAdmission.Pending -> start(admission)
+    is VoiceRuntimeRealtimeStartAdmission.Settled -> admission.result
+  }
+
+  fun admitStart(
+    commandId: String,
+    fence: VoiceRuntimeRealtimeFence,
+    activationAdmission: () -> Boolean = { true },
+  ): VoiceRuntimeRealtimeStartAdmission {
     val fingerprint = "start:$fence"
-    synchronized(this) {
-      commands.replay(commandId, fingerprint)?.let { return it.withReplay(true) }
+    return synchronized(this) {
+      commands.replay(commandId, fingerprint)?.let {
+        return@synchronized VoiceRuntimeRealtimeStartAdmission.Settled(it.withReplay(true))
+      }
       requireFence(fence)
       pendingStart?.let { pending ->
         if (pending.commandId == commandId) {
           if (pending.fingerprint != fingerprint) throw VoiceRuntimeIdempotencyConflictException()
-          return if (pending.cancelled) {
+          val result = if (pending.cancelled) {
             VoiceRuntimeRealtimeCommandResult.Rejected("start-cancelled")
           } else {
             VoiceRuntimeRealtimeCommandResult.Accepted(adopted = true)
           }
+          return@synchronized VoiceRuntimeRealtimeStartAdmission.Settled(result)
         }
-        return recordCommand(
-          commandId,
-          fingerprint,
-          VoiceRuntimeRealtimeCommandResult.Rejected("owner-conflict"),
+        return@synchronized VoiceRuntimeRealtimeStartAdmission.Settled(
+          recordCommand(
+            commandId,
+            fingerprint,
+            VoiceRuntimeRealtimeCommandResult.Rejected("owner-conflict"),
+          ),
         )
       }
       repository.loadFinalization()?.let {
-        return recordCommand(
-          commandId,
-          fingerprint,
-          VoiceRuntimeRealtimeCommandResult.Rejected("finalization-pending"),
+        return@synchronized VoiceRuntimeRealtimeStartAdmission.Settled(
+          recordCommand(
+            commandId,
+            fingerprint,
+            VoiceRuntimeRealtimeCommandResult.Rejected("finalization-pending"),
+          ),
         )
       }
       val current = checkpoint
@@ -504,30 +537,38 @@ internal class VoiceRuntimeRealtimeEngine(
           throw VoiceRuntimeIdempotencyConflictException()
         }
         if (current.rootCommandId == commandId && current.phase == VoiceRealtimePhase.PREPARING) {
-          return VoiceRuntimeRealtimeCommandResult.Accepted(adopted = true)
+          return@synchronized VoiceRuntimeRealtimeStartAdmission.Settled(
+            VoiceRuntimeRealtimeCommandResult.Accepted(adopted = true),
+          )
         }
-        return recordCommand(
-          commandId,
-          fingerprint,
-          if (current.fence == fence && !current.phase.isTerminal()) {
-            VoiceRuntimeRealtimeCommandResult.Accepted(adopted = true)
-          } else {
-            VoiceRuntimeRealtimeCommandResult.Rejected("owner-conflict")
-          },
+        return@synchronized VoiceRuntimeRealtimeStartAdmission.Settled(
+          recordCommand(
+            commandId,
+            fingerprint,
+            if (current.fence == fence && !current.phase.isTerminal()) {
+              VoiceRuntimeRealtimeCommandResult.Accepted(adopted = true)
+            } else {
+              VoiceRuntimeRealtimeCommandResult.Rejected("owner-conflict")
+            },
+          ),
         )
       }
       if (!repository.hasTerminalCapacity(fence, now())) {
-        return recordCommand(
-          commandId,
-          fingerprint,
-          VoiceRuntimeRealtimeCommandResult.Rejected("realtime-terminal-retention-full"),
+        return@synchronized VoiceRuntimeRealtimeStartAdmission.Settled(
+          recordCommand(
+            commandId,
+            fingerprint,
+            VoiceRuntimeRealtimeCommandResult.Rejected("realtime-terminal-retention-full"),
+          ),
         )
       }
       if (!activationAdmission()) {
-        return recordCommand(
-          commandId,
-          fingerprint,
-          VoiceRuntimeRealtimeCommandResult.Rejected("start-cancelled"),
+        return@synchronized VoiceRuntimeRealtimeStartAdmission.Settled(
+          recordCommand(
+            commandId,
+            fingerprint,
+            VoiceRuntimeRealtimeCommandResult.Rejected("start-cancelled"),
+          ),
         )
       }
       update(
@@ -539,7 +580,19 @@ internal class VoiceRuntimeRealtimeEngine(
         ),
       )
       pendingStart = PendingStart(commandId, fingerprint, fence)
+      VoiceRuntimeRealtimeStartAdmission.Pending(
+        commandId,
+        fingerprint,
+        fence,
+        VoiceRuntimeRealtimeCommandResult.Accepted(adopted = false),
+      )
     }
+  }
+
+  fun start(admission: VoiceRuntimeRealtimeStartAdmission.Pending): VoiceRuntimeRealtimeCommandResult {
+    val commandId = admission.commandId
+    val fingerprint = admission.fingerprint
+    val fence = admission.fence
     val remote = server.start(authority, fence, commandId)
     val outcome = synchronized(this) {
       val current = checkpoint?.takeIf {

@@ -964,23 +964,31 @@ class T3VoiceRuntimeService : Service() {
         }
         is VoiceRuntimeNativeCommand.StartRealtime -> {
           val engine = requireRealtimeEngineLocked(command.identity)
-          check(admission.tryAdmit()) { "The voice operation was cancelled before admission." }
           synchronized(operationLock) {
             ensureRuntimeForeground(
               ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
             )
           }
-          val admissionResult = voiceRuntimeRealtimeBinderOffload.submitStart {
-            val started = runCatching {
-              engine.start(
+          val admissionResult = voiceRuntimeRealtimeBinderOffload.submitStart(
+            admit = {
+              engine.admitStart(
                 command.commandId,
                 VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
+                admission::tryAdmit,
               )
-            }.getOrNull() is VoiceRuntimeRealtimeCommandResult.Accepted
-            if (!started) {
-              synchronized(operationLock) { reconcileForegroundAfterVoiceStopLocked() }
-            }
+            },
+            complete = { pending ->
+              val result = engine.start(pending)
+              if (result is VoiceRuntimeRealtimeCommandResult.Rejected &&
+                result.reason == "start-cancelled") {
+                synchronized(operationLock) { reconcileForegroundAfterVoiceStopLocked() }
+              }
+            },
+          )
+          if (admissionResult is VoiceRuntimeRealtimeCommandResult.Rejected &&
+            admissionResult.reason == "start-cancelled") {
+            synchronized(operationLock) { reconcileForegroundAfterVoiceStopLocked() }
           }
           realtimeCommandReceipt(command, admissionResult)
         }
@@ -1022,14 +1030,17 @@ class T3VoiceRuntimeService : Service() {
         is VoiceRuntimeNativeCommand.UpdateRealtimeFocus -> {
           check(admission.tryAdmit()) { "The voice operation was cancelled before admission." }
           val engine = requireRealtimeEngineLocked(command.identity)
-          val admissionResult = voiceRuntimeRealtimeBinderOffload.submitControl {
-            engine.updateFocus(
-              VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
-              command.commandId,
-              command.focus,
-            )
-          }
-          realtimeCommandReceipt(command, admissionResult)
+          val focused = voiceRuntimeRealtimeBinderOffload.submitFocus(
+            operation = {
+              engine.updateFocus(
+                VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
+                command.commandId,
+                command.focus,
+              )
+            },
+            onFailure = { recordVoiceRuntimeRealtimeControlFailure() },
+          )
+          realtimeBooleanReceipt(command) { focused }
         }
         is VoiceRuntimeNativeCommand.SetAudioRoute -> {
           check(admission.tryAdmit()) { "The voice operation was cancelled before admission." }
@@ -1051,20 +1062,26 @@ class T3VoiceRuntimeService : Service() {
             voiceRuntimeController.claimPresentationAction(command.lease, command.actionId)
           }
           val engine = requireRealtimeEngineLocked(command.identity)
-          val admissionResult = voiceRuntimeRealtimeBinderOffload.submitControl {
-            val acknowledged = engine.acknowledgePresentationAction(
-              VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
-              command.commandId,
-              command.actionId,
-              VoiceRuntimeRealtimePresentationDecision.Confirmation(
-                command.confirmationId,
-                command.decision,
-              ),
-            )
-            if (acknowledged) synchronized(operationLock) {
-              voiceRuntimeController.acknowledgePresentationAction(command.lease, command.actionId)
-            }
-          }
+          val admissionResult = voiceRuntimeRealtimeBinderOffload.submitAcknowledgement(
+            operation = {
+              engine.acknowledgePresentationAction(
+                VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
+                command.commandId,
+                command.actionId,
+                VoiceRuntimeRealtimePresentationDecision.Confirmation(
+                  command.confirmationId,
+                  command.decision,
+                ),
+              )
+            },
+            onAcknowledged = {
+              synchronized(operationLock) {
+                voiceRuntimeController.acknowledgePresentationAction(command.lease, command.actionId)
+              }
+            },
+            onFailure = { recordVoiceRuntimeRealtimeControlFailure() },
+            failure = { VoiceRuntimeFenceException("Realtime confirmation acknowledgement failed.") },
+          )
           realtimeCommandReceipt(command, admissionResult)
         }
       }
@@ -1107,7 +1124,9 @@ class T3VoiceRuntimeService : Service() {
               )
             else -> null
           }
-          if (realtimeActionId != actionId) return@synchronized null
+          if (realtimeActionId != actionId) {
+            return@synchronized null
+          }
           val snapshot = voiceRuntimeController.snapshot()
           val operation = snapshot.operation as? VoiceRuntimeOperation.Realtime
             ?: throw VoiceRuntimeFenceException("Realtime presentation action is stale.")
@@ -1120,17 +1139,26 @@ class T3VoiceRuntimeService : Service() {
               message,
             )
           )
-          voiceRuntimeController.acknowledgePresentationAction(lease, actionId)
           acknowledgement
         }
-        if (realtime != null) voiceRuntimeRealtimeBinderOffload.submitControl {
-          realtime.first.acknowledgePresentationAction(
-            realtime.second,
-            "action-$actionId-${UUID.randomUUID()}",
-            actionId,
-            realtime.third,
-          )
-        }
+        voiceRuntimeRealtimeBinderOffload.submitPresentationAcknowledgement(
+          hasRealtimeMatch = realtime != null,
+          operation = {
+            requireNotNull(realtime).first.acknowledgePresentationAction(
+              realtime.second,
+              "action-$actionId-${UUID.randomUUID()}",
+              actionId,
+              realtime.third,
+            )
+          },
+          onAcknowledged = {
+            synchronized(operationLock) {
+              voiceRuntimeController.acknowledgePresentationAction(lease, actionId)
+            }
+          },
+          onFailure = { recordVoiceRuntimeRealtimeControlFailure() },
+          failure = { VoiceRuntimeFenceException("Realtime action acknowledgement failed.") },
+        )
       }
     }
   }
@@ -4881,6 +4909,14 @@ class T3VoiceRuntimeService : Service() {
     if (operation()) VoiceRuntimeRealtimeCommandResult.Accepted(false)
     else VoiceRuntimeRealtimeCommandResult.Rejected("invalid-phase"),
   )
+
+  private fun recordVoiceRuntimeRealtimeControlFailure() {
+    T3VoiceDiagnostics.record(
+      generation = 0,
+      category = T3VoiceDiagnosticCategory.KERNEL,
+      code = T3VoiceDiagnosticCode.FAILED,
+    )
+  }
 
   private fun installedCanonicalAuthorityLocked(): VoiceRuntimeInstalledAuthority? {
     val persisted = (voiceRuntimeAuthorityStore.load()
