@@ -87,8 +87,7 @@ around the runs — authoring packet N+1 and adjudicating reviews while run N ex
      --target /home/kevin/worktrees/t3code \
      --input '{
        "spec": "/home/kevin/worktrees/t3code/specs/kernel-milestones/<mN>-<name>.md",
-       "implementerProfile": "codex-gpt-5-6-sol-xhigh",
-       "implementerReasoning": "medium",
+       "implementerProfile": "codex-gpt-5-6-sol-fast",
        "completionChecks": [
          {"key": "typecheck", "type": "command", "shell": true,
           "command": "vp run typecheck", "timeoutMs": 1200000},
