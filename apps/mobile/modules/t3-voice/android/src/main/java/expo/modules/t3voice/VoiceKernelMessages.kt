@@ -11,6 +11,13 @@ enum class VoiceKernelHostIntentAction {
   ACTION_START_REALTIME,
 }
 
+internal fun T3VoiceControlCommand.toVoiceKernelHostIntentAction(): VoiceKernelHostIntentAction =
+  when (this) {
+    T3VoiceControlCommand.PRIMARY -> VoiceKernelHostIntentAction.ACTION_PRIMARY
+    T3VoiceControlCommand.STOP -> VoiceKernelHostIntentAction.ACTION_STOP
+    T3VoiceControlCommand.TOGGLE_MUTE -> VoiceKernelHostIntentAction.ACTION_TOGGLE_MUTE
+  }
+
 enum class VoiceKernelDriver {
   MEDIA,
   NET,

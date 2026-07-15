@@ -29,13 +29,9 @@ class T3VoiceModule : Module() {
   // Android media APIs require a Looper even though Binder work must stay off the main thread.
   private val binderOperationThread = HandlerThread("t3-voice-binder").apply { start() }
   private val binderOperationHandler = Handler(binderOperationThread.looper)
-  // Stop commands must be able to cancel a synchronous start that is blocked on its Binder lane.
-  private val binderInterruptThread = HandlerThread("t3-voice-binder-interrupt").apply { start() }
-  private val binderInterruptHandler = Handler(binderInterruptThread.looper)
   private val binderOperationDispatcher =
     T3VoiceBinderOperationDispatcher(
       orderedPost = binderOperationHandler::post,
-      interruptPost = binderInterruptHandler::post,
     )
   private val pendingBinderOperations = T3VoiceBinderOperationRegistry<PendingBinderOperation>()
   private val bindingRealtimeOwner = T3VoiceBindingRealtimeOwnerPolicy()
@@ -53,8 +49,6 @@ class T3VoiceModule : Module() {
   private class PendingBinderOperation(
     val promise: Promise,
     val errorCode: String,
-    val lane: T3VoiceBinderOperationLane,
-    val ordering: T3VoiceBinderOperationOrdering?,
     val operation: (
       T3VoiceRuntimeService.VoiceBinder,
       BinderSettlement,
@@ -248,9 +242,7 @@ class T3VoiceModule : Module() {
         synchronized(binderLock) { binder = null }
         serviceBound = false
         binderOperationHandler.removeCallbacksAndMessages(null)
-        binderInterruptHandler.removeCallbacksAndMessages(null)
         binderOperationThread.quitSafely()
-        binderInterruptThread.quitSafely()
       }
 
       AsyncFunction("getMediaCapabilitiesAsync") {
@@ -423,8 +415,6 @@ class T3VoiceModule : Module() {
         withBinderAdmission(
           promise,
           "voice-runtime-command-failed",
-          T3VoiceBinderOperationLanePolicy.forCommand(command),
-          T3VoiceBinderOperationLanePolicy.orderingForCommand(command),
         ) { service, settlement, admission ->
           settlement.resolve(
             VoiceRuntimeBridge.receiptBody(service.dispatchVoiceRuntime(command, admission)),
@@ -914,7 +904,6 @@ class T3VoiceModule : Module() {
         withBinder(
           promise,
           "realtime-stop-failed",
-          T3VoiceBinderOperationLane.INTERRUPT,
         ) { voice, result ->
           result.resolve(voice.stopRealtimeSession(requireIdentifier(input, "nativeSessionId")))
         }
@@ -924,7 +913,6 @@ class T3VoiceModule : Module() {
         withBinder(
           promise,
           "realtime-drained-stop-failed",
-          T3VoiceBinderOperationLane.INTERRUPT,
         ) { voice, result ->
           voice.drainAndStopRealtimeSession(requireIdentifier(input, "nativeSessionId"))
           result.resolve()
@@ -1056,10 +1044,8 @@ class T3VoiceModule : Module() {
   private fun withBinder(
     promise: Promise,
     errorCode: String,
-    lane: T3VoiceBinderOperationLane = T3VoiceBinderOperationLane.ORDERED,
-    ordering: T3VoiceBinderOperationOrdering? = null,
     operation: (T3VoiceRuntimeService.VoiceBinder, BinderSettlement) -> Unit,
-  ) = withBinderAdmission(promise, errorCode, lane, ordering) { service, settlement, admission ->
+  ) = withBinderAdmission(promise, errorCode) { service, settlement, admission ->
     check(admission.tryAdmit()) { "The voice operation was cancelled before admission." }
     operation(service, settlement)
   }
@@ -1067,15 +1053,13 @@ class T3VoiceModule : Module() {
   private fun withBinderAdmission(
     promise: Promise,
     errorCode: String,
-    lane: T3VoiceBinderOperationLane = T3VoiceBinderOperationLane.ORDERED,
-    ordering: T3VoiceBinderOperationOrdering? = null,
     operation: (
       T3VoiceRuntimeService.VoiceBinder,
       BinderSettlement,
       T3VoiceBinderOperationAdmission,
     ) -> Unit,
   ) {
-    val pending = PendingBinderOperation(promise, errorCode, lane, ordering, operation)
+    val pending = PendingBinderOperation(promise, errorCode, operation)
     var dispatch: T3VoiceBinderOperationRegistry.Dispatch<PendingBinderOperation>? = null
     var connectedBinder: T3VoiceRuntimeService.VoiceBinder? = null
     var unavailableMessage: String? = null
@@ -1129,10 +1113,7 @@ class T3VoiceModule : Module() {
     dispatch: T3VoiceBinderOperationRegistry.Dispatch<PendingBinderOperation>,
   ) {
     val pending = dispatch.value
-    val accepted = binderOperationDispatcher.post(
-      lane = pending.lane,
-      ordering = pending.ordering,
-    ) operation@{ admission ->
+    val accepted = binderOperationDispatcher.post operation@{ admission ->
       val active = synchronized(binderLock) {
         pendingBinderOperations.isActive(dispatch.ticket, dispatch.binderGeneration)
       }
@@ -1368,228 +1349,34 @@ class T3VoiceModule : Module() {
   }
 }
 
-internal enum class T3VoiceBinderOperationLane { ORDERED, INTERRUPT }
-
-internal data class T3VoiceBinderOperationFence(
-  val identity: VoiceRuntimeIdentity,
-  val modeSessionId: String,
-)
-
-internal sealed interface T3VoiceBinderOperationOrdering {
-  val fence: T3VoiceBinderOperationFence
-
-  data class Activation(
-    override val fence: T3VoiceBinderOperationFence,
-  ) : T3VoiceBinderOperationOrdering
-
-  data class Stop(
-    override val fence: T3VoiceBinderOperationFence,
-  ) : T3VoiceBinderOperationOrdering
-}
-
 internal fun interface T3VoiceBinderOperationAdmission {
   fun tryAdmit(): Boolean
 }
 
-internal data class T3VoiceBinderOrderingRetention(
-  val pendingActivationCount: Int,
-  val stopSequenceCount: Int,
-)
-
-internal object T3VoiceBinderOperationLanePolicy {
-  fun forCommand(command: VoiceRuntimeNativeCommand): T3VoiceBinderOperationLane =
-    if (command is VoiceRuntimeNativeCommand.StopMode) {
-      T3VoiceBinderOperationLane.INTERRUPT
-    } else {
-      T3VoiceBinderOperationLane.ORDERED
-    }
-
-  fun orderingForCommand(command: VoiceRuntimeNativeCommand): T3VoiceBinderOperationOrdering? {
-    val fence = T3VoiceBinderOperationFence(command.identity, command.modeSessionId)
-    return when (command) {
-      is VoiceRuntimeNativeCommand.StartRealtime ->
-        T3VoiceBinderOperationOrdering.Activation(fence)
-      is VoiceRuntimeNativeCommand.StopMode -> T3VoiceBinderOperationOrdering.Stop(fence)
-      is VoiceRuntimeNativeCommand.Thread -> when (command.command) {
-        is VoiceRuntimeThreadCommand.Start,
-        is VoiceRuntimeThreadCommand.Resume,
-        -> T3VoiceBinderOperationOrdering.Activation(fence)
-        else -> null
-      }
-      else -> null
-    }
-  }
-}
-
 internal class T3VoiceBinderOperationDispatcher(
   private val orderedPost: (Runnable) -> Boolean,
-  private val interruptPost: (Runnable) -> Boolean,
 ) {
-  private enum class StopPostingState { REGISTERING, ACCEPTED, REJECTED }
-
-  private data class StopTombstone(
-    val sequence: Long,
-    var postingState: StopPostingState = StopPostingState.REGISTERING,
-    var finished: Boolean = false,
-  )
-
   private data class Registration(
-    val sequence: Long,
-    val ordering: T3VoiceBinderOperationOrdering?,
-    val stopTombstone: StopTombstone?,
     var admissionAttempted: Boolean = false,
-    var finished: Boolean = false,
   )
-
-  private val lock = Any()
-  private var nextSequence = 0L
-  private val pendingActivations = mutableMapOf<T3VoiceBinderOperationFence, MutableSet<Long>>()
-  private val stopSequences = mutableMapOf<T3VoiceBinderOperationFence, MutableList<StopTombstone>>()
 
   fun post(
-    lane: T3VoiceBinderOperationLane,
-    ordering: T3VoiceBinderOperationOrdering? = null,
     operation: (T3VoiceBinderOperationAdmission) -> Unit,
   ): Boolean {
-    val registration = synchronized(lock) { register(ordering) }
-    val runnable = Runnable {
-      if (!beforeRun(registration)) return@Runnable
-      try {
-        operation(T3VoiceBinderOperationAdmission { admit(registration) })
-      } finally {
-        synchronized(lock) { finishRegistration(registration) }
-      }
+    val registration = Registration()
+    return orderedPost {
+      operation(
+        T3VoiceBinderOperationAdmission {
+          synchronized(registration) {
+            if (registration.admissionAttempted) {
+              false
+            } else {
+              registration.admissionAttempted = true
+              true
+            }
+          }
+        },
+      )
     }
-    val postAccepted = when (lane) {
-      T3VoiceBinderOperationLane.ORDERED -> orderedPost(runnable)
-      T3VoiceBinderOperationLane.INTERRUPT -> interruptPost(runnable)
-    }
-    val accepted = synchronized(lock) {
-      if (postAccepted) markAccepted(registration)
-      val stopAdmitted = registration.stopTombstone?.postingState == StopPostingState.ACCEPTED
-      if (!postAccepted && !stopAdmitted) rollback(registration)
-      postAccepted || stopAdmitted
-    }
-    return accepted
-  }
-
-  private fun register(ordering: T3VoiceBinderOperationOrdering?): Registration {
-    nextSequence += 1
-    val sequence = nextSequence
-    var stopTombstone: StopTombstone? = null
-    when (ordering) {
-      is T3VoiceBinderOperationOrdering.Activation -> {
-        pendingActivations.getOrPut(ordering.fence) { mutableSetOf() }.add(sequence)
-      }
-      is T3VoiceBinderOperationOrdering.Stop -> {
-        val next = StopTombstone(sequence)
-        stopTombstone = next
-        stopSequences.getOrPut(ordering.fence) { mutableListOf() }.add(next)
-      }
-      null -> Unit
-    }
-    return Registration(sequence, ordering, stopTombstone)
-  }
-
-  private fun beforeRun(registration: Registration): Boolean = synchronized(lock) {
-    !registration.finished
-  }
-
-  private fun admit(registration: Registration): Boolean = synchronized(lock) {
-    if (registration.finished || registration.admissionAttempted) return@synchronized false
-    registration.admissionAttempted = true
-    when (registration.ordering) {
-      is T3VoiceBinderOperationOrdering.Activation ->
-        !finishActivation(registration, evaluateCancellation = true)
-      is T3VoiceBinderOperationOrdering.Stop -> {
-        markAccepted(registration)
-        true
-      }
-      null -> true
-    }
-  }
-
-  private fun finishRegistration(registration: Registration) {
-    if (registration.finished) return
-    when (val ordering = registration.ordering) {
-      is T3VoiceBinderOperationOrdering.Activation ->
-        finishActivation(registration, evaluateCancellation = false)
-      is T3VoiceBinderOperationOrdering.Stop -> {
-        registration.finished = true
-        registration.stopTombstone?.let { tombstone ->
-          tombstone.finished = true
-          pruneStopRegistrations(ordering.fence)
-        }
-      }
-      null -> registration.finished = true
-    }
-  }
-
-  private fun finishActivation(
-    registration: Registration,
-    evaluateCancellation: Boolean,
-  ): Boolean {
-    if (registration.finished) return false
-    registration.finished = true
-    val activation = registration.ordering as? T3VoiceBinderOperationOrdering.Activation
-      ?: return false
-    val pending = pendingActivations[activation.fence]
-    pending?.remove(registration.sequence)
-    if (pending?.isEmpty() == true) pendingActivations.remove(activation.fence)
-    val cancelled = evaluateCancellation && stopSequences[activation.fence].orEmpty().any {
-      it.postingState == StopPostingState.ACCEPTED && it.sequence > registration.sequence
-    }
-    pruneStopRegistrations(activation.fence)
-    return cancelled
-  }
-
-  private fun coversEarlierActivation(
-    fence: T3VoiceBinderOperationFence,
-    tombstone: StopTombstone,
-  ): Boolean = pendingActivations[fence].orEmpty().any { it < tombstone.sequence }
-
-  private fun pruneStopRegistrations(fence: T3VoiceBinderOperationFence) {
-    val registrations = stopSequences[fence] ?: return
-    registrations.removeAll { tombstone ->
-      when (tombstone.postingState) {
-        StopPostingState.REGISTERING -> false
-        StopPostingState.REJECTED -> true
-        StopPostingState.ACCEPTED -> !coversEarlierActivation(fence, tombstone)
-      }
-    }
-    if (registrations.isEmpty()) stopSequences.remove(fence)
-  }
-
-  private fun markAccepted(registration: Registration) {
-    val ordering = registration.ordering as? T3VoiceBinderOperationOrdering.Stop ?: return
-    val tombstone = registration.stopTombstone ?: return
-    if (tombstone.postingState != StopPostingState.REGISTERING) return
-    tombstone.postingState = StopPostingState.ACCEPTED
-    pruneStopRegistrations(ordering.fence)
-  }
-
-  private fun rollback(registration: Registration) {
-    when (val ordering = registration.ordering) {
-      is T3VoiceBinderOperationOrdering.Activation -> {
-        registration.finished = true
-        val pending = pendingActivations[ordering.fence]
-        pending?.remove(registration.sequence)
-        if (pending?.isEmpty() == true) pendingActivations.remove(ordering.fence)
-        pruneStopRegistrations(ordering.fence)
-      }
-      is T3VoiceBinderOperationOrdering.Stop -> {
-        val rejected = registration.stopTombstone
-        rejected?.postingState = StopPostingState.REJECTED
-        pruneStopRegistrations(ordering.fence)
-      }
-      null -> Unit
-    }
-  }
-
-  internal fun retainedOrderingCounts(): T3VoiceBinderOrderingRetention = synchronized(lock) {
-    T3VoiceBinderOrderingRetention(
-      pendingActivations.values.sumOf { it.size },
-      stopSequences.values.sumOf { it.size },
-    )
   }
 }

@@ -9,6 +9,7 @@ internal enum class T3VoiceDiagnosticCategory {
   FOCUS,
   TERMINAL,
   ENDPOINT,
+  KERNEL,
 }
 
 internal enum class T3VoiceDiagnosticCode {
@@ -64,6 +65,7 @@ internal enum class T3VoiceDiagnosticCode {
   HANDOFF_COMPOSER_ADOPTED,
   BRIDGE_OPERATION_STARTED,
   BRIDGE_OPERATION_FINISHED,
+  MAILBOX_BODY_SLOW,
 }
 
 internal data class T3VoiceDiagnosticEntry(
