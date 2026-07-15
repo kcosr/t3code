@@ -4249,22 +4249,33 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun realtimeCuePort(): VoiceRuntimeRealtimeCues = object : VoiceRuntimeRealtimeCues {
-    override fun ready(generation: Long, onComplete: () -> Unit): Boolean =
-      runOnKernelThreadOrAwait("realtime-ready-cue-request") {
-      if (!cueSettings.enabled) return@runOnKernelThreadOrAwait false
-      val cueGeneration = ++nextCueGeneration
-      cueCoordinator.requestReady(cueGeneration) {
-        dispatchVoiceRuntimeRealtimeControl(onComplete)
+    // The engine invokes both ports while holding its monitor. Accept optimistically and never
+    // await the kernel or invoke the engine completion inline; control IO re-enters the engine only
+    // after the monitor-holding call has returned.
+    override fun ready(generation: Long, onComplete: () -> Unit): Boolean {
+      mailbox.submit(callbackMessage("realtime-ready-cue-request")) {
+        val complete = { dispatchVoiceRuntimeRealtimeControl(onComplete) }
+        if (!cueSettings.enabled) {
+          complete()
+        } else {
+          val cueGeneration = ++nextCueGeneration
+          if (!cueCoordinator.requestReady(cueGeneration) { complete() }) complete()
+        }
       }
+      return true
     }
 
-    override fun ended(generation: Long, onComplete: () -> Unit): Boolean =
-      runOnKernelThreadOrAwait("realtime-ended-cue-request") {
-      if (!cueSettings.enabled) return@runOnKernelThreadOrAwait false
-      val cueGeneration = ++nextCueGeneration
-      cueCoordinator.requestEnded(cueGeneration) {
-        dispatchVoiceRuntimeRealtimeControl(onComplete)
+    override fun ended(generation: Long, onComplete: () -> Unit): Boolean {
+      mailbox.submit(callbackMessage("realtime-ended-cue-request")) {
+        val complete = { dispatchVoiceRuntimeRealtimeControl(onComplete) }
+        if (!cueSettings.enabled) {
+          complete()
+        } else {
+          val cueGeneration = ++nextCueGeneration
+          if (!cueCoordinator.requestEnded(cueGeneration) { complete() }) complete()
+        }
       }
+      return true
     }
   }
 
