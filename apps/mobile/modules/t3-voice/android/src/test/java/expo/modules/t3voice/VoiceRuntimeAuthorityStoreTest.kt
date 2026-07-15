@@ -383,6 +383,132 @@ internal class VoiceRuntimeAuthorityStoreTest {
   }
 
   @Test
+  fun `notification disable durably erases refresh authority while retaining active parent`() {
+    val storage = MemoryRuntimeStorage()
+    val store = refreshStore(storage)
+    val initial = authority()
+    store.prepareRefreshCredential(fence(), true)
+    store.activate(initial) {}
+    store.beginRefresh()
+
+    val disabled = store.disableReadiness(initial.runtimeId, initial.generation)
+
+    assertEquals(initial.copy(readinessEnabled = false), disabled)
+    assertEquals(
+      initial.copy(readinessEnabled = false),
+      (store.load() as VoiceRuntimeAuthorityLoadResult.Available).authority,
+    )
+    assertFalse(store.hasPendingRefresh())
+    assertTrue(runCatching { store.beginRefresh() }.isFailure)
+  }
+
+  @Test
+  fun `disabled realtime parent remains available for handoff until terminal cleanup`() {
+    val storage = MemoryRuntimeStorage()
+    val store = refreshStore(storage)
+    val realtimeTarget = VoiceRuntimeTarget.Realtime("environment-1", "conversation-1")
+    val realtime = authority().copy(
+      target = realtimeTarget,
+      targetDigest = T3VoiceRuntimeTargetIdentity.digest(
+        VoiceRuntimeBridge.canonicalRealtimeTargetIdentity(realtimeTarget),
+      ),
+    )
+    val realtimeFence = VoiceRuntimeAuthorityFence(
+      realtime.runtimeId,
+      realtime.generation,
+      realtime.provisioningOperationId,
+      realtime.targetDigest,
+      realtime.target,
+      T3VoiceRuntimeGrantOperation.REALTIME_START,
+      realtime.environmentOrigin,
+    )
+    store.prepareRefreshCredential(realtimeFence, true)
+    store.activate(realtime) {}
+    val disabled = requireNotNull(
+      store.disableReadiness(realtime.runtimeId, realtime.generation),
+    )
+    val threadTarget = VoiceRuntimeTarget.Thread(
+      "environment-1", "project-2", "thread-2", "default", false,
+      2_200, null, 600_000, true, 0,
+    )
+    val transition = disabled.copy(
+      generation = disabled.generation + 1,
+      provisioningOperationId = "handoff-after-disable",
+      target = threadTarget,
+      targetDigest = T3VoiceRuntimeTargetIdentity.digest(
+        VoiceRuntimeBridge.canonicalThreadTargetIdentity(threadTarget),
+      ),
+      token = "handoff-token",
+    )
+
+    store.prepareTransition(transition)
+
+    assertEquals(transition, store.inspectPreparedTransition())
+    assertEquals(
+      disabled,
+      (store.load() as VoiceRuntimeAuthorityLoadResult.Available).authority,
+    )
+  }
+
+  @Test
+  fun `in flight refresh retains rotated authority behind durable disable fence`() {
+    val storage = MemoryRuntimeStorage()
+    val store = refreshStore(storage)
+    val initial = authority()
+    store.prepareRefreshCredential(fence(), true)
+    store.activate(initial) {}
+    val attempt = store.beginRefresh()
+    val refreshed = initial.copy(
+      token = "rotated-runtime-token",
+      issuedAtEpochMillis = 2_000,
+      expiresAtEpochMillis = 9_000,
+      refreshRotationCounter = 1,
+    )
+    store.disableReadiness(initial.runtimeId, initial.generation)
+
+    assertTrue(runCatching { store.promoteRefresh(attempt, refreshed) {} }.isFailure)
+    assertEquals(
+      refreshed.copy(readinessEnabled = false),
+      store.promoteDisabledRefresh(attempt, refreshed),
+    )
+    assertEquals(
+      refreshed.copy(readinessEnabled = false),
+      (store.load() as VoiceRuntimeAuthorityLoadResult.Available).authority,
+    )
+    assertFalse(store.hasPendingRefresh())
+  }
+
+  @Test
+  fun `old disabled refresh cannot overwrite a newly provisioned generation`() {
+    val storage = MemoryRuntimeStorage()
+    val store = refreshStore(storage)
+    val initial = authority()
+    store.prepareRefreshCredential(fence(), true)
+    store.activate(initial) {}
+    val staleAttempt = store.beginRefresh()
+    val staleResult = initial.copy(
+      token = "stale-rotated-token",
+      refreshRotationCounter = 1,
+    )
+    store.clear()
+    val replacement = initial.copy(
+      generation = 8,
+      provisioningOperationId = "provision-runtime-1-8",
+      token = "replacement-token",
+    )
+    store.prepareRefreshCredential(fence(replacement), true)
+    store.activate(replacement) {}
+
+    assertTrue(runCatching {
+      store.promoteDisabledRefresh(staleAttempt, staleResult)
+    }.isFailure)
+    assertEquals(
+      replacement,
+      (store.load() as VoiceRuntimeAuthorityLoadResult.Available).authority,
+    )
+  }
+
+  @Test
   fun `permanent refresh rejection fences starts and clears waiting state`() {
     val storage = MemoryRuntimeStorage()
     val store = refreshStore(storage)

@@ -360,6 +360,26 @@ internal class VoiceRuntimeAuthorityStore(
   }
 
   @Synchronized
+  fun disableReadiness(
+    expectedRuntimeId: String,
+    expectedGeneration: Long,
+  ): VoiceRuntimePersistedAuthority? {
+    val current = loadIgnoringExpiry() ?: return null
+    if (current.runtimeId != expectedRuntimeId || current.generation != expectedGeneration) {
+      return null
+    }
+    val disabled = current.copy(readinessEnabled = false)
+    val encrypted = cipher.encrypt(
+      disabled.token.toByteArray(StandardCharsets.UTF_8),
+      metadata(disabled),
+    )
+    check(storage.put(
+      values(disabled, encrypted) + REFRESH_KEYS.associateWith { null },
+    )) { "Could not durably disable canonical voice readiness." }
+    return disabled
+  }
+
+  @Synchronized
   fun <T> promoteRefresh(
     attempt: VoiceRuntimeRefreshAttempt,
     authority: VoiceRuntimePersistedAuthority,
@@ -371,6 +391,7 @@ internal class VoiceRuntimeAuthorityStore(
     require(authority.refreshRotationCounter == attempt.expectedRotationCounter + 1)
     val currentAuthority = requireNotNull(loadIgnoringExpiry())
     require(currentAuthority.fence() == attempt.fence &&
+      currentAuthority.readinessEnabled &&
       currentAuthority.refreshRotationCounter == attempt.expectedRotationCounter)
     val candidate = requireNotNull(readCredential(CANDIDATE_PREFIX))
     require(candidate.fence == attempt.fence &&
@@ -400,6 +421,29 @@ internal class VoiceRuntimeAuthorityStore(
       check(storage.put(previous)) { "Could not roll back canonical refresh authority." }
       throw cause
     }
+  }
+
+  @Synchronized
+  fun promoteDisabledRefresh(
+    attempt: VoiceRuntimeRefreshAttempt,
+    authority: VoiceRuntimePersistedAuthority,
+  ): VoiceRuntimePersistedAuthority {
+    validate(authority)
+    require(authority.fence() == attempt.fence)
+    require(authority.readinessEnabled)
+    require(authority.refreshRotationCounter == attempt.expectedRotationCounter + 1)
+    val current = requireNotNull(loadIgnoringExpiry())
+    require(current.fence() == attempt.fence &&
+      current.refreshRotationCounter == attempt.expectedRotationCounter)
+    val disabled = authority.copy(readinessEnabled = false)
+    val encryptedAuthority = cipher.encrypt(
+      disabled.token.toByteArray(StandardCharsets.UTF_8),
+      metadata(disabled),
+    )
+    check(storage.put(
+      values(disabled, encryptedAuthority) + REFRESH_KEYS.associateWith { null },
+    )) { "Could not retain the rotated authority behind the readiness-disable fence." }
+    return disabled
   }
 
   @Synchronized

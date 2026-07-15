@@ -2,6 +2,7 @@ package expo.modules.t3voice
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -263,6 +264,200 @@ internal class T3VoiceCanonicalReadinessPolicyTest {
     ))
   }
 
+  @Test
+  fun `persistent preparation restart restores generation floor before reprovision`() {
+    val prepared = T3VoicePreparedReadiness(
+      T3VoiceReadinessConfig(enabled = true, generation = 7),
+      "runtime-1",
+      "https://environment.example.test",
+      T3VoiceRuntimeGrantOperation.REALTIME_START,
+      "a".repeat(64),
+    )
+    val startup = requireNotNull(
+      T3VoiceStartupAuthorityFencePolicy.persistentPreparation(prepared, null),
+    )
+    val controller = VoiceRuntimeActiveThreadController(
+      startup.runtimeId,
+      "restarted-process",
+      { 1_000 },
+      { null },
+      NoopThreadExecution(),
+      initialGeneration = startup.expectedCurrentGeneration,
+    )
+
+    assertEquals(6L, controller.snapshot().identity.generation)
+    assertTrue(T3VoiceConditionalDisablePolicy.canDisable(
+      "runtime-1",
+      6,
+      controller.snapshot().identity.generation,
+      listOf("runtime-1" to 6),
+      nativeVoiceActive = false,
+    ))
+    assertEquals(
+      7L,
+      T3VoiceReadinessReservationPolicy.reserve(
+        T3VoiceReadinessConfig(generation = controller.snapshot().identity.generation),
+        null,
+        T3VoiceReadinessConfig(enabled = true),
+        "runtime-1",
+        "https://environment.example.test",
+        T3VoiceRuntimeGrantOperation.REALTIME_START,
+        "b".repeat(64),
+      ).config.generation,
+    )
+  }
+
+  @Test
+  fun `startup persistent preparation validates refresh fence and runtime sources exactly`() {
+    val target = VoiceRuntimeTarget.Realtime("environment-1", "conversation-1")
+    val prepared = T3VoicePreparedReadiness(
+      T3VoiceReadinessConfig(enabled = true, generation = 7),
+      "runtime-1",
+      "https://environment.example.test",
+      T3VoiceRuntimeGrantOperation.REALTIME_START,
+      "a".repeat(64),
+    )
+    val refresh = VoiceRuntimePreparedRefreshCredential(
+      VoiceRuntimeAuthorityFence(
+        "runtime-1", 7, "provision-7", "a".repeat(64), target,
+        T3VoiceRuntimeGrantOperation.REALTIME_START,
+        "https://environment.example.test",
+      ),
+      "b".repeat(64),
+    )
+
+    val startup = requireNotNull(
+      T3VoiceStartupAuthorityFencePolicy.persistentPreparation(prepared, refresh),
+    )
+    assertEquals("runtime-1", T3VoiceStartupAuthorityFencePolicy.selectRuntimeId(
+      startup.runtimeId,
+      "runtime-1",
+    ))
+    assertTrue(runCatching {
+      T3VoiceStartupAuthorityFencePolicy.persistentPreparation(
+        prepared,
+        refresh.copy(fence = refresh.fence.copy(generation = 8)),
+      )
+    }.isFailure)
+    assertTrue(runCatching {
+      T3VoiceStartupAuthorityFencePolicy.selectRuntimeId("runtime-1", "runtime-2")
+    }.isFailure)
+    assertTrue(runCatching {
+      T3VoiceStartupAuthorityFencePolicy.requireCompatibleGeneration(startup, 10)
+    }.isFailure)
+    T3VoiceStartupAuthorityFencePolicy.requireCompatibleGeneration(startup, 6, 6)
+    assertTrue(runCatching {
+      T3VoiceStartupAuthorityFencePolicy.selectPreparation(
+        startup,
+        VoiceRuntimePreparedAttachedAuthority(refresh.fence, prepared.config),
+      )
+    }.isFailure)
+    assertTrue(runCatching {
+      T3VoiceStartupAuthorityFencePolicy.persistentPreparation(
+        prepared.copy(config = prepared.config.copy(generation = 0)),
+        null,
+      )
+    }.isFailure)
+  }
+
+  @Test
+  fun `refresh admission is fenced by exact durable readiness generation`() {
+    val authority = authority(
+      generation = 7,
+      readinessEnabled = true,
+      target = VoiceRuntimeTarget.Realtime("environment-1", "conversation-1"),
+    )
+    val disabledFence = T3VoiceDisabledAuthorityFence("runtime-1", 7)
+    var pendingUiDisableGeneration: Long? = 7
+    pendingUiDisableGeneration = null // React acknowledged the preference-reconciliation event.
+    assertNull(pendingUiDisableGeneration)
+    assertTrue(T3VoiceAuthorityRefreshAdmissionPolicy.canRefresh(
+      authority,
+      T3VoiceReadinessConfig(enabled = true, generation = 7),
+      null,
+    ))
+    assertFalse(T3VoiceAuthorityRefreshAdmissionPolicy.canRefresh(
+      authority,
+      T3VoiceReadinessConfig(enabled = false, generation = 7),
+      disabledFence,
+    ))
+    assertTrue(T3VoiceAuthorityRefreshAdmissionPolicy.isDurablyDisabled(
+      authority,
+      T3VoiceReadinessConfig(enabled = false, generation = 7),
+      disabledFence,
+    ))
+    // The worker uses this same admission both before beginning refresh and after
+    // a successful response/schedule, so either race observes the durable tombstone.
+    assertFalse(T3VoiceAuthorityRefreshAdmissionPolicy.canRefresh(
+      authority,
+      T3VoiceReadinessConfig(enabled = false, generation = 7),
+      disabledFence,
+    ))
+    assertFalse(T3VoiceAuthorityRefreshAdmissionPolicy.canRefresh(
+      authority,
+      T3VoiceReadinessConfig(enabled = true, generation = 8),
+      null,
+    ))
+    assertFalse(T3VoiceAuthorityRefreshAdmissionPolicy.isDurablyDisabled(
+      authority,
+      T3VoiceReadinessConfig(enabled = true, generation = 8),
+      null,
+    ))
+  }
+
+  @Test
+  fun `disabled parent is retained through active child and cleared only at terminal`() {
+    val disabled = authority(
+      generation = 7,
+      readinessEnabled = false,
+      target = VoiceRuntimeTarget.Realtime("environment-1", "conversation-1"),
+    )
+    val disabledFence = T3VoiceDisabledAuthorityFence("runtime-1", 7)
+
+    assertFalse(T3VoiceDisabledAuthorityRetentionPolicy.shouldClearAtTerminal(
+      disabled,
+      disabledFence = disabledFence,
+      canonicalIdle = false,
+    ))
+    assertTrue(T3VoiceDisabledAuthorityRetentionPolicy.shouldClearAtTerminal(
+      disabled,
+      disabledFence = disabledFence,
+      canonicalIdle = true,
+    ))
+    assertFalse(T3VoiceDisabledAuthorityRetentionPolicy.shouldClearAtTerminal(
+      disabled.copy(readinessEnabled = true),
+      disabledFence = disabledFence,
+      canonicalIdle = true,
+    ))
+  }
+
+  @Test
+  fun `disabled terminal cleanup preserves durable parent when controller clear fails`() {
+    val calls = mutableListOf<String>()
+    assertFalse(T3VoiceDisabledTerminalCleanupCoordinator.run(
+      canonicalIdle = true,
+      clearController = {
+        calls += "controller"
+        false
+      },
+      clearAuthority = { calls += "authority" },
+      clearEngine = { calls += "engine" },
+    ))
+    assertEquals(listOf("controller"), calls)
+
+    calls.clear()
+    assertTrue(T3VoiceDisabledTerminalCleanupCoordinator.run(
+      canonicalIdle = true,
+      clearController = {
+        calls += "controller"
+        true
+      },
+      clearAuthority = { calls += "authority" },
+      clearEngine = { calls += "engine" },
+    ))
+    assertEquals(listOf("controller", "authority", "engine"), calls)
+  }
+
   private fun authority(
     generation: Long,
     readinessEnabled: Boolean,
@@ -292,4 +487,13 @@ internal class T3VoiceCanonicalReadinessPolicyTest {
     speechEnabled = true,
     rearmGuardMs = 0,
   )
+
+  private class NoopThreadExecution : VoiceRuntimeThreadExecution {
+    override fun start(modeSessionId: String, turnClientOperationId: String,
+      submissionPolicy: String, draftContext: VoiceRuntimeDraftContext?) = true
+    override fun finish(outcome: String, draftContext: VoiceRuntimeDraftContext?) = true
+    override fun cancel() = true
+    override fun stop(policy: String) = true
+    override fun acknowledgeDraft(artifactId: String, outcome: String) = true
+  }
 }

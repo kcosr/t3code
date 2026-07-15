@@ -471,6 +471,7 @@ internal class VoiceRuntimeRealtimeEngine(
   fun start(
     commandId: String,
     fence: VoiceRuntimeRealtimeFence,
+    activationAdmission: () -> Boolean = { true },
   ): VoiceRuntimeRealtimeCommandResult {
     val fingerprint = "start:$fence"
     synchronized(this) {
@@ -528,6 +529,13 @@ internal class VoiceRuntimeRealtimeEngine(
           commandId,
           fingerprint,
           VoiceRuntimeRealtimeCommandResult.Rejected("realtime-terminal-retention-full"),
+        )
+      }
+      if (!activationAdmission()) {
+        return recordCommand(
+          commandId,
+          fingerprint,
+          VoiceRuntimeRealtimeCommandResult.Rejected("start-cancelled"),
         )
       }
       update(

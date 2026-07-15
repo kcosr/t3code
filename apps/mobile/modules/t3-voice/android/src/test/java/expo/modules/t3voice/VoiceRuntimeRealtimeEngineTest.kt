@@ -93,6 +93,39 @@ internal class VoiceRuntimeRealtimeEngineTest {
   }
 
   @Test
+  fun `cancelled admission is replayed and does not block a later start`() {
+    val engine = engine()
+    var admissionChecks = 0
+
+    assertEquals(
+      VoiceRuntimeRealtimeCommandResult.Rejected("start-cancelled"),
+      engine.start("cancelled-start", fence) {
+        admissionChecks += 1
+        false
+      },
+    )
+    assertEquals(1, admissionChecks)
+    assertEquals(0, server.startCount)
+    assertNull(engine.snapshot())
+
+    assertEquals(
+      VoiceRuntimeRealtimeCommandResult.Rejected("start-cancelled", replayed = true),
+      engine.start("cancelled-start", fence) {
+        admissionChecks += 1
+        true
+      },
+    )
+    assertEquals(1, admissionChecks)
+
+    assertEquals(
+      VoiceRuntimeRealtimeCommandResult.Accepted(false),
+      engine.start("later-start", fence) { true },
+    )
+    assertEquals(1, server.startCount)
+    assertEquals(VoiceRealtimePhase.NEGOTIATING, engine.snapshot()?.phase)
+  }
+
+  @Test
   fun `blocked action poll does not delay offer or snapshot`() {
     val engine = engine()
     assertTrue(engine.start("start-1", fence) is VoiceRuntimeRealtimeCommandResult.Accepted)

@@ -2,6 +2,7 @@ package expo.modules.t3voice
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -64,6 +65,37 @@ class VoiceRuntimeActiveThreadControllerTest {
     val thrown = controller.dispatch(start(commandId = "thrown"))
     assertTrue(thrown.outcome is VoiceRuntimeCommandOutcome.Rejected)
     assertEquals(VoiceRuntimeOperation.None, controller.snapshot().operation)
+  }
+
+  @Test
+  fun cancelledAdmissionIsJournaledReplayedAndDoesNotBlockALaterStart() {
+    configure()
+    var admissionChecks = 0
+
+    val cancelled = controller.dispatch(start(commandId = "cancelled")) {
+      admissionChecks += 1
+      false
+    }
+    assertEquals(
+      VoiceRuntimeCommandOutcome.Rejected("start-cancelled"),
+      cancelled.outcome,
+    )
+    assertFalse(cancelled.replayed)
+    assertEquals(1, admissionChecks)
+    assertNull(execution.started)
+    assertEquals(VoiceRuntimeOperation.None, controller.snapshot().operation)
+
+    val replayed = controller.dispatch(start(commandId = "cancelled")) {
+      admissionChecks += 1
+      true
+    }
+    assertEquals(VoiceRuntimeCommandOutcome.Rejected("start-cancelled"), replayed.outcome)
+    assertTrue(replayed.replayed)
+    assertEquals(1, admissionChecks)
+
+    val later = controller.dispatch(start(commandId = "later")) { true }
+    assertTrue(later.outcome is VoiceRuntimeCommandOutcome.Accepted)
+    assertEquals("turn-client", execution.started)
   }
 
   @Test

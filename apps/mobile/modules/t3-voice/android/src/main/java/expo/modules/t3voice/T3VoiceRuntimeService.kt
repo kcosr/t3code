@@ -1224,7 +1224,10 @@ class T3VoiceRuntimeService : Service() {
       voiceRuntimeController.acknowledgeRetainedRecord(identity, key)
     }
 
-    fun dispatchVoiceRuntime(command: VoiceRuntimeNativeCommand): VoiceRuntimeCommandReceipt {
+    fun dispatchVoiceRuntime(
+      command: VoiceRuntimeNativeCommand,
+      admission: T3VoiceBinderOperationAdmission,
+    ): VoiceRuntimeCommandReceipt {
       if (command !is VoiceRuntimeNativeCommand.StopMode) {
         synchronized(operationLock) {
           val persisted = (voiceRuntimeAuthorityStore.load()
@@ -1240,7 +1243,15 @@ class T3VoiceRuntimeService : Service() {
       }
       return when (command) {
         is VoiceRuntimeNativeCommand.Thread -> synchronized(operationLock) {
-          voiceRuntimeController.dispatch(command.command)
+          when (command.command) {
+            is VoiceRuntimeThreadCommand.Start,
+            is VoiceRuntimeThreadCommand.Resume,
+            -> voiceRuntimeController.dispatch(command.command, admission::tryAdmit)
+            else -> {
+              check(admission.tryAdmit()) { "The voice operation was cancelled before admission." }
+              voiceRuntimeController.dispatch(command.command)
+            }
+          }
         }
         is VoiceRuntimeNativeCommand.StartRealtime -> {
           val engine = requireRealtimeEngineLocked(command.identity)
@@ -1250,15 +1261,19 @@ class T3VoiceRuntimeService : Service() {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
             )
           }
-          realtimeCommandReceipt(
-            command,
-            engine.start(
-              command.commandId,
-              VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
-            ),
+          val result = engine.start(
+            command.commandId,
+            VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
+            admission::tryAdmit,
           )
+          if (result is VoiceRuntimeRealtimeCommandResult.Rejected &&
+            result.reason == "start-cancelled") {
+            synchronized(operationLock) { reconcileForegroundAfterVoiceStopLocked() }
+          }
+          realtimeCommandReceipt(command, result)
         }
         is VoiceRuntimeNativeCommand.StopMode -> {
+          check(admission.tryAdmit()) { "The voice stop was cancelled before admission." }
           val operation = synchronized(operationLock) { voiceRuntimeController.snapshot().operation }
           if (operation is VoiceRuntimeOperation.ThreadTurn) {
             synchronized(operationLock) {
@@ -1286,23 +1301,29 @@ class T3VoiceRuntimeService : Service() {
           }
         }
         is VoiceRuntimeNativeCommand.SetRealtimeMuted -> realtimeBooleanReceipt(command) {
+          check(admission.tryAdmit()) { "The voice operation was cancelled before admission." }
           requireRealtimeEngineLocked(command.identity).setMuted(
             VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
             command.muted,
           )
         }
         is VoiceRuntimeNativeCommand.UpdateRealtimeFocus -> realtimeBooleanReceipt(command) {
+          check(admission.tryAdmit()) { "The voice operation was cancelled before admission." }
           requireRealtimeEngineLocked(command.identity).updateFocus(
             VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
             command.commandId,
             command.focus,
           )
         }
-        is VoiceRuntimeNativeCommand.SetAudioRoute -> realtimeCommandReceipt(
-          command,
-          VoiceRuntimeRealtimeCommandResult.Rejected("unsupported-capability"),
-        )
+        is VoiceRuntimeNativeCommand.SetAudioRoute -> {
+          check(admission.tryAdmit()) { "The voice operation was cancelled before admission." }
+          realtimeCommandReceipt(
+            command,
+            VoiceRuntimeRealtimeCommandResult.Rejected("unsupported-capability"),
+          )
+        }
         is VoiceRuntimeNativeCommand.DecideRealtimeConfirmation -> {
+          check(admission.tryAdmit()) { "The voice operation was cancelled before admission." }
           synchronized(operationLock) {
             val pending = voiceRuntimeRealtimeEngine?.snapshot()?.pendingAction
               as? VoiceRuntimeRealtimeAction.ConfirmationRequired
@@ -1908,13 +1929,34 @@ class T3VoiceRuntimeService : Service() {
         canonicalInstalled = null
       }
     }
-    val installedRuntimeId = T3VoiceRecoveredRealtimeAuthorityPolicy.runtimeId(
-      canonicalInstalled?.authority,
-      startupFinalization,
-      startupRealtimeCheckpoint,
-      retiredAuthorityFence,
-      readinessStore.activeAuthority(),
-    ) ?: startupAttachedPreparation?.fence?.runtimeId
+    val startupPersistentPreparation =
+      if (canonicalInstalled == null) {
+        T3VoiceStartupAuthorityFencePolicy.persistentPreparation(
+          readinessStore.prepared(),
+          voiceRuntimeAuthorityStore.inspectPreparedRefreshCredential(),
+        )
+      } else {
+        null
+      }
+    val startupPreparation = T3VoiceStartupAuthorityFencePolicy.selectPreparation(
+      startupPersistentPreparation,
+      startupAttachedPreparation?.takeIf { canonicalInstalled == null },
+    )
+    T3VoiceStartupAuthorityFencePolicy.requireCompatibleGeneration(
+      startupPreparation,
+      startupFinalization?.fence?.identity?.generation,
+      startupRealtimeCheckpoint?.fence?.identity?.generation,
+      readinessStore.activeAuthority()?.config?.generation,
+      retiredAuthorityFence?.generation,
+    )
+    val installedRuntimeId = T3VoiceStartupAuthorityFencePolicy.selectRuntimeId(
+      canonicalInstalled?.authority?.runtimeId,
+      startupFinalization?.fence?.identity?.runtimeId,
+      startupRealtimeCheckpoint?.fence?.identity?.runtimeId,
+      readinessStore.activeAuthority()?.runtimeId,
+      startupPreparation?.runtimeId,
+      retiredAuthorityFence?.runtimeId,
+    )
     val canonicalRuntimeId = VoiceRuntimeDeviceIdentityStore(applicationContext)
       .getOrCreate(installedRuntimeId)
     voiceRuntimeController = VoiceRuntimeActiveThreadController(
@@ -2010,10 +2052,11 @@ class T3VoiceRuntimeService : Service() {
           cursor.sequence,
         ))
       },
-      initialGeneration = listOfNotNull(
-        retiredAuthorityFence?.generation,
-        startupAttachedPreparation?.fence?.generation?.minus(1),
-      ).maxOrNull(),
+      initialGeneration = when {
+        canonicalInstalled != null -> null
+        startupPreparation != null -> startupPreparation.expectedCurrentGeneration
+        else -> retiredAuthorityFence?.generation
+      },
     )
     startupAttachedPreparation?.takeIf { canonicalInstalled == null }?.let { prepared ->
       val config = verifyReadiness(prepared.readiness)
@@ -4745,6 +4788,55 @@ class T3VoiceRuntimeService : Service() {
     val deferred = voiceRuntimeRealtimeEngineSlot.deferredFor(engine)
     val canonical = (voiceRuntimeAuthorityStore.load()
       as? VoiceRuntimeAuthorityLoadResult.Available)?.authority
+    val notificationDisabledCanonical = canonical?.takeIf {
+      !it.readinessEnabled &&
+        readinessStore.disabledAuthorityFence() ==
+          T3VoiceDisabledAuthorityFence(it.runtimeId, it.generation)
+    }
+    if (notificationDisabledCanonical != null) {
+      if (!T3VoiceDisabledAuthorityRetentionPolicy.shouldClearAtTerminal(
+          notificationDisabledCanonical,
+          readinessStore.disabledAuthorityFence(),
+          voiceRuntimeController.isIdle(),
+        )) {
+        updateRuntimeControlSurfacesLocked()
+        return
+      }
+      val cleared = T3VoiceDisabledTerminalCleanupCoordinator.run(
+        canonicalIdle = voiceRuntimeController.isIdle(),
+        clearController = {
+          runCatching {
+            voiceRuntimeController.clearAuthority(
+              "realtime-disabled-terminal-${UUID.randomUUID()}",
+              voiceRuntimeController.snapshot().identity,
+            )
+          }.isSuccess
+        },
+        clearAuthority = {
+          voiceRuntimeAuthorityStore.clear()
+          check(readinessStore.clearDisabledAuthorityFence(
+            T3VoiceDisabledAuthorityFence(
+              notificationDisabledCanonical.runtimeId,
+              notificationDisabledCanonical.generation,
+            ),
+          )) { "Could not clear the disabled Realtime authority fence." }
+        },
+        clearEngine = {
+          voiceRuntimeRealtimeEngineSlot.clear(voiceRuntimeRealtimeEngineSlot.fence())
+        },
+      )
+      if (!cleared) {
+        T3VoiceDiagnostics.record(
+          0,
+          T3VoiceDiagnosticCategory.TERMINAL,
+          T3VoiceDiagnosticCode.CLEANUP_RECONCILIATION_REQUIRED,
+        )
+        updateRuntimeControlSurfacesLocked()
+        return
+      }
+      updateRuntimeControlSurfacesLocked()
+      return
+    }
     if (deferred != null && canonical?.target is VoiceRuntimeTarget.Realtime) {
       val candidate = createRealtimeEngineLocked(deferred.authority)
       voiceRuntimeRealtimeEngineSlot.swapDeferredAfterTerminal(deferred, candidate)
@@ -5006,7 +5098,14 @@ class T3VoiceRuntimeService : Service() {
     if (!::voiceRuntimeController.isInitialized) return
     val persisted = (voiceRuntimeAuthorityStore.load()
       as? VoiceRuntimeAuthorityLoadResult.Available)?.authority ?: return
-    if (!VoiceRuntimeAuthorityLifecyclePolicy.shouldClear(
+    val disabledAuthorityFence = readinessStore.disabledAuthorityFence()
+    val clearDisabledAtTerminal = T3VoiceDisabledAuthorityRetentionPolicy.shouldClearAtTerminal(
+      persisted,
+      disabledAuthorityFence,
+      voiceRuntimeController.isIdle(),
+    )
+    if (!clearDisabledAtTerminal &&
+      !VoiceRuntimeAuthorityLifecyclePolicy.shouldClear(
         persisted.readinessEnabled,
         voiceRuntimeController.consumerCount(),
         voiceRuntimeController.isIdle(),
@@ -5019,6 +5118,9 @@ class T3VoiceRuntimeService : Service() {
         T3VoicePendingRuntimeRevocation(persisted.runtimeId, persisted.environmentOrigin),
       )
       voiceRuntimeAuthorityStore.clear()
+      disabledAuthorityFence?.takeIf {
+        it.runtimeId == persisted.runtimeId && it.generation == persisted.generation
+      }?.let { check(readinessStore.clearDisabledAuthorityFence(it)) }
       clearIdleRealtimeEngineLocked()
       VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
     }
@@ -5730,9 +5832,28 @@ class T3VoiceRuntimeService : Service() {
         readinessConfig,
         readinessStore.pendingDisabled(),
       )) {
+      VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
+      val persisted = voiceRuntimeAuthorityStore.loadForRefresh()
+      val disabledFence = readinessStore.disabledAuthorityFence()
+      if (persisted != null && persisted.readinessEnabled &&
+        disabledFence == T3VoiceDisabledAuthorityFence(
+          persisted.runtimeId,
+          persisted.generation,
+        )) {
+        runCatching {
+          voiceRuntimeAuthorityStore.disableReadiness(
+            persisted.runtimeId,
+            persisted.generation,
+          )
+        }.getOrElse {
+          enterCanonicalRecoveryRequiredLocked("notification-disable-refresh-fence")
+          return
+        }
+      }
       reconcileReadinessLocked()
       return
     }
+    VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
     val canonical = voiceRuntimeController.snapshot()
     val disabled = T3VoiceCanonicalReadinessPolicy.disabled(
       readinessConfig,
@@ -5760,8 +5881,22 @@ class T3VoiceRuntimeService : Service() {
           T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin)
         }
     readinessConfig = disabled
-    readinessStore.writeDisabledWithPending(disabled, revocation)
+    val disabledAuthorityFence = grantMetadata?.let {
+      T3VoiceDisabledAuthorityFence(it.runtimeId, it.generation)
+    }
+    readinessStore.writeDisabledWithPending(disabled, revocation, disabledAuthorityFence)
     canonicalPreparedAuthority = null
+    grantMetadata?.let { persisted ->
+      runCatching {
+        voiceRuntimeAuthorityStore.disableReadiness(
+          persisted.runtimeId,
+          persisted.generation,
+        )
+      }.getOrElse {
+        enterCanonicalRecoveryRequiredLocked("notification-disable-refresh-fence")
+        return
+      }
+    }
     if (canonical.operation == VoiceRuntimeOperation.None) {
       if (canonical.target != null) {
         runCatching {
@@ -5775,7 +5910,11 @@ class T3VoiceRuntimeService : Service() {
         }
       }
       voiceRuntimeAuthorityStore.clear()
-      VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
+      disabledAuthorityFence?.let {
+        check(readinessStore.clearDisabledAuthorityFence(it)) {
+          "Could not clear the idle disabled authority fence."
+        }
+      }
       clearIdleRealtimeEngineLocked()
     }
     controllerCommands.invalidateReadiness()

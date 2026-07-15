@@ -19,26 +19,79 @@ internal class VoiceRuntimeAuthorityRefreshWorker(
 ) : Worker(appContext, workerParams) {
   override fun doWork(): Result {
     val store = VoiceRuntimeAuthorityStore(applicationContext)
+    val readinessStore = T3VoiceReadinessStore(applicationContext)
     val authority = store.loadForRefresh() ?: return Result.failure()
-    if (!authority.readinessEnabled) return Result.failure()
+    if (!canRefresh(authority, readinessStore)) return Result.failure()
     val attempt = runCatching { store.beginRefresh() }.getOrElse { return Result.failure() }
+    if (!canRefresh(authority, readinessStore)) return Result.failure()
     startRuntimeService(T3VoiceRuntimeService.ACTION_AUTHORITY_REFRESH_PENDING)
     return when (val result = VoiceRuntimeAuthorityRefreshClient().refresh(authority, attempt)) {
       is VoiceRuntimeRefreshResult.Success -> {
-        runCatching { store.promoteRefresh(attempt, result.authority) {} }
-          .getOrElse { return Result.failure() }
-        VoiceRuntimeAuthorityRefreshScheduler.schedule(applicationContext, result.authority)
+        if (canRefresh(authority, readinessStore)) {
+          val promoted = runCatching { store.promoteRefresh(attempt, result.authority) {} }
+          if (promoted.isFailure) {
+            if (!isDurablyDisabled(authority, readinessStore) ||
+              runCatching {
+                store.promoteDisabledRefresh(attempt, result.authority)
+              }.isFailure) {
+              return Result.failure()
+            }
+            VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
+            runCatching { startRuntimeService(T3VoiceRuntimeService.ACTION_AUTHORITY_REFRESHED) }
+            return Result.success()
+          }
+          VoiceRuntimeAuthorityRefreshScheduler.schedule(applicationContext, result.authority)
+          if (!canRefresh(result.authority, readinessStore)) {
+            VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
+          }
+        } else if (isDurablyDisabled(authority, readinessStore)) {
+          runCatching { store.promoteDisabledRefresh(attempt, result.authority) }
+            .getOrElse { return Result.failure() }
+          VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
+        } else {
+          return Result.failure()
+        }
         runCatching { startRuntimeService(T3VoiceRuntimeService.ACTION_AUTHORITY_REFRESHED) }
         Result.success()
       }
-      is VoiceRuntimeRefreshResult.Retryable -> Result.retry()
+      is VoiceRuntimeRefreshResult.Retryable ->
+        if (isDurablyDisabled(authority, readinessStore)) {
+          VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
+          Result.failure()
+        } else {
+          Result.retry()
+        }
       is VoiceRuntimeRefreshResult.Rejected -> {
+        if (isDurablyDisabled(authority, readinessStore)) {
+          VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
+          return Result.failure()
+        }
         runCatching { store.rejectRefresh(attempt) }.getOrElse { return Result.failure() }
         VoiceRuntimeAuthorityRefreshScheduler.cancel(applicationContext)
         runCatching { startRuntimeService(T3VoiceRuntimeService.ACTION_AUTHORITY_REFRESH_REJECTED) }
         Result.failure()
       }
     }
+  }
+
+  private fun canRefresh(
+    authority: VoiceRuntimePersistedAuthority,
+    readinessStore: T3VoiceReadinessStore,
+  ): Boolean = T3VoiceAuthorityRefreshAdmissionPolicy.canRefresh(
+    authority,
+    readinessStore.read(),
+    readinessStore.disabledAuthorityFence(),
+  )
+
+  private fun isDurablyDisabled(
+    authority: VoiceRuntimePersistedAuthority,
+    readinessStore: T3VoiceReadinessStore,
+  ): Boolean {
+    return T3VoiceAuthorityRefreshAdmissionPolicy.isDurablyDisabled(
+      authority,
+      readinessStore.read(),
+      readinessStore.disabledAuthorityFence(),
+    )
   }
 
   private fun startRuntimeService(actionValue: String) {

@@ -65,6 +65,130 @@ internal data class T3VoiceDisabledReadiness(
   val runtimeId: String?,
 )
 
+internal data class T3VoiceDisabledAuthorityFence(
+  val runtimeId: String,
+  val generation: Long,
+) {
+  init {
+    require(runtimeId.isNotBlank() && runtimeId.length <= 128)
+    require(generation > 0)
+  }
+}
+
+internal data class T3VoiceStartupAuthorityFence(
+  val runtimeId: String,
+  val expectedCurrentGeneration: Long,
+)
+
+internal object T3VoiceStartupAuthorityFencePolicy {
+  fun persistentPreparation(
+    prepared: T3VoicePreparedReadiness?,
+    refresh: VoiceRuntimePreparedRefreshCredential?,
+  ): T3VoiceStartupAuthorityFence? {
+    prepared ?: return null
+    require(prepared.config.generation > 0) {
+      "Persistent readiness preparation has an invalid generation."
+    }
+    refresh?.fence?.let { fence ->
+      require(
+        fence.runtimeId == prepared.runtimeId &&
+          fence.generation == prepared.config.generation &&
+          fence.targetDigest == prepared.targetIdentityDigest &&
+          fence.operation == prepared.operation &&
+          fence.environmentOrigin == prepared.environmentOrigin,
+      ) { "Persistent readiness preparation does not match its refresh fence." }
+    }
+    return T3VoiceStartupAuthorityFence(
+      prepared.runtimeId,
+      prepared.config.generation - 1,
+    )
+  }
+
+  fun selectPreparation(
+    persistent: T3VoiceStartupAuthorityFence?,
+    attached: VoiceRuntimePreparedAttachedAuthority?,
+  ): T3VoiceStartupAuthorityFence? {
+    val attachedFence = attached?.let {
+      require(it.fence.generation > 0) {
+        "Attached authority preparation has an invalid generation."
+      }
+      T3VoiceStartupAuthorityFence(
+        it.fence.runtimeId,
+        it.fence.generation - 1,
+      )
+    }
+    require(persistent == null || attachedFence == null) {
+      "Persistent and attached authority preparations cannot coexist."
+    }
+    return persistent ?: attachedFence
+  }
+
+  fun selectRuntimeId(vararg runtimeIds: String?): String? {
+    val distinct = runtimeIds.filterNotNull().distinct()
+    require(distinct.size <= 1) {
+      "Recovered voice authority fences belong to different runtimes."
+    }
+    return distinct.singleOrNull()
+  }
+
+  fun requireCompatibleGeneration(
+    preparation: T3VoiceStartupAuthorityFence?,
+    vararg recoveredGenerations: Long?,
+  ) {
+    preparation ?: return
+    val distinct = recoveredGenerations.filterNotNull().distinct()
+    require(distinct.all { it == preparation.expectedCurrentGeneration }) {
+      "Prepared voice authority generation conflicts with recovered runtime state."
+    }
+  }
+}
+
+internal object T3VoiceAuthorityRefreshAdmissionPolicy {
+  fun canRefresh(
+    authority: VoiceRuntimePersistedAuthority,
+    readiness: T3VoiceReadinessConfig,
+    disabledFence: T3VoiceDisabledAuthorityFence?,
+  ): Boolean =
+    authority.readinessEnabled &&
+      readiness.enabled &&
+      readiness.generation == authority.generation &&
+      disabledFence != T3VoiceDisabledAuthorityFence(authority.runtimeId, authority.generation)
+
+  fun isDurablyDisabled(
+    authority: VoiceRuntimePersistedAuthority,
+    readiness: T3VoiceReadinessConfig,
+    disabledFence: T3VoiceDisabledAuthorityFence?,
+  ): Boolean =
+    !readiness.enabled &&
+      readiness.generation >= authority.generation &&
+      disabledFence == T3VoiceDisabledAuthorityFence(authority.runtimeId, authority.generation)
+}
+
+internal object T3VoiceDisabledTerminalCleanupCoordinator {
+  fun run(
+    canonicalIdle: Boolean,
+    clearController: () -> Boolean,
+    clearAuthority: () -> Unit,
+    clearEngine: () -> Unit,
+  ): Boolean {
+    if (!canonicalIdle || !clearController()) return false
+    clearAuthority()
+    clearEngine()
+    return true
+  }
+}
+
+internal object T3VoiceDisabledAuthorityRetentionPolicy {
+  fun shouldClearAtTerminal(
+    authority: VoiceRuntimePersistedAuthority,
+    disabledFence: T3VoiceDisabledAuthorityFence?,
+    canonicalIdle: Boolean,
+  ): Boolean =
+    !authority.readinessEnabled &&
+      disabledFence == T3VoiceDisabledAuthorityFence(authority.runtimeId, authority.generation) &&
+      canonicalIdle
+}
+
 internal enum class VoiceRuntimeAuthorityState(val wireValue: String) {
   PREPARED("prepared"),
   ACTIVE("active"),
@@ -304,9 +428,20 @@ internal class T3VoiceReadinessStore(context: Context) {
     return T3VoiceRuntimeEvent.ReadinessDisabled(generation, "notification")
   }
 
+  fun disabledAuthorityFence(): T3VoiceDisabledAuthorityFence? {
+    val runtimeId = preferences.getString(KEY_DISABLED_AUTHORITY_RUNTIME_ID, null)
+    val generation = preferences.getLong(KEY_DISABLED_AUTHORITY_GENERATION, -1)
+    if (runtimeId == null && generation < 0) return null
+    check(runtimeId != null && generation > 0) {
+      "The disabled authority fence is incomplete."
+    }
+    return T3VoiceDisabledAuthorityFence(runtimeId, generation)
+  }
+
   fun writeDisabledWithPending(
     config: T3VoiceReadinessConfig,
     revocation: T3VoicePendingRuntimeRevocation?,
+    authorityFence: T3VoiceDisabledAuthorityFence?,
   ) {
     require(!config.enabled)
     val edit = preferences.edit()
@@ -326,6 +461,13 @@ internal class T3VoiceReadinessStore(context: Context) {
       .remove(KEY_ACTIVE_ENVIRONMENT_ORIGIN)
       .remove(KEY_ACTIVE_OPERATION)
       .remove(KEY_ACTIVE_TARGET_DIGEST)
+    if (authorityFence == null) {
+      edit.remove(KEY_DISABLED_AUTHORITY_RUNTIME_ID)
+        .remove(KEY_DISABLED_AUTHORITY_GENERATION)
+    } else {
+      edit.putString(KEY_DISABLED_AUTHORITY_RUNTIME_ID, authorityFence.runtimeId)
+        .putLong(KEY_DISABLED_AUTHORITY_GENERATION, authorityFence.generation)
+    }
     if (revocation !== null) {
       edit.putString(KEY_PENDING_REVOCATION_RUNTIME_ID, revocation.runtimeId)
         .putString(
@@ -342,6 +484,14 @@ internal class T3VoiceReadinessStore(context: Context) {
     return true
   }
 
+  fun clearDisabledAuthorityFence(expected: T3VoiceDisabledAuthorityFence): Boolean {
+    if (disabledAuthorityFence() != expected) return false
+    return preferences.edit()
+      .remove(KEY_DISABLED_AUTHORITY_RUNTIME_ID)
+      .remove(KEY_DISABLED_AUTHORITY_GENERATION)
+      .commit()
+  }
+
   companion object {
     private const val PREFERENCES_NAME = "t3_voice_readiness"
     private const val KEY_ENABLED = "enabled"
@@ -351,6 +501,8 @@ internal class T3VoiceReadinessStore(context: Context) {
     private const val KEY_AUTO_REARM = "auto_rearm"
     private const val KEY_GENERATION = "generation"
     private const val KEY_PENDING_DISABLED_GENERATION = "pending_disabled_generation"
+    private const val KEY_DISABLED_AUTHORITY_RUNTIME_ID = "disabled_authority_runtime_id"
+    private const val KEY_DISABLED_AUTHORITY_GENERATION = "disabled_authority_generation"
     private const val KEY_PREPARED = "prepared"
     private const val KEY_PREPARED_RUNTIME_ID = "prepared_runtime_id"
     private const val KEY_PREPARED_ENVIRONMENT_ORIGIN = "prepared_environment_origin"

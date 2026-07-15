@@ -829,9 +829,16 @@ internal class VoiceRuntimeActiveThreadController(
   }
 
   @Synchronized
-  fun dispatch(command: VoiceRuntimeThreadCommand): VoiceRuntimeCommandReceipt {
+  fun dispatch(
+    command: VoiceRuntimeThreadCommand,
+    activationAdmission: () -> Boolean = { true },
+  ): VoiceRuntimeCommandReceipt {
     val fingerprint = commandFingerprint(command)
     val (receipt, replayed) = commands.resolve(command.commandId, fingerprint) {
+      if ((command is VoiceRuntimeThreadCommand.Start || command is VoiceRuntimeThreadCommand.Resume) &&
+        !activationAdmission()) {
+        return@resolve receipt(command, VoiceRuntimeCommandOutcome.Rejected("start-cancelled"))
+      }
       admit(command)
     }
     return if (replayed) receipt.copy(replayed = true) else receipt

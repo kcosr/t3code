@@ -47,28 +47,30 @@ class T3VoiceBinderOperationDispatcherTest {
     val dispatcher = queuedDispatcher(ordered, interrupts)
     val fence = T3VoiceBinderOperationFence(VoiceRuntimeIdentity("runtime", "instance", 1), "session")
     var startRan = false
-    var startCancelled = false
+    var startReachedAdmission = false
     var stopRan = false
 
     assertTrue(
       dispatcher.post(
         T3VoiceBinderOperationLane.ORDERED,
         T3VoiceBinderOperationOrdering.Activation(fence),
-        onCancelled = { startCancelled = true },
-      ) { startRan = true },
+      ) { admission ->
+        startReachedAdmission = true
+        startRan = admission.tryAdmit()
+      },
     )
     assertTrue(
       dispatcher.post(
         T3VoiceBinderOperationLane.INTERRUPT,
         T3VoiceBinderOperationOrdering.Stop(fence),
-      ) { stopRan = true },
+      ) { admission -> stopRan = admission.tryAdmit() },
     )
 
     interrupts.removeFirst().run()
     ordered.removeFirst().run()
 
     assertTrue(stopRan)
-    assertTrue(startCancelled)
+    assertTrue(startReachedAdmission)
     assertFalse(startRan)
   }
 
@@ -79,29 +81,31 @@ class T3VoiceBinderOperationDispatcherTest {
     val dispatcher = queuedDispatcher(ordered, interrupts)
     val fence = T3VoiceBinderOperationFence(VoiceRuntimeIdentity("runtime", "instance", 1), "session")
     var startsRan = 0
-    var startsCancelled = 0
+    var startsReachedAdmission = 0
 
     repeat(2) {
       assertTrue(
         dispatcher.post(
           T3VoiceBinderOperationLane.ORDERED,
           T3VoiceBinderOperationOrdering.Activation(fence),
-          onCancelled = { startsCancelled += 1 },
-        ) { startsRan += 1 },
+        ) { admission ->
+          startsReachedAdmission += 1
+          if (admission.tryAdmit()) startsRan += 1
+        },
       )
     }
     assertTrue(
       dispatcher.post(
         T3VoiceBinderOperationLane.INTERRUPT,
         T3VoiceBinderOperationOrdering.Stop(fence),
-      ) {},
+      ) { it.tryAdmit() },
     )
 
     interrupts.removeFirst().run()
     ordered.removeFirst().run()
     ordered.removeFirst().run()
 
-    assertEquals(2, startsCancelled)
+    assertEquals(2, startsReachedAdmission)
     assertEquals(0, startsRan)
   }
 
@@ -111,28 +115,27 @@ class T3VoiceBinderOperationDispatcherTest {
     val interrupts = ArrayDeque<Runnable>()
     val dispatcher = queuedDispatcher(ordered, interrupts)
     val fence = T3VoiceBinderOperationFence(VoiceRuntimeIdentity("runtime", "instance", 1), "session")
-    var firstCancelled = false
+    var firstAdmitted = true
     var reconnectedStartRan = false
 
     dispatcher.post(
       T3VoiceBinderOperationLane.ORDERED,
       T3VoiceBinderOperationOrdering.Activation(fence),
-      onCancelled = { firstCancelled = true },
-    ) {}
+    ) { firstAdmitted = it.tryAdmit() }
     dispatcher.post(
       T3VoiceBinderOperationLane.INTERRUPT,
       T3VoiceBinderOperationOrdering.Stop(fence),
-    ) {}
+    ) { it.tryAdmit() }
     dispatcher.post(
       T3VoiceBinderOperationLane.ORDERED,
       T3VoiceBinderOperationOrdering.Activation(fence),
-    ) { reconnectedStartRan = true }
+    ) { admission -> reconnectedStartRan = admission.tryAdmit() }
 
     interrupts.removeFirst().run()
     ordered.removeFirst().run()
     ordered.removeFirst().run()
 
-    assertTrue(firstCancelled)
+    assertFalse(firstAdmitted)
     assertTrue(reconnectedStartRan)
   }
 
@@ -148,26 +151,52 @@ class T3VoiceBinderOperationDispatcherTest {
     )
     val fence = T3VoiceBinderOperationFence(VoiceRuntimeIdentity("runtime", "instance", 1), "session")
     var startRan = false
-    var startCancelled = false
 
     assertTrue(
       dispatcher.post(
         T3VoiceBinderOperationLane.ORDERED,
         T3VoiceBinderOperationOrdering.Activation(fence),
-        onCancelled = { startCancelled = true },
-      ) { startRan = true },
+      ) { admission -> startRan = admission.tryAdmit() },
     )
     assertFalse(
       dispatcher.post(
         T3VoiceBinderOperationLane.INTERRUPT,
         T3VoiceBinderOperationOrdering.Stop(fence),
-      ) {},
+      ) { it.tryAdmit() },
     )
 
     ordered.removeFirst().run()
 
     assertTrue(startRan)
-    assertFalse(startCancelled)
+  }
+
+  @Test
+  fun stopOnlyCancelsTheExactRuntimeAndModeFence() {
+    val ordered = ArrayDeque<Runnable>()
+    val interrupts = ArrayDeque<Runnable>()
+    val dispatcher = queuedDispatcher(ordered, interrupts)
+    val firstFence = T3VoiceBinderOperationFence(
+      VoiceRuntimeIdentity("runtime", "instance", 1),
+      "session",
+    )
+    val differentGeneration = firstFence.copy(
+      identity = firstFence.identity.copy(generation = 2),
+    )
+    var firstAdmitted = false
+
+    dispatcher.post(
+      T3VoiceBinderOperationLane.ORDERED,
+      T3VoiceBinderOperationOrdering.Activation(firstFence),
+    ) { firstAdmitted = it.tryAdmit() }
+    dispatcher.post(
+      T3VoiceBinderOperationLane.INTERRUPT,
+      T3VoiceBinderOperationOrdering.Stop(differentGeneration),
+    ) { it.tryAdmit() }
+
+    interrupts.removeFirst().run()
+    ordered.removeFirst().run()
+
+    assertTrue(firstAdmitted)
   }
 
   @Test
@@ -189,11 +218,13 @@ class T3VoiceBinderOperationDispatcherTest {
     val results = mutableListOf<String>()
 
     try {
-      dispatcher.post(T3VoiceBinderOperationLane.ORDERED) {
+      dispatcher.post(T3VoiceBinderOperationLane.ORDERED) { admission ->
+        assertTrue(admission.tryAdmit())
         results += "start"
         completed.countDown()
       }
-      dispatcher.post(T3VoiceBinderOperationLane.ORDERED) {
+      dispatcher.post(T3VoiceBinderOperationLane.ORDERED) { admission ->
+        assertTrue(admission.tryAdmit())
         results += "answer"
         completed.countDown()
       }
@@ -231,7 +262,8 @@ class T3VoiceBinderOperationDispatcherTest {
         dispatcher.post(
           T3VoiceBinderOperationLane.ORDERED,
           T3VoiceBinderOperationOrdering.Activation(fence),
-        ) {
+        ) { admission ->
+          assertTrue(admission.tryAdmit())
           orderedStarted.countDown()
           releaseOrdered.await()
         },
@@ -242,7 +274,8 @@ class T3VoiceBinderOperationDispatcherTest {
         dispatcher.post(
           T3VoiceBinderOperationLane.INTERRUPT,
           T3VoiceBinderOperationOrdering.Stop(fence),
-        ) {
+        ) { admission ->
+          assertTrue(admission.tryAdmit())
           interruptCompleted.countDown()
         },
       )
@@ -250,6 +283,62 @@ class T3VoiceBinderOperationDispatcherTest {
       assertTrue(interruptCompleted.await(1, TimeUnit.SECONDS))
     } finally {
       releaseOrdered.countDown()
+      orderedExecutor.shutdownNow()
+      interruptExecutor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun stopCancelsAStartPausedBetweenDispatcherAndServiceAdmission() {
+    val orderedExecutor = Executors.newSingleThreadExecutor()
+    val interruptExecutor = Executors.newSingleThreadExecutor()
+    val dispatcher = T3VoiceBinderOperationDispatcher(
+      orderedPost = {
+        orderedExecutor.submit(it)
+        true
+      },
+      interruptPost = {
+        interruptExecutor.submit(it)
+        true
+      },
+    )
+    val reachedServiceBoundary = CountDownLatch(1)
+    val releaseServiceAdmission = CountDownLatch(1)
+    val stopCompleted = CountDownLatch(1)
+    val startCompleted = CountDownLatch(1)
+    val fence = T3VoiceBinderOperationFence(VoiceRuntimeIdentity("runtime", "instance", 1), "session")
+    var startAdmitted = true
+
+    try {
+      assertTrue(
+        dispatcher.post(
+          T3VoiceBinderOperationLane.ORDERED,
+          T3VoiceBinderOperationOrdering.Activation(fence),
+        ) { admission ->
+          reachedServiceBoundary.countDown()
+          releaseServiceAdmission.await()
+          startAdmitted = admission.tryAdmit()
+          startCompleted.countDown()
+        },
+      )
+      assertTrue(reachedServiceBoundary.await(1, TimeUnit.SECONDS))
+
+      assertTrue(
+        dispatcher.post(
+          T3VoiceBinderOperationLane.INTERRUPT,
+          T3VoiceBinderOperationOrdering.Stop(fence),
+        ) { admission ->
+          assertTrue(admission.tryAdmit())
+          stopCompleted.countDown()
+        },
+      )
+      assertTrue(stopCompleted.await(1, TimeUnit.SECONDS))
+
+      releaseServiceAdmission.countDown()
+      assertTrue(startCompleted.await(1, TimeUnit.SECONDS))
+      assertFalse(startAdmitted)
+    } finally {
+      releaseServiceAdmission.countDown()
       orderedExecutor.shutdownNow()
       interruptExecutor.shutdownNow()
     }
