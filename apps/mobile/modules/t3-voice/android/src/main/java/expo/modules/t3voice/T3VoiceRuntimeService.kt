@@ -2223,7 +2223,11 @@ class T3VoiceRuntimeService : Service() {
       }
       ACTION_START_RECORDING -> {
         val foregroundServiceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-        promoteForegroundOnMainThread(foregroundServiceType)
+        if (T3VoiceStartCommandPolicy.shouldPromoteForegroundImmediately(
+            T3VoiceStateStore.state.value.isForeground,
+          )) {
+          promoteForegroundOnMainThread(foregroundServiceType)
+        }
         mailbox.submit(
           VoiceKernelMessage.HostIntent(VoiceKernelHostIntentAction.ACTION_START_RECORDING),
         ) {
@@ -2239,7 +2243,11 @@ class T3VoiceRuntimeService : Service() {
       }
       ACTION_START_PLAYBACK -> {
         val foregroundServiceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-        promoteForegroundOnMainThread(foregroundServiceType)
+        if (T3VoiceStartCommandPolicy.shouldPromoteForegroundImmediately(
+            T3VoiceStateStore.state.value.isForeground,
+          )) {
+          promoteForegroundOnMainThread(foregroundServiceType)
+        }
         mailbox.submit(
           VoiceKernelMessage.HostIntent(VoiceKernelHostIntentAction.ACTION_START_PLAYBACK),
         ) {
@@ -2257,7 +2265,11 @@ class T3VoiceRuntimeService : Service() {
         val foregroundServiceType =
           ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-        promoteForegroundOnMainThread(foregroundServiceType)
+        if (T3VoiceStartCommandPolicy.shouldPromoteForegroundImmediately(
+            T3VoiceStateStore.state.value.isForeground,
+          )) {
+          promoteForegroundOnMainThread(foregroundServiceType)
+        }
         mailbox.submit(
           VoiceKernelMessage.HostIntent(VoiceKernelHostIntentAction.ACTION_START_REALTIME),
         ) {
@@ -4834,12 +4846,16 @@ class T3VoiceRuntimeService : Service() {
       val interval = requireNotNull(checkpoint.heartbeatIntervalSeconds).times(1_000L)
       lateinit var scheduleNext: () -> Unit
       scheduleNext = {
-        voiceRuntimeRealtimeHeartbeatTask = submitCallbackDelayed({
+        lateinit var thisToken: VoiceKernelCancellationToken
+        thisToken = submitCallbackDelayed({
           voiceRuntimeRealtimeHeartbeatIo.submit {
             runCatching { engine.heartbeat(checkpoint.fence) }
             submitCallback {
               run {
-                if (voiceRuntimeRealtimeHeartbeatTask == null) return@run
+                if (!VoiceKernelReschedulePolicy.owns(
+                    voiceRuntimeRealtimeHeartbeatTask,
+                    thisToken,
+                  )) return@run
                 if (voiceRuntimeRealtimeEngine === engine && engine.snapshot() != null) {
                   scheduleNext()
                 } else voiceRuntimeRealtimeHeartbeatTask = null
@@ -4847,6 +4863,7 @@ class T3VoiceRuntimeService : Service() {
             }
           }
         }, interval)
+        voiceRuntimeRealtimeHeartbeatTask = thisToken
       }
       scheduleNext()
     }
@@ -4856,9 +4873,11 @@ class T3VoiceRuntimeService : Service() {
     ) {
       lateinit var scheduleNext: (Long) -> Unit
       scheduleNext = { delayMillis ->
-        voiceRuntimeRealtimeActionTask = submitCallbackDelayed(action@{
+        lateinit var thisToken: VoiceKernelCancellationToken
+        thisToken = submitCallbackDelayed(action@{
           val admission = run {
-            if (voiceRuntimeRealtimeActionTask == null || voiceRuntimeRealtimeEngine !== engine) {
+            if (!VoiceKernelReschedulePolicy.owns(voiceRuntimeRealtimeActionTask, thisToken) ||
+              voiceRuntimeRealtimeEngine !== engine) {
               return@run VoiceRuntimeRetentionAdmission.UNAVAILABLE
             }
             voiceRuntimeController.presentationCapacity()
@@ -4868,7 +4887,7 @@ class T3VoiceRuntimeService : Service() {
               VoiceRuntimeRetentionAdmission.UNAVAILABLE,
           )) {
             run {
-              if (voiceRuntimeRealtimeActionTask != null) {
+              if (VoiceKernelReschedulePolicy.owns(voiceRuntimeRealtimeActionTask, thisToken)) {
                 scheduleNext(500L)
               }
             }
@@ -4878,7 +4897,10 @@ class T3VoiceRuntimeService : Service() {
             runCatching { engine.pollActions(checkpoint.fence) }
             submitCallback {
               run {
-                if (voiceRuntimeRealtimeActionTask == null) return@run
+                if (!VoiceKernelReschedulePolicy.owns(
+                    voiceRuntimeRealtimeActionTask,
+                    thisToken,
+                  )) return@run
                 if (voiceRuntimeRealtimeEngine === engine && engine.snapshot() != null) {
                   scheduleNext(100L)
                 } else voiceRuntimeRealtimeActionTask = null
@@ -4886,6 +4908,7 @@ class T3VoiceRuntimeService : Service() {
             }
           }
         }, delayMillis)
+        voiceRuntimeRealtimeActionTask = thisToken
       }
       scheduleNext(0L)
     }

@@ -6,6 +6,12 @@ import org.junit.Test
 
 class T3VoiceStartCommandPolicyTest {
   @Test
+  fun immediatePromotionOnlyRunsForAColdForegroundTransition() {
+    assertEquals(true, T3VoiceStartCommandPolicy.shouldPromoteForegroundImmediately(false))
+    assertEquals(false, T3VoiceStartCommandPolicy.shouldPromoteForegroundImmediately(true))
+  }
+
+  @Test
   fun onlyTheExactActiveOwnerCanPromoteToForeground() {
     assertEquals(
       T3VoiceStartCommandDecision.PROMOTE_ACTIVE_OWNER,

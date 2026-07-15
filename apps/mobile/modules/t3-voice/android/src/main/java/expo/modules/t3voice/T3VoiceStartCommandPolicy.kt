@@ -8,6 +8,8 @@ internal enum class T3VoiceStartCommandDecision {
 }
 
 internal object T3VoiceStartCommandPolicy {
+  fun shouldPromoteForegroundImmediately(isForeground: Boolean): Boolean = !isForeground
+
   fun decide(
     expectedOwnerId: String?,
     activeOwnerId: String?,
