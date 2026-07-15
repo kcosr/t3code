@@ -90,6 +90,10 @@ around the runs — authoring packet N+1 and adjudicating reviews while run N ex
 2. **Packet**: orchestrator writes `specs/kernel-milestones/<mN>-<name>.md` — scope, files
    with line-referenced seams, invariants, forbidden changes, test expectations, done
    criteria. Reviewed by an Opus subagent, then committed before launch (clean tree).
+   Test inventories MUST enumerate every source set (`src/test` AND `src/androidTest`) —
+   the M0 run-2 review caught a compile break in the instrumented set that the unit-test
+   gates cannot see; the pc gate now includes
+   `:t3tools-mobile-voice-native:assembleDebugAndroidTest` for the same reason.
 3. **Launch**:
 
    ```bash
