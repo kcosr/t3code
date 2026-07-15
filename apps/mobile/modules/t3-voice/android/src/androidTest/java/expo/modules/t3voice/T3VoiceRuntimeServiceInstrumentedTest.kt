@@ -127,15 +127,7 @@ class T3VoiceRuntimeServiceInstrumentedTest {
     firstBinder.prepareRealtimeSession(
       nativeSessionId = sessionId,
       environmentOrigin = "https://127.0.0.1",
-      runtimeControlGrant =
-        VoiceRuntimeControlGrant(
-          token = "instrumentation-only-token",
-          sessionId = sessionId,
-          leaseGeneration = 1,
-          expiresAtEpochMillis = System.currentTimeMillis() + 60_000,
-          heartbeatIntervalMillis = 1_000,
-          failureGraceMillis = 30_000,
-        ),
+      audioRouteId = "system",
       callback =
         object : T3VoiceWebRtcResultCallback<String> {
           override fun onSuccess(result: String) = Unit
