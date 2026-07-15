@@ -11,7 +11,6 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
-import java.time.Instant
 import expo.modules.interfaces.permissions.Permissions
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
@@ -213,7 +212,7 @@ class T3VoiceModule : Module() {
       )
 
       Constants(
-        "nativeRevision" to 14,
+        "nativeRevision" to 15,
       )
 
       OnCreate {
@@ -279,16 +278,6 @@ class T3VoiceModule : Module() {
         }
       }
 
-      AsyncFunction("prepareVoiceRuntimeAuthorityAsync") {
-        input: Map<String, Any?>, promise: Promise,
-        ->
-        val (readiness, preparation) = parseAuthorityPreparation(input)
-        withBinder(promise, "voice-runtime-authority-prepare-failed") { service, settlement ->
-          val result = service.prepareVoiceRuntimeAuthority(readiness, preparation)
-          settlement.resolve(authorityPreparationBody(result))
-        }
-      }
-
       AsyncFunction("inspectVoiceRuntimeAuthorityAsync") {
         promise: Promise,
         ->
@@ -309,6 +298,19 @@ class T3VoiceModule : Module() {
               service.configureVoiceRuntimeAuthority(authority),
             ),
           )
+        }
+      }
+
+      AsyncFunction("setVoiceRuntimeSessionCredentialAsync") {
+        input: Map<String, Any?>, promise: Promise,
+        ->
+        requireExactKeys(input, setOf("environmentOrigin", "credential"))
+        withBinder(promise, "voice-runtime-session-credential-failed") { service, settlement ->
+          service.setVoiceRuntimeSessionCredential(
+            requireText(input, "environmentOrigin", 2_048),
+            requireText(input, "credential", 8_192),
+          )
+          settlement.resolve()
         }
       }
 
@@ -822,47 +824,11 @@ class T3VoiceModule : Module() {
       AsyncFunction("prepareRealtimeSessionAsync") { input: Map<String, Any>, promise: Promise ->
         requireExactKeys(
           input,
-          setOf("nativeSessionId", "environmentOrigin", "audioRouteId", "runtimeControlGrant"),
+          setOf("nativeSessionId", "environmentOrigin", "audioRouteId"),
         )
         val nativeSessionId = requireIdentifier(input, "nativeSessionId")
         val environmentOrigin = requireText(input, "environmentOrigin", 2_048)
         val audioRouteId = requireText(input, "audioRouteId", 64)
-        @Suppress("UNCHECKED_CAST")
-        val grantInput =
-          input["runtimeControlGrant"] as? Map<String, Any>
-            ?: error("runtimeControlGrant is required.")
-        requireExactKeys(
-          grantInput,
-          setOf(
-            "token",
-            "sessionId",
-            "leaseGeneration",
-            "expiresAt",
-            "heartbeatIntervalSeconds",
-            "failureGraceSeconds",
-          ),
-        )
-        val grantSessionId = requireIdentifier(grantInput, "sessionId")
-        check(grantSessionId == nativeSessionId) { "Native control grant session does not match." }
-        val runtimeControlGrant =
-          VoiceRuntimeControlGrant(
-            token = requireText(grantInput, "token", 128),
-            sessionId = grantSessionId,
-            leaseGeneration = requireLong(grantInput, "leaseGeneration"),
-            expiresAtEpochMillis =
-              Instant.parse(requireText(grantInput, "expiresAt", 128)).toEpochMilli(),
-            heartbeatIntervalMillis =
-              Math.multiplyExact(requireLong(grantInput, "heartbeatIntervalSeconds"), 1_000L),
-            failureGraceMillis =
-              Math.multiplyExact(requireLong(grantInput, "failureGraceSeconds"), 1_000L),
-          )
-        check(runtimeControlGrant.leaseGeneration > 0) { "leaseGeneration must be positive." }
-        check(runtimeControlGrant.heartbeatIntervalMillis > 0) {
-          "heartbeatIntervalSeconds must be positive."
-        }
-        check(runtimeControlGrant.failureGraceMillis > 0) {
-          "failureGraceSeconds must be positive."
-        }
         if (
           runCatching {
               VoiceRuntimeControlOriginPolicy.heartbeatUrl(environmentOrigin, nativeSessionId)
@@ -883,7 +849,6 @@ class T3VoiceModule : Module() {
               nativeSessionId,
               environmentOrigin,
               audioRouteId,
-              runtimeControlGrant,
               object : T3VoiceWebRtcResultCallback<String> {
                 override fun onSuccess(result: String) {
                   settlement.resolve(
@@ -1264,72 +1229,20 @@ class T3VoiceModule : Module() {
     )
   }
 
-  private fun parseAuthorityPreparation(
-    input: Map<String, Any?>,
-  ): Pair<T3VoiceReadinessConfig, VoiceRuntimeAuthorityPreparation> {
-    requireExactKeys(input, AUTHORITY_PREPARATION_FIELDS)
-    @Suppress("UNCHECKED_CAST")
-    val readiness = parseReadinessConfig(
-      input["readiness"] as? Map<String, Any?>
-        ?: throw IllegalArgumentException("readiness must be an object."),
-    )
-    @Suppress("UNCHECKED_CAST")
-    val targetInput = input["target"] as? Map<String, Any?>
-      ?: throw IllegalArgumentException("target must be an object.")
-    val operation = T3VoiceRuntimeGrantOperation.fromWireValue(requireText(input, "operation", 64))
-    val target = when (operation) {
-      T3VoiceRuntimeGrantOperation.REALTIME_START -> VoiceRuntimeBridge.parseRealtimeTarget(targetInput)
-      T3VoiceRuntimeGrantOperation.THREAD_TURN_START -> VoiceRuntimeBridge.parseThreadTarget(targetInput)
-    }
-    return readiness to VoiceRuntimeAuthorityPreparation(
-      requireText(input, "runtimeId", 128),
-      requireText(input, "runtimeInstanceId", 128),
-      requireText(input, "provisioningOperationId", 256),
-      requireLong(input, "expectedCurrentGeneration"),
-      requireLong(input, "generation"),
-      requireText(input, "targetDigest", 64),
-      target,
-      operation,
-      requireText(input, "environmentOrigin", 2_048),
-      readiness.enabled,
-    )
-  }
-
-  private fun authorityPreparationBody(
-    result: VoiceRuntimeAuthorityPreparationResult,
-  ): Map<String, Any?> = authorityReservationBody(result.preparation) + mapOf(
-    "state" to "prepared",
-    "refreshCredentialHash" to result.refreshCredentialHash,
-  )
-
-  private fun authorityReservationBody(
-    input: VoiceRuntimeAuthorityPreparation,
-  ): Map<String, Any?> = mapOf(
-    "runtimeId" to input.runtimeId,
-    "runtimeInstanceId" to input.runtimeInstanceId,
-    "provisioningOperationId" to input.provisioningOperationId,
-    "expectedCurrentGeneration" to input.expectedCurrentGeneration.toDouble(),
-    "generation" to input.generation.toDouble(),
-    "targetDigest" to input.targetDigest,
-    "target" to VoiceRuntimeBridge.targetBody(input.target),
-    "operation" to input.operation.wireValue,
-    "environmentOrigin" to VoiceRuntimeOriginPolicy.normalize(input.environmentOrigin),
-    "readinessEnabled" to input.readinessEnabled,
-  )
-
   private fun authorityInspectionBody(
     inspection: VoiceRuntimeAuthorityInspection,
-  ): Map<String, Any?> {
-    val input = inspection.preparation
-    return authorityReservationBody(input) + mapOf(
-      "state" to inspection.state,
+  ): Map<String, Any?> =
+    mapOf(
+      "state" to "active",
+      "runtimeId" to inspection.runtimeId,
+      "runtimeInstanceId" to inspection.runtimeInstanceId,
+      "expectedCurrentGeneration" to inspection.expectedCurrentGeneration.toDouble(),
+      "generation" to inspection.generation.toDouble(),
+      "target" to VoiceRuntimeBridge.targetBody(inspection.target),
+      "environmentOrigin" to inspection.environmentOrigin,
+      "readinessEnabled" to inspection.readinessEnabled,
       "readiness" to readinessBody(inspection.readiness),
-      "refreshCredentialHash" to inspection.refreshCredentialHash,
-      "issuedAt" to inspection.issuedAtEpochMillis?.let { java.time.Instant.ofEpochMilli(it).toString() },
-      "expiresAt" to inspection.expiresAtEpochMillis?.let { java.time.Instant.ofEpochMilli(it).toString() },
-      "refreshRotationCounter" to inspection.refreshRotationCounter?.toDouble(),
     )
-  }
 
   private fun parseRuntimeGrantMetadata(
     input: Map<String, Any?>,
@@ -1345,17 +1258,6 @@ class T3VoiceModule : Module() {
           requireText(input, "targetIdentity", MAXIMUM_TARGET_IDENTITY_LENGTH),
         ),
       expiresAtEpochMillis = expiresAtEpochMillis,
-    )
-
-  private fun authorityBody(snapshot: VoiceRuntimeAuthoritySnapshot): Map<String, Any?> =
-    mapOf(
-      "state" to snapshot.state.wireValue,
-      "runtimeId" to snapshot.runtimeId,
-      "readiness" to readinessBody(snapshot.config),
-      "environmentOrigin" to snapshot.environmentOrigin,
-      "operation" to snapshot.operation.wireValue,
-      "expiresAtEpochMillis" to snapshot.expiresAtEpochMillis?.toDouble(),
-      "refreshPending" to snapshot.refreshPending,
     )
 
   private fun runtimeRevocationBody(
@@ -1463,11 +1365,6 @@ class T3VoiceModule : Module() {
         "microphonePermissionGranted",
         "notificationPermissionGranted",
       )
-    private val AUTHORITY_PREPARATION_FIELDS = setOf(
-      "readiness", "runtimeId", "runtimeInstanceId", "provisioningOperationId",
-      "expectedCurrentGeneration", "generation", "targetDigest", "target", "operation",
-      "environmentOrigin",
-    )
   }
 }
 

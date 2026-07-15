@@ -434,7 +434,7 @@ class T3VoicePcmPlayerTest {
   }
 
   @Test
-  fun staleInactivityTimerCannotTerminateRefreshedPlayback() {
+  fun staleInactivityTimerCannotTerminateReplacementPlayback() {
     val scheduler = QueuedTimeoutScheduler()
     val errors = mutableListOf<String>()
     val player =
@@ -446,13 +446,13 @@ class T3VoicePcmPlayerTest {
         decodePcm = { byteArrayOf(0, 0) },
         timeoutScheduler = scheduler,
       )
-    player.start("refreshed", 24_000, 1)
-    player.enqueue("refreshed", 0, "ignored")
+    player.start("replacement", 24_000, 1)
+    player.enqueue("replacement", 0, "ignored")
 
     scheduler.runEvenIfCancelled(0)
 
     assertTrue(errors.isEmpty())
-    player.cancel("refreshed")
+    player.cancel("replacement")
     player.release()
   }
 

@@ -4,8 +4,6 @@ internal data class VoiceRuntimeRealtimeAuthority(
   val identity: VoiceRuntimeIdentity,
   val target: VoiceRuntimeTarget.Realtime,
   val environmentOrigin: String,
-  val runtimeToken: String,
-  val expiresAtEpochMillis: Long,
 )
 
 internal data class VoiceRuntimeRealtimeFence(
@@ -101,7 +99,8 @@ internal data class VoiceRuntimeRealtimeCheckpoint(
   val phase: VoiceRealtimePhase,
   val serverSessionId: String? = null,
   val leaseGeneration: Long? = null,
-  val controlGrant: VoiceRuntimeRealtimeControlGrant? = null,
+  val expiresAtEpochMillis: Long? = null,
+  val heartbeatIntervalSeconds: Long? = null,
   val lastActionSequence: Long = 0,
   val lastConnectedAtEpochMillis: Long? = null,
   val pendingAction: VoiceRuntimeRealtimeAction? = null,
@@ -112,7 +111,8 @@ internal data class VoiceRuntimeRealtimeCheckpoint(
   init {
     require(lastActionSequence >= 0)
     require((serverSessionId == null) == (leaseGeneration == null))
-    require((serverSessionId == null) == (controlGrant == null))
+    require((serverSessionId == null) == (expiresAtEpochMillis == null))
+    require((serverSessionId == null) == (heartbeatIntervalSeconds == null))
   }
 }
 
@@ -132,7 +132,6 @@ internal data class VoiceRuntimeRealtimeFinalization(
   val fence: VoiceRuntimeRealtimeFence,
   val sourceTarget: VoiceRuntimeTarget.Realtime,
   val sourceEnvironmentOrigin: String,
-  val sourceAuthorityExpiresAtEpochMillis: Long,
   val rootCommandId: String,
   val session: VoiceRuntimeRealtimeStartResult,
   val closeOperationId: String,
@@ -490,13 +489,6 @@ internal class VoiceRuntimeRealtimeEngine(
           commandId,
           fingerprint,
           VoiceRuntimeRealtimeCommandResult.Rejected("owner-conflict"),
-        )
-      }
-      if (authority.expiresAtEpochMillis <= now()) {
-        return recordCommand(
-          commandId,
-          fingerprint,
-          VoiceRuntimeRealtimeCommandResult.Rejected("authority-expired"),
         )
       }
       repository.loadFinalization()?.let {
@@ -875,18 +867,6 @@ internal class VoiceRuntimeRealtimeEngine(
   ): VoiceRuntimeRealtimeFinalizationResult {
     var current = initial
     while (true) {
-      if (current.stage == VoiceRuntimeRealtimeFinalizationStage.HANDOFF_COMMIT_PENDING &&
-        transitionCredentialExpired(current)) {
-        current = failHandoffAndAdvanceToSourceClose(
-          current,
-          "handoff-transition-credential-expired",
-        )
-        continue
-      }
-      if (current.stage == VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING &&
-        sourceCloseCredentialExpired(current)) {
-        return abandonFinalization(current, "source-close-credential-expired")
-      }
       when (current.stage) {
         VoiceRuntimeRealtimeFinalizationStage.HANDOFF_COMMIT_PENDING -> {
           val exchange = requireNotNull(current.handoffExchange)
@@ -911,13 +891,6 @@ internal class VoiceRuntimeRealtimeEngine(
           val exchange = requireNotNull(current.handoffExchange)
           val activated = runCatching { handoff.activate(exchange) }.getOrDefault(false)
           if (!activated) {
-            if (transitionCredentialExpired(current)) {
-              current = failHandoffAndAdvanceToSourceClose(
-                current,
-                "handoff-transition-credential-expired",
-              )
-              continue
-            }
             return failFinalization(current, "handoff-activation-failed", true)
           }
           current = advanceFinalization(
@@ -1012,15 +985,6 @@ internal class VoiceRuntimeRealtimeEngine(
     return VoiceRuntimeRealtimeFinalizationResult.Completed(summary)
   }
 
-  private fun transitionCredentialExpired(
-    finalization: VoiceRuntimeRealtimeFinalization,
-  ): Boolean = requireNotNull(finalization.handoffExchange)
-    .transitionGrant.expiresAtEpochMillis <= now()
-
-  private fun sourceCloseCredentialExpired(
-    finalization: VoiceRuntimeRealtimeFinalization,
-  ): Boolean = finalization.session.controlGrant.expiresAtEpochMillis <= now()
-
   private fun failHandoffAndAdvanceToSourceClose(
     current: VoiceRuntimeRealtimeFinalization,
     code: String,
@@ -1066,7 +1030,8 @@ internal class VoiceRuntimeRealtimeEngine(
           requireCheckpoint().copy(
             serverSessionId = result.value.state.sessionId,
             leaseGeneration = result.value.state.leaseGeneration,
-            controlGrant = result.value.controlGrant,
+            expiresAtEpochMillis = result.value.expiresAtEpochMillis,
+            heartbeatIntervalSeconds = result.value.heartbeatIntervalSeconds,
           ),
         )
         fail("invalid-start-response")
@@ -1078,7 +1043,8 @@ internal class VoiceRuntimeRealtimeEngine(
             phase = VoiceRealtimePhase.NEGOTIATING,
             serverSessionId = result.value.state.sessionId,
             leaseGeneration = result.value.state.leaseGeneration,
-            controlGrant = result.value.controlGrant,
+            expiresAtEpochMillis = result.value.expiresAtEpochMillis,
+            heartbeatIntervalSeconds = result.value.heartbeatIntervalSeconds,
           ),
         )
         val accepted = peer.prepare(
@@ -1223,7 +1189,7 @@ internal class VoiceRuntimeRealtimeEngine(
       }
       if (result.value.projectId != action.projectId || result.value.threadId != action.threadId ||
         result.value.autoRearm != action.autoRearm ||
-        result.value.transitionGrant.generation != current.fence.identity.generation + 1) {
+        result.value.reservation.generation != current.fence.identity.generation + 1) {
         fail("handoff-response-mismatch")
         return@synchronized false
       }
@@ -1369,7 +1335,6 @@ internal class VoiceRuntimeRealtimeEngine(
       fence = current.fence,
       sourceTarget = current.target,
       sourceEnvironmentOrigin = authority.environmentOrigin,
-      sourceAuthorityExpiresAtEpochMillis = authority.expiresAtEpochMillis,
       rootCommandId = current.rootCommandId,
       session = session,
       closeOperationId = closeOperationId,
@@ -1396,7 +1361,6 @@ internal class VoiceRuntimeRealtimeEngine(
       fence = fence,
       sourceTarget = authority.target,
       sourceEnvironmentOrigin = authority.environmentOrigin,
-      sourceAuthorityExpiresAtEpochMillis = authority.expiresAtEpochMillis,
       rootCommandId = rootCommandId,
       session = session,
       closeOperationId = "$rootCommandId.close.cancelled",
@@ -1458,20 +1422,6 @@ internal class VoiceRuntimeRealtimeEngine(
       finalization.fence.identity,
       finalization.sourceTarget,
       finalization.sourceEnvironmentOrigin,
-      when (finalization.stage) {
-        VoiceRuntimeRealtimeFinalizationStage.HANDOFF_COMMIT_PENDING,
-        VoiceRuntimeRealtimeFinalizationStage.HANDOFF_ACTIVATION_PENDING,
-        -> requireNotNull(finalization.handoffExchange).transitionGrant.token
-        VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING ->
-          finalization.session.controlGrant.token
-      },
-      when (finalization.stage) {
-        VoiceRuntimeRealtimeFinalizationStage.HANDOFF_COMMIT_PENDING,
-        VoiceRuntimeRealtimeFinalizationStage.HANDOFF_ACTIVATION_PENDING,
-        -> requireNotNull(finalization.handoffExchange).transitionGrant.expiresAtEpochMillis
-        VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING ->
-          finalization.session.controlGrant.expiresAtEpochMillis
-      },
     )
 
   private fun terminal(
@@ -1514,14 +1464,15 @@ internal class VoiceRuntimeRealtimeEngine(
   ): Boolean = result.state.conversationId == authority.target.conversationId &&
     result.state.phase == "signaling" &&
     result.state.leaseGeneration > 0 &&
-    result.controlGrant.expiresAtEpochMillis > now() &&
-    result.expiresAtEpochMillis >= result.controlGrant.expiresAtEpochMillis &&
+    result.expiresAtEpochMillis > now() &&
+    result.heartbeatIntervalSeconds > 0 &&
     fence.identity == authority.identity
 
   private fun restoredSession(current: VoiceRuntimeRealtimeCheckpoint): VoiceRuntimeRealtimeStartResult? {
     val sessionId = current.serverSessionId ?: return null
     val lease = current.leaseGeneration ?: return null
-    val control = current.controlGrant ?: return null
+    val expiresAtEpochMillis = current.expiresAtEpochMillis ?: return null
+    val heartbeatIntervalSeconds = current.heartbeatIntervalSeconds ?: return null
     return VoiceRuntimeRealtimeStartResult(
       VoiceRuntimeRealtimeSessionState(
         sessionId,
@@ -1531,8 +1482,8 @@ internal class VoiceRuntimeRealtimeEngine(
         current.lastActionSequence,
       ),
       "/api/voice/runtime/realtime-sessions/$sessionId/webrtc-offer",
-      control.expiresAtEpochMillis,
-      control,
+      expiresAtEpochMillis,
+      heartbeatIntervalSeconds,
     )
   }
 

@@ -31,6 +31,7 @@ internal data class VoiceRuntimeRealtimeLeaseFence(
 internal data class VoiceRuntimeRealtimeStartInput(
   val fence: VoiceRealtimeTransportFence,
   val clientOperationId: String,
+  val target: VoiceRuntimeTarget.Realtime,
 ) {
   init {
     requireIdentifier(clientOperationId, "client operation ID")
@@ -45,18 +46,11 @@ internal data class VoiceRuntimeRealtimeSessionState(
   val sequence: Long,
 )
 
-internal data class VoiceRuntimeRealtimeControlGrant(
-  val token: String,
-  val expiresAtEpochMillis: Long,
-  val heartbeatIntervalSeconds: Long,
-  val failureGraceSeconds: Long,
-)
-
 internal data class VoiceRuntimeRealtimeStartResult(
   val state: VoiceRuntimeRealtimeSessionState,
   val signalingPath: String,
   val expiresAtEpochMillis: Long,
-  val controlGrant: VoiceRuntimeRealtimeControlGrant,
+  val heartbeatIntervalSeconds: Long,
 )
 
 internal data class VoiceRuntimeRealtimeOfferInput(
@@ -270,9 +264,7 @@ internal data class VoiceRuntimeRealtimeThreadTarget(
   val rearmGuardMs: Long,
 )
 
-internal data class VoiceRuntimeRealtimeTransitionGrant(
-  val token: String,
-  val expiresAtEpochMillis: Long,
+internal data class VoiceRuntimeRealtimeTransitionReservation(
   val generation: Long,
   val modeSessionId: String,
   val target: VoiceRuntimeRealtimeThreadTarget,
@@ -284,7 +276,7 @@ internal data class VoiceRuntimeRealtimeHandoffExchangeResult(
   val projectId: String,
   val threadId: String,
   val autoRearm: Boolean,
-  val transitionGrant: VoiceRuntimeRealtimeTransitionGrant,
+  val reservation: VoiceRuntimeRealtimeTransitionReservation,
   val replayed: Boolean,
 )
 
@@ -336,6 +328,7 @@ internal object VoiceRuntimeRealtimeJson {
   fun encodeStart(input: VoiceRuntimeRealtimeStartInput) =
     fencedObject(input.fence)
       .put("clientOperationId", input.clientOperationId)
+      .put("target", JSONObject(VoiceRuntimeBridge.canonicalRealtimeTargetIdentity(input.target)))
       .bytes()
 
   fun decodeStart(bytes: ByteArray): VoiceRuntimeRealtimeStartResult {
@@ -349,27 +342,12 @@ internal object VoiceRuntimeRealtimeJson {
     require(signalingPath == sessionPath(state.sessionId, "webrtc-offer")) {
       "Unexpected Realtime signaling path."
     }
-    val control = objectField(root, "controlGrant").requireExactFields(CONTROL_GRANT_FIELDS)
-    require(stringField(control, "sessionId", 128) == state.sessionId) {
-      "Realtime control grant session mismatch."
-    }
-    require(positiveLongField(control, "leaseGeneration") == state.leaseGeneration) {
-      "Realtime control grant lease mismatch."
-    }
     val heartbeatIntervalSeconds = positiveLongField(root, "heartbeatIntervalSeconds")
-    require(positiveLongField(control, "heartbeatIntervalSeconds") == heartbeatIntervalSeconds) {
-      "Realtime heartbeat interval mismatch."
-    }
     return VoiceRuntimeRealtimeStartResult(
       state,
       signalingPath,
       instantField(root, "expiresAt"),
-      VoiceRuntimeRealtimeControlGrant(
-        boundedToken(stringField(control, "token", 128)),
-        instantField(control, "expiresAt"),
-        heartbeatIntervalSeconds,
-        positiveLongField(control, "failureGraceSeconds"),
-      ),
+      heartbeatIntervalSeconds,
     )
   }
 
@@ -477,8 +455,8 @@ internal object VoiceRuntimeRealtimeJson {
 
   fun decodeHandoff(bytes: ByteArray): VoiceRuntimeRealtimeHandoffExchangeResult {
     val root = objectFrom(bytes, HANDOFF_RESULT_FIELDS)
-    val grant = objectField(root, "transitionGrant").requireExactFields(TRANSITION_GRANT_FIELDS)
-    val target = objectField(grant, "target").requireExactFields(THREAD_TARGET_FIELDS)
+    val reservation = objectField(root, "reservation").requireExactFields(TRANSITION_RESERVATION_FIELDS)
+    val target = objectField(reservation, "target").requireExactFields(THREAD_TARGET_FIELDS)
     require(stringField(target, "mode", 32) == "thread") { "Invalid transition target mode." }
     val targetAutoRearm = booleanField(target, "autoRearm")
     val projectId = identifierField(root, "projectId")
@@ -502,11 +480,9 @@ internal object VoiceRuntimeRealtimeJson {
       projectId,
       threadId,
       targetAutoRearm,
-      VoiceRuntimeRealtimeTransitionGrant(
-        boundedToken(stringField(grant, "token", 128)),
-        instantField(grant, "expiresAt"),
-        positiveLongField(grant, "generation"),
-        identifierField(grant, "modeSessionId"),
+      VoiceRuntimeRealtimeTransitionReservation(
+        positiveLongField(reservation, "generation"),
+        identifierField(reservation, "modeSessionId"),
         targetValue,
       ),
       booleanField(root, "replayed"),
@@ -682,9 +658,6 @@ internal object VoiceRuntimeRealtimeJson {
     requireIdentifier(value, "session ID").also {
       require(it.matches(SAFE_PATH_SEGMENT)) { "Invalid Realtime session ID." }
     }
-  private fun boundedToken(token: String) = token.also {
-    require(it.isNotBlank() && it.none(Char::isWhitespace)) { "Invalid Realtime control token." }
-  }
   private fun outcomeField(source: JSONObject, name: String) =
     VoiceRuntimeRealtimeActionOutcome.entries.singleOrNull {
       it.wireValue == stringField(source, name, 32)
@@ -693,14 +666,10 @@ internal object VoiceRuntimeRealtimeJson {
     stringField(source, name, 32).also { require(it in SPEECH_PRESETS) { "Invalid speech preset." } }
 
   private val START_RESULT_FIELDS =
-    setOf("state", "transport", "expiresAt", "heartbeatIntervalSeconds", "controlGrant")
+    setOf("state", "transport", "expiresAt", "heartbeatIntervalSeconds")
   private val SESSION_STATE_FIELDS =
     setOf("sessionId", "conversationId", "mode", "phase", "leaseGeneration", "sequence")
   private val TRANSPORT_FIELDS = setOf("kind", "signalingPath")
-  private val CONTROL_GRANT_FIELDS = setOf(
-    "token", "sessionId", "leaseGeneration", "expiresAt", "heartbeatIntervalSeconds",
-    "failureGraceSeconds",
-  )
   private val ANSWER_FIELDS = setOf("sessionId", "leaseGeneration", "sdp", "replayed")
   private val HEARTBEAT_RESULT_FIELDS = setOf("state", "disposition", "handoffPending", "expiresAt")
   private val ACTIONS_RESULT_FIELDS = setOf("state", "actions")
@@ -714,10 +683,10 @@ internal object VoiceRuntimeRealtimeJson {
   private val FOCUS_FIELDS = setOf("projectId", "threadId")
   private val FOCUS_RESULT_FIELDS = setOf("state", "focus", "replayed")
   private val HANDOFF_RESULT_FIELDS =
-    setOf("actionId", "actionSequence", "projectId", "threadId", "autoRearm", "transitionGrant", "replayed")
+    setOf("actionId", "actionSequence", "projectId", "threadId", "autoRearm", "reservation", "replayed")
   private val HANDOFF_COMMIT_RESULT_FIELDS =
     setOf("actionId", "actionSequence", "committed", "replayed")
-  private val TRANSITION_GRANT_FIELDS = setOf("token", "expiresAt", "generation", "modeSessionId", "target")
+  private val TRANSITION_RESERVATION_FIELDS = setOf("generation", "modeSessionId", "target")
   private val THREAD_TARGET_FIELDS =
     setOf("mode", "environmentId", "projectId", "threadId", "speechPreset", "autoRearm", "endpointPolicy", "speechEnabled", "rearmGuardMs")
   private val ENDPOINT_POLICY_FIELDS = setOf("endSilenceMs", "noSpeechTimeoutMs", "maximumUtteranceMs")
@@ -745,38 +714,38 @@ internal class VoiceRuntimeRealtimeCall<T>(
 internal class VoiceRuntimeRealtimeDelegate(
   private val http: VoiceRuntimeRealtimeHttp = productionHttp(),
 ) {
-  fun start(origin: String, runtimeToken: String, input: VoiceRuntimeRealtimeStartInput) =
-    newStartCall(origin, runtimeToken, input).execute()
+  fun start(origin: String, sessionCredential: String, input: VoiceRuntimeRealtimeStartInput) =
+    newStartCall(origin, sessionCredential, input).execute()
 
-  fun newStartCall(origin: String, runtimeToken: String, input: VoiceRuntimeRealtimeStartInput) =
+  fun newStartCall(origin: String, sessionCredential: String, input: VoiceRuntimeRealtimeStartInput) =
     jsonCall(
-      request(origin, BASE_PATH, VoiceRuntimeHttpMethod.POST, RUNTIME_HEADER, runtimeToken,
+      request(origin, BASE_PATH, VoiceRuntimeHttpMethod.POST, sessionCredential,
         VoiceRuntimeRealtimeJson.encodeStart(input), MAXIMUM_SMALL_BYTES),
       VoiceRuntimeRealtimeJson::decodeStart,
     )
 
-  fun offer(origin: String, controlToken: String, sessionId: String, input: VoiceRuntimeRealtimeOfferInput) =
-    newOfferCall(origin, controlToken, sessionId, input).execute()
+  fun offer(origin: String, sessionCredential: String, sessionId: String, input: VoiceRuntimeRealtimeOfferInput) =
+    newOfferCall(origin, sessionCredential, sessionId, input).execute()
 
-  fun newOfferCall(origin: String, controlToken: String, sessionId: String, input: VoiceRuntimeRealtimeOfferInput) =
+  fun newOfferCall(origin: String, sessionCredential: String, sessionId: String, input: VoiceRuntimeRealtimeOfferInput) =
     jsonCall(
       request(origin, sessionPath(sessionId, "webrtc-offer"), VoiceRuntimeHttpMethod.POST,
-        CONTROL_HEADER, controlToken, VoiceRuntimeRealtimeJson.encodeOffer(input), MAXIMUM_SDP_BYTES),
+        sessionCredential, VoiceRuntimeRealtimeJson.encodeOffer(input), MAXIMUM_SDP_BYTES),
       VoiceRuntimeRealtimeJson::decodeAnswer,
     ) { it.sessionId == sessionId && it.leaseGeneration == input.fence.leaseGeneration }
 
-  fun heartbeat(origin: String, controlToken: String, sessionId: String, fence: VoiceRuntimeRealtimeLeaseFence) =
+  fun heartbeat(origin: String, sessionCredential: String, sessionId: String, fence: VoiceRuntimeRealtimeLeaseFence) =
     jsonCall(
       request(origin, sessionPath(sessionId, "heartbeat"), VoiceRuntimeHttpMethod.POST,
-        CONTROL_HEADER, controlToken, VoiceRuntimeRealtimeJson.encodeHeartbeat(fence), MAXIMUM_SMALL_BYTES),
+        sessionCredential, VoiceRuntimeRealtimeJson.encodeHeartbeat(fence), MAXIMUM_SMALL_BYTES),
       VoiceRuntimeRealtimeJson::decodeHeartbeat,
     ) { matchesState(it.state, sessionId, fence) }.execute()
 
-  fun actions(origin: String, controlToken: String, sessionId: String, query: VoiceRuntimeRealtimeActionsQuery) =
+  fun actions(origin: String, sessionCredential: String, sessionId: String, query: VoiceRuntimeRealtimeActionsQuery) =
     jsonCall(
       VoiceRuntimeHttpRequest(
         origin, sessionPath(sessionId, "actions"), VoiceRuntimeHttpMethod.GET,
-        VoiceRuntimeAuthority(CONTROL_HEADER, controlToken), null, 0, MAXIMUM_ACTIONS_BYTES,
+        VoiceRuntimeSessionCredential(sessionCredential), null, 0, MAXIMUM_ACTIONS_BYTES,
         linkedMapOf(
           "runtimeId" to query.fence.runtime.runtimeId,
           "runtimeInstanceId" to query.fence.runtime.runtimeInstanceId,
@@ -792,13 +761,13 @@ internal class VoiceRuntimeRealtimeDelegate(
 
   fun acknowledgeAction(
     origin: String,
-    controlToken: String,
+    sessionCredential: String,
     sessionId: String,
     actionId: String,
     input: VoiceRuntimeRealtimeActionAckInput,
   ) = jsonCall(
     request(origin, sessionPath(sessionId, "actions/${encodedSegment(actionId)}/ack"),
-      VoiceRuntimeHttpMethod.POST, CONTROL_HEADER, controlToken,
+      VoiceRuntimeHttpMethod.POST, sessionCredential,
       VoiceRuntimeRealtimeJson.encodeAck(input), MAXIMUM_SMALL_BYTES),
     VoiceRuntimeRealtimeJson::decodeAck,
   ) {
@@ -812,54 +781,54 @@ internal class VoiceRuntimeRealtimeDelegate(
       it.outcome == expectedOutcome
   }.execute()
 
-  fun updateFocus(origin: String, controlToken: String, sessionId: String, input: VoiceRuntimeRealtimeFocusInput) =
+  fun updateFocus(origin: String, sessionCredential: String, sessionId: String, input: VoiceRuntimeRealtimeFocusInput) =
     jsonCall(
       request(origin, sessionPath(sessionId, "focus"), VoiceRuntimeHttpMethod.PUT,
-        CONTROL_HEADER, controlToken, VoiceRuntimeRealtimeJson.encodeFocus(input), MAXIMUM_SMALL_BYTES),
+        sessionCredential, VoiceRuntimeRealtimeJson.encodeFocus(input), MAXIMUM_SMALL_BYTES),
       VoiceRuntimeRealtimeJson::decodeFocus,
     ) { matchesState(it.state, sessionId, input.fence) && it.focus == input.focus }.execute()
 
   fun exchangeHandoff(
     origin: String,
-    controlToken: String,
+    sessionCredential: String,
     sessionId: String,
     actionId: String,
     input: VoiceRuntimeRealtimeHandoffExchangeInput,
   ) = jsonCall(
     request(origin, sessionPath(sessionId, "handoffs/${encodedSegment(actionId)}/exchange"),
-      VoiceRuntimeHttpMethod.POST, CONTROL_HEADER, controlToken,
+      VoiceRuntimeHttpMethod.POST, sessionCredential,
       VoiceRuntimeRealtimeJson.encodeHandoff(input), MAXIMUM_SMALL_BYTES),
     VoiceRuntimeRealtimeJson::decodeHandoff,
   ) {
     it.actionId == actionId && it.actionSequence == input.actionSequence &&
-      it.transitionGrant.generation == input.nextGeneration &&
-      it.transitionGrant.modeSessionId == input.threadModeSessionId &&
-      it.transitionGrant.target.environmentId == input.environmentId &&
-      it.transitionGrant.target.speechPreset == input.speechPreset &&
-      it.transitionGrant.target.endpointPolicy == input.endpointPolicy &&
-      it.transitionGrant.target.speechEnabled == input.speechEnabled &&
-      it.transitionGrant.target.rearmGuardMs == input.rearmGuardMs
+      it.reservation.generation == input.nextGeneration &&
+      it.reservation.modeSessionId == input.threadModeSessionId &&
+      it.reservation.target.environmentId == input.environmentId &&
+      it.reservation.target.speechPreset == input.speechPreset &&
+      it.reservation.target.endpointPolicy == input.endpointPolicy &&
+      it.reservation.target.speechEnabled == input.speechEnabled &&
+      it.reservation.target.rearmGuardMs == input.rearmGuardMs
   }.execute()
 
   fun commitHandoff(
     origin: String,
-    transitionToken: String,
+    sessionCredential: String,
     sessionId: String,
     actionId: String,
     input: VoiceRuntimeRealtimeHandoffCommitInput,
   ) = jsonCall(
     request(origin, sessionPath(sessionId, "handoffs/${encodedSegment(actionId)}/commit"),
-      VoiceRuntimeHttpMethod.POST, TRANSITION_HEADER, transitionToken,
+      VoiceRuntimeHttpMethod.POST, sessionCredential,
       VoiceRuntimeRealtimeJson.encodeHandoffCommit(input), MAXIMUM_SMALL_BYTES),
     VoiceRuntimeRealtimeJson::decodeHandoffCommit,
   ) {
     it.actionId == actionId && it.actionSequence == input.actionSequence && it.committed
   }.execute()
 
-  fun close(origin: String, controlToken: String, sessionId: String, input: VoiceRuntimeRealtimeCloseInput) =
+  fun close(origin: String, sessionCredential: String, sessionId: String, input: VoiceRuntimeRealtimeCloseInput) =
     jsonCall(
       request(origin, sessionPath(sessionId, "close"), VoiceRuntimeHttpMethod.POST,
-        CONTROL_HEADER, controlToken, VoiceRuntimeRealtimeJson.encodeClose(input), MAXIMUM_SMALL_BYTES),
+        sessionCredential, VoiceRuntimeRealtimeJson.encodeClose(input), MAXIMUM_SMALL_BYTES),
       VoiceRuntimeRealtimeJson::decodeClose,
     ) { matchesState(it.state, sessionId, input.fence) }.execute()
 
@@ -867,12 +836,11 @@ internal class VoiceRuntimeRealtimeDelegate(
     origin: String,
     path: String,
     method: VoiceRuntimeHttpMethod,
-    header: String,
-    token: String,
+    sessionCredential: String,
     body: ByteArray,
     maximumBytes: Int,
   ) = VoiceRuntimeHttpRequest(
-    origin, path, method, VoiceRuntimeAuthority(header, token),
+    origin, path, method, VoiceRuntimeSessionCredential(sessionCredential),
     VoiceRuntimeByteArrayBody(body, "application/json"), maximumBytes.toLong(), maximumBytes,
   )
 
@@ -943,9 +911,6 @@ private fun requireIdentifier(value: String, label: String, maximumLength: Int =
   }
 
 private const val BASE_PATH = "/api/voice/runtime/realtime-sessions"
-private const val RUNTIME_HEADER = "x-t3-voice-runtime"
-private const val CONTROL_HEADER = "x-t3-voice-control"
-private const val TRANSITION_HEADER = "x-t3-voice-transition"
 private const val MAXIMUM_IDENTIFIER_CHARACTERS = 192
 private const val MAXIMUM_ACTION_MESSAGE_CHARACTERS = 512
 private const val MAXIMUM_SDP_CHARACTERS = 128 * 1_024

@@ -14,7 +14,7 @@ internal class VoiceRuntimeRealtimeTest {
     val result = delegate(requests) { _ -> startResponse() }.start(
       ORIGIN,
       "runtime-secret",
-      VoiceRuntimeRealtimeStartInput(runtimeFence(), "operation-create"),
+      VoiceRuntimeRealtimeStartInput(runtimeFence(), "operation-create", realtimeTarget()),
     )
 
     assertTrue(result is VoiceRuntimeRealtimeResult.Success<*>)
@@ -22,26 +22,28 @@ internal class VoiceRuntimeRealtimeTest {
       VoiceRuntimeRealtimeStartResult
     >).value
     assertEquals("session-1", value.state.sessionId)
-    assertEquals("control-secret", value.controlGrant.token)
+    assertEquals(15, value.heartbeatIntervalSeconds)
     assertEquals("$BASE/session-1/webrtc-offer", value.signalingPath)
     val request = requests.single()
     assertEquals(BASE, request.path)
     assertEquals(VoiceRuntimeHttpMethod.POST, request.method)
-    assertEquals("x-t3-voice-runtime", request.authority.headerName)
+    assertEquals("runtime-secret", request.sessionCredential.value)
     assertEquals(
-      setOf("runtimeId", "runtimeInstanceId", "generation", "modeSessionId", "clientOperationId"),
+      setOf(
+        "runtimeId", "runtimeInstanceId", "generation", "modeSessionId", "clientOperationId", "target",
+      ),
       body(request).keys().asSequence().toSet(),
     )
   }
 
   @Test
-  fun `create response is exact and uses canonical control grant`() {
+  fun `create response is exact and tokenless`() {
     val decoded = VoiceRuntimeRealtimeJson.decodeStart(startResponse())
     assertEquals(7, decoded.state.leaseGeneration)
-    assertEquals(15, decoded.controlGrant.heartbeatIntervalSeconds)
+    assertEquals(15, decoded.heartbeatIntervalSeconds)
 
     val legacy = JSONObject(startResponse().toString(Charsets.UTF_8))
-    legacy.put("runtimeControlGrant", legacy.remove("controlGrant"))
+    legacy.put("controlGrant", JSONObject().put("token", "old-secret"))
     assertThrows(IllegalArgumentException::class.java) {
       VoiceRuntimeRealtimeJson.decodeStart(legacy.toString().toByteArray())
     }
@@ -100,7 +102,7 @@ internal class VoiceRuntimeRealtimeTest {
     )
     assertEquals(leaseFields, body(requests[1]).keys().asSequence().toSet())
     assertEquals(leaseFields + "clientOperationId", body(requests[2]).keys().asSequence().toSet())
-    assertTrue(requests.all { it.authority.headerName == "x-t3-voice-control" })
+    assertTrue(requests.all { it.sessionCredential.value == "control-secret" })
   }
 
   @Test
@@ -195,10 +197,9 @@ internal class VoiceRuntimeRealtimeTest {
     val value = (result as VoiceRuntimeRealtimeResult.Success<
       VoiceRuntimeRealtimeHandoffExchangeResult
     >).value
-    assertEquals("transition-secret", value.transitionGrant.token)
-    assertEquals(5, value.transitionGrant.generation)
-    assertEquals("thread-mode-1", value.transitionGrant.modeSessionId)
-    assertEquals("project-1", value.transitionGrant.target.projectId)
+    assertEquals(5, value.reservation.generation)
+    assertEquals("thread-mode-1", value.reservation.modeSessionId)
+    assertEquals("project-1", value.reservation.target.projectId)
     assertEquals("$BASE/session-1/handoffs/handoff%3A1/exchange", requests.single().path)
     assertEquals(
       leaseFields + setOf(
@@ -209,7 +210,7 @@ internal class VoiceRuntimeRealtimeTest {
     )
 
     val mismatched = JSONObject(handoffResponse().toString(Charsets.UTF_8))
-    mismatched.getJSONObject("transitionGrant").put("generation", 6)
+    mismatched.getJSONObject("reservation").put("generation", 6)
     val failed = delegate(mutableListOf()) { _ -> mismatched.toString().toByteArray() }.exchangeHandoff(
       ORIGIN, "control-secret", "session-1", "handoff:1", input,
     )
@@ -217,7 +218,7 @@ internal class VoiceRuntimeRealtimeTest {
   }
 
   @Test
-  fun `handoff commit uses transition authority and exact reservation fence`() {
+  fun `handoff commit uses session credential and exact reservation fence`() {
     val requests = mutableListOf<VoiceRuntimeHttpRequest>()
     val result = delegate(requests) { _ -> handoffCommitResponse() }.commitHandoff(
       ORIGIN,
@@ -240,8 +241,7 @@ internal class VoiceRuntimeRealtimeTest {
     val request = requests.single()
     assertEquals("$BASE/session-1/handoffs/handoff%3A1/commit", request.path)
     assertEquals(VoiceRuntimeHttpMethod.POST, request.method)
-    assertEquals("x-t3-voice-transition", request.authority.headerName)
-    assertEquals("transition-secret", request.authority.token)
+    assertEquals("transition-secret", request.sessionCredential.value)
     assertEquals(
       leaseFields + setOf("actionSequence", "nextGeneration", "threadModeSessionId"),
       body(request).keys().asSequence().toSet(),
@@ -251,7 +251,9 @@ internal class VoiceRuntimeRealtimeTest {
   @Test
   fun `malformed success and transport failure remain classified`() {
     val malformed = delegate(mutableListOf()) { _ -> "{".toByteArray() }.start(
-      ORIGIN, "runtime-secret", VoiceRuntimeRealtimeStartInput(runtimeFence(), "operation"),
+      ORIGIN, "runtime-secret", VoiceRuntimeRealtimeStartInput(
+        runtimeFence(), "operation", realtimeTarget(),
+      ),
     )
     assertEquals(
       VoiceRuntimeHttpFailureKind.PERMANENT,
@@ -262,7 +264,9 @@ internal class VoiceRuntimeRealtimeTest {
         VoiceRuntimeHttpResult.Failure(VoiceRuntimeHttpFailureKind.RETRYABLE, 503)
       },
     ).start(
-      ORIGIN, "runtime-secret", VoiceRuntimeRealtimeStartInput(runtimeFence(), "operation"),
+      ORIGIN, "runtime-secret", VoiceRuntimeRealtimeStartInput(
+        runtimeFence(), "operation", realtimeTarget(),
+      ),
     ) as VoiceRuntimeRealtimeResult.Failure
     assertEquals(VoiceRuntimeHttpFailureKind.RETRYABLE, retryable.kind)
     assertEquals(503, retryable.statusCode)
@@ -283,6 +287,9 @@ internal class VoiceRuntimeRealtimeTest {
 
   private fun runtimeFence() =
     VoiceRealtimeTransportFence("runtime-1", "instance-1", 4, "mode-1")
+
+  private fun realtimeTarget() =
+    VoiceRuntimeTarget.Realtime("environment-1", "conversation-1")
 
   private fun leaseFence() = VoiceRuntimeRealtimeLeaseFence(runtimeFence(), 7)
 
@@ -308,9 +315,7 @@ internal class VoiceRuntimeRealtimeTest {
   private fun startResponse() = """{
     "state":${state()},
     "transport":{"kind":"webrtc-sdp-v1","signalingPath":"$BASE/session-1/webrtc-offer"},
-    "expiresAt":"2026-07-15T12:00:00Z","heartbeatIntervalSeconds":15,
-    "controlGrant":{"token":"control-secret","sessionId":"session-1","leaseGeneration":7,
-      "expiresAt":"2026-07-15T12:00:00Z","heartbeatIntervalSeconds":15,"failureGraceSeconds":45}
+    "expiresAt":"2026-07-15T12:00:00Z","heartbeatIntervalSeconds":15
   }""".toByteArray()
 
   private fun answerResponse() =
@@ -344,8 +349,8 @@ internal class VoiceRuntimeRealtimeTest {
 
   private fun handoffResponse() = """{
     "actionId":"handoff:1","actionSequence":2,"projectId":"project-1","threadId":"thread-1",
-    "autoRearm":true,"transitionGrant":{
-      "token":"transition-secret","expiresAt":"2026-07-14T12:01:00Z","generation":5,
+    "autoRearm":true,"reservation":{
+      "generation":5,
       "modeSessionId":"thread-mode-1","target":{"mode":"thread","environmentId":"environment-1",
         "projectId":"project-1","threadId":"thread-1","speechPreset":"warm","autoRearm":true,
         "endpointPolicy":{"endSilenceMs":2200,"noSpeechTimeoutMs":120000,"maximumUtteranceMs":900000},

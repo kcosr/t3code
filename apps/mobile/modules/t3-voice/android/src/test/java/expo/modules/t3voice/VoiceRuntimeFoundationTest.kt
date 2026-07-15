@@ -88,24 +88,22 @@ class VoiceRuntimeFoundationTest {
   }
 
   @Test
-  fun authorityUsesCasRetainsProvisioningReplayAndExpiresClosed() {
-    var now = 1_000L
-    val registry = VoiceRuntimeAuthorityRegistry("runtime", "instance", { now })
-    val first = reservation(1, expected = 0, operationId = "provision-1", expiresAt = 2_000)
+  fun authorityUsesTargetKeyedCasAndRetainsReplay() {
+    val registry = VoiceRuntimeAuthorityRegistry("runtime", "instance")
+    val first = reservation(1, expected = 0)
 
     assertEquals(first to false, registry.configure(first, "first-body"))
     assertEquals(first to true, registry.configure(first, "first-body"))
-    expectThrows<VoiceRuntimeIdempotencyConflictException> {
+    expectThrows<VoiceRuntimeFenceException> {
       registry.configure(first.copy(targetDigest = "other"), "different-body")
     }
     expectThrows<VoiceRuntimeFenceException> {
-      registry.configure(reservation(2, expected = 0, operationId = "stale", expiresAt = 3_000), "stale")
+      registry.configure(reservation(2, expected = 0), "stale")
     }
-    val second = reservation(2, expected = 1, operationId = "provision-2", expiresAt = 3_000)
+    val second = reservation(2, expected = 1)
     assertEquals(second to false, registry.configure(second, "second-body"))
     assertEquals(first to true, registry.configure(first, "first-body"))
-    now = 3_000
-    expectThrows<VoiceRuntimeExpiredException> { registry.requireCurrent(2) }
+    assertEquals(second, registry.requireCurrent(2))
   }
 
   @Test
@@ -213,16 +211,10 @@ class VoiceRuntimeFoundationTest {
   private fun reservation(
     generation: Long,
     expected: Long,
-    operationId: String,
-    expiresAt: Long,
   ) = VoiceRuntimeAuthorityReservation(
     identity.copy(generation = generation),
-    operationId,
     expected,
     "target-$generation",
-    "token-$generation",
-    1_000,
-    expiresAt,
   )
 
   private inline fun <reified T : Throwable> expectThrows(block: () -> Unit): T {

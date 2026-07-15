@@ -18,8 +18,6 @@ internal class VoiceRuntimeRealtimeEngineTest {
     identity,
     VoiceRuntimeTarget.Realtime("environment-1", "conversation-1"),
     "https://environment.example.test",
-    "runtime-token",
-    now + 600_000,
   )
   private val server = FakeServer()
   private val peer = FakePeer()
@@ -375,7 +373,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
     val pending = requireNotNull(repository.loadFinalization())
     assertEquals(VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING, pending.stage)
     assertEquals("start-1.close.user-stop", pending.closeOperationId)
-    assertEquals("control-token", pending.session.controlGrant.token)
+    assertEquals(15, pending.session.heartbeatIntervalSeconds)
     assertEquals(2L, pending.session.state.leaseGeneration)
     val reported = repository.terminals(now).single()
     assertTrue(reported.serverCleanupPending)
@@ -394,7 +392,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
     assertNull(repository.loadFinalization())
     assertFalse(replacement.isOperational())
     assertEquals("start-1.close.user-stop", server.lastCloseOperationId)
-    assertEquals("control-token", server.lastCloseControlToken)
+    assertEquals(15L, server.lastCloseHeartbeatIntervalSeconds)
   }
 
   @Test
@@ -608,109 +606,6 @@ internal class VoiceRuntimeRealtimeEngineTest {
     assertNull(repository.loadFinalization())
     assertTrue(repository.terminals(now).single().serverCleanupPending)
     assertTrue(engine.start("start-2", fence) is VoiceRuntimeRealtimeCommandResult.Accepted)
-  }
-
-  @Test
-  fun `expired parent authority does not prevent child-grant source cleanup`() {
-    val shortAuthority = authority.copy(expiresAtEpochMillis = now + 100)
-    val engine = connectedEngine(shortAuthority)
-    server.closeSucceeds = false
-    engine.stop("stop-1", fence, VoiceRuntimeRealtimeStopPolicy.IMMEDIATE)
-    cues.completeEnded()
-    val closeCount = server.closeCount
-
-    now = shortAuthority.expiresAtEpochMillis
-    server.closeSucceeds = true
-    val result = engine.reconcileFinalization()
-
-    assertTrue(result is VoiceRuntimeRealtimeFinalizationResult.Completed)
-    assertEquals(closeCount + 1, server.closeCount)
-    assertEquals("control-token", server.lastCloseAuthorityToken)
-    assertNull(repository.loadFinalization())
-    assertFalse(engine.isOperational())
-  }
-
-  @Test
-  fun `source close ignores expired handoff grant after activation`() {
-    server.transitionGrantExpiresAtEpochMillis = now + 100
-    val engine = connectedEngine()
-    server.closeSucceeds = false
-    server.actionValues += VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
-      12, now, "handoff-1", "project-1", "thread-1", true, now + 60_000,
-    )
-    assertTrue(engine.pollActions(fence))
-    peer.completeDrain()
-    cues.completeEnded()
-    assertEquals(
-      VoiceRuntimeRealtimeFinalizationStage.SOURCE_CLOSE_PENDING,
-      repository.loadFinalization()?.stage,
-    )
-
-    now += 100
-    server.closeSucceeds = true
-    val result = engine.reconcileFinalization()
-
-    assertTrue(result is VoiceRuntimeRealtimeFinalizationResult.Completed)
-    assertTrue(handoff.activated)
-    assertEquals(2, server.closeCount)
-    assertNull(repository.loadFinalization())
-  }
-
-  @Test
-  fun `handoff commit can recover after source control grant expires`() {
-    server.transitionGrantExpiresAtEpochMillis = now + 600_000
-    val engine = connectedEngine()
-    server.commitSucceeds = false
-    server.actionValues += VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
-      12, now, "handoff-1", "project-1", "thread-1", true, now + 60_000,
-    )
-    assertTrue(engine.pollActions(fence))
-    peer.completeDrain()
-    cues.completeEnded()
-    assertEquals(
-      VoiceRuntimeRealtimeFinalizationStage.HANDOFF_COMMIT_PENDING,
-      repository.loadFinalization()?.stage,
-    )
-
-    now = startResult().controlGrant.expiresAtEpochMillis
-    server.commitSucceeds = true
-    val result = engine.reconcileFinalization()
-
-    assertTrue(result is VoiceRuntimeRealtimeFinalizationResult.Completed)
-    assertTrue(handoff.activated)
-    assertEquals(0, server.closeCount)
-    assertEquals("thread-token", server.lastCommitAuthorityToken)
-    val terminal = repository.terminals(now).single()
-    assertEquals(VoiceRuntimeRealtimeTerminalOutcome.COMPLETED, terminal.outcome)
-    assertTrue(terminal.serverCleanupPending)
-  }
-
-  @Test
-  fun `expired transition grant converges before handoff commit while control grant remains live`() {
-    server.transitionGrantExpiresAtEpochMillis = now + 100
-    val engine = connectedEngine()
-    server.commitSucceeds = false
-    server.actionValues += VoiceRuntimeRealtimeAction.HandoffToThreadVoice(
-      12, now, "handoff-1", "project-1", "thread-1", true, now + 60_000,
-    )
-    assertTrue(engine.pollActions(fence))
-    peer.completeDrain()
-    cues.completeEnded()
-    val commitCount = server.commitCount
-
-    now += 100
-    server.commitSucceeds = true
-    val result = engine.reconcileFinalization()
-
-    assertTrue(result is VoiceRuntimeRealtimeFinalizationResult.Completed)
-    assertEquals(commitCount, server.commitCount)
-    assertEquals(1, server.closeCount)
-    assertFalse(handoff.activated)
-    assertNull(repository.loadFinalization())
-    val terminal = repository.terminals(now).single()
-    assertEquals(VoiceRuntimeRealtimeTerminalOutcome.FAILED, terminal.outcome)
-    assertEquals("handoff-transition-credential-expired", terminal.reason)
-    assertFalse(terminal.serverCleanupPending)
   }
 
   @Test
@@ -1093,7 +988,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
     ),
     "/api/voice/runtime/realtime-sessions/session-1/webrtc-offer",
     now + 600_000,
-    VoiceRuntimeRealtimeControlGrant("control-token", now + 300_000, 15, 45),
+    15,
   )
 
   private fun heartbeat(disposition: String) = VoiceRuntimeRealtimeHeartbeatResult(
@@ -1107,16 +1002,13 @@ internal class VoiceRuntimeRealtimeEngineTest {
     var startCount = 0
     var commitCount = 0
     var closeCount = 0
-    var lastCommitAuthorityToken: String? = null
-    var lastCloseAuthorityToken: String? = null
     var lastCloseOperationId: String? = null
-    var lastCloseControlToken: String? = null
+    var lastCloseHeartbeatIntervalSeconds: Long? = null
     var actionsCount = 0
     var commitSucceeds = true
     var commitFailureRetryable = true
     var closeSucceeds = true
     var closeFailureRetryable = true
-    var transitionGrantExpiresAtEpochMillis = now + 300_000
     var startResponse = startResult()
     val actionValues = mutableListOf<VoiceRuntimeRealtimeAction>()
     var heartbeatResult: VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeHeartbeatResult> =
@@ -1159,17 +1051,14 @@ internal class VoiceRuntimeRealtimeEngineTest {
       startCount = 0
       commitCount = 0
       closeCount = 0
-      lastCommitAuthorityToken = null
-      lastCloseAuthorityToken = null
       lastCloseOperationId = null
-      lastCloseControlToken = null
+      lastCloseHeartbeatIntervalSeconds = null
       actionsCount = 0
       actionValues.clear()
       commitSucceeds = true
       commitFailureRetryable = true
       closeSucceeds = true
       closeFailureRetryable = true
-      transitionGrantExpiresAtEpochMillis = now + 300_000
       startResponse = startResult()
       heartbeatResult = VoiceRuntimeRealtimeRemoteResult.Success(heartbeat("live"))
       actionsEntered = CountDownLatch(0)
@@ -1270,9 +1159,7 @@ internal class VoiceRuntimeRealtimeEngineTest {
         action.projectId,
         action.threadId,
         action.autoRearm,
-        VoiceRuntimeRealtimeTransitionGrant(
-          "thread-token",
-          transitionGrantExpiresAtEpochMillis,
+        VoiceRuntimeRealtimeTransitionReservation(
           identity.generation + 1,
           plan.threadModeSessionId,
           VoiceRuntimeRealtimeThreadTarget(
@@ -1297,7 +1184,6 @@ internal class VoiceRuntimeRealtimeEngineTest {
       exchange: VoiceRuntimeRealtimeHandoffExchangeResult,
     ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeHandoffCommitResult> {
       commitCount++
-      lastCommitAuthorityToken = authority.runtimeToken
       trace += "handoff-commit"
       return if (commitSucceeds) VoiceRuntimeRealtimeRemoteResult.Success(
         VoiceRuntimeRealtimeHandoffCommitResult(
@@ -1319,9 +1205,8 @@ internal class VoiceRuntimeRealtimeEngineTest {
       clientOperationId: String,
     ): VoiceRuntimeRealtimeRemoteResult<VoiceRuntimeRealtimeCloseResult> {
       closeCount++
-      lastCloseAuthorityToken = authority.runtimeToken
       lastCloseOperationId = clientOperationId
-      lastCloseControlToken = session.controlGrant.token
+      lastCloseHeartbeatIntervalSeconds = session.heartbeatIntervalSeconds
       closeEntered.countDown()
       check(closeRelease.await(2, TimeUnit.SECONDS)) { "Timed out waiting to release close." }
       trace += "server-close"

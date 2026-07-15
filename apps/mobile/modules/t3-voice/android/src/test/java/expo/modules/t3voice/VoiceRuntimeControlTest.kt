@@ -11,12 +11,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VoiceRuntimeControlTest {
-  private val grant =
-    VoiceRuntimeControlGrant(
-      token = "secret",
+  private val lease =
+    VoiceRuntimeControlLease(
       sessionId = "session-1",
       leaseGeneration = 2,
-      expiresAtEpochMillis = Long.MAX_VALUE,
       heartbeatIntervalMillis = 8_000,
       failureGraceMillis = 30_000,
     )
@@ -25,7 +23,7 @@ class VoiceRuntimeControlTest {
   fun schedulerStartsImmediatelyAtTheServerInterval() {
     assertEquals(
       T3VoiceNativeHeartbeatSchedule(initialDelayMillis = 0, intervalMillis = 8_000),
-      T3VoiceNativeHeartbeatSchedulePolicy.forGrant(grant),
+      T3VoiceNativeHeartbeatSchedulePolicy.forLease(lease),
     )
   }
 
@@ -100,7 +98,6 @@ class VoiceRuntimeControlTest {
         nowMillis = 29_999,
         lastSuccessMillis = 0,
         failureGraceMillis = 30_000,
-        expiresAtMillis = 100_000,
       ),
     )
     assertTrue(
@@ -109,20 +106,6 @@ class VoiceRuntimeControlTest {
         nowMillis = 30_000,
         lastSuccessMillis = 0,
         failureGraceMillis = 30_000,
-        expiresAtMillis = 100_000,
-      ),
-    )
-  }
-
-  @Test
-  fun grantExpiryAlwaysLosesControl() {
-    assertTrue(
-      T3VoiceNativeHeartbeatPolicy.shouldLoseControl(
-        T3VoiceNativeHeartbeatResult.SUCCESS,
-        nowMillis = 100,
-        lastSuccessMillis = 100,
-        failureGraceMillis = 30_000,
-        expiresAtMillis = 100,
       ),
     )
   }
@@ -143,7 +126,7 @@ class VoiceRuntimeControlTest {
   }
 
   @Test
-  fun terminalHeartbeatLosesControlOnceAndErasesTheGrant() {
+  fun terminalHeartbeatLosesControlOnceAndErasesTheLease() {
     val calls = AtomicInteger()
     val lost = CountDownLatch(1)
     val heartbeat =
@@ -158,7 +141,7 @@ class VoiceRuntimeControlTest {
         },
       )
     try {
-      heartbeat.start("https://termstation", grant.copy(heartbeatIntervalMillis = 25))
+      heartbeat.start("https://termstation", "secret", lease.copy(heartbeatIntervalMillis = 25))
       assertTrue("Control loss was not delivered", lost.await(1, TimeUnit.SECONDS))
       Thread.sleep(100)
       assertEquals(1, calls.get())
@@ -184,7 +167,7 @@ class VoiceRuntimeControlTest {
         },
       )
     try {
-      heartbeat.start("https://termstation", grant.copy(heartbeatIntervalMillis = 25))
+      heartbeat.start("https://termstation", "secret", lease.copy(heartbeatIntervalMillis = 25))
       assertTrue(ended.await(1, TimeUnit.SECONDS))
       Thread.sleep(100)
       assertEquals(VoiceRuntimeControlTermination.SESSION_ENDED, termination.get())
@@ -223,12 +206,14 @@ class VoiceRuntimeControlTest {
     try {
       heartbeat.start(
         "https://termstation",
-        grant.copy(token = "old", heartbeatIntervalMillis = 1_000),
+        "old",
+        lease.copy(heartbeatIntervalMillis = 1_000),
       )
       assertTrue(oldEntered.await(1, TimeUnit.SECONDS))
       heartbeat.start(
         "https://termstation",
-        grant.copy(token = "new", leaseGeneration = 3, heartbeatIntervalMillis = 25),
+        "new",
+        lease.copy(leaseGeneration = 3, heartbeatIntervalMillis = 25),
       )
       releaseOld.countDown()
       assertTrue(replacementSucceeded.await(1, TimeUnit.SECONDS))
@@ -259,8 +244,8 @@ class VoiceRuntimeControlTest {
     try {
       heartbeat.start(
         "https://termstation",
-        grant.copy(
-          expiresAtEpochMillis = 100_000,
+        "secret",
+        lease.copy(
           heartbeatIntervalMillis = 25,
           failureGraceMillis = 30_000,
         ),
@@ -288,7 +273,7 @@ class VoiceRuntimeControlTest {
         onTerminated = { _, _ -> throw AssertionError("Stopped control must not report loss") },
       )
     try {
-      heartbeat.start("https://termstation", grant.copy(heartbeatIntervalMillis = 100))
+      heartbeat.start("https://termstation", "secret", lease.copy(heartbeatIntervalMillis = 100))
       assertTrue(firstAttempt.await(1, TimeUnit.SECONDS))
       heartbeat.stop()
       val callsAtStop = calls.get()

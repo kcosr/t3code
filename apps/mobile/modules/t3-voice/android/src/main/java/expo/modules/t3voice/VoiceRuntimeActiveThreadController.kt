@@ -21,8 +21,6 @@ internal data class VoiceRuntimeInstalledAuthority(
   val runtimeId: String,
   val generation: Long,
   val targetDigest: String,
-  val token: String,
-  val expiresAtEpochMillis: Long,
 )
 
 internal sealed interface VoiceRuntimeThreadCommand {
@@ -164,7 +162,6 @@ internal class VoiceRuntimeActiveThreadController(
   private val authority = VoiceRuntimeAuthorityRegistry(
     runtimeId,
     runtimeInstanceId,
-    now,
     initialGenerationFloor = identity.generation,
   )
   private val commands = VoiceRuntimeIdempotencyLedger<VoiceRuntimeCommandReceipt>(idempotencyCapacity)
@@ -200,12 +197,12 @@ internal class VoiceRuntimeActiveThreadController(
   @Synchronized
   fun restoreCanonicalInstall(
     checkpoint: VoiceRuntimeCanonicalInstallCheckpoint,
-    failedProvisioningOperationId: String,
+    failedReservation: VoiceRuntimeAuthorityReservation,
   ): Boolean {
     val draftsRestored = runCatching { drafts.restore(checkpoint.drafts) }.getOrDefault(false)
     val retentionRestored = runCatching { retained.restore(checkpoint.retention) }.getOrDefault(false)
     val authorityRestored = runCatching {
-      authority.restore(checkpoint.authority, failedProvisioningOperationId)
+      authority.restore(checkpoint.authority, failedReservation)
     }.isSuccess
     var memoryRestored = true
     identity = checkpoint.identity
@@ -232,9 +229,7 @@ internal class VoiceRuntimeActiveThreadController(
     if (reservation.identity.runtimeId != identity.runtimeId ||
       reservation.identity.runtimeInstanceId != identity.runtimeInstanceId ||
       reservation.expectedCurrentGeneration != identity.generation ||
-      reservation.identity.generation != identity.generation + 1 ||
-      reservation.issuedAtEpochMillis > now() ||
-      reservation.expiresAtEpochMillis <= now()) {
+      reservation.identity.generation != identity.generation + 1) {
       throw VoiceRuntimeFenceException("Authority replacement fence is stale.")
     }
     val replacingRealtime = journal.snapshot.operation is VoiceRuntimeOperation.Realtime
@@ -242,14 +237,6 @@ internal class VoiceRuntimeActiveThreadController(
       journal.snapshot.mediaOwner != VoiceRuntimeMediaOwner.None)) {
       throw VoiceRuntimeFenceException("Active voice work must stop before authority replacement.")
     }
-  }
-
-  @Synchronized
-  fun refreshAuthority(reservation: VoiceRuntimeAuthorityReservation): VoiceRuntimeSnapshot {
-    requireInstalledAuthority(reservation)
-    authority.refresh(reservation)
-    appendState("authority-refreshed") { it.copy(failureCode = null) }
-    return journal.snapshot
   }
 
   @Synchronized
@@ -330,7 +317,7 @@ internal class VoiceRuntimeActiveThreadController(
         }
       }
     } catch (cause: Throwable) {
-      check(restoreCanonicalInstall(prior, reservation.provisioningOperationId)) {
+      check(restoreCanonicalInstall(prior, reservation)) {
         "Voice runtime canonical install rollback failed."
       }
       commands.forget(command.commandId)
@@ -1022,11 +1009,8 @@ internal class VoiceRuntimeActiveThreadController(
     val installed = installedAuthority() ?: throw VoiceRuntimeFenceException("Authority unavailable.")
     if (installed.runtimeId != reservation.identity.runtimeId ||
       installed.generation != reservation.identity.generation ||
-      installed.targetDigest != reservation.targetDigest ||
-      installed.token != reservationToken(reservation) ||
-      installed.expiresAtEpochMillis != reservation.expiresAtEpochMillis ||
-      installed.expiresAtEpochMillis <= now()) {
-      throw VoiceRuntimeFenceException("Canonical authority does not match installed grant.")
+      installed.targetDigest != reservation.targetDigest) {
+      throw VoiceRuntimeFenceException("Canonical authority does not match installed state.")
     }
   }
 
@@ -1229,9 +1213,6 @@ internal class VoiceRuntimeActiveThreadController(
     is VoiceRuntimeThreadCommand.Cancel -> command.turnClientOperationId
     is VoiceRuntimeThreadCommand.Stop -> null
   }
-
-  private fun reservationToken(reservation: VoiceRuntimeAuthorityReservation): String =
-    reservation.token
 
   internal fun targetDigest(target: VoiceRuntimeTarget.Thread): String {
     return T3VoiceRuntimeTargetIdentity.digest(VoiceRuntimeBridge.canonicalThreadTargetIdentity(target))

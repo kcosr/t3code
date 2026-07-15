@@ -175,22 +175,22 @@ internal class VoiceRuntimeExecutionStateTest {
   }
 
   @Test
-  fun `same target authority refresh preserves operation generation and accepts its events`() {
+  fun `same target authority update preserves operation generation and accepts its events`() {
     val current = activeWaitingSnapshot(autoRearm = false)
-    val refreshed =
+    val updated =
       VoiceRuntimeExecutionReducer.reduce(
         current,
         authority(generation = 4, autoRearm = true),
       )
-    assertEquals(4L, refreshed.snapshot.readinessGeneration)
-    assertEquals(3L, refreshed.snapshot.operationGeneration)
-    assertEquals("operation-1", refreshed.snapshot.operationId)
-    assertTrue(refreshed.snapshot.autoRearm)
-    assertTrue(refreshed.commands.isEmpty())
+    assertEquals(4L, updated.snapshot.readinessGeneration)
+    assertEquals(3L, updated.snapshot.operationGeneration)
+    assertEquals("operation-1", updated.snapshot.operationId)
+    assertTrue(updated.snapshot.autoRearm)
+    assertTrue(updated.commands.isEmpty())
 
     val applied =
       VoiceRuntimeExecutionReducer.reduce(
-        refreshed.snapshot,
+        updated.snapshot,
         serverEvent(2, VoiceRuntimeServerPhase.WAITING, generation = 3),
       )
     assertEquals(2L, applied.snapshot.eventCursor)

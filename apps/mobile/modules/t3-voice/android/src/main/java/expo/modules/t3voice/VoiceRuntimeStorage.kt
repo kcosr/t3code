@@ -7,6 +7,7 @@ import android.security.keystore.KeyProperties
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.security.KeyStore
+import java.util.Base64
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -197,4 +198,90 @@ internal sealed interface T3VoiceRuntimeGrantLoadResult {
   data class TargetReplaced(val grant: T3VoiceRuntimeGrant) : T3VoiceRuntimeGrantLoadResult
 
   data object Locked : T3VoiceRuntimeGrantLoadResult
+}
+
+internal data class VoiceRuntimeStoredSessionCredential(
+  val environmentOrigin: String,
+  val credential: VoiceRuntimeSessionCredential,
+)
+
+internal sealed interface VoiceRuntimeSessionCredentialLoadResult {
+  data object Missing : VoiceRuntimeSessionCredentialLoadResult
+  data object Locked : VoiceRuntimeSessionCredentialLoadResult
+  data class Available(val value: VoiceRuntimeStoredSessionCredential) :
+    VoiceRuntimeSessionCredentialLoadResult
+}
+
+internal class VoiceRuntimeSessionCredentialStore(
+  private val storage: VoiceRuntimeKeyValueStore,
+  private val cipher: T3VoiceRuntimeGrantCipher,
+) {
+  constructor(context: Context) : this(
+    VoiceRuntimePreferences(context.applicationContext),
+    T3VoiceAndroidKeystoreGrantCipher("t3.voice.runtime.session-credential.v1"),
+  )
+
+  @Synchronized
+  fun set(environmentOrigin: String, credential: String) {
+    val normalizedOrigin = VoiceRuntimeOriginPolicy.normalize(environmentOrigin)
+    val validated = VoiceRuntimeSessionCredential(credential)
+    val encrypted = cipher.encrypt(
+      validated.value.toByteArray(StandardCharsets.UTF_8),
+      metadata(normalizedOrigin),
+    )
+    check(storage.put(mapOf(
+      KEY_VERSION to VERSION,
+      KEY_ORIGIN to normalizedOrigin,
+      KEY_IV to Base64.getEncoder().encodeToString(encrypted.initializationVector),
+      KEY_CIPHERTEXT to Base64.getEncoder().encodeToString(encrypted.ciphertext),
+    ))) { "Could not persist the runtime session credential." }
+  }
+
+  @Synchronized
+  fun load(): VoiceRuntimeSessionCredentialLoadResult {
+    val values = KEYS.associateWith(storage::getString)
+    if (values.values.all { it == null }) return VoiceRuntimeSessionCredentialLoadResult.Missing
+    if (values.values.any { it == null }) return VoiceRuntimeSessionCredentialLoadResult.Locked
+    return try {
+      require(values.getValue(KEY_VERSION) == VERSION)
+      val origin = VoiceRuntimeOriginPolicy.normalize(values.getValue(KEY_ORIGIN)!!)
+      val plaintext = cipher.decrypt(
+        T3VoiceEncryptedGrant(
+          Base64.getDecoder().decode(values.getValue(KEY_IV)),
+          Base64.getDecoder().decode(values.getValue(KEY_CIPHERTEXT)),
+        ),
+        metadata(origin),
+      )
+      try {
+        VoiceRuntimeSessionCredentialLoadResult.Available(
+          VoiceRuntimeStoredSessionCredential(
+            origin,
+            VoiceRuntimeSessionCredential(String(plaintext, StandardCharsets.UTF_8)),
+          ),
+        )
+      } finally {
+        plaintext.fill(0)
+      }
+    } catch (_: Throwable) {
+      VoiceRuntimeSessionCredentialLoadResult.Locked
+    }
+  }
+
+  @Synchronized
+  fun clear() {
+    check(storage.clear(KEYS)) { "Could not clear the runtime session credential." }
+    cipher.deleteKey()
+  }
+
+  private fun metadata(environmentOrigin: String): ByteArray =
+    "$VERSION\n$environmentOrigin".toByteArray(StandardCharsets.UTF_8)
+
+  private companion object {
+    const val VERSION = "t3-voice-runtime-session-credential-v1"
+    const val KEY_VERSION = "runtime_session_credential_version"
+    const val KEY_ORIGIN = "runtime_session_credential_origin"
+    const val KEY_IV = "runtime_session_credential_iv"
+    const val KEY_CIPHERTEXT = "runtime_session_credential_ciphertext"
+    val KEYS = setOf(KEY_VERSION, KEY_ORIGIN, KEY_IV, KEY_CIPHERTEXT)
+  }
 }

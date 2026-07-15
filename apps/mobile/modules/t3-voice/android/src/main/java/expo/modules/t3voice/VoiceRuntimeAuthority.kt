@@ -2,12 +2,8 @@ package expo.modules.t3voice
 
 internal data class VoiceRuntimeAuthorityReservation(
   val identity: VoiceRuntimeIdentity,
-  val provisioningOperationId: String,
   val expectedCurrentGeneration: Long,
   val targetDigest: String,
-  val token: String,
-  val issuedAtEpochMillis: Long,
-  val expiresAtEpochMillis: Long,
 )
 
 internal data class VoiceRuntimeAuthorityRegistryCheckpoint(
@@ -18,7 +14,6 @@ internal data class VoiceRuntimeAuthorityRegistryCheckpoint(
 internal class VoiceRuntimeAuthorityRegistry(
   private val runtimeId: String,
   private val runtimeInstanceId: String,
-  private val now: () -> Long,
   idempotencyCapacity: Int = 128,
   initialGenerationFloor: Long = 0,
 ) {
@@ -32,7 +27,7 @@ internal class VoiceRuntimeAuthorityRegistry(
     reservation: VoiceRuntimeAuthorityReservation,
     fingerprint: String,
   ): Pair<VoiceRuntimeAuthorityReservation, Boolean> =
-    provisioning.resolve(reservation.provisioningOperationId, fingerprint) {
+    provisioning.resolve(idempotencyKey(reservation), fingerprint) {
       requireIdentity(reservation.identity)
       val comparisonFloor =
         if (authority == null && reservation.expectedCurrentGeneration >= generationFloor) {
@@ -44,20 +39,12 @@ internal class VoiceRuntimeAuthorityRegistry(
         reservation.identity.generation != comparisonFloor + 1) {
         throw VoiceRuntimeFenceException("Authority generation compare-and-swap failed.")
       }
-      val currentTime = now()
-      require(reservation.issuedAtEpochMillis <= currentTime) {
-        "Authority reservation was issued in the future."
-      }
-      require(reservation.expiresAtEpochMillis > currentTime) {
-        "Authority reservation is expired."
-      }
       authority = reservation
       generationFloor = reservation.identity.generation
       reservation
     }
 
-  fun current(): VoiceRuntimeAuthorityReservation? =
-    authority?.takeIf { it.expiresAtEpochMillis > now() }
+  fun current(): VoiceRuntimeAuthorityReservation? = authority
 
   fun requireCurrent(expectedGeneration: Long): VoiceRuntimeAuthorityReservation {
     val current = current() ?: throw VoiceRuntimeExpiredException()
@@ -65,21 +52,6 @@ internal class VoiceRuntimeAuthorityRegistry(
       throw VoiceRuntimeFenceException("Stale authority generation.")
     }
     return current
-  }
-
-  fun refresh(reservation: VoiceRuntimeAuthorityReservation) {
-    requireIdentity(reservation.identity)
-    val current = authority ?: throw VoiceRuntimeExpiredException()
-    if (reservation.identity != current.identity ||
-      reservation.provisioningOperationId != current.provisioningOperationId ||
-      reservation.expectedCurrentGeneration != current.expectedCurrentGeneration ||
-      reservation.targetDigest != current.targetDigest) {
-      throw VoiceRuntimeFenceException("Refreshed authority changed its canonical fence.")
-    }
-    val currentTime = now()
-    require(reservation.issuedAtEpochMillis <= currentTime)
-    require(reservation.expiresAtEpochMillis > currentTime)
-    authority = reservation
   }
 
   fun clear(identity: VoiceRuntimeIdentity) {
@@ -95,12 +67,15 @@ internal class VoiceRuntimeAuthorityRegistry(
 
   fun restore(
     checkpoint: VoiceRuntimeAuthorityRegistryCheckpoint,
-    provisioningOperationId: String,
+    failedReservation: VoiceRuntimeAuthorityReservation,
   ) {
     authority = checkpoint.authority
     generationFloor = checkpoint.generationFloor
-    provisioning.forget(provisioningOperationId)
+    provisioning.forget(idempotencyKey(failedReservation))
   }
+
+  private fun idempotencyKey(reservation: VoiceRuntimeAuthorityReservation): String =
+    "${reservation.identity.generation}:${reservation.targetDigest}"
 
   private fun requireIdentity(identity: VoiceRuntimeIdentity) {
     if (identity.runtimeId != runtimeId || identity.runtimeInstanceId != runtimeInstanceId) {

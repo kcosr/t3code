@@ -467,8 +467,7 @@ internal class VoiceRuntimeDurabilityTest {
   @Test
   fun `draft consume marker survives operation store restart`() {
     val storage = MemoryStore()
-    val cipher = AuthenticatedCipher()
-    val store = VoiceRuntimeThreadOperationStore(storage, cipher)
+    val store = VoiceRuntimeThreadOperationStore(storage)
     val claim = VoiceRuntimeThreadClaim(
       "runtime-1", "instance-1", 4, "mode-1", "https://example.test",
       "project-1", "thread-1", "client-1", "draft", "speech-1",
@@ -476,7 +475,7 @@ internal class VoiceRuntimeDurabilityTest {
     )
     store.writePrepared(claim)
     store.writeActive(VoiceRuntimeThreadOperationState.Active(
-      claim, "operation-1", 2_000, "token", 0,
+      claim, "operation-1", 2_000, 0,
       draftConsumePending = true,
       snapshot = VoiceRuntimeExecutionSnapshot(
         runtimeId = "runtime-1", readinessGeneration = 4, mode = VoiceRuntimeExecutionMode.THREAD,
@@ -485,7 +484,7 @@ internal class VoiceRuntimeDurabilityTest {
       ),
     ))
 
-    val loaded = (VoiceRuntimeThreadOperationStore(storage, cipher).load()
+    val loaded = (VoiceRuntimeThreadOperationStore(storage).load()
       as VoiceRuntimeThreadOperationLoadResult.Available).state
       as VoiceRuntimeThreadOperationState.Active
     assertTrue(loaded.draftConsumePending)
@@ -494,15 +493,14 @@ internal class VoiceRuntimeDurabilityTest {
   @Test
   fun `auto submit manual stop persists exact target draft disposition across restart`() {
     val storage = MemoryStore()
-    val cipher = AuthenticatedCipher()
-    val store = VoiceRuntimeThreadOperationStore(storage, cipher)
+    val store = VoiceRuntimeThreadOperationStore(storage)
     val claim = VoiceRuntimeThreadClaim(
       "runtime-1", "instance-1", 4, "mode-1", "https://example.test",
       "project-1", "thread-1", "client-1", "auto-submit", "speech-1", null,
     )
     store.writePrepared(claim)
     store.writeActive(VoiceRuntimeThreadOperationState.Active(
-      claim, "operation-1", 2_000, "token", 0,
+      claim, "operation-1", 2_000, 0,
       snapshot = VoiceRuntimeExecutionSnapshot(
         runtimeId = "runtime-1", readinessGeneration = 4, mode = VoiceRuntimeExecutionMode.THREAD,
         phase = VoiceRuntimePhase.WAITING, operationId = "operation-1",
@@ -519,7 +517,7 @@ internal class VoiceRuntimeDurabilityTest {
     assertEquals(context, prepared.state.claim.draftContext)
     assertTrue(prepared.state.draftDispositionPending)
 
-    val restarted = VoiceRuntimeThreadOperationStore(storage, cipher)
+    val restarted = VoiceRuntimeThreadOperationStore(storage)
     val loaded = (restarted.load() as VoiceRuntimeThreadOperationLoadResult.Available).state
       as VoiceRuntimeThreadOperationState.Active
     assertEquals("draft", loaded.claim.submissionPolicy)

@@ -20,7 +20,6 @@ internal data class VoiceRuntimeThreadAuthority(
 
 internal data class VoiceRuntimeThreadAuthorization(
   val authority: VoiceRuntimeThreadAuthority,
-  val runtimeGrantToken: String,
 )
 
 internal object VoiceRuntimeThreadAuthorityPolicy {
@@ -32,7 +31,7 @@ internal object VoiceRuntimeThreadAuthorityPolicy {
     allowDetachedContinuation: Boolean = false,
   ): VoiceRuntimeThreadAuthorization? {
     val target = persisted.target as? VoiceRuntimeTarget.Thread ?: return null
-    if (!microphonePermissionGranted || persisted.expiresAtEpochMillis <= nowMillis ||
+    if (!microphonePermissionGranted ||
       (!allowDetachedContinuation && !VoiceRuntimeAuthorityLifecyclePolicy.canDispatch(
         persisted.readinessEnabled,
         consumerCount,
@@ -50,7 +49,6 @@ internal object VoiceRuntimeThreadAuthorityPolicy {
         target.maximumUtteranceMs,
         target.rearmGuardMs,
       ),
-      persisted.token,
     )
   }
 
@@ -104,7 +102,6 @@ internal object VoiceRuntimeThreadAuthorityPolicy {
         selectedThreadId,
         readiness.autoRearm,
       ),
-      grant.token,
     )
   }
 
@@ -121,9 +118,9 @@ internal object VoiceRuntimeThreadAuthorityPolicy {
       snapshot.threadId == authority.selectedThreadId &&
       snapshot.operationId.isNotBlank() && clientOperationId.isNotBlank() &&
       snapshot.acknowledgedSequence <= snapshot.lastSequence &&
-      snapshot.retentionExpiresAtEpochMillis > nowMillis &&
-      result.operationGrant.expiresAtEpochMillis > nowMillis &&
-      result.operationGrant.expiresAtEpochMillis <= snapshot.operationTokenExpiresAtEpochMillis
+      snapshot.operationTokenExpiresAtEpochMillis > nowMillis &&
+      snapshot.operationTokenExpiresAtEpochMillis <= snapshot.retentionExpiresAtEpochMillis &&
+      snapshot.retentionExpiresAtEpochMillis > nowMillis
   }
 
   fun cancellationAuthority(
@@ -172,7 +169,6 @@ internal object VoiceRuntimeThreadAuthorityPolicy {
         claim.threadId,
         false,
       ),
-      grant.token,
     )
   }
 
@@ -249,7 +245,6 @@ internal data class VoiceRuntimeThreadAttempt(
   var highestDrainedSegment: Int? = null,
   val segmentDispositions: MutableList<VoiceRuntimeSpeechDisposition> = mutableListOf(),
   var operationId: String? = null,
-  var operationGrantToken: String? = null,
   var acknowledgedCursor: Long = 0,
   var recording: T3VoiceRecordingResult? = null,
   var polling: Boolean = false,

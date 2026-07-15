@@ -45,7 +45,7 @@ export type {
 } from "./T3Voice.types";
 
 const NATIVE_MODULE_NAME = "T3Voice";
-const NATIVE_REVISION = 14;
+const NATIVE_REVISION = 15;
 
 let resolvedModule: T3VoiceNativeModule | null | undefined;
 

@@ -45,8 +45,7 @@ internal class VoiceRuntimeThreadTurnTest {
     assertTrue(result.events[6] is VoiceRuntimeThreadTurnEvent.Terminal)
 
     val create = VoiceRuntimeThreadTurnJson.decodeCreate(createResponse())
-    assertEquals("operation-secret", create.operationGrant.token)
-    assertEquals(1_783_945_800_000, create.operationGrant.expiresAtEpochMillis)
+    assertEquals("operation-1", create.snapshot.operationId)
   }
 
   @Test
@@ -146,49 +145,49 @@ internal class VoiceRuntimeThreadTurnTest {
     assertTrue(
       delegate.create(
         ORIGIN,
-        "runtime-secret",
+        "session-secret",
         createInput(),
       ) is VoiceRuntimeThreadTurnResult.Success,
     )
     assertTrue(
       delegate.newDraftDispositionCall(
         ORIGIN,
-        "operation-secret",
+        "session-secret",
         "operation-1",
       ).execute() is VoiceRuntimeThreadTurnResult.Success,
     )
     assertTrue(
       delegate.uploadAudio(
         ORIGIN,
-        "operation-secret",
+        "session-secret",
         "operation-1",
         VoiceRuntimeByteArrayBody(byteArrayOf(1, 2, 3), "audio/mp4"),
       ) is VoiceRuntimeThreadTurnResult.Success,
     )
     assertTrue(
-      delegate.events(ORIGIN, "operation-secret", "operation-1", 12, 30_000) is
+      delegate.events(ORIGIN, "session-secret", "operation-1", 12, 30_000) is
         VoiceRuntimeThreadTurnResult.Success,
     )
     assertTrue(
       delegate.acknowledge(
-        ORIGIN, "operation-secret", "operation-1", 12, "speech-1", null, null, emptyList(),
+        ORIGIN, "session-secret", "operation-1", 12, "speech-1", null, null, emptyList(),
       ) is
         VoiceRuntimeThreadTurnResult.Success,
     )
     assertTrue(
-      delegate.speech(ORIGIN, "operation-secret", "operation-1", 4) is
+      delegate.speech(ORIGIN, "session-secret", "operation-1", 4) is
         VoiceRuntimeThreadTurnResult.Success,
     )
     assertTrue(
-      delegate.newDraftCall(ORIGIN, "operation-secret", "operation-1").execute() is
+      delegate.newDraftCall(ORIGIN, "session-secret", "operation-1").execute() is
         VoiceRuntimeThreadTurnResult.Success,
     )
     assertTrue(
-      delegate.newConsumeDraftCall(ORIGIN, "operation-secret", "operation-1").execute() is
+      delegate.newConsumeDraftCall(ORIGIN, "session-secret", "operation-1").execute() is
         VoiceRuntimeThreadTurnResult.Success,
     )
     assertTrue(
-      delegate.cancel(ORIGIN, "operation-secret", "operation-1") is
+      delegate.cancel(ORIGIN, "session-secret", "operation-1") is
         VoiceRuntimeThreadTurnResult.Success,
     )
 
@@ -206,10 +205,7 @@ internal class VoiceRuntimeThreadTurnTest {
       ),
       requests.map(VoiceRuntimeHttpRequest::method),
     )
-    assertEquals("x-t3-voice-runtime", requests[0].authority.headerName)
-    assertEquals("runtime-secret", requests[0].authority.token)
-    assertTrue(requests.drop(1).all { it.authority.headerName == "x-t3-voice-operation" })
-    assertTrue(requests.drop(1).all { it.authority.token == "operation-secret" })
+    assertTrue(requests.all { it.sessionCredential.value == "session-secret" })
     assertEquals(
       listOf(
         "/api/voice/runtime/thread-turns",
@@ -234,7 +230,7 @@ internal class VoiceRuntimeThreadTurnTest {
     assertEquals(
       setOf(
         "runtimeId", "runtimeInstanceId", "generation", "modeSessionId",
-        "turnClientOperationId", "submissionPolicy", "speechPlanId",
+        "turnClientOperationId", "submissionPolicy", "speechPlanId", "target",
       ),
       bodyFields(requests[0]),
     )
@@ -375,12 +371,6 @@ internal class VoiceRuntimeThreadTurnTest {
   private fun createResponse(): ByteArray =
     JSONObject()
       .put("snapshot", snapshot())
-      .put(
-        "operationGrant",
-        JSONObject()
-          .put("token", "operation-secret")
-          .put("expiresAt", "2026-07-13T12:30:00Z"),
-      )
       .bytes()
 
   private fun audioResponse(): ByteArray =
@@ -448,6 +438,10 @@ internal class VoiceRuntimeThreadTurnTest {
     "client-operation-1",
     "auto-submit",
     "speech-1",
+    VoiceRuntimeTarget.Thread(
+      "environment-1", "project-1", "thread-1", "default", true,
+      2_200, 60_000, 600_000, true, 500,
+    ),
   )
 
   private fun event(sequence: Long, type: String): JSONObject =

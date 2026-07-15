@@ -9,7 +9,6 @@ internal object VoiceRuntimeBridge {
     val target: VoiceRuntimeTarget,
     val environmentOrigin: String,
     val readinessEnabled: Boolean,
-    val refreshRotationCounter: Long,
     val fingerprint: String,
   )
   fun canonicalRealtimeTargetIdentity(target: VoiceRuntimeTarget.Realtime): String = canonicalJson(
@@ -49,7 +48,7 @@ internal object VoiceRuntimeBridge {
   }
 
   fun descriptorBody(): Map<String, Any> = mapOf(
-    "protocolMajor" to 1,
+    "protocolMajor" to 2,
     "executionModel" to "autonomous",
     "capabilities" to mapOf(
       "automaticEndpointing" to true,
@@ -68,30 +67,28 @@ internal object VoiceRuntimeBridge {
 
   fun parseAuthority(input: Map<String, Any?>): ParsedAuthority {
     requireKeys(input, setOf(
-      "runtimeId", "runtimeInstanceId", "provisioningOperationId", "expectedCurrentGeneration",
-      "generation", "targetDigest", "target", "operation", "environmentOrigin",
-      "readinessEnabled", "token", "refreshRotationCounter",
-      "issuedAt", "expiresAt",
+      "runtimeId", "runtimeInstanceId", "expectedCurrentGeneration", "generation", "target",
+      "environmentOrigin", "readinessEnabled",
     ))
-    val operation = text(input, "operation")
     val targetInput = objectValue(input, "target")
-    val target = when (operation) {
-      "realtime-start" -> parseRealtimeTarget(targetInput)
-      "thread-turn-start" -> parseThreadTarget(targetInput)
-      else -> throw IllegalArgumentException("Unsupported voice runtime authority operation.")
+    val target = when (text(targetInput, "mode")) {
+      "realtime" -> parseRealtimeTarget(targetInput)
+      "thread" -> parseThreadTarget(targetInput)
+      else -> throw IllegalArgumentException("Unsupported voice runtime authority target.")
     }
+    val targetIdentity = when (target) {
+      is VoiceRuntimeTarget.Realtime -> canonicalRealtimeTargetIdentity(target)
+      is VoiceRuntimeTarget.Thread -> canonicalThreadTargetIdentity(target)
+    }
+    val targetDigest = T3VoiceRuntimeTargetIdentity.digest(targetIdentity)
     val reservation = VoiceRuntimeAuthorityReservation(
       VoiceRuntimeIdentity(
         text(input, "runtimeId"),
         text(input, "runtimeInstanceId"),
         long(input, "generation"),
       ),
-      text(input, "provisioningOperationId"),
       long(input, "expectedCurrentGeneration"),
-      text(input, "targetDigest"),
-      text(input, "token"),
-      Instant.parse(text(input, "issuedAt")).toEpochMilli(),
-      Instant.parse(text(input, "expiresAt")).toEpochMilli(),
+      targetDigest,
     )
     val fingerprint = listOf(
       reservation.identity.runtimeId,
@@ -99,19 +96,14 @@ internal object VoiceRuntimeBridge {
       reservation.identity.generation,
       reservation.expectedCurrentGeneration,
       reservation.targetDigest,
-      reservation.token,
-      reservation.issuedAtEpochMillis,
-      reservation.expiresAtEpochMillis,
       target,
       boolean(input, "readinessEnabled"),
-      long(input, "refreshRotationCounter"),
     ).joinToString("\u0000")
     return ParsedAuthority(
       reservation,
       target,
       VoiceRuntimeOriginPolicy.normalize(text(input, "environmentOrigin")),
       boolean(input, "readinessEnabled"),
-      long(input, "refreshRotationCounter"),
       fingerprint,
     )
   }

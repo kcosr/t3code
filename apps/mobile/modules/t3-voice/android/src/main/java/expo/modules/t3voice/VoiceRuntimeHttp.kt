@@ -81,19 +81,11 @@ internal enum class VoiceRuntimeHttpMethod {
   PUT,
 }
 
-internal data class VoiceRuntimeAuthority(
-  val headerName: String,
-  val token: String,
-) {
+internal data class VoiceRuntimeSessionCredential(val value: String) {
   init {
-    require(headerName.matches(HEADER_NAME_PATTERN)) { "Invalid runtime authority header." }
-    require(token.isNotBlank() && token.length <= 128 && token.none(Char::isWhitespace)) {
-      "Invalid runtime authority token."
+    require(value.isNotBlank() && value.length <= 8_192 && value.none { it == '\r' || it == '\n' }) {
+      "Invalid runtime session credential."
     }
-  }
-
-  private companion object {
-    val HEADER_NAME_PATTERN = Regex("^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
   }
 }
 
@@ -117,7 +109,7 @@ internal data class VoiceRuntimeHttpRequest(
   val origin: String,
   val path: String,
   val method: VoiceRuntimeHttpMethod,
-  val authority: VoiceRuntimeAuthority,
+  val sessionCredential: VoiceRuntimeSessionCredential,
   val body: VoiceRuntimeRequestBody? = null,
   val maximumRequestBytes: Long = DEFAULT_MAXIMUM_REQUEST_BYTES,
   val maximumResponseBytes: Int = DEFAULT_MAXIMUM_RESPONSE_BYTES,
@@ -268,9 +260,9 @@ internal class VoiceRuntimeHttpCall(
       connection.useCaches = false
       connection.setRequestProperty("accept", "application/json, application/octet-stream")
       if (request.path.startsWith("/api/voice/runtime/")) {
-        connection.setRequestProperty("x-t3-voice-runtime-protocol-major", "1")
+        connection.setRequestProperty("x-t3-voice-runtime-protocol-major", "2")
       }
-      connection.setRequestProperty(request.authority.headerName, request.authority.token)
+      connection.setRequestProperty("Authorization", "Bearer ${request.sessionCredential.value}")
       request.body?.let { body ->
         connection.doOutput = true
         connection.setFixedLengthStreamingMode(body.contentLength)
@@ -397,9 +389,9 @@ internal class VoiceRuntimeHttpCall(
     connection.useCaches = false
     connection.setRequestProperty("accept", "application/json, application/octet-stream")
     if (request.path.startsWith("/api/voice/runtime/")) {
-      connection.setRequestProperty("x-t3-voice-runtime-protocol-major", "1")
+      connection.setRequestProperty("x-t3-voice-runtime-protocol-major", "2")
     }
-    connection.setRequestProperty(request.authority.headerName, request.authority.token)
+    connection.setRequestProperty("Authorization", "Bearer ${request.sessionCredential.value}")
     request.body?.let { body ->
       connection.doOutput = true
       connection.setFixedLengthStreamingMode(body.contentLength)

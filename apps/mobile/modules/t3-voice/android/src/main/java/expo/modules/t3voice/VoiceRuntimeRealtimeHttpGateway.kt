@@ -1,6 +1,7 @@
 package expo.modules.t3voice
 
 internal class VoiceRuntimeRealtimeHttpGateway(
+  private val sessionCredential: (String) -> String,
   private val delegate: VoiceRuntimeRealtimeDelegate = VoiceRuntimeRealtimeDelegate(),
 ) : VoiceRuntimeRealtimeServer {
   override fun start(
@@ -9,8 +10,8 @@ internal class VoiceRuntimeRealtimeHttpGateway(
     clientOperationId: String,
   ) = delegate.start(
     authority.environmentOrigin,
-    authority.runtimeToken,
-    VoiceRuntimeRealtimeStartInput(fence.toTransport(), clientOperationId),
+    sessionCredential(authority.environmentOrigin),
+    VoiceRuntimeRealtimeStartInput(fence.toTransport(), clientOperationId, authority.target),
   ).toRuntimeResult()
 
   override fun offer(
@@ -21,7 +22,7 @@ internal class VoiceRuntimeRealtimeHttpGateway(
     sdp: String,
   ) = delegate.offer(
     authority.environmentOrigin,
-    session.controlGrant.token,
+    sessionCredential(authority.environmentOrigin),
     session.state.sessionId,
     VoiceRuntimeRealtimeOfferInput(session.leaseFence(fence), clientOperationId, sdp),
   ).toRuntimeResult()
@@ -32,7 +33,7 @@ internal class VoiceRuntimeRealtimeHttpGateway(
     session: VoiceRuntimeRealtimeStartResult,
   ) = delegate.heartbeat(
     authority.environmentOrigin,
-    session.controlGrant.token,
+    sessionCredential(authority.environmentOrigin),
     session.state.sessionId,
     session.leaseFence(fence),
   ).toRuntimeResult()
@@ -45,7 +46,7 @@ internal class VoiceRuntimeRealtimeHttpGateway(
     waitMilliseconds: Long,
   ) = delegate.actions(
     authority.environmentOrigin,
-    session.controlGrant.token,
+    sessionCredential(authority.environmentOrigin),
     session.state.sessionId,
     VoiceRuntimeRealtimeActionsQuery(
       session.leaseFence(fence),
@@ -69,7 +70,7 @@ internal class VoiceRuntimeRealtimeHttpGateway(
     }
     return delegate.acknowledgeAction(
       authority.environmentOrigin,
-      session.controlGrant.token,
+      sessionCredential(authority.environmentOrigin),
       session.state.sessionId,
       actionId,
       when (decision) {
@@ -101,7 +102,7 @@ internal class VoiceRuntimeRealtimeHttpGateway(
     focus: VoiceRuntimeRealtimeFocus?,
   ) = delegate.updateFocus(
     authority.environmentOrigin,
-    session.controlGrant.token,
+    sessionCredential(authority.environmentOrigin),
     session.state.sessionId,
     VoiceRuntimeRealtimeFocusInput(
       session.leaseFence(fence),
@@ -118,7 +119,7 @@ internal class VoiceRuntimeRealtimeHttpGateway(
     plan: VoiceRuntimeRealtimeHandoffPlan,
   ) = delegate.exchangeHandoff(
     authority.environmentOrigin,
-    session.controlGrant.token,
+    sessionCredential(authority.environmentOrigin),
     session.state.sessionId,
     action.actionId,
     VoiceRuntimeRealtimeHandoffExchangeInput(
@@ -142,14 +143,14 @@ internal class VoiceRuntimeRealtimeHttpGateway(
     exchange: VoiceRuntimeRealtimeHandoffExchangeResult,
   ) = delegate.commitHandoff(
     authority.environmentOrigin,
-    exchange.transitionGrant.token,
+    sessionCredential(authority.environmentOrigin),
     session.state.sessionId,
     exchange.actionId,
     VoiceRuntimeRealtimeHandoffCommitInput(
       session.leaseFence(fence),
       exchange.actionSequence,
-      exchange.transitionGrant.generation,
-      exchange.transitionGrant.modeSessionId,
+      exchange.reservation.generation,
+      exchange.reservation.modeSessionId,
     ),
   ).toRuntimeResult()
 
@@ -160,7 +161,7 @@ internal class VoiceRuntimeRealtimeHttpGateway(
     clientOperationId: String,
   ) = delegate.close(
     authority.environmentOrigin,
-    session.controlGrant.token,
+    sessionCredential(authority.environmentOrigin),
     session.state.sessionId,
     VoiceRuntimeRealtimeCloseInput(session.leaseFence(fence), clientOperationId),
   ).toRuntimeResult()

@@ -7,306 +7,99 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 internal class VoiceRuntimeRealtimeEngineSlotTest {
+  private data class Engine(var active: Boolean = false)
+
   @Test
-  fun `refresh retains active engine and swaps only after terminal`() {
-    val first = FakeEngine(active = true)
-    val slot = slot(authority(), first)
-    val refreshed = authority(token = "runtime-token-2", expiresAt = 8_000)
+  fun `idle installation commits and completes`() {
+    val slot = VoiceRuntimeRealtimeEngineSlot<Engine>(isActive = { it.active })
+    val engine = Engine()
+    val installation = slot.stageIdleInstall(slot.fence(), authority(), engine)
 
-    val deferred = requireNotNull(slot.acceptRefresh(slot.fence(), refreshed))
-
-    assertSame(first, slot.snapshot().current?.engine)
-    assertEquals(authority(), slot.snapshot().current?.authority)
-    assertEquals(refreshed, slot.snapshot().deferredAuthority)
-    expectThrows<IllegalStateException> {
-      slot.swapDeferredAfterTerminal(deferred, FakeEngine())
-    }
-
-    first.active = false
-    val replacement = FakeEngine()
-    val swapped = slot.swapDeferredAfterTerminal(deferred, replacement)
-
-    assertSame(replacement, swapped.current?.engine)
-    assertEquals(refreshed, swapped.current?.authority)
-    assertNull(swapped.deferredAuthority)
+    assertSame(engine, slot.commit(installation).current?.engine)
+    assertSame(engine, slot.complete(installation).current?.engine)
   }
 
   @Test
-  fun `latest same-fence refresh supersedes an earlier deferred rotation`() {
-    val engine = FakeEngine(active = true)
-    val slot = slot(authority(), engine)
-    val first = authority(token = "runtime-token-2", expiresAt = 8_000)
-    val staleTicket = requireNotNull(slot.acceptRefresh(slot.fence(), first))
-    val second = authority(token = "runtime-token-3", expiresAt = 12_000)
-    val currentTicket = requireNotNull(slot.acceptRefresh(slot.fence(), second))
-    engine.active = false
-
-    expectThrows<VoiceRuntimeFenceException> {
-      slot.swapDeferredAfterTerminal(staleTicket, FakeEngine())
-    }
-    val swapped = slot.swapDeferredAfterTerminal(currentTicket, FakeEngine())
-
-    assertEquals(second, swapped.current?.authority)
-  }
-
-  @Test
-  fun `cross-fence or non-advancing refresh is rejected`() {
-    val engine = FakeEngine(active = true)
-    val slot = slot(authority(), engine)
-
-    expectThrows<VoiceRuntimeFenceException> {
-      slot.acceptRefresh(
-        slot.fence(),
-        authority(identity = identity.copy(generation = 2), token = "other", expiresAt = 8_000),
-      )
-    }
-    expectThrows<VoiceRuntimeFenceException> {
-      slot.acceptRefresh(slot.fence(), authority(token = "other", expiresAt = 4_000))
-    }
-  }
-
-  @Test
-  fun `replaying the installed refresh does not create deferred work`() {
-    val slot = slot(authority(), FakeEngine())
-
-    assertNull(slot.acceptRefresh(slot.fence(), authority()))
-    assertNull(slot.snapshot().deferredAuthority)
-  }
-
-  @Test
-  fun `committed idle replacement clears deferred refresh and can complete`() {
-    val first = FakeEngine()
-    val slot = slot(authority(), first)
-    slot.acceptRefresh(
-      slot.fence(),
-      authority(token = "runtime-token-2", expiresAt = 8_000),
+  fun `committed idle installation rolls back to previous engine`() {
+    val previous = Engine()
+    val slot = VoiceRuntimeRealtimeEngineSlot(
+      VoiceRuntimeRealtimeEngineBinding(authority(), previous),
+      Engine::active,
     )
-    val replacement = FakeEngine()
-    val replacementAuthority = authority(
-      identity = identity.copy(generation = 2),
-      token = "replacement-token",
-      expiresAt = 10_000,
-    )
-    val installation = slot.stageIdleInstall(slot.fence(), replacementAuthority, replacement)
-
-    val committed = slot.commit(installation)
-
-    assertSame(replacement, committed.current?.engine)
-    assertEquals(replacementAuthority, committed.current?.authority)
-    assertNull(committed.deferredAuthority)
-    assertEquals(committed, slot.complete(installation))
-  }
-
-  @Test
-  fun `rollback after commit restores exact prior binding and deferred authority`() {
-    val first = FakeEngine()
-    val initialAuthority = authority()
-    val slot = slot(initialAuthority, first)
-    val refreshed = authority(token = "runtime-token-2", expiresAt = 8_000)
-    slot.acceptRefresh(slot.fence(), refreshed)
-    val before = slot.snapshot()
-    val installation = slot.stageIdleInstall(
-      slot.fence(),
-      authority(identity = identity.copy(generation = 2), token = "candidate", expiresAt = 9_000),
-      FakeEngine(),
-    )
+    val candidate = Engine()
+    val installation = slot.stageIdleInstall(slot.fence(), authority(generation = 8), candidate)
     slot.commit(installation)
 
-    val rolledBack = slot.rollback(installation)
-
-    assertSame(first, rolledBack.current?.engine)
-    assertEquals(initialAuthority, rolledBack.current?.authority)
-    assertEquals(refreshed, rolledBack.deferredAuthority)
-    assertTrue(rolledBack.version > before.version)
+    assertSame(previous, slot.rollback(installation).current?.engine)
   }
 
   @Test
-  fun `rollback before commit leaves slot unchanged`() {
-    val first = FakeEngine()
-    val slot = slot(authority(), first)
-    val before = slot.snapshot()
-    val installation = slot.stageIdleInstall(
-      slot.fence(),
-      authority(identity = identity.copy(generation = 2), token = "candidate", expiresAt = 9_000),
-      FakeEngine(),
+  fun `active engine cannot be replaced`() {
+    val slot = VoiceRuntimeRealtimeEngineSlot(
+      VoiceRuntimeRealtimeEngineBinding(authority(), Engine(active = true)),
+      Engine::active,
     )
 
-    val rolledBack = slot.rollback(installation)
-
-    assertEquals(before, rolledBack)
-    assertSame(first, rolledBack.current?.engine)
+    assertTrue(runCatching {
+      slot.stageIdleInstall(slot.fence(), authority(generation = 8), Engine())
+    }.isFailure)
   }
 
   @Test
-  fun `staged clear can roll back or permanently clear a deferred replacement`() {
-    val first = FakeEngine()
-    val slot = slot(authority(), first)
-    val refreshed = authority(token = "runtime-token-2", expiresAt = 8_000)
-    slot.acceptRefresh(slot.fence(), refreshed)
+  fun `stale slot fence cannot mutate current engine`() {
+    val slot = VoiceRuntimeRealtimeEngineSlot<Engine>(isActive = Engine::active)
+    val stale = slot.fence()
+    val first = slot.stageIdleInstall(stale, authority(), Engine())
+    slot.commit(first)
+    slot.complete(first)
 
-    val rollback = slot.stageIdleClear(slot.fence())
-    assertNull(slot.commit(rollback).current)
-    val restored = slot.rollback(rollback)
-    assertSame(first, restored.current?.engine)
-    assertEquals(refreshed, restored.deferredAuthority)
-
-    val complete = slot.stageIdleClear(slot.fence())
-    val cleared = slot.commit(complete)
-    assertNull(cleared.current)
-    assertNull(cleared.deferredAuthority)
-    assertEquals(cleared, slot.complete(complete))
+    assertTrue(runCatching {
+      slot.stageIdleClear(stale)
+    }.isFailure)
   }
 
   @Test
-  fun `staged install rejects a skipped generation and a different runtime`() {
-    val slot = slot(authority(), FakeEngine())
-
-    expectThrows<VoiceRuntimeFenceException> {
-      slot.stageIdleInstall(
-        slot.fence(),
-        authority(identity = identity.copy(generation = 3), token = "candidate", expiresAt = 9_000),
-        FakeEngine(),
-      )
-    }
-    expectThrows<VoiceRuntimeFenceException> {
-      slot.stageIdleInstall(
-        slot.fence(),
-        authority(
-          identity = VoiceRuntimeIdentity("runtime-2", "instance-1", 2),
-          token = "candidate",
-          expiresAt = 9_000,
-        ),
-        FakeEngine(),
-      )
-    }
+  fun `idle clear removes binding`() {
+    val slot = VoiceRuntimeRealtimeEngineSlot(
+      VoiceRuntimeRealtimeEngineBinding(authority(), Engine()),
+      Engine::active,
+    )
+    val clear = slot.stageIdleClear(slot.fence())
+    slot.commit(clear)
+    assertNull(slot.complete(clear).current)
+    assertEquals(1, slot.snapshot().version)
   }
 
   @Test
-  fun `active binding and active candidate cannot enter staged install`() {
-    val active = FakeEngine(active = true)
-    val activeSlot = slot(authority(), active)
-    expectThrows<IllegalStateException> {
-      activeSlot.stageIdleInstall(
-        activeSlot.fence(),
-        authority(identity = identity.copy(generation = 2), token = "candidate", expiresAt = 9_000),
-        FakeEngine(),
-      )
-    }
-
-    val idleSlot = slot(authority(), FakeEngine())
-    expectThrows<IllegalStateException> {
-      idleSlot.stageIdleInstall(
-        idleSlot.fence(),
-        authority(identity = identity.copy(generation = 2), token = "candidate", expiresAt = 9_000),
-        FakeEngine(active = true),
-      )
-    }
-  }
-
-  @Test
-  fun `empty slot can stage a recovered checkpoint without treating it as live work`() {
-    val slot = VoiceRuntimeRealtimeEngineSlot<FakeEngine>(isActive = FakeEngine::active)
-    val recovered = FakeEngine(active = true)
-
+  fun `empty slot installs a recovered active engine`() {
+    val slot = VoiceRuntimeRealtimeEngineSlot<Engine>(isActive = Engine::active)
+    val recovered = Engine(active = true)
     val installation = slot.stageRecoveredInstall(slot.fence(), authority(), recovered)
-    val committed = slot.commit(installation)
 
-    assertSame(recovered, committed.current?.engine)
-    assertEquals(committed, slot.complete(installation))
+    assertSame(recovered, slot.commit(installation).current?.engine)
+    assertSame(recovered, slot.complete(installation).current?.engine)
   }
 
   @Test
-  fun `clear removes deferred authority and fences stale engine callbacks`() {
-    val first = FakeEngine(active = true)
-    val slot = slot(authority(), first)
-    val deferred = requireNotNull(slot.acceptRefresh(
-      slot.fence(),
-      authority(token = "runtime-token-2", expiresAt = 8_000),
-    ))
-    val clearFence = slot.fence()
-
-    assertSame(first, slot.clear(clearFence)?.engine)
-    assertNull(slot.snapshot().current)
-    assertNull(slot.snapshot().deferredAuthority)
-    first.active = false
-    expectThrows<VoiceRuntimeFenceException> {
-      slot.swapDeferredAfterTerminal(deferred, FakeEngine())
-    }
-    expectThrows<VoiceRuntimeFenceException> { slot.clear(clearFence) }
-  }
-
-  @Test
-  fun `handoff can discard deferred authority while retaining source finalization engine`() {
-    val source = FakeEngine(active = true)
-    val slot = slot(authority(), source)
-    val deferred = requireNotNull(slot.acceptRefresh(
-      slot.fence(),
-      authority(token = "runtime-token-2", expiresAt = 8_000),
-    ))
-
-    val retained = slot.discardDeferred(slot.fence())
-
-    assertSame(source, retained.current?.engine)
-    assertNull(retained.deferredAuthority)
-    source.active = false
-    expectThrows<VoiceRuntimeFenceException> {
-      slot.swapDeferredAfterTerminal(deferred, FakeEngine())
-    }
-  }
-
-  @Test
-  fun `candidate reference is fenced during committed rollback`() {
-    val first = FakeEngine()
-    val slot = slot(authority(), first)
-    val candidate = FakeEngine()
-    val installation = slot.stageIdleInstall(
-      slot.fence(),
-      authority(identity = identity.copy(generation = 2), token = "candidate", expiresAt = 9_000),
-      candidate,
+  fun `active committed candidate cannot be rolled back`() {
+    val previous = Engine()
+    val candidate = Engine()
+    val slot = VoiceRuntimeRealtimeEngineSlot(
+      VoiceRuntimeRealtimeEngineBinding(authority(), previous),
+      Engine::active,
     )
+    val installation = slot.stageIdleInstall(slot.fence(), authority(generation = 8), candidate)
     slot.commit(installation)
     candidate.active = true
 
-    expectThrows<IllegalStateException> { slot.rollback(installation) }
-
+    assertTrue(runCatching { slot.rollback(installation) }.isFailure)
     candidate.active = false
-    assertSame(first, slot.rollback(installation).current?.engine)
+    assertSame(previous, slot.rollback(installation).current?.engine)
   }
 
-  private fun slot(
-    authority: VoiceRuntimeRealtimeAuthority,
-    engine: FakeEngine,
-  ) = VoiceRuntimeRealtimeEngineSlot(
-    VoiceRuntimeRealtimeEngineBinding(authority, engine),
-    FakeEngine::active,
+  private fun authority(generation: Long = 7) = VoiceRuntimeRealtimeAuthority(
+    VoiceRuntimeIdentity("runtime-1", "process-1", generation),
+    VoiceRuntimeTarget.Realtime("environment-1", "conversation-1"),
+    "https://termstation",
   )
-
-  private fun authority(
-    identity: VoiceRuntimeIdentity = Companion.identity,
-    token: String = "runtime-token-1",
-    expiresAt: Long = 5_000,
-  ) = VoiceRuntimeRealtimeAuthority(
-    identity,
-    target,
-    "https://example.test",
-    token,
-    expiresAt,
-  )
-
-  private inline fun <reified T : Throwable> expectThrows(block: () -> Unit): T {
-    return try {
-      block()
-      throw AssertionError("Expected ${T::class.java.simpleName}")
-    } catch (cause: Throwable) {
-      if (cause !is T) throw cause
-      cause
-    }
-  }
-
-  private data class FakeEngine(var active: Boolean = false)
-
-  private companion object {
-    val identity = VoiceRuntimeIdentity("runtime-1", "instance-1", 1)
-    val target = VoiceRuntimeTarget.Realtime("environment-1", "conversation-1")
-  }
 }

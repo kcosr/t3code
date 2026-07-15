@@ -49,14 +49,10 @@ internal class VoiceRuntimeCommittedReadinessTest {
   private fun authority() = VoiceRuntimePersistedAuthority(
     runtimeId = "runtime-1",
     generation = 7,
-    provisioningOperationId = "provision-1",
     targetDigest = "a".repeat(64),
     target = VoiceRuntimeTarget.Realtime("environment-1", "conversation-1"),
     environmentOrigin = "https://environment.example.test",
     readinessEnabled = true,
-    token = "runtime-token",
-    issuedAtEpochMillis = 1,
-    expiresAtEpochMillis = 10_000,
   )
 
   private fun readiness() = T3VoicePreparedReadiness(

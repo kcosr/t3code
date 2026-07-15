@@ -100,20 +100,10 @@ internal data class T3VoiceStartupAuthorityResolution(
 internal object T3VoiceStartupAuthorityFencePolicy {
   fun persistentPreparation(
     prepared: T3VoicePreparedReadiness?,
-    refresh: VoiceRuntimePreparedRefreshCredential?,
   ): T3VoiceStartupAuthorityFence? {
     prepared ?: return null
     require(prepared.config.generation > 0) {
       "Persistent readiness preparation has an invalid generation."
-    }
-    refresh?.fence?.let { fence ->
-      require(
-        fence.runtimeId == prepared.runtimeId &&
-          fence.generation == prepared.config.generation &&
-          fence.targetDigest == prepared.targetIdentityDigest &&
-          fence.operation == prepared.operation &&
-          fence.environmentOrigin == prepared.environmentOrigin,
-      ) { "Persistent readiness preparation does not match its refresh fence." }
     }
     return T3VoiceStartupAuthorityFence(
       prepared.runtimeId,
@@ -199,45 +189,6 @@ internal object T3VoiceStartupAuthorityFencePolicy {
   }
 }
 
-internal object T3VoiceAuthorityRefreshAdmissionPolicy {
-  enum class Mode {
-    NORMAL,
-    DISABLED_RECOVERY,
-    REJECT,
-  }
-
-  fun canRefresh(
-    authority: VoiceRuntimePersistedAuthority,
-    readiness: T3VoiceReadinessConfig,
-    disabledFence: T3VoiceDisabledAuthorityFence?,
-  ): Boolean =
-    authority.readinessEnabled &&
-      readiness.enabled &&
-      readiness.generation == authority.generation &&
-      disabledFence != T3VoiceDisabledAuthorityFence(authority.runtimeId, authority.generation)
-
-  fun isDurablyDisabled(
-    authority: VoiceRuntimePersistedAuthority,
-    readiness: T3VoiceReadinessConfig,
-    disabledFence: T3VoiceDisabledAuthorityFence?,
-  ): Boolean =
-    !readiness.enabled &&
-      readiness.generation >= authority.generation &&
-      disabledFence == T3VoiceDisabledAuthorityFence(authority.runtimeId, authority.generation)
-
-  fun mode(
-    authority: VoiceRuntimePersistedAuthority,
-    readiness: T3VoiceReadinessConfig,
-    disabledFence: T3VoiceDisabledAuthorityFence?,
-    hasPendingRefresh: Boolean,
-  ): Mode = when {
-    canRefresh(authority, readiness, disabledFence) -> Mode.NORMAL
-    isDurablyDisabled(authority, readiness, disabledFence) && hasPendingRefresh ->
-      Mode.DISABLED_RECOVERY
-    else -> Mode.REJECT
-  }
-}
-
 internal object T3VoiceDisabledTerminalCleanupCoordinator {
   fun run(
     canonicalIdle: Boolean,
@@ -252,6 +203,17 @@ internal object T3VoiceDisabledTerminalCleanupCoordinator {
   }
 }
 
+internal object T3VoiceConfigureReadinessPolicy {
+  fun synthesize(
+    current: T3VoiceReadinessConfig,
+    generation: Long,
+    enabled: Boolean,
+  ): T3VoiceReadinessConfig {
+    require(generation > 0)
+    return current.copy(enabled = enabled, generation = generation)
+  }
+}
+
 internal object T3VoiceDisabledAuthorityRetentionPolicy {
   fun shouldClearAtTerminal(
     authority: VoiceRuntimePersistedAuthority,
@@ -262,21 +224,6 @@ internal object T3VoiceDisabledAuthorityRetentionPolicy {
       disabledFence == T3VoiceDisabledAuthorityFence(authority.runtimeId, authority.generation) &&
       canonicalIdle
 }
-
-internal enum class VoiceRuntimeAuthorityState(val wireValue: String) {
-  PREPARED("prepared"),
-  ACTIVE("active"),
-}
-
-internal data class VoiceRuntimeAuthoritySnapshot(
-  val state: VoiceRuntimeAuthorityState,
-  val runtimeId: String,
-  val config: T3VoiceReadinessConfig,
-  val environmentOrigin: String,
-  val operation: T3VoiceRuntimeGrantOperation,
-  val expiresAtEpochMillis: Long?,
-  val refreshPending: Boolean,
-)
 
 internal data class T3VoiceReadinessStoreCheckpoint(
   val values: Map<String, Any?>,
@@ -594,39 +541,6 @@ internal class T3VoiceReadinessStore(context: Context) {
 }
 
 internal object T3VoiceReadinessReservationPolicy {
-  fun reserve(
-    current: T3VoiceReadinessConfig,
-    prepared: T3VoicePreparedReadiness?,
-    desired: T3VoiceReadinessConfig,
-    proposedRuntimeId: String,
-    environmentOrigin: String,
-    operation: T3VoiceRuntimeGrantOperation,
-    targetIdentityDigest: String,
-  ): T3VoicePreparedReadiness {
-    require(desired.enabled) { "Prepared voice readiness must be enabled." }
-    require(proposedRuntimeId.isNotBlank() && proposedRuntimeId.length <= 128)
-    val normalizedOrigin = VoiceRuntimeOriginPolicy.normalize(environmentOrigin)
-    if (
-      prepared != null &&
-        prepared.config.sameReservationPayload(desired) &&
-        prepared.environmentOrigin == normalizedOrigin &&
-        prepared.operation == operation &&
-        prepared.targetIdentityDigest == targetIdentityDigest
-    ) {
-      return prepared.copy(
-        config = desired.copy(enabled = false, generation = prepared.config.generation),
-      )
-    }
-    val nextGeneration = maxOf(current.generation, prepared?.config?.generation ?: 0) + 1
-    return T3VoicePreparedReadiness(
-      desired.copy(enabled = false, generation = nextGeneration),
-      proposedRuntimeId,
-      normalizedOrigin,
-      operation,
-      targetIdentityDigest,
-    )
-  }
-
   fun requireActivation(
     locked: T3VoiceReadinessConfig,
     prepared: T3VoicePreparedReadiness?,
@@ -734,24 +648,6 @@ internal object T3VoiceRuntimeOwnershipPolicy {
       )
     }
     return null
-  }
-}
-
-internal object T3VoicePreparationExclusionPolicy {
-  fun requireCompatible(
-    readinessEnabled: Boolean,
-    persistentPrepared: Boolean,
-    attachedPrepared: Boolean,
-  ) {
-    if (readinessEnabled) {
-      require(!attachedPrepared) {
-        "Attached authority must be revoked before persistent readiness is prepared."
-      }
-    } else {
-      require(!persistentPrepared) {
-        "Persistent readiness authority must be revoked before attached authority is prepared."
-      }
-    }
   }
 }
 

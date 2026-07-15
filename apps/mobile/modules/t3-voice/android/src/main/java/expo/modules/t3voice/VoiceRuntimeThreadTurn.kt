@@ -12,6 +12,7 @@ internal data class VoiceRuntimeThreadTurnCreateInput(
   val turnClientOperationId: String,
   val submissionPolicy: String,
   val speechPlanId: String,
+  val target: VoiceRuntimeTarget.Thread,
 )
 
 internal data class VoiceRuntimeSpeechDisposition(
@@ -49,14 +50,8 @@ internal data class VoiceRuntimeThreadTurnSnapshot(
   val retentionExpiresAtEpochMillis: Long,
 )
 
-internal data class VoiceRuntimeThreadTurnGrant(
-  val token: String,
-  val expiresAtEpochMillis: Long,
-)
-
 internal data class VoiceRuntimeThreadTurnCreateResult(
   val snapshot: VoiceRuntimeThreadTurnSnapshot,
-  val operationGrant: VoiceRuntimeThreadTurnGrant,
 )
 
 internal sealed interface VoiceRuntimeThreadTurnEvent {
@@ -163,20 +158,15 @@ internal object VoiceRuntimeThreadTurnJson {
       .put("turnClientOperationId", input.turnClientOperationId)
       .put("submissionPolicy", input.submissionPolicy)
       .put("speechPlanId", input.speechPlanId)
+      .put("target", JSONObject(VoiceRuntimeBridge.canonicalThreadTargetIdentity(input.target)))
       .toString()
       .toByteArray(Charsets.UTF_8)
   }
 
   fun decodeCreate(bytes: ByteArray): VoiceRuntimeThreadTurnCreateResult {
-    val root = objectFrom(bytes, setOf("snapshot", "operationGrant"))
-    val grant = objectField(root, "operationGrant", setOf("token", "expiresAt"))
+    val root = objectFrom(bytes, setOf("snapshot"))
     return VoiceRuntimeThreadTurnCreateResult(
       snapshot = snapshot(objectField(root, "snapshot", SNAPSHOT_FIELDS)),
-      operationGrant =
-        VoiceRuntimeThreadTurnGrant(
-          token = token(grant, "token"),
-          expiresAtEpochMillis = instant(grant, "expiresAt"),
-        ),
     )
   }
 
@@ -496,11 +486,6 @@ internal object VoiceRuntimeThreadTurnJson {
     }
   }
 
-  private fun token(source: JSONObject, name: String): String =
-    string(source, name, 128).also {
-      require(it.isNotBlank() && it.none(Char::isWhitespace)) { "Invalid operation credential." }
-    }
-
   private fun requireIdentifier(value: String, label: String, maximumLength: Int): String =
     value.also {
       require(it.length <= maximumLength && it.matches(IDENTIFIER_PATTERN)) { "Invalid $label." }
@@ -615,7 +600,7 @@ internal class VoiceRuntimeThreadTurnDelegate(
 ) {
   fun newCreateCall(
     origin: String,
-    runtimeGrantToken: String,
+    sessionCredential: String,
     input: VoiceRuntimeThreadTurnCreateInput,
   ): VoiceRuntimeThreadCall<VoiceRuntimeThreadTurnCreateResult> =
     jsonCall(
@@ -623,7 +608,7 @@ internal class VoiceRuntimeThreadTurnDelegate(
         origin = origin,
         path = "/api/voice/runtime/thread-turns",
         method = VoiceRuntimeHttpMethod.POST,
-        authority = authority(RUNTIME_AUTHORITY_HEADER, runtimeGrantToken),
+        sessionCredential = credential(sessionCredential),
         body = jsonBody(VoiceRuntimeThreadTurnJson.encodeCreate(input)),
         maximumRequestBytes = MAXIMUM_JSON_BYTES,
         maximumResponseBytes = MAXIMUM_JSON_RESPONSE_BYTES,
@@ -633,14 +618,14 @@ internal class VoiceRuntimeThreadTurnDelegate(
 
   fun create(
     origin: String,
-    runtimeGrantToken: String,
+    sessionCredential: String,
     input: VoiceRuntimeThreadTurnCreateInput,
   ): VoiceRuntimeThreadTurnResult<VoiceRuntimeThreadTurnCreateResult> =
-    newCreateCall(origin, runtimeGrantToken, input).execute()
+    newCreateCall(origin, sessionCredential, input).execute()
 
   fun newUploadAudioCall(
     origin: String,
-    operationGrantToken: String,
+    sessionCredential: String,
     operationId: String,
     audio: VoiceRuntimeRequestBody,
   ): VoiceRuntimeThreadCall<VoiceRuntimeThreadTurnAudioResult> {
@@ -650,7 +635,7 @@ internal class VoiceRuntimeThreadTurnDelegate(
         origin = origin,
         path = operationPath(operationId, "audio"),
         method = VoiceRuntimeHttpMethod.PUT,
-        authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
+        sessionCredential = credential(sessionCredential),
         body = audio,
         maximumRequestBytes = MAXIMUM_AUDIO_BYTES,
         maximumResponseBytes = MAXIMUM_JSON_RESPONSE_BYTES,
@@ -661,7 +646,7 @@ internal class VoiceRuntimeThreadTurnDelegate(
 
   fun newDraftDispositionCall(
     origin: String,
-    operationGrantToken: String,
+    sessionCredential: String,
     operationId: String,
   ): VoiceRuntimeThreadCall<VoiceRuntimeThreadTurnDispositionResult> =
     jsonCall(
@@ -669,7 +654,7 @@ internal class VoiceRuntimeThreadTurnDelegate(
         origin = origin,
         path = operationPath(operationId, "disposition"),
         method = VoiceRuntimeHttpMethod.POST,
-        authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
+        sessionCredential = credential(sessionCredential),
         body = jsonBody(VoiceRuntimeThreadTurnJson.encodeDraftDisposition()),
         maximumRequestBytes = MAXIMUM_JSON_BYTES,
         maximumResponseBytes = MAXIMUM_JSON_RESPONSE_BYTES,
@@ -679,17 +664,17 @@ internal class VoiceRuntimeThreadTurnDelegate(
 
   fun uploadAudio(
     origin: String,
-    operationGrantToken: String,
+    sessionCredential: String,
     operationId: String,
     audio: VoiceRuntimeRequestBody,
   ): VoiceRuntimeThreadTurnResult<VoiceRuntimeThreadTurnAudioResult> {
     require(audio.contentType == "audio/mp4") { "Native thread turn audio must be audio/mp4." }
-    return newUploadAudioCall(origin, operationGrantToken, operationId, audio).execute()
+    return newUploadAudioCall(origin, sessionCredential, operationId, audio).execute()
   }
 
   fun newEventsCall(
     origin: String,
-    operationGrantToken: String,
+    sessionCredential: String,
     operationId: String,
     afterSequence: Long,
     waitMilliseconds: Int,
@@ -700,7 +685,7 @@ internal class VoiceRuntimeThreadTurnDelegate(
         origin = origin,
         path = operationPath(operationId, "events"),
         method = VoiceRuntimeHttpMethod.GET,
-        authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
+        sessionCredential = credential(sessionCredential),
         maximumResponseBytes = MAXIMUM_JSON_RESPONSE_BYTES,
         queryParameters = mapOf(
           "afterSequence" to afterSequence.toString(),
@@ -713,19 +698,19 @@ internal class VoiceRuntimeThreadTurnDelegate(
 
   fun events(
     origin: String,
-    operationGrantToken: String,
+    sessionCredential: String,
     operationId: String,
     afterSequence: Long,
     waitMilliseconds: Int,
   ): VoiceRuntimeThreadTurnResult<VoiceRuntimeThreadTurnEventsResult> {
     require(afterSequence in 0..MAXIMUM_SAFE_INTEGER && waitMilliseconds in 0..30_000)
-    return newEventsCall(origin, operationGrantToken, operationId, afterSequence, waitMilliseconds)
+    return newEventsCall(origin, sessionCredential, operationId, afterSequence, waitMilliseconds)
       .execute()
   }
 
   fun acknowledge(
     origin: String,
-    operationGrantToken: String,
+    sessionCredential: String,
     operationId: String,
     sequence: Long,
     speechPlanId: String,
@@ -735,7 +720,7 @@ internal class VoiceRuntimeThreadTurnDelegate(
   ): VoiceRuntimeThreadTurnResult<VoiceRuntimeThreadTurnSnapshot> =
     newAcknowledgeCall(
       origin,
-      operationGrantToken,
+      sessionCredential,
       operationId,
       sequence,
       speechPlanId,
@@ -746,7 +731,7 @@ internal class VoiceRuntimeThreadTurnDelegate(
 
   fun newAcknowledgeCall(
     origin: String,
-    operationGrantToken: String,
+    sessionCredential: String,
     operationId: String,
     sequence: Long,
     speechPlanId: String,
@@ -759,7 +744,7 @@ internal class VoiceRuntimeThreadTurnDelegate(
         origin = origin,
         path = operationPath(operationId, "events/ack"),
         method = VoiceRuntimeHttpMethod.POST,
-        authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
+        sessionCredential = credential(sessionCredential),
         body = jsonBody(VoiceRuntimeThreadTurnJson.encodeAcknowledgement(
           sequence,
           speechPlanId,
@@ -775,15 +760,15 @@ internal class VoiceRuntimeThreadTurnDelegate(
 
   fun speech(
     origin: String,
-    operationGrantToken: String,
+    sessionCredential: String,
     operationId: String,
     segmentIndex: Int,
   ): VoiceRuntimeThreadTurnResult<ByteArray> =
-    newSpeechCall(origin, operationGrantToken, operationId, segmentIndex).execute()
+    newSpeechCall(origin, sessionCredential, operationId, segmentIndex).execute()
 
   fun newSpeechCall(
     origin: String,
-    operationGrantToken: String,
+    sessionCredential: String,
     operationId: String,
     segmentIndex: Int,
   ): VoiceRuntimeThreadCall<ByteArray> {
@@ -792,7 +777,7 @@ internal class VoiceRuntimeThreadTurnDelegate(
       origin = origin,
       path = operationPath(operationId, "speech/$segmentIndex"),
       method = VoiceRuntimeHttpMethod.GET,
-      authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
+      sessionCredential = credential(sessionCredential),
       maximumResponseBytes = MAXIMUM_PCM_RESPONSE_BYTES,
     )) { response ->
       when (response) {
@@ -810,7 +795,7 @@ internal class VoiceRuntimeThreadTurnDelegate(
 
   fun newSpeechStreamCall(
     origin: String,
-    operationGrantToken: String,
+    sessionCredential: String,
     operationId: String,
     segmentIndex: Int,
     onChunk: (ByteArray) -> Unit,
@@ -820,7 +805,7 @@ internal class VoiceRuntimeThreadTurnDelegate(
       origin = origin,
       path = operationPath(operationId, "speech/$segmentIndex"),
       method = VoiceRuntimeHttpMethod.GET,
-      authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
+      sessionCredential = credential(sessionCredential),
       maximumResponseBytes = MAXIMUM_PCM_RESPONSE_BYTES,
     ))
     return object : VoiceRuntimeThreadCall<Unit> {
@@ -848,14 +833,14 @@ internal class VoiceRuntimeThreadTurnDelegate(
 
   fun cancel(
     origin: String,
-    operationGrantToken: String,
+    sessionCredential: String,
     operationId: String,
   ): VoiceRuntimeThreadTurnResult<VoiceRuntimeThreadTurnCancelResult> =
-    newCancelCall(origin, operationGrantToken, operationId).execute()
+    newCancelCall(origin, sessionCredential, operationId).execute()
 
   fun newCancelCall(
     origin: String,
-    operationGrantToken: String,
+    sessionCredential: String,
     operationId: String,
   ): VoiceRuntimeThreadCall<VoiceRuntimeThreadTurnCancelResult> =
     jsonCall(
@@ -863,7 +848,7 @@ internal class VoiceRuntimeThreadTurnDelegate(
         origin = origin,
         path = operationPath(operationId, "cancel"),
         method = VoiceRuntimeHttpMethod.POST,
-        authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
+        sessionCredential = credential(sessionCredential),
         body = jsonBody(VoiceRuntimeThreadTurnJson.encodeCancel()),
         maximumRequestBytes = MAXIMUM_JSON_BYTES,
         maximumResponseBytes = MAXIMUM_JSON_RESPONSE_BYTES,
@@ -873,14 +858,14 @@ internal class VoiceRuntimeThreadTurnDelegate(
 
   fun newDraftCall(
     origin: String,
-    operationGrantToken: String,
+    sessionCredential: String,
     operationId: String,
   ): VoiceRuntimeThreadCall<VoiceRuntimeThreadDraft> = jsonCall(
     VoiceRuntimeHttpRequest(
       origin = origin,
       path = operationPath(operationId, "draft"),
       method = VoiceRuntimeHttpMethod.GET,
-      authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
+      sessionCredential = credential(sessionCredential),
       maximumResponseBytes = MAXIMUM_JSON_RESPONSE_BYTES,
     ),
     VoiceRuntimeThreadTurnJson::decodeDraft,
@@ -888,14 +873,14 @@ internal class VoiceRuntimeThreadTurnDelegate(
 
   fun newConsumeDraftCall(
     origin: String,
-    operationGrantToken: String,
+    sessionCredential: String,
     operationId: String,
   ): VoiceRuntimeThreadCall<VoiceRuntimeThreadDraftConsumeResult> = jsonCall(
     VoiceRuntimeHttpRequest(
       origin = origin,
       path = operationPath(operationId, "draft/consume"),
       method = VoiceRuntimeHttpMethod.POST,
-      authority = authority(OPERATION_AUTHORITY_HEADER, operationGrantToken),
+      sessionCredential = credential(sessionCredential),
       body = jsonBody(JSONObject().toString().toByteArray(Charsets.UTF_8)),
       maximumRequestBytes = MAXIMUM_JSON_BYTES,
       maximumResponseBytes = MAXIMUM_JSON_RESPONSE_BYTES,
@@ -933,7 +918,7 @@ internal class VoiceRuntimeThreadTurnDelegate(
     return "/api/voice/runtime/thread-turns/$operationId/$suffix"
   }
 
-  private fun authority(name: String, token: String) = VoiceRuntimeAuthority(name, token)
+  private fun credential(value: String) = VoiceRuntimeSessionCredential(value)
 
   private fun jsonBody(bytes: ByteArray) =
     VoiceRuntimeByteArrayBody(bytes, "application/json")
@@ -964,8 +949,6 @@ internal class VoiceRuntimeThreadTurnDelegate(
       }
     }
 
-    const val RUNTIME_AUTHORITY_HEADER = "x-t3-voice-runtime"
-    const val OPERATION_AUTHORITY_HEADER = "x-t3-voice-operation"
     const val MAXIMUM_JSON_BYTES = 2_048L
     const val MAXIMUM_JSON_RESPONSE_BYTES = 256 * 1_024
     const val MAXIMUM_AUDIO_BYTES = 64L * 1_024L * 1_024L

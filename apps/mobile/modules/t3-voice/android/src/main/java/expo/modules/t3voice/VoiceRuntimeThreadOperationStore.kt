@@ -1,9 +1,7 @@
 package expo.modules.t3voice
 
 import android.content.Context
-import java.nio.charset.StandardCharsets
 import java.time.Instant
-import java.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -34,7 +32,6 @@ internal sealed interface VoiceRuntimeThreadOperationState {
     override val claim: VoiceRuntimeThreadClaim,
     val operationId: String,
     val expiresAtEpochMillis: Long,
-    val token: String,
     val acknowledgedCursor: Long,
     val recording: T3VoiceRecordingResult? = null,
     val detached: Boolean = false,
@@ -63,11 +60,9 @@ internal sealed interface VoiceRuntimeThreadOperationUpdateResult {
 
 internal class VoiceRuntimeThreadOperationStore(
   private val storage: VoiceRuntimeKeyValueStore,
-  private val cipher: T3VoiceRuntimeGrantCipher,
 ) {
   constructor(context: Context) : this(
     VoiceRuntimePreferences(context.applicationContext),
-    T3VoiceAndroidKeystoreGrantCipher("t3.voice.runtime.thread-operation.v1"),
   )
 
   @Synchronized fun writePrepared(
@@ -151,7 +146,6 @@ internal class VoiceRuntimeThreadOperationStore(
   }
 
   private fun writeActiveUnchecked(state: VoiceRuntimeThreadOperationState.Active) {
-    require(state.token.isNotBlank() && state.token.none(Char::isWhitespace))
     require(state.acknowledgedCursor in 0..state.snapshot.eventCursor)
     state.pendingReceipt?.let { receipt ->
       require(receipt.identity == VoiceRuntimeIdentity(
@@ -164,8 +158,6 @@ internal class VoiceRuntimeThreadOperationStore(
       require(receipt.turnOperationId == state.operationId)
       require(receipt.projectId == state.claim.projectId && receipt.threadId == state.claim.threadId)
     }
-    val aad = metadataBytes(state)
-    val encrypted = cipher.encrypt(state.token.toByteArray(), aad)
     writeBase("active", state.claim, mapOf(
       KEY_OPERATION to state.operationId,
       KEY_EXPIRES to state.expiresAtEpochMillis.toString(),
@@ -180,8 +172,6 @@ internal class VoiceRuntimeThreadOperationStore(
       KEY_DRAFT_CONSUME_PENDING to state.draftConsumePending.toString(),
       KEY_SNAPSHOT to encodeSnapshot(state.snapshot),
       KEY_PENDING_RECEIPT to state.pendingReceipt?.let(::encodeReceipt),
-      KEY_IV to Base64.getEncoder().encodeToString(encrypted.initializationVector),
-      KEY_CIPHERTEXT to Base64.getEncoder().encodeToString(encrypted.ciphertext),
     ))
   }
 
@@ -208,8 +198,8 @@ internal class VoiceRuntimeThreadOperationStore(
           )
         }
         "active" -> {
-          val unsigned = VoiceRuntimeThreadOperationState.Active(
-            claim, required(KEY_OPERATION), required(KEY_EXPIRES).toLong(), "pending",
+          VoiceRuntimeThreadOperationState.Active(
+            claim, required(KEY_OPERATION), required(KEY_EXPIRES).toLong(),
             required(KEY_ACKNOWLEDGED_CURSOR).toLong(),
             recordingOrNull(), required(KEY_DETACHED).toBooleanStrict(),
             required(KEY_CANCEL_REQUESTED).toBooleanStrict(),
@@ -218,13 +208,6 @@ internal class VoiceRuntimeThreadOperationStore(
             decodeSnapshot(required(KEY_SNAPSHOT)),
             storage.getString(KEY_PENDING_RECEIPT)?.let(::decodeReceipt),
           )
-          val token = cipher.decrypt(
-            T3VoiceEncryptedGrant(
-              Base64.getDecoder().decode(required(KEY_IV)),
-              Base64.getDecoder().decode(required(KEY_CIPHERTEXT)),
-            ), metadataBytes(unsigned),
-          ).toString(StandardCharsets.UTF_8)
-          unsigned.copy(token = token)
         }
         else -> error("Invalid native thread operation phase.")
       }
@@ -244,7 +227,6 @@ internal class VoiceRuntimeThreadOperationStore(
   @Synchronized fun clearLockedAfterAuthorityRevocation(): Boolean {
     if (load() != VoiceRuntimeThreadOperationLoadResult.Locked) return false
     check(storage.clear(ALL_KEYS)) { "Could not clear locked native thread operation." }
-    cipher.deleteKey()
     return true
   }
 
@@ -265,31 +247,6 @@ internal class VoiceRuntimeThreadOperationStore(
       KEY_DRAFT_COMPOSER_REVISION to claim.draftContext?.composerRevision,
     ) + ACTIVE_KEYS.associateWith { extra[it] })) { "Could not persist native thread operation." }
   }
-
-  private fun metadataBytes(state: VoiceRuntimeThreadOperationState.Active): ByteArray =
-    listOf("t3-voice-thread-operation-v1", state.claim.runtimeId,
-      state.claim.runtimeInstanceId,
-      state.claim.readinessGeneration.toString(),
-      state.claim.modeSessionId,
-      VoiceRuntimeOriginPolicy.normalize(state.claim.environmentOrigin),
-      state.claim.projectId, state.claim.threadId, state.claim.clientOperationId,
-      state.claim.submissionPolicy, state.claim.speechPlanId,
-      state.claim.draftContext?.environmentId.orEmpty(),
-      state.claim.draftContext?.projectId.orEmpty(),
-      state.claim.draftContext?.threadId.orEmpty(),
-      state.claim.draftContext?.composerRevision.orEmpty(),
-      state.operationId, state.expiresAtEpochMillis.toString(),
-      state.acknowledgedCursor.toString(),
-      state.recording?.recordingId.orEmpty(), state.recording?.uri.orEmpty(),
-      state.recording?.durationMs?.toString().orEmpty(),
-      state.recording?.byteLength?.toString().orEmpty(),
-      state.detached.toString(),
-      state.cancelRequested.toString(),
-      state.draftDispositionPending.toString(),
-      state.draftConsumePending.toString(),
-      encodeSnapshot(state.snapshot),
-      state.pendingReceipt?.let(::encodeReceipt).orEmpty(),
-    ).joinToString("\n").toByteArray(StandardCharsets.UTF_8)
 
   private fun recordingOrNull(): T3VoiceRecordingResult? {
     val values = listOf(KEY_RECORDING_ID, KEY_RECORDING_URI, KEY_RECORDING_DURATION, KEY_RECORDING_BYTES)
@@ -471,8 +428,6 @@ internal class VoiceRuntimeThreadOperationStore(
     const val KEY_RECORDING_URI = "thread_operation_recording_uri"
     const val KEY_RECORDING_DURATION = "thread_operation_recording_duration"
     const val KEY_RECORDING_BYTES = "thread_operation_recording_bytes"
-    const val KEY_IV = "thread_operation_iv"
-    const val KEY_CIPHERTEXT = "thread_operation_ciphertext"
     const val KEY_DETACHED = "thread_operation_detached"
     const val KEY_CANCEL_REQUESTED = "thread_operation_cancel_requested"
     const val KEY_DRAFT_DISPOSITION_PENDING = "thread_operation_draft_disposition_pending"
@@ -482,7 +437,7 @@ internal class VoiceRuntimeThreadOperationStore(
     val ACTIVE_KEYS =
       setOf(
         KEY_OPERATION, KEY_EXPIRES, KEY_ACKNOWLEDGED_CURSOR, KEY_RECORDING_ID, KEY_RECORDING_URI,
-        KEY_RECORDING_DURATION, KEY_RECORDING_BYTES, KEY_IV, KEY_CIPHERTEXT, KEY_DETACHED,
+        KEY_RECORDING_DURATION, KEY_RECORDING_BYTES, KEY_DETACHED,
         KEY_CANCEL_REQUESTED, KEY_SNAPSHOT, KEY_DRAFT_DISPOSITION_PENDING,
         KEY_DRAFT_CONSUME_PENDING, KEY_PENDING_RECEIPT,
       )

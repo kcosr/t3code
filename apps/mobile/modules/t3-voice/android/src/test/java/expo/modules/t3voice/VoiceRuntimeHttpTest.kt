@@ -56,7 +56,7 @@ internal class VoiceRuntimeHttpTest {
   }
 
   @Test
-  fun `transport disables redirects applies authority and bounds bodies`() {
+  fun `transport disables redirects applies session credential and bounds bodies`() {
     val connection = FakeHttpsConnection(200, "response".toByteArray())
     val transport = VoiceRuntimeHttpTransport { connection }
     val result =
@@ -65,7 +65,7 @@ internal class VoiceRuntimeHttpTest {
           origin = "https://environment.example.test",
           path = "/api/voice/native/thread-turns",
           method = VoiceRuntimeHttpMethod.POST,
-          authority = VoiceRuntimeAuthority("x-test-runtime", "secret-token"),
+          sessionCredential = VoiceRuntimeSessionCredential("secret-token"),
           body = VoiceRuntimeByteArrayBody("request".toByteArray(), "application/json"),
           maximumRequestBytes = 32,
           maximumResponseBytes = 32,
@@ -74,7 +74,7 @@ internal class VoiceRuntimeHttpTest {
 
     assertFalse(connection.instanceFollowRedirects)
     assertFalse(connection.useCaches)
-    assertEquals("secret-token", connection.getRequestProperty("x-test-runtime"))
+    assertEquals("Bearer secret-token", connection.getRequestProperty("Authorization"))
     assertArrayEquals("request".toByteArray(), connection.output.toByteArray())
     assertArrayEquals("response".toByteArray(), result.body)
     assertEquals(1, connection.disconnectCount)
@@ -168,7 +168,7 @@ internal class VoiceRuntimeHttpTest {
         origin = "https://environment.example.test",
         path = "/api/voice/runtime/thread-turns/operation-1/speech/0",
         method = VoiceRuntimeHttpMethod.GET,
-        authority = VoiceRuntimeAuthority("x-t3-voice-operation", "secret-token"),
+        sessionCredential = VoiceRuntimeSessionCredential("secret-token"),
         maximumResponseBytes = pcm.size,
       ),
     )
@@ -180,7 +180,8 @@ internal class VoiceRuntimeHttpTest {
     assertTrue(chunks.size > 1)
     assertTrue(chunks.all { it.size <= 64 * 1_024 && it.size % 2 == 0 })
     assertArrayEquals(pcm, chunks.fold(ByteArray(0)) { all, chunk -> all + chunk })
-    assertEquals("1", connection.getRequestProperty("x-t3-voice-runtime-protocol-major"))
+    assertEquals("2", connection.getRequestProperty("x-t3-voice-runtime-protocol-major"))
+    assertEquals("Bearer secret-token", connection.getRequestProperty("Authorization"))
   }
 
   @Test
@@ -190,10 +191,13 @@ internal class VoiceRuntimeHttpTest {
   }
 
   @Test
-  fun `authority token is bounded by the contract maximum`() {
-    VoiceRuntimeAuthority("x-test-runtime", "a".repeat(128))
+  fun `session credential is bounded and rejects header injection`() {
+    VoiceRuntimeSessionCredential("a".repeat(8_192))
     assertThrows(IllegalArgumentException::class.java) {
-      VoiceRuntimeAuthority("x-test-runtime", "a".repeat(129))
+      VoiceRuntimeSessionCredential("a".repeat(8_193))
+    }
+    assertThrows(IllegalArgumentException::class.java) {
+      VoiceRuntimeSessionCredential("credential\r\nHeader: injected")
     }
   }
 
@@ -205,7 +209,7 @@ internal class VoiceRuntimeHttpTest {
       origin = "https://environment.example.test",
       path = "/api/voice/native/test",
       method = method,
-      authority = VoiceRuntimeAuthority("x-test-runtime", "secret-token"),
+      sessionCredential = VoiceRuntimeSessionCredential("secret-token"),
       body = body,
     )
 }

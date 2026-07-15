@@ -11,7 +11,6 @@ internal data class VoiceRealtimeExecutionAuthority(
 
 internal data class VoiceRuntimeRealtimeAuthorization(
   val authority: VoiceRealtimeExecutionAuthority,
-  val runtimeGrantToken: String,
 ) {
   val runtimeId get() = authority.runtimeId
   val readinessGeneration get() = authority.readinessGeneration
@@ -27,7 +26,7 @@ internal object VoiceRuntimeRealtimeAuthorityPolicy {
     nowMillis: Long,
   ): VoiceRuntimeRealtimeAuthorization? {
     val target = persisted.target as? VoiceRuntimeTarget.Realtime ?: return null
-    if (!microphonePermissionGranted || persisted.expiresAtEpochMillis <= nowMillis ||
+    if (!microphonePermissionGranted ||
       !VoiceRuntimeAuthorityLifecyclePolicy.canDispatch(
         persisted.readinessEnabled,
         consumerCount,
@@ -39,7 +38,6 @@ internal object VoiceRuntimeRealtimeAuthorityPolicy {
         VoiceRuntimeOriginPolicy.normalize(persisted.environmentOrigin),
         target.conversationId,
       ),
-      persisted.token,
     )
   }
   fun validate(
@@ -74,7 +72,6 @@ internal object VoiceRuntimeRealtimeAuthorityPolicy {
           environmentOrigin = VoiceRuntimeOriginPolicy.normalize(metadata.environmentOrigin),
           conversationId = conversationId,
         ),
-      runtimeGrantToken = grant.token,
     )
   }
 
@@ -89,38 +86,26 @@ internal object VoiceRuntimeRealtimeAuthorityPolicy {
     result: VoiceRuntimeRealtimeStartResult,
     nowMillis: Long,
   ): Boolean {
-    val control = result.controlGrant
-    val heartbeatSeconds = control.heartbeatIntervalSeconds
-    val failureGraceSeconds = control.failureGraceSeconds
-    val remainingControlMillis = control.expiresAtEpochMillis - nowMillis
+    val heartbeatSeconds = result.heartbeatIntervalSeconds
     return result.state.conversationId == authority.conversationId &&
       result.state.phase == "signaling" &&
       result.expiresAtEpochMillis > nowMillis &&
-      control.expiresAtEpochMillis > nowMillis &&
-      control.expiresAtEpochMillis <= result.expiresAtEpochMillis &&
-      heartbeatSeconds in MINIMUM_HEARTBEAT_SECONDS..MAXIMUM_HEARTBEAT_SECONDS &&
-      failureGraceSeconds in
-        (heartbeatSeconds * MINIMUM_FAILURE_HEARTBEATS)..MAXIMUM_FAILURE_GRACE_SECONDS &&
-      remainingControlMillis >= (heartbeatSeconds + failureGraceSeconds) * 1_000L
+      heartbeatSeconds in MINIMUM_HEARTBEAT_SECONDS..MAXIMUM_HEARTBEAT_SECONDS
   }
 
-  fun runtimeControlGrant(
+  fun runtimeControlLease(
     result: VoiceRuntimeRealtimeStartResult,
-  ): VoiceRuntimeControlGrant =
-    VoiceRuntimeControlGrant(
-      token = result.controlGrant.token,
+  ): VoiceRuntimeControlLease =
+    VoiceRuntimeControlLease(
       sessionId = result.state.sessionId,
       leaseGeneration = result.state.leaseGeneration,
-      expiresAtEpochMillis = result.controlGrant.expiresAtEpochMillis,
       heartbeatIntervalMillis =
-        Math.multiplyExact(result.controlGrant.heartbeatIntervalSeconds, 1_000L),
-      failureGraceMillis = Math.multiplyExact(result.controlGrant.failureGraceSeconds, 1_000L),
+        Math.multiplyExact(result.heartbeatIntervalSeconds, 1_000L),
+      failureGraceMillis = Math.multiplyExact(result.heartbeatIntervalSeconds, 3_000L),
     )
 
   private const val MINIMUM_HEARTBEAT_SECONDS = 5L
   private const val MAXIMUM_HEARTBEAT_SECONDS = 5 * 60L
-  private const val MINIMUM_FAILURE_HEARTBEATS = 2L
-  private const val MAXIMUM_FAILURE_GRACE_SECONDS = 10 * 60L
 }
 
 internal data class VoiceRuntimeRealtimeAttempt(
@@ -184,7 +169,6 @@ internal data class VoiceRuntimeRealtimeCleanupMarker(
 
 internal data class VoiceRuntimeRealtimeCleanupAuthority(
   val marker: VoiceRuntimeRealtimeCleanupMarker,
-  val runtimeGrantToken: String,
 )
 
 internal enum class VoiceRuntimeRealtimeCleanupDecision {
@@ -230,7 +214,7 @@ internal object VoiceRuntimeRealtimeCleanupPolicy {
     ) {
       return null
     }
-    return VoiceRuntimeRealtimeCleanupAuthority(marker, grant.token)
+    return VoiceRuntimeRealtimeCleanupAuthority(marker)
   }
 
   fun authority(
@@ -242,7 +226,7 @@ internal object VoiceRuntimeRealtimeCleanupPolicy {
       persisted.generation != marker.readinessGeneration ||
       VoiceRuntimeOriginPolicy.normalize(persisted.environmentOrigin) !=
       VoiceRuntimeOriginPolicy.normalize(marker.environmentOrigin)) return null
-    return VoiceRuntimeRealtimeCleanupAuthority(marker, persisted.token)
+    return VoiceRuntimeRealtimeCleanupAuthority(marker)
   }
 
   fun startFailure(

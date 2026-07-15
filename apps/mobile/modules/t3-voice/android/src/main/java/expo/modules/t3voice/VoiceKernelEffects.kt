@@ -150,12 +150,6 @@ sealed interface VoiceKernelEffect {
     override val family = VoiceKernelEffectFamily.NET
   }
 
-  data class RefreshConfirm(
-    override val epoch: VoiceKernelEpoch,
-  ) : VoiceKernelEffect {
-    override val family = VoiceKernelEffectFamily.NET
-  }
-
   data class CancelAll(
     override val epoch: VoiceKernelEpoch,
     val scope: String,

@@ -102,7 +102,7 @@ class VoiceRuntimeActiveThreadControllerTest {
   fun rejectedHandoffStartRollsBackAuthorityAndCanBeRetried() {
     val source = VoiceRuntimeTarget.Realtime("environment", "conversation")
     val sourceDigest = controller.targetDigest(source)
-    installed = VoiceRuntimeInstalledAuthority("runtime", 1, sourceDigest, "token", 5_000)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, sourceDigest)
     val sourceReservation = reservation(sourceDigest)
     controller.configureRealtimeAuthority(sourceReservation, source, "source")
     controller.observeRealtime(
@@ -113,22 +113,15 @@ class VoiceRuntimeActiveThreadControllerTest {
         VoiceRealtimePhase.STOPPING,
         "session",
         1,
-        VoiceRuntimeRealtimeControlGrant("control", 5_000, 15, 45),
+        now + 60_000,
+        15,
       ),
     )
     val before = controller.snapshot()
     val target = target()
     val targetDigest = controller.targetDigest(target)
-    val targetReservation = VoiceRuntimeAuthorityReservation(
-      VoiceRuntimeIdentity("runtime", "instance", 2),
-      "handoff",
-      1,
-      targetDigest,
-      "transition-token",
-      1_000,
-      5_000,
-    )
-    installed = VoiceRuntimeInstalledAuthority("runtime", 2, targetDigest, "transition-token", 5_000)
+    val targetReservation = VoiceRuntimeAuthorityReservation(VoiceRuntimeIdentity("runtime", "instance", 2), 1, targetDigest)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 2, targetDigest)
     val command = VoiceRuntimeThreadCommand.Start(
       "handoff-start", targetReservation.identity, "thread-mode", "handoff-turn",
       "auto-submit", null, "stop-conflicting",
@@ -187,7 +180,7 @@ class VoiceRuntimeActiveThreadControllerTest {
   fun authorityRejectsMismatchedCanonicalTargetDigest() {
     val target = target()
     val digest = controller.targetDigest(target)
-    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest)
     expectThrows<VoiceRuntimeFenceException> {
       controller.configureAuthority(reservation("0".repeat(64)), target, "fingerprint")
     }
@@ -210,8 +203,6 @@ class VoiceRuntimeActiveThreadControllerTest {
       grant.metadata.runtimeId,
       grant.metadata.readinessGeneration,
       grant.metadata.targetIdentityDigest,
-      grant.token,
-      grant.metadata.expiresAtEpochMillis,
     )
 
     val snapshot = controller.configureAuthority(
@@ -261,7 +252,7 @@ class VoiceRuntimeActiveThreadControllerTest {
     )
     val target = target()
     val digest = local.targetDigest(target)
-    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest)
     local.configureAuthority(reservation(digest), target, "fingerprint")
     val handle = VoiceRuntimeDraftHandle(
       "artifact", VoiceRuntimeIdentity("runtime", "instance", 1), "mode", "turn-client",
@@ -302,7 +293,7 @@ class VoiceRuntimeActiveThreadControllerTest {
     )
     val target = target()
     val digest = local.targetDigest(target)
-    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest)
     local.configureAuthority(reservation(digest), target, "generation-1")
     val handle = VoiceRuntimeDraftHandle(
       "artifact", VoiceRuntimeIdentity("runtime", "instance", 1), "mode", "turn-client",
@@ -313,19 +304,11 @@ class VoiceRuntimeActiveThreadControllerTest {
     local.claimPresentationAction(lease, "review-artifact")
     val checkpoint = local.checkpointCanonicalInstall()
 
-    val replacement = VoiceRuntimeAuthorityReservation(
-      VoiceRuntimeIdentity("runtime", "instance", 2),
-      "provision-2",
-      1,
-      digest,
-      "token-2",
-      1_000,
-      5_000,
-    )
-    installed = VoiceRuntimeInstalledAuthority("runtime", 2, digest, "token-2", 5_000)
+    val replacement = VoiceRuntimeAuthorityReservation(VoiceRuntimeIdentity("runtime", "instance", 2), 1, digest)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 2, digest)
     local.configureAuthority(replacement, target, "generation-2")
 
-    assertTrue(local.restoreCanonicalInstall(checkpoint, replacement.provisioningOperationId))
+    assertTrue(local.restoreCanonicalInstall(checkpoint, replacement))
     assertEquals(checkpoint, local.checkpointCanonicalInstall())
     local.configureAuthority(replacement, target, "generation-2")
     assertEquals(2L, local.snapshot().identity.generation)
@@ -343,7 +326,10 @@ class VoiceRuntimeActiveThreadControllerTest {
       phase = VoiceRuntimePhase.IDLE,
     ))
 
-    assertTrue(controller.restoreCanonicalInstall(checkpoint, "unused-provisioning"))
+    assertTrue(controller.restoreCanonicalInstall(
+      checkpoint,
+      reservation(controller.targetDigest(target())),
+    ))
     assertEquals(checkpoint, controller.checkpointCanonicalInstall())
   }
 
@@ -371,7 +357,7 @@ class VoiceRuntimeActiveThreadControllerTest {
     )
     val target = target()
     val digest = local.targetDigest(target)
-    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest)
     local.configureAuthority(reservation(digest), target, "generation-1")
     local.dispatch(start())
     val checkpoint = local.checkpointCanonicalInstall()
@@ -382,12 +368,10 @@ class VoiceRuntimeActiveThreadControllerTest {
       phase = VoiceRuntimePhase.IDLE,
     ))
 
-    assertFalse(local.restoreCanonicalInstall(checkpoint, "failed-provisioning"))
+    assertFalse(local.restoreCanonicalInstall(checkpoint, reservation(digest)))
     assertTrue(draftRestoreAttempted)
     assertTrue(retentionRestoreAttempted)
     assertEquals(checkpoint.snapshot, local.snapshot())
-    local.refreshAuthority(reservation(digest))
-    assertEquals(checkpoint.identity, local.snapshot().identity)
   }
 
   @Test
@@ -432,7 +416,7 @@ class VoiceRuntimeActiveThreadControllerTest {
     )
     val target = target()
     val digest = local.targetDigest(target)
-    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest)
     local.configureAuthority(reservation(digest), target, "fingerprint")
     val firstReceipt = VoiceRuntimeThreadReceipt(
       VoiceRuntimeIdentity("runtime", "instance", 1), "mode-1", "turn-1", "operation-1",
@@ -491,7 +475,7 @@ class VoiceRuntimeActiveThreadControllerTest {
       realtimeTerminalAcknowledgement = repository::acknowledgeTerminal,
     )
     val digest = local.targetDigest(realtimeTarget)
-    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest)
     local.configureRealtimeAuthority(reservation(digest), realtimeTarget, "realtime-fingerprint")
     val lease = local.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
     val rebase = local.deliver(lease, null) as VoiceRuntimeDelivery.Rebase
@@ -518,7 +502,8 @@ class VoiceRuntimeActiveThreadControllerTest {
         VoiceRealtimePhase.CONNECTED,
         serverSessionId = "session",
         leaseGeneration = 1,
-        controlGrant = VoiceRuntimeRealtimeControlGrant("control-token", 5_000, 15, 30),
+        expiresAtEpochMillis = now + 60_000,
+        heartbeatIntervalSeconds = 15,
         lastConnectedAtEpochMillis = now,
       ),
     )
@@ -554,7 +539,7 @@ class VoiceRuntimeActiveThreadControllerTest {
       realtimeTerminalAcknowledgement = repository::acknowledgeTerminal,
     )
     val digest = local.targetDigest(realtimeTarget)
-    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest)
     local.configureRealtimeAuthority(reservation(digest), realtimeTarget, "realtime")
     local.observeRealtime(VoiceRuntimeRealtimeCheckpoint(
       VoiceRuntimeRealtimeFence(identity, "mode"),
@@ -563,7 +548,8 @@ class VoiceRuntimeActiveThreadControllerTest {
       VoiceRealtimePhase.CONNECTED,
       "session",
       1,
-      VoiceRuntimeRealtimeControlGrant("control", 5_000, 15, 30),
+      now + 60_000,
+      15,
     ))
     val lease = local.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
     val beforeTerminal = local.snapshot().cursor()
@@ -605,11 +591,9 @@ class VoiceRuntimeActiveThreadControllerTest {
       "runtime", "old-instance", { now }, { installed }, execution, retained = retained,
     )
     val digest = oldController.targetDigest(realtimeTarget)
-    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest)
     oldController.configureRealtimeAuthority(
-      VoiceRuntimeAuthorityReservation(
-        oldIdentity, "old-provision", 0, digest, "token", 1_000, 5_000,
-      ),
+      VoiceRuntimeAuthorityReservation(oldIdentity, 0, digest),
       realtimeTarget,
       "old-process",
     )
@@ -623,7 +607,8 @@ class VoiceRuntimeActiveThreadControllerTest {
       VoiceRealtimePhase.CONNECTED,
       "session",
       1,
-      VoiceRuntimeRealtimeControlGrant("control", 5_000, 15, 30),
+      now + 60_000,
+      15,
       pendingAction = navigateAction,
     )
     oldController.observeRealtime(recoveredCheckpoint)
@@ -654,9 +639,7 @@ class VoiceRuntimeActiveThreadControllerTest {
       "runtime", "new-instance", { now }, { installed }, execution, retained = retained,
     )
     restored.configureRealtimeAuthority(
-      VoiceRuntimeAuthorityReservation(
-        newIdentity, "new-provision", 0, digest, "token", 1_000, 5_000,
-      ),
+      VoiceRuntimeAuthorityReservation(newIdentity, 0, digest),
       realtimeTarget,
       "new-process",
     )
@@ -683,12 +666,12 @@ class VoiceRuntimeActiveThreadControllerTest {
       "runtime", "instance", { now }, { installed }, execution, retained = retained,
     )
     val digest = local.targetDigest(realtimeTarget)
-    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest)
     local.configureRealtimeAuthority(reservation(digest), realtimeTarget, "realtime")
     val fence = VoiceRuntimeRealtimeFence(identity, "mode")
     local.observeRealtime(VoiceRuntimeRealtimeCheckpoint(
       fence, realtimeTarget, "start", VoiceRealtimePhase.CONNECTED, "session", 1,
-      VoiceRuntimeRealtimeControlGrant("control", 5_000, 15, 30),
+      now + 60_000, 15,
     ))
     val original = VoiceRuntimeRealtimeAction.NavigateThread(
       1, now, "navigate", "project", "old-thread", 5_000,
@@ -737,7 +720,7 @@ class VoiceRuntimeActiveThreadControllerTest {
     )
     val target = target()
     val digest = local.targetDigest(target)
-    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest)
     local.configureAuthority(reservation(digest), target, "generation-1")
     val oldIdentity = VoiceRuntimeIdentity("runtime", "instance", 1)
     val receipt = VoiceRuntimeThreadReceipt(
@@ -746,11 +729,8 @@ class VoiceRuntimeActiveThreadControllerTest {
       listOf(VoiceRuntimeSpeechDisposition(2, "drained")), "completed", "completed", 1_000, 5_000,
     )
     assertEquals(VoiceRuntimeRetentionWriteResult.INSERTED, local.publishThreadReceipt(receipt))
-    val replacement = VoiceRuntimeAuthorityReservation(
-      VoiceRuntimeIdentity("runtime", "instance", 2),
-      "generation-2", 1, digest, "token-2", 1_000, 5_000,
-    )
-    installed = VoiceRuntimeInstalledAuthority("runtime", 2, digest, "token-2", 5_000)
+    val replacement = VoiceRuntimeAuthorityReservation(VoiceRuntimeIdentity("runtime", "instance", 2), 1, digest)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 2, digest)
     local.configureAuthority(replacement, target, "generation-2")
     val lease = local.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
 
@@ -772,7 +752,7 @@ class VoiceRuntimeActiveThreadControllerTest {
     )
     val firstTarget = target()
     val firstDigest = local.targetDigest(firstTarget)
-    installed = VoiceRuntimeInstalledAuthority("runtime", 1, firstDigest, "token", 5_000)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, firstDigest)
     local.configureAuthority(reservation(firstDigest), firstTarget, "environment-1")
     val firstIdentity = local.snapshot().identity
     val firstReceipt = VoiceRuntimeThreadReceipt(
@@ -797,10 +777,8 @@ class VoiceRuntimeActiveThreadControllerTest {
     )
     val secondDigest = local.targetDigest(secondTarget)
     val secondIdentity = firstIdentity.copy(generation = 2)
-    val secondReservation = VoiceRuntimeAuthorityReservation(
-      secondIdentity, "environment-2", 1, secondDigest, "token-2", 1_000, 5_000,
-    )
-    installed = VoiceRuntimeInstalledAuthority("runtime", 2, secondDigest, "token-2", 5_000)
+    val secondReservation = VoiceRuntimeAuthorityReservation(secondIdentity, 1, secondDigest)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 2, secondDigest)
     local.configureAuthority(secondReservation, secondTarget, "environment-2")
     val lease = local.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
     assertEquals(
@@ -822,10 +800,8 @@ class VoiceRuntimeActiveThreadControllerTest {
     )
 
     val thirdIdentity = firstIdentity.copy(generation = 3)
-    val thirdReservation = VoiceRuntimeAuthorityReservation(
-      thirdIdentity, "environment-1-again", 2, firstDigest, "token-3", 1_000, 5_000,
-    )
-    installed = VoiceRuntimeInstalledAuthority("runtime", 3, firstDigest, "token-3", 5_000)
+    val thirdReservation = VoiceRuntimeAuthorityReservation(thirdIdentity, 2, firstDigest)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 3, firstDigest)
     local.configureAuthority(thirdReservation, firstTarget, "environment-1-again")
     val restoredLease = local.attach(VoiceRuntimePresentation.FOREGROUND_ACTIVE)
     assertEquals(
@@ -858,7 +834,7 @@ class VoiceRuntimeActiveThreadControllerTest {
     val digest = T3VoiceRuntimeTargetIdentity.digest(
       VoiceRuntimeBridge.canonicalRealtimeTargetIdentity(target),
     )
-    installed = VoiceRuntimeInstalledAuthority("runtime", 3, digest, "token-3", 5_000)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 3, digest)
     val local = VoiceRuntimeActiveThreadController(
       "runtime", "instance", { now }, { installed }, execution,
       realtimeTerminals = repository::terminals,
@@ -866,15 +842,7 @@ class VoiceRuntimeActiveThreadControllerTest {
       initialGeneration = 2,
     )
     local.configureRealtimeAuthority(
-      VoiceRuntimeAuthorityReservation(
-        VoiceRuntimeIdentity("runtime", "instance", 3),
-        "provision-3",
-        2,
-        digest,
-        "token-3",
-        1_000,
-        5_000,
-      ),
+      VoiceRuntimeAuthorityReservation(VoiceRuntimeIdentity("runtime", "instance", 3), 2, digest),
       target,
       "generation-3",
     )
@@ -901,20 +869,12 @@ class VoiceRuntimeActiveThreadControllerTest {
   private fun configure() {
     val target = target()
     val digest = controller.targetDigest(target)
-    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest, "token", 5_000)
+    installed = VoiceRuntimeInstalledAuthority("runtime", 1, digest)
     controller.configureAuthority(reservation(digest), target, "fingerprint")
     assertEquals(VoiceRuntimeReadiness.Ready(VoiceRuntimeMode.THREAD), controller.snapshot().readiness)
   }
 
-  private fun reservation(digest: String) = VoiceRuntimeAuthorityReservation(
-    VoiceRuntimeIdentity("runtime", "instance", 1),
-    "provision",
-    0,
-    digest,
-    "token",
-    1_000,
-    5_000,
-  )
+  private fun reservation(digest: String) = VoiceRuntimeAuthorityReservation(VoiceRuntimeIdentity("runtime", "instance", 1), 0, digest)
 
   private fun target() = VoiceRuntimeTarget.Thread(
     "environment",

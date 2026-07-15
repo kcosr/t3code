@@ -8,7 +8,7 @@ import org.junit.Test
 
 internal class T3VoiceRuntimeServiceRecoveryTest {
   @Test
-  fun `process death after disable recovers checkpoint from child grant without canonical authority`() {
+  fun `process death after disable recovers checkpoint without canonical authority`() {
     val checkpoint = checkpoint()
 
     assertEquals(
@@ -28,7 +28,6 @@ internal class T3VoiceRuntimeServiceRecoveryTest {
     )
 
     assertEquals(checkpoint.fence.identity, recovered?.identity)
-    assertEquals("child-control-token", recovered?.runtimeToken)
     assertEquals("https://environment.example.test", recovered?.environmentOrigin)
     assertNull(T3VoiceRecoveredRealtimeAuthorityPolicy.authority(null, checkpoint, null))
   }
@@ -50,7 +49,7 @@ internal class T3VoiceRuntimeServiceRecoveryTest {
   }
 
   @Test
-  fun `finalization recovery uses durable child authority and embedded origin`() {
+  fun `finalization recovery uses durable authority and embedded origin`() {
     val finalization = finalization()
 
     val recovered = T3VoiceRecoveredRealtimeAuthorityPolicy.authority(
@@ -61,7 +60,6 @@ internal class T3VoiceRuntimeServiceRecoveryTest {
 
     assertEquals(finalization.fence.identity, recovered?.identity)
     assertEquals(finalization.sourceEnvironmentOrigin, recovered?.environmentOrigin)
-    assertEquals(finalization.session.controlGrant.token, recovered?.runtimeToken)
   }
 
   @Test
@@ -104,30 +102,6 @@ internal class T3VoiceRuntimeServiceRecoveryTest {
     ))
   }
 
-  @Test
-  fun `undispatched thread create uses latest exact token and retries stale rejection once refreshed`() {
-    val expected = threadAuthority()
-    val original = VoiceRuntimeThreadAuthorization(expected, "token-1")
-    val refreshed = VoiceRuntimeThreadAuthorization(expected, "token-2")
-    val differentTarget = VoiceRuntimeThreadAuthorization(
-      expected.copy(selectedThreadId = "thread-2"),
-      "token-3",
-    )
-
-    assertEquals("token-2", T3VoiceRuntimeThreadCreateAuthorityPolicy.token(expected, refreshed))
-    assertTrue(T3VoiceRuntimeThreadCreateAuthorityPolicy.shouldRetryRejected(
-      original.runtimeGrantToken,
-      expected,
-      refreshed,
-    ))
-    assertFalse(T3VoiceRuntimeThreadCreateAuthorityPolicy.shouldRetryRejected(
-      refreshed.runtimeGrantToken,
-      expected,
-      refreshed,
-    ))
-    assertNull(T3VoiceRuntimeThreadCreateAuthorityPolicy.token(expected, differentTarget))
-  }
-
   private fun checkpoint() = VoiceRuntimeRealtimeCheckpoint(
     fence = VoiceRuntimeRealtimeFence(
       VoiceRuntimeIdentity("runtime-1", "process-old", 4),
@@ -138,12 +112,8 @@ internal class T3VoiceRuntimeServiceRecoveryTest {
     phase = VoiceRealtimePhase.CONNECTED,
     serverSessionId = "session-1",
     leaseGeneration = 7,
-    controlGrant = VoiceRuntimeRealtimeControlGrant(
-      "child-control-token",
-      8_000,
-      5,
-      30,
-    ),
+    expiresAtEpochMillis = 10_000,
+    heartbeatIntervalSeconds = 5,
   )
 
   private fun finalization(): VoiceRuntimeRealtimeFinalization {
@@ -152,7 +122,6 @@ internal class T3VoiceRuntimeServiceRecoveryTest {
       fence = checkpoint.fence,
       sourceTarget = checkpoint.target,
       sourceEnvironmentOrigin = "https://environment.example.test",
-      sourceAuthorityExpiresAtEpochMillis = 10_000,
       rootCommandId = checkpoint.rootCommandId,
       session = VoiceRuntimeRealtimeStartResult(
         VoiceRuntimeRealtimeSessionState(
@@ -164,7 +133,7 @@ internal class T3VoiceRuntimeServiceRecoveryTest {
         ),
         "/api/voice/runtime/realtime-sessions/session-1/webrtc-offer",
         9_000,
-        requireNotNull(checkpoint.controlGrant),
+        5,
       ),
       closeOperationId = "root-1.close.recover",
       outcome = VoiceRuntimeRealtimeTerminalOutcome.INTERRUPTED,

@@ -13,11 +13,9 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.HttpsURLConnection
 
-internal data class VoiceRuntimeControlGrant(
-  val token: String,
+internal data class VoiceRuntimeControlLease(
   val sessionId: String,
   val leaseGeneration: Long,
-  val expiresAtEpochMillis: Long,
   val heartbeatIntervalMillis: Long,
   val failureGraceMillis: Long,
 )
@@ -43,10 +41,10 @@ internal data class T3VoiceNativeHeartbeatSchedule(
 )
 
 internal object T3VoiceNativeHeartbeatSchedulePolicy {
-  fun forGrant(grant: VoiceRuntimeControlGrant): T3VoiceNativeHeartbeatSchedule =
+  fun forLease(lease: VoiceRuntimeControlLease): T3VoiceNativeHeartbeatSchedule =
     T3VoiceNativeHeartbeatSchedule(
       initialDelayMillis = 0,
-      intervalMillis = grant.heartbeatIntervalMillis,
+      intervalMillis = lease.heartbeatIntervalMillis,
     )
 }
 
@@ -63,10 +61,8 @@ internal object T3VoiceNativeHeartbeatPolicy {
     nowMillis: Long,
     lastSuccessMillis: Long,
     failureGraceMillis: Long,
-    expiresAtMillis: Long,
   ): Boolean =
     result == T3VoiceNativeHeartbeatResult.TERMINAL_FAILURE ||
-      nowMillis >= expiresAtMillis ||
       (result == T3VoiceNativeHeartbeatResult.TRANSIENT_FAILURE &&
         nowMillis - lastSuccessMillis >= failureGraceMillis)
 }
@@ -148,7 +144,7 @@ internal object VoiceRuntimeControlOriginPolicy {
 internal fun interface T3VoiceNativeHeartbeatTransport {
   fun post(
     url: String,
-    token: String,
+    sessionCredential: String,
     sessionId: String,
     leaseGeneration: Long,
   ): T3VoiceNativeHeartbeatResult
@@ -157,7 +153,7 @@ internal fun interface T3VoiceNativeHeartbeatTransport {
 internal class T3VoiceHttpsNativeHeartbeatTransport : T3VoiceNativeHeartbeatTransport {
   override fun post(
     url: String,
-    token: String,
+    sessionCredential: String,
     sessionId: String,
     leaseGeneration: Long,
   ): T3VoiceNativeHeartbeatResult {
@@ -169,7 +165,7 @@ internal class T3VoiceHttpsNativeHeartbeatTransport : T3VoiceNativeHeartbeatTran
       connection.readTimeout = REQUEST_TIMEOUT_MILLIS
       connection.doOutput = true
       connection.setRequestProperty("content-type", "application/json")
-      connection.setRequestProperty("x-t3-voice-control", token)
+      connection.setRequestProperty("Authorization", "Bearer $sessionCredential")
       connection.outputStream.use { output ->
         output.write("{\"leaseGeneration\":$leaseGeneration}".toByteArray(Charsets.UTF_8))
       }
@@ -265,19 +261,26 @@ internal class VoiceRuntimeControlHeartbeat(
   private val onTerminated: (String, VoiceRuntimeControlTermination) -> Unit,
 ) {
   private val lock = Any()
-  private var grant: VoiceRuntimeControlGrant? = null
+  private var lease: VoiceRuntimeControlLease? = null
+  private var sessionCredential: String? = null
   private var heartbeatUrl: String? = null
   private var lastSuccessMillis = 0L
   private var scheduled: ScheduledFuture<*>? = null
 
-  fun start(origin: String, nextGrant: VoiceRuntimeControlGrant) {
-    val url = VoiceRuntimeControlOriginPolicy.heartbeatUrl(origin, nextGrant.sessionId)
+  fun start(
+    origin: String,
+    nextSessionCredential: String,
+    nextLease: VoiceRuntimeControlLease,
+  ) {
+    VoiceRuntimeSessionCredential(nextSessionCredential)
+    val url = VoiceRuntimeControlOriginPolicy.heartbeatUrl(origin, nextLease.sessionId)
     synchronized(lock) {
       stopLocked()
-      grant = nextGrant
+      lease = nextLease
+      sessionCredential = nextSessionCredential
       heartbeatUrl = url
       lastSuccessMillis = clockMillis()
-      val schedule = T3VoiceNativeHeartbeatSchedulePolicy.forGrant(nextGrant)
+      val schedule = T3VoiceNativeHeartbeatSchedulePolicy.forLease(nextLease)
       scheduled =
         executor.scheduleWithFixedDelay(
           ::heartbeat,
@@ -296,25 +299,19 @@ internal class VoiceRuntimeControlHeartbeat(
   }
 
   private fun heartbeat() {
-    val current: VoiceRuntimeControlGrant
+    val current: VoiceRuntimeControlLease
+    val credential: String
     val url: String
     synchronized(lock) {
-      current = grant ?: return
+      current = lease ?: return
+      credential = sessionCredential ?: return
       url = heartbeatUrl ?: return
     }
-    if (clockMillis() >= current.expiresAtEpochMillis) {
-      synchronized(lock) {
-        if (grant !== current) return
-        stopLocked()
-      }
-      onTerminated(current.sessionId, VoiceRuntimeControlTermination.SESSION_ENDED)
-      return
-    }
-    val result = transport.post(url, current.token, current.sessionId, current.leaseGeneration)
+    val result = transport.post(url, credential, current.sessionId, current.leaseGeneration)
     val now = clockMillis()
     var termination: VoiceRuntimeControlTermination? = null
     synchronized(lock) {
-      if (grant !== current) return
+      if (lease !== current) return
       if (result == T3VoiceNativeHeartbeatResult.SUCCESS) lastSuccessMillis = now
       if (
         result == T3VoiceNativeHeartbeatResult.SESSION_TERMINAL ||
@@ -333,7 +330,6 @@ internal class VoiceRuntimeControlHeartbeat(
           now,
           lastSuccessMillis,
           current.failureGraceMillis,
-          current.expiresAtEpochMillis,
         )
       ) {
         termination =
@@ -351,7 +347,8 @@ internal class VoiceRuntimeControlHeartbeat(
   private fun stopLocked() {
     scheduled?.cancel(true)
     scheduled = null
-    grant = null
+    lease = null
+    sessionCredential = null
     heartbeatUrl = null
     lastSuccessMillis = 0L
   }

@@ -14,16 +14,15 @@ class VoiceRuntimeThreadExecutionTest {
       2_200, 60_000, 600_000, true, 750,
     )
     val persisted = VoiceRuntimePersistedAuthority(
-      "runtime-1", 4, "provision-4",
+      "runtime-1", 4,
       T3VoiceRuntimeTargetIdentity.digest(VoiceRuntimeBridge.canonicalThreadTargetIdentity(target)),
-      target, "https://example.test", false, "runtime-secret", NOW - 1_000, NOW + 60_000,
+      target, "https://example.test", false,
     )
 
     assertNull(VoiceRuntimeThreadAuthorityPolicy.validateCanonical(
       persisted, 0, true, NOW))
     val attached = requireNotNull(VoiceRuntimeThreadAuthorityPolicy.validateCanonical(
       persisted, 1, true, NOW))
-    assertEquals("runtime-secret", attached.runtimeGrantToken)
     assertEquals(750, attached.authority.rearmGuardMs)
     assertEquals(2_200, attached.authority.endSilenceMs)
   }
@@ -63,6 +62,12 @@ class VoiceRuntimeThreadExecutionTest {
       authority, "client-1", progressed, NOW))
     assertFalse(VoiceRuntimeThreadAuthorityPolicy.validateCreated(
       authority, "client-1", progressed.copy(snapshot = progressed.snapshot.copy(threadId = "other")), NOW))
+    assertFalse(VoiceRuntimeThreadAuthorityPolicy.validateCreated(
+      authority,
+      "client-1",
+      progressed.copy(snapshot = progressed.snapshot.copy(operationTokenExpiresAtEpochMillis = NOW)),
+      NOW,
+    ))
     assertTrue(VoiceRuntimeThreadAuthorityPolicy.validateSnapshot(
       authority, "operation-1", 7, progressed.snapshot))
     assertFalse(VoiceRuntimeThreadAuthorityPolicy.validateSnapshot(
@@ -99,7 +104,6 @@ class VoiceRuntimeThreadExecutionTest {
     val authority = VoiceRuntimePersistedAuthority(
       runtimeId = "runtime-1",
       generation = 5,
-      provisioningOperationId = "handoff-1",
       targetDigest = T3VoiceRuntimeTargetIdentity.digest(
         VoiceRuntimeBridge.canonicalThreadTargetIdentity(
           VoiceRuntimeTarget.Thread(
@@ -114,9 +118,6 @@ class VoiceRuntimeThreadExecutionTest {
       ),
       environmentOrigin = "https://example.test",
       readinessEnabled = false,
-      token = "transition-token",
-      issuedAtEpochMillis = NOW - 1,
-      expiresAtEpochMillis = NOW + 60_000,
     )
 
     assertNull(VoiceRuntimeThreadAuthorityPolicy.validateCanonical(authority, 0, true, NOW))
@@ -170,7 +171,7 @@ class VoiceRuntimeThreadExecutionTest {
     val installed = activeAuthority()
     val active = VoiceRuntimeThreadOperationState.Active(
       claim(),
-      "operation-1", NOW + 50_000, "child-secret",
+      "operation-1", NOW + 50_000,
       acknowledgedCursor = 0,
       snapshot = VoiceRuntimeExecutionSnapshot(
         runtimeId = "runtime-1", readinessGeneration = 4, mode = VoiceRuntimeExecutionMode.THREAD,
@@ -300,7 +301,6 @@ class VoiceRuntimeThreadExecutionTest {
       claim(),
       "operation-1",
       NOW + 50_000,
-      "child-secret",
       acknowledgedCursor = 5,
       snapshot = VoiceRuntimeExecutionSnapshot(
         runtimeId = "runtime-1",
@@ -490,7 +490,7 @@ class VoiceRuntimeThreadExecutionTest {
     )
     val claim = claim()
     val active = VoiceRuntimeThreadOperationState.Active(
-      claim, "operation-1", NOW + 10_000, "child", 0, recording = recording,
+      claim, "operation-1", NOW + 10_000, 0, recording = recording,
       snapshot = VoiceRuntimeExecutionSnapshot(
         runtimeId = "runtime-1", readinessGeneration = 4,
         mode = VoiceRuntimeExecutionMode.THREAD, phase = VoiceRuntimePhase.FINALIZED,
@@ -510,7 +510,7 @@ class VoiceRuntimeThreadExecutionTest {
   @Test fun `stored operation recovery distinguishes unstarted active work`() {
     val claim = claim()
     val active = VoiceRuntimeThreadOperationState.Active(
-      claim, "operation-1", NOW, "child", 0,
+      claim, "operation-1", NOW, 0,
       snapshot = VoiceRuntimeExecutionSnapshot(
         runtimeId = "runtime-1", readinessGeneration = 4,
         mode = VoiceRuntimeExecutionMode.THREAD, phase = VoiceRuntimePhase.WAITING,
@@ -571,7 +571,7 @@ class VoiceRuntimeThreadExecutionTest {
     val targetDigest = DIGEST
     val claim = claim()
     val active = VoiceRuntimeThreadOperationState.Active(
-      claim, "operation-1", NOW + 10_000, "child", 0, cancelRequested = true,
+      claim, "operation-1", NOW + 10_000, 0, cancelRequested = true,
       snapshot = VoiceRuntimeExecutionSnapshot(
         runtimeId = "runtime-1",
         readinessGeneration = 4,
@@ -592,7 +592,6 @@ class VoiceRuntimeThreadExecutionTest {
       claim,
       NOW,
     )
-    assertEquals("secret", requireNotNull(authorization).runtimeGrantToken)
     assertNull(VoiceRuntimeThreadAuthorityPolicy.validatePreparedCancellation(
       T3VoiceRuntimeGrantLoadResult.Missing,
       activeAuthority(targetDigest),
@@ -676,8 +675,7 @@ class VoiceRuntimeThreadExecutionTest {
       retentionExpiresAtEpochMillis = NOW + 50_000,
     )
   private fun createResult(snapshot: VoiceRuntimeThreadTurnSnapshot) =
-    VoiceRuntimeThreadTurnCreateResult(snapshot,
-      VoiceRuntimeThreadTurnGrant("child", NOW + 40_000))
+    VoiceRuntimeThreadTurnCreateResult(snapshot)
   private fun terminalSnapshot(
     summary: VoiceRuntimeTerminalSummary,
     noSpeech: Boolean,

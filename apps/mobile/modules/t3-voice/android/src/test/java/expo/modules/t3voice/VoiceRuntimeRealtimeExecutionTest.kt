@@ -89,7 +89,7 @@ internal class VoiceRuntimeRealtimeExecutionTest {
   }
 
   @Test
-  fun `started session must retain exact conversation and live bounded leases`() {
+  fun `started session validates server session and derives heartbeat grace`() {
     val authority = requireNotNull(
       VoiceRuntimeRealtimeAuthorityPolicy.validate(
         readiness(),
@@ -112,13 +112,6 @@ internal class VoiceRuntimeRealtimeExecutionTest {
     assertFalse(
       VoiceRuntimeRealtimeAuthorityPolicy.validateStartedSession(
         authority,
-        valid.copy(controlGrant = valid.controlGrant.copy(expiresAtEpochMillis = NOW)),
-        NOW,
-      ),
-    )
-    assertFalse(
-      VoiceRuntimeRealtimeAuthorityPolicy.validateStartedSession(
-        authority,
         valid.copy(state = valid.state.copy(phase = "closed")),
         NOW,
       ),
@@ -126,18 +119,11 @@ internal class VoiceRuntimeRealtimeExecutionTest {
     assertFalse(
       VoiceRuntimeRealtimeAuthorityPolicy.validateStartedSession(
         authority,
-        valid.copy(controlGrant = valid.controlGrant.copy(failureGraceSeconds = 20)),
+        valid.copy(heartbeatIntervalSeconds = 3_600),
         NOW,
       ),
     )
-    assertFalse(
-      VoiceRuntimeRealtimeAuthorityPolicy.validateStartedSession(
-        authority,
-        valid.copy(controlGrant = valid.controlGrant.copy(heartbeatIntervalSeconds = 3_600)),
-        NOW,
-      ),
-    )
-    val native = VoiceRuntimeRealtimeAuthorityPolicy.runtimeControlGrant(valid)
+    val native = VoiceRuntimeRealtimeAuthorityPolicy.runtimeControlLease(valid)
     assertEquals(15_000, native.heartbeatIntervalMillis)
     assertEquals(45_000, native.failureGraceMillis)
   }
@@ -213,13 +199,7 @@ internal class VoiceRuntimeRealtimeExecutionTest {
         ),
       signalingPath = "/api/voice/native/realtime-sessions/session-1/webrtc-offer",
       expiresAtEpochMillis = NOW + 60_000,
-      controlGrant =
-        VoiceRuntimeRealtimeControlGrant(
-          token = "control-secret",
-          expiresAtEpochMillis = NOW + 60_000,
-          heartbeatIntervalSeconds = 15,
-          failureGraceSeconds = 45,
-        ),
+      heartbeatIntervalSeconds = 15,
     )
 
   private companion object {
