@@ -376,8 +376,6 @@ export class FakeVoiceRuntime implements VoiceRuntime {
       return { ...existingCommand.receipt, replayed: true };
     }
 
-    this.expireAuthority();
-
     const fenceRebase = this.commandFenceRebase(command);
     if (fenceRebase !== null) {
       return {
@@ -813,10 +811,6 @@ export class FakeVoiceRuntime implements VoiceRuntime {
       return { state: "disabled" };
     }
     return { state: "ready", mode: this.snapshot.target.mode };
-  }
-
-  private expireAuthority(): void {
-    // Session-backed authority is cleared explicitly or by the server revocation cascade.
   }
 
   private invalidateConsumers(): void {

@@ -122,7 +122,7 @@ describe.sequential("VoiceRuntimeAuthorityRepository", () => {
     }).pipe(Effect.provide(layer)),
   );
 
-  it.effect("atomically consumes a tokenless handoff reservation and replays its outcome", () =>
+  it.effect("survives a crash between handoff exchange and commit with exactly-once replay", () =>
     Effect.gen(function* () {
       yield* initialize;
       const authorities = yield* VoiceRuntimeAuthorityRepository;
@@ -152,6 +152,11 @@ describe.sequential("VoiceRuntimeAuthorityRepository", () => {
         target: threadTarget,
       };
       expect((yield* reservations.claim(reservation, 20)).status).toBe("claimed");
+      expect(
+        yield* sql<{ readonly consumedAt: number | null }>`SELECT consumed_at AS "consumedAt"
+          FROM voice_runtime_realtime_transition_grants
+          WHERE source_session_id = ${sourceSessionId} AND action_id = ${actionId}`,
+      ).toEqual([{ consumedAt: null }]);
       const commit = {
         authSessionId,
         runtimeId,
@@ -169,10 +174,20 @@ describe.sequential("VoiceRuntimeAuthorityRepository", () => {
         status: "consumed",
         target: threadTarget,
       });
+      expect(
+        yield* sql<{ readonly consumedAt: number | null }>`SELECT consumed_at AS "consumedAt"
+          FROM voice_runtime_realtime_transition_grants
+          WHERE source_session_id = ${sourceSessionId} AND action_id = ${actionId}`,
+      ).toEqual([{ consumedAt: 30 }]);
       expect(yield* authorities.consumeHandoff(commit, 40)).toEqual({
         status: "existing",
         target: threadTarget,
       });
+      expect(
+        yield* sql<{ readonly consumedAt: number | null }>`SELECT consumed_at AS "consumedAt"
+          FROM voice_runtime_realtime_transition_grants
+          WHERE source_session_id = ${sourceSessionId} AND action_id = ${actionId}`,
+      ).toEqual([{ consumedAt: 30 }]);
       expect(yield* authorities.find(authSessionId, runtimeId)).toMatchObject({
         generation: 2,
         target: threadTarget,
