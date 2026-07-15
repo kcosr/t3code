@@ -35,7 +35,7 @@ internal class VoiceHostDriver(
   private val dispatcher: VoiceHostMainDispatcher,
   private val effects: VoiceHostEffects,
   private val resultSink: VoiceKernelDriverResultSink,
-  private val epoch: () -> VoiceKernelEpoch,
+  private val epoch: (String) -> VoiceKernelEpoch,
 ) {
   fun setForeground(types: Int, snapshot: T3VoiceNotificationSnapshot) =
     execute("set-foreground") { effects.setForeground(types, snapshot) }
@@ -53,11 +53,12 @@ internal class VoiceHostDriver(
     execute("stop-self-if-idle") { effects.stopSelfIfIdle(startId) }
 
   private fun execute(label: String, body: () -> Unit) {
+    val armedEpoch = epoch(label)
     val runnable = Runnable {
       val result = runCatching(body)
       resultSink.post(
         VoiceKernelMessage.DriverResult(
-          epoch = epoch(),
+          epoch = armedEpoch,
           driver = VoiceKernelDriver.HOST,
           resultKind = label,
           payload = VoiceKernelDriverResultPayload.HostCompleted(label, result),

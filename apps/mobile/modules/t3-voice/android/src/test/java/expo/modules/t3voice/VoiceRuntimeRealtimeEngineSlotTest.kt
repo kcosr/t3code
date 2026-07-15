@@ -13,7 +13,7 @@ internal class VoiceRuntimeRealtimeEngineSlotTest {
   fun `idle installation commits and completes`() {
     val slot = VoiceRuntimeRealtimeEngineSlot<Engine>(isActive = { it.active })
     val engine = Engine()
-    val installation = slot.stageIdleInstall(slot.fence(), authority(), engine)
+    val installation = slot.stageIdleInstall(authority(), engine)
 
     assertSame(engine, slot.commit(installation).current?.engine)
     assertSame(engine, slot.complete(installation).current?.engine)
@@ -27,7 +27,7 @@ internal class VoiceRuntimeRealtimeEngineSlotTest {
       Engine::active,
     )
     val candidate = Engine()
-    val installation = slot.stageIdleInstall(slot.fence(), authority(generation = 8), candidate)
+    val installation = slot.stageIdleInstall(authority(generation = 8), candidate)
     slot.commit(installation)
 
     assertSame(previous, slot.rollback(installation).current?.engine)
@@ -41,20 +41,7 @@ internal class VoiceRuntimeRealtimeEngineSlotTest {
     )
 
     assertTrue(runCatching {
-      slot.stageIdleInstall(slot.fence(), authority(generation = 8), Engine())
-    }.isFailure)
-  }
-
-  @Test
-  fun `stale slot fence cannot mutate current engine`() {
-    val slot = VoiceRuntimeRealtimeEngineSlot<Engine>(isActive = Engine::active)
-    val stale = slot.fence()
-    val first = slot.stageIdleInstall(stale, authority(), Engine())
-    slot.commit(first)
-    slot.complete(first)
-
-    assertTrue(runCatching {
-      slot.stageIdleClear(stale)
+      slot.stageIdleInstall(authority(generation = 8), Engine())
     }.isFailure)
   }
 
@@ -64,17 +51,16 @@ internal class VoiceRuntimeRealtimeEngineSlotTest {
       VoiceRuntimeRealtimeEngineBinding(authority(), Engine()),
       Engine::active,
     )
-    val clear = slot.stageIdleClear(slot.fence())
+    val clear = slot.stageIdleClear()
     slot.commit(clear)
     assertNull(slot.complete(clear).current)
-    assertEquals(1, slot.snapshot().version)
   }
 
   @Test
   fun `empty slot installs a recovered active engine`() {
     val slot = VoiceRuntimeRealtimeEngineSlot<Engine>(isActive = Engine::active)
     val recovered = Engine(active = true)
-    val installation = slot.stageRecoveredInstall(slot.fence(), authority(), recovered)
+    val installation = slot.stageRecoveredInstall(authority(), recovered)
 
     assertSame(recovered, slot.commit(installation).current?.engine)
     assertSame(recovered, slot.complete(installation).current?.engine)
@@ -88,7 +74,7 @@ internal class VoiceRuntimeRealtimeEngineSlotTest {
       VoiceRuntimeRealtimeEngineBinding(authority(), previous),
       Engine::active,
     )
-    val installation = slot.stageIdleInstall(slot.fence(), authority(generation = 8), candidate)
+    val installation = slot.stageIdleInstall(authority(generation = 8), candidate)
     slot.commit(installation)
     candidate.active = true
 
@@ -100,7 +86,7 @@ internal class VoiceRuntimeRealtimeEngineSlotTest {
   @Test
   fun `reduction installation uses stable binding identity and live state`() {
     val slot = VoiceRuntimeRealtimeEngineSlot<Engine>(isActive = Engine::active)
-    val installation = slot.stageIdleInstall(slot.fence(), authority(), Engine())
+    val installation = slot.stageIdleInstall(authority(), Engine())
     val binding = requireNotNull(slot.commit(installation).current)
     slot.complete(installation)
     val checkpoint = VoiceRuntimeRealtimeCheckpoint(
@@ -110,13 +96,11 @@ internal class VoiceRuntimeRealtimeEngineSlotTest {
       VoiceRealtimePhase.PREPARING,
     )
     slot.applyReduction(
-      binding.identityToken,
       VoiceRuntimeRealtimeReduction(binding.state.copy(checkpoint = checkpoint), result = Unit),
     )
 
     assertEquals(checkpoint, slot.snapshot().current?.state?.checkpoint)
-    assertNull(slot.applyReduction(Any(), VoiceRuntimeRealtimeReduction(binding.state, result = Unit)))
-    assertTrue(runCatching { slot.stageIdleClear(slot.fence()) }.isFailure)
+    assertTrue(runCatching { slot.stageIdleClear() }.isFailure)
   }
 
   private fun authority(generation: Long = 7) = VoiceRuntimeRealtimeAuthority(

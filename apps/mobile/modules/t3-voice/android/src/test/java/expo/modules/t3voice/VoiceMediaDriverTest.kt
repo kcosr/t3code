@@ -10,7 +10,10 @@ class VoiceMediaDriverTest {
   fun `driver is constructible with fake listener and keeps realtime lazy`() {
     val events = mutableListOf<VoiceMediaDriverEvent>()
     val factory = FakeFactory()
-    val driver = VoiceMediaDriver(VoiceMediaDriverListener(events::add), factory)
+    val driver = VoiceMediaDriver(
+      VoiceMediaDriverListener { _, event -> events += event },
+      factory,
+    )
 
     assertEquals(listOf("cues", "recorder", "player", "focus"), factory.created)
     assertFalse(factory.created.contains("realtime"))
@@ -27,12 +30,12 @@ class VoiceMediaDriverTest {
     val created = mutableListOf<String>()
     val released = mutableListOf<String>()
 
-    override fun createRecorder(listener: VoiceMediaDriverListener) = create("recorder")
-    override fun createPlayer(listener: VoiceMediaDriverListener) = create("player")
-    override fun createFocus(listener: VoiceMediaDriverListener) = create("focus")
+    override fun createRecorder(listener: VoiceRawMediaDriverListener) = create("recorder")
+    override fun createPlayer(listener: VoiceRawMediaDriverListener) = create("player")
+    override fun createFocus(listener: VoiceRawMediaDriverListener) = create("focus")
     override fun createCues() = create("cues")
-    override fun createRouter(listener: VoiceMediaDriverListener) = create("router")
-    override fun createRealtime(router: String, listener: VoiceMediaDriverListener) = create("realtime")
+    override fun createRouter(listener: VoiceRawMediaDriverListener) = create("router")
+    override fun createRealtime(router: String, listener: VoiceRawMediaDriverListener) = create("realtime")
     override fun releaseRecorder(recorder: String) = release("recorder")
     override fun releasePlayer(player: String) = release("player")
     override fun releaseCues(cues: String) = release("cues")

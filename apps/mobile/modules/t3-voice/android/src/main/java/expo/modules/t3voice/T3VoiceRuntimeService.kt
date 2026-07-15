@@ -121,13 +121,54 @@ internal class T3VoiceRecordingNotStartedException : IllegalStateException(
 
 class T3VoiceRuntimeService : Service() {
   private val mailbox = VoiceKernelMailbox()
+  private val epochRegistry = VoiceKernelEpochRegistry()
+  private val admittedCueTerminals = mutableSetOf<VoiceKernelEpoch>()
 
-  private fun driverEpoch() = VoiceKernelEpoch(
-    runtimeInstanceId = "m3-placeholder",
-    authorityGeneration = 0,
-    rootOperationId = "m3-driver",
-    attemptOrdinal = 0,
-  )
+  private fun armEpoch(
+    kind: VoiceKernelEpochRootKind,
+    rootOperationId: String,
+    authorityGeneration: Long = voiceRuntimeController.snapshot().identity.generation,
+  ): VoiceKernelEpoch {
+    mailbox.assertKernelThread()
+    return epochRegistry.arm(
+      kind,
+      voiceRuntimeController.snapshot().identity.runtimeInstanceId,
+      authorityGeneration,
+      rootOperationId,
+    )
+  }
+
+  private fun driverEpoch(): VoiceKernelEpoch {
+    mailbox.assertKernelThread()
+    val threadAttempt = runtimeThreadAttempt
+    if (threadAttempt != null) {
+      return epochRegistry.current(threadAttempt.clientOperationId)
+        ?: armEpoch(
+          VoiceKernelEpochRootKind.THREAD_TURN,
+          threadAttempt.clientOperationId,
+          threadAttempt.authority.readinessGeneration,
+        )
+    }
+    val realtimeCheckpoint = voiceRuntimeRealtimeEngine?.let(::realtimeState)?.checkpoint
+    if (realtimeCheckpoint != null) {
+      val rootOperationId = realtimeCheckpoint.fence.modeSessionId
+      return epochRegistry.current(rootOperationId)
+        ?: armEpoch(
+          VoiceKernelEpochRootKind.REALTIME_MODE,
+          rootOperationId,
+          realtimeCheckpoint.fence.identity.generation,
+        )
+    }
+    return serviceEpoch()
+  }
+
+  private fun serviceEpoch(): VoiceKernelEpoch {
+    mailbox.assertKernelThread()
+    val identity = voiceRuntimeController.snapshot().identity
+    val rootOperationId = "service:${identity.runtimeInstanceId}"
+    return epochRegistry.current(rootOperationId)
+      ?: armEpoch(VoiceKernelEpochRootKind.SERVICE, rootOperationId, identity.generation)
+  }
 
   private fun callbackMessage(payloadKind: String) =
     VoiceKernelMessage.Command(callerIdentity = "runtime-callback", payloadKind = payloadKind)
@@ -143,6 +184,27 @@ class T3VoiceRuntimeService : Service() {
 
   private fun handleDriverResult(result: VoiceKernelMessage.DriverResult) {
     mailbox.assertKernelThread()
+    val admission = epochRegistry.currentEpochFor(result)?.let { currentEpoch ->
+      VoiceKernelEpochPolicy.admit(currentEpoch, result.epoch)
+    } ?: VoiceKernelEpochAdmission.DropStale(VoiceKernelEpochStalenessDimension.ROOT_OPERATION)
+    if (admission is VoiceKernelEpochAdmission.DropStale) {
+      T3VoiceDiagnostics.record(
+        generation = 0,
+        category = T3VoiceDiagnosticCategory.KERNEL,
+        code = T3VoiceDiagnosticCode.STALE_DRIVER_RESULT,
+        primaryCount = admission.dimension.ordinal + 1,
+      )
+      return
+    }
+    if (result.driver == VoiceKernelDriver.MEDIA && result.resultKind == "CueCompleted" &&
+      !admittedCueTerminals.add(result.epoch)) {
+      T3VoiceDiagnostics.record(
+        generation = 0,
+        category = T3VoiceDiagnosticCategory.KERNEL,
+        code = T3VoiceDiagnosticCode.DUPLICATE_CUE_TERMINAL,
+      )
+      return
+    }
     when (result.driver) {
       VoiceKernelDriver.NET -> {
         val payload = result.payload as VoiceKernelDriverResultPayload.NetCompleted
@@ -167,6 +229,17 @@ class T3VoiceRuntimeService : Service() {
     }
   }
 
+  private fun postCueCompletion(epoch: VoiceKernelEpoch, continuation: () -> Unit) {
+    postDriverResult(
+      VoiceKernelMessage.DriverResult(
+        epoch = epoch,
+        driver = VoiceKernelDriver.MEDIA,
+        resultKind = "CueCompleted",
+        payload = VoiceKernelDriverResultPayload.MediaEvent("CueCompleted", continuation),
+      ),
+    )
+  }
+
   private fun submitCallbackDelayed(
     body: () -> Unit,
     delayMillis: Long,
@@ -177,6 +250,28 @@ class T3VoiceRuntimeService : Service() {
     runnable: Runnable,
     delayMillis: Long,
   ): VoiceKernelCancellationToken = submitCallbackDelayed(runnable::run, delayMillis)
+
+  private fun scheduleTick(
+    timerId: String,
+    delayMillis: Long,
+    continuation: () -> Unit,
+  ): VoiceKernelCancellationToken {
+    val epoch = armEpoch(VoiceKernelEpochRootKind.TIMER, timerId)
+    val tick = VoiceKernelMessage.Tick(timerId, epoch)
+    return mailbox.submitDelayed(tick, delayMillis) {
+      handleDriverResult(
+        VoiceKernelMessage.DriverResult(
+          epoch = tick.epoch,
+          driver = VoiceKernelDriver.NET,
+          resultKind = "tick:${tick.timerId}",
+          payload = VoiceKernelDriverResultPayload.NetCompleted(
+            "tick:${tick.timerId}",
+            continuation,
+          ),
+        ),
+      )
+    }
+  }
 
   internal inner class VoiceBinder : Binder() {
     private fun binderMessage(payloadKind: String) =
@@ -700,6 +795,8 @@ class T3VoiceRuntimeService : Service() {
               ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
             )
+            val epoch = armEpoch(VoiceKernelEpochRootKind.REALTIME_PEER, nativeSessionId)
+            mediaDriver.armRealtime(nativeSessionId, epoch)
             realtime.prepare(nativeSessionId, diagnosticGeneration, audioRouteId, callback)
             check(T3VoiceStateStore.state.value.activeRealtimeSessionId == nativeSessionId) {
               "The Realtime peer terminated during preparation."
@@ -826,7 +923,6 @@ class T3VoiceRuntimeService : Service() {
       val readinessCheckpoint = readinessStore.checkpoint()
       val priorReadinessConfig = readinessConfig
       val priorCanonicalPreparedAuthority = canonicalPreparedAuthority
-      val slotFence = voiceRuntimeRealtimeEngineSlot.fence()
       val realtimeAuthority = (authority.target as? VoiceRuntimeTarget.Realtime)?.let { target ->
         VoiceRuntimeRealtimeAuthority(
           reservation.identity,
@@ -853,12 +949,11 @@ class T3VoiceRuntimeService : Service() {
           installation = when {
             candidateEngine != null ->
               voiceRuntimeRealtimeEngineSlot.stageIdleInstall(
-                slotFence,
                 requireNotNull(realtimeAuthority),
                 candidateEngine,
               )
             realtimeAuthority == null && installedBinding != null ->
-              voiceRuntimeRealtimeEngineSlot.stageIdleClear(slotFence)
+              voiceRuntimeRealtimeEngineSlot.stageIdleClear()
             else -> null
           }
           installation?.let(voiceRuntimeRealtimeEngineSlot::commit)
@@ -1268,10 +1363,8 @@ class T3VoiceRuntimeService : Service() {
     get() = mediaDriver.focus
   private val cueCoordinator: T3VoiceCueCoordinator
     get() = mediaDriver.cues
-  private var nextCueGeneration = 0L
   private var realtimeReadyCue: Pair<String, Long>? = null
   private var realtimeEndedCue: Pair<String, Long>? = null
-  private var realtimeStopDrainSessionId: String? = null
   private var pendingRecordingStart: T3VoicePendingRecordingStart? = null
   private var recordingEndedCue: Pair<String, Long>? = null
   private val realtime: T3VoiceWebRtcSession
@@ -1316,13 +1409,7 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun handleRecorderTerminatedLocked(termination: T3VoiceRecordingTermination) {
-    val owner = recordingOwner?.takeIf {
-      it.id == when (termination) {
-        is T3VoiceRecordingTermination.Completed -> termination.recording.recordingId
-        is T3VoiceRecordingTermination.Cancelled -> termination.recordingId
-        is T3VoiceRecordingTermination.Failed -> termination.recordingId
-      }
-    } ?: return
+    val owner = recordingOwner ?: return
     when (termination) {
       is T3VoiceRecordingTermination.Completed -> {
         terminateRecordingLocked(
@@ -1370,7 +1457,7 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun handlePcmFinishedLocked(playbackId: String) {
-    playbackOwner?.takeIf { it.id == playbackId }?.let { owner ->
+    playbackOwner?.let { owner ->
       terminatePlaybackLocked(
         owner,
         T3VoiceRuntimeEvent.PlaybackTerminated(playbackId, "completed"),
@@ -1384,7 +1471,7 @@ class T3VoiceRuntimeService : Service() {
         val persisted = applyRuntimeEventLocked(
           VoiceRuntimeExecutionEvent.PlaybackDrained(requireNotNull(attempt.operationId), segment),
         )
-        if (persisted != null && runtimeThreadAttempt === attempt) {
+        if (persisted != null) {
           syncRuntimeThreadSpeechProgress(attempt, runtimeSnapshot)
           acknowledgeRuntimeThread(
             attempt,
@@ -1496,10 +1583,11 @@ class T3VoiceRuntimeService : Service() {
         state.realtimeInputReady
     ) return
     if (realtimeReadyCue?.first == sessionId) return
-    val generation = ++nextCueGeneration
+    val epoch = armEpoch(VoiceKernelEpochRootKind.CUE, "cue:realtime-ready:$sessionId")
+    val generation = epoch.attemptOrdinal
     realtimeReadyCue = sessionId to generation
     if (!cueSettings.enabled || !cueCoordinator.requestReady(generation) { completion ->
-        mailbox.submit(callbackMessage("realtime-ready-cue")) {
+        postCueCompletion(epoch) {
           run {
             completeRealtimeReadyCueLocked(sessionId, completion.generation)
           }
@@ -1510,25 +1598,27 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun drainRealtimeForStopLocked(sessionId: String) {
-    if (realtimeStopDrainSessionId == sessionId) return
     cancelRealtimeReadyCueLocked(sessionId)
-    realtimeStopDrainSessionId = sessionId
+    val epoch = armEpoch(VoiceKernelEpochRootKind.REALTIME_PEER, sessionId)
     try {
       realtime.drainPlayout(sessionId) {
-        mailbox.submit(callbackMessage("realtime-stop-drain")) {
-          run {
-            if (realtimeStopDrainSessionId == sessionId) realtimeStopDrainSessionId = null
+        postDriverResult(
+          VoiceKernelMessage.DriverResult(
+            epoch = epoch,
+            driver = VoiceKernelDriver.MEDIA,
+            resultKind = "RealtimeDrainCompleted",
+            payload = VoiceKernelDriverResultPayload.MediaEvent("RealtimeDrainCompleted") {
             if (
               !handoffInProgress &&
                 T3VoiceStateStore.state.value.activeRealtimeSessionId == sessionId
             ) {
               runCatching { realtime.stop(sessionId) }
             }
-          }
-        }
+            },
+          ),
+        )
       }
     } catch (_: Throwable) {
-      if (realtimeStopDrainSessionId == sessionId) realtimeStopDrainSessionId = null
       if (T3VoiceStateStore.state.value.activeRealtimeSessionId == sessionId) {
         runCatching { realtime.stop(sessionId) }
       }
@@ -1536,7 +1626,8 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun completeRealtimeReadyCueLocked(sessionId: String, generation: Long) {
-    if (realtimeReadyCue != sessionId to generation) return
+    @Suppress("UNUSED_PARAMETER") val admittedGeneration = generation
+    if (realtimeReadyCue?.first != sessionId) return
     realtimeReadyCue = null
     val state = T3VoiceStateStore.state.value
     if (
@@ -1555,12 +1646,13 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun beginRealtimeEndedCueLocked(sessionId: String) {
-    val generation = ++nextCueGeneration
+    val epoch = armEpoch(VoiceKernelEpochRootKind.CUE, "cue:realtime-ended:$sessionId")
+    val generation = epoch.attemptOrdinal
     realtimeEndedCue = sessionId to generation
     val started = cueCoordinator.requestEnded(generation) { completion ->
-      mailbox.submit(callbackMessage("realtime-ended-cue")) {
+      postCueCompletion(epoch) {
         run {
-          if (realtimeEndedCue == sessionId to completion.generation) {
+          if (realtimeEndedCue?.first == sessionId) {
             realtimeEndedCue = null
             if (T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
               stopRuntimeForegroundLocked()
@@ -1585,7 +1677,8 @@ class T3VoiceRuntimeService : Service() {
       ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
         ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
     )
-    val generation = ++nextCueGeneration
+    val epoch = armEpoch(VoiceKernelEpochRootKind.CUE, "cue:recording-ready:${owner.id}")
+    val generation = epoch.attemptOrdinal
     val pending =
       T3VoicePendingRecordingStart(
         owner,
@@ -1601,7 +1694,7 @@ class T3VoiceRuntimeService : Service() {
     }
     val started =
       cueCoordinator.requestReady(generation) { completion ->
-        mailbox.submit(callbackMessage("recording-ready-cue")) {
+        postCueCompletion(epoch) {
           run {
             completeRecordingStartLocked(owner, completion.generation)
           }
@@ -1612,11 +1705,14 @@ class T3VoiceRuntimeService : Service() {
 
   private fun completeRecordingStartLocked(owner: T3VoiceOperationOwner, cueGeneration: Long) {
     val pending = pendingRecordingStart
-      ?.takeIf { it.owner == owner && it.cueGeneration == cueGeneration }
+      ?.takeIf { it.owner == owner }
       ?: return
+    @Suppress("UNUSED_PARAMETER") val admittedGeneration = cueGeneration
     pendingRecordingStart = null
     var captureStarted = false
     try {
+      val epoch = armEpoch(VoiceKernelEpochRootKind.RECORDING, owner.id)
+      mediaDriver.armRecording(owner.id, epoch)
       recorder.start(owner.id, pending.endpointConfig)
       captureStarted = true
       check(T3VoiceStateStore.markRecordingStarted(owner)) {
@@ -1666,12 +1762,13 @@ class T3VoiceRuntimeService : Service() {
       }
       return
     }
-    val generation = ++nextCueGeneration
+    val epoch = armEpoch(VoiceKernelEpochRootKind.CUE, "cue:recording-ended:$recordingId")
+    val generation = epoch.attemptOrdinal
     recordingEndedCue = recordingId to generation
     val started = cueCoordinator.requestEnded(generation) { completion ->
-      mailbox.submit(callbackMessage("recording-ended-cue")) {
+      postCueCompletion(epoch) {
         run {
-          if (recordingEndedCue == recordingId to completion.generation) {
+          if (recordingEndedCue?.first == recordingId) {
             recordingEndedCue = null
             if (T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
               stopRuntimeForegroundLocked()
@@ -2063,10 +2160,10 @@ class T3VoiceRuntimeService : Service() {
     createNotificationChannel()
     mailbox.submitAndAwait(callbackMessage("service-create-recovery")) {
       mediaDriver = VoiceMediaDriver(
-        listener = VoiceMediaDriverListener { event ->
+        listener = VoiceMediaDriverListener { epoch, event ->
           postDriverResult(
             VoiceKernelMessage.DriverResult(
-              epoch = driverEpoch(),
+              epoch = epoch,
               driver = VoiceKernelDriver.MEDIA,
               resultKind = event::class.java.simpleName,
               payload = VoiceKernelDriverResultPayload.MediaEvent(
@@ -2341,8 +2438,8 @@ class T3VoiceRuntimeService : Service() {
       T3VoiceStateStore.setInactive()
     }
     mailbox.drainAndQuit()
-    hostDriver.setWakeLock(false)
-    hostDriver.releaseMediaSession()
+    setWakeLockOnMainThread(false)
+    releaseMediaSessionOnMainThread()
     netDriver.release()
     storeDriver.release()
     mediaDriver.release()
@@ -2369,7 +2466,7 @@ class T3VoiceRuntimeService : Service() {
       }
     },
     resultSink = ::postDriverResult,
-    epoch = ::driverEpoch,
+    epoch = { serviceEpoch() },
   )
 
   private fun setForegroundOnMainThread(
@@ -2548,6 +2645,11 @@ class T3VoiceRuntimeService : Service() {
       attempt.draftConsumePending = recoveredActive.draftConsumePending
       syncRuntimeThreadSpeechProgress(attempt, recoveredSnapshot)
       runtimeThreadAttempt = attempt
+      armEpoch(
+        VoiceKernelEpochRootKind.THREAD_TURN,
+        attempt.clientOperationId,
+        attempt.authority.readinessGeneration,
+      )
       ensureRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
         ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
       if (!materializeRuntimeThreadReceiptLocked(attempt)) {
@@ -2656,6 +2758,11 @@ class T3VoiceRuntimeService : Service() {
     attempt.cancelRequested = prepared?.cancelRequested == true
     attempt.detached = attempt.cancelRequested
     runtimeThreadAttempt = attempt
+    armEpoch(
+      VoiceKernelEpochRootKind.THREAD_TURN,
+      attempt.clientOperationId,
+      attempt.authority.readinessGeneration,
+    )
     ensureRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
       ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
     createRuntimeThreadOperation(attempt)
@@ -2687,7 +2794,7 @@ class T3VoiceRuntimeService : Service() {
       releaseWakeLockForRuntimeBackoffLocked()
       submitCallbackDelayed({
         run {
-          if (runtimeThreadAttempt === attempt && !attempt.stopped) {
+          if (!attempt.stopped) {
             createRuntimeThreadOperation(attempt)
           }
         }
@@ -2735,7 +2842,7 @@ class T3VoiceRuntimeService : Service() {
     attempt: VoiceRuntimeThreadAttempt,
     result: VoiceRuntimeThreadTurnResult<VoiceRuntimeThreadTurnCreateResult>,
   ) {
-    if (runtimeThreadAttempt !== attempt || attempt.stopped) return
+    if (attempt.stopped) return
     val created = (result as? VoiceRuntimeThreadTurnResult.Success)?.value
     if (created == null || !VoiceRuntimeThreadAuthorityPolicy.validateCreated(
         attempt.authority, attempt.clientOperationId, created, System.currentTimeMillis())) {
@@ -2762,7 +2869,7 @@ class T3VoiceRuntimeService : Service() {
         releaseWakeLockForRuntimeBackoffLocked()
         submitCallbackDelayed({
           run {
-            if (runtimeThreadAttempt === attempt && !attempt.stopped) {
+            if (!attempt.stopped) {
               createRuntimeThreadOperation(attempt)
             }
           }
@@ -2889,10 +2996,8 @@ class T3VoiceRuntimeService : Service() {
           completeRuntimeHandoffActivationForAttemptLocked(attempt, true)
         },
         onFailure = {
-          if (runtimeThreadAttempt === attempt) {
-            if (!failRuntimeHandoffCaptureLocked(attempt)) {
-              failRuntimeThreadLocked(attempt, "native-thread-microphone-unavailable")
-            }
+          if (!failRuntimeHandoffCaptureLocked(attempt)) {
+            failRuntimeThreadLocked(attempt, "native-thread-microphone-unavailable")
           }
         },
       )
@@ -2959,7 +3064,7 @@ class T3VoiceRuntimeService : Service() {
       val result = call.execute()
       val continuation: () -> Unit = {
         run {
-          if (!attempt.finishCall(call) || runtimeThreadAttempt !== attempt || attempt.stopped) {
+          if (!attempt.finishCall(call) || attempt.stopped) {
             return@run
           }
           val transitioned = (result as? VoiceRuntimeThreadTurnResult.Success)?.value
@@ -2983,7 +3088,7 @@ class T3VoiceRuntimeService : Service() {
             attempt.retryFailures += 1
             submitCallbackDelayed({
               run {
-                if (runtimeThreadAttempt === attempt && !attempt.stopped) {
+                if (!attempt.stopped) {
                   requestRuntimeThreadDraftDisposition(attempt)
                 }
               }
@@ -3049,7 +3154,7 @@ class T3VoiceRuntimeService : Service() {
       val continuation: () -> Unit = {
         run {
           if (!attempt.finishCall(call)) return@run
-          if (runtimeThreadAttempt !== attempt || attempt.stopped) return@run
+          if (attempt.stopped) return@run
           val uploaded = (result as? VoiceRuntimeThreadTurnResult.Success)?.value
           if (uploaded == null || !VoiceRuntimeThreadAuthorityPolicy.validateSnapshot(
               attempt.authority, operationId, runtimeSnapshot.eventCursor, uploaded.snapshot)) {
@@ -3063,7 +3168,7 @@ class T3VoiceRuntimeService : Service() {
               releaseWakeLockForRuntimeBackoffLocked()
               submitCallbackDelayed({
                 run {
-                  if (runtimeThreadAttempt === attempt && !attempt.stopped) {
+                  if (!attempt.stopped) {
                     uploadRuntimeThreadRecording(attempt, recording)
                   }
                 }
@@ -3123,7 +3228,7 @@ class T3VoiceRuntimeService : Service() {
         run {
           attempt.polling = false
           if (!attempt.finishCall(initialCall)) return@run
-          if (runtimeThreadAttempt !== attempt || attempt.stopped) return@run
+          if (attempt.stopped) return@run
           val eventsResult = (result as? VoiceRuntimeThreadTurnResult.Success)?.value
           if (eventsResult == null || !VoiceRuntimeThreadAuthorityPolicy.validateSnapshot(
               attempt.authority, operationId, after, eventsResult.snapshot) ||
@@ -3307,7 +3412,7 @@ class T3VoiceRuntimeService : Service() {
       val continuation: () -> Unit = {
         run {
           attempt.draftFetching = false
-          if (!attempt.finishCall(call) || runtimeThreadAttempt !== attempt || attempt.stopped) {
+          if (!attempt.finishCall(call) || attempt.stopped) {
             return@run
           }
           val draft = (result as? VoiceRuntimeThreadTurnResult.Success)?.value
@@ -3347,7 +3452,7 @@ class T3VoiceRuntimeService : Service() {
       val result = call.execute()
       val continuation: () -> Unit = {
         run {
-          if (!attempt.finishCall(call) || runtimeThreadAttempt !== attempt || attempt.stopped) {
+          if (!attempt.finishCall(call) || attempt.stopped) {
             return@run
           }
           val consumed = (result as? VoiceRuntimeThreadTurnResult.Success)?.value
@@ -3369,8 +3474,9 @@ class T3VoiceRuntimeService : Service() {
             releaseWakeLockForRuntimeBackoffLocked()
             submitCallbackDelayed({
               run {
-                if (runtimeThreadAttempt === attempt && !attempt.stopped &&
-                  attempt.draftConsumePending) consumeRuntimeThreadDraft(attempt)
+                if (!attempt.stopped && attempt.draftConsumePending) {
+                  consumeRuntimeThreadDraft(attempt)
+                }
               }
             }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures))
           }
@@ -3408,7 +3514,7 @@ class T3VoiceRuntimeService : Service() {
       val continuation: () -> Unit = {
         run {
           if (!attempt.finishCall(call)) return@run
-          if (runtimeThreadAttempt !== attempt || attempt.stopped) return@run
+          if (attempt.stopped) return@run
           val ack = (acknowledged as? VoiceRuntimeThreadTurnResult.Success)?.value
           if (ack != null && VoiceRuntimeThreadAuthorityPolicy.validateSnapshot(
               attempt.authority, operationId, cursor, ack) &&
@@ -3441,7 +3547,7 @@ class T3VoiceRuntimeService : Service() {
             releaseWakeLockForRuntimeBackoffLocked()
             submitCallbackDelayed({
               run {
-                if (runtimeThreadAttempt === attempt && !attempt.stopped) {
+                if (!attempt.stopped) {
                   acknowledgeRuntimeThread(attempt, credential, operationId, cursor)
                 }
               }
@@ -3462,7 +3568,7 @@ class T3VoiceRuntimeService : Service() {
     releaseWakeLockForRuntimeBackoffLocked()
     submitCallbackDelayed({
       run {
-        if (runtimeThreadAttempt === attempt && !attempt.stopped) pollRuntimeThread(attempt)
+        if (!attempt.stopped) pollRuntimeThread(attempt)
       }
     }, delay)
   }
@@ -3518,7 +3624,7 @@ class T3VoiceRuntimeService : Service() {
   private fun startNextRuntimeThreadSpeechLocked(attempt: VoiceRuntimeThreadAttempt) {
     if (attempt.playingSegment != null || attempt.pendingSpeech.isEmpty()) {
       finishRuntimeThreadIfDrainedLocked(attempt)
-      if (runtimeThreadAttempt === attempt && attempt.playingSegment == null &&
+      if (attempt.playingSegment == null &&
         attempt.pendingSpeech.isEmpty() && !attempt.polling &&
         VoiceRuntimeThreadTerminalPolicy.shouldPollAfterAck(
           runtimeSnapshot,
@@ -3561,8 +3667,8 @@ class T3VoiceRuntimeService : Service() {
         val result = call.execute()
         val continuation: () -> Unit = {
           run {
-            if (!attempt.finishCall(call) || runtimeThreadAttempt !== attempt ||
-              attempt.stopped || attempt.playingSegment != segment) return@run
+            if (!attempt.finishCall(call) || attempt.stopped ||
+              attempt.playingSegment != segment) return@run
             if (result is VoiceRuntimeThreadTurnResult.Success && chunkCount > 0) {
               runCatching { player.finish(playbackId, chunkCount - 1) }
                 .onFailure {
@@ -3596,7 +3702,7 @@ class T3VoiceRuntimeService : Service() {
     outcome: String,
   ) {
     mailbox.assertKernelThread()
-    playbackOwner?.takeIf { it.id == playbackId }?.let { owner ->
+    playbackOwner?.let { owner ->
       terminatePlaybackLocked(
         owner,
         T3VoiceRuntimeEvent.PlaybackTerminated(playbackId, outcome),
@@ -3660,7 +3766,7 @@ class T3VoiceRuntimeService : Service() {
       releaseWakeLockForRuntimeBackoffLocked()
       submitCallbackDelayed({
         run {
-          if (runtimeThreadAttempt === attempt && !attempt.stopped) {
+          if (!attempt.stopped) {
             finishRuntimeThreadIfDrainedLocked(attempt)
           }
         }
@@ -3738,7 +3844,6 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun failRuntimeThreadLocked(attempt: VoiceRuntimeThreadAttempt, code: String) {
-    if (runtimeThreadAttempt !== attempt) return
     completeRuntimeHandoffActivationForAttemptLocked(attempt, false)
     T3VoiceStateStore.emit(T3VoiceRuntimeEvent.RuntimeError(
       operation = "runtime-thread", code = code,
@@ -3791,6 +3896,11 @@ class T3VoiceRuntimeService : Service() {
   private fun stopRuntimeThreadLocked(cancelServer: Boolean) {
     cancelVoiceRuntimeThreadRearmLocked()
     val attempt = runtimeThreadAttempt ?: return
+    armEpoch(
+      VoiceKernelEpochRootKind.THREAD_TURN,
+      attempt.clientOperationId,
+      attempt.authority.readinessGeneration,
+    )
     val initiallyPersisted = runtimeThreadOperationStore.load()
       as? VoiceRuntimeThreadOperationLoadResult.Available
     val prepared = initiallyPersisted?.state as? VoiceRuntimeThreadOperationState.Prepared
@@ -3899,7 +4009,6 @@ class T3VoiceRuntimeService : Service() {
       val continuation: () -> Unit = {
         run {
           if (!attempt.finishCancellationCall(call)) return@run
-          if (runtimeThreadAttempt !== attempt) return@run
           when (VoiceRuntimeThreadCancelPolicy.decide(result)) {
             VoiceRuntimeThreadCancelDecision.COMPLETE -> {
               val completed = VoiceRuntimeThreadLocalCleanupCoordinator.complete(
@@ -3919,7 +4028,7 @@ class T3VoiceRuntimeService : Service() {
                 releaseWakeLockForRuntimeBackoffLocked()
                 submitCallbackDelayed({
                   run {
-                    if (runtimeThreadAttempt === attempt && attempt.cancelRequested) {
+                    if (attempt.cancelRequested) {
                       cancelRuntimeThreadOperation(attempt)
                     }
                   }
@@ -3936,7 +4045,7 @@ class T3VoiceRuntimeService : Service() {
               releaseWakeLockForRuntimeBackoffLocked()
               submitCallbackDelayed({
                 run {
-                  if (runtimeThreadAttempt === attempt && attempt.cancelRequested) {
+                  if (attempt.cancelRequested) {
                     cancelRuntimeThreadOperation(attempt)
                   }
                 }
@@ -4049,31 +4158,29 @@ class T3VoiceRuntimeService : Service() {
     terminals = voiceRuntimeRealtimeRepository.terminals(System.currentTimeMillis()),
   )
 
-  private fun realtimeState(engine: VoiceRuntimeRealtimeReducer): VoiceRuntimeRealtimeState =
-    voiceRuntimeRealtimeEngineSlot.snapshot().current?.takeIf { it.engine === engine }?.state
-      ?: throw VoiceRuntimeFenceException("The Realtime reducer binding is stale.")
+  private fun realtimeState(
+    @Suppress("UNUSED_PARAMETER") engine: VoiceRuntimeRealtimeReducer,
+  ): VoiceRuntimeRealtimeState = checkNotNull(
+    voiceRuntimeRealtimeEngineSlot.snapshot().current,
+  ) { "The Realtime reducer slot is empty." }.state
 
   private fun <T> applyRealtimeReduction(
     engine: VoiceRuntimeRealtimeReducer,
     reduction: VoiceRuntimeRealtimeReduction<T>,
   ): T {
     mailbox.assertKernelThread()
-    val binding = voiceRuntimeRealtimeEngineSlot.snapshot().current
-      ?.takeIf { it.engine === engine } ?: return reduction.result
-    if (voiceRuntimeRealtimeEngineSlot.applyReduction(binding.identityToken, reduction) == null) {
+    if (voiceRuntimeRealtimeEngineSlot.applyReduction(reduction) == null) {
       return reduction.result
     }
-    reduction.effects.forEach { dispatchRealtimeEffect(engine, binding.identityToken, it) }
-    dispatchRealtimeOutputs(engine, binding.identityToken, reduction.outputs)
+    reduction.effects.forEach { dispatchRealtimeEffect(engine, it) }
+    dispatchRealtimeOutputs(engine, reduction.outputs)
     return reduction.result
   }
 
   private fun dispatchRealtimeOutputs(
     engine: VoiceRuntimeRealtimeReducer,
-    bindingIdentity: Any,
     outputs: List<VoiceRuntimeRealtimeOutput>,
   ) {
-    if (voiceRuntimeRealtimeEngineSlot.snapshot().current?.identityToken !== bindingIdentity) return
     outputs.forEach { output ->
       when (output) {
         is VoiceRuntimeRealtimeOutput.State -> {
@@ -4112,13 +4219,10 @@ class T3VoiceRuntimeService : Service() {
 
   private fun dispatchRealtimeEffect(
     engine: VoiceRuntimeRealtimeReducer,
-    bindingIdentity: Any,
     effect: VoiceRuntimeRealtimeEffect,
   ) {
     fun apply(reduction: VoiceRuntimeRealtimeReduction<*>) {
-      if (voiceRuntimeRealtimeEngineSlot.snapshot().current?.identityToken === bindingIdentity) {
-        applyRealtimeReduction(engine, reduction)
-      }
+      applyRealtimeReduction(engine, reduction)
     }
     fun <R> net(
       name: String,
@@ -4182,8 +4286,8 @@ class T3VoiceRuntimeService : Service() {
         },
         continuation = { persisted ->
           if (persisted.isSuccess) {
-            effect.effects.forEach { dispatchRealtimeEffect(engine, bindingIdentity, it) }
-            dispatchRealtimeOutputs(engine, bindingIdentity, effect.outputs)
+            effect.effects.forEach { dispatchRealtimeEffect(engine, it) }
+            dispatchRealtimeOutputs(engine, effect.outputs)
           } else recordVoiceRuntimeRealtimeControlFailure()
         },
       )
@@ -4201,6 +4305,12 @@ class T3VoiceRuntimeService : Service() {
         )
       }
       is VoiceRuntimeRealtimeEffect.PreparePeer -> {
+        val peerEpoch = armEpoch(
+          VoiceKernelEpochRootKind.REALTIME_PEER,
+          effect.fence.modeSessionId,
+          effect.fence.identity.generation,
+        )
+        mediaDriver.armRealtime(effect.fence.modeSessionId, peerEpoch)
         netDriver.execute("realtime-peer-prepare", VoiceNetLane.REALTIME, driverEpoch(), blockingBody = {
           val accepted = realtimePeerPort().prepare(
             effect.fence.modeSessionId,
@@ -4485,11 +4595,11 @@ class T3VoiceRuntimeService : Service() {
         voiceRuntimeAuthorityStore.discardPreparedTransition(it)
       }
     }
-    val expected = voiceRuntimeRealtimeEngineSlot.fence()
+    val installed = voiceRuntimeRealtimeEngineSlot.snapshot().current
     val target = persisted.target as? VoiceRuntimeTarget.Realtime
     if (target == null) {
-      if (expected.engine != null) {
-        val installation = voiceRuntimeRealtimeEngineSlot.stageIdleClear(expected)
+      if (installed != null) {
+        val installation = voiceRuntimeRealtimeEngineSlot.stageIdleClear()
         voiceRuntimeRealtimeEngineSlot.commit(installation)
         voiceRuntimeRealtimeEngineSlot.complete(installation)
       }
@@ -4499,9 +4609,9 @@ class T3VoiceRuntimeService : Service() {
     val engine = createRealtimeEngineLocked(authority)
     val state = loadRealtimeStateLocked()
     val installation = if (state.isOperational()) {
-      voiceRuntimeRealtimeEngineSlot.stageRecoveredInstall(expected, authority, engine, state)
+      voiceRuntimeRealtimeEngineSlot.stageRecoveredInstall(authority, engine, state)
     } else {
-      voiceRuntimeRealtimeEngineSlot.stageIdleInstall(expected, authority, engine, state)
+      voiceRuntimeRealtimeEngineSlot.stageIdleInstall(authority, engine, state)
     }
     voiceRuntimeRealtimeEngineSlot.commit(installation)
     voiceRuntimeRealtimeEngineSlot.complete(installation)
@@ -4525,7 +4635,6 @@ class T3VoiceRuntimeService : Service() {
     val engine = createRealtimeEngineLocked(authority)
     val state = loadRealtimeStateLocked()
     val installation = voiceRuntimeRealtimeEngineSlot.stageRecoveredInstall(
-      voiceRuntimeRealtimeEngineSlot.fence(),
       authority,
       engine,
       state,
@@ -4558,7 +4667,6 @@ class T3VoiceRuntimeService : Service() {
         realtimeState(engine), identity, System.currentTimeMillis(),
       ))
     }
-    if (voiceRuntimeRealtimeEngine !== engine) return
     if (recovery.isFailure) {
             T3VoiceDiagnostics.record(
               0,
@@ -4569,7 +4677,7 @@ class T3VoiceRuntimeService : Service() {
               scheduleVoiceRuntimeRealtimeFinalizationLocked(engine, 1_000L)
             } else {
               runCatching {
-                voiceRuntimeRealtimeEngineSlot.clear(voiceRuntimeRealtimeEngineSlot.fence())
+                voiceRuntimeRealtimeEngineSlot.clear()
               }
             }
       return
@@ -4661,11 +4769,14 @@ class T3VoiceRuntimeService : Service() {
     override fun ready(generation: Long, onComplete: () -> Unit): Boolean {
       mailbox.submit(callbackMessage("realtime-ready-cue-request")) {
         val complete = { dispatchVoiceRuntimeRealtimeControl(onComplete) }
+        val epoch = armEpoch(VoiceKernelEpochRootKind.CUE, "cue:engine-ready:$generation")
         if (!cueSettings.enabled) {
           complete()
         } else {
-          val cueGeneration = ++nextCueGeneration
-          if (!cueCoordinator.requestReady(cueGeneration) { complete() }) complete()
+          val cueGeneration = epoch.attemptOrdinal
+          if (!cueCoordinator.requestReady(cueGeneration) {
+              postCueCompletion(epoch, complete)
+            }) complete()
         }
       }
       return true
@@ -4674,11 +4785,14 @@ class T3VoiceRuntimeService : Service() {
     override fun ended(generation: Long, onComplete: () -> Unit): Boolean {
       mailbox.submit(callbackMessage("realtime-ended-cue-request")) {
         val complete = { dispatchVoiceRuntimeRealtimeControl(onComplete) }
+        val epoch = armEpoch(VoiceKernelEpochRootKind.CUE, "cue:engine-ended:$generation")
         if (!cueSettings.enabled) {
           complete()
         } else {
-          val cueGeneration = ++nextCueGeneration
-          if (!cueCoordinator.requestEnded(cueGeneration) { complete() }) complete()
+          val cueGeneration = epoch.attemptOrdinal
+          if (!cueCoordinator.requestEnded(cueGeneration) {
+              postCueCompletion(epoch, complete)
+            }) complete()
         }
       }
       return true
@@ -5008,21 +5122,21 @@ class T3VoiceRuntimeService : Service() {
     engine: VoiceRuntimeRealtimeReducer,
     delayMillis: Long = 0,
   ) {
-    if (voiceRuntimeRealtimeEngine !== engine || !realtimeState(engine).isOperational()) return
+    if (!realtimeState(engine).isOperational()) return
     if (voiceRuntimeRealtimeFinalizationTask != null) return
-    voiceRuntimeRealtimeFinalizationTask = submitCallbackDelayed({
+    voiceRuntimeRealtimeFinalizationTask = scheduleTick(
+      "realtime-finalization:${engine.authority.identity.runtimeInstanceId}",
+      delayMillis,
+    ) {
       run {
         voiceRuntimeRealtimeFinalizationTask = null
-        if (voiceRuntimeRealtimeEngine !== engine) return@run
       }
       runCatching {
         applyRealtimeReduction(engine, engine.reconcileFinalization(realtimeState(engine)))
       }.onFailure {
-        if (voiceRuntimeRealtimeEngine === engine) {
-          scheduleVoiceRuntimeRealtimeFinalizationLocked(engine, 1_000L)
-        }
+        scheduleVoiceRuntimeRealtimeFinalizationLocked(engine, 1_000L)
       }
-    }, delayMillis)
+    }
   }
 
   private fun handleRealtimeFinalizationResultLocked(
@@ -5030,7 +5144,6 @@ class T3VoiceRuntimeService : Service() {
     result: VoiceRuntimeRealtimeFinalizationResult,
   ) {
     mailbox.assertKernelThread()
-    if (voiceRuntimeRealtimeEngine !== engine) return
     when (result) {
       is VoiceRuntimeRealtimeFinalizationResult.Pending -> {
         val retryDelay = (500L * (1L shl result.attemptCount.coerceIn(0, 5)))
@@ -5070,7 +5183,7 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun reconcileRealtimeEngineTerminalLocked(engine: VoiceRuntimeRealtimeReducer) {
-    if (voiceRuntimeRealtimeEngine !== engine || realtimeState(engine).isOperational()) return
+    if (realtimeState(engine).isOperational()) return
     cancelVoiceRuntimeRealtimeTasksLocked()
     val canonical = (voiceRuntimeAuthorityStore.load()
       as? VoiceRuntimeAuthorityLoadResult.Available)?.authority
@@ -5127,7 +5240,7 @@ class T3VoiceRuntimeService : Service() {
               ),
             ),
           ) { "Could not clear the disabled Realtime authority fence." }
-          voiceRuntimeRealtimeEngineSlot.clear(voiceRuntimeRealtimeEngineSlot.fence())
+          voiceRuntimeRealtimeEngineSlot.clear()
           updateRuntimeControlSurfacesLocked()
         },
       )
@@ -5141,9 +5254,8 @@ class T3VoiceRuntimeService : Service() {
           val candidate = createRealtimeEngineLocked(canonicalAuthority)
           // The recovered engine may belong to the previous process instance. It is terminal,
           // so clear its fenced slot before installing the current canonical instance.
-          voiceRuntimeRealtimeEngineSlot.clear(voiceRuntimeRealtimeEngineSlot.fence())
+          voiceRuntimeRealtimeEngineSlot.clear()
           val installation = voiceRuntimeRealtimeEngineSlot.stageIdleInstall(
-            voiceRuntimeRealtimeEngineSlot.fence(),
             canonicalAuthority,
             candidate,
           )
@@ -5151,10 +5263,10 @@ class T3VoiceRuntimeService : Service() {
           voiceRuntimeRealtimeEngineSlot.complete(installation)
         }
       } else {
-        voiceRuntimeRealtimeEngineSlot.clear(voiceRuntimeRealtimeEngineSlot.fence())
+        voiceRuntimeRealtimeEngineSlot.clear()
       }
     } else {
-      voiceRuntimeRealtimeEngineSlot.clear(voiceRuntimeRealtimeEngineSlot.fence())
+      voiceRuntimeRealtimeEngineSlot.clear()
       if (canonical == null && voiceRuntimeController.isIdle()) {
         val identity = voiceRuntimeController.snapshot().identity
         val cleared = runCatching {
@@ -5172,7 +5284,7 @@ class T3VoiceRuntimeService : Service() {
   private fun clearIdleRealtimeEngineLocked() {
     val binding = voiceRuntimeRealtimeEngineSlot.snapshot().current ?: return
     if (binding.state.isOperational()) return
-    voiceRuntimeRealtimeEngineSlot.clear(voiceRuntimeRealtimeEngineSlot.fence())
+    voiceRuntimeRealtimeEngineSlot.clear()
   }
 
   private fun enterCanonicalRecoveryRequiredLocked(reason: String) {
@@ -5241,25 +5353,16 @@ class T3VoiceRuntimeService : Service() {
       val interval = requireNotNull(checkpoint.heartbeatIntervalSeconds).times(1_000L)
       lateinit var scheduleNext: () -> Unit
       scheduleNext = {
-        lateinit var thisToken: VoiceKernelCancellationToken
-        thisToken = submitCallbackDelayed({
+        voiceRuntimeRealtimeHeartbeatTask = scheduleTick(
+          "realtime-heartbeat:${checkpoint.fence.modeSessionId}",
+          interval,
+        ) {
           runCatching {
             applyRealtimeReduction(engine, engine.heartbeat(realtimeState(engine), checkpoint.fence))
           }
-          val continuation: () -> Unit = {
-                run {
-                  if (!VoiceKernelReschedulePolicy.owns(
-                      voiceRuntimeRealtimeHeartbeatTask,
-                      thisToken,
-                    )) return@run
-                  if (voiceRuntimeRealtimeEngine === engine && realtimeState(engine).checkpoint != null) {
-                    scheduleNext()
-                  } else voiceRuntimeRealtimeHeartbeatTask = null
-                }
-              }
-          continuation()
-        }, interval)
-        voiceRuntimeRealtimeHeartbeatTask = thisToken
+          if (realtimeState(engine).checkpoint != null) scheduleNext()
+          else voiceRuntimeRealtimeHeartbeatTask = null
+        }
       }
       scheduleNext()
     }
@@ -5269,64 +5372,49 @@ class T3VoiceRuntimeService : Service() {
     ) {
       lateinit var scheduleNext: (Long) -> Unit
       scheduleNext = { delayMillis ->
-        lateinit var thisToken: VoiceKernelCancellationToken
-        thisToken = submitCallbackDelayed(action@{
-          val admission = run {
-            if (!VoiceKernelReschedulePolicy.owns(voiceRuntimeRealtimeActionTask, thisToken) ||
-              voiceRuntimeRealtimeEngine !== engine) {
-              return@run VoiceRuntimeRetentionAdmission.UNAVAILABLE
-            }
-            voiceRuntimeController.presentationCapacity()
-          }
+        voiceRuntimeRealtimeActionTask = scheduleTick(
+          "realtime-actions:${checkpoint.fence.modeSessionId}",
+          delayMillis,
+        ) action@{
+          val admission = voiceRuntimeController.presentationCapacity()
           if (admission in setOf(
               VoiceRuntimeRetentionAdmission.FULL,
               VoiceRuntimeRetentionAdmission.UNAVAILABLE,
           )) {
-            run {
-              if (VoiceKernelReschedulePolicy.owns(voiceRuntimeRealtimeActionTask, thisToken)) {
-                scheduleNext(500L)
-              }
-            }
+            scheduleNext(500L)
             return@action
           }
           runCatching {
             applyRealtimeReduction(engine, engine.pollActions(realtimeState(engine), checkpoint.fence))
           }
-          val continuation: () -> Unit = {
-                run {
-                  if (!VoiceKernelReschedulePolicy.owns(
-                      voiceRuntimeRealtimeActionTask,
-                      thisToken,
-                    )) return@run
-                  if (voiceRuntimeRealtimeEngine === engine && realtimeState(engine).checkpoint != null) {
-                    scheduleNext(100L)
-                  } else voiceRuntimeRealtimeActionTask = null
-                }
-              }
-          continuation()
-        }, delayMillis)
-        voiceRuntimeRealtimeActionTask = thisToken
+          if (realtimeState(engine).checkpoint != null) scheduleNext(100L)
+          else voiceRuntimeRealtimeActionTask = null
+        }
       }
       scheduleNext(0L)
     }
     val deadline = checkpoint.drainDeadlineAtEpochMillis
     if (deadline != null && voiceRuntimeRealtimeDrainTask == null) {
-      voiceRuntimeRealtimeDrainTask = submitCallbackDelayed({
-        val shouldRun = run {
-          if (voiceRuntimeRealtimeDrainTask == null) return@run false
-          voiceRuntimeRealtimeDrainTask = null
-          voiceRuntimeRealtimeEngine === engine
-        }
-        if (shouldRun) {
-          runCatching { applyRealtimeReduction(engine, engine.onDrainDeadline(
-            realtimeState(engine), checkpoint.fence, System.currentTimeMillis(),
-          )) }
-        }
-      }, (deadline - System.currentTimeMillis()).coerceAtLeast(0))
+      voiceRuntimeRealtimeDrainTask = scheduleTick(
+        "realtime-drain:${checkpoint.fence.modeSessionId}",
+        (deadline - System.currentTimeMillis()).coerceAtLeast(0),
+      ) {
+        voiceRuntimeRealtimeDrainTask = null
+        runCatching { applyRealtimeReduction(engine, engine.onDrainDeadline(
+          realtimeState(engine), checkpoint.fence, System.currentTimeMillis(),
+        )) }
+      }
     }
   }
 
   private fun cancelVoiceRuntimeRealtimeTasksLocked() {
+    voiceRuntimeRealtimeEngine?.let(::realtimeState)?.checkpoint?.let { checkpoint ->
+      armEpoch(
+        VoiceKernelEpochRootKind.REALTIME_MODE,
+        checkpoint.fence.modeSessionId,
+        checkpoint.fence.identity.generation,
+      )
+    }
     voiceRuntimeRealtimeHeartbeatTask?.cancel()
     voiceRuntimeRealtimeActionTask?.cancel()
     voiceRuntimeRealtimeDrainTask?.cancel()
@@ -5717,6 +5805,8 @@ class T3VoiceRuntimeService : Service() {
     try {
       ensureRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
       check(playbackAudioFocus.start()) { "Android denied playback audio focus." }
+      val epoch = armEpoch(VoiceKernelEpochRootKind.PLAYBACK, playbackId)
+      mediaDriver.armPlayback(playbackId, epoch)
       player.start(playbackId, sampleRate, channelCount)
       keepServiceStarted(ACTION_START_PLAYBACK, playbackId)
     } catch (cause: Throwable) {
@@ -5731,6 +5821,7 @@ class T3VoiceRuntimeService : Service() {
   ) {
     mailbox.assertKernelThread()
     if (!T3VoiceStateStore.releaseRecording(owner)) return
+    armEpoch(VoiceKernelEpochRootKind.RECORDING, owner.id)
     if (recordingOwner == owner) recordingOwner = null
     if (stopForeground) stopRuntimeForegroundLocked()
   }
@@ -5742,6 +5833,7 @@ class T3VoiceRuntimeService : Service() {
   ) {
     mailbox.assertKernelThread()
     if (!T3VoiceStateStore.terminateRecording(owner, event)) return
+    armEpoch(VoiceKernelEpochRootKind.RECORDING, owner.id)
     if (recordingOwner == owner) recordingOwner = null
     if (stopForeground) stopRuntimeForegroundLocked()
   }
@@ -5752,6 +5844,7 @@ class T3VoiceRuntimeService : Service() {
   ) {
     mailbox.assertKernelThread()
     if (!T3VoiceStateStore.releasePlayback(owner)) return
+    armEpoch(VoiceKernelEpochRootKind.PLAYBACK, owner.id)
     playbackAudioFocus.stop()
     if (playbackOwner == owner) playbackOwner = null
     if (stopForeground) stopRuntimeForegroundLocked()
@@ -5764,6 +5857,7 @@ class T3VoiceRuntimeService : Service() {
   ) {
     mailbox.assertKernelThread()
     if (!T3VoiceStateStore.terminatePlayback(owner, event)) return
+    armEpoch(VoiceKernelEpochRootKind.PLAYBACK, owner.id)
     playbackAudioFocus.stop()
     if (playbackOwner == owner) playbackOwner = null
     if (stopForeground) stopRuntimeForegroundLocked()

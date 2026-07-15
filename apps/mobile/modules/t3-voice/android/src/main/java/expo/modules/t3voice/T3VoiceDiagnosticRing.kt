@@ -66,6 +66,8 @@ internal enum class T3VoiceDiagnosticCode {
   BRIDGE_OPERATION_STARTED,
   BRIDGE_OPERATION_FINISHED,
   MAILBOX_BODY_SLOW,
+  STALE_DRIVER_RESULT,
+  DUPLICATE_CUE_TERMINAL,
 }
 
 internal data class T3VoiceDiagnosticEntry(
