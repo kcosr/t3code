@@ -199,3 +199,73 @@ per-file fakes).
   thread-turn on bearer with React dead; revoke → `paused(reason=authority)` + media
   release; pause survives service restart; re-pair + credential re-supply resumes) →
   merge-forward + supersession edits.
+
+## Review amendments (BINDING — these supersede any conflicting text above)
+
+A1. **Configure activation block** (`T3VoiceRuntimeService.kt` ~:969-991): the
+`requireNotNull(readinessStore.prepared())` / `requireNotNull(canonicalPreparedAuthority)`
+gates die with the prepare path. Configure synthesizes readiness from the payload plus
+current native state: `readinessEnabled=true` → `writeActivated` a
+`T3VoicePreparedReadiness` built from the current verified `readinessConfig` with
+`generation = payload.generation` and the natively derived `targetDigest`;
+`readinessEnabled=false` → write the current config copied with `enabled=false,
+generation = payload.generation`. The 7-field payload carries only the boolean; the
+current native `readinessConfig` (permission-refreshed at startup ~:1853-1859) is the
+snapshot source.
+
+A2. **Realtime start decode**: `VoiceRuntimeRealtime.kt` `decodeStart` (~:696) must accept
+the run-1 result `{state, transport, expiresAt, heartbeatIntervalSeconds}` — NO
+`controlGrant`. Delete `VoiceRuntimeRealtimeStartResult.controlGrant`,
+`VoiceRuntimeRealtimeControlGrant`, the control-expiry/grace checks in
+`VoiceRuntimeRealtimeExecution.validateStartedSession` (~:92-104), and
+`runtimeControlGrant()` (~:107-118).
+
+A3. **Heartbeat grace decision**: `failureGraceMillis` no longer arrives on any wire.
+Derive it natively: `failureGraceMillis = 3 * heartbeatIntervalSeconds * 1000`. The
+transient-failure grace mechanism in `shouldLoseControl` is RETAINED with that derived
+value; only the control-grant expiry termination dies. `VoiceRuntimeControlGrant`'s
+surviving fields are therefore `sessionId`, `leaseGeneration`,
+`heartbeatIntervalMillis` (+ derived grace); rename the class if keeping "Grant" is
+misleading, e.g. `VoiceRuntimeControlLease`.
+
+A4. **Thread-turn + handoff decodes**: thread-turn create result is `{snapshot}` only —
+delete the `operationGrant` root requirement and `VoiceRuntimeThreadTurnGrant` (~:59,
+:171-175). Handoff exchange result field is RENAMED `transitionGrant` → `reservation`
+with shape `{generation, modeSessionId, target}` — rework `decodeHandoff`
+(`VoiceRuntimeRealtime.kt` ~:478) and its caller's `it.transitionGrant.*` validations
+(~:834-841); delete the transition token/expiry from
+`VoiceRuntimeRealtimeTransitionGrant`.
+
+A7. **Legacy prepare bridge** (`prepareRealtimeSessionAsync`, `T3VoiceModule.kt`
+~:823-858): run-1 JS calls it with `{nativeSessionId, environmentOrigin, audioRouteId}`;
+drop `runtimeControlGrant` from `requireExactKeys` and delete the grant parse + its
+plumbing through the service's realtime prepare/heartbeat start (heartbeat parameters per
+A3). This function is EXEMPT from the Forbidden bridge-surface rule — it is live
+ui-attached-path code that run 1 already reshaped on the TS side.
+
+A5. **Prepare-deletion orphan cascade** (delete; grep-verify each):
+`prepareRuntimeVoiceReadiness` (service ~:194-267), `T3VoicePreparationExclusionPolicy`,
+store `prepareAttachedAuthority` (~:134; the retained `inspectPreparedAttachedAuthority`
+is only the read half), module `parseAuthorityPreparation` / `authorityPreparationBody` /
+`AUTHORITY_PREPARATION_FIELDS` (~:1270-1303, :1467), and
+`VoiceRuntimeAuthorityPreparationResult` (store ~:74-77). For
+`T3VoiceReadinessReservationPolicy`, delete `reserve` only after verifying the rest of
+the object has no other live callers — if it does, delete only `reserve`. RETAIN
+`discardInitialPreparation` (live startup caller ~:2027). Reshape
+`authorityInspectionBody` (module ~:1320) to the run-1 `T3VoiceRuntimeAuthorityActive`
+shape (no provisioningOperationId/targetDigest/operation/refreshCredentialHash/
+issuedAt/expiresAt/rotation fields).
+
+A6. **Verification grep #2 correction**: use `grep -rniE "refresh"
+apps/mobile/modules/t3-voice/android/src` (no `\b` — it fails on camelCase
+mid-identifier). Empty allowlist rule unchanged.
+
+A8. **Forbidden wording**: "Deleting the prepared-TRANSITION family or changing its
+semantics" — the section-6 tokenless record-shape fallout is expected and permitted.
+
+A9. **Tests (additive to section 8)**: decode tests for the reshaped realtime start
+(no controlGrant), thread-turn create ({snapshot} only), handoff `reservation` decode;
+`validateStartedSession` without control expiry; configure-activation synthesis for both
+readinessEnabled values; heartbeat grace derivation. The idempotency-conflict test asserts
+the CAS `VoiceRuntimeFenceException` (same generation, different target), not a ledger
+error.
