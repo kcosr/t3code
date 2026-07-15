@@ -504,8 +504,6 @@ export interface T3VoiceNativeModule {
   readonly requestMicrophonePermissionAsync: () => Promise<PermissionResponse>;
   readonly getNotificationPermissionAsync: () => Promise<PermissionResponse>;
   readonly requestNotificationPermissionAsync: () => Promise<PermissionResponse>;
-  readonly getBluetoothPermissionAsync: () => Promise<PermissionResponse>;
-  readonly requestBluetoothPermissionAsync: () => Promise<PermissionResponse>;
   readonly startRecordingAsync: (input: T3VoiceRecordingInput) => Promise<void>;
   readonly stopRecordingAsync: (
     input: T3VoiceRecordingIdentifier,
@@ -528,9 +526,6 @@ export interface T3VoiceNativeModule {
     readonly actionId: string;
   }) => Promise<boolean>;
   readonly armThreadVoiceHandoffAsync: (input: T3VoiceRealtimeIdentifier) => Promise<void>;
-  readonly setReadinessSnapshotAsync: (
-    input: T3VoiceReadinessSnapshot,
-  ) => Promise<T3VoicePersistedReadinessSnapshot>;
   readonly setVoiceCuesEnabledAsync: (input: { readonly enabled: boolean }) => Promise<void>;
   readonly registerVoiceControllerAsync: (input: T3VoiceControllerRegistration) => Promise<void>;
   readonly unregisterVoiceControllerAsync: (input: T3VoiceControllerRegistration) => Promise<void>;

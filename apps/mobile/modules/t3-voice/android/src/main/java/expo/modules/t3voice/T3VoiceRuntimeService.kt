@@ -191,23 +191,6 @@ class T3VoiceRuntimeService : Service() {
     val voiceCommands: StateFlow<T3VoicePendingCommand?>
       get() = controllerCommands.pending
 
-    fun setReadinessSnapshot(config: T3VoiceReadinessConfig): T3VoiceReadinessConfig =
-      synchronized(operationLock) {
-        check(T3VoiceReadinessReconciliationPolicy.canApply(config, readinessStore.pendingDisabled())) {
-          "A notification disable must be acknowledged before readiness can be enabled."
-        }
-        val verified = verifyReadiness(config)
-        if (readinessConfig.samePayload(verified)) return@synchronized readinessConfig
-        val next = verified.copy(generation = readinessConfig.generation + 1)
-        fenceRuntimeThreadForReadinessLocked(next)
-        readinessConfig = next
-        readinessStore.write(next)
-        controllerCommands.invalidateReadiness()
-        reconcileReadinessLocked()
-        if (next.isEffective()) keepReadinessServiceStarted()
-        next
-      }
-
     fun prepareRuntimeVoiceReadiness(
       desired: T3VoiceReadinessConfig,
       proposedRuntimeId: String,
@@ -5512,205 +5495,11 @@ class T3VoiceRuntimeService : Service() {
     )
   }
 
-  private fun executeRealtimeHandoff(action: VoiceRealtimeHandoffAction): VoiceRealtimeHandoffOutcome {
-    val completed = CountDownLatch(1)
-    val completionLock = Any()
-    var terminal = false
-    var outcome: VoiceRealtimeHandoffOutcome =
-      VoiceRealtimeHandoffOutcome.Failed("recognition-start", "operation-timeout")
-    val complete: (VoiceRealtimeHandoffOutcome) -> Boolean = { next ->
-      synchronized(completionLock) {
-        if (terminal) {
-          false
-        } else {
-          terminal = true
-          outcome = next
-          completed.countDown()
-          true
-        }
-      }
-    }
-    mainHandler.post {
-      if (serviceDestroyed) {
-        complete(VoiceRealtimeHandoffOutcome.Failed("recognition-start", "runtime-unavailable"))
-        return@post
-      }
-      try {
-        synchronized(operationLock) { executeRealtimeHandoffLocked(action, complete) }
-      } catch (_: Throwable) {
-        complete(VoiceRealtimeHandoffOutcome.Failed("recognition-start", "runtime-unavailable"))
-      }
-    }
-    if (!completed.await(HANDOFF_COMMAND_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) {
-      val timeoutWon =
-        complete(VoiceRealtimeHandoffOutcome.Failed("recognition-start", "operation-timeout"))
-      if (timeoutWon) {
-        mainHandler.post {
-          if (!serviceDestroyed) synchronized(operationLock) {
-            cancelRealtimeHandoffRecordingLocked(
-              VoiceRealtimeHandoffPolicy.recordingId(action.actionId),
-              "handoff-timeout",
-            )
-            abortRealtimeHandoffRealtimeLocked(action)
-            handoffInProgress = false
-            awaitingHandoffAction = false
-            if (T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
-              stopRuntimeForegroundLocked()
-            }
-          }
-        }
-      }
-    }
-    return outcome
-  }
-
   private fun clearHandoffEligibilityLocked() {
     handoffEligibleSessionId = null
     handoffEligibleLeaseGeneration = null
     handoffEnvironmentOrigin = null
     awaitingHandoffAction = false
-  }
-
-  private fun executeRealtimeHandoffLocked(
-    action: VoiceRealtimeHandoffAction,
-    complete: (VoiceRealtimeHandoffOutcome) -> Boolean,
-  ) {
-    val finish = { outcome: VoiceRealtimeHandoffOutcome ->
-      val won = complete(outcome)
-      if (won) {
-        handoffInProgress = false
-        awaitingHandoffAction = false
-        if (T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
-          stopRuntimeForegroundLocked()
-        }
-      }
-      won
-    }
-    val state = T3VoiceStateStore.state.value
-    val recordingId = VoiceRealtimeHandoffPolicy.recordingId(action.actionId)
-    if (!VoiceRealtimeHandoffPolicy.matchesGrant(
-        action,
-        handoffEligibleSessionId,
-        handoffEligibleLeaseGeneration,
-      )) {
-      finish(VoiceRealtimeHandoffOutcome.Failed("target-resolution", "target-unavailable"))
-      return
-    }
-    if (state.phase == T3VoiceRuntimePhase.RECORDING && state.activeRecordingId == recordingId) {
-      emitThreadVoiceHandoff(action, recordingId)
-      finish(VoiceRealtimeHandoffOutcome.Listening)
-      return
-    }
-    if (state.phase == T3VoiceRuntimePhase.ARMING && state.activeRecordingId == recordingId) {
-      val pending = pendingRecordingStart?.takeIf { it.owner.id == recordingId }
-      if (pending == null) {
-        finish(VoiceRealtimeHandoffOutcome.Failed("recognition-start", "runtime-unavailable"))
-      } else {
-        pending.onStarted.clear()
-        pending.onFailure.clear()
-        pending.onStarted += {
-          if (finish(VoiceRealtimeHandoffOutcome.Listening)) {
-            emitThreadVoiceHandoff(action, recordingId)
-          }
-        }
-        pending.onFailure += {
-          finish(VoiceRealtimeHandoffOutcome.Failed("recognition-start", "microphone-unavailable"))
-        }
-      }
-      return
-    }
-    if (
-      state.activeRealtimeSessionId != action.sessionId && state.phase != T3VoiceRuntimePhase.IDLE
-    ) {
-      finish(VoiceRealtimeHandoffOutcome.Failed("target-resolution", "target-unavailable"))
-      return
-    }
-    handoffInProgress = true
-    awaitingHandoffAction = true
-    try {
-      cancelRealtimeReadyCueLocked(action.sessionId)
-      runtimeControlHeartbeat.stop()
-      if (state.activeRealtimeSessionId == action.sessionId) {
-        realtime.drainPlayout(action.sessionId) {
-          mainHandler.post {
-            if (!serviceDestroyed) synchronized(operationLock) {
-              if (
-                handoffInProgress &&
-                  VoiceRealtimeHandoffPolicy.matchesGrant(
-                    action,
-                    handoffEligibleSessionId,
-                    handoffEligibleLeaseGeneration,
-                  )
-              ) {
-                continueRealtimeHandoffAfterDrainLocked(action, recordingId, finish)
-              }
-            }
-          }
-        }
-      } else {
-        continueRealtimeHandoffAfterDrainLocked(action, recordingId, finish)
-      }
-    } catch (_: Throwable) {
-      abortRealtimeHandoffRealtimeLocked(action)
-      finish(VoiceRealtimeHandoffOutcome.Failed("recognition-start", "runtime-unavailable"))
-    }
-  }
-
-  private fun abortRealtimeHandoffRealtimeLocked(action: VoiceRealtimeHandoffAction) {
-    realtime.cancelPlayoutDrain(action.sessionId)
-    if (T3VoiceStateStore.state.value.activeRealtimeSessionId == action.sessionId) {
-      runCatching { realtime.stop(action.sessionId) }
-    }
-  }
-
-  private fun continueRealtimeHandoffAfterDrainLocked(
-    action: VoiceRealtimeHandoffAction,
-    recordingId: String,
-    finish: (VoiceRealtimeHandoffOutcome) -> Boolean,
-  ) {
-    val activeRealtimeSessionId = T3VoiceStateStore.state.value.activeRealtimeSessionId
-    if (activeRealtimeSessionId != null) {
-      if (activeRealtimeSessionId != action.sessionId || !realtime.stop(action.sessionId)) {
-        finish(VoiceRealtimeHandoffOutcome.Failed("realtime-release", "realtime-release-failed"))
-        return
-      }
-    }
-    if (T3VoiceStateStore.state.value.phase != T3VoiceRuntimePhase.IDLE) {
-      finish(VoiceRealtimeHandoffOutcome.Failed("realtime-release", "realtime-release-failed"))
-      return
-    }
-    val owner = T3VoiceStateStore.claimRecording(
-      recordingId,
-      T3VoiceOperationOwnerDomain.REALTIME_HANDOFF,
-      action.actionId,
-    )
-    if (owner == null) {
-      finish(VoiceRealtimeHandoffOutcome.Failed("recognition-start", "runtime-unavailable"))
-      return
-    }
-    recordingOwner = owner
-    try {
-      scheduleRecordingStartLocked(
-        owner,
-        T3VoiceEndpointDetectionConfig(),
-        onStarted = {
-          if (finish(VoiceRealtimeHandoffOutcome.Listening)) {
-            emitThreadVoiceHandoff(action, recordingId)
-          } else {
-            cancelRealtimeHandoffRecordingLocked(recordingId, "handoff-timeout")
-          }
-        },
-        onFailure = {
-          finish(VoiceRealtimeHandoffOutcome.Failed("recognition-start", "microphone-unavailable"))
-        },
-      )
-    } catch (_: SecurityException) {
-      releaseRecordingLocked(owner, stopForeground = false)
-      finish(VoiceRealtimeHandoffOutcome.Failed("recognition-start", "permission-denied"))
-    } catch (_: Throwable) {
-      releaseRecordingLocked(owner, stopForeground = false)
-      finish(VoiceRealtimeHandoffOutcome.Failed("recognition-start", "microphone-unavailable"))
-    }
   }
 
   private fun cancelRealtimeHandoffRecordingLocked(recordingId: String, reason: String) {
@@ -5733,45 +5522,6 @@ class T3VoiceRuntimeService : Service() {
     }
     T3VoiceStateStore.clearRealtimeHandoffRecordingTermination(recordingId)
     T3VoiceStateStore.clearRecordingTermination(recordingId)
-  }
-
-  private fun emitThreadVoiceHandoff(action: VoiceRealtimeHandoffAction, recordingId: String) {
-    val environmentOrigin = handoffEnvironmentOrigin ?: return
-    T3VoiceDiagnostics.record(
-      0,
-      T3VoiceDiagnosticCategory.STATE,
-      T3VoiceDiagnosticCode.HANDOFF_PUBLISHED,
-    )
-    T3VoiceStateStore.publishThreadVoiceHandoff(
-      T3VoiceRuntimeEvent.ThreadVoiceHandoff(
-        actionId = action.actionId,
-        projectId = action.projectId,
-        threadId = action.threadId,
-        recordingId = recordingId,
-        autoRearm = action.autoRearm,
-        environmentOrigin = environmentOrigin,
-        expiresAtEpochMillis = action.expiresAtEpochMillis,
-      ),
-    )?.recording?.let { displaced ->
-      runCatching { recorder.delete(displaced.recordingId, displaced.uri) }
-    }
-    mainHandler.postDelayed(
-      {
-        if (!serviceDestroyed) synchronized(operationLock) {
-          val pending = T3VoiceStateStore.pendingThreadVoiceHandoff()
-            ?.takeIf { it.actionId == action.actionId && it.recordingId == recordingId }
-            ?: return@synchronized
-          if (
-            pending.expiresAtEpochMillis <= System.currentTimeMillis() &&
-              !isThreadVoiceHandoffProtected(action.actionId)
-          ) {
-            discardRealtimeHandoffRecordingLocked(recordingId, "handoff-adoption-expired")
-            T3VoiceStateStore.clearThreadVoiceHandoff(action.actionId)
-          }
-        }
-      },
-      maxOf(0L, action.expiresAtEpochMillis - System.currentTimeMillis()),
-    )
   }
 
   private fun isThreadVoiceHandoffProtected(actionId: String): Boolean =
@@ -6308,7 +6058,6 @@ class T3VoiceRuntimeService : Service() {
     private const val ACTION_START_PLAYBACK = "expo.modules.t3voice.action.START_PLAYBACK"
     private const val ACTION_START_REALTIME = "expo.modules.t3voice.action.START_REALTIME"
     private const val EXTRA_OPERATION_ID = "operationId"
-    private const val HANDOFF_COMMAND_TIMEOUT_MILLIS = 8_000L
     private const val RUNTIME_HANDOFF_ACTIVATION_TIMEOUT_MILLIS = 60_000L
     private const val HANDOFF_ADOPTION_CLAIM_GRACE_MILLIS = 30_000L
     fun requestStop(context: Context) {

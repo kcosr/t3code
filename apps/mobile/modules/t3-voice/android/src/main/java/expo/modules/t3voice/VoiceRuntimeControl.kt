@@ -145,28 +145,6 @@ internal object VoiceRuntimeControlOriginPolicy {
 
 }
 
-internal data class VoiceRealtimeHandoffAction(
-  val actionId: String,
-  val sessionId: String,
-  val leaseGeneration: Long,
-  val projectId: String,
-  val threadId: String,
-  val autoRearm: Boolean,
-  val expiresAtEpochMillis: Long,
-)
-
-internal sealed interface VoiceRealtimeHandoffOutcome {
-  data object Listening : VoiceRealtimeHandoffOutcome
-  data class Failed(val stage: String, val reason: String) : VoiceRealtimeHandoffOutcome
-}
-
-internal object VoiceRealtimeHandoffPolicy {
-  fun recordingId(actionId: String) = "voice-handoff-$actionId"
-
-  fun matchesGrant(action: VoiceRealtimeHandoffAction, sessionId: String?, leaseGeneration: Long?): Boolean =
-    action.sessionId == sessionId && action.leaseGeneration == leaseGeneration
-}
-
 internal fun interface T3VoiceNativeHeartbeatTransport {
   fun post(
     url: String,

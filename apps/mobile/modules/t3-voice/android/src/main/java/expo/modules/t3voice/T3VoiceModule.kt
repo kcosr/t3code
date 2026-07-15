@@ -563,12 +563,6 @@ class T3VoiceModule : Module() {
         }
       }
 
-      AsyncFunction("setReadinessSnapshotAsync") { input: Map<String, Any?>, promise: Promise ->
-        withBinder(promise, "voice-readiness-update-failed") { service, settlement ->
-          settlement.resolve(readinessBody(service.setReadinessSnapshot(parseReadinessConfig(input))))
-        }
-      }
-
       AsyncFunction("setVoiceCuesEnabledAsync") { input: Map<String, Any>, promise: Promise ->
         requireExactKeys(input, setOf("enabled"))
         val enabled = input["enabled"] as? Boolean ?: error("enabled must be a boolean.")
@@ -671,22 +665,6 @@ class T3VoiceModule : Module() {
           appContext.permissions,
           promise,
           Manifest.permission.POST_NOTIFICATIONS,
-        )
-      }
-
-      AsyncFunction("getBluetoothPermissionAsync") { promise: Promise ->
-        Permissions.getPermissionsWithPermissionsManager(
-          appContext.permissions,
-          promise,
-          Manifest.permission.BLUETOOTH_CONNECT,
-        )
-      }
-
-      AsyncFunction("requestBluetoothPermissionAsync") { promise: Promise ->
-        Permissions.askForPermissionsWithPermissionsManager(
-          appContext.permissions,
-          promise,
-          Manifest.permission.BLUETOOTH_CONNECT,
         )
       }
 
