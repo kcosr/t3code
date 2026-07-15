@@ -2,7 +2,6 @@ package expo.modules.t3voice
 
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
 
 internal class VoiceStoreDriver(
   private val resultSink: VoiceKernelDriverResultSink,
@@ -28,12 +27,6 @@ internal class VoiceStoreDriver(
   }
 
   fun release() {
-    executor.shutdown()
-    try {
-      if (!executor.awaitTermination(5, TimeUnit.SECONDS)) executor.shutdownNow()
-    } catch (interrupted: InterruptedException) {
-      executor.shutdownNow()
-      Thread.currentThread().interrupt()
-    }
+    executor.shutdownNow()
   }
 }
