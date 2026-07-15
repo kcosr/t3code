@@ -116,3 +116,59 @@ router epoch coverage. `VoiceKernelReschedulePolicyTest` dies with its policy.
 Commits: `feat(voice): stamp real kernel epochs` then `feat(voice): delete local fencing
 families` (order matters — stamping lands and passes before deletion). Tree clean; pc
 gate follows; then M5.
+
+## Review amendments (BINDING — supersede conflicting text above)
+
+E1. **Route completions through admission FIRST.** Convert the 9 thread-lane
+`executeDetached` sites (:2722, :2957, :3045, :3112, :3304, :3344, :3403, :3556, :3892)
+to the continuation-carrying `netDriver.execute(label, lane, epoch) { IO; { completion } }`
+form so their completions arrive via `handleDriverResult`. NO check deletion anywhere
+until its path is admission-gated. Apply the same conversion to any other completion
+currently returning via `submitCallback`.
+
+E2. **Same-epoch exactly-once is NOT provided by admit()** (stateless equality). Where a
+family provided exactly-once: (a) cue terminal — add a per-epoch once-latch IN KERNEL
+STATE (first admitted terminal per cue epoch wins; later same-epoch terminals drop with a
+diagnostic) and only then delete `terminalClaimed`; (b) recorder — RETAIN the
+active-field read-then-null arbitration under the recorder monitor (it, not the epoch,
+guarantees one terminal fact); delete only the generation/owner staleness policy;
+(c) WebRTC session — the active-field transition already serializes stop/fail; the
+terminal latch is redundant and deletable, but for THAT reason, not epoch dedup.
+
+E3. **Per-root epoch registry.** Kernel state gains a registry mapping root →
+current `VoiceKernelEpoch` (thread turn by clientOperationId; realtime by session id;
+recording/playback/cue per-resource arming; tick by timerId), updated at each arming.
+`currentEpochFor(result)` = classification table over (driver, resultKind) → registry
+lookup. Each stamping site constructs its epoch from the registry entry it just armed.
+
+E4. **Stop/cancel bumps the root attemptOrdinal** (adopt the master spec's cancellation
+rule now). Even so, per E5, state predicates survive.
+
+E5. **Delete only identity conjuncts.** At each compound site remove ONLY the
+`=== attempt` / `!== engine` / `=== bindingIdentity` identity comparison; RETAIN
+`attempt.stopped` (16 sites), `attempt.cancelRequested` (:3917, :3934 — persisted and
+recovered; durable decision), `finishCall(call)` (internal call arbitration),
+`isOperational()` (:5005, :5067), `checkpoint != null` (:5249, :5295). The verification
+grep forces refactoring compound conditions, not deleting lines.
+
+E6. **Tombstones fenced to M5**: downgrade `T3VoiceSessionIdTombstones` to an assertion
+now (session ids are still bridge-supplied until the M5 cutover per the kernel spec);
+full deletion rides M5. Its test survives, re-pointed at the assertion.
+
+E7. **Per-arm timer dedup**: connection-timeout tokens and PCM timeoutGeneration dedupe
+re-arms within one root epoch — reproduce by bumping the per-resource attemptOrdinal at
+every re-arm so a superseded Tick carries a stale epoch; requires the E3 registry.
+PCM `requireActive` (:397-401) is command-path input validation — KEEP.
+
+E8. **Slot**: replace `committedVersion: Long?` with a phase marker
+(`STAGED|COMMITTED`) so two-phase commit sequencing survives, THEN delete `version`,
+`requireFence`, `requireBinding`.
+
+E9. **Per-file deletable members** (nothing else in these files):
+WebRTC session — the four staleness fields/uses `terminalLatch`, `audioOwners`,
+`connectionTimeouts`, `usedSessionIds` (:96-100, per E6 tombstones = assertion) and
+their call sites; the active-field synchronized blocks STAY. PCM — `timeoutGeneration`
+and `released` CAS staleness only; `requireActive`, queue locks, chunk validation STAY.
+Cue — `highestGeneration` admission and (after E2a's kernel latch) `terminalClaimed`;
+AudioTrack locks STAY. Enumerate any further candidate in the commit message BEFORE
+deleting it, with its classification.
