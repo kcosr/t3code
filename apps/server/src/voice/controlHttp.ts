@@ -178,6 +178,7 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
                     )
                   : Effect.void,
               ),
+              Effect.uninterruptible,
               Effect.catch((error) => failEnvironmentInternal("internal_error", error)),
             );
           if (configured.status === "stale") {
