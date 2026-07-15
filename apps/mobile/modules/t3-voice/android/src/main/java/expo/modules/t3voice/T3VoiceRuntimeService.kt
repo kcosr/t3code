@@ -2719,15 +2719,16 @@ class T3VoiceRuntimeService : Service() {
       releaseWakeLockForRuntimeBackoffLocked()
       return
     }
-    netDriver.executeDetached("thread-create", VoiceNetLane.THREAD_TURN, driverEpoch()) {
+    netDriver.execute("thread-create", VoiceNetLane.THREAD_TURN, driverEpoch(), blockingBody = {
       val result = call.execute()
-      submitCallback {
+      val continuation: () -> Unit = {
         run {
           if (!attempt.finishCall(call)) return@run
           handleRuntimeThreadCreatedLocked(attempt, result)
         }
       }
-    }
+      continuation
+    })
   }
 
   private fun handleRuntimeThreadCreatedLocked(
@@ -2954,9 +2955,9 @@ class T3VoiceRuntimeService : Service() {
       operationId,
     )
     if (!attempt.beginCall(call)) return
-    netDriver.executeDetached("thread-draft-disposition", VoiceNetLane.THREAD_TURN, driverEpoch()) {
+    netDriver.execute("thread-draft-disposition", VoiceNetLane.THREAD_TURN, driverEpoch(), blockingBody = {
       val result = call.execute()
-      submitCallback {
+      val continuation: () -> Unit = {
         run {
           if (!attempt.finishCall(call) || runtimeThreadAttempt !== attempt || attempt.stopped) {
             return@run
@@ -3019,7 +3020,8 @@ class T3VoiceRuntimeService : Service() {
           }
         }
       }
-    }
+      continuation
+    })
   }
 
   private fun uploadRuntimeThreadRecording(
@@ -3042,9 +3044,9 @@ class T3VoiceRuntimeService : Service() {
       releaseWakeLockForRuntimeBackoffLocked()
       return
     }
-    netDriver.executeDetached("thread-upload", VoiceNetLane.THREAD_TURN, driverEpoch()) {
+    netDriver.execute("thread-upload", VoiceNetLane.THREAD_TURN, driverEpoch(), blockingBody = {
       val result = call.execute()
-      submitCallback {
+      val continuation: () -> Unit = {
         run {
           if (!attempt.finishCall(call)) return@run
           if (runtimeThreadAttempt !== attempt || attempt.stopped) return@run
@@ -3079,7 +3081,8 @@ class T3VoiceRuntimeService : Service() {
           }
         }
       }
-    }
+      continuation
+    })
   }
 
   private fun pollRuntimeThread(attempt: VoiceRuntimeThreadAttempt) {
@@ -3109,20 +3112,17 @@ class T3VoiceRuntimeService : Service() {
       releaseWakeLockForRuntimeBackoffLocked()
       return
     }
-    netDriver.executeDetached("thread-poll", VoiceNetLane.THREAD_TURN, driverEpoch()) {
+    netDriver.execute("thread-poll", VoiceNetLane.THREAD_TURN, driverEpoch(), blockingBody = {
       val result = initialCall.execute()
-      if (!attempt.finishCall(initialCall)) {
-        submitCallback { run { attempt.polling = false } }
-        return@executeDetached
-      }
       val events = (result as? VoiceRuntimeThreadTurnResult.Success)?.value
       val eventWork = events?.let { VoiceRuntimeThreadSpeechPolicy.next(
         playbackCursor, highestAdvertisedSegment,
         it.events,
       ) }
-      submitCallback {
+      val continuation: () -> Unit = {
         run {
           attempt.polling = false
+          if (!attempt.finishCall(initialCall)) return@run
           if (runtimeThreadAttempt !== attempt || attempt.stopped) return@run
           val eventsResult = (result as? VoiceRuntimeThreadTurnResult.Success)?.value
           if (eventsResult == null || !VoiceRuntimeThreadAuthorityPolicy.validateSnapshot(
@@ -3182,7 +3182,8 @@ class T3VoiceRuntimeService : Service() {
           }
         }
       }
-    }
+      continuation
+    })
   }
 
   private fun runtimeThreadReceipt(
@@ -3301,9 +3302,9 @@ class T3VoiceRuntimeService : Service() {
       attempt.draftFetching = false
       return
     }
-    netDriver.executeDetached("thread-fetch-draft", VoiceNetLane.THREAD_TURN, driverEpoch()) {
+    netDriver.execute("thread-fetch-draft", VoiceNetLane.THREAD_TURN, driverEpoch(), blockingBody = {
       val result = call.execute()
-      submitCallback {
+      val continuation: () -> Unit = {
         run {
           attempt.draftFetching = false
           if (!attempt.finishCall(call) || runtimeThreadAttempt !== attempt || attempt.stopped) {
@@ -3329,7 +3330,8 @@ class T3VoiceRuntimeService : Service() {
           releaseWakeLockForRuntimeBackoffLocked()
         }
       }
-    }
+      continuation
+    })
   }
 
   private fun consumeRuntimeThreadDraft(attempt: VoiceRuntimeThreadAttempt) {
@@ -3341,9 +3343,9 @@ class T3VoiceRuntimeService : Service() {
       operationId,
     )
     if (!attempt.beginCall(call)) return
-    netDriver.executeDetached("thread-consume-draft", VoiceNetLane.THREAD_TURN, driverEpoch()) {
+    netDriver.execute("thread-consume-draft", VoiceNetLane.THREAD_TURN, driverEpoch(), blockingBody = {
       val result = call.execute()
-      submitCallback {
+      val continuation: () -> Unit = {
         run {
           if (!attempt.finishCall(call) || runtimeThreadAttempt !== attempt || attempt.stopped) {
             return@run
@@ -3374,7 +3376,8 @@ class T3VoiceRuntimeService : Service() {
           }
         }
       }
-    }
+      continuation
+    })
   }
 
   private fun acknowledgeRuntimeThread(
@@ -3400,9 +3403,9 @@ class T3VoiceRuntimeService : Service() {
       releaseWakeLockForRuntimeBackoffLocked()
       return
     }
-    netDriver.executeDetached("thread-acknowledge", VoiceNetLane.THREAD_TURN, driverEpoch()) {
+    netDriver.execute("thread-acknowledge", VoiceNetLane.THREAD_TURN, driverEpoch(), blockingBody = {
       val acknowledged = call.execute()
-      submitCallback {
+      val continuation: () -> Unit = {
         run {
           if (!attempt.finishCall(call)) return@run
           if (runtimeThreadAttempt !== attempt || attempt.stopped) return@run
@@ -3449,7 +3452,8 @@ class T3VoiceRuntimeService : Service() {
           }
         }
       }
-    }
+      continuation
+    })
   }
 
   private fun scheduleRuntimeThreadPollRetryLocked(attempt: VoiceRuntimeThreadAttempt) {
@@ -3553,9 +3557,9 @@ class T3VoiceRuntimeService : Service() {
         attempt.playingSegment = null
         return
       }
-      netDriver.executeDetached("thread-speech", VoiceNetLane.THREAD_TURN, driverEpoch()) {
+      netDriver.execute("thread-speech", VoiceNetLane.THREAD_TURN, driverEpoch(), blockingBody = {
         val result = call.execute()
-        submitCallback {
+        val continuation: () -> Unit = {
           run {
             if (!attempt.finishCall(call) || runtimeThreadAttempt !== attempt ||
               attempt.stopped || attempt.playingSegment != segment) return@run
@@ -3576,7 +3580,8 @@ class T3VoiceRuntimeService : Service() {
             }
           }
         }
-      }
+        continuation
+      })
     } catch (_: Throwable) {
       runCatching { player.cancel(playbackId) }
       handlePlaybackTerminationLocked(
@@ -3889,9 +3894,9 @@ class T3VoiceRuntimeService : Service() {
       attempt.authority.environmentOrigin, credential, operationId,
     )
     attempt.beginCancellationCall(call)
-    netDriver.executeDetached("thread-cancel", VoiceNetLane.THREAD_TURN, driverEpoch()) {
+    netDriver.execute("thread-cancel", VoiceNetLane.THREAD_TURN, driverEpoch(), blockingBody = {
       val result = call.execute()
-      submitCallback {
+      val continuation: () -> Unit = {
         run {
           if (!attempt.finishCancellationCall(call)) return@run
           if (runtimeThreadAttempt !== attempt) return@run
@@ -3951,7 +3956,8 @@ class T3VoiceRuntimeService : Service() {
           }
         }
       }
-    }
+      continuation
+    })
   }
 
 
