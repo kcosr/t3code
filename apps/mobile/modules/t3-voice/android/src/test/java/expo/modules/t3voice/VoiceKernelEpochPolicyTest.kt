@@ -137,19 +137,52 @@ class VoiceKernelEpochPolicyTest {
   }
 
   @Test
-  fun `cue terminal latch forgets the prior arm and admits once in constant space`() {
-    val latch = VoiceKernelCueOnceGate()
-    val first = currentEpoch.copy(rootOperationId = "cue:first")
-    val second = currentEpoch.copy(rootOperationId = "cue:second", attemptOrdinal = 4L)
+  fun `cue terminal gate admits once per independently armed root`() {
+    val registry = VoiceKernelEpochRegistry()
+    val recordingEnded = registry.arm(
+      VoiceKernelEpochRootKind.CUE,
+      "runtime-1",
+      7,
+      "cue:recording-ended:r1",
+    )
+    val recordingReady = registry.arm(
+      VoiceKernelEpochRootKind.CUE,
+      "runtime-1",
+      7,
+      "cue:recording-ready:r2",
+    )
 
-    latch.arm(first)
-    assertEquals(true, latch.admit(first))
-    assertEquals(false, latch.admit(first))
+    assertEquals(true, registry.admitCueTerminal(recordingEnded))
+    assertEquals(false, registry.admitCueTerminal(recordingEnded))
+    assertEquals(true, registry.admitCueTerminal(recordingReady))
+    assertEquals(false, registry.admitCueTerminal(recordingReady))
+  }
 
-    latch.arm(second)
-    assertEquals(false, latch.admit(first))
-    assertEquals(true, latch.admit(second))
-    assertEquals(false, latch.admit(second))
+  @Test
+  fun `cue terminal gate replaces only the rearmed root epoch`() {
+    val registry = VoiceKernelEpochRegistry()
+    val first = registry.arm(
+      VoiceKernelEpochRootKind.CUE,
+      "runtime-1",
+      7,
+      "cue:recording-ended:r1",
+    )
+    val independent = registry.arm(
+      VoiceKernelEpochRootKind.CUE,
+      "runtime-1",
+      7,
+      "cue:realtime-ended:s1",
+    )
+    val rearmed = registry.arm(
+      VoiceKernelEpochRootKind.CUE,
+      "runtime-1",
+      7,
+      first.rootOperationId,
+    )
+
+    assertEquals(false, registry.admitCueTerminal(first))
+    assertEquals(true, registry.admitCueTerminal(rearmed))
+    assertEquals(true, registry.admitCueTerminal(independent))
   }
 
   private fun driverResult(

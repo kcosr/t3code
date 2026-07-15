@@ -51,23 +51,6 @@ object VoiceKernelEpochPolicy {
   }
 }
 
-/** Constant-space exactly-once arbitration for the single physical cue resource. */
-internal class VoiceKernelCueOnceGate {
-  private var armedEpoch: VoiceKernelEpoch? = null
-  private var consumed = false
-
-  fun arm(epoch: VoiceKernelEpoch) {
-    armedEpoch = epoch
-    consumed = false
-  }
-
-  fun admit(epoch: VoiceKernelEpoch): Boolean {
-    if (epoch != armedEpoch || consumed) return false
-    consumed = true
-    return true
-  }
-}
-
 internal enum class VoiceKernelEpochRootKind {
   THREAD_TURN,
   REALTIME_MODE,
@@ -84,6 +67,7 @@ internal class VoiceKernelEpochRegistry {
   private data class Entry(
     val kind: VoiceKernelEpochRootKind,
     val epoch: VoiceKernelEpoch,
+    var cueTerminalConsumed: Boolean = false,
   )
 
   private val entries = mutableMapOf<String, Entry>()
@@ -108,6 +92,17 @@ internal class VoiceKernelEpochRegistry {
   }
 
   fun current(rootOperationId: String): VoiceKernelEpoch? = entries[rootOperationId]?.epoch
+
+  /** Admits the first terminal for each current cue root without a second historical epoch set. */
+  fun admitCueTerminal(epoch: VoiceKernelEpoch): Boolean {
+    val entry = entries[epoch.rootOperationId] ?: return false
+    if (entry.kind != VoiceKernelEpochRootKind.CUE || entry.epoch != epoch ||
+      entry.cueTerminalConsumed) {
+      return false
+    }
+    entry.cueTerminalConsumed = true
+    return true
+  }
 
   fun currentEpochFor(result: VoiceKernelMessage.DriverResult): VoiceKernelEpoch? {
     val entry = entries[result.epoch.rootOperationId] ?: return null

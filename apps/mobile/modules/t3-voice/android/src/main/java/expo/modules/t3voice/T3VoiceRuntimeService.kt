@@ -122,7 +122,6 @@ internal class T3VoiceRecordingNotStartedException : IllegalStateException(
 class T3VoiceRuntimeService : Service() {
   private val mailbox = VoiceKernelMailbox()
   private val epochRegistry = VoiceKernelEpochRegistry()
-  private val cueOnceGate = VoiceKernelCueOnceGate()
 
   private fun armEpoch(
     kind: VoiceKernelEpochRootKind,
@@ -136,7 +135,6 @@ class T3VoiceRuntimeService : Service() {
       authorityGeneration,
       rootOperationId,
     )
-    if (kind == VoiceKernelEpochRootKind.CUE) cueOnceGate.arm(epoch)
     return epoch
   }
 
@@ -199,7 +197,7 @@ class T3VoiceRuntimeService : Service() {
       return
     }
     if (result.driver == VoiceKernelDriver.MEDIA && result.resultKind == "CueCompleted" &&
-      !cueOnceGate.admit(result.epoch)) {
+      !epochRegistry.admitCueTerminal(result.epoch)) {
       T3VoiceDiagnostics.record(
         generation = 0,
         category = T3VoiceDiagnosticCategory.KERNEL,
