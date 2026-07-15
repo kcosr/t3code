@@ -50,17 +50,48 @@ class VoiceRuntimeRealtimeBinderOffloadTest {
   }
 
   @Test
-  fun focusFalseOrThrowingEngineIsObservableAsFailure() {
-    val offload = VoiceRuntimeRealtimeBinderOffload({}, Runnable::run)
-    val rejected = FakeEngine(focusResult = false)
-    val throwing = FakeEngine(focusFailure = VoiceRuntimeFenceException("stale focus"))
+  fun focusAdmissionIsSynchronousAndRemoteCompletionIsOffloaded() {
+    val controls = ArrayDeque<Runnable>()
+    val offload = VoiceRuntimeRealtimeBinderOffload({}, controls::addLast)
+    val rejected = FakeEngine(focusAdmission = false)
+    val remoteRejected = FakeEngine(focusResult = false)
+    val throwing = FakeEngine(focusFailure = VoiceRuntimeFenceException("network failed"))
     val failures = mutableListOf<Throwable>()
 
-    assertFalse(offload.submitFocus(rejected::updateFocus, failures::add))
-    assertFalse(offload.submitFocus(throwing::updateFocus, failures::add))
+    assertFalse(
+      offload.submitFocus(
+        rejected::admitFocus,
+        rejected::updateFocus,
+        failures::add,
+      ) { VoiceRuntimeFenceException("rejected focus") },
+    )
+    assertTrue(controls.isEmpty())
+    assertEquals(0, rejected.focusCompletionCount)
 
-    assertEquals(1, failures.size)
-    assertTrue(failures.single() is VoiceRuntimeFenceException)
+    assertTrue(
+      offload.submitFocus(
+        remoteRejected::admitFocus,
+        remoteRejected::updateFocus,
+        failures::add,
+      ) { VoiceRuntimeFenceException("rejected focus") },
+    )
+    assertTrue(
+      offload.submitFocus(
+        throwing::admitFocus,
+        throwing::updateFocus,
+        failures::add,
+      ) { VoiceRuntimeFenceException("rejected focus") },
+    )
+    assertEquals(0, throwing.focusCompletionCount)
+    assertTrue(failures.isEmpty())
+
+    controls.removeFirst().run()
+    controls.removeFirst().run()
+
+    assertEquals(2, failures.size)
+    assertTrue(failures.all { it is VoiceRuntimeFenceException })
+    assertEquals(1, remoteRejected.focusCompletionCount)
+    assertEquals(1, throwing.focusCompletionCount)
   }
 
   @Test
@@ -140,6 +171,7 @@ class VoiceRuntimeRealtimeBinderOffloadTest {
       ),
     private val startAdmissionFailure: Throwable? = null,
     private val startCompletionFailure: Throwable? = null,
+    private val focusAdmission: Boolean = true,
     private val focusResult: Boolean = true,
     private val focusFailure: Throwable? = null,
     private val acknowledgementResult: Boolean = true,
@@ -148,6 +180,8 @@ class VoiceRuntimeRealtimeBinderOffloadTest {
     var startCompletionCount = 0
       private set
     var acknowledgementCount = 0
+      private set
+    var focusCompletionCount = 0
       private set
 
     fun admitStart(): VoiceRuntimeRealtimeStartAdmission {
@@ -160,7 +194,10 @@ class VoiceRuntimeRealtimeBinderOffloadTest {
       startCompletionFailure?.let { throw it }
     }
 
+    fun admitFocus() = focusAdmission
+
     fun updateFocus(): Boolean {
+      focusCompletionCount += 1
       focusFailure?.let { throw it }
       return focusResult
     }

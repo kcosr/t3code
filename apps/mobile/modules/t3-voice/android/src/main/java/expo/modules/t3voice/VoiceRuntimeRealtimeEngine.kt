@@ -801,6 +801,13 @@ internal class VoiceRuntimeRealtimeEngine(
   }
 
   @Synchronized
+  fun admitFocus(fence: VoiceRuntimeRealtimeFence): Boolean {
+    val current = requireActive(fence)
+    requireSession(current)
+    return current.phase !in SHUTDOWN_PHASES
+  }
+
+  @Synchronized
   fun setMuted(fence: VoiceRuntimeRealtimeFence, muted: Boolean): Boolean {
     val current = requireActive(fence)
     if (current.phase !in setOf(VoiceRealtimePhase.CUEING, VoiceRealtimePhase.CONNECTED)) return false

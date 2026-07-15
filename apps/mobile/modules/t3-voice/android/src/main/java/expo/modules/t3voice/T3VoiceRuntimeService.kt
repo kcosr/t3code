@@ -1030,15 +1030,18 @@ class T3VoiceRuntimeService : Service() {
         is VoiceRuntimeNativeCommand.UpdateRealtimeFocus -> {
           check(admission.tryAdmit()) { "The voice operation was cancelled before admission." }
           val engine = requireRealtimeEngineLocked(command.identity)
+          val fence = VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId)
           val focused = voiceRuntimeRealtimeBinderOffload.submitFocus(
+            admit = { engine.admitFocus(fence) },
             operation = {
               engine.updateFocus(
-                VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
+                fence,
                 command.commandId,
                 command.focus,
               )
             },
             onFailure = { recordVoiceRuntimeRealtimeControlFailure() },
+            failure = { VoiceRuntimeFenceException("Realtime focus update failed.") },
           )
           realtimeBooleanReceipt(command) { focused }
         }

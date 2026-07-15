@@ -1,8 +1,5 @@
 package expo.modules.t3voice
 
-import java.util.concurrent.ExecutionException
-import java.util.concurrent.FutureTask
-
 internal class VoiceRuntimeRealtimeBinderOffload(
   private val startPost: (Runnable) -> Unit,
   private val controlPost: (Runnable) -> Unit,
@@ -24,10 +21,14 @@ internal class VoiceRuntimeRealtimeBinderOffload(
   }
 
   fun submitFocus(
+    admit: () -> Boolean,
     operation: () -> Boolean,
     onFailure: (Throwable) -> Unit,
-  ): Boolean = submitControlAndAwait {
-    runCatching(operation).onFailure(onFailure).getOrDefault(false)
+    failure: () -> Throwable,
+  ): Boolean {
+    if (!admit()) return false
+    submitAcknowledgement(operation, {}, onFailure, failure)
+    return true
   }
 
   fun submitAcknowledgement(
@@ -54,19 +55,6 @@ internal class VoiceRuntimeRealtimeBinderOffload(
       return
     }
     submitAcknowledgement(operation, onAcknowledged, onFailure, failure)
-  }
-
-  private fun submitControlAndAwait(body: () -> Boolean): Boolean {
-    val task = FutureTask(body)
-    controlPost(task)
-    return try {
-      task.get()
-    } catch (failure: ExecutionException) {
-      throw failure.cause ?: failure
-    } catch (interrupted: InterruptedException) {
-      Thread.currentThread().interrupt()
-      throw interrupted
-    }
   }
 
   private fun admittedResult() = VoiceRuntimeRealtimeCommandResult.Accepted(adopted = false)
