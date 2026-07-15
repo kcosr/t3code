@@ -4125,7 +4125,8 @@ class T3VoiceRuntimeService : Service() {
             }
           }
         }
-        if (mailbox.isKernelThread()) deliver() else submitCallback(deliver)
+        // Engine terminal publication must remain deferred even when a fact enters on the kernel.
+        submitCallback(deliver)
       },
       finalizationSink = VoiceRuntimeRealtimeFinalizationSink { result ->
         val deliver = {
