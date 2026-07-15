@@ -342,10 +342,59 @@ internal class T3VoiceCanonicalReadinessPolicyTest {
     assertTrue(runCatching {
       T3VoiceStartupAuthorityFencePolicy.selectRuntimeId("runtime-1", "runtime-2")
     }.isFailure)
-    assertTrue(runCatching {
-      T3VoiceStartupAuthorityFencePolicy.requireCompatibleGeneration(startup, 10)
-    }.isFailure)
-    T3VoiceStartupAuthorityFencePolicy.requireCompatibleGeneration(startup, 6, 6)
+    assertEquals(
+      T3VoiceStartupAuthorityResolution(null, "runtime-1", 10, true),
+      T3VoiceStartupAuthorityFencePolicy.resolve(
+        startup,
+        T3VoiceRecoveredAuthorityFence("runtime-1", 10),
+      ),
+    )
+    assertEquals(
+      T3VoiceStartupAuthorityResolution(null, "runtime-1", 7, true),
+      T3VoiceStartupAuthorityFencePolicy.resolve(
+        startup,
+        T3VoiceRecoveredAuthorityFence("runtime-1", 5),
+      ),
+    )
+    assertEquals(
+      T3VoiceStartupAuthorityResolution(startup, "runtime-1", 6, false),
+      T3VoiceStartupAuthorityFencePolicy.resolve(
+        startup,
+        T3VoiceRecoveredAuthorityFence("runtime-1", 6),
+        T3VoiceRecoveredAuthorityFence("runtime-1", 6),
+      ),
+    )
+    assertEquals(
+      T3VoiceStartupAuthorityResolution(null, "runtime-2", 6, true),
+      T3VoiceStartupAuthorityFencePolicy.resolve(
+        startup,
+        T3VoiceRecoveredAuthorityFence("runtime-2", 6),
+      ),
+    )
+    assertEquals(
+      T3VoiceStartupAuthorityResolution(null, "runtime-1", 10, false),
+      T3VoiceStartupAuthorityFencePolicy.resolve(
+        null,
+        T3VoiceRecoveredAuthorityFence("runtime-1", 7),
+        T3VoiceRecoveredAuthorityFence("runtime-1", 10),
+      ),
+    )
+    assertEquals(
+      T3VoiceStartupAuthorityResolution(null, "runtime-1", 6, true),
+      T3VoiceStartupAuthorityFencePolicy.resolve(
+        null,
+        T3VoiceRecoveredAuthorityFence("runtime-1", 6),
+        T3VoiceRecoveredAuthorityFence("runtime-2", 9),
+      ),
+    )
+    assertEquals(
+      T3VoiceStartupAuthorityResolution(null, "retired-runtime", 9, true),
+      T3VoiceStartupAuthorityFencePolicy.resolve(
+        null,
+        T3VoiceRecoveredAuthorityFence("retired-runtime", 9),
+        T3VoiceRecoveredAuthorityFence("readiness-runtime", 6),
+      ),
+    )
     assertTrue(runCatching {
       T3VoiceStartupAuthorityFencePolicy.selectPreparation(
         startup,

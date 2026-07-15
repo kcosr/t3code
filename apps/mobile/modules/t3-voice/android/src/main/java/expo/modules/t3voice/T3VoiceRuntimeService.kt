@@ -1874,9 +1874,10 @@ class T3VoiceRuntimeService : Service() {
           Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
             hasPermission(Manifest.permission.POST_NOTIFICATIONS),
       )
-    val startupAttachedPreparation = runCatching {
+    val startupAttachedPreparationResult = runCatching {
       voiceRuntimeAuthorityStore.inspectPreparedAttachedAuthority()
-    }.getOrNull()
+    }
+    var startupAttachedPreparation = startupAttachedPreparationResult.getOrNull()
     var canonicalInstalled = voiceRuntimeAuthorityStore.load()
       as? VoiceRuntimeAuthorityLoadResult.Available
     val startupFinalization = runCatching {
@@ -1929,34 +1930,137 @@ class T3VoiceRuntimeService : Service() {
         canonicalInstalled = null
       }
     }
-    val startupPersistentPreparation =
+    val startupPersistentReadinessResult =
+      if (canonicalInstalled == null) runCatching { readinessStore.prepared() }
+      else Result.success(null)
+    val startupPersistentReadiness = startupPersistentReadinessResult.getOrNull()
+    val startupPreparedRefreshResult =
       if (canonicalInstalled == null) {
-        T3VoiceStartupAuthorityFencePolicy.persistentPreparation(
-          readinessStore.prepared(),
-          voiceRuntimeAuthorityStore.inspectPreparedRefreshCredential(),
-        )
+        runCatching { voiceRuntimeAuthorityStore.inspectPreparedRefreshCredential() }
       } else {
-        null
+        Result.success(null)
       }
-    val startupPreparation = T3VoiceStartupAuthorityFencePolicy.selectPreparation(
-      startupPersistentPreparation,
-      startupAttachedPreparation?.takeIf { canonicalInstalled == null },
+    val startupPreparedRefresh = startupPreparedRefreshResult.getOrNull()
+    val startupPersistentPreparationResult =
+      if (canonicalInstalled == null) {
+        runCatching {
+          T3VoiceStartupAuthorityFencePolicy.persistentPreparation(
+            startupPersistentReadiness,
+            startupPreparedRefresh,
+          )
+        }
+      } else {
+        Result.success(null)
+      }
+    val startupActiveAuthorityResult = runCatching { readinessStore.activeAuthority() }
+    val startupActiveAuthority = startupActiveAuthorityResult.getOrNull()
+    val recoveredFences = arrayOf(
+      startupFinalization?.fence?.identity?.let {
+        T3VoiceRecoveredAuthorityFence(it.runtimeId, it.generation)
+      },
+      startupRealtimeCheckpoint?.fence?.identity?.let {
+        T3VoiceRecoveredAuthorityFence(it.runtimeId, it.generation)
+      },
+      retiredAuthorityFence?.let {
+        T3VoiceRecoveredAuthorityFence(it.runtimeId, it.generation)
+      },
+      startupActiveAuthority?.let {
+        T3VoiceRecoveredAuthorityFence(it.runtimeId, it.config.generation)
+      },
     )
-    T3VoiceStartupAuthorityFencePolicy.requireCompatibleGeneration(
-      startupPreparation,
-      startupFinalization?.fence?.identity?.generation,
-      startupRealtimeCheckpoint?.fence?.identity?.generation,
-      readinessStore.activeAuthority()?.config?.generation,
-      retiredAuthorityFence?.generation,
+    val preparationSelection = startupPersistentPreparationResult.mapCatching { persistent ->
+      check(startupPersistentReadinessResult.isSuccess)
+      check(startupPreparedRefreshResult.isSuccess)
+      check(startupAttachedPreparationResult.isSuccess)
+      check(startupActiveAuthorityResult.isSuccess)
+      check(startupPersistentReadiness != null || startupPreparedRefresh == null)
+      T3VoiceStartupAuthorityFencePolicy.selectPreparation(
+        persistent,
+        startupAttachedPreparation?.takeIf { canonicalInstalled == null },
+      )
+    }
+    var startupResolution = preparationSelection.fold(
+      onSuccess = { preparation ->
+        T3VoiceStartupAuthorityFencePolicy.resolve(preparation, *recoveredFences)
+      },
+      onFailure = {
+        val recoveredRuntimeId = recoveredFences.filterNotNull().firstOrNull()?.runtimeId
+        val preparationRuntimeId = runCatching {
+          T3VoiceStartupAuthorityFencePolicy.selectRuntimeId(
+            startupPersistentReadiness?.runtimeId,
+            startupPreparedRefresh?.fence?.runtimeId,
+            startupAttachedPreparation?.fence?.runtimeId,
+          )
+        }.getOrNull()
+        val selectedRuntimeId = recoveredRuntimeId ?: preparationRuntimeId
+        val recoveredGeneration = recoveredFences.asSequence()
+          .filterNotNull()
+          .filter { it.runtimeId == selectedRuntimeId }
+          .maxOfOrNull { it.generation }
+        val preparationGeneration = sequenceOf(
+          startupPersistentReadiness?.let { it.runtimeId to it.config.generation },
+          startupPreparedRefresh?.fence?.let { it.runtimeId to it.generation },
+          startupAttachedPreparation?.fence?.let { it.runtimeId to it.generation },
+        ).filterNotNull()
+          .filter { it.first == selectedRuntimeId }
+          .maxOfOrNull { it.second }
+        T3VoiceStartupAuthorityResolution(
+          preparation = null,
+          runtimeId = selectedRuntimeId,
+          initialGeneration = recoveredGeneration ?: preparationGeneration,
+          discardPreparation = canonicalInstalled == null && (
+            startupPersistentReadinessResult.isFailure || startupPreparedRefreshResult.isFailure ||
+              startupAttachedPreparationResult.isFailure || startupPersistentReadiness != null ||
+              startupActiveAuthorityResult.isFailure || startupPreparedRefresh != null ||
+              startupAttachedPreparation != null
+          ),
+        )
+      },
     )
-    val installedRuntimeId = T3VoiceStartupAuthorityFencePolicy.selectRuntimeId(
-      canonicalInstalled?.authority?.runtimeId,
-      startupFinalization?.fence?.identity?.runtimeId,
-      startupRealtimeCheckpoint?.fence?.identity?.runtimeId,
-      readinessStore.activeAuthority()?.runtimeId,
-      startupPreparation?.runtimeId,
-      retiredAuthorityFence?.runtimeId,
-    )
+    if (startupResolution.discardPreparation) {
+      val readinessRuntimeIds = listOfNotNull(
+        startupActiveAuthority?.runtimeId,
+        startupPersistentReadiness?.runtimeId,
+        startupPreparedRefresh?.fence?.runtimeId,
+        startupAttachedPreparation?.fence?.runtimeId,
+      )
+      val readinessGeneration = readinessConfig.generation.takeIf {
+        startupResolution.runtimeId == null ||
+          readinessRuntimeIds.any { runtimeId -> runtimeId == startupResolution.runtimeId }
+      }
+      val generationFloor = maxOf(
+        startupResolution.initialGeneration ?: 0,
+        readinessGeneration ?: 0,
+      )
+      val pendingRevocation = startupPersistentReadiness?.let {
+        T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin)
+      } ?: startupPreparedRefresh?.let {
+        T3VoicePendingRuntimeRevocation(it.fence.runtimeId, it.fence.environmentOrigin)
+      } ?: startupAttachedPreparation?.let {
+        T3VoicePendingRuntimeRevocation(it.fence.runtimeId, it.fence.environmentOrigin)
+      }
+      val disabled = readinessConfig.copy(enabled = false, generation = generationFloor)
+      readinessStore.writeDisabledForRuntimeRevocation(disabled, pendingRevocation)
+      voiceRuntimeAuthorityStore.discardInitialPreparation()
+      readinessConfig = disabled
+      startupAttachedPreparation = null
+      T3VoiceDiagnostics.record(
+        0,
+        T3VoiceDiagnosticCategory.TERMINAL,
+        T3VoiceDiagnosticCode.CLEANUP_RECONCILIATION_REQUIRED,
+      )
+      startupResolution = startupResolution.copy(
+        preparation = null,
+        initialGeneration = generationFloor,
+      )
+    }
+    val installedRuntimeId = T3VoiceRecoveredRealtimeAuthorityPolicy.runtimeId(
+      canonicalInstalled?.authority,
+      startupFinalization,
+      startupRealtimeCheckpoint,
+      retiredAuthorityFence,
+      startupActiveAuthority,
+    ) ?: startupResolution.runtimeId
     val canonicalRuntimeId = VoiceRuntimeDeviceIdentityStore(applicationContext)
       .getOrCreate(installedRuntimeId)
     voiceRuntimeController = VoiceRuntimeActiveThreadController(
@@ -2054,8 +2158,7 @@ class T3VoiceRuntimeService : Service() {
       },
       initialGeneration = when {
         canonicalInstalled != null -> null
-        startupPreparation != null -> startupPreparation.expectedCurrentGeneration
-        else -> retiredAuthorityFence?.generation
+        else -> startupResolution.initialGeneration
       },
     )
     startupAttachedPreparation?.takeIf { canonicalInstalled == null }?.let { prepared ->

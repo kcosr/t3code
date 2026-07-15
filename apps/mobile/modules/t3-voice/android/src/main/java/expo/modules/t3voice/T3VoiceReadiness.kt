@@ -80,6 +80,23 @@ internal data class T3VoiceStartupAuthorityFence(
   val expectedCurrentGeneration: Long,
 )
 
+internal data class T3VoiceRecoveredAuthorityFence(
+  val runtimeId: String,
+  val generation: Long,
+) {
+  init {
+    require(runtimeId.isNotBlank() && runtimeId.length <= 128)
+    require(generation > 0)
+  }
+}
+
+internal data class T3VoiceStartupAuthorityResolution(
+  val preparation: T3VoiceStartupAuthorityFence?,
+  val runtimeId: String?,
+  val initialGeneration: Long?,
+  val discardPreparation: Boolean,
+)
+
 internal object T3VoiceStartupAuthorityFencePolicy {
   fun persistentPreparation(
     prepared: T3VoicePreparedReadiness?,
@@ -131,15 +148,54 @@ internal object T3VoiceStartupAuthorityFencePolicy {
     return distinct.singleOrNull()
   }
 
-  fun requireCompatibleGeneration(
+  fun resolve(
     preparation: T3VoiceStartupAuthorityFence?,
-    vararg recoveredGenerations: Long?,
-  ) {
-    preparation ?: return
-    val distinct = recoveredGenerations.filterNotNull().distinct()
-    require(distinct.all { it == preparation.expectedCurrentGeneration }) {
-      "Prepared voice authority generation conflicts with recovered runtime state."
+    vararg recoveredFences: T3VoiceRecoveredAuthorityFence?,
+  ): T3VoiceStartupAuthorityResolution {
+    val allRecovered = recoveredFences.filterNotNull()
+    val recoveredRuntimeId = allRecovered.firstOrNull()?.runtimeId
+    val recovered = allRecovered.filter { it.runtimeId == recoveredRuntimeId }
+    val recoveredGeneration = recovered.maxOfOrNull { it.generation }
+    val recoveredConflict = allRecovered.any { it.runtimeId != recoveredRuntimeId }
+    if (preparation == null) {
+      return T3VoiceStartupAuthorityResolution(
+        preparation = null,
+        runtimeId = recoveredRuntimeId,
+        initialGeneration = recoveredGeneration,
+        discardPreparation = recoveredConflict,
+      )
     }
+    val compatible = !recoveredConflict && recovered.all { fence ->
+      fence.runtimeId == preparation.runtimeId &&
+        fence.generation == preparation.expectedCurrentGeneration
+    }
+    if (compatible) {
+      return T3VoiceStartupAuthorityResolution(
+        preparation,
+        preparation.runtimeId,
+        preparation.expectedCurrentGeneration,
+        false,
+      )
+    }
+    if (recoveredConflict ||
+      (recoveredRuntimeId != null && recoveredRuntimeId != preparation.runtimeId)
+    ) {
+      return T3VoiceStartupAuthorityResolution(
+        preparation = null,
+        runtimeId = recoveredRuntimeId,
+        initialGeneration = recoveredGeneration,
+        discardPreparation = true,
+      )
+    }
+    return T3VoiceStartupAuthorityResolution(
+      preparation = null,
+      runtimeId = preparation.runtimeId,
+      initialGeneration = maxOf(
+        preparation.expectedCurrentGeneration + 1,
+        recoveredGeneration ?: 0,
+      ),
+      discardPreparation = true,
+    )
   }
 }
 

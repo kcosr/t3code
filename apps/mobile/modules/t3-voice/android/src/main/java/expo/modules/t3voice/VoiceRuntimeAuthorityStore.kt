@@ -201,6 +201,13 @@ internal class VoiceRuntimeAuthorityStore(
       ?.let { VoiceRuntimePreparedRefreshCredential(it.fence, it.credentialHash) }
 
   @Synchronized
+  fun discardInitialPreparation() {
+    check(storage.clear(credentialKeys(PREPARED_PREFIX) + KEY_PREPARED_ATTACHED)) {
+      "Could not discard prepared canonical voice authority."
+    }
+  }
+
+  @Synchronized
   fun <T> activate(
     authority: VoiceRuntimePersistedAuthority,
     activate: () -> T,

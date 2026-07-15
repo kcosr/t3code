@@ -216,6 +216,27 @@ internal class VoiceRuntimeAuthorityStoreTest {
   }
 
   @Test
+  fun `startup recovery discards only the stale initial authority preparation`() {
+    val persistentStorage = MemoryRuntimeStorage()
+    val persistentStore = refreshStore(persistentStorage)
+    persistentStorage.values["unrelated-durable-state"] = "preserved"
+    persistentStore.prepareRefreshCredential(fence(), true)
+
+    persistentStore.discardInitialPreparation()
+
+    assertNull(persistentStore.inspectPreparedRefreshCredential())
+    assertEquals("preserved", persistentStorage.values["unrelated-durable-state"])
+
+    val attachedStorage = MemoryRuntimeStorage()
+    val attachedStore = refreshStore(attachedStorage)
+    attachedStore.prepareAttachedAuthority(fence(), attachedReadiness())
+
+    attachedStore.discardInitialPreparation()
+
+    assertNull(attachedStore.inspectPreparedAttachedAuthority())
+  }
+
+  @Test
   fun `failed candidate activation restores exact current authority`() {
     val storage = MemoryRuntimeStorage()
     val cipher = AuthorityTestCipher()
