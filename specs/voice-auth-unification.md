@@ -278,3 +278,11 @@ boundary sections.
   deliberate behavior change (N2), protocol-shape claim narrowed to the four gated runtime
   headers (N3), wire-vs-server-record clarification on "lease schema untouched" (N4),
   6.2 disposition numbering (N1). Spec is implementable as written.
+- **2026-07-15 — M0 run-1 packet review addendum.** Two omissions found in this spec's
+  Deletion inventory during execution-packet review, corrected there and noted here:
+  the grant/ticket contract surface extends beyond `voiceRuntime.ts` into
+  `packages/contracts/src/voice.ts` (`VoiceRuntimeControlGrant`,
+  `VoiceThreadTurnCreateResult.operationGrant`, `VoiceSessionCreateResult.runtimeControlGrant`,
+  `VoiceMediaTicket*`) and `baseSchemas.ts` (`VoiceMediaTicketId`); and
+  `VoiceSessionService.ts` is a primary grant-registry consumer (18 call sites) alongside
+  the two services already listed.
