@@ -69,10 +69,10 @@ slots into).
 | W0c | Kernel type surfaces: message/effect/epoch definitions + unwired kernel skeleton                                                                                                                                                      | W0a                            | no                         |
 | M0  | Voice auth unification (`specs/voice-auth-unification.md`)                                                                                                                                                                            | W0 merged                      | no                         |
 | M1  | Mailbox ingress (kernel thread; binder/intents/media-button routed through it; interrupt lane + stop tombstones deleted)                                                                                                              | M0                             | no                         |
-| M2  | State capture: callbacks onto mailbox, `operationLock` deleted. Device soak gate.                                                                                                                                                     | M1                             | no — ships alone           |
+| M2  | State capture: callbacks onto mailbox, `operationLock` deleted.                                                                                                                                                                       | M1                             | no — ships alone           |
 | M3  | Driver extraction (Media/Net/Store/Host); realtime engine → sub-reducer                                                                                                                                                               | M2                             | no                         |
 | M4  | Epoch consolidation; delete local fencing families                                                                                                                                                                                    | M3                             | no                         |
-| M5  | Bridge cutover (delete unreachable surface; pending/ack → completion handles + retained records; `nativeRevision` bump). Device gate.                                                                                                 | M4                             | no                         |
+| M5  | Bridge cutover (delete unreachable surface; pending/ack → completion handles + retained records; `nativeRevision` bump).                                                                                                              | M4                             | no                         |
 | M6  | Recovery as pure function + fixture matrix; service shrinks to host                                                                                                                                                                   | M2 (fixtures reusable earlier) | partially                  |
 | M7  | Package split                                                                                                                                                                                                                         | M6                             | no                         |
 
@@ -159,3 +159,14 @@ around the runs — authoring packet N+1 and adjudicating reviews while run N ex
   (distributed authority chain) largely dissolves.
 - Stabilization commit on `feature/native-voice-runtime-ownership` before W0 launches.
 - W0 packet drafts; decide per-milestone `vp check` scopes for command checks.
+
+## Strategy revision — 2026-07-15 (end-state-first)
+
+Per Kevin's direction mid-M0: drive straight to the end state. Interim functional
+regressions between milestones are ACCEPTABLE; per-milestone human device gates are
+REMOVED (M2 soak, M5 device gate, and the M0 interactive scenarios are consolidated into
+ONE full device validation after the final milestone). Per-milestone gates that remain:
+daemon checks, adjudication review, and the pc compile/test gate for Kotlin milestones.
+Agent-executable device checks (install, launch, crash sweep, service lifecycle via adb)
+run where cheap. M0's device gate closed on this basis: deployed to server + phone,
+launch/crash sweep clean, interactive scenarios deferred to the final validation.
