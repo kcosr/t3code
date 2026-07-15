@@ -1,112 +1,120 @@
-# M1 — Mailbox Ingress
+# M1 — Mailbox Ingress (rev 2, review-integrated)
 
-First kernel milestone of `specs/native-voice-runtime-kernel.md` (Migration M1). Introduces
-the kernel thread and mailbox; routes every ingress source through it; deletes the binder
-INTERRUPT lane and stop-tombstone dispatcher. Behavior-neutral: the message handler still
-takes `operationLock` internally and runs the exact code the entry points run today. All
-line references are against the post-M0 tree (HEAD at or after `df7640988`).
+First kernel milestone of `specs/native-voice-runtime-kernel.md`. Introduces the kernel
+thread and mailbox, routes ingress through it, deletes the module INTERRUPT lane and stop
+tombstones — WITH a mandatory offload pre-step, because the original safety assumption was
+disproven: `engine.start` blocks on `server.start` HTTP inline (engine :543 → gateway →
+`execute()`, 5s connect + 30s read timeouts). Commit `02fa14e2b` moved only `peer.prepare`.
+Line refs are against the post-M0 tree.
 
-## Context
+## Step 0 — offload pre-step (do FIRST, separate commit)
 
-No Kotlin toolchain on this host; mirror existing idioms; expect a pc-gate fix round. The
-W0c types are the vocabulary: `VoiceKernelMessage` (`VoiceKernelMessages.kt:23-45`),
-`VoiceKernelHostIntentAction` (8 values, post-M0), `VoiceKernel.kt` reducer contract (NOT
-implemented this milestone — the mailbox executes legacy closures, not a reducer).
+Mirror the pattern `startCanonicalRealtimeLocked` already uses
+(`T3VoiceRuntimeService.kt:4864`, `voiceRuntimeRealtimeStartIo.submit { engine.start }`) at
+the binder arms that currently call blocking engine methods inline:
 
-Stale-spec note: the kernel spec's M1 text predates M0 — "worker intents" no longer exist
-(refresh worker deleted), `RefreshConfirm` is gone from the effect catalog, and the module
-line citations moved. This packet's numbers are authoritative.
+- `dispatchVoiceRuntime.StartRealtime` (~:909): compute admission synchronously
+  (ledger/fence — no network), then offload the `engine.start` call to
+  `voiceRuntimeRealtimeStartIo`. The command receipt is the admission result; the start
+  outcome already flows through engine state events (exactly as the notification path
+  behaves today).
+- `dispatchVoiceRuntime.UpdateRealtimeFocus` (~:955-961) and
+  `DecideRealtimeConfirmation` (~:982-991): offload their `engine.*` bodies (which call
+  `server.updateFocus`/`server.acknowledgeAction`) to `voiceRuntimeRealtimeControlIo`.
+- `acknowledgeVoiceRuntimePresentationAction` (~:1018-1055): same offload for its
+  `engine.acknowledgePresentationAction` call; the binder return value must not depend on
+  the offloaded network result (verify what it returns; if it currently returns a value
+  derived from the server call, return the locally-known acknowledgement state — the
+  server result reconciles via events).
 
-## Design
+Verified nonblocking already (no offload needed): thread-mode Start/Resume/Finish/Cancel
+via `voiceRuntimeController.dispatch`, realtime `StopMode` (`engine.stop` marks shutdown,
+defers `server.close` to `remoteDispatcher`).
 
-### 1. `VoiceKernelMailbox` (new file)
+## Step 1 — `VoiceKernelMailbox` (new file)
 
-A service-owned single `HandlerThread("t3-voice-kernel")` + `Handler` wrapping a totally
-ordered queue of entries `{message: VoiceKernelMessage, body: () -> Unit}`. For M1 the
-`message` is diagnostic metadata (kind + origin recorded in the diagnostic ring); `body` is
-the legacy closure. API: `submit(message, body)`, `submitDelayed(message, delayMillis,
-body)` returning a cancellation token (replaces `mainHandler.postDelayed` ONLY where M1
-moves an ingress path — the 51 broad mainHandler sites move in M2, not now), `assertKernelThread()`,
-`drainAndQuit()` for `onDestroy`. Add a watchdog: log a diagnostic-ring entry when a body
-runs > 250 ms (evidence for M3's driver extraction; no behavior change).
+Single `HandlerThread("t3-voice-kernel")` + ordered queue. API:
 
-### 2. Binder ingress
+- `submit(message: VoiceKernelMessage, body: () -> Unit)`
+- `submitAndAwait(message, body: () -> T): T` — for value-returning binder methods
+  (receipt/lease/snapshot/read results consumed synchronously by the module, e.g.
+  `dispatchVoiceRuntime`'s receipt read at `T3VoiceModule.kt:430`). Binder handler threads
+  may block awaiting; assert the kernel thread itself never calls it.
+- `submitDelayed(message, delayMillis, body)` returning a cancellation token.
+- `assertKernelThread()`, `drainAndQuit()` for `onDestroy`.
+- Watchdog: diagnostic-ring entry when a body exceeds 250 ms (post-Step-0, sustained
+  entries indicate a missed blocking path — investigate, don't ignore).
+  The `message` is diagnostic metadata for M1; bodies are legacy closures still taking
+  `operationLock` internally. No reducer, no KernelState, no effects.
 
-Every `VoiceBinder` method that acquires `operationLock` (the ~33 `L`-marked methods and
-the two piecewise dispatchers `dispatchVoiceRuntime` :872 and
-`acknowledgeVoiceRuntimePresentationAction` :1018) wraps its existing body in
-`mailbox.submit(...)`. Completion callbacks settle exactly as today (the bodies already
-settle via callback/return plumbing — pure reads that take no lock, e.g. flow getters
-:137-155, `acknowledgeRecordingTermination` :454, `enqueuePlaybackChunk` :566, stay
-direct). The two piecewise dispatchers become ONE mailbox submission each — their
-interleaved unlocked engine calls run inside the single body (the engine's own admission
-is nonblocking; see Safety).
+## Step 2 — binder ingress
 
-### 3. Host ingress
+Lock-taking `VoiceBinder` methods (the ~33 `synchronized(operationLock)` bodies plus the
+two piecewise dispatchers `dispatchVoiceRuntime` :872 and
+`acknowledgeVoiceRuntimePresentationAction` :1018) route through the mailbox:
+value-returning ones via `submitAndAwait`, fire-and-forget ones via `submit`. Pure reads
+that take no lock (flow getters :137-155, `acknowledgeRecordingTermination` :454,
+`enqueuePlaybackChunk` :566, etc.) stay direct. Each piecewise dispatcher becomes ONE
+submission; after Step 0 their bodies contain no blocking network work.
 
-- `onStartCommand` (:2061-2101): each action arm becomes `mailbox.submit(HostIntent(...))`
-  with the arm's existing locked body; the sticky/return computation stays synchronous
-  using the current readiness snapshot (Android requires an immediate return — read the
-  cached policy answer, do not wait on the mailbox).
-- MediaSession callbacks (:5318-5357) and the `onMediaButtonEvent` mainHandler hop (:5335):
-  submit `HostIntent` messages instead of posting/locking directly.
-- Notification actions already arrive via `onStartCommand` — no separate path.
+## Step 3 — host ingress
 
-### 4. Module lane collapse (`T3VoiceModule.kt`)
+`onStartCommand` (:2061-2101): six arms become `mailbox.submit(HostIntent(...))`. TWO
+EXCEPTIONS run synchronously in place because the sticky return depends on state they
+mutate: `ACTION_DISABLE_READINESS` (mutates `readinessConfig` via
+`disableReadinessLocked` :1665-region) and `ACTION_READINESS` (reassigns it in
+`reconcileReadinessLocked`), plus the `else` branch (`stopSelf` decision). The
+`START_STICKY` computation (:2097-2101) reads `readinessConfig` — it must see those arms'
+mutations. MediaSession callbacks (:5318-5357) including the `onMediaButtonEvent`
+mainHandler hop (:5335): submit `HostIntent` instead of posting/locking directly.
 
-Delete: the INTERRUPT thread/handler (:33-34), its teardown (:251-253), the lane enum +
-ordering types + lane policy (:1371-1421), and the stop-tombstone machinery inside
-`T3VoiceBinderOperationDispatcher` (:1424-1595 — the class shrinks to single-lane
-registration/settlement; keep `T3VoiceBinderOperationAdmission` :1390-1392, keep
-binder-generation stamps and reconnect replay :56-102, :1137-1179 — those are
-connection-epoch fencing, deleted in M4, not now). All AsyncFunctions route through the
-single ordered path; `stopRealtimeSessionAsync` / `drainAndStopRealtimeSessionAsync`
-(:913-932) and `dispatchVoiceRuntimeAsync` (:421-431) lose their lane/ordering arguments.
+## Step 4 — module lane collapse (`T3VoiceModule.kt`)
 
-### Safety argument (why deleting INTERRUPT is sound NOW — verify, don't assume)
+DELETE precisely:
 
-The INTERRUPT lane existed so a stop could preempt a start blocked inside the ordered
-lane. Post-`02fa14e2b` the canonical realtime start is admission-based: `engine.start`
-records the command and returns; network/ICE work runs on the engine IO executors, not in
-the binder body. VERIFY this by reading the current `dispatchVoiceRuntime` StartRealtime
-path and `VoiceRuntimeRealtimeEngine.start` — confirm no network call, no `.get()`, no
-latch-wait executes inside the submitted body. The legacy ui-attached
-`prepareRealtimeSession` (:598) DOES perform ICE-complete offer creation in its body; it
-is production-unreachable on Android (autonomous execution model) and its stop
-(`stopRealtimeSession` :657) rides the same FIFO — acceptable and documented, deleted at
-M5. If verification finds ANY canonical-path blocking in a submitted body, STOP and
-report rather than shipping a stop-latency regression.
+- INTERRUPT thread/handler decls :33-34; teardown lines :251 and :253 ONLY (:252 is the
+  ORDERED thread's `quitSafely` — KEEP).
+- Lane enum + ordering types + policy: :1371-1388 and :1394-1421 (this includes
+  `T3VoiceBinderOrderingRetention` :1394-1397). KEEP `T3VoiceBinderOperationAdmission`
+  :1390-1392.
+- Tombstone machinery inside `T3VoiceBinderOperationDispatcher` (:1424-1595):
+  `StopPostingState`, `StopTombstone`, `stopSequences`, the INTERRUPT post branch, Stop
+  register/admit arms, `finishActivation` cancellation eval, `coversEarlierActivation`,
+  `pruneStopRegistrations`, `markAccepted` Stop logic, `rollback` Stop arm, and the test
+  hook `retainedOrderingCounts` (:1589-1594). The class shrinks to single-lane
+  registration/settlement.
+- `PendingBinderOperation.lane`/.`ordering` fields (:56-57); KEEP :64-102 (ticket,
+  binderGeneration, connected/replay). Update `withBinder`/`withBinderAdmission`
+  signatures (:1056-1077, drop lane/ordering params), `scheduleBinderOperation`
+  (:1127-1169, drop the :1133-1134 lane/ordering reads), the dispatcher constructor
+  (:35-39, drop `interruptPost`), and the lane arguments at `stopRealtimeSessionAsync`
+  :913-921, `drainAndStopRealtimeSessionAsync` :923-932, `dispatchVoiceRuntimeAsync`
+  :421-431.
+- Binder-generation stamps and reconnect replay are KEPT (M4 territory).
 
 ## Forbidden
 
-- Implementing the reducer, KernelState, effects, epoch checking, or driver extraction
-  (M2-M4). The mailbox executes legacy closures, period.
-- Removing `operationLock` or changing any locked body's logic beyond wrapping it.
-- Touching the 51 broad `mainHandler` post sites, the 8 executors, engine internals,
-  stores, or any TS beyond nothing (no TS changes this milestone; `nativeRevision` stays
-  15 — no bridge shape changes).
-- Deleting binder-generation stamps or reconnect replay (M4).
+Reducer/KernelState/effects/epoch implementation; removing `operationLock`; touching the
+51 broad mainHandler sites, the 8 executors beyond Step 0's submissions, stores, engine
+internals beyond the offload seams; any TS change (`nativeRevision` stays 15).
 
 ## Verification
 
-1. `grep -rn "binderInterruptThread\|binderInterruptHandler\|T3VoiceBinderOperationLane\b\|StopTombstone\|stopSequences\|pruneStopRegistrations\|coversEarlierActivation" apps/mobile/modules/t3-voice` → zero.
-2. `grep -rn "synchronized(operationLock)" T3VoiceRuntimeService.kt | wc -l` unchanged ±0
-   from base for non-ingress sites; every binder/host ingress body now enters via
-   `mailbox.submit` (list the submission count in the commit message).
-3. `pnpm run typecheck` + `pnpm run lint:mobile` green (TS untouched — prove it).
-4. New unit tests: mailbox FIFO ordering under concurrent submit; submitDelayed
-   cancellation; watchdog threshold entry; onStartCommand arms produce the right
-   HostIntent kinds (pure mapping test); module dispatcher single-lane
-   registration/settlement/replay still covered by the surviving
-   `T3VoiceBinderOperationDispatcherTest` cases (rewrite the lane/tombstone cases as
-   deletions, keep generation/replay cases).
-5. Commit message: the Safety-argument verification result (what you read, what you
-   found), submission-site count, deletion inventory.
+1. `grep -rn "binderInterruptThread\|binderInterruptHandler\|T3VoiceBinderOperationLane\b\|T3VoiceBinderOperationOrdering\|T3VoiceBinderOperationLanePolicy\|T3VoiceBinderOperationFence\|T3VoiceBinderOrderingRetention\|retainedOrderingCounts\|StopTombstone\|stopSequences\|pruneStopRegistrations\|coversEarlierActivation\|interruptPost" apps/mobile/modules/t3-voice` → zero.
+2. Every submitted binder/host body enters via mailbox (count submissions in commit
+   message); non-ingress `synchronized(operationLock)` sites unchanged.
+3. `pnpm run typecheck` + `pnpm run lint:mobile` green (no TS changes — prove it).
+4. Tests: mailbox FIFO/submitAndAwait/delayed-cancel/watchdog units; HostIntent mapping;
+   Step-0 offload — receipt independent of network result (fake engine/server per existing
+   idioms). `T3VoiceBinderOperationDispatcherTest`: its 14 cases are ALL lane/tombstone
+   cases — delete/rewrite; only `ordinaryOperationsRemainOrdered` survives (single-lane);
+   generation/replay coverage lives in `T3VoiceBinderOperationRegistryTest` (unaffected —
+   verify it still compiles against the reshaped `PendingBinderOperation`).
+5. Commit message: offload seams changed, submission count, deletion inventory.
 
 ## Done criteria
 
-One or two commits, subject `feat(voice): route runtime ingress through kernel mailbox`;
-tree clean; then orchestrator-owned pc gate (module tests + androidTest compile) — note
-`T3VoiceRuntimeServiceInstrumentedTest` exercises binder start/stop across rebind and must
-still pass unmodified (it is a consumer of the reshaped module surface only if lanes leak
-into its API — they must not).
+Two commits (Step 0; Steps 1-4), subjects `fix(voice): offload blocking engine calls from
+binder arms` and `feat(voice): route runtime ingress through kernel mailbox`; tree clean;
+orchestrator-owned pc gate after park (module tests + androidTest compile —
+`T3VoiceRuntimeServiceInstrumentedTest` must pass unmodified).
