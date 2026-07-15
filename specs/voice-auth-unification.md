@@ -85,8 +85,11 @@ What the deleted machinery carried that is not authentication survives as plain 
     generation. This is an explicit per-session lifecycle flag on the retained lease/binding
     record — it cannot be derived from fence-vs-current-authority comparison, which either
     leaks non-close operations through the cached binding or wrongly rejects a legitimate
-    close carrying the superseded generation. It reproduces the control-grant
-    `preserveSessionClose` downgrade semantics without the credential;
+    close carrying the superseded generation. For the handoff path this reproduces the
+    control-grant `preserveSessionClose` downgrade exactly; for target replacement it is a
+    deliberate, strictly more graceful behavior change — today `replace` fully revokes with
+    no close preserved (`revokeDerived(..., false)`), and preserving close there is an
+    intentional improvement, not a reproduction;
   - thread-turn operation routes: the operation row records the creating auth session and
     runtime identity; requests must match. The per-operation HMAC token tier is deleted;
     draft read/consume keeps its existing operation-scoped semantics under the ownership
@@ -167,7 +170,9 @@ Contracts (`packages/contracts/src/voiceRuntime.ts`): `VoiceRuntimeGrant`,
 `VoiceRuntimeGrantProvisionInput`, `VoiceRuntimeGrantRefreshInput`, revocation shapes,
 `VoiceRuntimeCredentialHash`, `refreshRotationCounter`, target-digest fields tied to
 provisioning; `environmentHttp.ts` grant/ticket endpoints. The command fence, snapshot,
-lease, journal, and event schemas are untouched.
+lease, journal, and event schemas are untouched. ("Untouched" refers to the wire
+contracts; the server-side lease/binding record gains the close-only lifecycle field
+described under Route auth.)
 
 Kotlin:
 
@@ -214,7 +219,9 @@ JS:
 One vertical cutover, per the repo's no-alias rule: server route auth, contract removal,
 Kotlin credential attachment, and JS provisioning simplification land together; the old
 headers are rejected, not aliased. `VOICE_RUNTIME_PROTOCOL_MAJOR` bumps 1 → 2 (removing the
-six custom auth headers changes the native↔server protocol shape; a mismatched pair must
+four runtime-route auth headers changes the native↔server protocol shape on the
+protocol-gated routes (`x-t3-voice-ticket` lives on media routes outside the gate and
+degrades to session auth; `x-t3-voice-refresh` dies with its endpoint); a mismatched pair must
 refuse voice cleanly via the protocol gate, not fail with opaque 401s), and `nativeRevision`
 bumps (the native↔JS provisioning contract changes shape). Kotlin note: the
 `VoiceRuntimeAuthority` token validation (length ≤ 128, no whitespace, `VoiceRuntimeHttp.kt`)
@@ -263,5 +270,11 @@ boundary sections.
   cancel-pre-dispatch/detach-post-dispatch distinction (3.1/3.2/6.3); migration gains the
   `VOICE_RUNTIME_PROTOCOL_MAJOR` 1→2 bump and the Kotlin token-validation rework note
   (5.1/5.2). Confirmed sound by review: single-trust-domain rationale, `canonicalFence`
-  claim, media session fallback, refresh-endpoint-outside-auth claim, thread-turn
+  claim, media session fallback, refresh-endpoint-outside-auth claim (6.2), thread-turn
   session-scoping (1.2), media-ticket removal viability (6.1).
+- **2026-07-14 — Opus review cycle 2 — verdict: ready-with-amendments.** All cycle-1
+  finding groups verified as resolved with code-grounded evidence; amendments mutually
+  consistent with unchanged sections. Applied polish: close-only-for-replacement framed as
+  deliberate behavior change (N2), protocol-shape claim narrowed to the four gated runtime
+  headers (N3), wire-vs-server-record clarification on "lease schema untouched" (N4),
+  6.2 disposition numbering (N1). Spec is implementable as written.

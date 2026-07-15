@@ -90,9 +90,9 @@ around the runs — authoring packet N+1 and adjudicating reviews while run N ex
        "implementerProfile": "codex-gpt-5-6-sol-fast",
        "completionChecks": [
          {"key": "typecheck", "type": "command",
-          "command": "pnpm", "args": ["run", "typecheck"], "timeoutMs": 1200000},
+          "command": "bash", "args": ["-lc", "pnpm run typecheck"], "timeoutMs": 1200000},
          {"key": "lint-mobile", "type": "command",
-          "command": "pnpm", "args": ["run", "lint:mobile"], "timeoutMs": 600000},
+          "command": "bash", "args": ["-lc", "pnpm run lint:mobile"], "timeoutMs": 600000},
          {"key": "committed", "type": "has-commits", "baseRef": "<stack-tip-sha>"},
          {"key": "clean", "type": "git-clean"}
        ]
@@ -100,7 +100,11 @@ around the runs — authoring packet N+1 and adjudicating reviews while run N ex
    ```
 
    No `branch-pushed` check — pushes to `kcosr/t3code` are performed only by the
-   orchestrator. Adjust command checks per milestone (JS-touching milestones add targeted
+   orchestrator. Command checks are wrapped in `bash -lc` because the keel daemon's
+   systemd unit PATH omits `/home/kevin/.local/bin` (where pnpm lives); the login shell
+   restores the user PATH. The durable fix is adding that directory to
+   `keel-daemon.service` PATH and restarting the daemon — deferred because a daemon
+   restart affects Keel runs outside this workstream. Adjust command checks per milestone (JS-touching milestones add targeted
    `vp check` scopes).
 
 4. **Adjudicate at park**: inspect `git diff <base>...`; spawn adversarial Opus subagents
