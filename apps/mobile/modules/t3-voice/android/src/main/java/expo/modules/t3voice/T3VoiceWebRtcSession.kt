@@ -47,6 +47,7 @@ internal class T3VoiceWebRtcSession(
 ) {
   private data class ActiveSession(
     val sessionId: String,
+    val epoch: VoiceKernelEpoch,
     val diagnosticGeneration: Long,
     var audioRouteId: String,
     val playoutMonitor: T3VoiceRealtimePlayoutMonitor,
@@ -176,6 +177,7 @@ internal class T3VoiceWebRtcSession(
 
   fun prepare(
     sessionId: String,
+    epoch: VoiceKernelEpoch,
     diagnosticGeneration: Long,
     audioRouteId: String,
     callback: T3VoiceWebRtcResultCallback<String>,
@@ -202,6 +204,7 @@ internal class T3VoiceWebRtcSession(
           check(active == null) { "A Realtime voice session started concurrently." }
           ActiveSession(
             sessionId = sessionId,
+            epoch = epoch,
             diagnosticGeneration = diagnosticGeneration,
             audioRouteId = audioRouteId,
             playoutMonitor = prepared.playoutMonitor,
@@ -578,7 +581,7 @@ internal class T3VoiceWebRtcSession(
       val routeSetup =
         runCatching {
           if (synchronized(lock) { active === session && !session.audioRouterActive }) {
-            val routerStart = audioRouter.start(sessionId)
+            val routerStart = audioRouter.start(sessionId, session.epoch)
             check(routerStart.transition.state != T3VoiceAudioFocusState.TERMINATED) {
               "Android denied Realtime audio focus."
             }
@@ -650,8 +653,9 @@ internal class T3VoiceWebRtcSession(
     )
   }
 
-  internal fun handleAudioFocusActions(actions: List<T3VoiceAudioFocusAction>) {
-    val session = synchronized(lock) { active } ?: return
+  internal fun handleAudioFocusChange(sessionId: String, change: Int) {
+    val session = synchronized(lock) { active?.takeIf { it.sessionId == sessionId } } ?: return
+    val actions = audioRouter.handleAudioFocusChange(change).actions
     for (action in actions) {
       if (synchronized(lock) { active !== session }) return
       val applied =
@@ -717,9 +721,12 @@ internal class T3VoiceWebRtcSession(
     }
   }
 
-  internal fun handleAudioRouteChanged(change: T3VoiceAudioRouteChange) {
-    val sessionId = synchronized(lock) { active?.sessionId } ?: return
-    onRouteChanged(sessionId, change)
+  internal fun handleAudioDevicesChanged(sessionId: String) {
+    val ownsRouter = synchronized(lock) {
+      active?.let { it.sessionId == sessionId && it.audioRouterActive } == true
+    }
+    if (!ownsRouter) return
+    audioRouter.reconcileSelectedRoute()?.let { onRouteChanged(sessionId, it) }
   }
 
   private fun armConnectionTimeout(session: ActiveSession) {

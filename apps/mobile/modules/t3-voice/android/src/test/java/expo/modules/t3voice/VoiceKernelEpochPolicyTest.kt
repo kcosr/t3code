@@ -136,6 +136,22 @@ class VoiceKernelEpochPolicyTest {
     )
   }
 
+  @Test
+  fun `cue terminal latch forgets the prior arm and admits once in constant space`() {
+    val latch = VoiceKernelCueOnceGate()
+    val first = currentEpoch.copy(rootOperationId = "cue:first")
+    val second = currentEpoch.copy(rootOperationId = "cue:second", attemptOrdinal = 4L)
+
+    latch.arm(first)
+    assertEquals(true, latch.admit(first))
+    assertEquals(false, latch.admit(first))
+
+    latch.arm(second)
+    assertEquals(false, latch.admit(first))
+    assertEquals(true, latch.admit(second))
+    assertEquals(false, latch.admit(second))
+  }
+
   private fun driverResult(
     epoch: VoiceKernelEpoch,
     driver: VoiceKernelDriver,

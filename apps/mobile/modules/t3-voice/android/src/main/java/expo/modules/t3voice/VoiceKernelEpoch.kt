@@ -51,6 +51,23 @@ object VoiceKernelEpochPolicy {
   }
 }
 
+/** Constant-space exactly-once arbitration for the single physical cue resource. */
+internal class VoiceKernelCueOnceGate {
+  private var armedEpoch: VoiceKernelEpoch? = null
+  private var consumed = false
+
+  fun arm(epoch: VoiceKernelEpoch) {
+    armedEpoch = epoch
+    consumed = false
+  }
+
+  fun admit(epoch: VoiceKernelEpoch): Boolean {
+    if (epoch != armedEpoch || consumed) return false
+    consumed = true
+    return true
+  }
+}
+
 internal enum class VoiceKernelEpochRootKind {
   THREAD_TURN,
   REALTIME_MODE,
@@ -116,7 +133,9 @@ internal class VoiceKernelEpochRegistry {
       "PlaybackFocusSuspended", "PlaybackFocusResumed", "PlaybackFocusTerminated",
       -> kind == VoiceKernelEpochRootKind.PLAYBACK
       "CueCompleted" -> kind == VoiceKernelEpochRootKind.CUE
-      "RealtimeStateChanged", "RealtimeRouteChanged", "RealtimeError", "RealtimeTerminated" ->
+      "RealtimeStateChanged", "RealtimeRouteChanged", "RealtimeAudioFocusChanged",
+      "RealtimeAudioDevicesChanged", "RealtimeError", "RealtimeTerminated",
+      ->
         kind == VoiceKernelEpochRootKind.REALTIME_PEER
       "RealtimeDrainCompleted" -> kind == VoiceKernelEpochRootKind.REALTIME_PEER
       else -> false

@@ -35,6 +35,15 @@ internal sealed interface VoiceMediaDriverEvent {
     val change: T3VoiceAudioRouteChange,
   ) : VoiceMediaDriverEvent
 
+  data class RealtimeAudioFocusChanged(
+    val sessionId: String,
+    val change: Int,
+  ) : VoiceMediaDriverEvent
+
+  data class RealtimeAudioDevicesChanged(
+    val sessionId: String,
+  ) : VoiceMediaDriverEvent
+
   data class RealtimeError(
     val sessionId: String,
     val code: String,
@@ -51,8 +60,10 @@ internal sealed interface VoiceMediaDriverEvent {
   ) : VoiceMediaDriverEvent
 }
 
-internal fun interface VoiceRawMediaDriverListener {
+internal interface VoiceRawMediaDriverListener {
   fun onMediaEvent(event: VoiceMediaDriverEvent)
+
+  fun onMediaEvent(epoch: VoiceKernelEpoch, event: VoiceMediaDriverEvent)
 }
 
 internal fun interface VoiceMediaDriverListener {
@@ -82,8 +93,14 @@ internal class VoiceMediaDriver<Recorder, Player, Focus, Cues, Router, Realtime>
   private val playbackEpochs = java.util.concurrent.ConcurrentHashMap<String, VoiceKernelEpoch>()
   private val realtimeEpochs = java.util.concurrent.ConcurrentHashMap<String, VoiceKernelEpoch>()
   @Volatile private var playbackFocusEpoch: VoiceKernelEpoch? = null
-  private val rawListener = VoiceRawMediaDriverListener { event ->
-    listener.onMediaEvent(epochFor(event), event)
+  private val rawListener = object : VoiceRawMediaDriverListener {
+    override fun onMediaEvent(event: VoiceMediaDriverEvent) {
+      listener.onMediaEvent(epochFor(event), event)
+    }
+
+    override fun onMediaEvent(epoch: VoiceKernelEpoch, event: VoiceMediaDriverEvent) {
+      listener.onMediaEvent(epoch, event)
+    }
   }
 
   val cues: Cues = factory.createCues()
@@ -130,6 +147,8 @@ internal class VoiceMediaDriver<Recorder, Player, Focus, Cues, Router, Realtime>
       -> playbackFocusEpoch
       is VoiceMediaDriverEvent.RealtimeStateChanged -> realtimeEpochs[event.sessionId]
       is VoiceMediaDriverEvent.RealtimeRouteChanged -> realtimeEpochs[event.sessionId]
+      is VoiceMediaDriverEvent.RealtimeAudioFocusChanged -> realtimeEpochs[event.sessionId]
+      is VoiceMediaDriverEvent.RealtimeAudioDevicesChanged -> realtimeEpochs[event.sessionId]
       is VoiceMediaDriverEvent.RealtimeError -> realtimeEpochs[event.sessionId]
       is VoiceMediaDriverEvent.RealtimeTerminated -> realtimeEpochs[event.sessionId]
     },
@@ -153,9 +172,6 @@ internal class AndroidVoiceMediaDriverFactory(
   T3VoiceWebRtcSession
 > {
   private val applicationContext = context.applicationContext
-  private var focusActions: ((List<T3VoiceAudioFocusAction>) -> Unit)? = null
-  private var routeChanged: ((T3VoiceAudioRouteChange) -> Unit)? = null
-
   override fun createRecorder(listener: VoiceRawMediaDriverListener) =
     T3VoiceRecorder(applicationContext) { listener.onMediaEvent(VoiceMediaDriverEvent.RecorderTerminated(it)) }
 
@@ -181,8 +197,24 @@ internal class AndroidVoiceMediaDriverFactory(
   override fun createRouter(listener: VoiceRawMediaDriverListener): T3VoiceAudioRouter {
     return T3VoiceAudioRouter(
       applicationContext,
-      onFocusActions = { actions -> focusActions?.invoke(actions) },
-      onRouteChanged = { change -> routeChanged?.invoke(change) },
+      onFocusChanged = { epoch, sessionId, change ->
+        listener.onMediaEvent(
+          epoch,
+          VoiceMediaDriverEvent.RealtimeAudioFocusChanged(sessionId, change),
+        )
+      },
+      onAudioDevicesChanged = { epoch, sessionId ->
+        listener.onMediaEvent(
+          epoch,
+          VoiceMediaDriverEvent.RealtimeAudioDevicesChanged(sessionId),
+        )
+      },
+      onRouteChanged = { epoch, sessionId, change ->
+        listener.onMediaEvent(
+          epoch,
+          VoiceMediaDriverEvent.RealtimeRouteChanged(sessionId, change),
+        )
+      },
     )
   }
 
@@ -212,8 +244,6 @@ internal class AndroidVoiceMediaDriverFactory(
         )
       },
     )
-    focusActions = realtime::handleAudioFocusActions
-    routeChanged = realtime::handleAudioRouteChanged
     return realtime
   }
 

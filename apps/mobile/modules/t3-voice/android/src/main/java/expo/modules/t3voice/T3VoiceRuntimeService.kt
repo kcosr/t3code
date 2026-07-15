@@ -122,7 +122,7 @@ internal class T3VoiceRecordingNotStartedException : IllegalStateException(
 class T3VoiceRuntimeService : Service() {
   private val mailbox = VoiceKernelMailbox()
   private val epochRegistry = VoiceKernelEpochRegistry()
-  private val admittedCueTerminals = mutableSetOf<VoiceKernelEpoch>()
+  private val cueOnceGate = VoiceKernelCueOnceGate()
 
   private fun armEpoch(
     kind: VoiceKernelEpochRootKind,
@@ -130,12 +130,14 @@ class T3VoiceRuntimeService : Service() {
     authorityGeneration: Long = voiceRuntimeController.snapshot().identity.generation,
   ): VoiceKernelEpoch {
     mailbox.assertKernelThread()
-    return epochRegistry.arm(
+    val epoch = epochRegistry.arm(
       kind,
       voiceRuntimeController.snapshot().identity.runtimeInstanceId,
       authorityGeneration,
       rootOperationId,
     )
+    if (kind == VoiceKernelEpochRootKind.CUE) cueOnceGate.arm(epoch)
+    return epoch
   }
 
   private fun driverEpoch(): VoiceKernelEpoch {
@@ -197,7 +199,7 @@ class T3VoiceRuntimeService : Service() {
       return
     }
     if (result.driver == VoiceKernelDriver.MEDIA && result.resultKind == "CueCompleted" &&
-      !admittedCueTerminals.add(result.epoch)) {
+      !cueOnceGate.admit(result.epoch)) {
       T3VoiceDiagnostics.record(
         generation = 0,
         category = T3VoiceDiagnosticCategory.KERNEL,
@@ -798,7 +800,7 @@ class T3VoiceRuntimeService : Service() {
             )
             val epoch = armEpoch(VoiceKernelEpochRootKind.REALTIME_PEER, nativeSessionId)
             mediaDriver.armRealtime(nativeSessionId, epoch)
-            realtime.prepare(nativeSessionId, diagnosticGeneration, audioRouteId, callback)
+            realtime.prepare(nativeSessionId, epoch, diagnosticGeneration, audioRouteId, callback)
             check(T3VoiceStateStore.state.value.activeRealtimeSessionId == nativeSessionId) {
               "The Realtime peer terminated during preparation."
             }
@@ -1397,6 +1399,10 @@ class T3VoiceRuntimeService : Service() {
           reason = event.change.reason.name.lowercase().replace('_', '-'),
         ),
       )
+      is VoiceMediaDriverEvent.RealtimeAudioFocusChanged ->
+        realtime.handleAudioFocusChange(event.sessionId, event.change)
+      is VoiceMediaDriverEvent.RealtimeAudioDevicesChanged ->
+        realtime.handleAudioDevicesChanged(event.sessionId)
       is VoiceMediaDriverEvent.RealtimeError -> T3VoiceStateStore.emit(
         T3VoiceRuntimeEvent.RuntimeError(
           operation = "realtime:${event.sessionId}",
@@ -4323,7 +4329,7 @@ class T3VoiceRuntimeService : Service() {
         )
         mediaDriver.armRealtime(effect.fence.modeSessionId, peerEpoch)
         netDriver.execute("realtime-peer-prepare", VoiceNetLane.REALTIME, driverEpoch(), blockingBody = {
-          val accepted = realtimePeerPort().prepare(
+          val accepted = realtimePeerPort(peerEpoch).prepare(
             effect.fence.modeSessionId,
             { offer -> submitCallback {
               apply(engine.onPeerOffer(realtimeState(engine), effect.fence, effect.sessionId, offer))
@@ -4705,7 +4711,9 @@ class T3VoiceRuntimeService : Service() {
     updateRuntimeControlSurfacesLocked()
   }
 
-  private fun realtimePeerPort(): VoiceRuntimeRealtimePeer = object : VoiceRuntimeRealtimePeer {
+  private fun realtimePeerPort(
+    prepareEpoch: VoiceKernelEpoch? = null,
+  ): VoiceRuntimeRealtimePeer = object : VoiceRuntimeRealtimePeer {
     override fun prepare(
       modeSessionId: String,
       onOffer: (String) -> Unit,
@@ -4715,6 +4723,7 @@ class T3VoiceRuntimeService : Service() {
       val diagnosticGeneration = T3VoiceDiagnostics.nextGeneration()
       realtime.prepare(
         modeSessionId,
+        checkNotNull(prepareEpoch) { "Realtime peer preparation requires an armed epoch." },
         diagnosticGeneration,
         readinessConfig.audioRouteId,
         object : T3VoiceWebRtcResultCallback<String> {
