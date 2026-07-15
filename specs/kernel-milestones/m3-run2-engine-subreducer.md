@@ -78,3 +78,57 @@ idempotency ledger; leaving any `synchronized` or sink-callback in the engine fi
 
 Commits: `feat(voice): convert realtime engine to a kernel sub-reducer` (+ optional test
 migration commit); tree clean; pc gate follows; then M4.
+
+## Review amendments (BINDING — supersede conflicting text above)
+
+D1. **RealtimeState also holds `finalization` and the terminals-retention ledger.**
+Reductions read `loadFinalization`/`hasTerminalCapacity`/`terminals` (engine :525, :556,
+:1432) and prune the ledger; the durable repository becomes a WRITE-THROUGH Persist sink
+for these — never read mid-reduction. Load once at install/recovery; state is the truth
+thereafter.
+
+D2. **Presentation is NOT a fire-and-forget output.** Two-phase: reduction emits
+`PublishPresentation(action)` + transient pending marker → service applies to the
+controller → `completePresentationPublish(action, result)` reduction installs
+`pendingAction` on INSERTED/UPDATED, else emits `RetractPresentation` (preserve the
+compensating retract, engine :1209/:1212).
+
+D3. **Handoff prepare/rollback/activate are StoreDriver lane effects with completion
+reductions** (Boolean → install-or-fail; rollback as compensation). They are TEE cipher
+ops and were missing from the effect enumeration.
+
+D4. **`recoverInterrupted` and `reconcileFinalization` decompose as staged sagas**: one
+effect → completion reduction → persist-next-stage/emit-next, unrolling the loop; the
+`terminalPublication` once-per-stage idempotency guard (engine :1454) must survive the
+async boundary.
+
+D5. Peer/cue **Boolean results route into completion reductions** (prepare, applyAnswer,
+setInputReady, setMuted, drain, ready, ended) — none are fire-and-forget.
+
+D6. Verification #1 applies to `VoiceRuntimeRealtimeEngine.kt` EXACTLY; the slot file's
+9 `@Synchronized` are ALSO removed under kernel-thread assertions (slot becomes
+kernel-owned).
+
+D7. **Slot migration**: stable binding-identity token separate from the value-typed
+RealtimeState (`!==` fence/binding checks break on immutable values); `isActive` reads
+the live RealtimeState; the version CAS at Slot.kt:112 is PRESENT AND USED — retain it.
+
+D8. **Retired-with-documented-reason allowance**: monitor-non-blocking and
+concurrent-admission scenarios (engine test :127, :150, :296, :327, :532, :559, :653,
+:682) may be retired or re-expressed structurally (deferred-effect assertions); list each
+with its reason in the commit message. "Zero dropped" applies to all other scenarios.
+
+D9. **Dispatch glue specified**: RealtimeState lives in the slot binding; add
+`applyRealtimeReduction(reduction)` (installs state', dispatches effects+outputs), called
+from binder reductions and lane continuations; continuations carry a stale-binding guard
+(captured binding identity still installed); binder-offload `complete` reshapes to
+server.start-on-lane + completeStart-on-kernel, with the start-cancelled →
+foreground-reconcile special case (:1043-1048) on the completion.
+
+D10. Document the two behavioral shifts: terminal-summary/`realtimeTermination` delivery
+and restart-after-IMMEDIATE-stop defer to close completion; `setMuted` receipt becomes
+admission-only.
+
+D11. `activationAdmission` (engine :488) and `now()` become reduction INPUTS (evaluated
+by the service glue, passed in). Seam-map SERVICE line refs predate run 1 (drift
+~40-65 lines) — symbol-search service sites; engine refs are current.
