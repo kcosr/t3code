@@ -41,6 +41,16 @@ slots into).
 4. **Reviews:**
    - Inside each Keel run: the default read-only reviewer (`claude-default`, Opus 4.8 xhigh)
      iterates with the implementer unattended for up to 10 rounds.
+   - Every launch's `reviewFocus` MUST begin with this boilerplate before the
+     milestone-specific focus: "Do not run builds, test suites, typecheck, or lint — the
+     implementer has already run them and daemon completionChecks re-run them after your
+     review; re-running them wastes your round. Review by reading the diff and files, plus
+     cheap greps only." The stock reviewer prompt injects `reviewFocus` as its Focus line,
+     so no custom workflow is needed. Escalation if reviewers ignore it: save a custom
+     workflow (`t3-implement-review`) with a hardened reviewer prompt — a one-line edit to
+     `reviewPrompt` in a copy of `implement-review-loop.workflow.ts`, saved under the new
+     name so the shared default stays untouched. Do not strip Bash from the reviewer
+     profile; greps are legitimate review tools.
    - Specs, packets, and post-integration gates: direct Opus subagents spawned by the
      orchestrator, resumed across cycles via continued agent conversations. Keel's
      `spec-review-loop` / `iterative-review` are not used — the orchestrator is already
