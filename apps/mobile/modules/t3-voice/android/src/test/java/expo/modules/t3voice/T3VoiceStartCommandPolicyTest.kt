@@ -1,5 +1,6 @@
 package expo.modules.t3voice
 
+import android.app.Service
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -38,5 +39,17 @@ class T3VoiceStartCommandPolicyTest {
       T3VoiceStartCommandDecision.STOP_STALE_START,
       T3VoiceStartCommandPolicy.decide(null, "owner-b"),
     )
+  }
+
+  @Test
+  fun readinessChangesPublishUpdatedStickiness() {
+    val cache = T3VoiceStartCommandStickinessCache()
+    assertEquals(Service.START_NOT_STICKY, cache.value)
+
+    cache.publish(T3VoiceReadinessConfig(enabled = true))
+    assertEquals(Service.START_STICKY, cache.value)
+
+    cache.publish(T3VoiceReadinessConfig(enabled = false))
+    assertEquals(Service.START_NOT_STICKY, cache.value)
   }
 }

@@ -63,6 +63,17 @@ private data class T3VoicePendingRuntimeHandoffActivation(
   val completions: MutableList<(Boolean) -> Unit> = mutableListOf(),
 )
 
+private data class T3VoiceNotificationSnapshot(
+  val active: Boolean = false,
+  val starting: Boolean = false,
+  val canStart: Boolean = false,
+  val controllerAttached: Boolean = false,
+  val readinessEnabled: Boolean = false,
+  val readinessMode: T3VoiceReadinessMode = T3VoiceReadinessMode.REALTIME,
+  val realtimeActive: Boolean = false,
+  val realtimeMuted: Boolean = false,
+)
+
 internal object T3VoiceRuntimeHandoffCapturePolicy {
   fun isArmed(
     expectedClientOperationId: String,
@@ -1198,7 +1209,12 @@ class T3VoiceRuntimeService : Service() {
   private var voiceRuntimeRealtimeFinalizationTask: Runnable? = null
   private var voiceRuntimeThreadRearmTask: Runnable? = null
   private var canonicalPreparedAuthority: T3VoicePreparedReadiness? = null
+  private val startCommandStickiness = T3VoiceStartCommandStickinessCache()
   private var readinessConfig = T3VoiceReadinessConfig()
+    set(value) {
+      field = value
+      startCommandStickiness.publish(value)
+    }
   private var cueSettings = T3VoiceCueSettings()
   private var runtimeSnapshot = VoiceRuntimeExecutionSnapshot()
   @Volatile private var serviceDestroyed = false
@@ -1211,7 +1227,8 @@ class T3VoiceRuntimeService : Service() {
   private var detachedThreadContinuationAdmission = false
   private val controllerCommands = T3VoiceControllerCommands()
   private var mediaSession: MediaSession? = null
-  private var foregroundServiceTypes = 0
+  @Volatile private var foregroundServiceTypes = 0
+  @Volatile private var notificationSnapshot = T3VoiceNotificationSnapshot()
   private var wakeLock: PowerManager.WakeLock? = null
   private val foregroundReleaseCoordinator =
     T3VoiceForegroundReleaseCoordinator(
@@ -2189,57 +2206,79 @@ class T3VoiceRuntimeService : Service() {
       ) {
         synchronized(operationLock) { executeControlCommandLocked(T3VoiceControlCommand.TOGGLE_MUTE) }
       }
-      ACTION_DISABLE_READINESS -> synchronized(operationLock) { disableReadinessLocked() }
-      ACTION_READINESS -> synchronized(operationLock) { reconcileReadinessLocked() }
-      ACTION_START_RECORDING -> mailbox.submit(
-        VoiceKernelMessage.HostIntent(VoiceKernelHostIntentAction.ACTION_START_RECORDING),
+      ACTION_DISABLE_READINESS -> mailbox.submit(
+        VoiceKernelMessage.HostIntent(VoiceKernelHostIntentAction.ACTION_DISABLE_READINESS),
       ) {
-        synchronized(operationLock) {
-          reconcileStartCommand(
-            expectedOwnerId = intent.getStringExtra(EXTRA_OPERATION_ID),
-            activeOwnerId = T3VoiceStateStore.state.value.activeRecordingId,
-            foregroundServiceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
-            startId = startId,
-          )
+        synchronized(operationLock) { disableReadinessLocked() }
+      }
+      ACTION_READINESS -> mailbox.submit(
+        VoiceKernelMessage.HostIntent(VoiceKernelHostIntentAction.ACTION_READINESS),
+      ) {
+        synchronized(operationLock) { reconcileReadinessLocked() }
+      }
+      ACTION_START_RECORDING -> {
+        val foregroundServiceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        promoteForegroundOnMainThread(foregroundServiceType)
+        mailbox.submit(
+          VoiceKernelMessage.HostIntent(VoiceKernelHostIntentAction.ACTION_START_RECORDING),
+        ) {
+          synchronized(operationLock) {
+            reconcileStartCommand(
+              expectedOwnerId = intent.getStringExtra(EXTRA_OPERATION_ID),
+              activeOwnerId = T3VoiceStateStore.state.value.activeRecordingId,
+              foregroundServiceType = foregroundServiceType,
+              startId = startId,
+            )
+          }
         }
       }
-      ACTION_START_PLAYBACK -> mailbox.submit(
-        VoiceKernelMessage.HostIntent(VoiceKernelHostIntentAction.ACTION_START_PLAYBACK),
-      ) {
-        synchronized(operationLock) {
-          reconcileStartCommand(
-            expectedOwnerId = intent.getStringExtra(EXTRA_OPERATION_ID),
-            activeOwnerId = T3VoiceStateStore.state.value.activePlaybackId,
-            foregroundServiceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
-            startId = startId,
-          )
+      ACTION_START_PLAYBACK -> {
+        val foregroundServiceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        promoteForegroundOnMainThread(foregroundServiceType)
+        mailbox.submit(
+          VoiceKernelMessage.HostIntent(VoiceKernelHostIntentAction.ACTION_START_PLAYBACK),
+        ) {
+          synchronized(operationLock) {
+            reconcileStartCommand(
+              expectedOwnerId = intent.getStringExtra(EXTRA_OPERATION_ID),
+              activeOwnerId = T3VoiceStateStore.state.value.activePlaybackId,
+              foregroundServiceType = foregroundServiceType,
+              startId = startId,
+            )
+          }
         }
       }
-      ACTION_START_REALTIME -> mailbox.submit(
-        VoiceKernelMessage.HostIntent(VoiceKernelHostIntentAction.ACTION_START_REALTIME),
-      ) {
-        synchronized(operationLock) {
-          reconcileStartCommand(
-            expectedOwnerId = intent.getStringExtra(EXTRA_OPERATION_ID),
-            activeOwnerId = T3VoiceStateStore.state.value.activeRealtimeSessionId,
-            foregroundServiceType =
-              ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
-            startId = startId,
-          )
+      ACTION_START_REALTIME -> {
+        val foregroundServiceType =
+          ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        promoteForegroundOnMainThread(foregroundServiceType)
+        mailbox.submit(
+          VoiceKernelMessage.HostIntent(VoiceKernelHostIntentAction.ACTION_START_REALTIME),
+        ) {
+          synchronized(operationLock) {
+            reconcileStartCommand(
+              expectedOwnerId = intent.getStringExtra(EXTRA_OPERATION_ID),
+              activeOwnerId = T3VoiceStateStore.state.value.activeRealtimeSessionId,
+              foregroundServiceType = foregroundServiceType,
+              startId = startId,
+            )
+          }
         }
       }
-      else -> synchronized(operationLock) {
-        if (readinessConfig.enabled) reconcileReadinessLocked() else stopSelf(startId)
+      else -> mailbox.submit(
+        VoiceKernelMessage.Command(
+          callerIdentity = "android-service",
+          payloadKind = "start-command-other",
+        ),
+      ) {
+        synchronized(operationLock) {
+          if (readinessConfig.enabled) reconcileReadinessLocked() else stopSelf(startId)
+        }
       }
     }
-    return synchronized(operationLock) {
-      if (T3VoiceForegroundLifecyclePolicy.shouldRemainStarted(readinessConfig)) {
-        START_STICKY
-      } else {
-        START_NOT_STICKY
-      }
-    }
+    // The kernel may update readiness just after this read; one intent may return stale stickiness.
+    return startCommandStickiness.value
   }
 
   override fun onDestroy() {
@@ -2303,7 +2342,9 @@ class T3VoiceRuntimeService : Service() {
 
   private fun startRuntimeForeground(foregroundServiceType: Int) {
     T3VoiceForegroundLifecyclePolicy.requireDeclaredNonzero(foregroundServiceType)
-    val notification = buildNotification()
+    val snapshot = captureNotificationSnapshotLocked()
+    notificationSnapshot = snapshot
+    val notification = buildNotification(snapshot)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
       startForeground(NOTIFICATION_ID, notification, foregroundServiceType)
     } else {
@@ -2312,6 +2353,17 @@ class T3VoiceRuntimeService : Service() {
     T3VoiceStateStore.setForeground(true)
     foregroundServiceTypes = foregroundServiceType
     updateRuntimeControlSurfacesLocked()
+  }
+
+  private fun promoteForegroundOnMainThread(foregroundServiceType: Int) {
+    T3VoiceForegroundLifecyclePolicy.requireDeclaredNonzero(foregroundServiceType)
+    val notification = buildNotification(notificationSnapshot)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+      startForeground(NOTIFICATION_ID, notification, foregroundServiceType)
+    } else {
+      startForeground(NOTIFICATION_ID, notification)
+    }
+    foregroundServiceTypes = foregroundServiceType
   }
 
   private fun keepServiceStarted(action: String, operationId: String) {
@@ -5550,8 +5602,13 @@ class T3VoiceRuntimeService : Service() {
         .build(),
     )
     session.isActive = readinessConfig.isEffective() || active
+    val snapshot = captureNotificationSnapshotLocked(state, active)
+    notificationSnapshot = snapshot
     if (state.isForeground) {
-      getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification())
+      getSystemService(NotificationManager::class.java).notify(
+        NOTIFICATION_ID,
+        buildNotification(snapshot),
+      )
     }
   }
 
@@ -5574,10 +5631,10 @@ class T3VoiceRuntimeService : Service() {
     getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
   }
 
-  @Suppress("DEPRECATION")
-  private fun buildNotification(): Notification {
-    val state = T3VoiceStateStore.state.value
-    val active = runtimeControlSurfaceActiveLocked(state)
+  private fun captureNotificationSnapshotLocked(
+    state: T3VoiceRuntimeState = T3VoiceStateStore.state.value,
+    active: Boolean = runtimeControlSurfaceActiveLocked(state),
+  ): T3VoiceNotificationSnapshot {
     val realtimeCheckpoint = voiceRuntimeRealtimeEngine?.snapshot()
     val starting =
       state.phase == T3VoiceRuntimePhase.ARMING ||
@@ -5592,6 +5649,20 @@ class T3VoiceRuntimeService : Service() {
       realtimeCheckpoint == null &&
         runtimeThreadAttempt == null &&
         (canonicalRealtimeAuthorityLocked() != null || nativeThreadAuthorityLocked() != null)
+    return T3VoiceNotificationSnapshot(
+      active = active,
+      starting = starting,
+      canStart = canStart,
+      controllerAttached = controllerAttached,
+      readinessEnabled = readinessConfig.enabled,
+      readinessMode = readinessConfig.mode,
+      realtimeActive = state.phase == T3VoiceRuntimePhase.REALTIME,
+      realtimeMuted = state.realtimeMuted,
+    )
+  }
+
+  @Suppress("DEPRECATION")
+  private fun buildNotification(snapshot: T3VoiceNotificationSnapshot): Notification {
     val primaryIntent =
       PendingIntent.getService(
         this,
@@ -5644,18 +5715,18 @@ class T3VoiceRuntimeService : Service() {
       .setSmallIcon(android.R.drawable.ic_btn_speak_now)
       .setContentTitle(
         when {
-          starting -> "T3 voice starting"
-          active -> "T3 voice active"
+          snapshot.starting -> "T3 voice starting"
+          snapshot.active -> "T3 voice active"
           else -> "T3 voice ready"
         },
       )
       .setContentText(
         when {
-          starting -> "Preparing audio. Use Stop to cancel."
-          active -> "Use the voice control to stop the active operation."
-          canStart -> "Voice controls are ready."
-          controllerAttached -> "Microphone permission is required."
-          readinessConfig.mode == T3VoiceReadinessMode.REALTIME ->
+          snapshot.starting -> "Preparing audio. Use Stop to cancel."
+          snapshot.active -> "Use the voice control to stop the active operation."
+          snapshot.canStart -> "Voice controls are ready."
+          snapshot.controllerAttached -> "Microphone permission is required."
+          snapshot.readinessMode == T3VoiceReadinessMode.REALTIME ->
             "Open T3 to renew voice authorization."
           else -> "Open T3 to unlock voice controls."
         },
@@ -5663,19 +5734,19 @@ class T3VoiceRuntimeService : Service() {
       .setContentIntent(contentIntent)
       .setOngoing(true)
       .setOnlyAlertOnce(true)
-    if (active) {
+    if (snapshot.active) {
       builder.addAction(android.R.drawable.ic_media_pause, "Stop", stopPendingIntent)
-      if (active && state.phase == T3VoiceRuntimePhase.REALTIME) {
+      if (snapshot.realtimeActive) {
         builder.addAction(
           android.R.drawable.ic_btn_speak_now,
-          if (state.realtimeMuted) "Unmute" else "Mute",
+          if (snapshot.realtimeMuted) "Unmute" else "Mute",
           muteIntent,
         )
       }
-    } else if (canStart) {
+    } else if (snapshot.canStart) {
       builder.addAction(android.R.drawable.ic_media_play, "Start", primaryIntent)
     }
-    if (readinessConfig.enabled) {
+    if (snapshot.readinessEnabled) {
       builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disable", disableReadinessIntent)
     }
     return builder.build()
