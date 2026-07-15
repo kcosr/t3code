@@ -698,6 +698,7 @@ internal class VoiceRuntimeRealtimeReducer(
           listOf(
             VoiceRuntimeRealtimeEffect.Persist(
               VoiceRuntimeRealtimePersistence.InstallFinalization(null, finalization),
+              outputs = listOf(VoiceRuntimeRealtimeOutput.FinalizationInstalled(finalization)),
               effects = listOf(finalizationEffect(finalization)),
             ),
           ),
