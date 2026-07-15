@@ -1,13 +1,11 @@
 package expo.modules.t3voice
 
-import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
 
 internal enum class T3VoiceRuntimePhase {
   INACTIVE,
@@ -28,7 +26,6 @@ internal enum class T3VoiceOperationOwnerDomain {
 
 internal data class T3VoiceOperationOwner(
   val id: String,
-  val generation: Long,
   val domain: T3VoiceOperationOwnerDomain,
   val operationId: String,
 )
@@ -37,9 +34,7 @@ internal data class T3VoiceRuntimeState(
   val phase: T3VoiceRuntimePhase,
   val isForeground: Boolean,
   val activeRecordingId: String?,
-  val activeRecordingGeneration: Long?,
   val activePlaybackId: String?,
-  val activePlaybackGeneration: Long?,
   val activeRealtimeSessionId: String?,
   val realtimeConnectionState: String?,
   val realtimeMuted: Boolean,
@@ -199,9 +194,7 @@ internal object T3VoiceStateStore {
         phase = T3VoiceRuntimePhase.INACTIVE,
         isForeground = false,
         activeRecordingId = null,
-        activeRecordingGeneration = null,
         activePlaybackId = null,
-        activePlaybackGeneration = null,
         activeRealtimeSessionId = null,
         realtimeConnectionState = null,
         realtimeMuted = false,
@@ -210,7 +203,6 @@ internal object T3VoiceStateStore {
       ),
     )
   private val mutableEvents = MutableSharedFlow<T3VoiceRuntimeEvent>(extraBufferCapacity = 64)
-  private val nextOperationGeneration = AtomicLong(0)
   private val mutableRealtimeTermination =
     MutableStateFlow<T3VoiceRuntimeEvent.RealtimeTerminated?>(null)
   private val mutableRecordingTermination =
@@ -258,7 +250,7 @@ internal object T3VoiceStateStore {
     }
     adoptedThreadVoiceHandoffRecordingIds.remove(current.recordingId)
     threadVoiceHandoffAdoptionClaims.remove(actionId)
-    mutableThreadVoiceHandoff.compareAndSet(current, null)
+    if (mutableThreadVoiceHandoff.value == current) mutableThreadVoiceHandoff.value = null
   }
 
   @Synchronized
@@ -314,32 +306,26 @@ internal object T3VoiceStateStore {
     if (recordingStillAdoptable) return current
     adoptedThreadVoiceHandoffRecordingIds.remove(current.recordingId)
     threadVoiceHandoffAdoptionClaims.remove(current.actionId)
-    mutableThreadVoiceHandoff.compareAndSet(current, null)
+    if (mutableThreadVoiceHandoff.value == current) mutableThreadVoiceHandoff.value = null
     return null
   }
 
   fun claimRealtime(sessionId: String): Boolean {
-    while (true) {
-      val current = mutableState.value
-      if (current.phase != T3VoiceRuntimePhase.IDLE) return false
-      val next =
-        current.copy(
+    val current = mutableState.value
+    if (current.phase != T3VoiceRuntimePhase.IDLE) return false
+    mutableState.value =
+      current.copy(
           phase = T3VoiceRuntimePhase.REALTIME,
           activeRecordingId = null,
-          activeRecordingGeneration = null,
           activePlaybackId = null,
-          activePlaybackGeneration = null,
           activeRealtimeSessionId = sessionId,
           realtimeConnectionState = "preparing",
           realtimeMuted = false,
           realtimeInputReady = false,
           sequence = current.sequence + 1,
         )
-      if (mutableState.compareAndSet(current, next)) {
-        mutableRealtimeTermination.value = null
-        return true
-      }
-    }
+    mutableRealtimeTermination.value = null
+    return true
   }
 
   fun releaseRealtimeClaim(sessionId: String) {
@@ -359,9 +345,7 @@ internal object T3VoiceStateStore {
       it.copy(
         phase = T3VoiceRuntimePhase.IDLE,
         activeRecordingId = null,
-        activeRecordingGeneration = null,
         activePlaybackId = null,
-        activePlaybackGeneration = null,
         activeRealtimeSessionId = null,
         realtimeConnectionState = null,
         realtimeMuted = false,
@@ -384,7 +368,6 @@ internal object T3VoiceStateStore {
       mutableRecordingTermination.value != null) return null
     val owner = T3VoiceOperationOwner(
       recordingId,
-      nextOperationGeneration.incrementAndGet(),
       domain,
       operationId,
     )
@@ -393,9 +376,7 @@ internal object T3VoiceStateStore {
         it.copy(
           phase = T3VoiceRuntimePhase.ARMING,
           activeRecordingId = recordingId,
-          activeRecordingGeneration = owner.generation,
           activePlaybackId = null,
-          activePlaybackGeneration = null,
           activeRealtimeSessionId = null,
           realtimeConnectionState = null,
           realtimeMuted = false,
@@ -409,12 +390,10 @@ internal object T3VoiceStateStore {
     updateIfOperationOwner(
       owner,
       T3VoiceRuntimeState::activeRecordingId,
-      T3VoiceRuntimeState::activeRecordingGeneration,
     ) {
       it.copy(
         phase = T3VoiceRuntimePhase.IDLE,
         activeRecordingId = null,
-        activeRecordingGeneration = null,
       )
     }
 
@@ -422,7 +401,6 @@ internal object T3VoiceStateStore {
     updateIfOperationOwner(
       owner,
       T3VoiceRuntimeState::activeRecordingId,
-      T3VoiceRuntimeState::activeRecordingGeneration,
     ) {
       it.copy(phase = T3VoiceRuntimePhase.RECORDING)
     }
@@ -460,11 +438,12 @@ internal object T3VoiceStateStore {
   fun clearRecordingTermination(recordingId: String) {
     val current = mutableRecordingTermination.value?.takeIf { it.recordingId == recordingId }
       ?: return
-    if (!mutableRecordingTermination.compareAndSet(current, null)) return
+    if (mutableRecordingTermination.value != current) return
+    mutableRecordingTermination.value = null
     val handoff = mutableThreadVoiceHandoff.value?.takeIf { it.recordingId == recordingId }
     if (handoff != null) {
       threadVoiceHandoffAdoptionClaims.remove(handoff.actionId)
-      mutableThreadVoiceHandoff.compareAndSet(handoff, null)
+      if (mutableThreadVoiceHandoff.value == handoff) mutableThreadVoiceHandoff.value = null
     }
     adoptedThreadVoiceHandoffRecordingIds.remove(recordingId)
   }
@@ -479,7 +458,6 @@ internal object T3VoiceStateStore {
       mutablePlaybackTermination.value != null) return null
     val owner = T3VoiceOperationOwner(
       playbackId,
-      nextOperationGeneration.incrementAndGet(),
       domain,
       operationId,
     )
@@ -488,9 +466,7 @@ internal object T3VoiceStateStore {
         it.copy(
           phase = T3VoiceRuntimePhase.PLAYING,
           activeRecordingId = null,
-          activeRecordingGeneration = null,
           activePlaybackId = playbackId,
-          activePlaybackGeneration = owner.generation,
           activeRealtimeSessionId = null,
           realtimeConnectionState = null,
           realtimeMuted = false,
@@ -504,12 +480,10 @@ internal object T3VoiceStateStore {
     updateIfOperationOwner(
       owner,
       T3VoiceRuntimeState::activePlaybackId,
-      T3VoiceRuntimeState::activePlaybackGeneration,
     ) {
       it.copy(
         phase = T3VoiceRuntimePhase.IDLE,
         activePlaybackId = null,
-        activePlaybackGeneration = null,
       )
     }
 
@@ -526,10 +500,9 @@ internal object T3VoiceStateStore {
   }
 
   fun clearPlaybackTermination(playbackId: String) {
-    mutablePlaybackTermination.compareAndSet(
-      mutablePlaybackTermination.value?.takeIf { it.playbackId == playbackId },
-      null,
-    )
+    if (mutablePlaybackTermination.value?.playbackId == playbackId) {
+      mutablePlaybackTermination.value = null
+    }
   }
 
   fun setRealtime(
@@ -542,9 +515,7 @@ internal object T3VoiceStateStore {
       it.copy(
         phase = T3VoiceRuntimePhase.REALTIME,
         activeRecordingId = null,
-        activeRecordingGeneration = null,
         activePlaybackId = null,
-        activePlaybackGeneration = null,
         activeRealtimeSessionId = sessionId,
         realtimeConnectionState = connectionState,
         realtimeMuted = muted,
@@ -575,9 +546,7 @@ internal object T3VoiceStateStore {
         phase = T3VoiceRuntimePhase.INACTIVE,
         isForeground = false,
         activeRecordingId = null,
-        activeRecordingGeneration = null,
         activePlaybackId = null,
-        activePlaybackGeneration = null,
         activeRealtimeSessionId = null,
         realtimeConnectionState = null,
         realtimeMuted = false,
@@ -591,10 +560,9 @@ internal object T3VoiceStateStore {
   }
 
   private fun update(transform: (T3VoiceRuntimeState) -> T3VoiceRuntimeState) {
-    mutableState.update { current ->
-      val next = transform(current)
-      if (next == current) current else next.copy(sequence = current.sequence + 1)
-    }
+    val current = mutableState.value
+    val next = transform(current)
+    mutableState.value = if (next == current) current else next.copy(sequence = current.sequence + 1)
   }
 
   private fun updateIfRealtimeOwner(
@@ -605,13 +573,10 @@ internal object T3VoiceStateStore {
   }
 
   private fun claimIdle(transform: (T3VoiceRuntimeState) -> T3VoiceRuntimeState): Boolean {
-    while (true) {
-      val current = mutableState.value
-      if (current.phase != T3VoiceRuntimePhase.IDLE) return false
-      val transformed = transform(current)
-      val next = transformed.copy(sequence = current.sequence + 1)
-      if (mutableState.compareAndSet(current, next)) return true
-    }
+    val current = mutableState.value
+    if (current.phase != T3VoiceRuntimePhase.IDLE) return false
+    mutableState.value = transform(current).copy(sequence = current.sequence + 1)
+    return true
   }
 
   private fun updateIfOwner(
@@ -619,29 +584,24 @@ internal object T3VoiceStateStore {
     selectedOwner: (T3VoiceRuntimeState) -> String?,
     transform: (T3VoiceRuntimeState) -> T3VoiceRuntimeState,
   ): Boolean {
-    while (true) {
-      val current = mutableState.value
-      if (selectedOwner(current) != ownerId) return false
-      val transformed = transform(current)
-      val next = if (transformed == current) current else transformed.copy(sequence = current.sequence + 1)
-      if (next == current || mutableState.compareAndSet(current, next)) return true
-    }
+    val current = mutableState.value
+    if (selectedOwner(current) != ownerId) return false
+    val transformed = transform(current)
+    mutableState.value =
+      if (transformed == current) current else transformed.copy(sequence = current.sequence + 1)
+    return true
   }
 
   private fun updateIfOperationOwner(
     owner: T3VoiceOperationOwner,
     selectedId: (T3VoiceRuntimeState) -> String?,
-    selectedGeneration: (T3VoiceRuntimeState) -> Long?,
     transform: (T3VoiceRuntimeState) -> T3VoiceRuntimeState,
   ): Boolean {
-    while (true) {
-      val current = mutableState.value
-      if (selectedId(current) != owner.id || selectedGeneration(current) != owner.generation) {
-        return false
-      }
-      val transformed = transform(current)
-      val next = if (transformed == current) current else transformed.copy(sequence = current.sequence + 1)
-      if (next == current || mutableState.compareAndSet(current, next)) return true
-    }
+    val current = mutableState.value
+    if (selectedId(current) != owner.id) return false
+    val transformed = transform(current)
+    mutableState.value =
+      if (transformed == current) current else transformed.copy(sequence = current.sequence + 1)
+    return true
   }
 }

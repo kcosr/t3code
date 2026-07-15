@@ -169,26 +169,6 @@ class T3VoiceStateStoreTest {
   }
 
   @Test
-  fun recordingAndPlaybackRejectStaleGenerationsEvenWhenIdsAreReused() {
-    val firstRecording = checkNotNull(claimComposerRecording("recording"))
-    assertTrue(T3VoiceStateStore.releaseRecording(firstRecording))
-    val replacementRecording = checkNotNull(claimComposerRecording("recording"))
-    assertTrue(replacementRecording.generation > firstRecording.generation)
-    assertFalse(T3VoiceStateStore.releaseRecording(firstRecording))
-    assertEquals("recording", T3VoiceStateStore.state.value.activeRecordingId)
-    assertTrue(T3VoiceStateStore.releaseRecording(replacementRecording))
-
-    val firstPlayback = checkNotNull(claimManualPlayback("playback"))
-    assertTrue(T3VoiceStateStore.releasePlayback(firstPlayback))
-    val replacementPlayback = checkNotNull(claimManualPlayback("playback"))
-    assertTrue(replacementPlayback.generation > firstPlayback.generation)
-    assertFalse(T3VoiceStateStore.releasePlayback(firstPlayback))
-    assertEquals("playback", T3VoiceStateStore.state.value.activePlaybackId)
-    assertTrue(T3VoiceStateStore.releasePlayback(replacementPlayback))
-    assertEquals(T3VoiceRuntimePhase.IDLE, T3VoiceStateStore.state.value.phase)
-  }
-
-  @Test
   fun modeClaimsClearMutuallyExclusiveAndTerminalRealtimeFields() {
     assertTrue(T3VoiceStateStore.claimRealtime("session-a"))
     assertTrue(
@@ -208,9 +188,7 @@ class T3VoiceStateStoreTest {
     assertEquals(T3VoiceRuntimePhase.ARMING, recordingState.phase)
     assertTrue(T3VoiceStateStore.markRecordingStarted(recording))
     assertEquals(T3VoiceRuntimePhase.RECORDING, T3VoiceStateStore.state.value.phase)
-    assertEquals(recording.generation, recordingState.activeRecordingGeneration)
     assertNull(recordingState.activePlaybackId)
-    assertNull(recordingState.activePlaybackGeneration)
     assertNull(recordingState.activeRealtimeSessionId)
     assertNull(recordingState.realtimeConnectionState)
     assertFalse(recordingState.realtimeMuted)
@@ -219,9 +197,7 @@ class T3VoiceStateStoreTest {
     val playback = checkNotNull(claimManualPlayback("playback-a"))
     val playbackState = T3VoiceStateStore.state.value
     assertEquals(T3VoiceRuntimePhase.PLAYING, playbackState.phase)
-    assertEquals(playback.generation, playbackState.activePlaybackGeneration)
     assertNull(playbackState.activeRecordingId)
-    assertNull(playbackState.activeRecordingGeneration)
     assertNull(playbackState.activeRealtimeSessionId)
     assertNull(playbackState.realtimeConnectionState)
     assertFalse(playbackState.realtimeMuted)

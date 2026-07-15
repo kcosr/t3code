@@ -12,13 +12,6 @@ internal fun interface VoiceKernelCancellationToken {
   fun cancel(): Boolean
 }
 
-internal object VoiceKernelReschedulePolicy {
-  fun owns(
-    current: VoiceKernelCancellationToken?,
-    scheduled: VoiceKernelCancellationToken,
-  ): Boolean = current === scheduled
-}
-
 /**
  * Serializes runtime state ownership onto one kernel thread.
  *

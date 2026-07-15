@@ -49,11 +49,9 @@ internal class T3VoiceWebRtcSession(
     val sessionId: String,
     val diagnosticGeneration: Long,
     var audioRouteId: String,
-    val audioOwner: T3VoiceRealtimeAudioOwnerPolicy.Owner,
     val playoutMonitor: T3VoiceRealtimePlayoutMonitor,
     val audioDeviceModule: JavaAudioDeviceModule,
     val peerConnectionFactory: PeerConnectionFactory,
-    val timeoutOwner: T3VoiceRealtimeConnectionTimeoutPolicy.Owner,
     val peerConnection: PeerConnection,
     val audioSource: AudioSource,
     val audioTrack: AudioTrack,
@@ -68,7 +66,7 @@ internal class T3VoiceWebRtcSession(
     var offerTimeout: ScheduledFuture<*>? = null,
     var connectingTimeout: ScheduledFuture<*>? = null,
     var disconnectedTimeout: ScheduledFuture<*>? = null,
-    var audioRouterGeneration: Long? = null,
+    var audioRouterActive: Boolean = false,
     var playoutDrain: PlayoutDrain? = null,
     val resourcesReleased: AtomicBoolean = AtomicBoolean(false),
   )
@@ -93,11 +91,8 @@ internal class T3VoiceWebRtcSession(
   private val applicationContext = context.applicationContext
   private val lock = Any()
   private val scheduler = Executors.newSingleThreadScheduledExecutor()
-  private val terminalLatch = T3VoiceRealtimeTerminalLatch()
-  private val audioOwners = T3VoiceRealtimeAudioOwnerPolicy()
-  private val connectionTimeouts = T3VoiceRealtimeConnectionTimeoutPolicy()
   private var active: ActiveSession? = null
-  private val usedSessionIds = T3VoiceSessionIdTombstones(SESSION_ID_TOMBSTONE_CAPACITY)
+  private val sessionIds = T3VoiceSessionIdAssertion(SESSION_ID_TOMBSTONE_CAPACITY)
 
   init {
     initializeWebRtc(applicationContext)
@@ -105,7 +100,6 @@ internal class T3VoiceWebRtcSession(
 
   private fun createPeerResources(
     sessionId: String,
-    audioOwner: T3VoiceRealtimeAudioOwnerPolicy.Owner,
   ): PreparedPeer {
     var audioDeviceModule: JavaAudioDeviceModule? = null
     var peerConnectionFactory: PeerConnectionFactory? = null
@@ -130,8 +124,8 @@ internal class T3VoiceWebRtcSession(
           .setUseHardwareNoiseSuppressor(
             JavaAudioDeviceModule.isBuiltInNoiseSuppressorSupported(),
           )
-          .setAudioRecordErrorCallback(AudioRecordErrorCallback(audioOwner))
-          .setAudioTrackErrorCallback(AudioTrackErrorCallback(audioOwner))
+          .setAudioRecordErrorCallback(AudioRecordErrorCallback(sessionId))
+          .setAudioTrackErrorCallback(AudioTrackErrorCallback(sessionId))
           .setPlaybackSamplesReadyCallback(PlaybackSamplesReadyCallback(playoutMonitor))
           .createAudioDeviceModule()
       peerConnectionFactory =
@@ -187,12 +181,11 @@ internal class T3VoiceWebRtcSession(
     callback: T3VoiceWebRtcResultCallback<String>,
   ) {
     require(sessionId.isNotBlank()) { "nativeSessionId must be a non-empty string." }
-    val audioOwner = synchronized(lock) {
+    synchronized(lock) {
       check(active == null) { "A Realtime voice session is already active." }
-      check(usedSessionIds.add(sessionId)) { "Realtime native session IDs cannot be reused." }
-      audioOwners.issue(sessionId)
+      sessionIds.assertFresh(sessionId)
     }
-    val prepared = createPeerResources(sessionId, audioOwner)
+    val prepared = createPeerResources(sessionId)
     T3VoiceDiagnostics.record(
       diagnosticGeneration,
       T3VoiceDiagnosticCategory.LIFECYCLE,
@@ -211,11 +204,9 @@ internal class T3VoiceWebRtcSession(
             sessionId = sessionId,
             diagnosticGeneration = diagnosticGeneration,
             audioRouteId = audioRouteId,
-            audioOwner = audioOwner,
             playoutMonitor = prepared.playoutMonitor,
             audioDeviceModule = prepared.audioDeviceModule,
             peerConnectionFactory = prepared.peerConnectionFactory,
-            timeoutOwner = connectionTimeouts.activate(sessionId),
             peerConnection = peerConnection,
             audioSource = audioSource,
             audioTrack = audioTrack,
@@ -223,9 +214,7 @@ internal class T3VoiceWebRtcSession(
             offerCallback = callback,
           ).also { session ->
             active = session
-            audioOwners.activate(audioOwner)
             installedSession = session
-            terminalLatch.activate(sessionId)
             session.offerTimeout =
               scheduler.schedule(
                 { fail(sessionId, ERROR_ICE_TIMEOUT, "WebRTC ICE gathering timed out.", null, true) },
@@ -364,17 +353,14 @@ internal class T3VoiceWebRtcSession(
   fun routes(): List<Map<String, Any>> = audioRouter.routes().map(T3VoiceAudioRoute::toResultBody)
 
   fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>> {
-    val (session, routerGeneration) =
-      synchronized(lock) {
-        val session = requireActive(sessionId)
-        val generation = checkNotNull(session.audioRouterGeneration) {
-          "The Realtime audio route owner is unavailable."
-        }
-        session to generation
+    val session = synchronized(lock) {
+      requireActive(sessionId).also {
+        check(it.audioRouterActive) { "The Realtime audio route owner is unavailable." }
       }
-    audioRouter.select(routeId, routerGeneration)
+    }
+    audioRouter.select(routeId)
     synchronized(lock) {
-      if (active === session && session.audioRouterGeneration == routerGeneration) {
+      if (active === session && session.audioRouterActive) {
         session.audioRouteId = routeId
       }
     }
@@ -470,21 +456,19 @@ internal class T3VoiceWebRtcSession(
       T3VoiceDiagnosticCategory.LIFECYCLE,
       T3VoiceDiagnosticCode.MEDIA_RELEASED,
     )
-    session.audioRouterGeneration?.let(audioRouter::stop)
-    if (terminalLatch.claim(sessionId)) {
-      T3VoiceDiagnostics.record(
-        session.diagnosticGeneration,
-        T3VoiceDiagnosticCategory.TERMINAL,
-        T3VoiceDiagnosticCode.ENDED,
-      )
-      onTerminated(
-        sessionId,
-        OUTCOME_ENDED,
-        ERROR_SESSION_STOPPED,
-        false,
-        session.diagnosticGeneration,
-      )
-    }
+    if (session.audioRouterActive) audioRouter.stop()
+    T3VoiceDiagnostics.record(
+      session.diagnosticGeneration,
+      T3VoiceDiagnosticCategory.TERMINAL,
+      T3VoiceDiagnosticCode.ENDED,
+    )
+    onTerminated(
+      sessionId,
+      OUTCOME_ENDED,
+      ERROR_SESSION_STOPPED,
+      false,
+      session.diagnosticGeneration,
+    )
     onStateChanged(sessionId, STATE_CLOSED, session.captureState.userMuted, false)
     return true
   }
@@ -593,21 +577,21 @@ internal class T3VoiceWebRtcSession(
       } ?: return
       val routeSetup =
         runCatching {
-          if (synchronized(lock) { active === session && session.audioRouterGeneration == null }) {
+          if (synchronized(lock) { active === session && !session.audioRouterActive }) {
             val routerStart = audioRouter.start(sessionId)
             check(routerStart.transition.state != T3VoiceAudioFocusState.TERMINATED) {
               "Android denied Realtime audio focus."
             }
             var adopted = false
             try {
-              runCatching { audioRouter.select(session.audioRouteId, routerStart.ownerGeneration) }
+              runCatching { audioRouter.select(session.audioRouteId) }
                 .onFailure {
-                  audioRouter.select(T3VoiceAudioRouteKind.SYSTEM.id, routerStart.ownerGeneration)
+                  audioRouter.select(T3VoiceAudioRouteKind.SYSTEM.id)
                 }
               adopted =
                 synchronized(lock) {
                   if (active === session) {
-                    session.audioRouterGeneration = routerStart.ownerGeneration
+                    session.audioRouterActive = true
                     true
                   } else {
                     false
@@ -615,7 +599,7 @@ internal class T3VoiceWebRtcSession(
                 }
               check(adopted) { "Realtime session changed during audio route setup." }
             } finally {
-              if (!adopted) audioRouter.stop(routerStart.ownerGeneration)
+              if (!adopted) audioRouter.stop()
             }
           }
           val shouldPlay =
@@ -740,16 +724,11 @@ internal class T3VoiceWebRtcSession(
 
   private fun armConnectionTimeout(session: ActiveSession) {
     session.connectingTimeout?.cancel(false)
-    val token =
-      connectionTimeouts.arm(
-        session.timeoutOwner,
-        T3VoiceRealtimeConnectionTimeoutPolicy.Kind.CONNECTING,
-      ) ?: return
     session.connectingTimeout =
       scheduler.schedule(
         {
           failOnConnectionTimeout(
-            token,
+            session,
             ERROR_CONNECTION_TIMEOUT,
             "The Realtime media connection timed out while connecting.",
           )
@@ -761,16 +740,11 @@ internal class T3VoiceWebRtcSession(
 
   private fun armDisconnectedTimeout(session: ActiveSession) {
     session.disconnectedTimeout?.cancel(false)
-    val token =
-      connectionTimeouts.arm(
-        session.timeoutOwner,
-        T3VoiceRealtimeConnectionTimeoutPolicy.Kind.DISCONNECTED,
-      ) ?: return
     session.disconnectedTimeout =
       scheduler.schedule(
         {
           failOnConnectionTimeout(
-            token,
+            session,
             ERROR_DISCONNECTED_TIMEOUT,
             "The Realtime media connection did not recover.",
           )
@@ -781,24 +755,15 @@ internal class T3VoiceWebRtcSession(
   }
 
   private fun failOnConnectionTimeout(
-    token: T3VoiceRealtimeConnectionTimeoutPolicy.Token,
+    session: ActiveSession,
     code: String,
     message: String,
   ) {
     val session =
       synchronized(lock) {
-        if (!connectionTimeouts.consume(token)) return
-        val current = active?.takeIf {
-          it.sessionId == token.owner.sessionId && it.timeoutOwner == token.owner
-        } ?: return
+        val current = active?.takeIf { it === session } ?: return
         val peerState = current.peerConnection.connectionState()
-        val shouldFail =
-          when (token.kind) {
-            T3VoiceRealtimeConnectionTimeoutPolicy.Kind.CONNECTING ->
-              peerState != PeerConnection.PeerConnectionState.CONNECTED
-            T3VoiceRealtimeConnectionTimeoutPolicy.Kind.DISCONNECTED ->
-              peerState != PeerConnection.PeerConnectionState.CONNECTED
-          }
+        val shouldFail = peerState != PeerConnection.PeerConnectionState.CONNECTED
         if (!shouldFail) {
           if (peerState == PeerConnection.PeerConnectionState.CONNECTED) {
             cancelConnectionTimeouts(current)
@@ -816,7 +781,6 @@ internal class T3VoiceWebRtcSession(
     session.connectingTimeout = null
     session.disconnectedTimeout?.cancel(false)
     session.disconnectedTimeout = null
-    connectionTimeouts.disarmAll(session.timeoutOwner)
   }
 
   private fun fail(
@@ -853,21 +817,19 @@ internal class T3VoiceWebRtcSession(
       T3VoiceDiagnosticCategory.LIFECYCLE,
       T3VoiceDiagnosticCode.MEDIA_RELEASED,
     )
-    session.audioRouterGeneration?.let(audioRouter::stop)
-    if (terminalLatch.claim(session.sessionId)) {
-      T3VoiceDiagnostics.record(
-        session.diagnosticGeneration,
-        T3VoiceDiagnosticCategory.TERMINAL,
-        T3VoiceDiagnosticCode.FAILED,
-      )
-      onTerminated(
-        session.sessionId,
-        OUTCOME_FAILED,
-        code,
-        recoverable,
-        session.diagnosticGeneration,
-      )
-    }
+    if (session.audioRouterActive) audioRouter.stop()
+    T3VoiceDiagnostics.record(
+      session.diagnosticGeneration,
+      T3VoiceDiagnosticCategory.TERMINAL,
+      T3VoiceDiagnosticCode.FAILED,
+    )
+    onTerminated(
+      session.sessionId,
+      OUTCOME_FAILED,
+      code,
+      recoverable,
+      session.diagnosticGeneration,
+    )
     onStateChanged(session.sessionId, STATE_FAILED, session.captureState.userMuted, false)
   }
 
@@ -877,8 +839,6 @@ internal class T3VoiceWebRtcSession(
     session.offerTimeout?.cancel(false)
     session.offerTimeout = null
     cancelConnectionTimeouts(session)
-    connectionTimeouts.deactivate(session.timeoutOwner)
-    synchronized(lock) { audioOwners.deactivate(session.audioOwner) }
     releasePeerResources(
       session.audioDeviceModule,
       session.peerConnectionFactory,
@@ -1149,33 +1109,33 @@ internal class T3VoiceWebRtcSession(
   }
 
   private inner class AudioRecordErrorCallback(
-    private val owner: T3VoiceRealtimeAudioOwnerPolicy.Owner,
+    private val sessionId: String,
   ) : JavaAudioDeviceModule.AudioRecordErrorCallback {
     override fun onWebRtcAudioRecordInitError(message: String?) =
-      reportAudioError(owner, "realtime-microphone-init", message)
+      reportAudioError(sessionId, "realtime-microphone-init", message)
 
     override fun onWebRtcAudioRecordStartError(
       code: JavaAudioDeviceModule.AudioRecordStartErrorCode?,
       message: String?,
-    ) = reportAudioError(owner, "realtime-microphone-start", message)
+    ) = reportAudioError(sessionId, "realtime-microphone-start", message)
 
     override fun onWebRtcAudioRecordError(message: String?) =
-      reportAudioError(owner, "realtime-microphone", message)
+      reportAudioError(sessionId, "realtime-microphone", message)
   }
 
   private inner class AudioTrackErrorCallback(
-    private val owner: T3VoiceRealtimeAudioOwnerPolicy.Owner,
+    private val sessionId: String,
   ) : JavaAudioDeviceModule.AudioTrackErrorCallback {
     override fun onWebRtcAudioTrackInitError(message: String?) =
-      reportAudioError(owner, "realtime-playout-init", message)
+      reportAudioError(sessionId, "realtime-playout-init", message)
 
     override fun onWebRtcAudioTrackStartError(
       code: JavaAudioDeviceModule.AudioTrackStartErrorCode?,
       message: String?,
-    ) = reportAudioError(owner, "realtime-playout-start", message)
+    ) = reportAudioError(sessionId, "realtime-playout-start", message)
 
     override fun onWebRtcAudioTrackError(message: String?) =
-      reportAudioError(owner, "realtime-playout", message)
+      reportAudioError(sessionId, "realtime-playout", message)
   }
 
   private class PlaybackSamplesReadyCallback(
@@ -1188,18 +1148,11 @@ internal class T3VoiceWebRtcSession(
   }
 
   private fun reportAudioError(
-    owner: T3VoiceRealtimeAudioOwnerPolicy.Owner,
+    sessionId: String,
     code: String,
     @Suppress("UNUSED_PARAMETER") providerMessage: String?,
   ) {
-    val session =
-      synchronized(lock) {
-        if (!audioOwners.isActive(owner)) return
-        val current = active?.takeIf { it.audioOwner == owner } ?: return
-        active = null
-        current
-      }
-    finishFailedSession(session, code, "Realtime audio failed.", null, true)
+    fail(sessionId, code, "Realtime audio failed.", null, true)
   }
 
   private open class BaseSdpObserver : SdpObserver {

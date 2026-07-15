@@ -161,7 +161,6 @@ internal sealed interface T3VoiceRecordingTermination {
 
 internal class T3VoiceRecorder(
   private val context: Context,
-  private val terminalLock: Any = Any(),
   private val onTerminated: (T3VoiceRecordingTermination) -> Unit = {},
 ) {
   private data class ActiveRecording(
@@ -169,15 +168,12 @@ internal class T3VoiceRecorder(
     val recorder: MediaRecorder,
     val file: File,
     val startedAtMs: Long,
-    val terminalOwner: T3VoiceRecordingTerminalPolicy.Owner,
     val endpointDetector: T3VoiceEndpointDetector,
   )
 
   private var active: ActiveRecording? = null
   private val recordingCache = T3VoiceRecordingCache(context.cacheDir)
   private val completed = T3VoiceCompletedRecordingRegistry(recordingCache)
-  private val terminalPolicy = T3VoiceRecordingTerminalPolicy()
-  private val terminalCoordinator = T3VoiceRecordingTerminalCoordinator(terminalLock)
   private val endpointThread = HandlerThread("t3-voice-endpoint").apply { start() }
   private val endpointHandler = Handler(endpointThread.looper)
 
@@ -194,7 +190,6 @@ internal class T3VoiceRecorder(
     check(active == null) { "A voice recording is already active." }
     val outputFile = recordingCache.createTempFile()
     val recorder = createMediaRecorder()
-    val terminalOwner = terminalPolicy.activate(recordingId)
     try {
       recorder.setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
       recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
@@ -209,7 +204,6 @@ internal class T3VoiceRecorder(
       recorder.prepare()
       recorder.start()
     } catch (cause: Throwable) {
-      terminalPolicy.deactivate(terminalOwner)
       recorder.release()
       outputFile.delete()
       throw cause
@@ -221,19 +215,17 @@ internal class T3VoiceRecorder(
         recorder = recorder,
         file = outputFile,
         startedAtMs = SystemClock.elapsedRealtime(),
-        terminalOwner = terminalOwner,
         endpointDetector =
           T3VoiceEndpointDetector(endpointConfig) { diagnostic ->
             T3VoiceDiagnostics.recordEndpoint(diagnosticGeneration, diagnostic)
           },
       )
-    scheduleEndpointPoll(terminalOwner)
+    scheduleEndpointPoll(requireNotNull(active))
   }
 
   @Synchronized
   fun stop(recordingId: String): T3VoiceRecordingResult {
     val recording = requireActive(recordingId)
-    check(terminalPolicy.claim(recording.terminalOwner)) { "The recording already terminated." }
     recordTerminalDiagnostic(recording)
     active = null
     return finalizeCompleted(recording)
@@ -244,7 +236,6 @@ internal class T3VoiceRecorder(
     val recording = requireActive(recordingId)
     recordTerminalDiagnostic(recording)
     active = null
-    terminalPolicy.deactivate(recording.terminalOwner)
     try {
       recording.recorder.stop()
     } catch (_: RuntimeException) {
@@ -266,7 +257,6 @@ internal class T3VoiceRecorder(
     if (recording != null) {
       recordTerminalDiagnostic(recording)
       active = null
-      terminalPolicy.deactivate(recording.terminalOwner)
       recording.recorder.release()
       recording.file.delete()
     }
@@ -288,26 +278,22 @@ internal class T3VoiceRecorder(
         MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED -> "media-file-size-limit"
         else -> return
       }
-    terminalCoordinator.serialized {
-      val recording =
-        synchronized(this) {
-          val current = active?.takeIf { it.recorder === source } ?: return@serialized
-          if (!terminalPolicy.claim(current.terminalOwner)) return@serialized
-          active = null
-          current
-        }
-      recordTerminalDiagnostic(recording)
-      completeAutomatically(recording, reason)
+    val recording = synchronized(this) {
+      val current = active?.takeIf { it.recorder === source } ?: return
+      active = null
+      current
     }
+    recordTerminalDiagnostic(recording)
+    completeAutomatically(recording, reason)
   }
 
-  private fun scheduleEndpointPoll(owner: T3VoiceRecordingTerminalPolicy.Owner) {
+  private fun scheduleEndpointPoll(owner: ActiveRecording) {
     endpointHandler.postDelayed(
       object : Runnable {
         override fun run() {
           val termination =
             synchronized(this@T3VoiceRecorder) {
-              val recording = active?.takeIf { it.terminalOwner == owner } ?: return
+              val recording = active?.takeIf { it === owner } ?: return
               val elapsed = SystemClock.elapsedRealtime() - recording.startedAtMs
               recording.endpointDetector.observe(elapsed, recording.recorder.maxAmplitude)
             }
@@ -315,22 +301,17 @@ internal class T3VoiceRecorder(
             endpointHandler.postDelayed(this, ENDPOINT_POLL_INTERVAL_MS)
             return
           }
-          terminalCoordinator.serialized {
-            val recording =
-              synchronized(this@T3VoiceRecorder) {
-                val current =
-                  active?.takeIf { it.terminalOwner == owner } ?: return@serialized
-                if (!terminalPolicy.claim(owner)) return@serialized
-                active = null
-                current
-              }
-            when (termination) {
-              T3VoiceEndpointDetector.Outcome.NO_SPEECH -> cancelAutomatically(recording)
-              T3VoiceEndpointDetector.Outcome.SPEECH_ENDED ->
-                completeAutomatically(recording, "speech-ended")
-              T3VoiceEndpointDetector.Outcome.MAXIMUM_UTTERANCE ->
-                completeAutomatically(recording, "maximum-utterance")
-            }
+          val recording = synchronized(this@T3VoiceRecorder) {
+            val current = active?.takeIf { it === owner } ?: return
+            active = null
+            current
+          }
+          when (termination) {
+            T3VoiceEndpointDetector.Outcome.NO_SPEECH -> cancelAutomatically(recording)
+            T3VoiceEndpointDetector.Outcome.SPEECH_ENDED ->
+              completeAutomatically(recording, "speech-ended")
+            T3VoiceEndpointDetector.Outcome.MAXIMUM_UTTERANCE ->
+              completeAutomatically(recording, "maximum-utterance")
           }
         }
       },

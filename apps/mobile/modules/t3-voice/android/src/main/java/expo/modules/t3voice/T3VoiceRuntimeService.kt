@@ -243,13 +243,14 @@ class T3VoiceRuntimeService : Service() {
   private fun submitCallbackDelayed(
     body: () -> Unit,
     delayMillis: Long,
-  ): VoiceKernelCancellationToken =
-    mailbox.submitDelayed(callbackMessage("async-delay"), delayMillis, body)
+    timerId: String,
+  ): VoiceKernelCancellationToken = scheduleTick(timerId, delayMillis, body)
 
   private fun submitCallbackDelayed(
     runnable: Runnable,
     delayMillis: Long,
-  ): VoiceKernelCancellationToken = submitCallbackDelayed(runnable::run, delayMillis)
+    timerId: String,
+  ): VoiceKernelCancellationToken = submitCallbackDelayed(runnable::run, delayMillis, timerId)
 
   private fun scheduleTick(
     timerId: String,
@@ -2798,7 +2799,8 @@ class T3VoiceRuntimeService : Service() {
             createRuntimeThreadOperation(attempt)
           }
         }
-      }, VoiceRuntimeThreadRetryPolicy.delayMillis(++attempt.retryFailures))
+      }, VoiceRuntimeThreadRetryPolicy.delayMillis(++attempt.retryFailures),
+        "thread-create:${attempt.clientOperationId}")
       return
     }
     val target = persistedAuthority()?.target as? VoiceRuntimeTarget.Thread
@@ -2873,7 +2875,8 @@ class T3VoiceRuntimeService : Service() {
               createRuntimeThreadOperation(attempt)
             }
           }
-        }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures))
+        }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures),
+          "thread-create:${attempt.clientOperationId}")
       } else failRuntimeThreadLocked(attempt, "native-thread-create-failed")
       return
     }
@@ -3092,7 +3095,8 @@ class T3VoiceRuntimeService : Service() {
                   requestRuntimeThreadDraftDisposition(attempt)
                 }
               }
-            }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures))
+            }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures),
+              "thread-draft-disposition:${attempt.clientOperationId}")
             return@run
           }
           val persisted = runtimeThreadOperationStore.updateActive(attempt.clientOperationId) {
@@ -3172,7 +3176,8 @@ class T3VoiceRuntimeService : Service() {
                     uploadRuntimeThreadRecording(attempt, recording)
                   }
                 }
-              }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures))
+              }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures),
+                "thread-upload:${attempt.clientOperationId}")
             } else failRuntimeThreadLocked(attempt, "native-thread-upload-failed")
           } else {
             attempt.retryFailures = 0
@@ -3386,7 +3391,7 @@ class T3VoiceRuntimeService : Service() {
       run {
         if (runtimeThreadAttempt == null) startRuntimeThreadLocked()
       }
-    }, VoiceRuntimeThreadRetryPolicy.delayMillis(1))
+    }, VoiceRuntimeThreadRetryPolicy.delayMillis(1), "thread-restore")
   }
 
   private fun fetchRuntimeThreadDraft(attempt: VoiceRuntimeThreadAttempt) {
@@ -3478,7 +3483,8 @@ class T3VoiceRuntimeService : Service() {
                   consumeRuntimeThreadDraft(attempt)
                 }
               }
-            }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures))
+            }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures),
+              "thread-consume-draft:${attempt.clientOperationId}")
           }
         }
       }
@@ -3551,7 +3557,8 @@ class T3VoiceRuntimeService : Service() {
                   acknowledgeRuntimeThread(attempt, credential, operationId, cursor)
                 }
               }
-            }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures))
+            }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures),
+              "thread-acknowledge:${attempt.clientOperationId}")
           } else {
             attempt.acknowledging = false
             failRuntimeThreadLocked(attempt, "native-thread-ack-failed")
@@ -3570,7 +3577,7 @@ class T3VoiceRuntimeService : Service() {
       run {
         if (!attempt.stopped) pollRuntimeThread(attempt)
       }
-    }, delay)
+    }, delay, "thread-poll:${attempt.clientOperationId}")
   }
 
   private fun runtimeThreadServerEvent(
@@ -3770,7 +3777,8 @@ class T3VoiceRuntimeService : Service() {
             finishRuntimeThreadIfDrainedLocked(attempt)
           }
         }
-      }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures))
+      }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures),
+        "thread-finish:${attempt.clientOperationId}")
       return
     }
     runtimeThreadAttempt = null
@@ -3835,7 +3843,8 @@ class T3VoiceRuntimeService : Service() {
           stopRuntimeForegroundLocked()
         }
       }
-    }, VoiceRuntimeThreadRearmPolicy.delayMillis(target))
+    }, VoiceRuntimeThreadRearmPolicy.delayMillis(target),
+      "thread-rearm:${expectedIdentity.runtimeInstanceId}")
   }
 
   private fun cancelVoiceRuntimeThreadRearmLocked() {
@@ -4032,7 +4041,8 @@ class T3VoiceRuntimeService : Service() {
                       cancelRuntimeThreadOperation(attempt)
                     }
                   }
-                }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures))
+                }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures),
+                  "thread-cancel:${attempt.clientOperationId}")
                 return@run
               }
               attempt.stopped = true
@@ -4049,7 +4059,8 @@ class T3VoiceRuntimeService : Service() {
                     cancelRuntimeThreadOperation(attempt)
                   }
                 }
-              }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures))
+              }, VoiceRuntimeThreadRetryPolicy.delayMillis(attempt.retryFailures),
+                "thread-cancel:${attempt.clientOperationId}")
             }
             VoiceRuntimeThreadCancelDecision.AWAIT_REVOCATION -> {
               T3VoiceDiagnostics.record(

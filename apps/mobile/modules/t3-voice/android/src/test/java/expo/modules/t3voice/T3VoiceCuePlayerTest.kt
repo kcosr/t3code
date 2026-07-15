@@ -97,18 +97,20 @@ class T3VoiceCuePlayerTest {
   }
 
   @Test
-  fun `newer transition cancels old and stale transition cannot replace it`() {
-    val fixture = Fixture(outputs = ArrayDeque(listOf(FakeOutput(), FakeOutput())))
+  fun `each armed transition replaces the prior cue`() {
+    val fixture = Fixture(outputs = ArrayDeque(listOf(FakeOutput(), FakeOutput(), FakeOutput())))
     val completions = mutableListOf<T3VoiceCueCompletion>()
 
     assertTrue(fixture.player.play(T3VoiceCue.READY, 7, completions::add))
     assertTrue(fixture.player.play(T3VoiceCue.ENDED, 8, completions::add))
-    assertFalse(fixture.player.play(T3VoiceCue.READY, 7, completions::add))
+    assertTrue(fixture.player.play(T3VoiceCue.READY, 7, completions::add))
     fixture.worker.runAll()
 
-    assertEquals(1, completions.size)
-    assertEquals(7L, completions.single().generation)
-    assertEquals(T3VoiceCueOutcome.CANCELLED, completions.single().outcome)
+    assertEquals(listOf(7L, 8L), completions.map { it.generation })
+    assertEquals(
+      listOf(T3VoiceCueOutcome.CANCELLED, T3VoiceCueOutcome.CANCELLED),
+      completions.map { it.outcome },
+    )
   }
 
   @Test

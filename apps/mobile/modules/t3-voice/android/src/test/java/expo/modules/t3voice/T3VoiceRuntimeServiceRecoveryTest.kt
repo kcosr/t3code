@@ -86,7 +86,6 @@ internal class T3VoiceRuntimeServiceRecoveryTest {
     }
     val owner = T3VoiceOperationOwner(
       "operation-1",
-      1,
       T3VoiceOperationOwnerDomain.THREAD_MODE,
       "operation-1",
     )

@@ -9,7 +9,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.PI
 import kotlin.math.sin
 
@@ -79,8 +78,8 @@ internal class T3VoiceCuePlayer(
     val pcm: ByteArray,
     val deadlineAtMs: Long,
     val completion: (T3VoiceCueCompletion) -> Unit,
-    val terminalClaimed: AtomicBoolean = AtomicBoolean(false),
     val attemptTasks: MutableList<T3VoiceCueTask> = mutableListOf(),
+    var acceptingOutput: Boolean = true,
     var attempt: Int = 0,
     var output: T3VoiceCueOutput? = null,
     var timeoutTask: T3VoiceCueTask? = null,
@@ -88,7 +87,6 @@ internal class T3VoiceCuePlayer(
 
   private val lock = Any()
   private var active: ActiveCue? = null
-  private var highestGeneration = 0L
   private var released = false
 
   init {
@@ -105,9 +103,8 @@ internal class T3VoiceCuePlayer(
     val replaced: ActiveCue?
     val next: ActiveCue
     synchronized(lock) {
-      if (released || generation <= highestGeneration) return false
-      highestGeneration = generation
-      replaced = active
+      if (released) return false
+      replaced = active?.takeIf { it.acceptingOutput }
       val pcm =
         T3VoiceCuePcm.withStartupPreRoll(
           sampleRate,
@@ -141,13 +138,15 @@ internal class T3VoiceCuePlayer(
   }
 
   fun cancel(generation: Long): Boolean {
-    val current = synchronized(lock) { active?.takeIf { it.generation == generation } } ?: return false
+    val current = synchronized(lock) {
+      active?.takeIf { it.generation == generation && it.acceptingOutput }
+    } ?: return false
     settle(current, T3VoiceCueOutcome.CANCELLED, flush = true)
     return true
   }
 
   fun cancelActive(): Boolean {
-    val current = synchronized(lock) { active } ?: return false
+    val current = synchronized(lock) { active?.takeIf { it.acceptingOutput } } ?: return false
     settle(current, T3VoiceCueOutcome.CANCELLED, flush = true)
     return true
   }
@@ -170,7 +169,7 @@ internal class T3VoiceCuePlayer(
       return
     }
     synchronized(lock) {
-      if (active !== cue || cue.terminalClaimed.get()) {
+      if (!cue.acceptingOutput) {
         worker.execute { runCatching { output.release(true) } }
         return
       }
@@ -186,7 +185,7 @@ internal class T3VoiceCuePlayer(
       }
       if (!isCurrent(cue)) return
       synchronized(lock) {
-        if (active !== cue || cue.output !== output || cue.terminalClaimed.get()) return
+        if (!cue.acceptingOutput || cue.output !== output) return
         cue.attemptTasks += scheduler.schedule(coldStartCheckMs) { checkColdStart(cue, output) }
         cue.attemptTasks += scheduler.schedule(drainPollMs) { checkDrain(cue, output) }
       }
@@ -233,7 +232,7 @@ internal class T3VoiceCuePlayer(
       settle(cue, T3VoiceCueOutcome.TIMED_OUT, flush = true)
     } else {
       synchronized(lock) {
-        if (active === cue && !cue.terminalClaimed.get()) {
+        if (cue.acceptingOutput) {
           cue.timeoutTask = scheduler.schedule(remainingMs) { checkTimeout(cue) }
         }
       }
@@ -241,7 +240,6 @@ internal class T3VoiceCuePlayer(
   }
 
   private fun settle(cue: ActiveCue, outcome: T3VoiceCueOutcome, flush: Boolean) {
-    if (!cue.terminalClaimed.compareAndSet(false, true)) return
     recordDiagnostic(
       cue.generation,
       T3VoiceDiagnosticCategory.TERMINAL,
@@ -253,7 +251,7 @@ internal class T3VoiceCuePlayer(
       },
     )
     val output = synchronized(lock) {
-      if (active === cue) active = null
+      cue.acceptingOutput = false
       cue.attemptTasks.forEach(T3VoiceCueTask::cancel)
       cue.attemptTasks.clear()
       cue.timeoutTask?.cancel()
@@ -268,13 +266,13 @@ internal class T3VoiceCuePlayer(
   }
 
   private fun isCurrent(cue: ActiveCue): Boolean =
-    synchronized(lock) { active === cue && !cue.terminalClaimed.get() }
+    synchronized(lock) { cue.acceptingOutput }
 
   private fun owns(cue: ActiveCue, output: T3VoiceCueOutput): Boolean =
     synchronized(lock) { ownsLocked(cue, output) }
 
   private fun ownsLocked(cue: ActiveCue, output: T3VoiceCueOutput): Boolean =
-    active === cue && cue.output === output && !cue.terminalClaimed.get()
+    cue.acceptingOutput && cue.output === output
 
   private fun timeoutFor(pcm: ByteArray): Long {
     val audioDurationMs =

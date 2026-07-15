@@ -10,7 +10,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 
 internal interface T3VoicePcmOutput {
   val playbackHeadPosition: Long
@@ -82,8 +81,7 @@ internal class T3VoicePcmPlayer(
     var outputStarted: Boolean = false,
     var drainScheduled: Boolean = false,
     var incompleteTimeout: T3VoicePlaybackTimeoutTask? = null,
-    var timeoutGeneration: Long = 0,
-    val released: AtomicBoolean = AtomicBoolean(false),
+    var outputReleased: Boolean = false,
   )
 
   private val executor = Executors.newSingleThreadExecutor()
@@ -403,23 +401,23 @@ internal class T3VoicePcmPlayer(
   }
 
   private fun releaseOutputOnce(playback: ActivePlayback, flush: Boolean) {
-    synchronized(lock) { cancelIncompleteTimeoutLocked(playback) }
-    if (playback.released.compareAndSet(false, true)) playback.output.release(flush)
+    val release = synchronized(lock) {
+      cancelIncompleteTimeoutLocked(playback)
+      if (playback.outputReleased) false else true.also { playback.outputReleased = it }
+    }
+    if (release) playback.output.release(flush)
   }
 
   private fun armInactivityTimeoutLocked(playback: ActivePlayback) {
     if (playback.paused) return
     cancelIncompleteTimeoutLocked(playback)
-    val timeoutGeneration = playback.timeoutGeneration
-    playback.incompleteTimeout =
-      timeoutScheduler.schedule(limits.inactivityTimeoutMs) {
+    lateinit var timeout: T3VoicePlaybackTimeoutTask
+    timeout = timeoutScheduler.schedule(limits.inactivityTimeoutMs) {
         val timedOut =
           synchronized(lock) {
-            if (
-              active !== playback ||
-                playback.cancelled ||
-                playback.timeoutGeneration != timeoutGeneration
-            ) return@schedule
+            if (active !== playback || playback.cancelled || playback.incompleteTimeout !== timeout) {
+              return@schedule
+            }
             active = null
             playback.cancelled = true
             playback.pending.clear()
@@ -429,10 +427,10 @@ internal class T3VoicePcmPlayer(
         releaseOutputOnce(timedOut, flush = true)
         onError(timedOut.playbackId, IllegalStateException("PCM playback stream became inactive."))
       }
+    playback.incompleteTimeout = timeout
   }
 
   private fun cancelIncompleteTimeoutLocked(playback: ActivePlayback) {
-    playback.timeoutGeneration += 1
     playback.incompleteTimeout?.cancel()
     playback.incompleteTimeout = null
   }

@@ -26,7 +26,6 @@ internal data class T3VoiceAudioRoute(
 
 internal data class T3VoiceAudioRouterStartResult(
   val transition: T3VoiceAudioFocusTransition,
-  val ownerGeneration: Long,
 )
 
 internal class T3VoiceAudioRouter(
@@ -40,9 +39,7 @@ internal class T3VoiceAudioRouter(
   private var selectedRoute = T3VoiceAudioRouteKind.SYSTEM
   private var deviceCallbackRegistered = false
   private var active = false
-  private var activeOwnerId: String? = null
   private var generation = 0L
-  private var activeGeneration: Long? = null
   private var focusChangeListener: AudioManager.OnAudioFocusChangeListener? = null
   private var deviceCallback: AudioDeviceCallback? = null
 
@@ -50,31 +47,25 @@ internal class T3VoiceAudioRouter(
   fun start(ownerId: String): T3VoiceAudioRouterStartResult {
     require(ownerId.isNotBlank()) { "Audio route owner must be non-empty." }
     if (active) {
-      if (activeOwnerId == ownerId) {
-        return T3VoiceAudioRouterStartResult(
-          transition = T3VoiceAudioFocusTransition(focusState, emptyList()),
-          ownerGeneration = checkNotNull(activeGeneration),
-        )
-      }
-      releaseAudioOwnership()
+      return T3VoiceAudioRouterStartResult(
+        transition = T3VoiceAudioFocusTransition(focusState, emptyList()),
+      )
     }
-    val ownerGeneration = T3VoiceDiagnostics.nextGeneration()
-    generation = ownerGeneration
-    activeGeneration = ownerGeneration
-    activeOwnerId = ownerId
+    val diagnosticGeneration = T3VoiceDiagnostics.nextGeneration()
+    generation = diagnosticGeneration
     recordDiagnostic(T3VoiceDiagnosticCategory.LIFECYCLE, T3VoiceDiagnosticCode.STARTED)
     focusChangeListener =
       AudioManager.OnAudioFocusChangeListener { change ->
-        onAudioFocusChanged(ownerGeneration, change)
+        onAudioFocusChanged(change)
       }
     deviceCallback =
       object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
-          reconcileSelectedRoute(ownerGeneration)
+          reconcileSelectedRoute()
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
-          reconcileSelectedRoute(ownerGeneration)
+          reconcileSelectedRoute()
         }
       }
     active = true
@@ -85,24 +76,19 @@ internal class T3VoiceAudioRouter(
       registerDeviceCallback()
       return T3VoiceAudioRouterStartResult(
         transition = T3VoiceAudioFocusTransition(focusState, emptyList()),
-        ownerGeneration = ownerGeneration,
       )
     }
     return T3VoiceAudioRouterStartResult(
       transition = applyFocusEvent(T3VoiceAudioFocusEvent.REQUEST_DENIED),
-      ownerGeneration = ownerGeneration,
     )
   }
 
   @Synchronized
-  fun stop(ownerGeneration: Long? = null): Boolean {
+  fun stop(): Boolean {
     if (!active) return false
-    if (ownerGeneration != null && activeGeneration != ownerGeneration) return false
     recordDiagnostic(T3VoiceDiagnosticCategory.LIFECYCLE, T3VoiceDiagnosticCode.STOPPED)
     unregisterDeviceCallback()
     active = false
-    activeGeneration = null
-    activeOwnerId = null
     focusState = T3VoiceAudioFocusState.TERMINATED
     selectedRoute = T3VoiceAudioRouteKind.SYSTEM
     runCatching(::clearSelectedRoute)
@@ -139,9 +125,8 @@ internal class T3VoiceAudioRouter(
   }
 
   @Synchronized
-  fun select(routeId: String, ownerGeneration: Long) {
+  fun select(routeId: String) {
     check(active) { "An active Realtime session is required to select an audio route." }
-    check(activeGeneration == ownerGeneration) { "The Realtime audio route owner changed." }
     val route = requireNotNull(T3VoiceAudioRouteKind.fromId(routeId)) { "Unsupported audio route." }
     if (route == T3VoiceAudioRouteKind.SYSTEM) {
       clearSelectedRoute()
@@ -291,8 +276,8 @@ internal class T3VoiceAudioRouter(
   }
 
   @Synchronized
-  private fun onAudioFocusChanged(ownerGeneration: Long, change: Int) {
-    if (!active || activeGeneration != ownerGeneration) return
+  private fun onAudioFocusChanged(change: Int) {
+    if (!active) return
     val event =
       when (change) {
         AudioManager.AUDIOFOCUS_GAIN -> T3VoiceAudioFocusEvent.GAINED
@@ -327,8 +312,6 @@ internal class T3VoiceAudioRouter(
   private fun releaseAudioOwnership() {
     if (!active) return
     active = false
-    activeGeneration = null
-    activeOwnerId = null
     unregisterDeviceCallback()
     selectedRoute = T3VoiceAudioRouteKind.SYSTEM
     runCatching(::clearSelectedRoute)
@@ -367,8 +350,8 @@ internal class T3VoiceAudioRouter(
   }
 
   @Synchronized
-  private fun reconcileSelectedRoute(ownerGeneration: Long) {
-    if (!active || activeGeneration != ownerGeneration) return
+  private fun reconcileSelectedRoute() {
+    if (!active) return
     val availableDevices =
       availableOutputDevicesOrNull()
         ?: run {
