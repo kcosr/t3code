@@ -39,6 +39,7 @@ internal enum class T3VoiceRealtimePlayoutDrainOutcome {
 
 internal class T3VoiceWebRtcSession(
   context: Context,
+  private val audioRouter: T3VoiceAudioRouter,
   private val onStateChanged: (String, String, Boolean, Boolean) -> Unit,
   private val onRouteChanged: (String, T3VoiceAudioRouteChange) -> Unit,
   private val onError: (String, String, String, Boolean) -> Unit,
@@ -92,12 +93,6 @@ internal class T3VoiceWebRtcSession(
   private val applicationContext = context.applicationContext
   private val lock = Any()
   private val scheduler = Executors.newSingleThreadScheduledExecutor()
-  private val audioRouter =
-    T3VoiceAudioRouter(
-      applicationContext,
-      ::handleAudioFocusActions,
-      ::handleAudioRouteChanged,
-    )
   private val terminalLatch = T3VoiceRealtimeTerminalLatch()
   private val audioOwners = T3VoiceRealtimeAudioOwnerPolicy()
   private val connectionTimeouts = T3VoiceRealtimeConnectionTimeoutPolicy()
@@ -671,7 +666,7 @@ internal class T3VoiceWebRtcSession(
     )
   }
 
-  private fun handleAudioFocusActions(actions: List<T3VoiceAudioFocusAction>) {
+  internal fun handleAudioFocusActions(actions: List<T3VoiceAudioFocusAction>) {
     val session = synchronized(lock) { active } ?: return
     for (action in actions) {
       if (synchronized(lock) { active !== session }) return
@@ -738,7 +733,7 @@ internal class T3VoiceWebRtcSession(
     }
   }
 
-  private fun handleAudioRouteChanged(change: T3VoiceAudioRouteChange) {
+  internal fun handleAudioRouteChanged(change: T3VoiceAudioRouteChange) {
     val sessionId = synchronized(lock) { active?.sessionId } ?: return
     onRouteChanged(sessionId, change)
   }

@@ -301,8 +301,18 @@ class T3VoiceModule : Module() {
           service.setVoiceRuntimeSessionCredential(
             requireText(input, "environmentOrigin", 2_048),
             requireText(input, "credential", 8_192),
-          )
-          settlement.resolve()
+          ) { persisted ->
+            persisted.fold(
+              onSuccess = { settlement.resolve() },
+              onFailure = { cause ->
+                settlement.reject(
+                  "voice-runtime-session-credential-failed",
+                  cause.message ?: "The runtime session credential could not be persisted.",
+                  cause,
+                )
+              },
+            )
+          }
         }
       }
 

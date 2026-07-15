@@ -36,11 +36,11 @@ sealed interface VoiceKernelMessage {
     val action: VoiceKernelHostIntentAction,
   ) : VoiceKernelMessage
 
-  /** Concrete driver result payloads are bound at M1/M3. */
   data class DriverResult(
     val epoch: VoiceKernelEpoch,
     val driver: VoiceKernelDriver,
     val resultKind: String,
+    val payload: VoiceKernelDriverResultPayload,
   ) : VoiceKernelMessage
 
   data class Tick(
@@ -50,4 +50,27 @@ sealed interface VoiceKernelMessage {
 
   /** Loaded-state payload is bound at M6. */
   data object Recover : VoiceKernelMessage
+}
+
+sealed interface VoiceKernelDriverResultPayload {
+  data class NetCompleted(
+    val label: String,
+    val continuation: () -> Unit,
+  ) : VoiceKernelDriverResultPayload
+
+  data class StorePersisted(
+    val label: String,
+    val result: Result<Unit>,
+    val continuation: (Result<Unit>) -> Unit,
+  ) : VoiceKernelDriverResultPayload
+
+  data class MediaEvent(
+    val eventKind: String,
+    val continuation: () -> Unit,
+  ) : VoiceKernelDriverResultPayload
+
+  data class HostCompleted(
+    val label: String,
+    val result: Result<Unit>,
+  ) : VoiceKernelDriverResultPayload
 }
