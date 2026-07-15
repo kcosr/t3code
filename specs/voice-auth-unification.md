@@ -9,8 +9,8 @@ ticket sections of `specs/native-voice-runtime-ownership.md` and the media ticke
 ## Decision
 
 There is exactly one client identity per device: the pairing state. The Android native voice
-runtime authenticates to the T3 server as the paired client itself — the same durable client
-session and the same access-token exchange React uses — and every voice runtime and media
+runtime authenticates to the T3 server as the paired client itself — attaching the same
+stored session credential React uses — and every voice runtime and media
 endpoint authenticates with standard session auth plus the `voice:use` scope. The parallel
 voice credential system (runtime grants, control grants, per-operation tokens, transition
 grant tokens, media tickets, refresh rotation) is deleted, not re-derived.
@@ -40,22 +40,27 @@ What the deleted machinery carried that is not authentication survives as plain 
 - The background-execution problem the refresh-rotation subsystem solved disappears with the
   right session method: paired bearer-token sessions default to a 30-day TTL
   (`SessionStore.ts` `DEFAULT_SESSION_TTL`; the bearer path of
-  `exchangeBootstrapCredentialForAccessToken` passes no TTL), and renewal is the same token
-  exchange every client already performs. Only DPoP access tokens are capped at one hour;
-  see Credential model.
+  `exchangeBootstrapCredentialForAccessToken` passes no TTL). The durable credential IS the
+  bearer session token — the bearer client performs no ongoing token exchange
+  (`authorizeBearer` attaches the stored token directly), so there is nothing for native to
+  refresh. Only DPoP access tokens are capped at one hour; see Credential model.
 
 ## Credential model
 
-- The app holds one credential set in Keystore-backed app storage readable by both React and
-  the native service: the pairing bootstrap credential and the current access token.
-- The native runtime attaches the current access token (`Authorization: Bearer ...`) to its
-  server calls. When stale, it performs the existing `/oauth/token` exchange with the shared
-  bootstrap credential — the same flow, not a voice-specific one.
-- Environments using DPoP: the DPoP signing key lives in the same app Keystore and is usable
-  by the service process; native performs the same DPoP proof as React. The initial
-  implementation targets the bearer path (local single-user deployments); DPoP-bound native
-  calls are follow-up hardening, not a blocker, because the deployment in scope pairs with
-  bearer sessions.
+- The app holds one shared credential in Keystore-backed app storage readable by both React
+  and the native service: the durable bearer session token
+  (`SavedRemoteConnection.bearerToken` — the credential the paired client already persists).
+- The native runtime attaches that token (`Authorization: Bearer ...`) to its server calls.
+  There is no native-side refresh because none exists to mirror: the bearer path performs no
+  token exchange (`authorizeBearer` attaches the stored token directly; the pairing one-time
+  token is consumed at pairing and is not reusable). On bearer expiry (30-day session TTL)
+  the affected mode enters `paused(reason=authority)` until the user re-pairs from React —
+  accepted for single-user local deployments.
+- Environments using DPoP are explicitly deferred: DPoP access tokens are one-hour and DO
+  require the `/oauth/token` exchange plus the DPoP signing key and a reusable relay
+  bootstrap credential. Supporting native DPoP means sharing that key and exchange flow with
+  the service process — follow-up hardening, not part of M0. The deployment in scope pairs
+  with bearer sessions.
 - Nothing voice-specific is minted, hashed, rotated, or refreshed. `voice:use` is already in
   `AuthStandardClientScopes`; no scope changes.
 
@@ -74,6 +79,14 @@ What the deleted machinery carried that is not authentication survives as plain 
     `generation`, `leaseGeneration`, `modeSessionId`) — which already travel in every
     request body/query (`canonicalFence`) — are validated against the stored lease exactly
     as the control grant cross-checked them;
+  - **close-only lifecycle flag**: after a voice session's bound generation is superseded
+    (handoff consumed or target replaced), the ownership check admits ONLY `close` for that
+    `voiceSessionId` and rejects every other child route, independent of the request's
+    generation. This is an explicit per-session lifecycle flag on the retained lease/binding
+    record — it cannot be derived from fence-vs-current-authority comparison, which either
+    leaks non-close operations through the cached binding or wrongly rejects a legitimate
+    close carrying the superseded generation. It reproduces the control-grant
+    `preserveSessionClose` downgrade semantics without the credential;
   - thread-turn operation routes: the operation row records the creating auth session and
     runtime identity; requests must match. The per-operation HMAC token tier is deleted;
     draft read/consume keeps its existing operation-scoped semantics under the ownership
@@ -101,16 +114,36 @@ What the deleted machinery carried that is not authentication survives as plain 
 The realtime→thread transition grant (one-use HMAC token consumed by `commitHandoff` to
 atomically advance the authority generation) is replaced by an idempotent reservation keyed
 `(voiceSessionId, actionId, nextGeneration)` with a `consumedAt` mark, created at exchange
-and consumed at commit under the same session ownership check. Same table shape minus the
-token; same exactly-once guarantee; redelivery returns the stored outcome.
+and consumed at commit under the same session ownership check. `sourceLeaseGeneration`
+remains a validated fence field on commit (it disambiguates the reservation today).
 
-### Revocation cascade (must not regress)
+Exactly-once is carried by transactionality, not the key alone: consuming the reservation
+(`consumedAt` CAS from NULL) and advancing the authority generation (CAS
+`expected == nextGeneration - 1 → nextGeneration`) occur in ONE atomic transaction,
+mirroring the existing `transition` transaction. Redelivery re-reads the reservation by its
+key; when `consumedAt` is set and the authority is already at `nextGeneration`, the stored
+outcome is returned. A crash between exchange and commit leaves an unconsumed reservation
+that commit can still consume; a crash cannot separate the consume-mark from the generation
+advance.
 
-`VoiceSessionLifecycleLive` already subscribes to `SessionStore.streamChanges` and fans
-`clientRemoved` out to voice sessions and grant registries. The cascade is rewired, not
-removed: on session revocation, terminate resident voice sessions, in-flight thread turns,
-and authority records for that `authSessionId` directly. An integration test asserts
-revoking the paired client ends native-held realtime and thread-turn work.
+### Revocation and replacement cascades (must not regress)
+
+Two distinct cascades exist today and both are rewired, not removed:
+
+**Auth-session revocation** (`VoiceSessionLifecycleLive` on `clientRemoved`): end resident
+voice sessions, cancel PRE-dispatch thread turns and DETACH already-dispatched coding turns
+(the accepted coding turn continues server-side, per the ownership spec), remove authority
+records, and purge `VoiceRuntimeRealtimeStarts` rows for that `authSessionId`. An
+integration test asserts revoking the paired client ends native-held realtime work and
+detaches (not kills) a dispatched coding turn.
+
+**Target replacement / clear** (currently driven by `revokeRuntime` + `revokeDerived`,
+which the grant-registry deletion removes): on a generation-advancing `configureAuthority`
+or a `clearAuthority`, the server must (a) end resident realtime/thread voice sessions
+bound to the prior generation (today `sessions.revokeRuntimeAuthority`), (b) cancel
+pre-dispatch thread turns for that runtime, and (c) purge superseded
+`VoiceRuntimeRealtimeStarts` rows. The retained starts table has no other purge trigger
+once the registry is deleted; both cascades above must re-home it explicitly.
 
 ## Deletion inventory
 
@@ -180,8 +213,14 @@ JS:
 
 One vertical cutover, per the repo's no-alias rule: server route auth, contract removal,
 Kotlin credential attachment, and JS provisioning simplification land together; the old
-headers are rejected, not aliased. `nativeRevision` bumps (the native↔JS provisioning
-contract changes shape). Local deployments cut over in a maintenance window with a rebuilt
+headers are rejected, not aliased. `VOICE_RUNTIME_PROTOCOL_MAJOR` bumps 1 → 2 (removing the
+six custom auth headers changes the native↔server protocol shape; a mismatched pair must
+refuse voice cleanly via the protocol gate, not fail with opaque 401s), and `nativeRevision`
+bumps (the native↔JS provisioning contract changes shape). Kotlin note: the
+`VoiceRuntimeAuthority` token validation (length ≤ 128, no whitespace, `VoiceRuntimeHttp.kt`)
+was sized for compact grant digests and is incompatible with `Authorization: Bearer <token>`
+values — the credential accessor replaces that header abstraction rather than re-pointing
+it. Local deployments cut over in a maintenance window with a rebuilt
 dev client; grant tables are drop-migrated after the cutover release. No data migration:
 authority records are re-established on first native attach (target reconfiguration), and
 in-flight voice sessions do not survive the maintenance window — acceptable for ephemeral
@@ -194,14 +233,15 @@ realtime sessions by the ownership spec's own process-failure rules.
   generation/lease; handoff exchange+commit exactly-once under redelivery and crash between
   exchange and commit; revocation cascade ends realtime and thread-turn work; media routes
   session-only (ticket path removed).
-- Kotlin: credential accessor attach/refresh (mock token exchange), startup with absent /
-  stale / revoked credential converges to `unavailable`/`locked` without capture; deleted
-  rotation paths have no surviving references.
+- Kotlin: credential accessor attaches the shared bearer token; startup with absent /
+  stale / revoked credential converges to `unavailable`/`locked` without capture; expiry or
+  revocation mid-mode pauses with `paused(reason=authority)` (no refresh path exists on
+  bearer); deleted rotation paths have no surviving references.
 - Conformance fixtures updated once (`configureAuthority` shape) and shared TS/Kotlin
   fixtures re-exported.
 - Device: background thread-turn completes with React dead using only the shared bearer
-  credential; token expiry mid-mode pauses with `paused(reason=authority)` and recovers
-  after refresh.
+  credential; revoking the client mid-mode pauses the runtime and releases media; recovery
+  requires re-pairing from React, and the paused state survives service restart.
 
 ## Supersessions
 
@@ -214,4 +254,14 @@ boundary sections.
 
 ## Review correspondence
 
-(appended by review cycles)
+- **2026-07-14 — Opus review cycle 1 — verdict: needs-rework.** Applied: credential model
+  rewritten to shared-bearer-token-no-refresh (the bearer path performs no `/oauth/token`
+  exchange and the pairing token is one-time; findings 4.1/4.2); close-only lifecycle flag
+  added to route auth (1.1); handoff exactly-once tightened to atomic
+  consume+CAS with `sourceLeaseGeneration` fence retained (2.1/2.2); target-replacement and
+  clear cascade added with `VoiceRuntimeRealtimeStarts` purge re-homing and
+  cancel-pre-dispatch/detach-post-dispatch distinction (3.1/3.2/6.3); migration gains the
+  `VOICE_RUNTIME_PROTOCOL_MAJOR` 1→2 bump and the Kotlin token-validation rework note
+  (5.1/5.2). Confirmed sound by review: single-trust-domain rationale, `canonicalFence`
+  claim, media session fallback, refresh-endpoint-outside-auth claim, thread-turn
+  session-scoping (1.2), media-ticket removal viability (6.1).

@@ -89,12 +89,10 @@ around the runs — authoring packet N+1 and adjudicating reviews while run N ex
        "spec": "/home/kevin/worktrees/t3code/specs/kernel-milestones/<mN>-<name>.md",
        "implementerProfile": "codex-gpt-5-6-sol-fast",
        "completionChecks": [
-         {"key": "typecheck", "type": "command", "shell": true,
-          "command": "vp run typecheck", "timeoutMs": 1200000},
-         {"key": "lint-mobile", "type": "command", "shell": true,
-          "command": "vp run lint:mobile", "timeoutMs": 1200000},
-         {"key": "native-static", "type": "command", "shell": true,
-          "command": "bun scripts/mobile-native-static-check.ts", "timeoutMs": 600000},
+         {"key": "typecheck", "type": "command",
+          "command": "pnpm", "args": ["run", "typecheck"], "timeoutMs": 1200000},
+         {"key": "lint-mobile", "type": "command",
+          "command": "pnpm", "args": ["run", "lint:mobile"], "timeoutMs": 600000},
          {"key": "committed", "type": "has-commits", "baseRef": "<stack-tip-sha>"},
          {"key": "clean", "type": "git-clean"}
        ]
