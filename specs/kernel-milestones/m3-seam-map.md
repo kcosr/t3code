@@ -29,8 +29,11 @@ Authoritative inventory for the M3 packets; produced by orchestrator audit. Key 
   :470, pendingStart :471, finalizationInFlight :472, commands ledger :473 (retained).
 - Stores: all internally @Synchronized, shared with WorkManager (stay non-exclusive).
   Keystore ciphers (authority + session credential) are tens-of-ms TEE ops — never in a
-  reducer step; commit-point sites: authority prepareTransition :4326, configure
-  :5059-5064, clear :5036; realtimeRepository.save (engine update()); threadOperation/
+  reducer step; commit-point sites (CORRECTED): clear() at TEN sites
+  (:258,:906,:1692,:2184,:3739,:4721,:4810,:5036,:5068,:5523); prepareTransition :4326;
+  discardPreparedTransition :4092/:4341/:4686. The 'configure' cipher write lives inside
+  VoiceRuntimeActiveThreadController (:260/:342) reached via voiceRuntimeController.
+  configure\* (:809-812, :5059-5062) — NOT a VoiceRuntimeAuthorityStore method; realtimeRepository.save (engine update()); threadOperation/
   readiness/cueSettings are cheap SharedPreferences.
 - Host effects: startForeground :2359-2373 (kernel) + promoteForegroundOnMainThread
   :2375-2384 (main thread, proto-HostDriver template); wake :5542-5556; MediaSession

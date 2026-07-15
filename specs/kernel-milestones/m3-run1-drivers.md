@@ -88,3 +88,45 @@ run (M4 wires real epochs) — but the plumbing must thread them.
 
 Commits: `feat(voice): extract net and store drivers`, `feat(voice): extract media and
 host drivers` (or one combined if cleaner); tree clean; pc gate follows.
+
+## Review amendments (BINDING — supersede conflicting text above)
+
+C1. **Hop reclassification**: eliminate to a direct kernel message ONLY the controlIo
+:1276 hop (onPeerConnected — pure fact, no server call). The hops at :1328, :4924, :4296
+and the offer callback (:4257) reach `completeShutdown → reconcileFinalization`
+(synchronous `server.commitHandoff`/`handoff.activate`/`server.close`) or
+`onOfferReady → server.offer` — synchronous network under the engine monitor. They MUST
+ride the NetDriver realtime lane, never the kernel thread. offerIo is lane-absorbed, not
+eliminated. Also: even for :1276, note that running engine entry on the kernel thread
+flips stateSink to inline-under-monitor delivery — wrap the sink dispatch so deliveries
+remain deferred via submitCallback regardless of calling thread (preserve today's
+behavior).
+
+C2. **NetDriver lanes revised**: thread-turn lane (sequential, unchanged) + realtime lane
+bound **4** (action 25s long-poll + heartbeat + start/offer + cleanup) + a DEDICATED
+control sub-lane of 1 (absorbs today's controlIo single thread: setMuted/stop/
+peer-terminated/drain-deadline/cue-complete/controlPost) so stop latency and control FIFO
+ordering are preserved exactly. Document the lane→consumer table in the driver kdoc.
+
+C3. **StoreDriver scope narrowed**: convert to persist→Persisted ONLY the
+fire-and-continue authority writes (the clear() sites NOT embedded in value-returning
+awaits, e.g. :1692, :2184, :3739, :4721, :4810, :5523 — verify each caller shape before
+converting). Authority writes embedded in `submitAndAwait`/`runOnKernelThreadOrAwait`
+bodies that return values synchronously (:906, :4326, :4341, :5036-in-:5030-runCatching,
+:5059-5064 controller configure, restoreCanonicalAuthorityLocked) STAY INLINE this run —
+their conversion requires the engine/binder contract changes owned by run 2/M4. The
+exception scoping of :5030's runCatching and the :5039 check() ordering must not change.
+
+C4. **MediaDriver construction order**: construct the driver at the TOP of onCreate's B3
+submitAndAwait body, BEFORE restoreCanonicalAuthorityLocked (:1930) — the engine ports
+(:4000-4002) and the async cleanupIo recovery (:4160) dereference driver-owned objects.
+Preserve the `realtime` lazy(SYNCHRONIZED) delegate semantics inside the driver (no eager
+WebRTC/PeerConnectionFactory init). The resulting construction reorder (cueCoordinator/
+recorder/player onto the kernel thread ahead of auth restore) is accepted; note it in the
+commit message.
+
+C5. **Token loops**: the heartbeat/action reschedule token dance
+(`VoiceKernelReschedulePolicy.owns` at :4855/:4890/:4900) moves intact into the
+`handleDriverResult` continuations — token captured at schedule, ownership-checked at
+result, new token stored on reschedule. `VoiceRuntimeRealtimeBinderOffload`
+(:1211-1214) is rewired to the driver lanes, not orphaned.
