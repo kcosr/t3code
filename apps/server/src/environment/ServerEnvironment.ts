@@ -1,4 +1,8 @@
-import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  VOICE_RUNTIME_PROTOCOL_MAJOR,
+  type ExecutionEnvironmentDescriptor,
+} from "@t3tools/contracts";
 import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -133,7 +137,7 @@ export const make = Effect.gen(function* () {
       arch: platformArch(hostArchitecture),
     },
     serverVersion: packageJson.version,
-    voiceRuntimeProtocolMajor: 1,
+    voiceRuntimeProtocolMajor: VOICE_RUNTIME_PROTOCOL_MAJOR,
     capabilities: {
       repositoryIdentity: true,
     },

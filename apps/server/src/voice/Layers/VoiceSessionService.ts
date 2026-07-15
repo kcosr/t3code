@@ -41,8 +41,6 @@ import { VoiceContextCompiler } from "../Services/VoiceContextCompiler.ts";
 import { VoiceConversationService } from "../Services/VoiceConversationService.ts";
 import type { RealtimeProviderEvent, RealtimeProviderSession } from "../Services/VoiceProvider.ts";
 import { VoiceProviderRegistry } from "../Services/VoiceProviderRegistry.ts";
-import { VoiceMediaTicketRegistry } from "../Services/VoiceMediaTicketRegistry.ts";
-import { VoiceRuntimeControlGrantRegistry } from "../Services/VoiceRuntimeControlGrantRegistry.ts";
 import { logVoiceDiagnostic, type VoiceSessionEndReason } from "../Services/VoiceObservability.ts";
 import { VoiceSessionRegistry, type VoiceSessionLease } from "../Services/VoiceSessionRegistry.ts";
 import {
@@ -203,8 +201,6 @@ const make = Effect.gen(function* () {
   const tools = yield* VoiceToolExecutor;
   const handoffActions = yield* VoiceHandoffActionRepository;
   const settingsService = yield* ServerSettingsService;
-  const tickets = yield* VoiceMediaTicketRegistry;
-  const runtimeControlGrants = yield* VoiceRuntimeControlGrantRegistry;
   const projection = yield* ProjectionSnapshotQuery;
   const serviceScope = yield* Scope.make("sequential");
   const lifecycleMutex = yield* Semaphore.make(1);
@@ -541,13 +537,6 @@ const make = Effect.gen(function* () {
     yield* emit(session.lease, { type: "state", phase });
     const current = (yield* SynchronizedRef.get(runtime)).sessions.get(session.lease.sessionId);
     yield* terminateProvider(current ?? session, options);
-    yield* options.handoffAuthority === "succeeded"
-      ? runtimeControlGrants.completeHandoff(session.lease.sessionId)
-      : options.handoffAuthority === "failed"
-        ? runtimeControlGrants.revokeSession(session.lease.sessionId)
-        : terminationSnapshot.terminalToolClaimed
-          ? runtimeControlGrants.releaseSessionControl(session.lease.sessionId)
-          : runtimeControlGrants.revokeSession(session.lease.sessionId);
     yield* registry.release(session.lease);
     yield* SynchronizedRef.update(runtime, (current) => {
       const idempotency = new Map(current.idempotency);
@@ -775,11 +764,6 @@ const make = Effect.gen(function* () {
     const expiredAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
     const expired = yield* handoffActions.expire({ now: expiredAt });
     yield* Effect.forEach(expired, persistHandoffOutcome, { discard: true });
-    yield* Effect.forEach(
-      new Set(expired.map((action) => action.realtimeSessionId)),
-      (sessionId) => runtimeControlGrants.revokeSession(VoiceSessionId.make(sessionId)),
-      { discard: true },
-    );
   });
 
   const submitTerminalHandoff = Effect.fn("VoiceSessionService.submitTerminalHandoff")(function* (
@@ -834,7 +818,6 @@ const make = Effect.gen(function* () {
               cause,
             }),
         ),
-        Effect.tapError(() => runtimeControlGrants.revokeSession(lease.sessionId)),
       );
     yield* providerSession
       .completeTerminalToolCall({
@@ -844,22 +827,19 @@ const make = Effect.gen(function* () {
       })
       .pipe(
         Effect.tapError(() =>
-          Effect.all([
-            handoffActions
-              .acknowledge({
-                actionId: action.actionId,
-                authSessionId: action.authSessionId,
-                result: {
-                  outcome: "failed",
-                  outcomeState: null,
-                  outcomeStage: "realtime-release",
-                  outcomeReason: "realtime-release-failed",
-                },
-                acknowledgedAt: createdAt,
-              })
-              .pipe(Effect.flatMap(persistHandoffOutcome)),
-            runtimeControlGrants.revokeSession(lease.sessionId),
-          ]).pipe(Effect.ignore),
+          handoffActions
+            .acknowledge({
+              actionId: action.actionId,
+              authSessionId: action.authSessionId,
+              result: {
+                outcome: "failed",
+                outcomeState: null,
+                outcomeStage: "realtime-release",
+                outcomeReason: "realtime-release-failed",
+              },
+              acknowledgedAt: createdAt,
+            })
+            .pipe(Effect.flatMap(persistHandoffOutcome), Effect.ignore),
         ),
       );
     const activatedAtMillis = yield* Clock.currentTimeMillis;
@@ -867,7 +847,7 @@ const make = Effect.gen(function* () {
     const expiresAtMillis = activatedAtMillis + HANDOFF_ACTION_TIMEOUT_MILLIS;
     const expiresAt = DateTime.formatIso(DateTime.makeUnsafe(expiresAtMillis));
     // Reserve the handoff capability before publishing the action. Teardown may
-    // race this transition, and must retain the narrowly scoped polling grant.
+    // race this transition, and must retain the narrowly scoped polling state.
     yield* Effect.gen(function* () {
       yield* mutateSession(lease.sessionId, (session) => [
         undefined,
@@ -891,12 +871,9 @@ const make = Effect.gen(function* () {
           }),
       ),
       Effect.tapError(() =>
-        Effect.all([
-          mutateSession(lease.sessionId, (session) => [
-            undefined,
-            { ...session, terminalHandoffReady: false },
-          ]),
-          runtimeControlGrants.revokeSession(lease.sessionId),
+        mutateSession(lease.sessionId, (session) => [
+          undefined,
+          { ...session, terminalHandoffReady: false },
         ]).pipe(Effect.ignore),
       ),
     );
@@ -1207,33 +1184,6 @@ const make = Effect.gen(function* () {
           "session.create",
           "The idempotent session belongs to different runtime authority",
         );
-      const token = yield* runtimeControlGrants
-        .issue({
-          authSessionId: ownerAuthSessionId,
-          sessionId: existing.lease.sessionId,
-          leaseGeneration: existing.lease.generation,
-          expiresAt: Date.parse(existing.expiresAt),
-          capabilities: new Set([
-            "session-control",
-            "handoff-actions",
-            ...(principal.runtimeAuthority === undefined
-              ? []
-              : (["webrtc-signaling", "session-close"] as const)),
-          ]),
-          ...(principal.runtimeAuthority === undefined
-            ? {}
-            : {
-                runtimeId: principal.runtimeAuthority.runtimeId,
-                runtimeGeneration: principal.runtimeAuthority.generation,
-              }),
-        })
-        .pipe(
-          Effect.tapError(() =>
-            endRuntimeSession(existing, "error", {
-              reason: "authority-issuance-failed",
-            }),
-          ),
-        );
       return {
         state: existing.state,
         transport: {
@@ -1242,14 +1192,6 @@ const make = Effect.gen(function* () {
         },
         expiresAt: existing.expiresAt,
         heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
-        runtimeControlGrant: {
-          token,
-          sessionId: existing.lease.sessionId,
-          leaseGeneration: existing.lease.generation,
-          expiresAt: existing.expiresAt,
-          heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
-          failureGraceSeconds: HEARTBEAT_FAILURE_GRACE_SECONDS,
-        },
       };
     }
     const initialFocus = yield* validateFocus({
@@ -1327,7 +1269,6 @@ const make = Effect.gen(function* () {
       takeover: input.conversation.type === "continue" && input.conversation.takeover,
     });
     if (Option.isSome(acquired.replacedSessionId)) {
-      yield* runtimeControlGrants.revokeSession(acquired.replacedSessionId.value);
       const displaced = (yield* SynchronizedRef.get(runtime)).sessions.get(
         acquired.replacedSessionId.value,
       );
@@ -1495,40 +1436,6 @@ const make = Effect.gen(function* () {
       acquired.lease.sessionId,
       (current) => [undefined, { ...current, heartbeatFiber }] as const,
     );
-    const runtimeControlToken = yield* runtimeControlGrants
-      .issue({
-        authSessionId: ownerAuthSessionId,
-        sessionId: acquired.lease.sessionId,
-        leaseGeneration: acquired.lease.generation,
-        expiresAt: Date.parse(expiresAt),
-        capabilities: new Set([
-          "session-control",
-          "handoff-actions",
-          ...(principal.runtimeAuthority === undefined
-            ? []
-            : (["webrtc-signaling", "session-close"] as const)),
-        ]),
-        ...(principal.runtimeAuthority === undefined
-          ? {}
-          : {
-              runtimeId: principal.runtimeAuthority.runtimeId,
-              runtimeGeneration: principal.runtimeAuthority.generation,
-            }),
-      })
-      .pipe(
-        Effect.tapError(() =>
-          SynchronizedRef.get(runtime).pipe(
-            Effect.flatMap((current) => {
-              const session = current.sessions.get(acquired.lease.sessionId);
-              return session === undefined
-                ? Effect.void
-                : endRuntimeSession(session, "error", {
-                    reason: "authority-issuance-failed",
-                  });
-            }),
-          ),
-        ),
-      );
     return {
       state,
       transport: {
@@ -1537,14 +1444,6 @@ const make = Effect.gen(function* () {
       },
       expiresAt,
       heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
-      runtimeControlGrant: {
-        token: runtimeControlToken,
-        sessionId: acquired.lease.sessionId,
-        leaseGeneration: acquired.lease.generation,
-        expiresAt,
-        heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
-        failureGraceSeconds: HEARTBEAT_FAILURE_GRACE_SECONDS,
-      },
     };
   });
 
@@ -1952,8 +1851,6 @@ const make = Effect.gen(function* () {
   const revokeAuthSession: VoiceSessionServiceShape["revokeAuthSession"] = (owner) =>
     lifecycleMutex.withPermits(1)(
       Effect.gen(function* () {
-        yield* tickets.revokeAuthSession(owner);
-        yield* runtimeControlGrants.revokeAuthSession(owner);
         const owned = Array.from((yield* SynchronizedRef.get(runtime)).sessions.values()).filter(
           (session) =>
             session.lease.ownerAuthSessionId === owner && session.terminalAt === undefined,
@@ -2190,9 +2087,6 @@ const make = Effect.gen(function* () {
       yield* persistHandoffOutcome(settled);
       const handoffSucceeded = settled.status === "settled" && settled.outcome === "succeeded";
       const settledSessionId = VoiceSessionId.make(settled.realtimeSessionId);
-      yield* handoffSucceeded
-        ? runtimeControlGrants.completeHandoff(settledSessionId)
-        : runtimeControlGrants.revokeSession(settledSessionId);
       yield* endTerminalProviderSession(
         settledSessionId,
         "handed-off-to-thread-voice",
@@ -2372,12 +2266,6 @@ const make = Effect.gen(function* () {
         yield* Effect.forEach(expired, persistHandoffOutcome, {
           discard: true,
         });
-        yield* Effect.forEach(
-          new Set(expired.map((action) => action.realtimeSessionId)),
-          (expiredSessionId) =>
-            runtimeControlGrants.revokeSession(VoiceSessionId.make(expiredSessionId)),
-          { discard: true },
-        );
         const pending = yield* handoffActions
           .listPending({
             authSessionId: owner,
@@ -2500,7 +2388,6 @@ const make = Effect.gen(function* () {
             ),
           );
         yield* persistActivatedHandoffReconciliation(reconciled);
-        yield* runtimeControlGrants.completeHandoff(sessionId);
         yield* endTerminalProviderSession(
           sessionId,
           "handed-off-to-thread-voice",

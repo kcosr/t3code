@@ -1,4 +1,6 @@
 import type {
+  AuthEnvironmentScope,
+  AuthSessionId,
   VoiceClientActionId,
   VoiceRuntimeRealtimeActionAckInput,
   VoiceRuntimeRealtimeActionAckResult,
@@ -27,49 +29,52 @@ import type { VoiceError } from "../Errors.ts";
 
 export interface VoiceRealtimeControlServiceShape {
   readonly create: (
-    runtimeToken: string,
+    principal: {
+      readonly sessionId: AuthSessionId;
+      readonly scopes: ReadonlySet<AuthEnvironmentScope>;
+    },
     input: VoiceRuntimeRealtimeSessionCreateInput,
   ) => Effect.Effect<VoiceRuntimeRealtimeSessionCreateResult, VoiceError>;
   readonly offer: (
-    controlToken: string,
+    authSessionId: AuthSessionId,
     sessionId: VoiceSessionId,
     input: VoiceRuntimeRealtimeWebRtcOfferInput,
   ) => Effect.Effect<VoiceRuntimeRealtimeWebRtcAnswer, VoiceError>;
   readonly heartbeat: (
-    controlToken: string,
+    authSessionId: AuthSessionId,
     sessionId: VoiceSessionId,
     input: VoiceRuntimeRealtimeHeartbeatInput,
   ) => Effect.Effect<VoiceRuntimeRealtimeHeartbeatResult, VoiceError>;
   readonly actions: (
-    controlToken: string,
+    authSessionId: AuthSessionId,
     sessionId: VoiceSessionId,
     query: VoiceRuntimeRealtimeActionsQuery,
   ) => Effect.Effect<VoiceRuntimeRealtimeActionsResult, VoiceError>;
   readonly acknowledgeAction: (
-    controlToken: string,
+    authSessionId: AuthSessionId,
     sessionId: VoiceSessionId,
     actionId: VoiceClientActionId,
     input: VoiceRuntimeRealtimeActionAckInput,
   ) => Effect.Effect<VoiceRuntimeRealtimeActionAckResult, VoiceError>;
   readonly updateFocus: (
-    controlToken: string,
+    authSessionId: AuthSessionId,
     sessionId: VoiceSessionId,
     input: VoiceRuntimeRealtimeFocusInput,
   ) => Effect.Effect<VoiceRuntimeRealtimeFocusResult, VoiceError>;
   readonly exchangeHandoff: (
-    controlToken: string,
+    authSessionId: AuthSessionId,
     sessionId: VoiceSessionId,
     actionId: VoiceClientActionId,
     input: VoiceRuntimeRealtimeHandoffExchangeInput,
   ) => Effect.Effect<VoiceRuntimeRealtimeHandoffExchangeResult, VoiceError>;
   readonly commitHandoff: (
-    transitionToken: string,
+    authSessionId: AuthSessionId,
     sessionId: VoiceSessionId,
     actionId: VoiceClientActionId,
     input: VoiceRuntimeRealtimeHandoffCommitInput,
   ) => Effect.Effect<VoiceRuntimeRealtimeHandoffCommitResult, VoiceError>;
   readonly close: (
-    controlToken: string,
+    authSessionId: AuthSessionId,
     sessionId: VoiceSessionId,
     input: VoiceRuntimeRealtimeCloseInput,
   ) => Effect.Effect<VoiceRuntimeRealtimeCloseResult, VoiceError>;

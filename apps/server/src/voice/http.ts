@@ -14,7 +14,6 @@ import * as Multipart from "effect/unstable/http/Multipart";
 
 import { authenticateRawRouteWithScope } from "../auth/http.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
-import { VoiceMediaTicketRegistry } from "./Services/VoiceMediaTicketRegistry.ts";
 import { inspectVoiceMp4 } from "./Services/VoiceMp4Inspector.ts";
 import { observeVoiceMediaStream } from "./Services/VoiceObservability.ts";
 import {
@@ -32,7 +31,6 @@ import {
 } from "./Services/VoiceMediaPolicy.ts";
 import { VoiceProviderRegistry } from "./Services/VoiceProviderRegistry.ts";
 
-const VOICE_TICKET_HEADER = "x-t3-voice-ticket";
 const decodeTranscriptionMetadata = Schema.decodeUnknownEffect(
   Schema.fromJsonString(VoiceTranscriptionMetadata),
 );
@@ -116,22 +114,7 @@ const voiceMediaPolicyErrorResponse = (error: VoiceMediaPolicyError) =>
     ),
   );
 
-const authenticateVoiceMedia = (operation: "transcription-upload" | "speech-stream") =>
-  Effect.gen(function* () {
-    const request = yield* HttpServerRequest.HttpServerRequest;
-    const ticket = request.headers[VOICE_TICKET_HEADER];
-    if (ticket === undefined) {
-      yield* authenticateRawRouteWithScope(AuthVoiceUseScope);
-      return null;
-    }
-    const tickets = yield* VoiceMediaTicketRegistry;
-    return yield* tickets.consume(ticket, operation);
-  });
-
-const ticketAuthorizesRequest = (
-  scope: Effect.Success<ReturnType<typeof authenticateVoiceMedia>>,
-  requestId: VoiceSpeechRequest["requestId"] | VoiceTranscriptionMetadata["requestId"],
-) => scope === null || (scope !== undefined && scope.requestId === requestId);
+const authenticateVoiceMedia = authenticateRawRouteWithScope(AuthVoiceUseScope);
 
 const decodeTranscriptionMultipart = Effect.gen(function* () {
   const settingsService = yield* ServerSettingsService;
@@ -194,13 +177,7 @@ const transcriptionRoute = HttpRouter.add(
   "POST",
   "/api/voice/transcriptions",
   Effect.gen(function* () {
-    const authorization = yield* authenticateVoiceMedia("transcription-upload");
-    if (authorization === undefined) {
-      return HttpServerResponse.jsonUnsafe(
-        { code: "auth_invalid", reason: "invalid_credential" },
-        { status: 401 },
-      );
-    }
+    yield* authenticateVoiceMedia;
     const settingsService = yield* ServerSettingsService;
     const settings = (yield* settingsService.getSettings).voice;
     return yield* Effect.gen(function* () {
@@ -208,12 +185,6 @@ const transcriptionRoute = HttpRouter.add(
         decodeTranscriptionMultipart,
         settings.mediaRequestTimeoutSeconds,
       );
-      if (!ticketAuthorizesRequest(authorization, metadata.requestId)) {
-        return HttpServerResponse.jsonUnsafe(
-          { code: "auth_invalid", reason: "invalid_credential" },
-          { status: 401 },
-        );
-      }
       const permit = yield* mediaRequestLimiter.acquire(settings.maxConcurrentMediaRequests);
       return yield* Effect.gen(function* () {
         const providers = yield* VoiceProviderRegistry;
@@ -265,13 +236,7 @@ const speechRoute = HttpRouter.add(
   "POST",
   "/api/voice/speech",
   Effect.gen(function* () {
-    const authorization = yield* authenticateVoiceMedia("speech-stream");
-    if (authorization === undefined) {
-      return HttpServerResponse.jsonUnsafe(
-        { code: "auth_invalid", reason: "invalid_credential" },
-        { status: 401 },
-      );
-    }
+    yield* authenticateVoiceMedia;
     const request = yield* HttpServerRequest.HttpServerRequest;
     const settingsService = yield* ServerSettingsService;
     const settings = (yield* settingsService.getSettings).voice;
@@ -293,12 +258,6 @@ const speechRoute = HttpRouter.add(
     );
     if (new TextEncoder().encode(input.text).byteLength > settings.maxSpeechTextBytes) {
       return yield* invalidRequest("Voice speech text exceeds the configured limit");
-    }
-    if (!ticketAuthorizesRequest(authorization, input.requestId)) {
-      return HttpServerResponse.jsonUnsafe(
-        { code: "auth_invalid", reason: "invalid_credential" },
-        { status: 401 },
-      );
     }
     const providers = yield* VoiceProviderRegistry;
     const provider = yield* providers.resolve("speech.streaming");

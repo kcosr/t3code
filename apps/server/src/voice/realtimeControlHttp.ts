@@ -1,4 +1,5 @@
 import {
+  AuthVoiceUseScope,
   VoiceClientActionId,
   VoiceRuntimeRealtimeActionAckInput,
   VoiceRuntimeRealtimeActionsQuery,
@@ -20,12 +21,10 @@ import * as Stream from "effect/Stream";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 
 import type { VoiceError } from "./Errors.ts";
+import { authenticateRawRouteWithScope } from "../auth/http.ts";
 import { VoiceRealtimeControlService } from "./Services/VoiceRealtimeControlService.ts";
 import { voiceRuntimeProtocolResponse } from "./runtimeProtocolHttp.ts";
 
-const RUNTIME_HEADER = "x-t3-voice-runtime";
-const CONTROL_HEADER = "x-t3-voice-control";
-const TRANSITION_HEADER = "x-t3-voice-transition";
 const JSON_LIMIT = 128 * 1_024;
 const noStore = {
   "cache-control": "no-store",
@@ -34,7 +33,6 @@ const noStore = {
 
 const response = (body: unknown, status = 200) =>
   HttpServerResponse.jsonUnsafe(body, { status, headers: noStore });
-const unauthorized = () => response({ code: "auth_invalid", reason: "invalid_credential" }, 401);
 const invalidRequest = () =>
   response({ code: "invalid_request", message: "Invalid Realtime voice request" }, 400);
 
@@ -107,12 +105,12 @@ const routeContext = Effect.fn("voice.runtime-realtime.http.context")(function* 
   const request = yield* HttpServerRequest.HttpServerRequest;
   const incompatible = voiceRuntimeProtocolResponse(request);
   if (incompatible !== undefined) return { incompatible };
+  const principal = yield* authenticateRawRouteWithScope(AuthVoiceUseScope);
   const route = yield* HttpRouter.RouteContext;
-  const token = request.headers[CONTROL_HEADER];
   const sessionId = yield* decodeSessionId(route.params.sessionId).pipe(Effect.option);
-  return token === undefined || Option.isNone(sessionId)
+  return Option.isNone(sessionId)
     ? undefined
-    : { request, route, token, sessionId: sessionId.value };
+    : { request, route, principal, sessionId: sessionId.value };
 });
 
 const createRoute = HttpRouter.add(
@@ -122,12 +120,11 @@ const createRoute = HttpRouter.add(
     const request = yield* HttpServerRequest.HttpServerRequest;
     const incompatible = voiceRuntimeProtocolResponse(request);
     if (incompatible !== undefined) return incompatible;
-    const token = request.headers[RUNTIME_HEADER];
-    if (token === undefined) return unauthorized();
+    const principal = yield* authenticateRawRouteWithScope(AuthVoiceUseScope);
     const input = yield* decodeCreate(request);
     if (Option.isNone(input)) return invalidRequest();
     const result = yield* (yield* VoiceRealtimeControlService)
-      .create(token, input.value)
+      .create({ sessionId: principal.sessionId, scopes: new Set(principal.scopes) }, input.value)
       .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
@@ -139,11 +136,11 @@ const offerRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* routeContext();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const input = yield* decodeOffer(context.request);
     if (Option.isNone(input)) return invalidRequest();
     const result = yield* (yield* VoiceRealtimeControlService)
-      .offer(context.token, context.sessionId, input.value)
+      .offer(context.principal.sessionId, context.sessionId, input.value)
       .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
@@ -155,11 +152,11 @@ const heartbeatRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* routeContext();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const input = yield* decodeHeartbeat(context.request);
     if (Option.isNone(input)) return invalidRequest();
     const result = yield* (yield* VoiceRealtimeControlService)
-      .heartbeat(context.token, context.sessionId, input.value)
+      .heartbeat(context.principal.sessionId, context.sessionId, input.value)
       .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
@@ -171,7 +168,7 @@ const actionsRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* routeContext();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const url = new URL(context.request.url, "http://runtime.invalid");
     const query = yield* decodeActionsQuery(
       {
@@ -187,7 +184,7 @@ const actionsRoute = HttpRouter.add(
     ).pipe(Effect.option);
     if (Option.isNone(query)) return invalidRequest();
     const result = yield* (yield* VoiceRealtimeControlService)
-      .actions(context.token, context.sessionId, query.value)
+      .actions(context.principal.sessionId, context.sessionId, query.value)
       .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
@@ -199,12 +196,17 @@ const acknowledgeActionRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* routeContext();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const actionId = yield* decodeActionId(context.route.params.actionId).pipe(Effect.option);
     const input = yield* decodeAck(context.request);
     if (Option.isNone(actionId) || Option.isNone(input)) return invalidRequest();
     const result = yield* (yield* VoiceRealtimeControlService)
-      .acknowledgeAction(context.token, context.sessionId, actionId.value, input.value)
+      .acknowledgeAction(
+        context.principal.sessionId,
+        context.sessionId,
+        actionId.value,
+        input.value,
+      )
       .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
@@ -216,11 +218,11 @@ const focusRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* routeContext();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const input = yield* decodeFocus(context.request);
     if (Option.isNone(input)) return invalidRequest();
     const result = yield* (yield* VoiceRealtimeControlService)
-      .updateFocus(context.token, context.sessionId, input.value)
+      .updateFocus(context.principal.sessionId, context.sessionId, input.value)
       .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
@@ -232,12 +234,12 @@ const handoffRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* routeContext();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const actionId = yield* decodeActionId(context.route.params.actionId).pipe(Effect.option);
     const input = yield* decodeHandoff(context.request);
     if (Option.isNone(actionId) || Option.isNone(input)) return invalidRequest();
     const result = yield* (yield* VoiceRealtimeControlService)
-      .exchangeHandoff(context.token, context.sessionId, actionId.value, input.value)
+      .exchangeHandoff(context.principal.sessionId, context.sessionId, actionId.value, input.value)
       .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
@@ -247,23 +249,14 @@ const handoffCommitRoute = HttpRouter.add(
   "POST",
   "/api/voice/runtime/realtime-sessions/:sessionId/handoffs/:actionId/commit",
   Effect.gen(function* () {
-    const request = yield* HttpServerRequest.HttpServerRequest;
-    const incompatible = voiceRuntimeProtocolResponse(request);
-    if (incompatible !== undefined) return incompatible;
-    const route = yield* HttpRouter.RouteContext;
-    const token = request.headers[TRANSITION_HEADER];
-    const sessionId = yield* decodeSessionId(route.params.sessionId).pipe(Effect.option);
-    const actionId = yield* decodeActionId(route.params.actionId).pipe(Effect.option);
-    const input = yield* decodeHandoffCommit(request);
-    if (
-      token === undefined ||
-      Option.isNone(sessionId) ||
-      Option.isNone(actionId) ||
-      Option.isNone(input)
-    )
-      return token === undefined ? unauthorized() : invalidRequest();
+    const context = yield* routeContext();
+    if (context !== undefined && "incompatible" in context) return context.incompatible;
+    if (context === undefined) return invalidRequest();
+    const actionId = yield* decodeActionId(context.route.params.actionId).pipe(Effect.option);
+    const input = yield* decodeHandoffCommit(context.request);
+    if (Option.isNone(actionId) || Option.isNone(input)) return invalidRequest();
     const result = yield* (yield* VoiceRealtimeControlService)
-      .commitHandoff(token, sessionId.value, actionId.value, input.value)
+      .commitHandoff(context.principal.sessionId, context.sessionId, actionId.value, input.value)
       .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
@@ -275,11 +268,11 @@ const closeRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* routeContext();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const input = yield* decodeClose(context.request);
     if (Option.isNone(input)) return invalidRequest();
     const result = yield* (yield* VoiceRealtimeControlService)
-      .close(context.token, context.sessionId, input.value)
+      .close(context.principal.sessionId, context.sessionId, input.value)
       .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),

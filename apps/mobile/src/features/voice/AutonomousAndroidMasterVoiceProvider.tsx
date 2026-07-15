@@ -233,7 +233,7 @@ export function AutonomousAndroidMasterVoiceProvider(props: {
   latestRef.current = { preferences, threadShells, environmentId, focus: props.focus, prepared };
 
   provisioningRef.current ??= new NativeVoiceRuntimeProvisioningCoordinator(
-    makeNativeVoiceRuntimeProvisioningAdapter(native, uuidv4, async (authority) => {
+    makeNativeVoiceRuntimeProvisioningAdapter(native, async (authority) => {
       await autonomousAndroidVoiceBinding.configureAuthority(authority);
     }),
   );

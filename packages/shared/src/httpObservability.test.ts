@@ -6,15 +6,12 @@ import { describe, expect } from "vite-plus/test";
 import { httpHeaderRedactionLayer } from "./httpObservability.ts";
 
 describe("HTTP observability", () => {
-  it.effect("redacts authentication and native voice control headers", () =>
+  it.effect("redacts standard authentication headers", () =>
     Effect.gen(function* () {
       const names = yield* Headers.CurrentRedactedNames;
 
       expect(names).toContain("authorization");
       expect(names).toContain("dpop");
-      expect(names).toContain("x-t3-voice-control");
-      expect(names).toContain("x-t3-voice-runtime");
-      expect(names).toContain("x-t3-voice-operation");
     }).pipe(Effect.provide(httpHeaderRedactionLayer)),
   );
 });

@@ -274,9 +274,6 @@ export function useThreadSpeech(input: {
         case "segment": {
           const requestId = VoiceRequestId.make(uuidv4());
           const client = await makeMobileVoiceClient(prepared);
-          const ticket = await Effect.runPromise(
-            client.createMediaTicket({ operation: "speech-stream", requestId }),
-          );
           await Effect.runPromise(
             client
               .synthesize({
@@ -288,7 +285,6 @@ export function useThreadSpeech(input: {
                   text: action.segment.text,
                   preset: "default",
                 },
-                ticket,
               })
               .pipe(
                 Stream.runForEach((bytes) =>

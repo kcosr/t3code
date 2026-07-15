@@ -6,7 +6,6 @@ import {
   VoiceModeSessionId,
   VoiceRuntimeCommandId,
   VoiceRuntimeInstanceId,
-  VoiceRuntimeProvisioningOperationId,
   VoiceClientActionId,
   type VoiceRuntimeAuthorityReservation,
   type VoiceRuntimeCommand,
@@ -16,7 +15,6 @@ import {
 } from "@t3tools/contracts";
 
 import { FakeVoiceRuntime } from "./fakeRuntime.ts";
-import { computeVoiceRuntimeTargetDigest } from "./runtime.ts";
 import type { VoiceRuntime, VoiceRuntimeFactory } from "./runtime.ts";
 
 export class VoiceRuntimeConformanceError extends Error {}
@@ -154,7 +152,6 @@ export async function verifyVoiceRuntimeConformance(
 
   const nextAuthority = {
     ...prepared.authority,
-    provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-runtime-next"),
     expectedCurrentGeneration: configured.generation,
     generation: configured.generation + 1,
   };
@@ -193,7 +190,6 @@ export async function verifyVoiceRuntimeConformance(
     () =>
       runtime.configureAuthority({
         ...nextAuthority,
-        provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("reuse-generation"),
         generation: configured.generation,
       }),
     "authority generation reuse was accepted after clear",
@@ -202,30 +198,9 @@ export async function verifyVoiceRuntimeConformance(
     () =>
       runtime.configureAuthority({
         ...nextAuthority,
-        provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("jump-generation"),
         generation: configured.generation + 2,
       }),
     "authority generation jump was accepted after clear",
-  );
-  await ensureRejected(
-    () =>
-      runtime.configureAuthority({
-        ...nextAuthority,
-        provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("future-authority"),
-        issuedAt: "2099-01-01T00:00:00.000Z",
-        expiresAt: "2099-01-02T00:00:00.000Z",
-      }),
-    "future authority reservation was accepted",
-  );
-  await ensureRejected(
-    () =>
-      runtime.configureAuthority({
-        ...nextAuthority,
-        provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("expired-authority"),
-        issuedAt: "2000-01-01T00:00:00.000Z",
-        expiresAt: "2000-01-02T00:00:00.000Z",
-      }),
-    "expired authority reservation was accepted",
   );
   const rotated = await runtime.configureAuthority(nextAuthority);
   ensure(
@@ -256,18 +231,11 @@ export function makeFakeVoiceRuntimeConformanceFixture(): VoiceRuntimeConformanc
       const authority: VoiceRuntimeAuthorityReservation = {
         runtimeId: initial.runtimeId,
         runtimeInstanceId: initial.runtimeInstanceId,
-        provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-runtime"),
         expectedCurrentGeneration: initial.generation,
         generation: initial.generation + 1,
-        targetDigest: await computeVoiceRuntimeTargetDigest(target),
         target,
         environmentOrigin: "https://termstation",
-        operation: "realtime-start",
         readinessEnabled: true,
-        refreshRotationCounter: 0,
-        token: "test-runtime-token",
-        issuedAt: "2020-01-01T00:00:00.000Z",
-        expiresAt: "2099-01-01T00:00:00.000Z",
       };
       const start: VoiceRuntimeCommand = {
         kind: "start-realtime",

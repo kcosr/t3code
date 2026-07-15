@@ -23,6 +23,11 @@ describe("Realtime runtime contracts", () => {
       strict(VoiceRuntimeRealtimeSessionCreateInput, {
         ...fence,
         clientOperationId: "start-contract",
+        target: {
+          mode: "realtime",
+          environmentId: "environment-contract",
+          conversationId: "conversation-contract",
+        },
       }),
     ).toMatchObject(fence);
     expect(() =>

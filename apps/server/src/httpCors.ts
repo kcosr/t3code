@@ -5,12 +5,7 @@ export const browserApiCorsAllowedHeaders = [
   "traceparent",
   "content-type",
   "dpop",
-  "x-t3-voice-ticket",
   "x-t3-voice-runtime-protocol-major",
-  "x-t3-voice-runtime",
-  "x-t3-voice-control",
-  "x-t3-voice-operation",
-  "x-t3-voice-refresh",
 ] as const;
 
 export const browserApiCorsHeaders = {

@@ -23,6 +23,7 @@ export interface PersistedVoiceRuntimeRealtimeStart {
   readonly conversationId: VoiceConversationId;
   readonly sessionId: VoiceSessionId | null;
   readonly leaseGeneration: number | null;
+  readonly closeOnly: boolean;
   readonly failure: {
     readonly reason: VoicePublicErrorReason;
     readonly operation: string;
@@ -35,7 +36,10 @@ export interface PersistedVoiceRuntimeRealtimeStart {
 
 export interface VoiceRuntimeRealtimeStartRepositoryShape {
   readonly claim: (
-    input: Omit<PersistedVoiceRuntimeRealtimeStart, "sessionId" | "leaseGeneration" | "failure"> & {
+    input: Omit<
+      PersistedVoiceRuntimeRealtimeStart,
+      "sessionId" | "leaseGeneration" | "closeOnly" | "failure"
+    > & {
       readonly now: number;
     },
   ) => Effect.Effect<

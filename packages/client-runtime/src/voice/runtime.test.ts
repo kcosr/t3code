@@ -11,7 +11,6 @@ import {
   VoiceRuntimeCommandId,
   VoiceRuntimeConsumerLeaseId,
   VoiceRuntimeInstanceId,
-  VoiceRuntimeProvisioningOperationId,
   VoiceToolCallId,
   VoiceTurnClientOperationId,
 } from "@t3tools/contracts";
@@ -27,7 +26,6 @@ import {
   makeFakeVoiceRuntimeConformanceFixture,
   verifyVoiceRuntimeConformance,
 } from "./runtimeConformance.ts";
-import { computeVoiceRuntimeTargetDigest } from "./runtime.ts";
 
 async function configureThreadRuntime(runtime: FakeVoiceRuntime) {
   const initial = await runtime.getSnapshot();
@@ -49,44 +47,15 @@ async function configureThreadRuntime(runtime: FakeVoiceRuntime) {
   return runtime.configureAuthority({
     runtimeId: initial.runtimeId,
     runtimeInstanceId: initial.runtimeInstanceId,
-    provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("thread-provision"),
     expectedCurrentGeneration: initial.generation,
     generation: initial.generation + 1,
-    targetDigest: await computeVoiceRuntimeTargetDigest(target),
     target,
     environmentOrigin: "https://termstation",
-    operation: "thread-turn-start",
     readinessEnabled: true,
-    refreshRotationCounter: 0,
-    token: "thread-token",
-    issuedAt: "2020-01-01T00:00:00.000Z",
-    expiresAt: "2099-01-01T00:00:00.000Z",
   });
 }
 
 describe("VoiceRuntime foundation", () => {
-  it("computes a deterministic SHA-256 target digest without WebCrypto", async () => {
-    await expect(
-      computeVoiceRuntimeTargetDigest({
-        mode: "realtime",
-        environmentId: EnvironmentId.make("environment-1"),
-        conversationId: VoiceConversationId.make("conversation-1"),
-      }),
-    ).resolves.toBe("ed90e56c178637e806ddcbebd79d1a38c43316669e098549cc5b2afbcb1e80ac");
-
-    const left = await computeVoiceRuntimeTargetDigest({
-      mode: "realtime",
-      environmentId: EnvironmentId.make("environment-1"),
-      conversationId: VoiceConversationId.make("conversation-1"),
-    });
-    const right = await computeVoiceRuntimeTargetDigest({
-      conversationId: VoiceConversationId.make("conversation-1"),
-      environmentId: EnvironmentId.make("environment-1"),
-      mode: "realtime",
-    });
-    expect(right).toBe(left);
-  });
-
   it("passes the shared fake-runtime conformance scenario", async () => {
     const report = await verifyVoiceRuntimeConformance(makeFakeVoiceRuntimeConformanceFixture());
 
@@ -186,7 +155,7 @@ describe("VoiceRuntime foundation", () => {
           threadId: ThreadId.make("thread-1"),
         },
         composerRevision: "revision-1",
-        expiresAt: "2026-07-15T00:00:00.000Z",
+        expiresAt: "2099-07-15T00:00:00.000Z",
       },
       "draft transcript",
     );
@@ -207,7 +176,7 @@ describe("VoiceRuntime foundation", () => {
     expect(VoiceRuntimeConsumerLeaseId.make("consumer-1")).toBe("consumer-1");
   });
 
-  it("validates and idempotently replays authority provisioning", async () => {
+  it("validates and idempotently replays authority configuration", async () => {
     const runtime = new FakeVoiceRuntime();
     const fixture = makeFakeVoiceRuntimeConformanceFixture();
     const initial = await runtime.getSnapshot();
@@ -216,38 +185,13 @@ describe("VoiceRuntime foundation", () => {
 
     await expect(runtime.configureAuthority(prepared.authority)).resolves.toEqual(configured);
     await expect(
-      runtime.configureAuthority({ ...prepared.authority, token: "changed-token" }),
-    ).rejects.toBeInstanceOf(FakeVoiceRuntimeAuthorityError);
-
-    const invalidDigestRuntime = new FakeVoiceRuntime();
-    const invalidInitial = await invalidDigestRuntime.getSnapshot();
-    const invalidPrepared = await fixture.prepare(invalidDigestRuntime, invalidInitial);
-    await expect(
-      invalidDigestRuntime.configureAuthority({
-        ...invalidPrepared.authority,
-        targetDigest: "wrong-digest",
-      }),
-    ).rejects.toBeInstanceOf(FakeVoiceRuntimeAuthorityError);
-
-    const expiredRuntime = new FakeVoiceRuntime({ now: () => Date.parse("2026-01-02T00:00:00Z") });
-    const expiredInitial = await expiredRuntime.getSnapshot();
-    const expiredPrepared = await fixture.prepare(expiredRuntime, expiredInitial);
-    await expect(
-      expiredRuntime.configureAuthority({
-        ...expiredPrepared.authority,
-        issuedAt: "2025-01-01T00:00:00.000Z",
-        expiresAt: "2026-01-01T00:00:00.000Z",
-      }),
-    ).rejects.toBeInstanceOf(FakeVoiceRuntimeAuthorityError);
-
-    const futureRuntime = new FakeVoiceRuntime({ now: () => Date.parse("2026-01-02T00:00:00Z") });
-    const futureInitial = await futureRuntime.getSnapshot();
-    const futurePrepared = await fixture.prepare(futureRuntime, futureInitial);
-    await expect(
-      futureRuntime.configureAuthority({
-        ...futurePrepared.authority,
-        issuedAt: "2026-01-03T00:00:00.000Z",
-        expiresAt: "2026-01-04T00:00:00.000Z",
+      runtime.configureAuthority({
+        ...prepared.authority,
+        target: {
+          mode: "realtime",
+          environmentId: EnvironmentId.make("environment-1"),
+          conversationId: VoiceConversationId.make("other"),
+        },
       }),
     ).rejects.toBeInstanceOf(FakeVoiceRuntimeAuthorityError);
   });
@@ -268,13 +212,11 @@ describe("VoiceRuntime foundation", () => {
     await expect(
       runtime.configureAuthority({
         ...prepared.authority,
-        provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("reuse-generation-one"),
       }),
     ).rejects.toBeInstanceOf(FakeVoiceRuntimeAuthorityError);
     await expect(
       runtime.configureAuthority({
         ...prepared.authority,
-        provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("jump-generation-three"),
         expectedCurrentGeneration: configured.generation,
         generation: configured.generation + 2,
       }),
@@ -282,7 +224,6 @@ describe("VoiceRuntime foundation", () => {
 
     const next = await runtime.configureAuthority({
       ...prepared.authority,
-      provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-generation-two"),
       expectedCurrentGeneration: configured.generation,
       generation: configured.generation + 1,
     });
@@ -298,7 +239,6 @@ describe("VoiceRuntime foundation", () => {
     await runtime.dispatch(prepared.start);
     const replacement = {
       ...prepared.authority,
-      provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("active-replacement"),
       expectedCurrentGeneration: configured.generation,
       generation: configured.generation + 1,
     };
@@ -352,7 +292,6 @@ describe("VoiceRuntime foundation", () => {
     const deliveriesBeforeRotation = deliveryCount;
     const secondAuthority = {
       ...prepared.authority,
-      provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-runtime-2"),
       expectedCurrentGeneration: firstGeneration.generation,
       generation: firstGeneration.generation + 1,
     };
@@ -370,24 +309,8 @@ describe("VoiceRuntime foundation", () => {
     });
   });
 
-  it("rejects starts after authority is cleared or expires", async () => {
-    let now = Date.parse("2026-01-01T00:00:00Z");
-    const runtime = new FakeVoiceRuntime({ now: () => now });
+  it("rejects starts after authority is cleared", async () => {
     const fixture = makeFakeVoiceRuntimeConformanceFixture();
-    const initial = await runtime.getSnapshot();
-    const prepared = await fixture.prepare(runtime, initial);
-    const targetDigest = await computeVoiceRuntimeTargetDigest(prepared.authority.target);
-    await runtime.configureAuthority({
-      ...prepared.authority,
-      targetDigest,
-      issuedAt: "2025-12-31T00:00:00.000Z",
-      expiresAt: "2026-01-01T00:00:01.000Z",
-    });
-    now += 2_000;
-    const expired = await runtime.dispatch(prepared.start);
-    expect(expired.outcome).toEqual({ type: "rejected", reason: "authority-unavailable" });
-    expect((await runtime.getSnapshot()).availability).toBe("locked");
-
     const clearedRuntime = new FakeVoiceRuntime();
     const clearedInitial = await clearedRuntime.getSnapshot();
     const clearedPrepared = await fixture.prepare(clearedRuntime, clearedInitial);
@@ -520,11 +443,7 @@ describe("VoiceRuntime foundation", () => {
     const fixture = makeFakeVoiceRuntimeConformanceFixture();
     const initial = await runtime.getSnapshot();
     const prepared = await fixture.prepare(runtime, initial);
-    const configured = await runtime.configureAuthority({
-      ...prepared.authority,
-      issuedAt: "2025-01-01T00:00:00.000Z",
-      expiresAt: "2099-01-01T00:00:00.000Z",
-    });
+    const configured = await runtime.configureAuthority(prepared.authority);
     const beforeStartRoute = await runtime.dispatch({
       kind: "set-audio-route",
       commandId: VoiceRuntimeCommandId.make("route-before-start"),

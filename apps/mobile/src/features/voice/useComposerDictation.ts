@@ -95,10 +95,6 @@ export function useComposerDictation(input: {
         const requestId = VoiceRequestId.make(uuidv4());
         const client = await makeMobileVoiceClient(prepared);
         if (operationGenerationRef.current !== generation) return;
-        const ticket = await Effect.runPromise(
-          client.createMediaTicket({ operation: "transcription-upload", requestId }),
-        );
-        if (operationGenerationRef.current !== generation) return;
         let draft = beginTranscriptionDraft(draftAtStop);
         let lastRendered = draftAtStop;
         const applyEvent = (event: VoiceTranscriptionStreamEvent) =>
@@ -125,7 +121,6 @@ export function useComposerDictation(input: {
                 requestId,
                 format: completedRecording.mimeType,
               },
-              ticket,
             })
             .pipe(Stream.runForEach(applyEvent)),
         );

@@ -1,21 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
-import * as DateTime from "effect/DateTime";
 
 import { __testing } from "./controlHttp.ts";
 
 describe("voice capability descriptors", () => {
-  it("caps runtime authority at the earlier parent-session expiry", () => {
-    const now = DateTime.makeUnsafe("2026-07-13T00:00:00.000Z");
-    expect(
-      DateTime.formatIso(
-        __testing.runtimeAuthorityExpiresAt(now, DateTime.makeUnsafe("2026-07-13T03:00:00.000Z")),
-      ),
-    ).toBe("2026-07-13T03:00:00.000Z");
-    expect(DateTime.formatIso(__testing.runtimeAuthorityExpiresAt(now))).toBe(
-      "2026-08-12T00:00:00.000Z",
-    );
-  });
-
   it("advertises the enforceable Android transcription upload policy", () => {
     expect(
       __testing.descriptor("transcription.request", "ready", {

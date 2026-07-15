@@ -68,6 +68,7 @@ import Migration0052 from "./Migrations/052_VoiceNativeControlGrantCloseOnly.ts"
 import Migration0053 from "./Migrations/053_VoiceThreadTurnSpeechPolicy.ts";
 import Migration0054 from "./Migrations/054_VoiceRuntimeProtocolCutover.ts";
 import Migration0055 from "./Migrations/055_VoiceRealtimeTransitionReservation.ts";
+import Migration0056 from "./Migrations/056_VoiceSessionAuthority.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -135,6 +136,7 @@ export const migrationEntries = [
   [53, "VoiceThreadTurnSpeechPolicy", Migration0053],
   [54, "VoiceRuntimeProtocolCutover", Migration0054],
   [55, "VoiceRealtimeTransitionReservation", Migration0055],
+  [56, "VoiceSessionAuthority", Migration0056],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

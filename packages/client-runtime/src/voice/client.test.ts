@@ -7,12 +7,10 @@ import {
   VoiceClientActionId,
   VoiceConfirmationId,
   VoiceConversationId,
-  VoiceMediaTicketId,
   VoiceRuntimeId,
-  VoiceRuntimeGrantProvisionInput,
+  VoiceRuntimeAuthorityConfigureInput,
   VoicePlaybackId,
   VoiceRequestId,
-  VoiceRuntimeProvisioningOperationId,
   VoiceSessionId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -35,11 +33,6 @@ const SESSION_ID = VoiceSessionId.make("voice-session-1");
 const CONFIRMATION_ID = VoiceConfirmationId.make("confirmation-1");
 const CLIENT_ACTION_ID = VoiceClientActionId.make("client-action-1");
 const RUNTIME_ID = VoiceRuntimeId.make("runtime-1");
-const TARGET_DIGEST = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const REFRESH_CREDENTIAL_HASH = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const PROVISIONING_OPERATION_ID = VoiceRuntimeProvisioningOperationId.make(
-  "provision-android-main-3",
-);
 const PROJECT_ID = ProjectId.make("project-1");
 const THREAD_ID = ThreadId.make("thread-1");
 const threadGrantTarget = (autoRearm: boolean) => ({
@@ -57,13 +50,12 @@ const threadGrantTarget = (autoRearm: boolean) => ({
   speechEnabled: true,
   rearmGuardMs: 500,
 });
-const decodeGrantProvisionBody = Schema.decodeUnknownSync(
-  Schema.fromJsonString(VoiceRuntimeGrantProvisionInput),
+const decodeAuthorityConfigureBody = Schema.decodeUnknownSync(
+  Schema.fromJsonString(VoiceRuntimeAuthorityConfigureInput),
 );
-
 const preparedConnection = (
   httpAuthorization: PreparedHttpAuthorization | null,
-  voiceRuntimeProtocolMajor = 1,
+  voiceRuntimeProtocolMajor = 2,
 ): PreparedConnection => ({
   environmentId: ENVIRONMENT_ID,
   label: "Voice test",
@@ -74,7 +66,7 @@ const preparedConnection = (
   target: new PrimaryConnectionTarget({
     environmentId: ENVIRONMENT_ID,
     label: "Voice test",
-    voiceRuntimeProtocolMajor: 1,
+    voiceRuntimeProtocolMajor: 2,
     httpBaseUrl: "https://environment.example.test",
     wsBaseUrl: "wss://environment.example.test",
   }),
@@ -102,10 +94,10 @@ describe("makeVoiceHttpClient", () => {
 
     expect(() =>
       makeVoiceHttpClient({
-        prepared: preparedConnection(null, 2),
+        prepared: preparedConnection(null, 1),
         fetch,
       }),
-    ).toThrow("Voice requires runtime protocol major 1");
+    ).toThrow("Voice requires runtime protocol major 2");
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -122,19 +114,11 @@ describe("makeVoiceHttpClient", () => {
         const method = init?.method ?? "GET";
         requests.push({ url, method, body: init?.body, headers: init?.headers });
         return method === "DELETE"
-          ? jsonResponse({ runtimeId: RUNTIME_ID, revoked: true })
+          ? jsonResponse({ runtimeId: RUNTIME_ID, cleared: true })
           : jsonResponse({
-              token: "narrow-runtime-token",
               runtimeId: RUNTIME_ID,
               generation: 3,
-              provisioningOperationId: "provision-android-main-3",
-              targetDigest: TARGET_DIGEST,
               target: threadGrantTarget(true),
-              operation: "thread-turn-start",
-              readinessEnabled: true,
-              refreshRotationCounter: 0,
-              issuedAt: "2026-07-10T20:00:00.000Z",
-              expiresAt: "2026-08-10T20:00:00.000Z",
             });
       };
       const client = makeVoiceHttpClient({
@@ -142,23 +126,22 @@ describe("makeVoiceHttpClient", () => {
         fetch,
       });
 
-      const grant = yield* client.provisionVoiceRuntimeGrant(RUNTIME_ID, {
+      const authority = yield* client.configureVoiceRuntimeAuthority(RUNTIME_ID, {
         expectedCurrentGeneration: 2,
         generation: 3,
-        provisioningOperationId: PROVISIONING_OPERATION_ID,
-        targetDigest: TARGET_DIGEST,
         target: threadGrantTarget(true),
-        operation: "thread-turn-start",
-        readinessEnabled: true,
-        refreshCredentialHash: REFRESH_CREDENTIAL_HASH,
       });
-      const revoked = yield* client.revokeVoiceRuntimeGrant(RUNTIME_ID);
+      const cleared = yield* client.clearVoiceRuntimeAuthority(RUNTIME_ID);
 
-      expect(grant.token).toBe("narrow-runtime-token");
-      expect(revoked).toEqual({ runtimeId: RUNTIME_ID, revoked: true });
+      expect(authority).toEqual({
+        runtimeId: RUNTIME_ID,
+        generation: 3,
+        target: threadGrantTarget(true),
+      });
+      expect(cleared).toEqual({ runtimeId: RUNTIME_ID, cleared: true });
       expect(requests.map(({ url, method }) => `${method} ${url}`)).toEqual([
-        `PUT https://environment.example.test/api/voice/runtime/runtimes/${RUNTIME_ID}/grant`,
-        `DELETE https://environment.example.test/api/voice/runtime/runtimes/${RUNTIME_ID}/grant`,
+        `PUT https://environment.example.test/api/voice/runtime/runtimes/${RUNTIME_ID}/authority`,
+        `DELETE https://environment.example.test/api/voice/runtime/runtimes/${RUNTIME_ID}/authority`,
       ]);
       const provisionBody = requests[0]?.body;
       const encodedProvisionBody =
@@ -166,22 +149,17 @@ describe("makeVoiceHttpClient", () => {
           ? new TextDecoder().decode(provisionBody)
           : provisionBody;
       expect(
-        decodeGrantProvisionBody(String(encodedProvisionBody), { onExcessProperty: "error" }),
+        decodeAuthorityConfigureBody(String(encodedProvisionBody), { onExcessProperty: "error" }),
       ).toEqual({
         expectedCurrentGeneration: 2,
         generation: 3,
-        provisioningOperationId: "provision-android-main-3",
-        targetDigest: TARGET_DIGEST,
-        operation: "thread-turn-start",
         target: threadGrantTarget(true),
-        readinessEnabled: true,
-        refreshCredentialHash: REFRESH_CREDENTIAL_HASH,
       });
       expect(
         requests.map(({ headers }) =>
           new Headers(headers).get("x-t3-voice-runtime-protocol-major"),
         ),
-      ).toEqual(["1", "1"]);
+      ).toEqual(["2", "2"]);
     }),
   );
 
@@ -200,35 +178,22 @@ describe("makeVoiceHttpClient", () => {
         signer,
         fetch: async () =>
           jsonResponse({
-            token: "narrow-runtime-token",
             runtimeId: RUNTIME_ID,
             generation: 3,
-            provisioningOperationId: "provision-android-main-3",
-            targetDigest: TARGET_DIGEST,
             target: threadGrantTarget(false),
-            operation: "thread-turn-start",
-            readinessEnabled: false,
-            refreshRotationCounter: 0,
-            issuedAt: "2026-07-10T20:00:00.000Z",
-            expiresAt: "2026-08-10T20:00:00.000Z",
           }),
       });
 
-      yield* client.provisionVoiceRuntimeGrant(RUNTIME_ID, {
+      yield* client.configureVoiceRuntimeAuthority(RUNTIME_ID, {
         expectedCurrentGeneration: 2,
         generation: 3,
-        provisioningOperationId: PROVISIONING_OPERATION_ID,
-        targetDigest: TARGET_DIGEST,
         target: threadGrantTarget(false),
-        operation: "thread-turn-start",
-        readinessEnabled: false,
-        refreshCredentialHash: null,
       });
 
       expect(proofs).toEqual([
         {
           method: "PUT",
-          url: `https://environment.example.test/api/voice/runtime/runtimes/${RUNTIME_ID}/grant`,
+          url: `https://environment.example.test/api/voice/runtime/runtimes/${RUNTIME_ID}/authority`,
         },
       ]);
     }),
@@ -263,7 +228,7 @@ describe("makeVoiceHttpClient", () => {
     }),
   );
 
-  it.effect("exposes conversation CRUD and media tickets through the typed voice API", () =>
+  it.effect("exposes conversation CRUD through the typed voice API", () =>
     Effect.gen(function* () {
       const requests: Array<{
         readonly url: string;
@@ -273,14 +238,6 @@ describe("makeVoiceHttpClient", () => {
         const url = String(resource);
         requests.push({ url, init });
         const method = init?.method ?? "GET";
-        if (url.endsWith("/media-tickets")) {
-          return jsonResponse({
-            ticketId: "ticket-1",
-            token: "one-use-token",
-            operation: "speech-stream",
-            expiresAt: "2026-07-10T20:01:00.000Z",
-          });
-        }
         if (url.endsWith("/clear-context")) {
           return jsonResponse({
             conversationId: CONVERSATION_ID,
@@ -332,10 +289,6 @@ describe("makeVoiceHttpClient", () => {
           idempotencyKey: "clear-one",
         }),
         client.deleteConversation(CONVERSATION_ID),
-        client.createMediaTicket({
-          operation: "speech-stream",
-          requestId: REQUEST_ID,
-        }),
       ]);
 
       expect(results[0]).toEqual(conversation);
@@ -346,7 +299,6 @@ describe("makeVoiceHttpClient", () => {
       expect(results[4].activeContextEpoch).toBe(2);
       expect(results[5].activeEpoch).toBe(2);
       expect(results[6].deleted).toBe(true);
-      expect(results[7].token).toBe("one-use-token");
       expect(requests.some(({ init }) => init?.method === "PATCH")).toBe(true);
       expect(
         requests.some(({ url }) => url.endsWith("/transcript?cursor=next-page&limit=20")),
@@ -437,14 +389,6 @@ describe("makeVoiceHttpClient", () => {
             },
             expiresAt: "2026-07-10T20:55:00.000Z",
             heartbeatIntervalSeconds: 10,
-            runtimeControlGrant: {
-              token: "native-control-token",
-              sessionId: SESSION_ID,
-              leaseGeneration: 1,
-              expiresAt: "2026-07-10T20:55:00.000Z",
-              heartbeatIntervalSeconds: 10,
-              failureGraceSeconds: 30,
-            },
           });
         }
         return jsonResponse(sessionState);
@@ -606,7 +550,7 @@ describe("makeVoiceHttpClient", () => {
             readonly requestUrl: string;
             readonly fileUri: string;
             readonly parameters: Readonly<Record<string, string>>;
-            readonly ticket: string | null;
+            readonly authorization: string | null;
           }
         | undefined;
       const client = makeVoiceHttpClient({
@@ -619,7 +563,7 @@ describe("makeVoiceHttpClient", () => {
             requestUrl: input.requestUrl,
             fileUri: input.fileUri,
             parameters: input.parameters,
-            ticket: input.headers.get("x-t3-voice-ticket"),
+            authorization: input.headers.get("authorization"),
           };
           return {
             status: 200,
@@ -637,12 +581,6 @@ describe("makeVoiceHttpClient", () => {
             filename: "recording.m4a",
           },
           metadata: { requestId: REQUEST_ID, format: "audio/mp4" },
-          ticket: {
-            ticketId: VoiceMediaTicketId.make("ticket-native-upload"),
-            token: "native-upload-token",
-            operation: "transcription-upload",
-            expiresAt: "2026-07-10T20:01:00.000Z",
-          },
         })
         .pipe(Stream.runCollect);
 
@@ -653,7 +591,7 @@ describe("makeVoiceHttpClient", () => {
         parameters: {
           metadata: '{"requestId":"request-1","format":"audio/mp4"}',
         },
-        ticket: "native-upload-token",
+        authorization: "Bearer voice-token",
       });
     }),
   );
@@ -730,7 +668,7 @@ describe("makeVoiceHttpClient", () => {
     }),
   );
 
-  it.effect("streams PCM with a one-use media ticket and no connection credential", () =>
+  it.effect("streams PCM with the standard session credential", () =>
     Effect.gen(function* () {
       let received: RequestInit | undefined;
       const fetch: typeof globalThis.fetch = async (_resource, init) => {
@@ -741,21 +679,12 @@ describe("makeVoiceHttpClient", () => {
         });
       };
       const client = makeVoiceHttpClient({
-        prepared: preparedConnection({
-          _tag: "Dpop",
-          accessToken: "dpop-token",
-        }),
+        prepared: preparedConnection({ _tag: "Bearer", token: "voice-token" }),
         fetch,
       });
 
       const chunks = yield* client
         .synthesize({
-          ticket: {
-            ticketId: VoiceMediaTicketId.make("ticket-1"),
-            token: "one-use-token",
-            operation: "speech-stream",
-            expiresAt: "2026-07-10T20:01:00.000Z",
-          },
           request: {
             requestId: REQUEST_ID,
             playbackId: PLAYBACK_ID,
@@ -772,10 +701,8 @@ describe("makeVoiceHttpClient", () => {
 
       expect(Array.from(chunks[0] ?? [])).toEqual([1, 2, 3, 4]);
       const headers = new Headers(received?.headers);
-      expect(headers.get("x-t3-voice-ticket")).toBe("one-use-token");
-      expect(headers.has("authorization")).toBe(false);
+      expect(headers.get("authorization")).toBe("Bearer voice-token");
       expect(headers.has("dpop")).toBe(false);
-      expect(received?.credentials).toBeUndefined();
     }),
   );
 });

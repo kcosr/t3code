@@ -78,10 +78,6 @@ export const VoiceRuntimeConsumerLeaseId = TrimmedNonEmptyString.check(
   Schema.isMaxLength(128),
 ).pipe(Schema.brand("VoiceRuntimeConsumerLeaseId"));
 export type VoiceRuntimeConsumerLeaseId = typeof VoiceRuntimeConsumerLeaseId.Type;
-export const VoiceRuntimeProvisioningOperationId = TrimmedNonEmptyString.check(
-  Schema.isMaxLength(128),
-).pipe(Schema.brand("VoiceRuntimeProvisioningOperationId"));
-export type VoiceRuntimeProvisioningOperationId = typeof VoiceRuntimeProvisioningOperationId.Type;
 export const VoiceComposerCaptureOperationId = TrimmedNonEmptyString.check(
   Schema.isMaxLength(128),
 ).pipe(Schema.brand("VoiceComposerCaptureOperationId"));
@@ -110,8 +106,6 @@ export const VoiceConfirmationId = makeEntityId("VoiceConfirmationId");
 export type VoiceConfirmationId = typeof VoiceConfirmationId.Type;
 export const VoiceClientActionId = makeEntityId("VoiceClientActionId");
 export type VoiceClientActionId = typeof VoiceClientActionId.Type;
-export const VoiceMediaTicketId = makeEntityId("VoiceMediaTicketId");
-export type VoiceMediaTicketId = typeof VoiceMediaTicketId.Type;
 
 export const ProviderItemId = makeEntityId("ProviderItemId");
 export type ProviderItemId = typeof ProviderItemId.Type;

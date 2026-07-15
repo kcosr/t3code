@@ -8,13 +8,12 @@ import {
   VoiceCommandReceipt,
   VoiceRealtimeOperationPhase,
   VoiceRuntimeCommand,
+  VoiceRuntimeAuthority,
+  VoiceRuntimeAuthorityClearResult,
+  VoiceRuntimeAuthorityConfigureInput,
   VoiceRuntimeAuthorityReservation,
   VoiceRuntimeDescriptor,
   VoiceRuntimeEvent,
-  VoiceRuntimeGrant,
-  VoiceRuntimeGrantProvisionInput,
-  VoiceRuntimeGrantRefreshInput,
-  VoiceRuntimeGrantRevocationResult,
   VoiceRuntimeRebase,
   VoiceRuntimeRetainedRecordAcknowledgement,
   VoiceRuntimeSnapshot,
@@ -122,7 +121,7 @@ describe("voice runtime contracts", () => {
   });
   it("strictly round-trips the descriptor and independent snapshot axes", () => {
     const descriptor = {
-      protocolMajor: 1,
+      protocolMajor: 2,
       executionModel: "autonomous",
       capabilities: {
         automaticEndpointing: true,
@@ -220,25 +219,18 @@ describe("voice runtime contracts", () => {
     const reservation = {
       runtimeId: "runtime-1",
       runtimeInstanceId: "instance-1",
-      provisioningOperationId: "provision-1",
       expectedCurrentGeneration: 3,
       generation: 4,
-      targetDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       environmentOrigin: "https://termstation",
       target,
-      operation: "realtime-start",
       readinessEnabled: true,
-      refreshRotationCounter: 0,
-      token: "token",
-      issuedAt: "2026-07-14T00:00:00.000Z",
-      expiresAt: "2026-07-15T00:00:00.000Z",
     } as const;
 
     expect(strictDecode(VoiceRuntimeAuthorityReservation, reservation)).toEqual(reservation);
     expect(() =>
       strictDecode(VoiceRuntimeAuthorityReservation, {
         ...reservation,
-        operation: "thread-turn-start",
+        token: "obsolete-secret",
       }),
     ).toThrow();
     expect(() =>
@@ -254,68 +246,30 @@ describe("voice runtime contracts", () => {
     ).toThrow();
   });
 
-  it("strictly binds grant provisioning and refresh to one canonical target", () => {
-    const targetDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const refreshCredentialHash =
-      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const provision = {
+  it("strictly binds session authority configuration to one canonical target", () => {
+    const configure = {
       expectedCurrentGeneration: 3,
       generation: 4,
-      provisioningOperationId: "provision-4",
-      targetDigest,
       target,
-      operation: "realtime-start",
-      readinessEnabled: true,
-      refreshCredentialHash,
     } as const;
-    const grant = {
-      token: "runtime-token",
+    const authority = {
       runtimeId: "runtime-1",
       generation: 4,
-      provisioningOperationId: "provision-4",
-      targetDigest,
       target,
-      operation: "realtime-start",
-      readinessEnabled: true,
-      refreshRotationCounter: 0,
-      issuedAt: "2026-07-14T00:00:00.000Z",
-      expiresAt: "2026-08-13T00:00:00.000Z",
-    } as const;
-    const refresh = {
-      refreshRequestId: "refresh-1",
-      provisioningOperationId: "provision-4",
-      generation: 4,
-      operation: "realtime-start",
-      targetDigest,
-      expectedRotationCounter: 0,
-      candidateCredentialHash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     } as const;
 
-    expect(strictDecode(VoiceRuntimeGrantProvisionInput, provision)).toEqual(provision);
-    expect(strictDecode(VoiceRuntimeGrant, grant)).toEqual(grant);
-    expect(strictDecode(VoiceRuntimeGrantRefreshInput, refresh)).toEqual(refresh);
+    expect(strictDecode(VoiceRuntimeAuthorityConfigureInput, configure)).toEqual(configure);
+    expect(strictDecode(VoiceRuntimeAuthority, authority)).toEqual(authority);
     expect(
-      strictDecode(VoiceRuntimeGrantRevocationResult, {
+      strictDecode(VoiceRuntimeAuthorityClearResult, {
         runtimeId: "runtime-1",
-        revoked: true,
+        cleared: true,
       }),
-    ).toEqual({ runtimeId: "runtime-1", revoked: true });
+    ).toEqual({ runtimeId: "runtime-1", cleared: true });
     expect(() =>
-      strictDecode(VoiceRuntimeGrantProvisionInput, {
-        ...provision,
-        operation: "thread-turn-start",
-      }),
-    ).toThrow();
-    expect(() =>
-      strictDecode(VoiceRuntimeGrant, {
-        ...grant,
-        operation: "thread-turn-start",
-      }),
-    ).toThrow();
-    expect(() =>
-      strictDecode(VoiceRuntimeGrantProvisionInput, {
-        ...provision,
-        readinessEnabled: false,
+      strictDecode(VoiceRuntimeAuthorityConfigureInput, {
+        ...configure,
+        credential: "obsolete-secret",
       }),
     ).toThrow();
   });
@@ -420,6 +374,21 @@ describe("voice runtime contracts", () => {
       turnClientOperationId: "turn-client-1",
       submissionPolicy: "auto-submit",
       speechPlanId: "speech-plan-1",
+      target: {
+        mode: "thread",
+        environmentId: "environment-1",
+        projectId: "project-1",
+        threadId: "thread-1",
+        speechPreset: "default",
+        autoRearm: true,
+        endpointPolicy: {
+          endSilenceMs: 2_200,
+          noSpeechTimeoutMs: null,
+          maximumUtteranceMs: 600_000,
+        },
+        speechEnabled: true,
+        rearmGuardMs: 500,
+      },
     } as const;
     const operation = {
       operationId: "thread-operation-1",

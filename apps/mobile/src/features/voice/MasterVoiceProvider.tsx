@@ -482,7 +482,7 @@ export function UiAttachedMasterVoiceProvider(props: {
   const nativeProvisioning = useMemo(() => {
     if (native === null) return null;
     return new NativeVoiceRuntimeProvisioningCoordinator(
-      makeNativeVoiceRuntimeProvisioningAdapter(native, uuidv4, async (authority) => {
+      makeNativeVoiceRuntimeProvisioningAdapter(native, async (authority) => {
         await native.configureVoiceRuntimeAuthorityAsync(authority);
       }),
     );

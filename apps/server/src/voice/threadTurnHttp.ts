@@ -1,4 +1,5 @@
 import {
+  AuthVoiceUseScope,
   VoiceRuntimeThreadTurnCancelInput,
   VoiceRuntimeThreadTurnEventsAckInput,
   VoiceRuntimeThreadTurnEventsQuery,
@@ -16,11 +17,10 @@ import * as Stream from "effect/Stream";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 
 import type { VoiceError } from "./Errors.ts";
+import { authenticateRawRouteWithScope } from "../auth/http.ts";
 import { VoiceThreadTurnService } from "./Services/VoiceThreadTurnService.ts";
 import { voiceRuntimeProtocolResponse } from "./runtimeProtocolHttp.ts";
 
-const VOICE_RUNTIME_HEADER = "x-t3-voice-runtime";
-const VOICE_OPERATION_HEADER = "x-t3-voice-operation";
 const JSON_LIMIT = 2_048;
 const noStore = {
   "cache-control": "no-store",
@@ -50,7 +50,6 @@ const decodeEventsQuery = Schema.decodeUnknownEffect(VoiceRuntimeThreadTurnEvent
 
 const response = (body: unknown, status = 200) =>
   HttpServerResponse.jsonUnsafe(body, { status, headers: noStore });
-const unauthorized = () => response({ code: "auth_invalid", reason: "invalid_credential" }, 401);
 const invalidRequest = (message = "Invalid voice Thread turn request") =>
   response({ code: "invalid_request", message }, 400);
 const payloadTooLarge = () => response({ code: "payload_too_large" }, 413);
@@ -131,12 +130,12 @@ const withOperation = Effect.fn("voice.thread-turn.http.operation")(function* ()
   const request = yield* HttpServerRequest.HttpServerRequest;
   const incompatible = voiceRuntimeProtocolResponse(request);
   if (incompatible !== undefined) return { incompatible };
+  const principal = yield* authenticateRawRouteWithScope(AuthVoiceUseScope);
   const context = yield* HttpRouter.RouteContext;
-  const token = request.headers[VOICE_OPERATION_HEADER];
   const operationId = yield* decodeOperationId(context.params.operationId).pipe(Effect.option);
-  return token === undefined || Option.isNone(operationId)
+  return Option.isNone(operationId)
     ? undefined
-    : { request, token, operationId: operationId.value };
+    : { request, principal, operationId: operationId.value };
 });
 
 const createRoute = HttpRouter.add(
@@ -146,14 +145,13 @@ const createRoute = HttpRouter.add(
     const request = yield* HttpServerRequest.HttpServerRequest;
     const incompatible = voiceRuntimeProtocolResponse(request);
     if (incompatible !== undefined) return incompatible;
-    const token = request.headers[VOICE_RUNTIME_HEADER];
-    if (token === undefined) return unauthorized();
+    const principal = yield* authenticateRawRouteWithScope(AuthVoiceUseScope);
     const service = yield* VoiceThreadTurnService;
-    const authorized = yield* service.authorizeCreate(token).pipe(Effect.result);
-    if (Result.isFailure(authorized)) return voiceFailure(authorized.failure);
     const input = yield* decodeJson(request, decodeCreate);
     if (Option.isNone(input)) return invalidRequest();
-    const result = yield* service.create(token, input.value).pipe(Effect.result);
+    const result = yield* service
+      .create({ sessionId: principal.sessionId, scopes: new Set(principal.scopes) }, input.value)
+      .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
 );
@@ -164,7 +162,7 @@ const audioRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const contentType = context.request.headers["content-type"]?.split(";", 1)[0]?.trim();
     if (contentType !== "audio/mp4") return invalidRequest("Content-Type must be audio/mp4");
     const languageHeader = context.request.headers["content-language"];
@@ -176,7 +174,7 @@ const audioRoute = HttpRouter.add(
       return invalidRequest("Invalid content language");
     const service = yield* VoiceThreadTurnService;
     const admission = yield* service
-      .beginAudioUpload(context.token, context.operationId)
+      .beginAudioUpload(context.principal.sessionId, context.operationId)
       .pipe(Effect.result);
     if (Result.isFailure(admission)) return voiceFailure(admission.failure);
     const upload = yield* Effect.gen(function* () {
@@ -202,11 +200,11 @@ const dispositionRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const input = yield* decodeJson(context.request, decodeDisposition);
     if (Option.isNone(input)) return invalidRequest();
     const result = yield* (yield* VoiceThreadTurnService)
-      .setDraftDisposition(context.token, context.operationId)
+      .setDraftDisposition(context.principal.sessionId, context.operationId)
       .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
@@ -218,7 +216,7 @@ const eventsRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const url = new URL(context.request.url, "http://native.invalid");
     const query = yield* decodeEventsQuery(
       {
@@ -229,7 +227,7 @@ const eventsRoute = HttpRouter.add(
     ).pipe(Effect.option);
     if (Option.isNone(query)) return invalidRequest();
     const result = yield* (yield* VoiceThreadTurnService)
-      .events(context.token, context.operationId, query.value)
+      .events(context.principal.sessionId, context.operationId, query.value)
       .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
@@ -241,16 +239,16 @@ const acknowledgeRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const service = yield* VoiceThreadTurnService;
     const authorized = yield* service
-      .authorizeOperation(context.token, context.operationId)
+      .authorizeOperation(context.principal.sessionId, context.operationId)
       .pipe(Effect.result);
     if (Result.isFailure(authorized)) return voiceFailure(authorized.failure);
     const input = yield* decodeJson(context.request, decodeAck);
     if (Option.isNone(input)) return invalidRequest();
     const result = yield* service
-      .acknowledgeEvents(context.token, context.operationId, input.value)
+      .acknowledgeEvents(context.principal.sessionId, context.operationId, input.value)
       .pipe(Effect.result);
     return Result.isFailure(result)
       ? voiceFailure(result.failure)
@@ -264,12 +262,12 @@ const speechRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const route = yield* HttpRouter.RouteContext;
     const segmentIndex = Number(route.params.segmentIndex);
     if (!Number.isSafeInteger(segmentIndex) || segmentIndex < 0) return invalidRequest();
     const result = yield* (yield* VoiceThreadTurnService)
-      .speech(context.token, context.operationId, segmentIndex)
+      .speech(context.principal.sessionId, context.operationId, segmentIndex)
       .pipe(Effect.result);
     if (Result.isFailure(result)) return voiceFailure(result.failure);
     return HttpServerResponse.stream(result.success, {
@@ -288,15 +286,17 @@ const cancelRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const service = yield* VoiceThreadTurnService;
     const authorized = yield* service
-      .authorizeOperation(context.token, context.operationId)
+      .authorizeOperation(context.principal.sessionId, context.operationId)
       .pipe(Effect.result);
     if (Result.isFailure(authorized)) return voiceFailure(authorized.failure);
     const input = yield* decodeJson(context.request, decodeCancel);
     if (Option.isNone(input)) return invalidRequest();
-    const result = yield* service.cancel(context.token, context.operationId).pipe(Effect.result);
+    const result = yield* service
+      .cancel(context.principal.sessionId, context.operationId)
+      .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
 );
@@ -307,9 +307,9 @@ const draftRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const result = yield* (yield* VoiceThreadTurnService)
-      .readDraft(context.token, context.operationId)
+      .readDraft(context.principal.sessionId, context.operationId)
       .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
@@ -321,9 +321,9 @@ const consumeDraftRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const result = yield* (yield* VoiceThreadTurnService)
-      .consumeDraft(context.token, context.operationId)
+      .consumeDraft(context.principal.sessionId, context.operationId)
       .pipe(Effect.result);
     return Result.isFailure(result) ? voiceFailure(result.failure) : response(result.success);
   }),
@@ -335,9 +335,9 @@ const detachRoute = HttpRouter.add(
   Effect.gen(function* () {
     const context = yield* withOperation();
     if (context !== undefined && "incompatible" in context) return context.incompatible;
-    if (context === undefined) return unauthorized();
+    if (context === undefined) return invalidRequest();
     const result = yield* (yield* VoiceThreadTurnService)
-      .detach(context.token, context.operationId)
+      .detach(context.principal.sessionId, context.operationId)
       .pipe(Effect.result);
     return Result.isFailure(result)
       ? voiceFailure(result.failure)

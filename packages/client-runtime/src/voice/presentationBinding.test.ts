@@ -10,7 +10,6 @@ import {
   VoiceRuntimeCommandId,
   VoiceRuntimeId,
   VoiceRuntimeInstanceId,
-  VoiceRuntimeProvisioningOperationId,
   VoiceTurnClientOperationId,
   type VoiceRuntimeAuthorityReservation,
 } from "@t3tools/contracts";
@@ -18,7 +17,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { FakeVoiceRuntime } from "./fakeRuntime.ts";
 import { VoiceRuntimePresentationBinding } from "./presentationBinding.ts";
-import { computeVoiceRuntimeTargetDigest, type VoiceRuntime } from "./runtime.ts";
+import type { VoiceRuntime } from "./runtime.ts";
 
 const now = Date.parse("2026-07-13T12:00:00.000Z");
 const runtimeId = VoiceRuntimeId.make("presentation-runtime");
@@ -34,20 +33,11 @@ async function realtimeAuthority(
   return {
     runtimeId,
     runtimeInstanceId,
-    provisioningOperationId: VoiceRuntimeProvisioningOperationId.make(
-      `presentation-provision-${generation}`,
-    ),
     expectedCurrentGeneration,
     generation,
-    targetDigest: await computeVoiceRuntimeTargetDigest(target),
     target,
     environmentOrigin: "https://termstation",
-    operation: "realtime-start",
     readinessEnabled: true,
-    refreshRotationCounter: 0,
-    token: `presentation-token-${generation}`,
-    issuedAt: "2026-07-13T12:00:00.000Z",
-    expiresAt: "2026-07-13T13:00:00.000Z",
   };
 }
 

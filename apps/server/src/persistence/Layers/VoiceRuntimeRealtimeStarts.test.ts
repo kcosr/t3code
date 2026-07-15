@@ -39,7 +39,7 @@ const input = {
 
 it.effect("durably fences unbound and bound native Realtime start replays", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 54 });
+    yield* runMigrations({ toMigrationInclusive: 56 });
     const repository = yield* VoiceRuntimeRealtimeStartRepository;
     expect(yield* repository.claim(input)).toEqual({ status: "claimed" });
 
@@ -83,7 +83,7 @@ it.effect("durably fences unbound and bound native Realtime start replays", () =
 
 it.effect("refuses a late bind after an ambiguous claim lease expires", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 54 });
+    yield* runMigrations({ toMigrationInclusive: 56 });
     const repository = yield* VoiceRuntimeRealtimeStartRepository;
     const late = {
       ...input,
@@ -108,7 +108,7 @@ it.effect("refuses a late bind after an ambiguous claim lease expires", () =>
 
 it.effect("reclaims retryable failures while replaying terminal failures", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 54 });
+    yield* runMigrations({ toMigrationInclusive: 56 });
     const repository = yield* VoiceRuntimeRealtimeStartRepository;
     const failed = {
       ...input,
@@ -177,7 +177,7 @@ it.effect("reclaims retryable failures while replaying terminal failures", () =>
 
 it.effect("serializes concurrent claims to one durable owner", () =>
   Effect.gen(function* () {
-    yield* runMigrations({ toMigrationInclusive: 54 });
+    yield* runMigrations({ toMigrationInclusive: 56 });
     const repository = yield* VoiceRuntimeRealtimeStartRepository;
     const concurrent = {
       ...input,

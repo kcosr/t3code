@@ -26,8 +26,8 @@ import {
 } from "./auth.ts";
 import {
   AuthSessionId,
-  ThreadId,
   TrimmedNonEmptyString,
+  ThreadId,
   VoiceConversationId,
   VoiceConfirmationId,
   VoiceClientActionId,
@@ -69,8 +69,6 @@ import {
   VoiceConversationTranscriptPage,
   VoiceConversationTranscriptQuery,
   VoiceConversationUpdateInput,
-  VoiceMediaTicket,
-  VoiceMediaTicketRequest,
   VoicePublicErrorReason,
   VoiceSessionCloseResult,
   VoiceSessionCreateInput,
@@ -86,11 +84,9 @@ import {
 } from "./voice.ts";
 import {
   VOICE_RUNTIME_PROTOCOL_MAJOR,
-  VoiceRuntimeGrant,
-  VoiceRuntimeGrantProvisionInput,
-  VoiceRuntimeGrantRefreshInput,
-  VoiceRuntimeGrantRefreshResult,
-  VoiceRuntimeGrantRevocationResult,
+  VoiceRuntimeAuthority,
+  VoiceRuntimeAuthorityClearResult,
+  VoiceRuntimeAuthorityConfigureInput,
 } from "./voiceRuntime.ts";
 import {
   HistoryReadInput,
@@ -111,11 +107,6 @@ const VoiceRuntimeAuthenticatedHeaders = Schema.Struct({
   "x-t3-voice-runtime-protocol-major": Schema.optionalKey(Schema.String),
 });
 
-const VoiceRuntimeRefreshHeaders = Schema.Struct({
-  "x-t3-voice-refresh": TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
-  "x-t3-voice-runtime-protocol-major": Schema.optionalKey(Schema.String),
-});
-
 const OptionalDpopProofHeaders = Schema.Struct({
   dpop: Schema.optionalKey(Schema.String),
 });
@@ -124,8 +115,6 @@ export const EnvironmentRequestInvalidReason = Schema.Literals([
   "invalid_scope",
   "scope_not_granted",
   "invalid_command",
-  "invalid_voice_media_binding",
-  "voice_media_ticket_limit",
   "native_voice_target_invalid",
 ]);
 export type EnvironmentRequestInvalidReason = typeof EnvironmentRequestInvalidReason.Type;
@@ -419,10 +408,6 @@ const EnvironmentScopedOperationErrors = [
   EnvironmentScopeRequiredError,
   EnvironmentInternalError,
 ] as const;
-const EnvironmentVoiceMediaTicketErrors = [
-  EnvironmentRequestInvalidError,
-  ...EnvironmentScopedOperationErrors,
-] as const;
 const EnvironmentPairingCredentialErrors = [
   EnvironmentRequestInvalidError,
   ...EnvironmentScopedOperationErrors,
@@ -671,13 +656,13 @@ export class EnvironmentHistoryHttpApi extends HttpApiGroup.make("history")
 export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
   .add(
     HttpApiEndpoint.put(
-      "provisionVoiceRuntimeGrant",
-      "/api/voice/runtime/runtimes/:runtimeId/grant",
+      "configureVoiceRuntimeAuthority",
+      "/api/voice/runtime/runtimes/:runtimeId/authority",
       {
         headers: VoiceRuntimeAuthenticatedHeaders,
         params: Schema.Struct({ runtimeId: VoiceRuntimeId }),
-        payload: VoiceRuntimeGrantProvisionInput,
-        success: VoiceRuntimeGrant,
+        payload: VoiceRuntimeAuthorityConfigureInput,
+        success: VoiceRuntimeAuthority,
         error: [
           EnvironmentVoiceRuntimeProtocolIncompatibleError,
           EnvironmentRequestInvalidError,
@@ -689,35 +674,18 @@ export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
   )
   .add(
     HttpApiEndpoint.delete(
-      "revokeVoiceRuntimeGrant",
-      "/api/voice/runtime/runtimes/:runtimeId/grant",
+      "clearVoiceRuntimeAuthority",
+      "/api/voice/runtime/runtimes/:runtimeId/authority",
       {
         headers: VoiceRuntimeAuthenticatedHeaders,
         params: Schema.Struct({ runtimeId: VoiceRuntimeId }),
-        success: VoiceRuntimeGrantRevocationResult,
+        success: VoiceRuntimeAuthorityClearResult,
         error: [
           EnvironmentVoiceRuntimeProtocolIncompatibleError,
           ...EnvironmentScopedOperationErrors,
         ],
       },
     ).middleware(EnvironmentAuthenticatedAuth),
-  )
-  .add(
-    HttpApiEndpoint.post(
-      "refreshVoiceRuntimeGrant",
-      "/api/voice/runtime/runtimes/:runtimeId/grant/refresh",
-      {
-        headers: VoiceRuntimeRefreshHeaders,
-        params: Schema.Struct({ runtimeId: VoiceRuntimeId }),
-        payload: VoiceRuntimeGrantRefreshInput,
-        success: VoiceRuntimeGrantRefreshResult,
-        error: [
-          EnvironmentVoiceRuntimeProtocolIncompatibleError,
-          EnvironmentRequestInvalidError,
-          EnvironmentVoiceOperationError,
-        ],
-      },
-    ),
   )
   .add(
     HttpApiEndpoint.post("createSession", "/api/voice/sessions", {
@@ -902,14 +870,6 @@ export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
       headers: OptionalBearerHeaders,
       success: VoiceCapabilities,
       error: EnvironmentScopedOperationErrors,
-    }).middleware(EnvironmentAuthenticatedAuth),
-  )
-  .add(
-    HttpApiEndpoint.post("mediaTicket", "/api/voice/media-tickets", {
-      headers: OptionalBearerHeaders,
-      payload: VoiceMediaTicketRequest,
-      success: VoiceMediaTicket,
-      error: EnvironmentVoiceMediaTicketErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(

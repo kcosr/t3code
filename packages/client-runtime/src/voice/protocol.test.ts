@@ -8,24 +8,24 @@ import {
 
 describe("voice runtime protocol compatibility", () => {
   it("reports the canonical protocol as available", () => {
-    expect(voiceRuntimeProtocolAvailability({ voiceRuntimeProtocolMajor: 1 })).toEqual({
+    expect(voiceRuntimeProtocolAvailability({ voiceRuntimeProtocolMajor: 2 })).toEqual({
       status: "available",
-      protocolMajor: 1,
+      protocolMajor: 2,
     });
     expect(() =>
-      assertVoiceRuntimeProtocolAvailable({ voiceRuntimeProtocolMajor: 1 }),
+      assertVoiceRuntimeProtocolAvailable({ voiceRuntimeProtocolMajor: 2 }),
     ).not.toThrow();
   });
 
   it("reports and rejects an incompatible environment without fallback", () => {
-    const availability = voiceRuntimeProtocolAvailability({ voiceRuntimeProtocolMajor: 2 });
+    const availability = voiceRuntimeProtocolAvailability({ voiceRuntimeProtocolMajor: 1 });
     expect(availability).toEqual({
       status: "unavailable",
       reason: "incompatible-protocol-major",
-      requiredMajor: 1,
-      actualMajor: 2,
+      requiredMajor: 2,
+      actualMajor: 1,
     });
-    expect(() => assertVoiceRuntimeProtocolAvailable({ voiceRuntimeProtocolMajor: 2 })).toThrow(
+    expect(() => assertVoiceRuntimeProtocolAvailable({ voiceRuntimeProtocolMajor: 1 })).toThrow(
       VoiceRuntimeProtocolIncompatibleError,
     );
   });

@@ -3,14 +3,14 @@ import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 
 import { SessionStore } from "../../auth/SessionStore.ts";
+import { VoiceRuntimeAuthorityRepository } from "../../persistence/Services/VoiceRuntimeAuthorities.ts";
 import { VoiceSessionService } from "../Services/VoiceSessionService.ts";
-import { VoiceRuntimeGrantRegistry } from "../Services/VoiceRuntimeGrantRegistry.ts";
 
 export const VoiceSessionLifecycleLive = Layer.effectDiscard(
   Effect.gen(function* () {
     const authSessions = yield* SessionStore;
     const voiceSessions = yield* VoiceSessionService;
-    const runtimeAuthorityGrants = yield* VoiceRuntimeGrantRegistry;
+    const runtimeAuthorities = yield* VoiceRuntimeAuthorityRepository;
 
     yield* authSessions.streamChanges.pipe(
       Stream.runForEach((change) =>
@@ -18,7 +18,7 @@ export const VoiceSessionLifecycleLive = Layer.effectDiscard(
           ? Effect.all(
               [
                 voiceSessions.revokeAuthSession(change.sessionId),
-                runtimeAuthorityGrants.revokeAuthSession(change.sessionId),
+                runtimeAuthorities.clearAuthSession(change.sessionId),
               ],
               { discard: true },
             )

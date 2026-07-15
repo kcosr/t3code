@@ -35,7 +35,6 @@ import type {
   VoiceRuntimeDelivery,
   VoiceRuntimeSubscriptionInput,
 } from "./runtime.ts";
-import { computeVoiceRuntimeTargetDigest } from "./runtime.ts";
 
 const DEFAULT_LEASE_DURATION_MS = 30_000;
 const DEFAULT_JOURNAL_CAPACITY = 128;
@@ -87,7 +86,7 @@ interface Subscriber {
 }
 
 const defaultDescriptor = (): VoiceRuntimeDescriptor => ({
-  protocolMajor: 1,
+  protocolMajor: 2,
   executionModel: "autonomous",
   capabilities: {
     automaticEndpointing: true,
@@ -117,10 +116,8 @@ const fingerprint = (command: VoiceRuntimeCommand): string => {
   return JSON.stringify(canonicalValue(request));
 };
 
-const provisioningFingerprint = (reservation: VoiceRuntimeAuthorityReservation): string => {
-  const { provisioningOperationId: _provisioningOperationId, ...request } = reservation;
-  return JSON.stringify(canonicalValue(request));
-};
+const authorityFingerprint = (reservation: VoiceRuntimeAuthorityReservation): string =>
+  JSON.stringify(canonicalValue(reservation));
 
 const clearFingerprint = (command: VoiceRuntimeAuthorityClearCommand): string => {
   const { commandId: _commandId, ...request } = command;
@@ -171,7 +168,6 @@ export class FakeVoiceRuntime implements VoiceRuntime {
   private readonly journal: Array<VoiceRuntimeEvent> = [];
   private readonly commands = new Map<string, StoredCommand>();
   private readonly operationStarts = new Map<string, StoredOperationStart>();
-  private readonly provisioningOperations = new Map<string, StoredSnapshotOutcome>();
   private readonly authorityClears = new Map<string, StoredSnapshotOutcome>();
   private readonly threadReceipts: Array<VoiceThreadTurnReceipt> = [];
   private readonly realtimeSummaries: Array<VoiceRealtimeTerminalSummary> = [];
@@ -309,13 +305,11 @@ export class FakeVoiceRuntime implements VoiceRuntime {
   }
 
   async configureAuthority(input: VoiceRuntimeAuthorityReservation): Promise<VoiceRuntimeSnapshot> {
-    const requestFingerprint = provisioningFingerprint(input);
-    const previous = this.provisioningOperations.get(input.provisioningOperationId);
-    if (previous !== undefined) {
-      if (previous.fingerprint !== requestFingerprint) {
-        throw new FakeVoiceRuntimeAuthorityError("Provisioning operation payload changed");
+    if (this.authority?.generation === input.generation) {
+      if (authorityFingerprint(this.authority) !== authorityFingerprint(input)) {
+        throw new FakeVoiceRuntimeAuthorityError("Authority generation payload changed");
       }
-      return previous.snapshot;
+      return this.snapshot;
     }
     this.requireRuntimeFence(
       input.runtimeId,
@@ -324,20 +318,6 @@ export class FakeVoiceRuntime implements VoiceRuntime {
     );
     if (input.generation !== input.expectedCurrentGeneration + 1) {
       throw new FakeVoiceRuntimeAuthorityError("Authority generations must advance exactly once");
-    }
-    const issuedAt = Date.parse(input.issuedAt);
-    const expiresAt = Date.parse(input.expiresAt);
-    if (
-      !Number.isFinite(issuedAt) ||
-      !Number.isFinite(expiresAt) ||
-      issuedAt > this.now() ||
-      expiresAt <= this.now() ||
-      expiresAt <= issuedAt
-    ) {
-      throw new FakeVoiceRuntimeAuthorityError("Authority reservation is not currently valid");
-    }
-    if ((await computeVoiceRuntimeTargetDigest(input.target)) !== input.targetDigest) {
-      throw new FakeVoiceRuntimeAuthorityError("Authority target digest does not match its target");
     }
     if (this.snapshot.operation.kind !== "none") {
       throw new FakeVoiceRuntimeAuthorityError(
@@ -357,10 +337,6 @@ export class FakeVoiceRuntime implements VoiceRuntime {
       failure: null,
     };
     this.publishState();
-    this.retainBounded(this.provisioningOperations, input.provisioningOperationId, {
-      fingerprint: requestFingerprint,
-      snapshot: this.snapshot,
-    });
     return this.snapshot;
   }
 
@@ -788,8 +764,7 @@ export class FakeVoiceRuntime implements VoiceRuntime {
       this.snapshot.availability === "ready" &&
       this.authority !== null &&
       this.authority.generation === this.snapshot.generation &&
-      this.authority.target.mode === mode &&
-      Date.parse(this.authority.expiresAt) > this.now()
+      this.authority.target.mode === mode
     );
   }
 
@@ -841,15 +816,7 @@ export class FakeVoiceRuntime implements VoiceRuntime {
   }
 
   private expireAuthority(): void {
-    if (this.authority === null || Date.parse(this.authority.expiresAt) > this.now()) return;
-    this.authority = null;
-    this.snapshot = {
-      ...this.snapshot,
-      availability: "locked",
-      target: this.snapshot.operation.kind === "none" ? null : this.snapshot.target,
-      readiness: { state: "disabled" },
-    };
-    this.publishState();
+    // Session-backed authority is cleared explicitly or by the server revocation cascade.
   }
 
   private invalidateConsumers(): void {

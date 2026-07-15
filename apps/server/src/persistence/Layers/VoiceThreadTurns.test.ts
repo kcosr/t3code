@@ -19,17 +19,11 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
 import * as NodeSqliteClient from "../NodeSqliteClient.ts";
-import { VoiceRuntimeGrantRepository } from "../Services/VoiceRuntimeGrants.ts";
 import { VoiceThreadTurnStore } from "../Services/VoiceThreadTurns.ts";
-import { VoiceRuntimeGrantRepositoryLive } from "./VoiceRuntimeGrants.ts";
 import { VoiceThreadTurnStoreLive } from "./VoiceThreadTurns.ts";
 
 const sqlite = NodeSqliteClient.layerMemory();
-const testLayer = Layer.mergeAll(
-  sqlite,
-  VoiceThreadTurnStoreLive.pipe(Layer.provide(sqlite)),
-  VoiceRuntimeGrantRepositoryLive.pipe(Layer.provide(sqlite)),
-);
+const testLayer = Layer.mergeAll(sqlite, VoiceThreadTurnStoreLive.pipe(Layer.provide(sqlite)));
 const authSessionId = AuthSessionId.make("native-thread-auth");
 const runtimeId = VoiceRuntimeId.make("native-thread-runtime");
 const runtimeInstanceId = VoiceRuntimeInstanceId.make("native-thread-runtime-instance");
@@ -38,10 +32,10 @@ const nowIso = "2026-07-13T12:00:00.000Z";
 const now = Date.parse(nowIso);
 
 const initialize = Effect.gen(function* () {
-  yield* runMigrations({ toMigrationInclusive: 54 });
+  yield* runMigrations({ toMigrationInclusive: 56 });
   const sql = yield* SqlClient.SqlClient;
   yield* sql`DELETE FROM voice_thread_turn_operations`;
-  yield* sql`DELETE FROM voice_runtime_grants`;
+  yield* sql`DELETE FROM voice_runtime_authorities`;
   yield* sql`DELETE FROM auth_sessions WHERE session_id = ${authSessionId}`;
   yield* sql`INSERT INTO auth_sessions (
     session_id, subject, scopes, method, client_device_type, issued_at, expires_at
@@ -49,15 +43,12 @@ const initialize = Effect.gen(function* () {
     ${authSessionId}, 'native-thread-test', '[]', 'bearer-access-token', 'mobile',
     '2026-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z'
   )`;
-  yield* sql`INSERT INTO voice_runtime_grants (
-    token_hash, provisioning_operation_id, runtime_id, generation, auth_session_id, granted_scopes_json,
-    target_json, target_digest, operation, readiness_enabled, expires_at, created_at
+  yield* sql`INSERT INTO voice_runtime_authorities (
+    auth_session_id, runtime_id, generation, target_json, created_at, updated_at
   ) VALUES (
-    'runtime-token-hash', 'thread-turn-store-provision', ${runtimeId}, 3, ${authSessionId}, '[]',
+    ${authSessionId}, ${runtimeId}, 3,
     '{"mode":"thread","environmentId":"environment","projectId":"project","threadId":"thread","speechPreset":"default","autoRearm":true,"endpointPolicy":{"endSilenceMs":2200,"noSpeechTimeoutMs":null,"maximumUtteranceMs":120000},"speechEnabled":true,"rearmGuardMs":500}',
-    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    'thread-turn-start', 0,
-    ${now + 60_000}, ${now}
+    ${now}, ${now}
   )`;
 });
 
@@ -105,7 +96,7 @@ describe.sequential("VoiceThreadTurnStore", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.effect("claims idempotently and keeps the rotated child token independently bounded", () =>
+  it.effect("claims idempotently and rotates the operation ownership fence", () =>
     Effect.gen(function* () {
       yield* initialize;
       const store = yield* VoiceThreadTurnStore;
@@ -137,11 +128,11 @@ describe.sequential("VoiceThreadTurnStore", () => {
       ).toBe("acknowledged");
 
       const sql = yield* SqlClient.SqlClient;
-      yield* sql`UPDATE voice_runtime_grants SET generation = 4
+      yield* sql`UPDATE voice_runtime_authorities SET generation = 4
         WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`;
       expect(
         yield* store.authorize(operationId, "rotated-operation-token-hash", now),
-      ).toMatchObject({ operationId, runtimeGeneration: 3 });
+      ).toBeUndefined();
     }).pipe(Effect.provide(testLayer)),
   );
 
@@ -150,7 +141,7 @@ describe.sequential("VoiceThreadTurnStore", () => {
       yield* initialize;
       const store = yield* VoiceThreadTurnStore;
       const sql = yield* SqlClient.SqlClient;
-      yield* sql`UPDATE voice_runtime_grants SET generation = 4
+      yield* sql`UPDATE voice_runtime_authorities SET generation = 4
         WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`;
 
       expect(yield* store.claim(claimInput)).toEqual({ status: "revoked" });
@@ -158,34 +149,24 @@ describe.sequential("VoiceThreadTurnStore", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.effect("keeps an admitted child usable while expired parent refresh scope is retained", () =>
+  it.effect("rejects client access after the parent authority generation advances", () =>
     Effect.gen(function* () {
       yield* initialize;
       const store = yield* VoiceThreadTurnStore;
-      const runtimeGrants = yield* VoiceRuntimeGrantRepository;
       const sql = yield* SqlClient.SqlClient;
       yield* store.claim({
         ...claimInput,
         operationTokenExpiresAt: now + 120_000,
       });
-      yield* sql`UPDATE voice_runtime_grants SET expires_at = ${now - 1}
+      yield* sql`UPDATE voice_runtime_authorities SET generation = 4
         WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`;
-      yield* runtimeGrants.findActive("unrelated-runtime-token", now);
       expect(
         yield* sql<{ readonly count: number }>`SELECT count(*) AS count
-          FROM voice_runtime_grants WHERE auth_session_id = ${authSessionId}`,
+          FROM voice_runtime_authorities WHERE auth_session_id = ${authSessionId}`,
       ).toEqual([{ count: 1 }]);
 
-      expect(yield* store.authorize(operationId, claimInput.tokenHash, now)).toMatchObject({
-        operationId,
-      });
-      expect(
-        yield* store.readEventPage(operationId, claimInput.tokenHash, now, 0, 100),
-      ).toMatchObject({ operation: { operationId } });
-      expect(yield* store.acknowledge(operationId, claimInput.tokenHash, ackInput(1), now)).toBe(
-        "acknowledged",
-      );
-      expect(yield* store.detach(operationId, claimInput.tokenHash, now, nowIso)).toBe("detached");
+      expect(yield* store.authorize(operationId, claimInput.tokenHash, now)).toBeUndefined();
+      expect(yield* store.get(operationId)).toMatchObject({ operationId });
     }).pipe(Effect.provide(testLayer)),
   );
 
@@ -330,7 +311,7 @@ describe.sequential("VoiceThreadTurnStore", () => {
   );
 
   it.effect(
-    "keeps accepted work accessible across generation rotation and speech retries stable",
+    "keeps accepted server-side work after authority rotation and speech retries stable",
     () =>
       Effect.gen(function* () {
         yield* initialize;
@@ -359,12 +340,9 @@ describe.sequential("VoiceThreadTurnStore", () => {
           messageId: MessageId.make("message"),
         });
         const sql = yield* SqlClient.SqlClient;
-        yield* sql`UPDATE voice_runtime_grants SET generation = 4
+        yield* sql`UPDATE voice_runtime_authorities SET generation = 4
         WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`;
-        expect(yield* store.authorize(operationId, claimInput.tokenHash, now)).toMatchObject({
-          operationId,
-          runtimeGeneration: 3,
-        });
+        expect(yield* store.authorize(operationId, claimInput.tokenHash, now)).toBeUndefined();
 
         const segment = {
           operationId,
@@ -487,7 +465,7 @@ describe.sequential("VoiceThreadTurnStore", () => {
         { type: "phase", occurredAt: nowIso, phase: "transcribing" },
         { phase: "transcribing" },
       );
-      yield* sql`UPDATE voice_runtime_grants SET generation = 4
+      yield* sql`UPDATE voice_runtime_authorities SET generation = 4
         WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`;
       expect(
         yield* store.beginDispatch(operationId, claimInput.tokenHash, "lease", now, nowIso),
@@ -608,7 +586,7 @@ describe.sequential("VoiceThreadTurnStore", () => {
         });
 
         // Simulate the durable parent deletion succeeding while derived-row cleanup fails.
-        yield* sql`DELETE FROM voice_runtime_grants
+        yield* sql`DELETE FROM voice_runtime_authorities
           WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`;
         yield* store.revokeRuntime(authSessionId, runtimeId);
 

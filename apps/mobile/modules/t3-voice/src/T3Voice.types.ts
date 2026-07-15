@@ -198,59 +198,19 @@ export interface T3VoicePersistedReadinessSnapshot extends T3VoiceReadinessSnaps
   readonly generation: number;
 }
 
-export type T3VoiceRuntimeGrantOperation = "realtime-start" | "thread-turn-start";
-
-export interface T3VoiceRuntimeAuthorityPrepareInput {
-  readonly readiness: T3VoiceReadinessSnapshot;
-  readonly runtimeId: string;
-  readonly runtimeInstanceId: string;
-  readonly provisioningOperationId: string;
-  readonly expectedCurrentGeneration: number;
-  readonly generation: number;
-  readonly targetDigest: string;
-  readonly target: VoiceRuntimeTarget;
-  readonly operation: T3VoiceRuntimeGrantOperation;
-  readonly environmentOrigin: string;
-}
-
-export interface T3VoiceRuntimeAuthorityPrepared {
-  readonly state: "prepared";
-  readonly runtimeId: string;
-  readonly runtimeInstanceId: string;
-  readonly provisioningOperationId: string;
-  readonly expectedCurrentGeneration: number;
-  readonly generation: number;
-  readonly targetDigest: string;
-  readonly target: VoiceRuntimeTarget;
-  readonly operation: T3VoiceRuntimeGrantOperation;
-  readonly environmentOrigin: string;
-  readonly readinessEnabled: boolean;
-  readonly readiness: T3VoicePersistedReadinessSnapshot;
-  readonly refreshCredentialHash: string | null;
-}
-
 export interface T3VoiceRuntimeAuthorityActive {
   readonly state: "active";
   readonly runtimeId: string;
   readonly runtimeInstanceId: string;
-  readonly provisioningOperationId: string;
   readonly expectedCurrentGeneration: number;
   readonly generation: number;
-  readonly targetDigest: string;
   readonly target: VoiceRuntimeTarget;
-  readonly operation: T3VoiceRuntimeGrantOperation;
   readonly environmentOrigin: string;
   readonly readinessEnabled: boolean;
   readonly readiness: T3VoicePersistedReadinessSnapshot;
-  readonly issuedAt: string;
-  readonly expiresAt: string;
-  readonly refreshRotationCounter: number;
-  readonly refreshCredentialHash: null;
 }
 
-export type T3VoiceRuntimeAuthoritySnapshot =
-  | T3VoiceRuntimeAuthorityPrepared
-  | T3VoiceRuntimeAuthorityActive;
+export type T3VoiceRuntimeAuthoritySnapshot = T3VoiceRuntimeAuthorityActive;
 
 export interface T3VoiceRuntimeAuthorityClearIfIdleInput {
   readonly runtimeId: string | null;
@@ -297,14 +257,6 @@ export interface T3VoiceRealtimeIdentifier {
 export interface T3VoiceRealtimePrepareInput extends T3VoiceRealtimeIdentifier {
   readonly environmentOrigin: string;
   readonly audioRouteId: string;
-  readonly runtimeControlGrant: {
-    readonly token: string;
-    readonly sessionId: string;
-    readonly leaseGeneration: number;
-    readonly expiresAt: string;
-    readonly heartbeatIntervalSeconds: number;
-    readonly failureGraceSeconds: number;
-  };
 }
 
 export interface T3VoiceRealtimeOffer {
@@ -487,10 +439,11 @@ export interface T3VoiceNativeModule {
   readonly acknowledgeVoiceRuntimePresentationActionAsync: (
     input: VoiceRuntimePresentationActionAcknowledgement,
   ) => Promise<void>;
-  readonly prepareVoiceRuntimeAuthorityAsync: (
-    input: T3VoiceRuntimeAuthorityPrepareInput,
-  ) => Promise<T3VoiceRuntimeAuthorityPrepared>;
   readonly inspectVoiceRuntimeAuthorityAsync: () => Promise<T3VoiceRuntimeAuthoritySnapshot | null>;
+  readonly setVoiceRuntimeSessionCredentialAsync: (input: {
+    readonly environmentOrigin: string;
+    readonly credential: string;
+  }) => Promise<void>;
   readonly disableVoiceRuntimeReadinessAsync: () => Promise<VoiceRuntimeSnapshot>;
   readonly clearVoiceRuntimeAuthorityIfIdleAsync: (
     input: T3VoiceRuntimeAuthorityClearIfIdleInput,

@@ -52,14 +52,6 @@ const serverSession = {
   },
   expiresAt: "2026-07-10T22:00:00.000Z" as never,
   heartbeatIntervalSeconds: 10,
-  runtimeControlGrant: {
-    token: "native-control-token",
-    sessionId: SESSION_ID,
-    leaseGeneration: 1,
-    expiresAt: "2026-07-10T22:00:00.000Z" as never,
-    heartbeatIntervalSeconds: 8,
-    failureGraceSeconds: 30,
-  },
 };
 
 const makeAttachmentStore = (initial: RealtimeVoiceAttachmentRecord | null = null) => {
@@ -615,7 +607,6 @@ describe("RealtimeVoiceController", () => {
       nativeSessionId: SESSION_ID,
       environmentOrigin: "https://environment.example.test",
       audioRouteId: "system",
-      runtimeControlGrant: serverSession.runtimeControlGrant,
     });
     expect(client.offerSession).toHaveBeenCalledWith({
       sessionId: SESSION_ID,

@@ -32,6 +32,7 @@ interface StartRow {
   readonly conversationId: string;
   readonly sessionId: string | null;
   readonly leaseGeneration: number | null;
+  readonly closeOnly: number;
   readonly failureReason: string | null;
   readonly failureOperation: string | null;
   readonly failureDetail: string | null;
@@ -52,6 +53,7 @@ const decode = (row: StartRow): PersistedVoiceRuntimeRealtimeStart => ({
   conversationId: VoiceConversationId.make(row.conversationId),
   sessionId: row.sessionId === null ? null : VoiceSessionId.make(row.sessionId),
   leaseGeneration: row.leaseGeneration,
+  closeOnly: row.closeOnly === 1,
   failure:
     row.failureReason === null ||
     row.failureOperation === null ||
@@ -81,6 +83,7 @@ const make = Effect.gen(function* () {
             runtime_generation AS "runtimeGeneration", mode_session_id AS "modeSessionId",
             client_operation_id AS "clientOperationId", conversation_id AS "conversationId",
             session_id AS "sessionId", lease_generation AS "leaseGeneration",
+            close_only AS "closeOnly",
             failure_reason AS "failureReason",
             failure_operation AS "failureOperation", failure_detail AS "failureDetail",
             failure_retryable AS "failureRetryable", claim_expires_at AS "claimExpiresAt",
@@ -182,6 +185,7 @@ const make = Effect.gen(function* () {
       runtime_generation AS "runtimeGeneration", mode_session_id AS "modeSessionId",
       client_operation_id AS "clientOperationId", conversation_id AS "conversationId",
       session_id AS "sessionId", lease_generation AS "leaseGeneration",
+      close_only AS "closeOnly",
       failure_reason AS "failureReason", failure_operation AS "failureOperation",
       failure_detail AS "failureDetail", failure_retryable AS "failureRetryable",
       claim_expires_at AS "claimExpiresAt", expires_at AS "expiresAt"
@@ -213,11 +217,20 @@ const make = Effect.gen(function* () {
     authSessionId,
     runtimeId,
   ) =>
-    sql`DELETE FROM voice_runtime_realtime_starts
-      WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}`.pipe(
-      Effect.asVoid,
-      Effect.mapError(toPersistenceSqlError("VoiceRuntimeRealtimeStartRepository.revokeRuntime")),
-    );
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          yield* sql`UPDATE voice_runtime_realtime_starts SET close_only = 1
+        WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}
+          AND session_id IS NOT NULL`;
+          yield* sql`DELETE FROM voice_runtime_realtime_starts
+        WHERE auth_session_id = ${authSessionId} AND runtime_id = ${runtimeId}
+          AND session_id IS NULL`;
+        }),
+      )
+      .pipe(
+        Effect.mapError(toPersistenceSqlError("VoiceRuntimeRealtimeStartRepository.revokeRuntime")),
+      );
   const revokeAuthSession: VoiceRuntimeRealtimeStartRepositoryShape["revokeAuthSession"] = (
     authSessionId,
   ) =>

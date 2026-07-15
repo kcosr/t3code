@@ -9,6 +9,7 @@ import {
   type VoicePublicErrorReason,
   type VoiceRuntimeThreadTurnPhase,
   type VoiceRuntimeThreadTurnSnapshot,
+  VoiceRuntimeTarget,
 } from "@t3tools/contracts";
 import { appendSpeechText, initialSpeechChunkerState } from "@t3tools/shared/speechChunker";
 import * as Cause from "effect/Cause";
@@ -47,7 +48,7 @@ import {
   VOICE_TRANSCRIPTION_OUTPUT_MAX_BYTES,
   VoiceMediaRequestLimiter,
 } from "../Services/VoiceMediaPolicy.ts";
-import { VoiceRuntimeGrantRegistry } from "../Services/VoiceRuntimeGrantRegistry.ts";
+import { VoiceRuntimeAuthorityRepository } from "../../persistence/Services/VoiceRuntimeAuthorities.ts";
 import { VoiceThreadTurnService } from "../Services/VoiceThreadTurnService.ts";
 import { VoiceProviderRegistry } from "../Services/VoiceProviderRegistry.ts";
 
@@ -57,10 +58,12 @@ const EVENT_PAGE_LIMIT = 100;
 const TERMINAL_RETENTION_MILLIS = 30 * 24 * 60 * 60 * 1_000;
 const DRAFT_TTL_MILLIS = 15 * 60 * 1_000;
 const DRAFT_KEY_NAME = "voice-thread-draft-encryption-key-v1";
-const OPERATION_TOKEN_KEY_NAME = "voice-thread-operation-token-key-v1";
 const hashToken = (token: string) => NodeCrypto.createHash("sha256").update(token).digest("hex");
+const ownershipHash = (authSessionId: string, operationId: string) =>
+  hashToken(`${authSessionId}\0${operationId}`);
 const deterministicHash = (...values: ReadonlyArray<string>) =>
   NodeCrypto.createHash("sha256").update(values.join("\0")).digest("base64url");
+const encodeRuntimeTarget = Schema.encodeSync(Schema.fromJsonString(VoiceRuntimeTarget));
 const voiceError = (
   reason: VoicePublicErrorReason,
   operation: string,
@@ -158,11 +161,8 @@ const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const secretStore = yield* ServerSecretStore;
   const draftKey = yield* secretStore.getOrCreateRandom(DRAFT_KEY_NAME, 32).pipe(Effect.orDie);
-  const operationTokenKey = yield* secretStore
-    .getOrCreateRandom(OPERATION_TOKEN_KEY_NAME, 32)
-    .pipe(Effect.orDie);
   const store = yield* VoiceThreadTurnStore;
-  const runtimeGrants = yield* VoiceRuntimeGrantRegistry;
+  const runtimeAuthorities = yield* VoiceRuntimeAuthorityRepository;
   const providers = yield* VoiceProviderRegistry;
   const settingsService = yield* ServerSettingsService;
   const limiter = yield* VoiceMediaRequestLimiter;
@@ -233,25 +233,18 @@ const make = Effect.gen(function* () {
     return record;
   });
   const authorize = Effect.fn("VoiceThreadTurnService.authorize")(function* (
-    token: string,
+    authSessionId: string,
     operationId: VoiceThreadTurnOperationId,
   ) {
-    if (token.length === 0 || token.length > 128)
-      return yield* voiceError(
-        "authorization-revoked",
-        "thread-turn.authorize",
-        "Operation credential is invalid",
-        false,
-      );
     const now = yield* Clock.currentTimeMillis;
     const record = yield* store
-      .authorize(operationId, hashToken(token), now)
+      .authorize(operationId, ownershipHash(authSessionId, operationId), now)
       .pipe(Effect.mapError(repositoryFailure("thread-turn.authorize")));
     if (record === undefined)
       return yield* voiceError(
         "authorization-revoked",
         "thread-turn.authorize",
-        "Operation credential is invalid or expired",
+        "Operation is not owned by this session or has expired",
         false,
       );
     return record;
@@ -725,37 +718,38 @@ const make = Effect.gen(function* () {
 
   const create: VoiceThreadTurnService["Service"]["create"] = Effect.fn(
     "VoiceThreadTurnService.create",
-  )(function* (runtimeToken, input) {
+  )(function* (principal, input) {
     yield* getEnabledVoiceSettings;
     yield* maintain();
-    const grant = yield* runtimeGrants.authorize(runtimeToken);
+    const runtimeId = VoiceRuntimeId.make(input.runtimeId);
+    const authority = yield* runtimeAuthorities
+      .find(principal.sessionId, runtimeId)
+      .pipe(Effect.mapError(repositoryFailure("thread-turn.authority")));
     if (
-      grant === undefined ||
-      grant.target.mode !== "thread" ||
-      VoiceRuntimeId.make(grant.runtimeId) !== input.runtimeId ||
-      grant.generation !== input.generation
+      authority === undefined ||
+      authority.target.mode !== "thread" ||
+      authority.generation !== input.generation ||
+      encodeRuntimeTarget(authority.target) !== encodeRuntimeTarget(input.target)
     )
       return yield* voiceError(
         "authorization-revoked",
         "thread-turn.create",
-        "Runtime credential is invalid",
+        "Runtime authority is stale or belongs to a different session",
         false,
       );
-    const threadTarget = grant.target;
+    const threadTarget = authority.target;
     const now = yield* Clock.currentTimeMillis;
     const operationId = VoiceThreadTurnOperationId.make(
-      `native-thread-turn:${deterministicHash(grant.authSessionId, grant.runtimeId, input.runtimeInstanceId, String(grant.generation), input.modeSessionId, input.turnClientOperationId)}`,
+      `native-thread-turn:${deterministicHash(principal.sessionId, runtimeId, input.runtimeInstanceId, String(authority.generation), input.modeSessionId, input.turnClientOperationId)}`,
     );
-    const token = NodeCrypto.createHmac("sha256", operationTokenKey)
-      .update(operationId)
-      .digest("base64url");
-    const currentGrant = yield* runtimeGrants.authorize(runtimeToken);
+    const currentAuthority = yield* runtimeAuthorities
+      .find(principal.sessionId, runtimeId)
+      .pipe(Effect.mapError(repositoryFailure("thread-turn.authority")));
     if (
-      currentGrant === undefined ||
-      currentGrant.target.mode !== "thread" ||
-      currentGrant.authSessionId !== grant.authSessionId ||
-      currentGrant.runtimeId !== grant.runtimeId ||
-      currentGrant.generation !== grant.generation
+      currentAuthority === undefined ||
+      currentAuthority.target.mode !== "thread" ||
+      currentAuthority.generation !== authority.generation ||
+      encodeRuntimeTarget(currentAuthority.target) !== encodeRuntimeTarget(authority.target)
     )
       return yield* voiceError(
         "authorization-revoked",
@@ -766,10 +760,10 @@ const make = Effect.gen(function* () {
     const claim = yield* store
       .claim({
         operationId,
-        authSessionId: grant.authSessionId,
-        runtimeId: grant.runtimeId,
+        authSessionId: principal.sessionId,
+        runtimeId,
         runtimeInstanceId: input.runtimeInstanceId,
-        runtimeGeneration: grant.generation,
+        runtimeGeneration: authority.generation,
         modeSessionId: input.modeSessionId,
         turnClientOperationId: input.turnClientOperationId,
         projectId: threadTarget.projectId,
@@ -779,7 +773,7 @@ const make = Effect.gen(function* () {
         autoRearm: threadTarget.autoRearm,
         submissionPolicy: input.submissionPolicy,
         speechPlanId: input.speechPlanId,
-        tokenHash: hashToken(token),
+        tokenHash: ownershipHash(principal.sessionId, operationId),
         operationTokenExpiresAt: now + OPERATION_TTL_MILLIS,
         retentionExpiresAt: now + TERMINAL_RETENTION_MILLIS,
         nowEpochMillis: now,
@@ -826,20 +820,14 @@ const make = Effect.gen(function* () {
       generation: created.runtimeGeneration,
       phase: created.phase,
     });
-    return {
-      snapshot: yield* hydrateSnapshot(created),
-      operationGrant: {
-        token,
-        expiresAt: DateTime.formatIso(DateTime.makeUnsafe(created.operationTokenExpiresAt)),
-      },
-    };
+    return { snapshot: yield* hydrateSnapshot(created) };
   });
 
   const uploadAudio: VoiceThreadTurnService["Service"]["uploadAudio"] = Effect.fn(
     "VoiceThreadTurnService.uploadAudio",
-  )(function* (operationToken, operationId, bytes, language) {
-    const operation = yield* authorize(operationToken, operationId);
-    const operationTokenHash = hashToken(operationToken);
+  )(function* (authSessionId, operationId, bytes, language) {
+    const operation = yield* authorize(authSessionId, operationId);
+    const operationTokenHash = ownershipHash(authSessionId, operationId);
     if (terminalPhase(operation.phase))
       return {
         snapshot: yield* hydrateSnapshot(operation),
@@ -1100,8 +1088,8 @@ const make = Effect.gen(function* () {
 
   const beginAudioUpload: VoiceThreadTurnService["Service"]["beginAudioUpload"] = Effect.fn(
     "VoiceThreadTurnService.beginAudioUpload",
-  )(function* (operationToken, operationId) {
-    yield* authorize(operationToken, operationId);
+  )(function* (authSessionId, operationId) {
+    yield* authorize(authSessionId, operationId);
     const settings = yield* getEnabledVoiceSettings;
     const permit = yield* limiter
       .acquire(settings.maxConcurrentMediaRequests)
@@ -1114,19 +1102,19 @@ const make = Effect.gen(function* () {
       maximumBytes: settings.maxUploadBytes,
       bodyTimeoutSeconds: Math.max(30, settings.maxInputDurationSeconds + 30),
       upload: (bytes: Uint8Array, language?: string) =>
-        uploadAudio(operationToken, operationId, bytes, language),
+        uploadAudio(authSessionId, operationId, bytes, language),
       release: permit.release,
     };
   });
 
   const setDraftDisposition: VoiceThreadTurnService["Service"]["setDraftDisposition"] = Effect.fn(
     "VoiceThreadTurnService.setDraftDisposition",
-  )(function* (operationToken, operationId) {
-    yield* authorize(operationToken, operationId);
+  )(function* (authSessionId, operationId) {
+    yield* authorize(authSessionId, operationId);
     const result = yield* store
       .setDraftDisposition(
         operationId,
-        hashToken(operationToken),
+        ownershipHash(authSessionId, operationId),
         yield* Clock.currentTimeMillis,
         yield* nowIso,
       )
@@ -1150,14 +1138,14 @@ const make = Effect.gen(function* () {
 
   const events: VoiceThreadTurnService["Service"]["events"] = Effect.fn(
     "VoiceThreadTurnService.events",
-  )(function* (operationToken, operationId, eventQuery) {
+  )(function* (authSessionId, operationId, eventQuery) {
     yield* maintain();
     const readPage = Effect.fn("VoiceThreadTurnService.readEventPage")(function* () {
-      yield* authorize(operationToken, operationId);
+      yield* authorize(authSessionId, operationId);
       const page = yield* store
         .readEventPage(
           operationId,
-          hashToken(operationToken),
+          ownershipHash(authSessionId, operationId),
           yield* Clock.currentTimeMillis,
           eventQuery.afterSequence,
           EVENT_PAGE_LIMIT,
@@ -1191,12 +1179,12 @@ const make = Effect.gen(function* () {
 
   const acknowledgeEvents: VoiceThreadTurnService["Service"]["acknowledgeEvents"] = Effect.fn(
     "VoiceThreadTurnService.acknowledgeEvents",
-  )(function* (operationToken, operationId, input) {
-    yield* authorize(operationToken, operationId);
+  )(function* (authSessionId, operationId, input) {
+    yield* authorize(authSessionId, operationId);
     const accepted = yield* store
       .acknowledge(
         operationId,
-        hashToken(operationToken),
+        ownershipHash(authSessionId, operationId),
         { ...input, occurredAt: yield* nowIso },
         yield* Clock.currentTimeMillis,
       )
@@ -1220,8 +1208,8 @@ const make = Effect.gen(function* () {
 
   const speech: VoiceThreadTurnService["Service"]["speech"] = Effect.fn(
     "VoiceThreadTurnService.speech",
-  )(function* (operationToken, operationId, segmentIndex) {
-    const operation = yield* authorize(operationToken, operationId);
+  )(function* (authSessionId, operationId, segmentIndex) {
+    const operation = yield* authorize(authSessionId, operationId);
     if (!operation.speechEnabled)
       return yield* voiceError(
         "invalid-phase",
@@ -1229,7 +1217,7 @@ const make = Effect.gen(function* () {
         "Speech synthesis is disabled for this operation",
         false,
       );
-    const tokenHash = hashToken(operationToken);
+    const tokenHash = ownershipHash(authSessionId, operationId);
     const authorizedSegment = yield* store
       .getSpeechSegmentAuthorized(
         operationId,
@@ -1341,15 +1329,20 @@ const make = Effect.gen(function* () {
 
   const cancel: VoiceThreadTurnService["Service"]["cancel"] = Effect.fn(
     "VoiceThreadTurnService.cancel",
-  )(function* (operationToken, operationId) {
-    const operation = yield* authorize(operationToken, operationId);
+  )(function* (authSessionId, operationId) {
+    const operation = yield* authorize(authSessionId, operationId);
     if (terminalPhase(operation.phase))
       return {
         snapshot: yield* hydrateSnapshot(operation),
         cancelled: operation.phase === "cancelled",
       };
     const result = yield* store
-      .cancel(operationId, hashToken(operationToken), yield* nowIso, yield* Clock.currentTimeMillis)
+      .cancel(
+        operationId,
+        ownershipHash(authSessionId, operationId),
+        yield* nowIso,
+        yield* Clock.currentTimeMillis,
+      )
       .pipe(Effect.mapError(repositoryFailure("thread-turn.cancel")));
     if (result === "revoked")
       return yield* voiceError(
@@ -1371,13 +1364,13 @@ const make = Effect.gen(function* () {
 
   const readDraft: VoiceThreadTurnService["Service"]["readDraft"] = Effect.fn(
     "VoiceThreadTurnService.readDraft",
-  )(function* (operationToken, operationId) {
+  )(function* (authSessionId, operationId) {
     const normalizedOperationId = VoiceThreadTurnOperationId.make(operationId);
-    yield* authorize(operationToken, normalizedOperationId);
+    yield* authorize(authSessionId, normalizedOperationId);
     const result = yield* store
       .readDraftAuthorized(
         normalizedOperationId,
-        hashToken(operationToken),
+        ownershipHash(authSessionId, operationId),
         yield* Clock.currentTimeMillis,
         yield* nowIso,
       )
@@ -1434,14 +1427,14 @@ const make = Effect.gen(function* () {
 
   const consumeDraft: VoiceThreadTurnService["Service"]["consumeDraft"] = Effect.fn(
     "VoiceThreadTurnService.consumeDraft",
-  )(function* (operationToken, operationId) {
+  )(function* (authSessionId, operationId) {
     const normalizedOperationId = VoiceThreadTurnOperationId.make(operationId);
-    yield* authorize(operationToken, normalizedOperationId);
+    yield* authorize(authSessionId, normalizedOperationId);
     const result = yield* store
       .consumeDraft(
         normalizedOperationId,
         VoiceDraftArtifactId.make(`voice-draft:${normalizedOperationId}`),
-        hashToken(operationToken),
+        ownershipHash(authSessionId, operationId),
         yield* Clock.currentTimeMillis,
         yield* nowIso,
       )
@@ -1468,13 +1461,13 @@ const make = Effect.gen(function* () {
 
   const detach: VoiceThreadTurnService["Service"]["detach"] = Effect.fn(
     "VoiceThreadTurnService.detach",
-  )(function* (operationToken, operationId) {
+  )(function* (authSessionId, operationId) {
     const normalizedOperationId = VoiceThreadTurnOperationId.make(operationId);
-    yield* authorize(operationToken, normalizedOperationId);
+    yield* authorize(authSessionId, normalizedOperationId);
     const result = yield* store
       .detach(
         normalizedOperationId,
-        hashToken(operationToken),
+        ownershipHash(authSessionId, operationId),
         yield* Clock.currentTimeMillis,
         yield* nowIso,
       )
@@ -1507,25 +1500,8 @@ const make = Effect.gen(function* () {
   );
 
   return VoiceThreadTurnService.of({
-    authorizeCreate: (runtimeToken) =>
-      runtimeGrants
-        .authorize(runtimeToken)
-        .pipe(
-          Effect.flatMap((grant) =>
-            grant?.target.mode === "thread"
-              ? Effect.void
-              : Effect.fail(
-                  voiceError(
-                    "authorization-revoked",
-                    "thread-turn.create-authorize",
-                    "Runtime credential is invalid",
-                    false,
-                  ),
-                ),
-          ),
-        ),
-    authorizeOperation: (operationToken, operationId) =>
-      authorize(operationToken, operationId).pipe(Effect.flatMap(hydrateSnapshot)),
+    authorizeOperation: (authSessionId, operationId) =>
+      authorize(authSessionId, operationId).pipe(Effect.flatMap(hydrateSnapshot)),
     beginAudioUpload,
     create,
     uploadAudio,

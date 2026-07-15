@@ -8,12 +8,10 @@ import {
   VoiceRuntimeCommandId,
   VoiceRuntimeId,
   VoiceRuntimeInstanceId,
-  VoiceRuntimeProvisioningOperationId,
 } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vitest";
 
 import { FakeVoiceRuntime } from "./fakeRuntime.ts";
-import { computeVoiceRuntimeTargetDigest } from "./runtime.ts";
 import { VoiceRuntimeController } from "./runtimeController.ts";
 
 const now = Date.parse("2026-07-13T12:00:00.000Z");
@@ -30,18 +28,11 @@ async function configuredRuntime() {
   await runtime.configureAuthority({
     runtimeId,
     runtimeInstanceId,
-    provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provision-controller"),
     expectedCurrentGeneration: 0,
     generation: 1,
-    targetDigest: await computeVoiceRuntimeTargetDigest(target),
     target,
     environmentOrigin: "https://termstation",
-    operation: "realtime-start",
     readinessEnabled: true,
-    refreshRotationCounter: 0,
-    token: "runtime-controller-token",
-    issuedAt: "2026-07-13T12:00:00.000Z",
-    expiresAt: "2026-07-13T13:00:00.000Z",
   });
   return runtime;
 }

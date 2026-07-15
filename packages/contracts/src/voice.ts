@@ -13,7 +13,6 @@ import {
   VoiceClientActionId,
   VoiceConversationEntryId,
   VoiceConversationId,
-  VoiceMediaTicketId,
   VoiceRuntimeId,
   VoiceThreadTurnOperationId,
   VoicePlaybackId,
@@ -268,16 +267,6 @@ export const VoiceSessionState = Schema.Struct({
 });
 export type VoiceSessionState = typeof VoiceSessionState.Type;
 
-export const VoiceRuntimeControlGrant = Schema.Struct({
-  token: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
-  sessionId: VoiceSessionId,
-  leaseGeneration: PositiveInt,
-  expiresAt: IsoDateTime,
-  heartbeatIntervalSeconds: PositiveInt,
-  failureGraceSeconds: PositiveInt,
-});
-export type VoiceRuntimeControlGrant = typeof VoiceRuntimeControlGrant.Type;
-
 export const VoiceSpeechPreset = Schema.Literals(["default", "warm"]);
 export type VoiceSpeechPreset = typeof VoiceSpeechPreset.Type;
 
@@ -322,10 +311,6 @@ export type VoiceThreadTurnSnapshot = typeof VoiceThreadTurnSnapshot.Type;
 
 export const VoiceThreadTurnCreateResult = Schema.Struct({
   snapshot: VoiceThreadTurnSnapshot,
-  operationGrant: Schema.Struct({
-    token: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
-    expiresAt: IsoDateTime,
-  }),
 });
 export type VoiceThreadTurnCreateResult = typeof VoiceThreadTurnCreateResult.Type;
 
@@ -435,7 +420,6 @@ export const VoiceSessionCreateResult = Schema.Struct({
   transport: VoiceMediaTransport,
   expiresAt: IsoDateTime,
   heartbeatIntervalSeconds: PositiveInt,
-  runtimeControlGrant: VoiceRuntimeControlGrant,
 });
 export type VoiceSessionCreateResult = typeof VoiceSessionCreateResult.Type;
 
@@ -795,29 +779,6 @@ export const VoiceSpeechRequest = Schema.Struct({
   preset: VoiceSpeechPreset,
 });
 export type VoiceSpeechRequest = typeof VoiceSpeechRequest.Type;
-
-export const VoiceMediaTicketOperation = Schema.Literals(["transcription-upload", "speech-stream"]);
-export type VoiceMediaTicketOperation = typeof VoiceMediaTicketOperation.Type;
-
-export const VoiceMediaTicketRequest = Schema.Union([
-  Schema.Struct({
-    operation: Schema.Literal("transcription-upload"),
-    requestId: VoiceRequestId,
-  }),
-  Schema.Struct({
-    operation: Schema.Literal("speech-stream"),
-    requestId: VoiceRequestId,
-  }),
-]);
-export type VoiceMediaTicketRequest = typeof VoiceMediaTicketRequest.Type;
-
-export const VoiceMediaTicket = Schema.Struct({
-  ticketId: VoiceMediaTicketId,
-  token: TrimmedNonEmptyString,
-  operation: VoiceMediaTicketOperation,
-  expiresAt: IsoDateTime,
-});
-export type VoiceMediaTicket = typeof VoiceMediaTicket.Type;
 
 export const VoicePublicErrorReason = Schema.Literals([
   "disabled",

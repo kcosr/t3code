@@ -1,10 +1,4 @@
-import {
-  EnvironmentId,
-  VoiceConversationId,
-  VoiceRuntimeInstanceId,
-  VoiceRuntimeProvisioningOperationId,
-  VoiceRuntimeTargetDigest,
-} from "@t3tools/contracts";
+import { EnvironmentId, VoiceConversationId, VoiceRuntimeInstanceId } from "@t3tools/contracts";
 import { describe, expect, it } from "vitest";
 
 import { autonomousNativeVoiceReadinessAction } from "./autonomousNativeVoiceReadiness";
@@ -26,12 +20,9 @@ const authority = {
   state: "active" as const,
   runtimeId: "runtime-1",
   runtimeInstanceId: VoiceRuntimeInstanceId.make("runtime-instance-1"),
-  provisioningOperationId: VoiceRuntimeProvisioningOperationId.make("provisioning-1"),
   expectedCurrentGeneration: 0,
   generation: 1,
-  targetDigest: VoiceRuntimeTargetDigest.make("a".repeat(64)),
   target: resolvedTarget.target,
-  operation: "realtime-start" as const,
   environmentOrigin: "https://environment.example.test",
   readinessEnabled: true,
   readiness: {
@@ -44,10 +35,6 @@ const authority = {
     notificationPermissionGranted: true,
     generation: 1,
   },
-  issuedAt: "2026-07-14T12:00:00.000Z",
-  expiresAt: "2026-07-15T12:00:00.000Z",
-  refreshRotationCounter: 0,
-  refreshCredentialHash: null,
 };
 
 describe("autonomous native voice readiness", () => {

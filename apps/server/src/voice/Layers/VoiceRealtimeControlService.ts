@@ -1,6 +1,8 @@
 import {
+  AuthSessionId,
   VoiceClientActionId,
   VoiceRuntimeId,
+  VoiceRuntimeTarget,
   type VoiceThreadRuntimeTarget,
   type VoiceRuntimeRealtimeAction,
   type VoiceRuntimeRealtimeActionAckResult,
@@ -18,15 +20,14 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as NodeCrypto from "node:crypto";
 
-import { ServerSecretStore } from "../../auth/ServerSecretStore.ts";
+import { VoiceRuntimeAuthorityRepository } from "../../persistence/Services/VoiceRuntimeAuthorities.ts";
 import { VoiceRuntimeRealtimeStartRepository } from "../../persistence/Services/VoiceRuntimeRealtimeStarts.ts";
-import { VoiceRealtimeTransitionGrantRepository } from "../../persistence/Services/VoiceRealtimeTransitionGrants.ts";
+import { VoiceRealtimeTransitionReservationRepository } from "../../persistence/Services/VoiceRealtimeTransitionReservations.ts";
 import { VoiceError } from "../Errors.ts";
-import { VoiceRuntimeControlGrantRegistry } from "../Services/VoiceRuntimeControlGrantRegistry.ts";
-import { VoiceRuntimeGrantRegistry } from "../Services/VoiceRuntimeGrantRegistry.ts";
 import {
   VoiceRealtimeControlService,
   type VoiceRealtimeControlServiceShape,
@@ -34,7 +35,6 @@ import {
 import { VoiceSessionService } from "../Services/VoiceSessionService.ts";
 
 const START_CLAIM_MILLIS = 60_000;
-const TRANSITION_TOKEN_KEY_NAME = "voice-realtime-transition-token-key-v1";
 const OPERATION_CACHE_TTL_MILLIS = 5 * 60_000;
 const OPERATION_CACHE_LIMIT = 512;
 
@@ -45,11 +45,13 @@ interface SessionBinding {
   readonly generation: number;
   readonly modeSessionId: string;
   readonly leaseGeneration: number;
+  readonly expiresAt: number;
+  readonly closeOnly: boolean;
   readonly acknowledgedActionSequences: Set<number>;
 }
 
 interface CachedOperation {
-  readonly tokenHash: string;
+  readonly authSessionId: string;
   readonly fingerprint: string;
   readonly result: unknown;
   readonly expiresAt: number;
@@ -57,6 +59,7 @@ interface CachedOperation {
 
 const hash = (...parts: ReadonlyArray<string | number>) =>
   NodeCrypto.createHash("sha256").update(parts.join("\0")).digest("base64url");
+const encodeRuntimeTarget = Schema.encodeSync(Schema.fromJsonString(VoiceRuntimeTarget));
 
 const operationError = (
   reason: VoiceError["reason"],
@@ -131,15 +134,10 @@ export const protectRealtimeStartCriticalSection = <A, E, R>(effect: Effect.Effe
   effect.pipe(Effect.uninterruptible);
 
 const make = Effect.gen(function* () {
-  const runtimeGrants = yield* VoiceRuntimeGrantRegistry;
-  const controlGrants = yield* VoiceRuntimeControlGrantRegistry;
+  const runtimeAuthorities = yield* VoiceRuntimeAuthorityRepository;
   const starts = yield* VoiceRuntimeRealtimeStartRepository;
-  const transitions = yield* VoiceRealtimeTransitionGrantRepository;
+  const transitions = yield* VoiceRealtimeTransitionReservationRepository;
   const sessions = yield* VoiceSessionService;
-  const secretStore = yield* ServerSecretStore;
-  const transitionTokenKey = yield* secretStore
-    .getOrCreateRandom(TRANSITION_TOKEN_KEY_NAME, 32)
-    .pipe(Effect.orDie);
   const mutex = yield* Semaphore.make(1);
   const bindings = new Map<string, SessionBinding>();
   const operations = new Map<string, CachedOperation>();
@@ -177,7 +175,7 @@ const make = Effect.gen(function* () {
     );
 
   const requireControl = Effect.fn("VoiceRealtimeControlService.requireControl")(function* (
-    token: string,
+    authSessionId: AuthSessionId,
     sessionId: VoiceSessionId,
     input: {
       readonly runtimeId: string;
@@ -186,50 +184,58 @@ const make = Effect.gen(function* () {
       readonly modeSessionId: string;
       readonly leaseGeneration: number;
     },
-    capability: "session-control" | "handoff-actions" | "webrtc-signaling" | "session-close",
+    capability:
+      | "session-control"
+      | "handoff-actions"
+      | "handoff-commit"
+      | "webrtc-signaling"
+      | "session-close",
   ) {
-    const grant = yield* controlGrants.authorize(token);
-    let binding = bindings.get(sessionId);
-    if (grant !== undefined && binding === undefined) {
-      const persisted = yield* starts
-        .findBySession(sessionId, yield* Clock.currentTimeMillis)
-        .pipe(
-          Effect.mapError((cause) =>
-            operationError(
-              "provider-unavailable",
-              "runtime-realtime.authorize",
-              `Realtime start storage is unavailable: ${String(cause)}`,
-              true,
-            ),
+    const cached = bindings.get(sessionId);
+    const persisted = yield* starts
+      .findBySession(sessionId, yield* Clock.currentTimeMillis)
+      .pipe(
+        Effect.mapError((cause) =>
+          operationError(
+            "provider-unavailable",
+            "runtime-realtime.authorize",
+            `Realtime start storage is unavailable: ${String(cause)}`,
+            true,
           ),
-        );
-      if (
-        persisted !== undefined &&
-        persisted.sessionId === sessionId &&
-        persisted.leaseGeneration !== null
-      ) {
-        binding = {
-          authSessionId: String(persisted.authSessionId),
-          runtimeId: String(persisted.runtimeId),
-          runtimeInstanceId: String(persisted.runtimeInstanceId),
-          generation: persisted.runtimeGeneration,
-          modeSessionId: String(persisted.modeSessionId),
-          leaseGeneration: persisted.leaseGeneration,
-          acknowledgedActionSequences: new Set(),
-        };
-        bindings.set(sessionId, binding);
-      }
-    }
+        ),
+      );
+    const binding =
+      persisted === undefined ||
+      persisted.sessionId !== sessionId ||
+      persisted.leaseGeneration === null
+        ? undefined
+        : {
+            authSessionId: String(persisted.authSessionId),
+            runtimeId: String(persisted.runtimeId),
+            runtimeInstanceId: String(persisted.runtimeInstanceId),
+            generation: persisted.runtimeGeneration,
+            modeSessionId: String(persisted.modeSessionId),
+            leaseGeneration: persisted.leaseGeneration,
+            expiresAt: persisted.expiresAt,
+            closeOnly: persisted.closeOnly,
+            acknowledgedActionSequences:
+              cached?.authSessionId === persisted.authSessionId &&
+              cached.runtimeId === persisted.runtimeId &&
+              cached.runtimeInstanceId === persisted.runtimeInstanceId &&
+              cached.generation === persisted.runtimeGeneration &&
+              cached.modeSessionId === persisted.modeSessionId &&
+              cached.leaseGeneration === persisted.leaseGeneration
+                ? cached.acknowledgedActionSequences
+                : new Set<number>(),
+          };
+    if (binding === undefined) bindings.delete(sessionId);
+    else bindings.set(sessionId, binding);
     if (
-      grant === undefined ||
       binding === undefined ||
-      !grant.capabilities.has(capability) ||
-      grant.sessionId !== sessionId ||
-      grant.leaseGeneration !== input.leaseGeneration ||
-      grant.runtimeId === undefined ||
-      String(grant.runtimeId) !== input.runtimeId ||
-      grant.runtimeGeneration !== input.generation ||
-      binding.authSessionId !== grant.authSessionId ||
+      binding.authSessionId !== authSessionId ||
+      // A committed handoff replay must reach consumeHandoff so it can return the
+      // stored exactly-once outcome; every other post-supersession operation is close-only.
+      (binding.closeOnly && capability !== "session-close" && capability !== "handoff-commit") ||
       binding.runtimeId !== input.runtimeId ||
       binding.runtimeInstanceId !== input.runtimeInstanceId ||
       binding.generation !== input.generation ||
@@ -242,14 +248,15 @@ const make = Effect.gen(function* () {
         "Realtime child authority does not match the active runtime operation",
       );
     }
-    return { grant, binding };
+    return { authSessionId, binding };
   });
 
   const runCached = <A>(
-    token: string,
+    authSessionId: AuthSessionId,
     sessionId: VoiceSessionId,
     clientOperationId: string,
     fingerprint: string,
+    authorize: Effect.Effect<void, VoiceError>,
     effect: Effect.Effect<A, VoiceError>,
     replay: (value: A) => A,
   ): Effect.Effect<A, VoiceError> =>
@@ -257,13 +264,13 @@ const make = Effect.gen(function* () {
       const sessionLock = yield* sessionMutex(sessionId);
       return yield* sessionLock.withPermits(1)(
         Effect.gen(function* () {
+          yield* authorize;
           const now = yield* Clock.currentTimeMillis;
           maintainOperationCache(now);
           const key = `${sessionId}\0${clientOperationId}`;
           const existing = operations.get(key);
-          const tokenHash = hash(token);
           if (existing !== undefined) {
-            if (existing.tokenHash !== tokenHash || existing.fingerprint !== fingerprint) {
+            if (existing.authSessionId !== authSessionId || existing.fingerprint !== fingerprint) {
               return yield* operationError(
                 "invalid-phase",
                 "runtime-realtime.idempotency",
@@ -274,7 +281,7 @@ const make = Effect.gen(function* () {
           }
           const value = yield* effect;
           operations.set(key, {
-            tokenHash,
+            authSessionId,
             fingerprint,
             result: value,
             expiresAt: now + OPERATION_CACHE_TTL_MILLIS,
@@ -285,14 +292,26 @@ const make = Effect.gen(function* () {
       );
     });
 
-  const create: VoiceRealtimeControlServiceShape["create"] = (runtimeToken, input) =>
+  const create: VoiceRealtimeControlServiceShape["create"] = (principal, input) =>
     Effect.gen(function* () {
-      const grant = yield* runtimeGrants.authorize(runtimeToken);
+      const runtimeId = VoiceRuntimeId.make(input.runtimeId);
+      const authority = yield* runtimeAuthorities
+        .find(principal.sessionId, runtimeId)
+        .pipe(
+          Effect.mapError((cause) =>
+            operationError(
+              "provider-unavailable",
+              "runtime-realtime.authority",
+              `Runtime authority storage is unavailable: ${String(cause)}`,
+              true,
+            ),
+          ),
+        );
       if (
-        grant === undefined ||
-        grant.target.mode !== "realtime" ||
-        String(grant.runtimeId) !== input.runtimeId ||
-        grant.generation !== input.generation
+        authority === undefined ||
+        authority.target.mode !== "realtime" ||
+        authority.generation !== input.generation ||
+        encodeRuntimeTarget(authority.target) !== encodeRuntimeTarget(input.target)
       ) {
         return yield* operationError(
           "authorization-revoked",
@@ -300,12 +319,22 @@ const make = Effect.gen(function* () {
           "Realtime runtime authority is stale or does not match the requested target",
         );
       }
-      const current = yield* runtimeGrants.authorize(runtimeToken);
+      const current = yield* runtimeAuthorities
+        .find(principal.sessionId, runtimeId)
+        .pipe(
+          Effect.mapError((cause) =>
+            operationError(
+              "provider-unavailable",
+              "runtime-realtime.authority",
+              `Runtime authority storage is unavailable: ${String(cause)}`,
+              true,
+            ),
+          ),
+        );
       if (
         current === undefined ||
-        current.authSessionId !== grant.authSessionId ||
-        current.runtimeId !== grant.runtimeId ||
-        current.generation !== grant.generation
+        current.generation !== authority.generation ||
+        encodeRuntimeTarget(current.target) !== encodeRuntimeTarget(authority.target)
       ) {
         return yield* operationError(
           "authorization-revoked",
@@ -319,16 +348,16 @@ const make = Effect.gen(function* () {
         input.clientOperationId,
       );
       const operationKey = `runtime-realtime:${hash(
-        grant.authSessionId,
-        grant.runtimeId,
-        grant.generation,
+        principal.sessionId,
+        runtimeId,
+        authority.generation,
         operationIdentity,
       )}`;
       const createInput = {
         mode: "realtime-agent" as const,
         conversation: {
           type: "continue" as const,
-          conversationId: grant.target.conversationId,
+          conversationId: authority.target.conversationId,
           takeover: false,
         },
         media: {
@@ -343,15 +372,15 @@ const make = Effect.gen(function* () {
       const claimed = yield* starts
         .claim({
           operationKey,
-          authSessionId: grant.authSessionId,
-          runtimeId: grant.runtimeId,
+          authSessionId: principal.sessionId,
+          runtimeId,
           runtimeInstanceId: input.runtimeInstanceId,
-          runtimeGeneration: grant.generation,
+          runtimeGeneration: authority.generation,
           modeSessionId: input.modeSessionId,
           clientOperationId: operationIdentity,
-          conversationId: grant.target.conversationId,
-          claimExpiresAt: Math.min(grant.expiresAt, now + START_CLAIM_MILLIS),
-          expiresAt: grant.expiresAt,
+          conversationId: authority.target.conversationId,
+          claimExpiresAt: now + START_CLAIM_MILLIS,
+          expiresAt: now + 55 * 60_000,
           now,
         })
         .pipe(
@@ -387,18 +416,18 @@ const make = Effect.gen(function* () {
       }
       const existingSessionId =
         claimed.status === "existing" ? (claimed.record.sessionId ?? undefined) : undefined;
-      const principal = {
-        sessionId: grant.authSessionId,
-        scopes: grant.grantedScopes,
+      const sessionPrincipal = {
+        sessionId: principal.sessionId,
+        scopes: principal.scopes,
         runtimeAuthority: {
-          runtimeId: grant.runtimeId,
-          generation: grant.generation,
+          runtimeId,
+          generation: authority.generation,
         },
       };
       const created = yield* (
         existingSessionId === undefined
-          ? sessions.create(principal, createInput)
-          : sessions.resumeCreate(principal, createInput, existingSessionId)
+          ? sessions.create(sessionPrincipal, createInput)
+          : sessions.resumeCreate(sessionPrincipal, createInput, existingSessionId)
       ).pipe(Effect.result);
       if (Result.isFailure(created)) {
         if (claimed.status === "claimed") {
@@ -448,7 +477,7 @@ const make = Effect.gen(function* () {
         if (!bound) {
           yield* sessions
             .close(
-              grant.authSessionId,
+              principal.sessionId,
               created.success.state.sessionId,
               created.success.state.leaseGeneration,
             )
@@ -463,14 +492,16 @@ const make = Effect.gen(function* () {
       }
       const priorBinding = bindings.get(created.success.state.sessionId);
       bindings.set(created.success.state.sessionId, {
-        authSessionId: String(grant.authSessionId),
+        authSessionId: String(principal.sessionId),
         runtimeId: input.runtimeId,
         runtimeInstanceId: input.runtimeInstanceId,
         generation: input.generation,
         modeSessionId: input.modeSessionId,
         leaseGeneration: created.success.state.leaseGeneration,
+        expiresAt: Date.parse(created.success.expiresAt),
+        closeOnly: false,
         acknowledgedActionSequences:
-          priorBinding?.authSessionId === grant.authSessionId &&
+          priorBinding?.authSessionId === principal.sessionId &&
           priorBinding.runtimeId === input.runtimeId &&
           priorBinding.runtimeInstanceId === input.runtimeInstanceId &&
           priorBinding.generation === input.generation &&
@@ -487,20 +518,20 @@ const make = Effect.gen(function* () {
         },
         expiresAt: created.success.expiresAt,
         heartbeatIntervalSeconds: created.success.heartbeatIntervalSeconds,
-        controlGrant: created.success.runtimeControlGrant,
       };
       return result;
     }).pipe(protectRealtimeStartCriticalSection);
 
-  const offer: VoiceRealtimeControlServiceShape["offer"] = (token, sessionId, input) =>
+  const offer: VoiceRealtimeControlServiceShape["offer"] = (authSessionId, sessionId, input) =>
     runCached<VoiceRuntimeRealtimeWebRtcAnswer>(
-      token,
+      authSessionId,
       sessionId,
       input.clientOperationId,
       `offer\0${canonicalFence(input)}\0${hash(input.sdp)}`,
+      requireControl(authSessionId, sessionId, input, "webrtc-signaling").pipe(Effect.asVoid),
       Effect.gen(function* () {
-        const { grant } = yield* requireControl(token, sessionId, input, "webrtc-signaling");
-        const answer = yield* sessions.offer(grant.authSessionId, sessionId, {
+        yield* requireControl(authSessionId, sessionId, input, "webrtc-signaling");
+        const answer = yield* sessions.offer(authSessionId, sessionId, {
           sessionId,
           leaseGeneration: input.leaseGeneration,
           sdp: input.sdp,
@@ -513,18 +544,18 @@ const make = Effect.gen(function* () {
       (value) => ({ ...value, replayed: true as const }),
     );
 
-  const heartbeat: VoiceRealtimeControlServiceShape["heartbeat"] = (token, sessionId, input) =>
+  const heartbeat: VoiceRealtimeControlServiceShape["heartbeat"] = (
+    authSessionId,
+    sessionId,
+    input,
+  ) =>
     Effect.gen(function* () {
-      const { grant } = yield* requireControl(token, sessionId, input, "session-control");
-      const state = yield* sessions.heartbeat(
-        grant.authSessionId,
-        sessionId,
-        input.leaseGeneration,
-      );
+      const { binding } = yield* requireControl(authSessionId, sessionId, input, "session-control");
+      const state = yield* sessions.heartbeat(authSessionId, sessionId, input.leaseGeneration);
       const terminal = state.phase === "ended" || state.phase === "error";
       const pending = terminal
         ? yield* sessions.listPendingHandoffActions(
-            grant.authSessionId,
+            authSessionId,
             sessionId,
             input.leaseGeneration,
             20,
@@ -534,14 +565,14 @@ const make = Effect.gen(function* () {
         state,
         disposition: terminal ? "terminal" : "live",
         handoffPending: pending.length > 0,
-        expiresAt: DateTime.formatIso(DateTime.makeUnsafe(grant.expiresAt)),
+        expiresAt: DateTime.formatIso(DateTime.makeUnsafe(binding.expiresAt)),
       };
     });
 
-  const actions: VoiceRealtimeControlServiceShape["actions"] = (token, sessionId, query) =>
+  const actions: VoiceRealtimeControlServiceShape["actions"] = (authSessionId, sessionId, query) =>
     Effect.gen(function* () {
-      const { grant, binding } = yield* requireControl(token, sessionId, query, "session-control");
-      const backlog = yield* sessions.events(grant.authSessionId, sessionId, 0, 0);
+      const { binding } = yield* requireControl(authSessionId, sessionId, query, "session-control");
+      const backlog = yield* sessions.events(authSessionId, sessionId, 0, 0);
       const pending = backlog.events.flatMap((event): ReadonlyArray<VoiceRuntimeRealtimeAction> => {
         const action = toAction(event);
         if (action === undefined || !("actionId" in action)) return [];
@@ -549,7 +580,7 @@ const make = Effect.gen(function* () {
       });
       if (pending.length > 0) return { state: backlog.state, actions: pending };
       const result = yield* sessions.events(
-        grant.authSessionId,
+        authSessionId,
         sessionId,
         query.afterSequence,
         query.waitMilliseconds,
@@ -566,13 +597,13 @@ const make = Effect.gen(function* () {
     });
 
   const acknowledgeAction: VoiceRealtimeControlServiceShape["acknowledgeAction"] = (
-    token,
+    authSessionId,
     sessionId,
     actionId,
     input,
   ) =>
     runCached<VoiceRuntimeRealtimeActionAckResult>(
-      token,
+      authSessionId,
       sessionId,
       input.clientOperationId,
       `action-ack\0${canonicalFence(input)}\0${actionId}\0${input.actionSequence}\0${
@@ -580,14 +611,15 @@ const make = Effect.gen(function* () {
           ? `${input.action}\0${input.outcome}\0${input.message ?? ""}`
           : `${input.action}\0${input.confirmationId}\0${input.decision}`
       }`,
+      requireControl(authSessionId, sessionId, input, "session-control").pipe(Effect.asVoid),
       Effect.gen(function* () {
-        const { grant, binding } = yield* requireControl(
-          token,
+        const { binding } = yield* requireControl(
+          authSessionId,
           sessionId,
           input,
           "session-control",
         );
-        const result = yield* sessions.events(grant.authSessionId, sessionId, 0, 0);
+        const result = yield* sessions.events(authSessionId, sessionId, 0, 0);
         const actions = result.events.flatMap((event) => {
           const action = toAction(event);
           return action === undefined || !("actionId" in action) ? [] : [action];
@@ -608,7 +640,7 @@ const make = Effect.gen(function* () {
               "Realtime action acknowledgement kind does not match the pending action",
             );
           }
-          yield* sessions.acknowledgeClientAction(grant.authSessionId, sessionId, actionId, {
+          yield* sessions.acknowledgeClientAction(authSessionId, sessionId, actionId, {
             leaseGeneration: input.leaseGeneration,
             action: "activate-thread",
             outcome: input.outcome,
@@ -625,7 +657,7 @@ const make = Effect.gen(function* () {
               "Realtime confirmation decision does not match the pending action",
             );
           }
-          yield* sessions.confirm(grant.authSessionId, sessionId, action.confirmationId, {
+          yield* sessions.confirm(authSessionId, sessionId, action.confirmationId, {
             decision: input.decision,
           });
         } else {
@@ -646,15 +678,20 @@ const make = Effect.gen(function* () {
       (value) => ({ ...value, replayed: true as const }),
     );
 
-  const updateFocus: VoiceRealtimeControlServiceShape["updateFocus"] = (token, sessionId, input) =>
+  const updateFocus: VoiceRealtimeControlServiceShape["updateFocus"] = (
+    authSessionId,
+    sessionId,
+    input,
+  ) =>
     runCached<VoiceRuntimeRealtimeFocusResult>(
-      token,
+      authSessionId,
       sessionId,
       input.clientOperationId,
       `focus\0${canonicalFence(input)}\0${JSON.stringify(input.focus)}`,
+      requireControl(authSessionId, sessionId, input, "session-control").pipe(Effect.asVoid),
       Effect.gen(function* () {
-        const { grant } = yield* requireControl(token, sessionId, input, "session-control");
-        const result = yield* sessions.updateFocus(grant.authSessionId, sessionId, {
+        yield* requireControl(authSessionId, sessionId, input, "session-control");
+        const result = yield* sessions.updateFocus(authSessionId, sessionId, {
           leaseGeneration: input.leaseGeneration,
           ...(input.focus === null
             ? {}
@@ -680,166 +717,105 @@ const make = Effect.gen(function* () {
     );
 
   const exchangeHandoff: VoiceRealtimeControlServiceShape["exchangeHandoff"] = (
-    token,
+    authSessionId,
     sessionId,
     actionId,
     input,
   ) => {
     const fingerprint = `handoff\0${canonicalFence(input)}\0${actionId}\0${input.actionSequence}\0${input.nextGeneration}\0${input.threadModeSessionId}\0${input.environmentId}\0${input.speechPreset}\0${JSON.stringify(input.endpointPolicy)}\0${input.speechEnabled}\0${input.rearmGuardMs}`;
-    const operationKey = `runtime-realtime-handoff:${hash(
-      sessionId,
-      input.leaseGeneration,
-      actionId,
-      input.runtimeId,
-      input.runtimeInstanceId,
-      input.generation,
-      input.nextGeneration,
-      input.threadModeSessionId,
-      input.clientOperationId,
-      fingerprint,
-    )}`;
-    const sourceControlTokenHash = NodeCrypto.createHash("sha256").update(token).digest("hex");
-    const transitionToken = NodeCrypto.createHmac("sha256", transitionTokenKey)
-      .update(operationKey)
-      .digest("base64url");
-    const transitionTokenHash = NodeCrypto.createHash("sha256")
-      .update(transitionToken)
-      .digest("hex");
     return runCached<VoiceRuntimeRealtimeHandoffExchangeResult>(
-      token,
+      authSessionId,
       sessionId,
       input.clientOperationId,
       fingerprint,
+      requireControl(authSessionId, sessionId, input, "handoff-actions").pipe(Effect.asVoid),
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
-        const stored = yield* transitions
-          .findByOperationKey(operationKey, now)
+        yield* requireControl(authSessionId, sessionId, input, "handoff-actions");
+        const events = yield* sessions.events(authSessionId, sessionId, 0, 0);
+        const event = events.events.find(
+          (candidate) =>
+            candidate.type === "client-action" &&
+            candidate.action === "handoff-to-thread-voice" &&
+            candidate.actionId === actionId,
+        );
+        const pending = yield* sessions.listPendingHandoffActions(
+          authSessionId,
+          sessionId,
+          input.leaseGeneration,
+          20,
+        );
+        const action = pending.find((candidate) => candidate.actionId === actionId);
+        if (
+          event === undefined ||
+          event.sequence !== input.actionSequence ||
+          action === undefined ||
+          Date.parse(action.expiresAt) <= now ||
+          input.nextGeneration !== input.generation + 1
+        ) {
+          return yield* operationError(
+            "invalid-phase",
+            "runtime-realtime.handoff",
+            "Realtime handoff action is not pending for this session",
+          );
+        }
+        const target: VoiceThreadRuntimeTarget = {
+          mode: "thread",
+          environmentId: input.environmentId,
+          projectId: action.projectId,
+          threadId: action.threadId,
+          speechPreset: input.speechPreset,
+          autoRearm: action.autoRearm,
+          endpointPolicy: input.endpointPolicy,
+          speechEnabled: input.speechEnabled,
+          rearmGuardMs: input.rearmGuardMs,
+        };
+        const candidate = {
+          authSessionId,
+          sourceSessionId: sessionId,
+          sourceLeaseGeneration: input.leaseGeneration,
+          actionId,
+          actionSequence: input.actionSequence,
+          runtimeId: VoiceRuntimeId.make(input.runtimeId),
+          runtimeInstanceId: input.runtimeInstanceId,
+          sourceGeneration: input.generation,
+          nextGeneration: input.nextGeneration,
+          modeSessionId: input.threadModeSessionId,
+          target,
+        };
+        const claimed = yield* transitions
+          .claim(candidate, now)
           .pipe(
             Effect.mapError((cause) =>
               operationError(
                 "provider-unavailable",
                 "runtime-realtime.handoff",
-                `Realtime transition authority storage is unavailable: ${String(cause)}`,
+                `Realtime transition reservation storage is unavailable: ${String(cause)}`,
                 true,
               ),
             ),
           );
-        let receipt = stored;
-        let replayed = stored !== undefined;
-        if (receipt !== undefined) {
-          if (
-            receipt.sourceControlTokenHash !== sourceControlTokenHash ||
-            receipt.sourceSessionId !== sessionId ||
-            receipt.sourceLeaseGeneration !== input.leaseGeneration ||
-            receipt.actionId !== actionId ||
-            receipt.actionSequence !== input.actionSequence ||
-            receipt.runtimeId !== input.runtimeId ||
-            receipt.runtimeInstanceId !== input.runtimeInstanceId ||
-            receipt.sourceGeneration !== input.generation ||
-            receipt.targetGeneration !== input.nextGeneration ||
-            receipt.modeSessionId !== input.threadModeSessionId
-          ) {
-            return yield* operationError(
-              "authorization-revoked",
-              "runtime-realtime.handoff",
-              "Realtime handoff replay authority does not match this exchange",
-            );
-          }
-        } else {
-          const authorized = yield* requireControl(token, sessionId, input, "handoff-actions");
-          const events = yield* sessions.events(authorized.grant.authSessionId, sessionId, 0, 0);
-          const event = events.events.find(
-            (candidate) =>
-              candidate.type === "client-action" &&
-              candidate.action === "handoff-to-thread-voice" &&
-              candidate.actionId === actionId,
+        if (claimed.status === "mismatch") {
+          return yield* operationError(
+            "invalid-phase",
+            "runtime-realtime.handoff",
+            "Realtime handoff reservation conflicts with an existing exchange",
           );
-          const pending = yield* sessions.listPendingHandoffActions(
-            authorized.grant.authSessionId,
-            sessionId,
-            input.leaseGeneration,
-            20,
-          );
-          const action = pending.find((candidate) => candidate.actionId === actionId);
-          if (
-            event === undefined ||
-            event.sequence !== input.actionSequence ||
-            action === undefined ||
-            Date.parse(action.expiresAt) <= now ||
-            input.nextGeneration !== input.generation + 1
-          ) {
-            return yield* operationError(
-              "invalid-phase",
-              "runtime-realtime.handoff",
-              "Realtime handoff action is not pending for this session",
-            );
-          }
-          const target: VoiceThreadRuntimeTarget = {
-            mode: "thread",
-            environmentId: input.environmentId,
-            projectId: action.projectId,
-            threadId: action.threadId,
-            speechPreset: input.speechPreset,
-            autoRearm: action.autoRearm,
-            endpointPolicy: input.endpointPolicy,
-            speechEnabled: input.speechEnabled,
-            rearmGuardMs: input.rearmGuardMs,
-          };
-          const candidate = {
-            operationKey,
-            tokenHash: transitionTokenHash,
-            sourceControlTokenHash,
-            authSessionId: authorized.grant.authSessionId,
-            sourceSessionId: sessionId,
-            sourceLeaseGeneration: input.leaseGeneration,
-            actionId,
-            actionSequence: input.actionSequence,
-            runtimeId: input.runtimeId,
-            runtimeInstanceId: input.runtimeInstanceId,
-            sourceGeneration: input.generation,
-            targetGeneration: input.nextGeneration,
-            modeSessionId: input.threadModeSessionId,
-            target,
-            expiresAt: Math.min(Date.parse(action.expiresAt), now + 60_000),
-            authorityExpiresAt: authorized.grant.expiresAt,
-          };
-          const claimed = yield* transitions
-            .claim(candidate, now)
-            .pipe(
-              Effect.mapError((cause) =>
-                operationError(
-                  "provider-unavailable",
-                  "runtime-realtime.handoff",
-                  `Realtime transition authority storage is unavailable: ${String(cause)}`,
-                  true,
-                ),
-              ),
-            );
-          if (claimed.status === "mismatch") {
-            return yield* operationError(
-              "invalid-phase",
-              "runtime-realtime.handoff",
-              "Realtime handoff transition identity conflicts with an existing exchange",
-            );
-          }
-          receipt =
-            claimed.status === "existing" ? claimed.record : { ...candidate, consumedAt: null };
-          replayed = claimed.status === "existing";
         }
+        const receipt =
+          claimed.status === "existing" ? claimed.record : { ...candidate, consumedAt: null };
         return {
           actionId,
           actionSequence: receipt.actionSequence,
           projectId: receipt.target.projectId,
           threadId: receipt.target.threadId,
           autoRearm: receipt.target.autoRearm,
-          transitionGrant: {
-            token: transitionToken,
-            expiresAt: DateTime.formatIso(DateTime.makeUnsafe(receipt.authorityExpiresAt)),
+          reservation: {
             generation: input.nextGeneration,
             modeSessionId: input.threadModeSessionId,
             target: receipt.target,
           },
-          replayed,
+          replayed: claimed.status === "existing",
         } satisfies VoiceRuntimeRealtimeHandoffExchangeResult;
       }).pipe(Effect.uninterruptible),
       (value) => ({ ...value, replayed: true as const }),
@@ -847,54 +823,50 @@ const make = Effect.gen(function* () {
   };
 
   const commitHandoff: VoiceRealtimeControlServiceShape["commitHandoff"] = (
-    transitionToken,
+    authSessionId,
     sessionId,
     actionId,
     input,
   ) =>
     Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
-      const tokenHash = NodeCrypto.createHash("sha256").update(transitionToken).digest("hex");
-      const receipt = yield* transitions
-        .findByToken(tokenHash, now)
+      const binding = (yield* requireControl(authSessionId, sessionId, input, "handoff-commit"))
+        .binding;
+      const consumed = yield* runtimeAuthorities
+        .consumeHandoff(
+          {
+            authSessionId,
+            runtimeId: VoiceRuntimeId.make(input.runtimeId),
+            runtimeInstanceId: input.runtimeInstanceId,
+            sourceSessionId: sessionId,
+            sourceLeaseGeneration: input.leaseGeneration,
+            actionId,
+            actionSequence: input.actionSequence,
+            sourceGeneration: input.generation,
+            nextGeneration: input.nextGeneration,
+            modeSessionId: input.threadModeSessionId,
+          },
+          now,
+        )
         .pipe(
           Effect.mapError((cause) =>
             operationError(
               "provider-unavailable",
               "runtime-realtime.handoff-commit",
-              `Realtime transition authority storage is unavailable: ${String(cause)}`,
+              `Runtime authority storage is unavailable: ${String(cause)}`,
               true,
             ),
           ),
         );
-      if (
-        receipt === undefined ||
-        receipt.sourceSessionId !== sessionId ||
-        receipt.actionId !== actionId ||
-        receipt.sourceLeaseGeneration !== input.leaseGeneration ||
-        receipt.runtimeId !== input.runtimeId ||
-        receipt.runtimeInstanceId !== input.runtimeInstanceId ||
-        receipt.sourceGeneration !== input.generation ||
-        receipt.targetGeneration !== input.nextGeneration ||
-        receipt.modeSessionId !== input.threadModeSessionId ||
-        receipt.actionSequence !== input.actionSequence
-      )
+      if (consumed.status === "stale")
         return yield* operationError(
           "authorization-revoked",
           "runtime-realtime.handoff-commit",
-          "Realtime transition authority does not match this commit",
+          "Realtime handoff reservation does not match this commit",
         );
-      const activated = yield* runtimeGrants.activateTransition(transitionToken, {
-        authSessionId: receipt.authSessionId,
-        runtimeId: VoiceRuntimeId.make(receipt.runtimeId),
-        sourceGeneration: receipt.sourceGeneration,
-        targetGeneration: receipt.targetGeneration,
-        target: receipt.target,
-        authorityExpiresAt: receipt.authorityExpiresAt,
-      });
       const acknowledged = yield* sessions
         .acknowledgeRuntimeHandoffAction(
-          receipt.authSessionId,
+          authSessionId,
           sessionId,
           input.leaseGeneration,
           actionId,
@@ -904,33 +876,34 @@ const make = Effect.gen(function* () {
       if (Result.isFailure(acknowledged)) {
         yield* sessions
           .reconcileActivatedRuntimeHandoff(
-            receipt.authSessionId,
+            authSessionId,
             sessionId,
             input.leaseGeneration,
             actionId,
-            { projectId: receipt.target.projectId, threadId: receipt.target.threadId },
+            { projectId: consumed.target.projectId, threadId: consumed.target.threadId },
           )
           .pipe(Effect.result);
       }
-      bindings.get(sessionId)?.acknowledgedActionSequences.add(receipt.actionSequence);
+      bindings.set(sessionId, { ...binding, closeOnly: true });
+      bindings.get(sessionId)?.acknowledgedActionSequences.add(input.actionSequence);
       return {
         actionId,
-        actionSequence: receipt.actionSequence,
+        actionSequence: input.actionSequence,
         committed: true,
-        replayed: activated.replayed || receipt.consumedAt !== null,
+        replayed: consumed.status === "existing",
       } satisfies VoiceRuntimeRealtimeHandoffCommitResult;
     }).pipe(Effect.uninterruptible);
 
-  const close: VoiceRealtimeControlServiceShape["close"] = (token, sessionId, input) =>
+  const close: VoiceRealtimeControlServiceShape["close"] = (authSessionId, sessionId, input) =>
     runCached<VoiceRuntimeRealtimeCloseResult>(
-      token,
+      authSessionId,
       sessionId,
       input.clientOperationId,
       `close\0${canonicalFence(input)}`,
+      requireControl(authSessionId, sessionId, input, "session-close").pipe(Effect.asVoid),
       Effect.gen(function* () {
-        const { grant } = yield* requireControl(token, sessionId, input, "session-close");
-        const result = yield* sessions.close(grant.authSessionId, sessionId, input.leaseGeneration);
-        yield* controlGrants.revokeSession(sessionId);
+        yield* requireControl(authSessionId, sessionId, input, "session-close");
+        const result = yield* sessions.close(authSessionId, sessionId, input.leaseGeneration);
         bindings.delete(sessionId);
         return {
           ...result,

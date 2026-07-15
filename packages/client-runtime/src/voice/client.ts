@@ -24,11 +24,9 @@ import {
   type VoiceConversationTranscriptPage,
   type VoiceConversationTranscriptQuery,
   type VoiceConversationUpdateInput,
-  type VoiceMediaTicket,
-  type VoiceMediaTicketRequest,
-  type VoiceRuntimeGrant,
-  type VoiceRuntimeGrantProvisionInput,
-  type VoiceRuntimeGrantRevocationResult,
+  type VoiceRuntimeAuthority,
+  type VoiceRuntimeAuthorityClearResult,
+  type VoiceRuntimeAuthorityConfigureInput,
   type VoiceRuntimeId,
   type VoiceSessionCloseResult,
   type VoiceSessionCreateInput,
@@ -66,7 +64,6 @@ import { assertVoiceRuntimeProtocolAvailable } from "./protocol.ts";
 
 const DEFAULT_VOICE_HTTP_TIMEOUT_MS = 30_000;
 const DEFAULT_VOICE_MEDIA_TIMEOUT_MS = 5 * 60_000;
-const VOICE_TICKET_HEADER = "x-t3-voice-ticket";
 const decodeTranscriptionEvent = Schema.decodeUnknownEffect(
   Schema.fromJsonString(VoiceTranscriptionStreamEvent),
 );
@@ -174,22 +171,21 @@ export interface VoiceTranscriptionInput {
         readonly filename: string;
       };
   readonly metadata: VoiceTranscriptionMetadata;
-  readonly ticket?: VoiceMediaTicket;
 }
 
 export interface VoiceSpeechInput {
   readonly request: VoiceSpeechRequest;
-  readonly ticket?: VoiceMediaTicket;
 }
 
 export interface VoiceHttpClient {
-  readonly provisionVoiceRuntimeGrant: (
+  readonly configureVoiceRuntimeAuthority: (
     runtimeId: VoiceRuntimeId,
-    input: VoiceRuntimeGrantProvisionInput,
-  ) => Effect.Effect<VoiceRuntimeGrant, RemoteEnvironmentRequestError>;
-  readonly revokeVoiceRuntimeGrant: (
+    input: VoiceRuntimeAuthorityConfigureInput,
+  ) => Effect.Effect<VoiceRuntimeAuthority, RemoteEnvironmentRequestError>;
+  readonly clearVoiceRuntimeAuthority: (
     runtimeId: VoiceRuntimeId,
-  ) => Effect.Effect<VoiceRuntimeGrantRevocationResult, RemoteEnvironmentRequestError>;
+  ) => Effect.Effect<VoiceRuntimeAuthorityClearResult, RemoteEnvironmentRequestError>;
+  readonly bearerSessionCredential: string | null;
   readonly createSession: (
     input: VoiceSessionCreateInput,
   ) => Effect.Effect<VoiceSessionCreateResult, RemoteEnvironmentRequestError>;
@@ -253,9 +249,6 @@ export interface VoiceHttpClient {
     conversationId: VoiceConversationId,
     input: VoiceConversationClearContextInput,
   ) => Effect.Effect<VoiceConversationClearContextResult, RemoteEnvironmentRequestError>;
-  readonly createMediaTicket: (
-    input: VoiceMediaTicketRequest,
-  ) => Effect.Effect<VoiceMediaTicket, RemoteEnvironmentRequestError>;
   readonly transcribe: (
     input: VoiceTranscriptionInput,
   ) => Stream.Stream<VoiceTranscriptionStreamEventType, VoiceMediaStreamError>;
@@ -310,11 +303,7 @@ const rawHeaders = Effect.fn("VoiceHttpClient.rawHeaders")(function* (input: {
   readonly prepared: PreparedConnection;
   readonly signer: Option.Option<ManagedRelayDpopSigner["Service"]>;
   readonly requestUrl: string;
-  readonly ticket?: VoiceMediaTicket;
 }) {
-  if (input.ticket !== undefined) {
-    return { [VOICE_TICKET_HEADER]: input.ticket.token };
-  }
   return yield* buildEnvironmentAuthHeaders(
     input.prepared.httpAuthorization,
     "POST",
@@ -327,7 +316,6 @@ const mediaRequestHeaders = Effect.fn("VoiceHttpClient.mediaRequestHeaders")(fun
   readonly prepared: PreparedConnection;
   readonly signer: Option.Option<ManagedRelayDpopSigner["Service"]>;
   readonly requestUrl: string;
-  readonly ticket?: VoiceMediaTicket;
   readonly contentType?: string;
 }) {
   const authorization = yield* rawHeaders(input);
@@ -337,9 +325,6 @@ const mediaRequestHeaders = Effect.fn("VoiceHttpClient.mediaRequestHeaders")(fun
   }
   if ("dpop" in authorization && authorization.dpop !== undefined) {
     headers.set("dpop", authorization.dpop);
-  }
-  if (VOICE_TICKET_HEADER in authorization) {
-    headers.set(VOICE_TICKET_HEADER, authorization[VOICE_TICKET_HEADER]);
   }
   if (input.contentType !== undefined) {
     headers.set("content-type", input.contentType);
@@ -353,7 +338,6 @@ const fetchMediaResponse = (input: {
   readonly signer: Option.Option<ManagedRelayDpopSigner["Service"]>;
   readonly timeoutMs: number;
   readonly requestUrl: string;
-  readonly ticket?: VoiceMediaTicket;
   readonly send: (headers: Headers, signal: AbortSignal) => Promise<Response>;
   readonly contentType?: string;
 }): Effect.Effect<Response, RemoteEnvironmentRequestError | VoiceHttpResponseError> =>
@@ -386,7 +370,6 @@ const uploadUriMediaResponse = (input: {
   readonly signer: Option.Option<ManagedRelayDpopSigner["Service"]>;
   readonly timeoutMs: number;
   readonly requestUrl: string;
-  readonly ticket?: VoiceMediaTicket;
   readonly upload: (headers: Headers, signal: AbortSignal) => Promise<VoiceUriUploadResult>;
 }): Effect.Effect<VoiceUriUploadResult, RemoteEnvironmentRequestError | VoiceHttpResponseError> =>
   Effect.gen(function* () {
@@ -458,57 +441,16 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
       ...request,
     });
   return {
-    provisionVoiceRuntimeGrant: (runtimeId, payload) => {
-      if (payload.operation === "realtime-start" && payload.readinessEnabled) {
-        return control({
-          method: "PUT",
-          pathname: `/api/voice/runtime/runtimes/${runtimeId}/grant`,
-          run: (client, headers) =>
-            client.voice.provisionVoiceRuntimeGrant({
-              headers: {
-                ...headers,
-                [VOICE_RUNTIME_PROTOCOL_HEADER]: String(VOICE_RUNTIME_PROTOCOL_MAJOR),
-              },
-              params: { runtimeId },
-              payload,
-            }),
-        });
-      }
-      if (payload.operation === "realtime-start" && !payload.readinessEnabled) {
-        return control({
-          method: "PUT",
-          pathname: `/api/voice/runtime/runtimes/${runtimeId}/grant`,
-          run: (client, headers) =>
-            client.voice.provisionVoiceRuntimeGrant({
-              headers: {
-                ...headers,
-                [VOICE_RUNTIME_PROTOCOL_HEADER]: String(VOICE_RUNTIME_PROTOCOL_MAJOR),
-              },
-              params: { runtimeId },
-              payload,
-            }),
-        });
-      }
-      if (payload.operation === "thread-turn-start" && payload.readinessEnabled) {
-        return control({
-          method: "PUT",
-          pathname: `/api/voice/runtime/runtimes/${runtimeId}/grant`,
-          run: (client, headers) =>
-            client.voice.provisionVoiceRuntimeGrant({
-              headers: {
-                ...headers,
-                [VOICE_RUNTIME_PROTOCOL_HEADER]: String(VOICE_RUNTIME_PROTOCOL_MAJOR),
-              },
-              params: { runtimeId },
-              payload,
-            }),
-        });
-      }
-      return control({
+    bearerSessionCredential:
+      input.prepared.httpAuthorization?._tag === "Bearer"
+        ? input.prepared.httpAuthorization.token
+        : null,
+    configureVoiceRuntimeAuthority: (runtimeId, payload) =>
+      control({
         method: "PUT",
-        pathname: `/api/voice/runtime/runtimes/${runtimeId}/grant`,
+        pathname: `/api/voice/runtime/runtimes/${runtimeId}/authority`,
         run: (client, headers) =>
-          client.voice.provisionVoiceRuntimeGrant({
+          client.voice.configureVoiceRuntimeAuthority({
             headers: {
               ...headers,
               [VOICE_RUNTIME_PROTOCOL_HEADER]: String(VOICE_RUNTIME_PROTOCOL_MAJOR),
@@ -516,14 +458,13 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
             params: { runtimeId },
             payload,
           }),
-      });
-    },
-    revokeVoiceRuntimeGrant: (runtimeId) =>
+      }),
+    clearVoiceRuntimeAuthority: (runtimeId) =>
       control({
         method: "DELETE",
-        pathname: `/api/voice/runtime/runtimes/${runtimeId}/grant`,
+        pathname: `/api/voice/runtime/runtimes/${runtimeId}/authority`,
         run: (client, headers) =>
-          client.voice.revokeVoiceRuntimeGrant({
+          client.voice.clearVoiceRuntimeAuthority({
             headers: {
               ...headers,
               [VOICE_RUNTIME_PROTOCOL_HEADER]: String(VOICE_RUNTIME_PROTOCOL_MAJOR),
@@ -726,19 +667,6 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
             payload,
           }),
       }),
-    createMediaTicket: (payload) =>
-      control({
-        method: "POST",
-        pathname: "/api/voice/media-tickets",
-        run: (client, headers) => {
-          switch (payload.operation) {
-            case "transcription-upload":
-              return client.voice.mediaTicket({ headers, payload });
-            case "speech-stream":
-              return client.voice.mediaTicket({ headers, payload });
-          }
-        },
-      }),
     transcribe: (request) => {
       const requestUrl = environmentEndpointUrl(
         input.prepared.httpBaseUrl,
@@ -766,7 +694,6 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
                 headers,
                 signal,
               }),
-            ...(request.ticket === undefined ? {} : { ticket: request.ticket }),
           }).pipe(
             Effect.map((response) =>
               decodeTranscriptionLines(
@@ -793,11 +720,10 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
               headers,
               body,
               signal,
-              ...(input.prepared.httpAuthorization === null && request.ticket === undefined
+              ...(input.prepared.httpAuthorization === null
                 ? { credentials: "include" as const }
                 : {}),
             }),
-          ...(request.ticket === undefined ? {} : { ticket: request.ticket }),
         }).pipe(
           Effect.map((response) =>
             decodeTranscriptionLines(
@@ -824,12 +750,11 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
               headers,
               body,
               signal,
-              ...(input.prepared.httpAuthorization === null && request.ticket === undefined
+              ...(input.prepared.httpAuthorization === null
                 ? { credentials: "include" as const }
                 : {}),
             }),
           contentType: "application/json",
-          ...(request.ticket === undefined ? {} : { ticket: request.ticket }),
         }).pipe(Effect.map((response) => responseByteStream(response, requestUrl))),
       );
     },

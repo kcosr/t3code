@@ -529,12 +529,11 @@ const make = Effect.gen(function* () {
           const authority = yield* sql<{
             readonly found: number;
           }>`SELECT 1 AS found
-            FROM voice_runtime_grants AS runtime
+            FROM voice_runtime_authorities AS runtime
             INNER JOIN auth_sessions AS auth ON auth.session_id = runtime.auth_session_id
             WHERE runtime.auth_session_id = ${input.authSessionId}
               AND runtime.runtime_id = ${input.runtimeId}
               AND runtime.generation = ${input.runtimeGeneration}
-              AND runtime.expires_at > ${input.nowEpochMillis}
               AND auth.revoked_at IS NULL AND auth.expires_at > ${nowIso}
             LIMIT 1`;
           if (authority.length === 0) return { status: "revoked" as const };
@@ -705,9 +704,10 @@ const make = Effect.gen(function* () {
         `SELECT ${qualifiedOperationColumns}
        FROM voice_thread_turn_operations AS operation
        INNER JOIN auth_sessions AS auth ON auth.session_id = operation.auth_session_id
-       INNER JOIN voice_runtime_grants AS runtime
+       INNER JOIN voice_runtime_authorities AS runtime
          ON runtime.auth_session_id = operation.auth_session_id
          AND runtime.runtime_id = operation.runtime_id
+         AND runtime.generation = operation.runtime_generation
        WHERE operation.operation_id = ? AND operation.token_hash = ?
          AND operation.retention_expires_at > ?
          AND (operation.operation_token_expires_at > ?

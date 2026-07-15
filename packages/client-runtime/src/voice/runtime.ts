@@ -17,24 +17,7 @@ import type {
   VoiceRuntimeRebase,
   VoiceRuntimeSnapshot,
   VoiceRuntimeCommand,
-  VoiceRuntimeTarget,
 } from "@t3tools/contracts";
-import { sha256 } from "@noble/hashes/sha2";
-
-function canonicalValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalValue);
-  if (value === null || typeof value !== "object") return value;
-  return Object.fromEntries(
-    Object.entries(value)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, entry]) => [key, canonicalValue(entry)]),
-  );
-}
-
-export async function computeVoiceRuntimeTargetDigest(target: VoiceRuntimeTarget): Promise<string> {
-  const bytes = new TextEncoder().encode(JSON.stringify(canonicalValue(target)));
-  return [...sha256(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
 
 export interface VoiceRuntimeSubscriptionInput {
   readonly lease: VoiceRuntimeConsumerLease;

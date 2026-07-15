@@ -53,7 +53,6 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Stream from "effect/Stream";
-import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import {
@@ -70,7 +69,6 @@ import * as Socket from "effect/unstable/socket/Socket";
 import { vi } from "vite-plus/test";
 
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
-const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 
 import * as ServerConfig from "./config.ts";
 import { makeServedRoutesLayer } from "./server.ts";
@@ -134,7 +132,7 @@ const testEnvironmentDescriptor = {
   capabilities: {
     repositoryIdentity: true,
   },
-  voiceRuntimeProtocolMajor: 1,
+  voiceRuntimeProtocolMajor: 2,
 };
 const makeDefaultOrchestrationReadModel = () => {
   const now = "2026-01-01T00:00:00.000Z";
@@ -1218,12 +1216,7 @@ const assertBrowserApiCorsPreflightHeaders = (
     "content-type",
     "dpop",
     "traceparent",
-    "x-t3-voice-control",
-    "x-t3-voice-operation",
-    "x-t3-voice-refresh",
-    "x-t3-voice-runtime",
     "x-t3-voice-runtime-protocol-major",
-    "x-t3-voice-ticket",
   ]);
 };
 const crossOriginClientOrigin = "http://remote-client.test:3773";
@@ -1414,7 +1407,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("rejects a voice media ticket used for a different request", () =>
+  it.effect("rejects an unauthenticated voice media request", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest({
         layers: {
@@ -1426,23 +1419,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           },
         },
       });
-      const cookie = yield* getAuthenticatedSessionCookieHeader();
-      const ticketResponse = yield* fetchEffect(
-        yield* getHttpServerUrl("/api/voice/media-tickets"),
-        {
-          method: "POST",
-          headers: { cookie, "content-type": "application/json" },
-          body: jsonRequestBody({ operation: "speech-stream", requestId: "voice-request-a" }),
-        },
-      );
-      const ticket = yield* responseJsonEffect<{ readonly token: string }>(ticketResponse);
-      assert.equal(ticketResponse.status, 200);
-
       const speechResponse = yield* fetchEffect(yield* getHttpServerUrl("/api/voice/speech"), {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-t3-voice-ticket": ticket.token,
         },
         body: jsonRequestBody({
           requestId: "voice-request-b",
@@ -1481,23 +1461,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           new URL("./voice/Services/fixtures/silence-aac-lc-mono.m4a", import.meta.url),
         ),
       );
-      const cookie = yield* getAuthenticatedSessionCookieHeader();
-
       for (let index = 0; index <= maximumConcurrentMediaRequests; index += 1) {
-        const ticketResponse = yield* fetchEffect(
-          yield* getHttpServerUrl("/api/voice/media-tickets"),
-          {
-            method: "POST",
-            headers: { cookie, "content-type": "application/json" },
-            body: jsonRequestBody({
-              operation: "transcription-upload",
-              requestId: `voice-ticket-${index}`,
-            }),
-          },
-        );
-        const ticket = yield* responseJsonEffect<{ readonly token: string }>(ticketResponse);
-        assert.equal(ticketResponse.status, 200);
-
         const form = new FormData();
         form.append("audio", new Blob([fixture], { type: "audio/mp4" }), "recording.m4a");
         form.append(
@@ -1507,7 +1471,6 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         const response = yield* Effect.raceFirst(
           fetchEffect(yield* getHttpServerUrl("/api/voice/transcriptions"), {
             method: "POST",
-            headers: { "x-t3-voice-ticket": ticket.token },
             body: form,
           }),
           Effect.sleep("2 seconds").pipe(
@@ -1522,7 +1485,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("consumes a voice media ticket before rejecting an invalid request body", () =>
+  it.effect("uses reusable session authentication before rejecting invalid voice media", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest({
         layers: {
@@ -1535,21 +1498,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         },
       });
       const cookie = yield* getAuthenticatedSessionCookieHeader();
-      const ticketResponse = yield* fetchEffect(
-        yield* getHttpServerUrl("/api/voice/media-tickets"),
-        {
-          method: "POST",
-          headers: { cookie, "content-type": "application/json" },
-          body: jsonRequestBody({ operation: "speech-stream", requestId: "voice-request-replay" }),
-        },
-      );
-      const ticket = yield* responseJsonEffect<{ readonly token: string }>(ticketResponse);
-      assert.equal(ticketResponse.status, 200);
-
       const speechUrl = yield* getHttpServerUrl("/api/voice/speech");
       const headers = {
         "content-type": "application/json",
-        "x-t3-voice-ticket": ticket.token,
+        cookie,
       };
       const first = yield* fetchEffect(speechUrl, {
         method: "POST",
@@ -1563,7 +1515,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       });
 
       assert.equal(first.status, 400);
-      assert.equal(replay.status, 401);
+      assert.equal(replay.status, 400);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -3260,7 +3212,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("provisions, refreshes, and revokes canonical voice runtime authority", () =>
+  it.effect("configures and clears session-owned voice runtime authority", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest();
 
@@ -3271,7 +3223,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       };
       const headers = {
         ...authenticatedHeaders,
-        "x-t3-voice-runtime-protocol-major": "1",
+        "x-t3-voice-runtime-protocol-major": "2",
       };
       const conversationResponse = yield* fetchEffect("/api/voice/conversations", {
         method: "POST",
@@ -3284,37 +3236,22 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(conversationResponse.status, 200);
 
       const runtimeId = "android-server-test";
-      const provisioningOperationId = "provision-android-server-test-1";
       const target = {
         mode: "realtime",
         environmentId: testEnvironmentDescriptor.environmentId,
         conversationId: conversation.conversationId,
       } as const;
-      const targetDigest = NodeCrypto.createHash("sha256")
-        .update(
-          encodeJson({
-            conversationId: target.conversationId,
-            environmentId: target.environmentId,
-            mode: target.mode,
-          }),
-        )
-        .digest("hex");
-      const provisionBody = jsonRequestBody({
+      const configureBody = jsonRequestBody({
         expectedCurrentGeneration: 0,
         generation: 1,
-        provisioningOperationId,
         target,
-        targetDigest,
-        operation: "realtime-start",
-        readinessEnabled: true,
-        refreshCredentialHash: NodeCrypto.createHash("sha256").update("a".repeat(43)).digest("hex"),
       });
       const incompatibleResponse = yield* fetchEffect(
-        `/api/voice/runtime/runtimes/${runtimeId}/grant`,
+        `/api/voice/runtime/runtimes/${runtimeId}/authority`,
         {
           method: "PUT",
           headers: authenticatedHeaders,
-          body: provisionBody,
+          body: configureBody,
         },
       );
       assert.equal(incompatibleResponse.status, 426);
@@ -3324,89 +3261,54 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         readonly traceId: string;
       }>(incompatibleResponse);
       assert.equal(incompatible.code, "voice_runtime_protocol_incompatible");
-      assert.equal(incompatible.requiredMajor, 1);
+      assert.equal(incompatible.requiredMajor, 2);
       assert.isTrue(incompatible.traceId.length > 0);
-      const provisionResponse = yield* fetchEffect(
-        `/api/voice/runtime/runtimes/${runtimeId}/grant`,
+      const configureResponse = yield* fetchEffect(
+        `/api/voice/runtime/runtimes/${runtimeId}/authority`,
         {
           method: "PUT",
           headers,
-          body: provisionBody,
+          body: configureBody,
         },
       );
-      const provisioned = yield* responseJsonEffect<{
-        readonly token: string;
+      const configured = yield* responseJsonEffect<{
         readonly runtimeId: string;
         readonly generation: number;
-        readonly provisioningOperationId: string;
-        readonly refreshRotationCounter: number;
         readonly target: unknown;
-        readonly issuedAt: string;
-        readonly expiresAt: string;
-      }>(provisionResponse);
-      assert.equal(provisionResponse.status, 200);
-      assert.equal(provisioned.runtimeId, runtimeId);
-      assert.equal(provisioned.generation, 1);
-      assert.equal(provisioned.provisioningOperationId, provisioningOperationId);
-      assert.equal(provisioned.refreshRotationCounter, 0);
-      assert.isFalse(Number.isNaN(Date.parse(provisioned.issuedAt)));
-      assert.isTrue(provisioned.token.length > 20);
+      }>(configureResponse);
+      assert.equal(configureResponse.status, 200);
+      assert.deepEqual(configured, { runtimeId, generation: 1, target });
 
-      const retryResponse = yield* fetchEffect(`/api/voice/runtime/runtimes/${runtimeId}/grant`, {
-        method: "PUT",
-        headers,
-        body: provisionBody,
-      });
-      const retried = yield* responseJsonEffect<{ readonly token: string }>(retryResponse);
-      assert.equal(retryResponse.status, 200);
-      assert.equal(retried.token, provisioned.token);
-
-      const candidateRefreshCredential = "b".repeat(43);
-      const refreshResponse = yield* fetchEffect(
-        `/api/voice/runtime/runtimes/${runtimeId}/grant/refresh`,
+      const retryResponse = yield* fetchEffect(
+        `/api/voice/runtime/runtimes/${runtimeId}/authority`,
         {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-t3-voice-runtime-protocol-major": "1",
-            "x-t3-voice-refresh": "a".repeat(43),
-          },
-          body: jsonRequestBody({
-            refreshRequestId: "refresh-android-server-test-1",
-            provisioningOperationId,
-            generation: 1,
-            operation: "realtime-start",
-            targetDigest,
-            expectedRotationCounter: 0,
-            candidateCredentialHash: NodeCrypto.createHash("sha256")
-              .update(candidateRefreshCredential)
-              .digest("hex"),
-          }),
+          method: "PUT",
+          headers,
+          body: configureBody,
         },
       );
-      const refreshed = yield* responseJsonEffect<{
-        readonly token: string;
-        readonly refreshRotationCounter: number;
-      }>(refreshResponse);
-      assert.equal(refreshResponse.status, 200);
-      assert.equal(refreshed.refreshRotationCounter, 1);
-      assert.notEqual(refreshed.token, provisioned.token);
+      const retried = yield* responseJsonEffect<unknown>(retryResponse);
+      assert.equal(retryResponse.status, 200);
+      assert.deepEqual(retried, configured);
 
-      const revokeResponse = yield* fetchEffect(`/api/voice/runtime/runtimes/${runtimeId}/grant`, {
-        method: "DELETE",
-        headers,
-      });
-      const revoked = yield* responseJsonEffect<{
+      const clearResponse = yield* fetchEffect(
+        `/api/voice/runtime/runtimes/${runtimeId}/authority`,
+        {
+          method: "DELETE",
+          headers,
+        },
+      );
+      const cleared = yield* responseJsonEffect<{
         readonly runtimeId: string;
-        readonly revoked: boolean;
-      }>(revokeResponse);
-      assert.equal(revokeResponse.status, 200);
-      assert.deepEqual(revoked, { runtimeId, revoked: true });
+        readonly cleared: boolean;
+      }>(clearResponse);
+      assert.equal(clearResponse.status, 200);
+      assert.deepEqual(cleared, { runtimeId, cleared: true });
 
       const legacyResponse = yield* fetchEffect(`/api/voice/native-runtimes/${runtimeId}/grant`, {
         method: "PUT",
         headers,
-        body: provisionBody,
+        body: configureBody,
       });
       assert.equal(legacyResponse.status, 404);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
@@ -4303,12 +4205,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         "content-type",
         "dpop",
         "traceparent",
-        "x-t3-voice-control",
-        "x-t3-voice-operation",
-        "x-t3-voice-refresh",
-        "x-t3-voice-runtime",
         "x-t3-voice-runtime-protocol-major",
-        "x-t3-voice-ticket",
       ]);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
