@@ -900,22 +900,28 @@ class T3VoiceRuntimeService : Service() {
         }
         is VoiceRuntimeNativeCommand.StartRealtime -> {
           val engine = requireRealtimeEngineLocked(command.identity)
+          check(admission.tryAdmit()) { "The voice operation was cancelled before admission." }
           synchronized(operationLock) {
             ensureRuntimeForeground(
               ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
             )
           }
-          val result = engine.start(
-            command.commandId,
-            VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
-            admission::tryAdmit,
-          )
-          if (result is VoiceRuntimeRealtimeCommandResult.Rejected &&
-            result.reason == "start-cancelled") {
-            synchronized(operationLock) { reconcileForegroundAfterVoiceStopLocked() }
+          voiceRuntimeRealtimeStartIo.submit {
+            val started = runCatching {
+              engine.start(
+                command.commandId,
+                VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
+              )
+            }.getOrNull() is VoiceRuntimeRealtimeCommandResult.Accepted
+            if (!started) {
+              synchronized(operationLock) { reconcileForegroundAfterVoiceStopLocked() }
+            }
           }
-          realtimeCommandReceipt(command, result)
+          realtimeCommandReceipt(
+            command,
+            VoiceRuntimeRealtimeCommandResult.Accepted(adopted = false),
+          )
         }
         is VoiceRuntimeNativeCommand.StopMode -> {
           check(admission.tryAdmit()) { "The voice stop was cancelled before admission." }
@@ -952,12 +958,19 @@ class T3VoiceRuntimeService : Service() {
             command.muted,
           )
         }
-        is VoiceRuntimeNativeCommand.UpdateRealtimeFocus -> realtimeBooleanReceipt(command) {
+        is VoiceRuntimeNativeCommand.UpdateRealtimeFocus -> {
           check(admission.tryAdmit()) { "The voice operation was cancelled before admission." }
-          requireRealtimeEngineLocked(command.identity).updateFocus(
-            VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
-            command.commandId,
-            command.focus,
+          val engine = requireRealtimeEngineLocked(command.identity)
+          voiceRuntimeRealtimeControlIo.submit {
+            engine.updateFocus(
+              VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
+              command.commandId,
+              command.focus,
+            )
+          }
+          realtimeCommandReceipt(
+            command,
+            VoiceRuntimeRealtimeCommandResult.Accepted(adopted = false),
           )
         }
         is VoiceRuntimeNativeCommand.SetAudioRoute -> {
@@ -979,8 +992,9 @@ class T3VoiceRuntimeService : Service() {
             }
             voiceRuntimeController.claimPresentationAction(command.lease, command.actionId)
           }
-          val acknowledged = requireRealtimeEngineLocked(command.identity)
-            .acknowledgePresentationAction(
+          val engine = requireRealtimeEngineLocked(command.identity)
+          voiceRuntimeRealtimeControlIo.submit {
+            val acknowledged = engine.acknowledgePresentationAction(
               VoiceRuntimeRealtimeFence(command.identity, command.modeSessionId),
               command.commandId,
               command.actionId,
@@ -989,10 +1003,14 @@ class T3VoiceRuntimeService : Service() {
                 command.decision,
               ),
             )
-          if (acknowledged) synchronized(operationLock) {
-            voiceRuntimeController.acknowledgePresentationAction(command.lease, command.actionId)
+            if (acknowledged) synchronized(operationLock) {
+              voiceRuntimeController.acknowledgePresentationAction(command.lease, command.actionId)
+            }
           }
-          realtimeBooleanReceipt(command) { acknowledged }
+          realtimeCommandReceipt(
+            command,
+            VoiceRuntimeRealtimeCommandResult.Accepted(adopted = false),
+          )
         }
       }
     }
@@ -1035,23 +1053,24 @@ class T3VoiceRuntimeService : Service() {
         val snapshot = voiceRuntimeController.snapshot()
         val operation = snapshot.operation as? VoiceRuntimeOperation.Realtime
           ?: throw VoiceRuntimeFenceException("Realtime presentation action is stale.")
-        Triple(requireRealtimeEngineLocked(snapshot.identity), snapshot.identity, operation.modeSessionId)
-      }
-      if (realtime != null) {
-        val acknowledged = realtime.first.acknowledgePresentationAction(
-          VoiceRuntimeRealtimeFence(realtime.second, realtime.third),
-          "action-$actionId-${UUID.randomUUID()}",
-          actionId,
+        Triple(
+          requireRealtimeEngineLocked(snapshot.identity),
+          VoiceRuntimeRealtimeFence(snapshot.identity, operation.modeSessionId),
           VoiceRuntimeRealtimePresentationDecision.Navigate(
             if (outcome == "succeeded") VoiceRuntimeRealtimeActionOutcome.SUCCEEDED
             else VoiceRuntimeRealtimeActionOutcome.FAILED,
             message,
           ),
         )
-        if (!acknowledged) throw VoiceRuntimeFenceException("Realtime action acknowledgement failed.")
-      }
-      synchronized(operationLock) {
         voiceRuntimeController.acknowledgePresentationAction(lease, actionId)
+      }
+      if (realtime != null) voiceRuntimeRealtimeControlIo.submit {
+        realtime.first.acknowledgePresentationAction(
+          realtime.second,
+          "action-$actionId-${UUID.randomUUID()}",
+          actionId,
+          realtime.third,
+        )
       }
     }
   }
