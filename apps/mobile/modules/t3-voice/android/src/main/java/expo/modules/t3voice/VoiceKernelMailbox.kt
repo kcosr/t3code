@@ -12,6 +12,13 @@ internal fun interface VoiceKernelCancellationToken {
   fun cancel(): Boolean
 }
 
+/**
+ * Serializes runtime state ownership onto one kernel thread.
+ *
+ * Fire-and-forget submissions are silently dropped after shutdown begins so late media callbacks
+ * remain harmless. Synchronous submissions still fail after shutdown because an awaiting caller
+ * cannot receive a meaningful result from a dropped body.
+ */
 internal class VoiceKernelMailbox(
   private val watchdogMillis: Long = WATCHDOG_MILLIS,
   private val clock: () -> Long = SystemClock::elapsedRealtime,
@@ -40,11 +47,9 @@ internal class VoiceKernelMailbox(
   private val thread = HandlerThread("t3-voice-kernel").apply { start() }
   private val handler = Handler(thread.looper)
 
-  fun submit(message: VoiceKernelMessage, body: () -> Unit) {
-    check(accepting.get()) { "The voice kernel mailbox is no longer accepting messages." }
-    check(handler.post { runSubmitted(message, body) }) {
-      "The voice kernel mailbox rejected a message."
-    }
+  fun submit(message: VoiceKernelMessage, body: () -> Unit): Boolean {
+    if (!accepting.get()) return false
+    return handler.post { runSubmitted(message, body) }
   }
 
   fun <T> submitAndAwait(message: VoiceKernelMessage, body: () -> T): T {
@@ -70,14 +75,12 @@ internal class VoiceKernelMailbox(
     body: () -> Unit,
   ): VoiceKernelCancellationToken {
     require(delayMillis >= 0) { "Mailbox delay cannot be negative." }
-    check(accepting.get()) { "The voice kernel mailbox is no longer accepting messages." }
+    if (!accepting.get()) return NO_OP_CANCELLATION_TOKEN
     val pending = AtomicBoolean(true)
     val runnable = Runnable {
       if (pending.compareAndSet(true, false)) runSubmitted(message, body)
     }
-    check(handler.postDelayed(runnable, delayMillis)) {
-      "The voice kernel mailbox rejected a delayed message."
-    }
+    if (!handler.postDelayed(runnable, delayMillis)) return NO_OP_CANCELLATION_TOKEN
     return VoiceKernelCancellationToken {
       if (!pending.compareAndSet(true, false)) {
         false
@@ -89,8 +92,10 @@ internal class VoiceKernelMailbox(
   }
 
   fun assertKernelThread() {
-    check(Looper.myLooper() === thread.looper) { "Voice kernel state requires the kernel thread." }
+    check(isKernelThread()) { "Voice kernel state requires the kernel thread." }
   }
+
+  fun isKernelThread(): Boolean = Looper.myLooper() === thread.looper
 
   fun drainAndQuit() {
     if (!accepting.compareAndSet(true, false)) return
@@ -121,5 +126,6 @@ internal class VoiceKernelMailbox(
 
   private companion object {
     const val WATCHDOG_MILLIS = 250L
+    val NO_OP_CANCELLATION_TOKEN = VoiceKernelCancellationToken { false }
   }
 }

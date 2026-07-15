@@ -8,6 +8,7 @@ import java.util.concurrent.atomic.AtomicLong
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -63,6 +64,36 @@ class VoiceKernelMailboxInstrumentedTest {
       mailbox.submitAndAwait(message) { now.addAndGet(251) }
 
       assertEquals(message to 251L, watched)
+    } finally {
+      mailbox.drainAndQuit()
+    }
+  }
+
+  @Test
+  fun fireAndForgetSubmissionsDropSilentlyAfterDrainWhileAwaitStillFails() {
+    val mailbox = VoiceKernelMailbox()
+    mailbox.drainAndQuit()
+
+    assertFalse(mailbox.submit(command("late")) { error("must not run") })
+    assertFalse(
+      mailbox.submitDelayed(command("late-delayed"), 0) { error("must not run") }.cancel(),
+    )
+    assertThrows(IllegalStateException::class.java) {
+      mailbox.submitAndAwait(command("late-await")) { Unit }
+    }
+  }
+
+  @Test
+  fun kernelThreadDiscriminatorSupportsInlineAndForeignDispatch() {
+    val mailbox = VoiceKernelMailbox()
+    try {
+      assertFalse(mailbox.isKernelThread())
+      mailbox.submitAndAwait(command("kernel-discriminator")) {
+        assertTrue(mailbox.isKernelThread())
+        var ranInline = false
+        if (mailbox.isKernelThread()) ranInline = true
+        assertTrue(ranInline)
+      }
     } finally {
       mailbox.drainAndQuit()
     }
