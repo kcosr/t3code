@@ -39,6 +39,7 @@ internal class VoiceKernelMailbox(
   },
 ) {
   private val accepting = AtomicBoolean(true)
+  private val acceptanceLock = Any()
 
   init {
     require(watchdogMillis >= 0) { "Mailbox watchdog duration cannot be negative." }
@@ -48,17 +49,21 @@ internal class VoiceKernelMailbox(
   private val handler = Handler(thread.looper)
 
   fun submit(message: VoiceKernelMessage, body: () -> Unit): Boolean {
-    if (!accepting.get()) return false
-    return handler.post { runSubmitted(message, body) }
+    return synchronized(acceptanceLock) {
+      if (!accepting.get()) return false
+      handler.post { runSubmitted(message, body) }
+    }
   }
 
   fun <T> submitAndAwait(message: VoiceKernelMessage, body: () -> T): T {
     check(Looper.myLooper() !== thread.looper) {
       "The voice kernel thread cannot synchronously await its own mailbox."
     }
-    check(accepting.get()) { "The voice kernel mailbox is no longer accepting messages." }
     val task = FutureTask { runBody(message, body) }
-    check(handler.post(task)) { "The voice kernel mailbox rejected a message." }
+    synchronized(acceptanceLock) {
+      check(accepting.get()) { "The voice kernel mailbox is no longer accepting messages." }
+      check(handler.post(task)) { "The voice kernel mailbox rejected a message." }
+    }
     return try {
       task.get()
     } catch (failure: ExecutionException) {
@@ -75,12 +80,14 @@ internal class VoiceKernelMailbox(
     body: () -> Unit,
   ): VoiceKernelCancellationToken {
     require(delayMillis >= 0) { "Mailbox delay cannot be negative." }
-    if (!accepting.get()) return NO_OP_CANCELLATION_TOKEN
     val pending = AtomicBoolean(true)
     val runnable = Runnable {
       if (pending.compareAndSet(true, false)) runSubmitted(message, body)
     }
-    if (!handler.postDelayed(runnable, delayMillis)) return NO_OP_CANCELLATION_TOKEN
+    synchronized(acceptanceLock) {
+      if (!accepting.get()) return NO_OP_CANCELLATION_TOKEN
+      if (!handler.postDelayed(runnable, delayMillis)) return NO_OP_CANCELLATION_TOKEN
+    }
     return VoiceKernelCancellationToken {
       if (!pending.compareAndSet(true, false)) {
         false
@@ -98,13 +105,15 @@ internal class VoiceKernelMailbox(
   fun isKernelThread(): Boolean = Looper.myLooper() === thread.looper
 
   fun drainAndQuit() {
-    if (!accepting.compareAndSet(true, false)) return
-    if (Looper.myLooper() === thread.looper) {
-      thread.quitSafely()
-      return
-    }
-    check(handler.post { thread.quitSafely() }) {
-      "The voice kernel mailbox could not enqueue its shutdown barrier."
+    synchronized(acceptanceLock) {
+      if (!accepting.compareAndSet(true, false)) return
+      if (isKernelThread()) {
+        thread.quitSafely()
+        return
+      }
+      check(handler.post { thread.quitSafely() }) {
+        "The voice kernel mailbox could not enqueue its shutdown barrier."
+      }
     }
     thread.join()
   }

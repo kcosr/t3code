@@ -7,10 +7,6 @@ import java.io.InputStream
 import java.io.InputStreamReader
 import java.net.URI
 import java.time.Instant
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.ScheduledFuture
-import java.util.concurrent.TimeUnit
 import javax.net.ssl.HttpsURLConnection
 
 internal data class VoiceRuntimeControlLease(
@@ -251,105 +247,5 @@ internal class T3VoiceHttpsNativeHeartbeatTransport : T3VoiceNativeHeartbeatTran
   private companion object {
     const val REQUEST_TIMEOUT_MILLIS = 5_000
     const val MAXIMUM_RESPONSE_BYTES = 4_096
-  }
-}
-
-internal class VoiceRuntimeControlHeartbeat(
-  private val transport: T3VoiceNativeHeartbeatTransport = T3VoiceHttpsNativeHeartbeatTransport(),
-  private val clockMillis: () -> Long = System::currentTimeMillis,
-  private val executor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor(),
-  private val onTerminated: (String, VoiceRuntimeControlTermination) -> Unit,
-) {
-  private val lock = Any()
-  private var lease: VoiceRuntimeControlLease? = null
-  private var sessionCredential: String? = null
-  private var heartbeatUrl: String? = null
-  private var lastSuccessMillis = 0L
-  private var scheduled: ScheduledFuture<*>? = null
-
-  fun start(
-    origin: String,
-    nextSessionCredential: String,
-    nextLease: VoiceRuntimeControlLease,
-  ) {
-    VoiceRuntimeSessionCredential(nextSessionCredential)
-    val url = VoiceRuntimeControlOriginPolicy.heartbeatUrl(origin, nextLease.sessionId)
-    synchronized(lock) {
-      stopLocked()
-      lease = nextLease
-      sessionCredential = nextSessionCredential
-      heartbeatUrl = url
-      lastSuccessMillis = clockMillis()
-      val schedule = T3VoiceNativeHeartbeatSchedulePolicy.forLease(nextLease)
-      scheduled =
-        executor.scheduleWithFixedDelay(
-          ::heartbeat,
-          schedule.initialDelayMillis,
-          schedule.intervalMillis,
-          TimeUnit.MILLISECONDS,
-        )
-    }
-  }
-
-  fun stop() = synchronized(lock) { stopLocked() }
-
-  fun destroy() {
-    stop()
-    executor.shutdownNow()
-  }
-
-  private fun heartbeat() {
-    val current: VoiceRuntimeControlLease
-    val credential: String
-    val url: String
-    synchronized(lock) {
-      current = lease ?: return
-      credential = sessionCredential ?: return
-      url = heartbeatUrl ?: return
-    }
-    val result = transport.post(url, credential, current.sessionId, current.leaseGeneration)
-    val now = clockMillis()
-    var termination: VoiceRuntimeControlTermination? = null
-    synchronized(lock) {
-      if (lease !== current) return
-      if (result == T3VoiceNativeHeartbeatResult.SUCCESS) lastSuccessMillis = now
-      if (
-        result == T3VoiceNativeHeartbeatResult.SESSION_TERMINAL ||
-          result == T3VoiceNativeHeartbeatResult.SESSION_TERMINAL_HANDOFF
-      ) {
-        termination =
-          if (result == T3VoiceNativeHeartbeatResult.SESSION_TERMINAL_HANDOFF) {
-            VoiceRuntimeControlTermination.HANDOFF_PENDING
-          } else {
-            VoiceRuntimeControlTermination.SESSION_ENDED
-          }
-        stopLocked()
-      } else if (
-        T3VoiceNativeHeartbeatPolicy.shouldLoseControl(
-          result,
-          now,
-          lastSuccessMillis,
-          current.failureGraceMillis,
-        )
-      ) {
-        termination =
-          if (result == T3VoiceNativeHeartbeatResult.TRANSIENT_FAILURE) {
-            VoiceRuntimeControlTermination.TRANSIENT_FAILURE
-          } else {
-            VoiceRuntimeControlTermination.CONTROL_REJECTED
-          }
-        stopLocked()
-      }
-    }
-    termination?.let { onTerminated(current.sessionId, it) }
-  }
-
-  private fun stopLocked() {
-    scheduled?.cancel(true)
-    scheduled = null
-    lease = null
-    sessionCredential = null
-    heartbeatUrl = null
-    lastSuccessMillis = 0L
   }
 }

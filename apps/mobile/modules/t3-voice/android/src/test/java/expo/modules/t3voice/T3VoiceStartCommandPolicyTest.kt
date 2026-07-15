@@ -46,7 +46,9 @@ class T3VoiceStartCommandPolicyTest {
     val cache = T3VoiceStartCommandStickinessCache()
     assertEquals(Service.START_NOT_STICKY, cache.value)
 
-    cache.publish(T3VoiceReadinessConfig(enabled = true))
+    cache.publish(
+      T3VoiceReadinessConfig(enabled = true, notificationPermissionGranted = true),
+    )
     assertEquals(Service.START_STICKY, cache.value)
 
     cache.publish(T3VoiceReadinessConfig(enabled = false))
