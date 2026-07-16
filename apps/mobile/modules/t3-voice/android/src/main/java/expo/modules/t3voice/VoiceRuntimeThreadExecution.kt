@@ -571,17 +571,6 @@ internal object VoiceRuntimeWakeLockPolicy {
   ): Boolean = hasThreadWork || hasRealtimeMedia || hasRealtimeCleanupInFlight
 }
 
-internal object T3VoiceRevocationAcknowledgementCoordinator {
-  fun run(
-    pendingMatches: Boolean,
-    clearDerivedState: () -> Boolean,
-    clearPendingFence: () -> Boolean,
-  ): Boolean {
-    if (!pendingMatches || !clearDerivedState()) return false
-    return clearPendingFence()
-  }
-}
-
 internal data class VoiceRuntimeThreadSpeechWork(
   val segmentIndex: Int,
   val advertisedSequence: Long?,

@@ -355,21 +355,6 @@ internal class T3VoiceWebRtcSession(
 
   fun routes(): List<Map<String, Any>> = audioRouter.routes().map(T3VoiceAudioRoute::toResultBody)
 
-  fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>> {
-    val session = synchronized(lock) {
-      requireActive(sessionId).also {
-        check(it.audioRouterActive) { "The Realtime audio route owner is unavailable." }
-      }
-    }
-    audioRouter.select(routeId)
-    synchronized(lock) {
-      if (active === session && session.audioRouterActive) {
-        session.audioRouteId = routeId
-      }
-    }
-    return routes()
-  }
-
   fun drainPlayout(
     sessionId: String,
     onComplete: (T3VoiceRealtimePlayoutDrainOutcome) -> Unit,

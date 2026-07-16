@@ -120,21 +120,6 @@ internal sealed interface T3VoiceRuntimeEvent {
       )
   }
 
-  data class AudioRouteChanged(
-    val nativeSessionId: String,
-    val routeId: String,
-    val routeType: String,
-    val reason: String,
-  ) : T3VoiceRuntimeEvent {
-    override fun toEventBody(): Map<String, Any> =
-      mapOf(
-        "nativeSessionId" to nativeSessionId,
-        "routeId" to routeId,
-        "routeType" to routeType,
-        "reason" to reason,
-      )
-  }
-
   data class RealtimeTerminated(
     val nativeSessionId: String,
     val outcome: String,
@@ -297,13 +282,8 @@ internal object T3VoiceStateStore {
       ),
     )
   private val mutableEvents = MutableSharedFlow<T3VoiceRuntimeEvent>(extraBufferCapacity = 64)
-  private val mutableRealtimeTermination =
-    MutableStateFlow<T3VoiceRuntimeEvent.RealtimeTerminated?>(null)
-
   val state: StateFlow<T3VoiceRuntimeState> = mutableState.asStateFlow()
   val events: SharedFlow<T3VoiceRuntimeEvent> = mutableEvents.asSharedFlow()
-  val realtimeTermination: StateFlow<T3VoiceRuntimeEvent.RealtimeTerminated?> =
-    mutableRealtimeTermination.asStateFlow()
   fun claimRealtime(sessionId: String): Boolean {
     val current = mutableState.value
     if (current.phase != T3VoiceRuntimePhase.IDLE) return false
@@ -318,7 +298,6 @@ internal object T3VoiceStateStore {
           realtimeInputReady = false,
           sequence = current.sequence + 1,
         )
-    mutableRealtimeTermination.value = null
     return true
   }
 
@@ -496,7 +475,6 @@ internal object T3VoiceStateStore {
           realtimeInputReady = false,
         )
       }
-    if (terminated) mutableRealtimeTermination.value = event
     return terminated
   }
 

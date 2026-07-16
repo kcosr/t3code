@@ -5,7 +5,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
@@ -17,7 +16,6 @@ import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 class T3VoiceModule : Module() {
@@ -34,14 +32,9 @@ class T3VoiceModule : Module() {
       orderedPost = binderOperationHandler::post,
     )
   private val pendingBinderOperations = T3VoiceBinderOperationRegistry<PendingBinderOperation>()
-  private val bindingRealtimeOwner = T3VoiceBindingRealtimeOwnerPolicy()
-  private var stateCollection: Job? = null
   private var eventCollection: Job? = null
-  private var realtimeTerminationCollection: Job? = null
-  private var voiceCommandCollection: Job? = null
   private var rebindScheduled = false
   private var rebindAttemptedSinceConnection = false
-  private var registeredControllerGeneration: Long? = null
 
   private class PendingBinderOperation(
     val promise: Promise,
@@ -74,35 +67,18 @@ class T3VoiceModule : Module() {
     object : ServiceConnection {
       override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
         val connectedBinder = service as? T3VoiceRuntimeService.VoiceBinder ?: return
-        val (bindingGeneration, dispatches) =
+        val dispatches =
           synchronized(binderLock) {
             if (destroyed) return
-            val generation = bindingRealtimeOwner.connected()
             binder = connectedBinder
-            bindingRealtimeOwner.observe(
-              generation,
-              connectedBinder.state.value.activeRealtimeSessionId,
-            )
             rebindScheduled = false
             rebindAttemptedSinceConnection = false
-            generation to pendingBinderOperations.connected()
+            pendingBinderOperations.connected()
           }
         dispatches.forEach { dispatch ->
           cancelBinderTimeout(dispatch.value)
           scheduleBinderOperation(connectedBinder, dispatch)
         }
-        stateCollection?.cancel()
-        stateCollection =
-          appContext.mainQueue.launch {
-            connectedBinder.state.collectLatest { state ->
-              synchronized(binderLock) {
-                if (binder === connectedBinder) {
-                  bindingRealtimeOwner.observe(bindingGeneration, state.activeRealtimeSessionId)
-                }
-              }
-              sendEvent(STATE_CHANGED_EVENT, state.toEventBody())
-            }
-          }
         eventCollection?.cancel()
         eventCollection =
           appContext.mainQueue.launch {
@@ -122,29 +98,12 @@ class T3VoiceModule : Module() {
                   }
                 is T3VoiceRuntimeEvent.RuntimeError ->
                   sendEvent(RUNTIME_ERROR_EVENT, event.toEventBody())
-                is T3VoiceRuntimeEvent.AudioRouteChanged ->
-                  sendEvent(AUDIO_ROUTE_CHANGED_EVENT, event.toEventBody())
-                is T3VoiceRuntimeEvent.RealtimeTerminated ->
-                  sendEvent(REALTIME_TERMINATED_EVENT, event.toEventBody())
+                is T3VoiceRuntimeEvent.RealtimeTerminated -> Unit
                 is T3VoiceRuntimeEvent.ReadinessDisabled ->
                   sendEvent(READINESS_DISABLED_EVENT, event.toEventBody())
                 is T3VoiceRuntimeEvent.VoiceRuntimeWake ->
                   sendEvent(VOICE_RUNTIME_WAKE_EVENT, event.toEventBody())
               }
-            }
-          }
-        realtimeTerminationCollection?.cancel()
-        realtimeTerminationCollection =
-          appContext.mainQueue.launch {
-            connectedBinder.realtimeTermination.collectLatest { event ->
-              if (event != null) sendEvent(REALTIME_TERMINATED_EVENT, event.toEventBody())
-            }
-          }
-        voiceCommandCollection?.cancel()
-        voiceCommandCollection =
-          appContext.mainQueue.launch {
-            connectedBinder.voiceCommands.collectLatest { command ->
-              if (command != null) sendEvent(VOICE_COMMAND_EVENT, command.toEventBody())
             }
           }
       }
@@ -175,20 +134,16 @@ class T3VoiceModule : Module() {
     ModuleDefinition {
       Name(MODULE_NAME)
       Events(
-        STATE_CHANGED_EVENT,
         PLAYBACK_CHUNK_CONSUMED_EVENT,
         PLAYBACK_TERMINATED_EVENT,
         RECORDING_TERMINATED_EVENT,
         RUNTIME_ERROR_EVENT,
-        AUDIO_ROUTE_CHANGED_EVENT,
-        REALTIME_TERMINATED_EVENT,
-        VOICE_COMMAND_EVENT,
         READINESS_DISABLED_EVENT,
         VOICE_RUNTIME_WAKE_EVENT,
       )
 
       Constants(
-        "nativeRevision" to 16,
+        "nativeRevision" to 17,
       )
 
       OnCreate {
@@ -206,11 +161,6 @@ class T3VoiceModule : Module() {
         destroyed = true
         cancelCollections()
         val context = appContext.reactContext
-        val connectedBinder = binder
-        registeredControllerGeneration?.let { generation ->
-          connectedBinder?.unregisterVoiceController(generation)
-        }
-        registeredControllerGeneration = null
         val pending = synchronized(binderLock) { pendingBinderOperations.destroy() }
         pending.forEach { entry ->
           rejectPendingOperation(
@@ -225,17 +175,6 @@ class T3VoiceModule : Module() {
         serviceBound = false
         binderOperationHandler.removeCallbacksAndMessages(null)
         binderOperationThread.quitSafely()
-      }
-
-      AsyncFunction("getMediaCapabilitiesAsync") {
-        mapOf(
-          "microphone" to true,
-          "boundedRecording" to true,
-          "automaticEndpointDetection" to true,
-          "orderedPcmPlayback" to true,
-          "realtimeWebRtc" to true,
-          "bluetoothRouting" to (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S),
-        )
       }
 
       AsyncFunction("getStateAsync") {
@@ -524,64 +463,6 @@ class T3VoiceModule : Module() {
         }
       }
 
-      AsyncFunction("acknowledgeVoiceRuntimeAuthorityRevocationAsync") {
-        input: Map<String, Any?>,
-        promise: Promise,
-        ->
-        requireExactKeys(input, setOf("runtimeId", "environmentOrigin"))
-        val expected =
-          T3VoicePendingRuntimeRevocation(
-            requireText(input, "runtimeId", 128),
-            VoiceRuntimeOriginPolicy.normalize(
-              requireText(input, "environmentOrigin", 2_048),
-            ),
-          )
-        withBinder(promise, "voice-runtime-revocation-acknowledgement-failed") {
-          service,
-          settlement,
-          ->
-          check(service.acknowledgeRuntimeRevocation(expected)) {
-            "The pending runtime voice runtime revocation is stale."
-          }
-          settlement.resolve()
-        }
-      }
-
-      AsyncFunction("setVoiceCuesEnabledAsync") { input: Map<String, Any>, promise: Promise ->
-        requireExactKeys(input, setOf("enabled"))
-        val enabled = input["enabled"] as? Boolean ?: error("enabled must be a boolean.")
-        withBinder(promise, "voice-cue-settings-update-failed") { service, settlement ->
-          service.setVoiceCuesEnabled(enabled)
-          settlement.resolve()
-        }
-      }
-
-      AsyncFunction("registerVoiceControllerAsync") { input: Map<String, Any>, promise: Promise ->
-        requireExactKeys(input, setOf("controllerGeneration"))
-        val generation = requireLong(input, "controllerGeneration")
-        withBinder(promise, "voice-controller-registration-failed") { service, settlement ->
-          service.registerVoiceController(generation)
-          registeredControllerGeneration = generation
-          settlement.resolve()
-        }
-      }
-
-      AsyncFunction("unregisterVoiceControllerAsync") { input: Map<String, Any>, promise: Promise ->
-        requireExactKeys(input, setOf("controllerGeneration"))
-        val generation = requireLong(input, "controllerGeneration")
-        withBinder(promise, "voice-controller-unregistration-failed") { service, settlement ->
-          service.unregisterVoiceController(generation)
-          if (registeredControllerGeneration == generation) registeredControllerGeneration = null
-          settlement.resolve()
-        }
-      }
-
-      AsyncFunction("getPendingVoiceCommandAsync") { promise: Promise ->
-        withBinder(promise, "voice-command-read-failed") { service, settlement ->
-          settlement.resolve(service.pendingVoiceCommand())
-        }
-      }
-
       AsyncFunction("getPendingReadinessDisabledAsync") { promise: Promise ->
         withBinder(promise, "readiness-disabled-read-failed") { service, settlement ->
           settlement.resolve(service.pendingReadinessDisabled())
@@ -598,23 +479,6 @@ class T3VoiceModule : Module() {
           ->
           check(service.acknowledgeReadinessDisabled(generation)) {
             "The readiness-disabled event is stale."
-          }
-          settlement.resolve()
-        }
-      }
-
-      AsyncFunction("completeVoiceCommandAsync") { input: Map<String, Any>, promise: Promise ->
-        requireExactKeys(input, setOf("commandId", "controllerGeneration", "outcome"))
-        val commandId = requireIdentifier(input, "commandId")
-        val generation = requireLong(input, "controllerGeneration")
-        val outcome = input["outcome"] as? String
-          ?: throw IllegalArgumentException("outcome must be success or failure.")
-        require(outcome == "success" || outcome == "failure") {
-          "outcome must be success or failure."
-        }
-        withBinder(promise, "voice-command-completion-failed") { service, settlement ->
-          check(service.completeVoiceCommand(commandId, generation, outcome)) {
-            "The voice command is stale or owned by another controller."
           }
           settlement.resolve()
         }
@@ -779,125 +643,6 @@ class T3VoiceModule : Module() {
       }
 
 
-      AsyncFunction("prepareRealtimeSessionAsync") { input: Map<String, Any>, promise: Promise ->
-        requireExactKeys(
-          input,
-          setOf("nativeSessionId", "environmentOrigin", "audioRouteId"),
-        )
-        val nativeSessionId = requireIdentifier(input, "nativeSessionId")
-        val environmentOrigin = requireText(input, "environmentOrigin", 2_048)
-        val audioRouteId = requireText(input, "audioRouteId", 64)
-        if (
-          runCatching {
-              VoiceRuntimeControlOriginPolicy.heartbeatUrl(environmentOrigin, nativeSessionId)
-            }
-            .isFailure
-        ) {
-          promise.reject(
-            "realtime-secure-environment-required",
-            publicRealtimeFailureMessage("realtime-secure-environment-required"),
-            null,
-          )
-        } else try {
-          withBinder(
-            promise,
-            "realtime-prepare-failed",
-          ) { voice, settlement ->
-            voice.prepareRealtimeSession(
-              nativeSessionId,
-              environmentOrigin,
-              audioRouteId,
-              object : T3VoiceWebRtcResultCallback<String> {
-                override fun onSuccess(result: String) {
-                  settlement.resolve(
-                    mapOf(
-                      "nativeSessionId" to nativeSessionId,
-                      "sdp" to result,
-                    ),
-                  )
-                }
-
-                override fun onFailure(
-                  code: String,
-                  @Suppress("UNUSED_PARAMETER") message: String,
-                  @Suppress("UNUSED_PARAMETER") cause: Throwable?,
-                ) {
-                  settlement.reject(code, publicRealtimeFailureMessage(code))
-                }
-              },
-            )
-          }
-        } catch (_: Throwable) {
-          promise.reject(
-            "realtime-prepare-failed",
-            publicRealtimeFailureMessage("realtime-prepare-failed"),
-            null,
-          )
-        }
-      }
-
-      AsyncFunction("applyRealtimeAnswerAsync") { input: Map<String, String>, promise: Promise ->
-        val nativeSessionId = requireIdentifier(input, "nativeSessionId")
-        val sdp = requireText(input, "sdp", T3VoiceBridgeValidation.MAXIMUM_SDP_LENGTH)
-        try {
-          withBinder(promise, "realtime-answer-rejected") { voice, settlement ->
-            voice.applyRealtimeAnswer(
-              nativeSessionId,
-              sdp,
-              object : T3VoiceWebRtcResultCallback<Unit> {
-                override fun onSuccess(result: Unit) {
-                  settlement.resolve()
-                }
-
-                override fun onFailure(
-                  code: String,
-                  @Suppress("UNUSED_PARAMETER") message: String,
-                  @Suppress("UNUSED_PARAMETER") cause: Throwable?,
-                ) {
-                  settlement.reject(code, publicRealtimeFailureMessage(code))
-                }
-              },
-            )
-          }
-        } catch (_: Throwable) {
-          promise.reject(
-            "realtime-answer-rejected",
-            publicRealtimeFailureMessage("realtime-answer-rejected"),
-            null,
-          )
-        }
-      }
-
-      AsyncFunction("stopRealtimeSessionAsync") { input: Map<String, String>, promise: Promise ->
-        withBinder(
-          promise,
-          "realtime-stop-failed",
-        ) { voice, result ->
-          result.resolve(voice.stopRealtimeSession(requireIdentifier(input, "nativeSessionId")))
-        }
-      }
-
-      AsyncFunction("drainAndStopRealtimeSessionAsync") { input: Map<String, String>, promise: Promise ->
-        withBinder(
-          promise,
-          "realtime-drained-stop-failed",
-        ) { voice, result ->
-          voice.drainAndStopRealtimeSession(requireIdentifier(input, "nativeSessionId"))
-          result.resolve()
-        }
-      }
-
-      AsyncFunction("setRealtimeMutedAsync") { input: Map<String, Any>, promise: Promise ->
-        val muted = input["muted"] as? Boolean ?: error("muted must be a boolean.")
-        withBinder(promise, "realtime-mute-failed") { voice, result ->
-          voice.setRealtimeMuted(
-            nativeSessionId = requireIdentifier(input, "nativeSessionId"),
-            muted = muted,
-          )
-          result.resolve()
-        }
-      }
-
       AsyncFunction("getAudioRoutesAsync") { promise: Promise ->
         withBinder(promise, "audio-routes-failed") { voice, result ->
           result.resolve(voice.getAudioRoutes())
@@ -910,37 +655,15 @@ class T3VoiceModule : Module() {
         }
       }
 
-      AsyncFunction("setAudioRouteAsync") { input: Map<String, String>, promise: Promise ->
-        withBinder(promise, "audio-route-selection-failed") { voice, result ->
-          result.resolve(
-            voice.setAudioRoute(
-              nativeSessionId = requireIdentifier(input, "nativeSessionId"),
-              routeId = requireIdentifier(input, "routeId"),
-            ),
-          )
-        }
-      }
     }
 
   private fun handleBindingLoss(message: String, rebind: Boolean) {
-    val (disconnected, realtimeOwner) =
+    val disconnected =
       synchronized(binderLock) {
-        val owner = bindingRealtimeOwner.disconnected()
         binder = null
-        pendingBinderOperations.disconnected() to owner
+        pendingBinderOperations.disconnected()
       }
     cancelCollections()
-    if (realtimeOwner != null) {
-      sendEvent(
-        REALTIME_TERMINATED_EVENT,
-        T3VoiceRuntimeEvent.RealtimeTerminated(
-          nativeSessionId = realtimeOwner.sessionId,
-          outcome = "failed",
-          code = "realtime-service-disconnected",
-          retryable = true,
-        ).toEventBody(),
-      )
-    }
     disconnected.forEach { entry -> rejectPendingOperation(entry.value, message) }
     if (rebind) scheduleServiceRebind()
   }
@@ -1246,36 +969,16 @@ class T3VoiceModule : Module() {
     T3VoiceBridgeValidation.requireText(input, key, maximumLength)
 
   private fun cancelCollections() {
-    stateCollection?.cancel()
-    stateCollection = null
     eventCollection?.cancel()
     eventCollection = null
-    realtimeTerminationCollection?.cancel()
-    realtimeTerminationCollection = null
-    voiceCommandCollection?.cancel()
-    voiceCommandCollection = null
   }
-
-  private fun publicRealtimeFailureMessage(code: String): String =
-    when (code) {
-      "realtime-secure-environment-required" ->
-        "Realtime voice requires an HTTPS environment."
-      "realtime-answer-rejected" -> "The Realtime answer was rejected."
-      "realtime-ice-timeout" -> "The Realtime connection timed out."
-      "realtime-offer-failed" -> "The Realtime offer could not be created."
-      else -> "The Realtime media session could not be prepared."
-    }
 
   companion object {
     private const val MODULE_NAME = "T3Voice"
-    private const val STATE_CHANGED_EVENT = "stateChanged"
     private const val PLAYBACK_CHUNK_CONSUMED_EVENT = "playbackChunkConsumed"
     private const val PLAYBACK_TERMINATED_EVENT = "playbackTerminated"
     private const val RECORDING_TERMINATED_EVENT = "recordingTerminated"
     private const val RUNTIME_ERROR_EVENT = "runtimeError"
-    private const val AUDIO_ROUTE_CHANGED_EVENT = "audioRouteChanged"
-    private const val REALTIME_TERMINATED_EVENT = "realtimeTerminated"
-    private const val VOICE_COMMAND_EVENT = "voiceCommand"
     private const val READINESS_DISABLED_EVENT = "readinessDisabled"
     private const val VOICE_RUNTIME_WAKE_EVENT = "voiceRuntimeWake"
     private const val BINDER_CONNECTION_TIMEOUT_MS = 5_000L

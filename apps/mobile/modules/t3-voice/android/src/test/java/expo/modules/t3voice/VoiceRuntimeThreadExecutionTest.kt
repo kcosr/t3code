@@ -452,23 +452,6 @@ class VoiceRuntimeThreadExecutionTest {
     assertTrue(rejected.cancelled)
   }
 
-  @Test fun `revocation fence is cleared last and survives derived cleanup crash`() {
-    val order = mutableListOf<String>()
-    assertFalse(T3VoiceRevocationAcknowledgementCoordinator.run(
-      pendingMatches = true,
-      clearDerivedState = { order += "derived"; false },
-      clearPendingFence = { order += "fence"; true },
-    ))
-    assertEquals(listOf("derived"), order)
-    order.clear()
-    assertTrue(T3VoiceRevocationAcknowledgementCoordinator.run(
-      pendingMatches = true,
-      clearDerivedState = { order += "derived"; true },
-      clearPendingFence = { order += "fence"; true },
-    ))
-    assertEquals(listOf("derived", "fence"), order)
-  }
-
   @Test fun `cancel completion deletes recording before clearing durable operation`() {
     val order = mutableListOf<String>()
     assertFalse(VoiceRuntimeThreadLocalCleanupCoordinator.complete(

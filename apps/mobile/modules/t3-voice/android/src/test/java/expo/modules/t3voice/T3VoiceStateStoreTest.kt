@@ -61,7 +61,7 @@ class T3VoiceStateStoreTest {
     assertTrue(T3VoiceStateStore.releasePlayback(playback))
   }
 
-  @Test fun terminalStateIsDurableAndRejectsStaleUpdates() {
+  @Test fun terminalStateRejectsStaleUpdates() {
     assertTrue(T3VoiceStateStore.claimRealtime("session-a"))
     val terminal =
       T3VoiceRuntimeEvent.RealtimeTerminated(
@@ -76,7 +76,6 @@ class T3VoiceStateStoreTest {
 
     assertNull(T3VoiceStateStore.state.value.activeRealtimeSessionId)
     assertEquals("failed", T3VoiceStateStore.state.value.realtimeConnectionState)
-    assertEquals(terminal, T3VoiceStateStore.realtimeTermination.value)
   }
 
   @Test fun recordingCompletionIsDurableAndBlocksReplacementUntilAcknowledged() {

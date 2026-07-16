@@ -173,7 +173,7 @@ carried in the journal snapshot; the two terminations become per-operation bridg
   :524; read `pendingDisabled()` :446-450 returns a `T3VoiceRuntimeEvent.ReadinessDisabled`;
   ack `acknowledgePendingDisabled()` :502-506).
 - **Write site:** `disableReadinessLocked` (svc :5948) → `readinessStore.writeDisabledWithPending`
-  (:6007 → Readiness.kt :462-500, sets pending_disabled_generation) — the _notification-disable_
+  (:6007 → Readiness.kt :462-500, sets pending*disabled_generation) — the \_notification-disable*
   path (caller svc :2321). Note the _conditional/in-app_ disable `disableRuntimeVoiceReadinessLocked`
   (svc :341) uses `writeDisabledForRuntimeRevocation` (:369) which does **not** set pending-disabled.
 - **Event:** `T3VoiceStateStore.emit(ReadinessDisabled(...))` at svc :6051-6053 → module events

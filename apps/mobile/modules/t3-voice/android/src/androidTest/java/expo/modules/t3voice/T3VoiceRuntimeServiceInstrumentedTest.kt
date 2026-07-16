@@ -115,50 +115,6 @@ class T3VoiceRuntimeServiceInstrumentedTest {
     waitUntil { T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.INACTIVE }
   }
 
-  @Test
-  fun realtimeSurvivesUnbindAndNotificationStopAfterRebind() {
-    InstrumentationRegistry.getInstrumentation().uiAutomation.grantRuntimePermission(
-      context.packageName,
-      Manifest.permission.RECORD_AUDIO,
-    )
-    val sessionId = UUID.randomUUID().toString()
-    val first = bindService()
-    val firstBinder = checkNotNull(first.binder.get())
-    firstBinder.prepareRealtimeSession(
-      nativeSessionId = sessionId,
-      environmentOrigin = "https://127.0.0.1",
-      audioRouteId = "system",
-      callback =
-        object : T3VoiceWebRtcResultCallback<String> {
-          override fun onSuccess(result: String) = Unit
-
-          override fun onFailure(code: String, message: String, cause: Throwable?) = Unit
-        },
-    )
-    waitUntil {
-      firstBinder.state.value.phase == T3VoiceRuntimePhase.REALTIME &&
-        firstBinder.state.value.isForeground &&
-        firstBinder.state.value.activeRealtimeSessionId == sessionId
-    }
-    context.unbindService(first.connection)
-    waitUntil { T3VoiceStateStore.state.value.activeRealtimeSessionId == sessionId }
-
-    val second = bindService()
-    try {
-      val secondBinder = checkNotNull(second.binder.get())
-      assertEquals(sessionId, secondBinder.state.value.activeRealtimeSessionId)
-      T3VoiceRuntimeService.requestStop(context)
-      waitUntil {
-        secondBinder.state.value.phase == T3VoiceRuntimePhase.IDLE &&
-          !secondBinder.state.value.isForeground &&
-          secondBinder.state.value.activeRealtimeSessionId == null
-      }
-    } finally {
-      context.unbindService(second.connection)
-    }
-    waitUntil { T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.INACTIVE }
-  }
-
   private fun bindService(): BoundService {
     val connected = CountDownLatch(1)
     val binder = AtomicReference<T3VoiceRuntimeService.VoiceBinder?>()

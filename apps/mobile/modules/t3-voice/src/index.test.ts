@@ -24,7 +24,7 @@ describe("T3 voice native module resolution", () => {
   });
 
   it("returns and caches the installed native module", async () => {
-    const nativeModule = { nativeRevision: 16 };
+    const nativeModule = { nativeRevision: 17 };
     expoMocks.requireOptionalNativeModule.mockReturnValue(nativeModule);
     const voice = await import("./index");
 
