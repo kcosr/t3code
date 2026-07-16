@@ -30,6 +30,14 @@ choreography. The fixture matrix from run 1 pins behavior across the cutover.
   internal to `startRuntimeThreadLocked`).
 - F2-E: where seam-map §6/§7 says "relocate recover() to kernel/", the packets govern —
   no package moves before M7.
+- Run-1 adjudication carry-forwards (binding): (a) the legacy-retirement session
+  credential clear (svc:1499-1503) stays LOADER-side per the ruling documented in
+  VoiceRuntimeRecovery.kt's KDoc — the cutover's loader step performs it with
+  retireLegacyV2; it is NOT a plan effect. (b) The CANONICAL realtime install executor
+  runs only if the ConfigureCanonicalAuthority effect succeeded
+  (restoreCanonicalAuthorityLocked returned true) — mirroring live svc:1854-1856; the
+  RECOVERED install is not so gated. Encode this as interpreter sequencing, not a new
+  decision.
 
 ## The cutover (host sequence per run-1 ruling R-2)
 
