@@ -453,13 +453,19 @@ has **dead reachability in production** today. Audit results:
   `playbackChunkConsumed`, `recordingTerminated`, `playbackTerminated`, `runtimeError`.
 - **Keep — permissions/diagnostics (6)**: mic and notification get/request, `getStateAsync`,
   `getDiagnosticsAsync`.
-- **Convert**: the four live pending/ack groups. Composer-recording and manual-playback
-  terminations become per-operation bridge completion handles (already required by ownership
-  spec:318-324 — the sticky global slots are explicitly removed there). Readiness-disabled
-  and authority-revocation notices become retained records acknowledged through
-  `acknowledgeVoiceRuntimeRetainedRecordAsync` and redelivered via rebase, which is exactly
-  how the contract models durable notices (contracts:484-507, 593-605). The event
-  `readinessDisabled` becomes a retained-record wake.
+- **Convert**: the two termination pending/ack groups. Composer-recording and
+  manual-playback terminations become per-operation bridge completion handles (already
+  required by ownership spec:318-324 — the sticky global slots are explicitly removed
+  there). [M5 deviation, 2026-07-15] The readiness-disabled and authority-revocation
+  notices are NOT converted: the retained-record protocol is a closed contracts-typed
+  server-journal surface (the acknowledgement union and rebase struct enumerate exactly
+  `thread-receipt` and `realtime-terminal`; the sections previously cited here model no
+  generic notice mechanism), and the notices are native-origin facts that already carry
+  the durable get/acknowledge model the conversion was after. They keep their existing
+  SharedPreferences-backed bridge surface (`readinessDisabled` event included); only the
+  caller-less dedicated revocation acknowledge is deleted as dead code. Unifying notices
+  onto a retained-record abstraction is deferred past M7 and would require contracts
+  changes designed on their own terms.
 - **Delete**: everything listed under Evidence, plus `executeRealtimeHandoff` and
   `completionLock` (dead code), the interrupt lane, and the sticky termination StateFlows.
 
