@@ -23,6 +23,60 @@ class T3VoiceStateStoreTest {
   @Test fun realtimeOwnershipIsClaimedAtomically() {
     assertTrue(T3VoiceStateStore.claimRealtime("session-a"))
     assertFalse(T3VoiceStateStore.claimRealtime("session-b"))
+    assertEquals("session-a", T3VoiceStateStore.state.value.activeRealtimeSessionId)
+  }
+
+  @Test fun modeClaimsClearMutuallyExclusiveAndTerminalRealtimeFields() {
+    assertTrue(T3VoiceStateStore.claimRealtime("session-a"))
+    assertTrue(
+      T3VoiceStateStore.terminateRealtime(
+        T3VoiceRuntimeEvent.RealtimeTerminated(
+          nativeSessionId = "session-a",
+          outcome = "failed",
+          code = "test-failure",
+          retryable = true,
+        ),
+      ),
+    )
+    assertEquals("failed", T3VoiceStateStore.state.value.realtimeConnectionState)
+
+    val recording = checkNotNull(claimComposerRecording("recording-a", "operation-a"))
+    val recordingState = T3VoiceStateStore.state.value
+    assertEquals(T3VoiceRuntimePhase.ARMING, recordingState.phase)
+    assertTrue(T3VoiceStateStore.markRecordingStarted(recording))
+    assertEquals(T3VoiceRuntimePhase.RECORDING, T3VoiceStateStore.state.value.phase)
+    assertNull(recordingState.activePlaybackId)
+    assertNull(recordingState.activeRealtimeSessionId)
+    assertNull(recordingState.realtimeConnectionState)
+    assertFalse(recordingState.realtimeMuted)
+    assertTrue(T3VoiceStateStore.releaseRecording(recording))
+
+    val playback = checkNotNull(claimManualPlayback("playback-a", "operation-a"))
+    val playbackState = T3VoiceStateStore.state.value
+    assertEquals(T3VoiceRuntimePhase.PLAYING, playbackState.phase)
+    assertNull(playbackState.activeRecordingId)
+    assertNull(playbackState.activeRealtimeSessionId)
+    assertNull(playbackState.realtimeConnectionState)
+    assertFalse(playbackState.realtimeMuted)
+    assertTrue(T3VoiceStateStore.releasePlayback(playback))
+  }
+
+  @Test fun terminalStateIsDurableAndRejectsStaleUpdates() {
+    assertTrue(T3VoiceStateStore.claimRealtime("session-a"))
+    val terminal =
+      T3VoiceRuntimeEvent.RealtimeTerminated(
+        nativeSessionId = "session-a",
+        outcome = "failed",
+        code = "realtime-connection-failed",
+        retryable = true,
+      )
+
+    T3VoiceStateStore.terminateRealtime(terminal)
+    T3VoiceStateStore.setRealtime("session-a", "connected", false, true)
+
+    assertNull(T3VoiceStateStore.state.value.activeRealtimeSessionId)
+    assertEquals("failed", T3VoiceStateStore.state.value.realtimeConnectionState)
+    assertEquals(terminal, T3VoiceStateStore.realtimeTermination.value)
   }
 
   @Test fun recordingCompletionIsDurableAndBlocksReplacementUntilAcknowledged() {
@@ -30,11 +84,49 @@ class T3VoiceStateStoreTest {
     val terminal = recordingTerminal("recording-a")
     assertTrue(T3VoiceStateStore.terminateRecording(owner, terminal))
     assertNull(claimComposerRecording("recording-b", "operation-b"))
+    assertTrue(T3VoiceStateStore.claimRealtime("session-a"))
+    assertEquals(terminal, T3VoiceBridgeCompletionStore.pendingRecordings(owner.domain).single().terminal)
+    T3VoiceStateStore.releaseRealtimeClaim("session-a")
     assertEquals(terminal, T3VoiceBridgeCompletionStore.pendingRecordings(owner.domain).single().terminal)
     assertNull(T3VoiceBridgeCompletionStore.acknowledgeRecording(owner.domain, "other"))
     assertNull(claimComposerRecording("recording-b", "operation-b"))
     T3VoiceBridgeCompletionStore.acknowledgeRecording(owner.domain, owner.operationId)
     assertTrue(claimComposerRecording("recording-b", "operation-b") != null)
+  }
+
+  @Test fun bridgeCompletionDoesNotBlockNativeThreadWork() {
+    val composer = checkNotNull(claimComposerRecording("composer", "composer-operation"))
+    assertTrue(T3VoiceStateStore.terminateRecording(composer, recordingTerminal(composer.id)))
+
+    val native = T3VoiceStateStore.claimRecording(
+      "thread-recording",
+      T3VoiceOperationOwnerDomain.THREAD_MODE,
+      "thread-operation",
+    )
+    assertTrue(native != null)
+    assertTrue(T3VoiceStateStore.releaseRecording(checkNotNull(native)))
+    assertNull(claimComposerRecording("other-composer", "other-composer-operation"))
+  }
+
+  @Test fun discardDeletesRecordingButAcknowledgementDoesNot() {
+    val deleted = mutableListOf<Pair<String, String>>()
+    val bridge = RecordingTerminationBridgeHarness { recordingId, uri ->
+      deleted += recordingId to uri
+    }
+    val domain = T3VoiceOperationOwnerDomain.COMPOSER_DICTATION
+    val acknowledged = T3VoiceOperationOwner("recording-ack", domain, "operation-ack")
+    val discarded = T3VoiceOperationOwner("recording-discard", domain, "operation-discard")
+    T3VoiceBridgeCompletionStore.putRecording(acknowledged, recordingTerminal(acknowledged.id))
+    T3VoiceBridgeCompletionStore.putRecording(discarded, recordingTerminal(discarded.id))
+
+    bridge.acknowledgeRecordingTermination(acknowledged.operationId)
+    assertTrue(deleted.isEmpty())
+    assertTrue(bridge.discardUnownedRecordingTermination(discarded.operationId))
+
+    assertEquals(
+      listOf("recording-discard" to "file:///recording-discard.m4a"),
+      deleted,
+    )
   }
 
   @Test fun playbackCompletionIsDurableAndBlocksReplacementUntilAcknowledged() {
@@ -121,4 +213,29 @@ class T3VoiceStateStoreTest {
 
   private fun claimManualPlayback(playbackId: String, operationId: String) =
     T3VoiceStateStore.claimPlayback(playbackId, T3VoiceOperationOwnerDomain.MANUAL_PLAYBACK, operationId)
+
+  private class RecordingTerminationBridgeHarness(
+    private val recorderDelete: (recordingId: String, uri: String) -> Unit,
+  ) {
+    fun acknowledgeRecordingTermination(operationId: String) {
+      T3VoiceBridgeCompletionStore.acknowledgeRecording(
+        T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
+        operationId,
+      )
+    }
+
+    fun discardUnownedRecordingTermination(operationId: String): Boolean {
+      val completion = T3VoiceBridgeCompletionStore.pendingRecordings(
+        T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
+      ).firstOrNull { it.owner.operationId == operationId } ?: return false
+      completion.terminal.recording?.let { recording ->
+        recorderDelete(completion.terminal.recordingId, recording.uri)
+      }
+      T3VoiceBridgeCompletionStore.acknowledgeRecording(
+        completion.owner.domain,
+        completion.owner.operationId,
+      )
+      return true
+    }
+  }
 }

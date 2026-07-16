@@ -85,4 +85,23 @@ describe("orphaned dictation termination cleanup", () => {
     await expect(discardOrphanedRecordingTerminationIfUnowned(native, event)).resolves.toBe(false);
     expect(calls).toEqual([{ operationId: "operation-a" }]);
   });
+
+  it("plain acknowledgement never takes the orphan-discard path", async () => {
+    const acknowledgements: Array<unknown> = [];
+    const discards: Array<unknown> = [];
+    const native = {
+      acknowledgeRecordingTerminationAsync: async (input: unknown) => {
+        acknowledgements.push(input);
+      },
+      discardUnownedRecordingTerminationAsync: async (input: unknown) => {
+        discards.push(input);
+        return true;
+      },
+    } as unknown as T3VoiceNativeModule;
+
+    await native.acknowledgeRecordingTerminationAsync({ operationId: "operation-a" });
+
+    expect(acknowledgements).toEqual([{ operationId: "operation-a" }]);
+    expect(discards).toEqual([]);
+  });
 });
