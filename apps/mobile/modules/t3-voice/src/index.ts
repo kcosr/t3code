@@ -30,6 +30,7 @@ export type {
   T3VoiceRealtimeOffer,
   T3VoiceRealtimePrepareInput,
   T3VoiceRealtimeTerminatedEvent,
+  T3VoiceThreadVoiceHandoffEvent,
   T3VoiceReadinessMode,
   T3VoiceReadinessSnapshot,
   T3VoicePersistedReadinessSnapshot,

@@ -245,6 +245,16 @@ internal object T3VoiceBridgeCompletionStore {
     playbacks.remove(domain to operationId)
 }
 
+internal fun restoreBridgeRecordingCompletions(
+  restoreCompleted: (T3VoiceRecordingResult) -> Unit,
+  sweepStaleCache: () -> Unit,
+) {
+  T3VoiceBridgeCompletionStore.pendingRecordings(
+    T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
+  ).mapNotNull { it.terminal.recording }.forEach(restoreCompleted)
+  sweepStaleCache()
+}
+
 internal object T3VoiceStateStore {
   private val mutableState =
     MutableStateFlow(

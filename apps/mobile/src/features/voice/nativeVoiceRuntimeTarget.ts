@@ -18,33 +18,6 @@ import type { PersistedVoiceThreadTarget } from "./masterVoiceState";
 import { durableVoiceConversations, newVoiceConversationTitle } from "./masterVoiceState";
 
 type NativeRuntimeTargetClient = Pick<VoiceHttpClient, "createConversation" | "listConversations">;
-
-export interface VoiceEnvironmentOriginCandidate {
-  readonly environmentId: EnvironmentId;
-  readonly httpBaseUrl: string;
-}
-
-export function resolveVoiceEnvironmentIdByOrigin(
-  candidates: ReadonlyArray<VoiceEnvironmentOriginCandidate>,
-  environmentOrigin: string,
-): EnvironmentId | null {
-  const exact = candidates.filter((candidate) => candidate.httpBaseUrl === environmentOrigin);
-  if (exact.length === 1) return exact[0]!.environmentId;
-  let expectedOrigin: string;
-  try {
-    expectedOrigin = new URL(environmentOrigin).origin;
-  } catch {
-    return null;
-  }
-  const normalized = candidates.filter((candidate) => {
-    try {
-      return new URL(candidate.httpBaseUrl).origin === expectedOrigin;
-    } catch {
-      return false;
-    }
-  });
-  return normalized.length === 1 ? normalized[0]!.environmentId : null;
-}
 type NativeRuntimeThreadShell = Pick<
   EnvironmentThreadShell,
   "archivedAt" | "environmentId" | "id" | "projectId"

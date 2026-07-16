@@ -2152,10 +2152,10 @@ class T3VoiceRuntimeService : Service() {
         )
       }
     }
-      T3VoiceBridgeCompletionStore.pendingRecordings(
-        T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
-      ).mapNotNull { it.terminal.recording }.forEach(recorder::restoreCompleted)
-      recorder.sweepStaleCache()
+      restoreBridgeRecordingCompletions(
+        recorder::restoreCompleted,
+        recorder::sweepStaleCache,
+      )
       T3VoiceStateStore.setServiceReady()
       if (reconcilePersistedThreadOperationLocked()) {
         startRuntimeThreadLocked()

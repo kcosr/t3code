@@ -73,6 +73,33 @@ class T3VoiceStateStoreTest {
     )
   }
 
+  @Test fun serviceRestoreProtectsUnacknowledgedRecordingBeforeCacheSweep() {
+    val owner = T3VoiceOperationOwner(
+      "recording-a",
+      T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
+      "operation-a",
+    )
+    val recording = recordingTerminal(owner.id).recording!!
+    T3VoiceBridgeCompletionStore.putRecording(owner, recordingTerminal(owner.id))
+    val artifacts = mutableSetOf(recording.uri)
+    val restored = mutableSetOf<String>()
+    val calls = mutableListOf<String>()
+
+    restoreBridgeRecordingCompletions(
+      restoreCompleted = {
+        calls += "restore:${it.recordingId}"
+        restored += it.uri
+      },
+      sweepStaleCache = {
+        calls += "sweep"
+        artifacts.retainAll(restored)
+      },
+    )
+
+    assertEquals(listOf("restore:recording-a", "sweep"), calls)
+    assertTrue(recording.uri in artifacts)
+  }
+
   @Test fun nativeThreadTerminalsDoNotOccupyBridgeCompletionStore() {
     val recording = checkNotNull(T3VoiceStateStore.claimRecording("thread-recording", T3VoiceOperationOwnerDomain.THREAD_MODE, "thread-operation"))
     assertTrue(T3VoiceStateStore.terminateRecording(recording, recordingTerminal(recording.id)))

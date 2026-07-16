@@ -185,6 +185,16 @@ export interface T3VoiceCompletionWakeEvent {
   readonly operationId: string;
 }
 
+export interface T3VoiceThreadVoiceHandoffEvent {
+  readonly actionId: string;
+  readonly projectId: string;
+  readonly threadId: string;
+  readonly recordingId: string;
+  readonly autoRearm: boolean;
+  readonly environmentOrigin: string;
+  readonly expiresAtEpochMillis: number;
+}
+
 export type T3VoiceReadinessMode = "realtime" | "thread";
 
 export interface T3VoiceReadinessSnapshot {
@@ -385,6 +395,10 @@ export interface T3VoiceNativeModule {
       listener: (event: T3VoiceRealtimeTerminatedEvent) => void,
     ): T3VoiceEventSubscription;
     (
+      eventName: "threadVoiceHandoff",
+      listener: (event: T3VoiceThreadVoiceHandoffEvent) => void,
+    ): T3VoiceEventSubscription;
+    (
       eventName: "voiceCommand",
       listener: (event: T3VoiceCommandEvent) => void,
     ): T3VoiceEventSubscription;
@@ -471,6 +485,15 @@ export interface T3VoiceNativeModule {
   readonly getPendingRecordingTerminationAsync: () => Promise<
     ReadonlyArray<T3VoiceRecordingTerminatedEvent>
   >;
+  readonly getPendingThreadVoiceHandoffAsync: () => Promise<T3VoiceThreadVoiceHandoffEvent | null>;
+  readonly acknowledgeThreadVoiceHandoffAsync: (input: {
+    readonly actionId: string;
+    readonly outcome: "adopted" | "failed";
+  }) => Promise<void>;
+  readonly beginThreadVoiceHandoffAdoptionAsync: (input: {
+    readonly actionId: string;
+  }) => Promise<boolean>;
+  readonly armThreadVoiceHandoffAsync: (input: T3VoiceRealtimeIdentifier) => Promise<void>;
   readonly setVoiceCuesEnabledAsync: (input: { readonly enabled: boolean }) => Promise<void>;
   readonly registerVoiceControllerAsync: (input: T3VoiceControllerRegistration) => Promise<void>;
   readonly unregisterVoiceControllerAsync: (input: T3VoiceControllerRegistration) => Promise<void>;
@@ -505,6 +528,9 @@ export interface T3VoiceNativeModule {
   ) => Promise<void>;
   readonly getAudioRoutesAsync: () => Promise<ReadonlyArray<T3VoiceAudioRoute>>;
   readonly getDiagnosticsAsync: () => Promise<ReadonlyArray<T3VoiceDiagnosticEntry>>;
+  readonly recordThreadVoiceHandoffClientStageAsync: (input: {
+    readonly stage: "accepted" | "navigation-requested" | "composer-adopted";
+  }) => Promise<void>;
   readonly setAudioRouteAsync: (
     input: T3VoiceRealtimeIdentifier & {
       readonly routeId: T3VoiceAudioRoute["id"];
