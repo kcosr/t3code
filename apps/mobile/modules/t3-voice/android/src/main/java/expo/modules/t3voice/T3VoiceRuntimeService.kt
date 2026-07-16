@@ -1488,6 +1488,240 @@ class T3VoiceRuntimeService : Service() {
   private fun persistedAuthority(): VoiceRuntimePersistedAuthority? =
     (voiceRuntimeAuthorityStore.load() as? VoiceRuntimeAuthorityLoadResult.Available)?.authority
 
+  private fun loadRecoveryState(): Pair<LoadedState, Permissions> {
+    val retiredAuthorityFence = voiceRuntimeAuthorityStore.retireLegacyV2()
+    if (retiredAuthorityFence != null) {
+      storeDriver.persist("legacy-retirement-clear-session-credential", driverEpoch(), body = {
+        voiceRuntimeSessionCredentialStore.clear()
+      })
+    }
+    var snapshot = runtimeSnapshotStore.read()
+    runCatching {
+      VoiceRuntimeLegacyRealtimeCutover(
+        runtimeSnapshotStore,
+        VoiceRuntimeRealtimeCleanupStore(applicationContext),
+      ).migrate(snapshot)
+    }.onSuccess { cutover ->
+      snapshot = cutover.snapshot
+      if (cutover.migrated) {
+        T3VoiceDiagnostics.record(
+          0,
+          T3VoiceDiagnosticCategory.TERMINAL,
+          T3VoiceDiagnosticCode.LEGACY_REALTIME_RETIRED,
+        )
+      }
+    }.onFailure {
+      snapshot = VoiceRuntimeExecutionSnapshot()
+      T3VoiceDiagnostics.record(
+        0,
+        T3VoiceDiagnosticCategory.TERMINAL,
+        T3VoiceDiagnosticCode.CLEANUP_RECONCILIATION_REQUIRED,
+      )
+    }
+    val attached = runCatching { voiceRuntimeAuthorityStore.inspectPreparedAttachedAuthority() }
+    val canonical = voiceRuntimeAuthorityStore.load()
+    val finalization = runCatching { voiceRuntimeRealtimeRepository.loadFinalization() }
+    val checkpoint = runCatching { voiceRuntimeRealtimeRepository.load() }
+    val prepared = runCatching { readinessStore.prepared() }
+    val active = runCatching { readinessStore.activeAuthority() }
+    val threadOperation = runtimeThreadOperationStore.load()
+    val threadRecordingRestored = VoiceRuntimeThreadRecordingRecovery.restore(
+      threadOperation,
+      recorder::restoreCompleted,
+    )
+    return LoadedState(
+      readinessConfig = readinessStore.read(),
+      preparedReadiness = prepared.getOrNull(),
+      activeAuthority = active.getOrNull(),
+      attachedPreparation = attached.getOrNull(),
+      canonicalAuthority = canonical,
+      retiredAuthorityFence = retiredAuthorityFence,
+      realtimeFinalization = finalization.getOrNull(),
+      realtimeCheckpoint = checkpoint.getOrNull(),
+      runtimeSnapshot = snapshot,
+      threadOperation = threadOperation,
+      cueSettings = cueSettingsStore.read(),
+      attachedPreparationRead = attached.isSuccess,
+      persistentReadinessRead = prepared.isSuccess,
+      activeAuthorityRead = active.isSuccess,
+      finalizationRead = finalization.isSuccess,
+      checkpointRead = checkpoint.isSuccess,
+      threadRecordingRestored = threadRecordingRestored,
+    ) to Permissions(
+      microphoneGranted = hasPermission(Manifest.permission.RECORD_AUDIO),
+      notificationGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+        hasPermission(Manifest.permission.POST_NOTIFICATIONS),
+    )
+  }
+
+  private fun executeRecoveryEffectLocked(
+    effect: VoiceRuntimeRecoveryEffect,
+    canonicalConfigured: Boolean,
+  ): Boolean = when (effect) {
+    is VoiceRuntimeRecoveryEffect.WriteReadiness -> {
+      readinessStore.write(effect.config)
+      canonicalConfigured
+    }
+    is VoiceRuntimeRecoveryEffect.WriteActivatedReadiness -> {
+      readinessStore.writeActivated(effect.config, effect.authority)
+      canonicalConfigured
+    }
+    is VoiceRuntimeRecoveryEffect.WriteDisabledForRuntimeRevocation -> {
+      readinessStore.writeDisabledForRuntimeRevocation(effect.config, effect.pending)
+      canonicalConfigured
+    }
+    VoiceRuntimeRecoveryEffect.DiscardInitialPreparation -> {
+      voiceRuntimeAuthorityStore.discardInitialPreparation()
+      canonicalConfigured
+    }
+    VoiceRuntimeRecoveryEffect.InvalidateReadiness -> {
+      controllerCommands.invalidateReadiness()
+      canonicalConfigured
+    }
+    VoiceRuntimeRecoveryEffect.ClearLockedAfterAuthorityRevocation -> {
+      runtimeThreadOperationStore.clearLockedAfterAuthorityRevocation()
+      canonicalConfigured
+    }
+    VoiceRuntimeRecoveryEffect.ClearRuntimeSnapshot -> {
+      runtimeSnapshotStore.clear()
+      runtimeSnapshot = VoiceRuntimeExecutionSnapshot()
+      canonicalConfigured
+    }
+    is VoiceRuntimeRecoveryEffect.ClearAuthority -> {
+      storeDriver.persist(effect.reason, driverEpoch(), body = {
+        voiceRuntimeAuthorityStore.clear()
+      })
+      canonicalConfigured
+    }
+    is VoiceRuntimeRecoveryEffect.Diagnostic -> {
+      T3VoiceDiagnostics.record(
+        effect.generation,
+        T3VoiceDiagnosticCategory.TERMINAL,
+        effect.code,
+      )
+      canonicalConfigured
+    }
+    is VoiceRuntimeRecoveryEffect.ConfigureCanonicalAuthority ->
+      restoreCanonicalAuthorityLocked(effect.authority)
+    is VoiceRuntimeRecoveryEffect.InstallRealtime -> {
+      when (val install = effect.plan) {
+        is VoiceRuntimeRealtimeInstallPlan.Recovered ->
+          installRecoveredRealtimeStateLocked()
+        is VoiceRuntimeRealtimeInstallPlan.Canonical ->
+          if (canonicalConfigured) installRealtimeEngineLocked(install.authority) else Unit
+        VoiceRuntimeRealtimeInstallPlan.None -> Unit
+      }
+      canonicalConfigured
+    }
+    is VoiceRuntimeRecoveryEffect.RestoreCompletedRecording -> {
+      recorder.restoreCompleted(effect.recording)
+      canonicalConfigured
+    }
+    is VoiceRuntimeRecoveryEffect.DetachActiveThread -> {
+      runtimeThreadOperationStore.writeActive(effect.state)
+      canonicalConfigured
+    }
+    VoiceRuntimeRecoveryEffect.RestoreBridgeCompletions -> {
+      restoreBridgeRecordingCompletions(recorder::restoreCompleted) {}
+      canonicalConfigured
+    }
+    VoiceRuntimeRecoveryEffect.SweepStaleCache -> {
+      recorder.sweepStaleCache()
+      canonicalConfigured
+    }
+    VoiceRuntimeRecoveryEffect.SetServiceReady -> {
+      T3VoiceStateStore.setServiceReady()
+      canonicalConfigured
+    }
+    is VoiceRuntimeRecoveryEffect.ReconcileThreadOperation -> {
+      if (reconcileRecoveryThreadOperationLocked()) startRuntimeThreadLocked()
+      canonicalConfigured
+    }
+  }
+
+  private fun reconcileRecoveryThreadOperationLocked(): Boolean {
+    val loaded = runtimeThreadOperationStore.load()
+    val grant = (voiceRuntimeAuthorityStore.load()
+      as? VoiceRuntimeAuthorityLoadResult.Available)?.authority
+    return when (VoiceRuntimeThreadStoredStatePolicy.decide(
+      loaded,
+      VoiceRuntimeThreadStoredStatePolicy.parentGrantAvailable(grant, loaded),
+      System.currentTimeMillis(),
+    )) {
+      VoiceRuntimeThreadStoredStateDecision.NONE -> false
+      VoiceRuntimeThreadStoredStateDecision.RESTORE -> true
+      VoiceRuntimeThreadStoredStateDecision.CANCEL_PREPARED -> {
+        val prepared = (loaded as VoiceRuntimeThreadOperationLoadResult.Available)
+          .state as VoiceRuntimeThreadOperationState.Prepared
+        runtimeThreadOperationStore.writePrepared(prepared.claim, cancelRequested = true)
+        true
+      }
+      VoiceRuntimeThreadStoredStateDecision.CANCEL_UNDISPATCHED -> {
+        val active = (loaded as VoiceRuntimeThreadOperationLoadResult.Available)
+          .state as VoiceRuntimeThreadOperationState.Active
+        runtimeThreadOperationStore.writeActive(active.copy(detached = true, cancelRequested = true))
+        true
+      }
+      VoiceRuntimeThreadStoredStateDecision.REVOKE -> {
+        executeThreadOperationRevocationLocked(loaded, grant)
+        false
+      }
+    }
+  }
+
+  private fun executeThreadOperationRevocationLocked(
+    loaded: VoiceRuntimeThreadOperationLoadResult,
+    grant: VoiceRuntimePersistedAuthority?,
+  ) {
+    T3VoiceDiagnostics.record(
+      0,
+      T3VoiceDiagnosticCategory.TERMINAL,
+      T3VoiceDiagnosticCode.THREAD_RECONCILIATION_REQUIRED,
+    )
+    when (val selection = VoiceRuntimeThreadStoredStatePolicy.selectRevocation(
+      loaded,
+      readinessStore.pendingRuntimeRevocation(),
+      readinessStore.activeAuthority(),
+      grant,
+    )) {
+      is VoiceRuntimeThreadStoredStatePolicy.RevocationSelection.Disable -> {
+        val disabled = T3VoiceCanonicalReadinessPolicy.disabled(
+          readinessConfig,
+          voiceRuntimeController.snapshot().identity.generation,
+        )
+        readinessStore.writeDisabledForRuntimeRevocation(disabled, selection.pending)
+        readinessConfig = disabled
+        canonicalPreparedAuthority = null
+        storeDriver.persist("revoke-thread-operation-clear-authority", driverEpoch(), body = {
+          voiceRuntimeAuthorityStore.clear()
+        })
+        controllerCommands.invalidateReadiness()
+      }
+      VoiceRuntimeThreadStoredStatePolicy.RevocationSelection.ClearLocked -> {
+        runtimeThreadOperationStore.clearLockedAfterAuthorityRevocation()
+        runtimeSnapshotStore.clear()
+        runtimeSnapshot = VoiceRuntimeExecutionSnapshot()
+      }
+      VoiceRuntimeThreadStoredStatePolicy.RevocationSelection.None -> Unit
+    }
+  }
+
+  private fun configureRecoveryHost(plan: VoiceRuntimeRecoveryPlan) {
+    readinessConfig = plan.readinessConfig
+    runtimeSnapshot = plan.runtimeSnapshot
+    cueSettings = plan.cueSettings
+    canonicalPreparedAuthority = plan.canonicalPreparedAuthority
+    hostDriver = createHostDriver()
+    createNotificationChannel()
+  }
+
+  private fun executeRecoveryPlanLocked(plan: VoiceRuntimeRecoveryPlan) {
+    var canonicalConfigured = false
+    plan.effects.forEach { effect ->
+      canonicalConfigured = executeRecoveryEffectLocked(effect, canonicalConfigured)
+    }
+  }
+
   override fun onCreate() {
     super.onCreate()
     readinessStore = T3VoiceReadinessStore(applicationContext)
