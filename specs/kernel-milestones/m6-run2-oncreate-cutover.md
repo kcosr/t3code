@@ -1,0 +1,82 @@
+# M6 Run 2 — onCreate Cutover + Choreography Deletion
+
+Second M6 run; requires run 1 landed (recover(), loader shape, resolveWithFallback, and
+the full fixture matrix all green with onCreate untouched). Binding inventory:
+`specs/kernel-milestones/m6-seam-map.md` §1/§6/§7. Scope: cut the live startup path over
+to loader → `recover()` → host sequence → effect execution, then DELETE the inline
+choreography. The fixture matrix from run 1 pins behavior across the cutover.
+
+## The cutover (host sequence per run-1 ruling R-2)
+
+`onCreate` becomes, in order:
+
+1. Construct stores + repos (unchanged — these are loader inputs).
+2. LOADER: assemble `LoadedState` (all 13 sources, seam map §2) + Permissions snapshot;
+   `LegacyRealtimeCutover.migrate` runs here in its current shape (loader-side).
+3. `val plan = recover(loadedState, permissions, clock)`.
+4. `deviceIdentity.getOrCreate(plan.installedRuntimeId)` (durable write, host).
+5. Construct `voiceRuntimeController` from plan identity data (the existing ~1719-1794
+   execution-closure block moves intact — it is host wiring, not decision logic).
+6. Cue settings from plan; `createHostDriver()`; notification channel (unchanged host).
+7. Kernel-thread block (`submitAndAwait("service-create-recovery")`): construct
+   mediaDriver (unchanged), then EXECUTE `plan.effects` in emitted order via a single
+   effect-interpreter `when` — each effect maps to the existing method per seam map §4
+   (configure authority, engine-slot recovered/canonical install, thread-op writes,
+   revoke sequence, restoreCompleted calls, sweepStaleCache, setServiceReady,
+   startRuntimeThreadLocked, restoreProcess, storeDriver clears with driverEpoch() at
+   execution, diagnostics).
+
+## Deletions (only after the cutover compiles against the interpreter)
+
+- The inline decision choreography inside `onCreate` (the ~388-line body's steps 2-16,
+  18, and the kernel block's decision content of steps 21-26 — everything recover() now
+  owns), and the two helpers `reconcilePersistedThreadOperationLocked` +
+  `revokePersistedThreadOperationLocked` (their decision halves live in recover(); their
+  effect halves live in the interpreter).
+- The now-uncalled inline scenario-5 fallback (superseded by resolveWithFallback).
+- Nothing else. Methods the interpreter calls (restoreCanonicalAuthorityLocked,
+  installRecoveredRealtimeStateLocked, installRealtimeEngineLocked,
+  recoverRealtimeEngineLocked, startRuntimeThreadLocked, etc.) STAY — they are effect
+  executors, not choreography.
+
+## Behavior invariants (the fixture matrix pins these; the cutover must not move them)
+
+- All ordering invariants of seam map §7 (restore-before-sweep; ready-before-start;
+  configure-before-installs/reconcile; recovered-install precedence; retire-fence before
+  fence assembly — the latter is now loader-ordering).
+- Failure semantics preserved verbatim: every runCatching + diagnostic on corrupt
+  finalization/checkpoint/prepared-authority; readiness-reconcile failure → clear
+  authority + disable + canonicalInstalled=null; cutover failure → reset snapshot + diag;
+  authority Locked → non-capturing convergence. These live in recover()/loader per run 1;
+  the cutover may not add or drop any.
+- Foreground posture: still NOT touched by recovery (downstream only). If the cutover
+  causes any startForeground on the startup path, that is a defect.
+- `onStartCommand`/`onDestroy`/`onBind` untouched.
+
+## Tests
+
+- Run 1's fixture matrix must pass UNCHANGED — it is the cutover's safety net; any
+  fixture edit in this run is a finding unless it adds assertions.
+- Existing instrumented tests (`T3VoiceRuntimeServiceInstrumentedTest`) must still
+  compile and their scenarios remain valid (they drive onCreate implicitly via service
+  start — the recovery outcome must be observably identical).
+- Add one interpreter test if expressible without Robolectric: a synthetic plan with all
+  effect kinds asserts the interpreter dispatches each to the right method-shape (via a
+  seam/fake if one exists cheaply; if not feasible without a harness, record why in run
+  notes — do not fake it with a hollow stub).
+- No test weakening anywhere.
+
+## Forbidden
+
+- No package moves (M7).
+- No changes to recover()'s decisions — if the cutover exposes a divergence between the
+  old inline behavior and recover()'s plan, STOP and surface it (that is a run-1 defect
+  to fix THERE, with a fixture, not something to absorb in the interpreter).
+- No new decision logic in the service — the interpreter is a dumb dispatch table.
+
+## Done criteria
+
+- onCreate = stores + loader + recover + host sequence + interpreter (~15-line core);
+  inline choreography and both helpers deleted (service ~6033 → ~5650 per seam map §6);
+  fixture matrix + all suites green; both source sets compile;
+  `pnpm run typecheck`, `pnpm run lint:mobile` green; tree clean.
