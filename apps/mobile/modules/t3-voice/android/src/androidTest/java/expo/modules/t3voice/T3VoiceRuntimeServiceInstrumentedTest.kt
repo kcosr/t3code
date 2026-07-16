@@ -1,5 +1,9 @@
 package expo.modules.t3voice
 
+import expo.modules.t3voice.kernel.T3VoiceRuntimePhase
+import expo.modules.t3voice.kernel.T3VoiceStateStore
+import expo.modules.t3voice.media.T3VoiceEndpointDetectionConfig
+
 import android.Manifest
 import android.content.ComponentName
 import android.content.Context

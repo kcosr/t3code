@@ -1,5 +1,22 @@
 package expo.modules.t3voice
 
+import expo.modules.t3voice.kernel.T3VoiceOperationOwner
+import expo.modules.t3voice.kernel.T3VoiceOperationOwnerDomain
+import expo.modules.t3voice.kernel.T3VoiceRuntimePhase
+import expo.modules.t3voice.kernel.VoiceRealtimePhase
+import expo.modules.t3voice.kernel.VoiceRuntimeIdentity
+import expo.modules.t3voice.kernel.VoiceRuntimeRealtimeCheckpoint
+import expo.modules.t3voice.kernel.VoiceRuntimeRealtimeFence
+import expo.modules.t3voice.kernel.VoiceRuntimeRealtimeFinalization
+import expo.modules.t3voice.kernel.VoiceRuntimeRealtimeFinalizationStage
+import expo.modules.t3voice.kernel.VoiceRuntimeRealtimeTerminalOutcome
+import expo.modules.t3voice.kernel.VoiceRuntimeTarget
+import expo.modules.t3voice.kernel.VoiceRuntimeThreadAttempt
+import expo.modules.t3voice.kernel.VoiceRuntimeThreadAuthority
+import expo.modules.t3voice.kernel.recover
+import expo.modules.t3voice.net.VoiceRuntimeRealtimeSessionState
+import expo.modules.t3voice.net.VoiceRuntimeRealtimeStartResult
+
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
