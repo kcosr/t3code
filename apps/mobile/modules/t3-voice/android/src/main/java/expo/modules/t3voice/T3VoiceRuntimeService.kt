@@ -1730,221 +1730,12 @@ class T3VoiceRuntimeService : Service() {
     runtimeThreadOperationStore = VoiceRuntimeThreadOperationStore(applicationContext)
     voiceRuntimeAuthorityStore = VoiceRuntimeAuthorityStore(applicationContext)
     voiceRuntimeSessionCredentialStore = VoiceRuntimeSessionCredentialStore(applicationContext)
-    val retiredAuthorityFence = voiceRuntimeAuthorityStore.retireLegacyV2()
-    if (retiredAuthorityFence != null) {
-      storeDriver.persist("legacy-retirement-clear-session-credential", driverEpoch(), body = {
-        voiceRuntimeSessionCredentialStore.clear()
-      })
-    }
     voiceRuntimeRealtimeRepository =
       VoiceRuntimeDurableRealtimeCheckpointRepository(applicationContext)
-    runtimeSnapshot = runtimeSnapshotStore.read()
-    runCatching {
-      VoiceRuntimeLegacyRealtimeCutover(
-        runtimeSnapshotStore,
-        VoiceRuntimeRealtimeCleanupStore(applicationContext),
-      ).migrate(runtimeSnapshot)
-    }.onSuccess { cutover ->
-      runtimeSnapshot = cutover.snapshot
-      if (cutover.migrated) {
-        T3VoiceDiagnostics.record(
-          0,
-          T3VoiceDiagnosticCategory.TERMINAL,
-          T3VoiceDiagnosticCode.LEGACY_REALTIME_RETIRED,
-        )
-      }
-    }.onFailure {
-      // The retired owner remains unavailable even if its local tombstone cannot be cleared.
-      runtimeSnapshot = VoiceRuntimeExecutionSnapshot()
-      T3VoiceDiagnostics.record(
-        0,
-        T3VoiceDiagnosticCategory.TERMINAL,
-        T3VoiceDiagnosticCode.CLEANUP_RECONCILIATION_REQUIRED,
-      )
-    }
-    readinessConfig =
-      readinessStore.read().copy(
-        microphonePermissionGranted = hasPermission(Manifest.permission.RECORD_AUDIO),
-        notificationPermissionGranted =
-          Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-            hasPermission(Manifest.permission.POST_NOTIFICATIONS),
-      )
-    val startupAttachedPreparationResult = runCatching {
-      voiceRuntimeAuthorityStore.inspectPreparedAttachedAuthority()
-    }
-    var startupAttachedPreparation = startupAttachedPreparationResult.getOrNull()
-    var canonicalInstalled = voiceRuntimeAuthorityStore.load()
-      as? VoiceRuntimeAuthorityLoadResult.Available
-    val startupFinalization = runCatching {
-      voiceRuntimeRealtimeRepository.loadFinalization()
-    }.onFailure {
-      T3VoiceDiagnostics.record(
-        0,
-        T3VoiceDiagnosticCategory.TERMINAL,
-        T3VoiceDiagnosticCode.CLEANUP_RECONCILIATION_REQUIRED,
-      )
-    }.getOrNull()
-    val startupRealtimeCheckpoint = runCatching {
-      voiceRuntimeRealtimeRepository.load()
-    }.onFailure {
-      T3VoiceDiagnostics.record(
-        0,
-        T3VoiceDiagnosticCategory.TERMINAL,
-        T3VoiceDiagnosticCode.CLEANUP_RECONCILIATION_REQUIRED,
-      )
-    }.getOrNull()
-    canonicalInstalled?.authority?.let { canonical ->
-      val reconciled = runCatching {
-        if (!canonical.readinessEnabled) {
-          val aligned = T3VoiceCanonicalReadinessPolicy.transient(readinessConfig, canonical)
-          readinessStore.write(aligned)
-          readinessConfig = verifyReadiness(aligned)
-        } else {
-          when (val decision = VoiceRuntimeCommittedReadinessPolicy.reconcile(
-              canonical,
-              readinessStore.prepared(),
-              readinessStore.activeAuthority(),
-            )) {
-            VoiceRuntimeCommittedReadinessDecision.NotRequired ->
-              error("Persistent readiness reconciliation was not required.")
-            is VoiceRuntimeCommittedReadinessDecision.Current ->
-              readinessConfig = verifyReadiness(decision.authority.config)
-            is VoiceRuntimeCommittedReadinessDecision.Promote -> {
-              readinessStore.writeActivated(decision.authority.config, decision.authority)
-              readinessConfig = verifyReadiness(decision.authority.config)
-            }
-            VoiceRuntimeCommittedReadinessDecision.Mismatch ->
-              error("Canonical authority and readiness state do not match.")
-          }
-        }
-      }.isSuccess
-      if (!reconciled) {
-        storeDriver.persist("startup-reconciliation-clear-authority", driverEpoch(), body = {
-          voiceRuntimeAuthorityStore.clear()
-        })
-        runCatching { readinessStore.write(readinessConfig.copy(enabled = false)) }
-        readinessConfig = readinessConfig.copy(enabled = false)
-        canonicalInstalled = null
-      }
-    }
-    val startupPersistentReadinessResult =
-      if (canonicalInstalled == null) runCatching { readinessStore.prepared() }
-      else Result.success(null)
-    val startupPersistentReadiness = startupPersistentReadinessResult.getOrNull()
-    val startupPersistentPreparationResult =
-      if (canonicalInstalled == null) {
-        runCatching {
-          T3VoiceStartupAuthorityFencePolicy.persistentPreparation(
-            startupPersistentReadiness,
-          )
-        }
-      } else {
-        Result.success(null)
-      }
-    val startupActiveAuthorityResult = runCatching { readinessStore.activeAuthority() }
-    val startupActiveAuthority = startupActiveAuthorityResult.getOrNull()
-    val recoveredFences = arrayOf(
-      startupFinalization?.fence?.identity?.let {
-        T3VoiceRecoveredAuthorityFence(it.runtimeId, it.generation)
-      },
-      startupRealtimeCheckpoint?.fence?.identity?.let {
-        T3VoiceRecoveredAuthorityFence(it.runtimeId, it.generation)
-      },
-      retiredAuthorityFence?.let {
-        T3VoiceRecoveredAuthorityFence(it.runtimeId, it.generation)
-      },
-      startupActiveAuthority?.let {
-        T3VoiceRecoveredAuthorityFence(it.runtimeId, it.config.generation)
-      },
-    )
-    val preparationSelection = startupPersistentPreparationResult.mapCatching { persistent ->
-      check(startupPersistentReadinessResult.isSuccess)
-      check(startupAttachedPreparationResult.isSuccess)
-      check(startupActiveAuthorityResult.isSuccess)
-      T3VoiceStartupAuthorityFencePolicy.selectPreparation(
-        persistent,
-        startupAttachedPreparation?.takeIf { canonicalInstalled == null },
-      )
-    }
-    var startupResolution = preparationSelection.fold(
-      onSuccess = { preparation ->
-        T3VoiceStartupAuthorityFencePolicy.resolve(preparation, *recoveredFences)
-      },
-      onFailure = {
-        val recoveredRuntimeId = recoveredFences.filterNotNull().firstOrNull()?.runtimeId
-        val preparationRuntimeId = runCatching {
-          T3VoiceStartupAuthorityFencePolicy.selectRuntimeId(
-            startupPersistentReadiness?.runtimeId,
-            startupAttachedPreparation?.fence?.runtimeId,
-          )
-        }.getOrNull()
-        val selectedRuntimeId = recoveredRuntimeId ?: preparationRuntimeId
-        val recoveredGeneration = recoveredFences.asSequence()
-          .filterNotNull()
-          .filter { it.runtimeId == selectedRuntimeId }
-          .maxOfOrNull { it.generation }
-        val preparationGeneration = sequenceOf(
-          startupPersistentReadiness?.let { it.runtimeId to it.config.generation },
-          startupAttachedPreparation?.fence?.let { it.runtimeId to it.generation },
-        ).filterNotNull()
-          .filter { it.first == selectedRuntimeId }
-          .maxOfOrNull { it.second }
-        T3VoiceStartupAuthorityResolution(
-          preparation = null,
-          runtimeId = selectedRuntimeId,
-          initialGeneration = recoveredGeneration ?: preparationGeneration,
-          discardPreparation = canonicalInstalled == null && (
-            startupPersistentReadinessResult.isFailure ||
-              startupAttachedPreparationResult.isFailure || startupPersistentReadiness != null ||
-              startupActiveAuthorityResult.isFailure ||
-              startupAttachedPreparation != null
-          ),
-        )
-      },
-    )
-    if (startupResolution.discardPreparation) {
-      val readinessRuntimeIds = listOfNotNull(
-        startupActiveAuthority?.runtimeId,
-        startupPersistentReadiness?.runtimeId,
-        startupAttachedPreparation?.fence?.runtimeId,
-      )
-      val readinessGeneration = readinessConfig.generation.takeIf {
-        startupResolution.runtimeId == null ||
-          readinessRuntimeIds.any { runtimeId -> runtimeId == startupResolution.runtimeId }
-      }
-      val generationFloor = maxOf(
-        startupResolution.initialGeneration ?: 0,
-        readinessGeneration ?: 0,
-      )
-      val pendingRevocation = startupPersistentReadiness?.let {
-        T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin)
-      } ?: startupAttachedPreparation?.let {
-        T3VoicePendingRuntimeRevocation(it.fence.runtimeId, it.fence.environmentOrigin)
-      }
-      val disabled = readinessConfig.copy(enabled = false, generation = generationFloor)
-      readinessStore.writeDisabledForRuntimeRevocation(disabled, pendingRevocation)
-      voiceRuntimeAuthorityStore.discardInitialPreparation()
-      readinessConfig = disabled
-      startupAttachedPreparation = null
-      T3VoiceDiagnostics.record(
-        0,
-        T3VoiceDiagnosticCategory.TERMINAL,
-        T3VoiceDiagnosticCode.CLEANUP_RECONCILIATION_REQUIRED,
-      )
-      startupResolution = startupResolution.copy(
-        preparation = null,
-        initialGeneration = generationFloor,
-      )
-    }
-    val installedRuntimeId = T3VoiceRecoveredRealtimeAuthorityPolicy.runtimeId(
-      canonicalInstalled?.authority,
-      startupFinalization,
-      startupRealtimeCheckpoint,
-      retiredAuthorityFence,
-      startupActiveAuthority,
-    ) ?: startupResolution.runtimeId
+    val (loadedState, permissions) = loadRecoveryState()
+    val plan = recover(loadedState, permissions, Clock(System::currentTimeMillis))
     val canonicalRuntimeId = VoiceRuntimeDeviceIdentityStore(applicationContext)
-      .getOrCreate(installedRuntimeId)
+      .getOrCreate(plan.installedRuntimeId)
     voiceRuntimeController = VoiceRuntimeActiveThreadController(
       runtimeId = canonicalRuntimeId,
       runtimeInstanceId = UUID.randomUUID().toString(),
@@ -2046,26 +1837,9 @@ class T3VoiceRuntimeService : Service() {
           cursor.sequence,
         ))
       },
-      initialGeneration = when {
-        canonicalInstalled != null -> null
-        else -> startupResolution.initialGeneration
-      },
+      initialGeneration = plan.initialGeneration,
     )
-    startupAttachedPreparation?.takeIf { canonicalInstalled == null }?.let { prepared ->
-      val config = verifyReadiness(prepared.readiness)
-      readinessStore.write(config)
-      readinessConfig = config
-      canonicalPreparedAuthority = T3VoicePreparedReadiness(
-        config,
-        prepared.fence.runtimeId,
-        prepared.fence.environmentOrigin,
-        prepared.fence.target.grantOperation(),
-        prepared.fence.targetDigest,
-      )
-    }
-    cueSettings = cueSettingsStore.read()
-    hostDriver = createHostDriver()
-    createNotificationChannel()
+    configureRecoveryHost(plan)
     mailbox.submitAndAwait(callbackMessage("service-create-recovery")) {
       mediaDriver = VoiceMediaDriver(
         listener = VoiceMediaDriverListener { epoch, event ->
@@ -2083,32 +1857,7 @@ class T3VoiceRuntimeService : Service() {
         },
         factory = AndroidVoiceMediaDriverFactory(applicationContext),
       )
-      val canonicalRestored =
-        canonicalInstalled?.authority?.let(::restoreCanonicalAuthorityLocked) == true
-      if (!installRecoveredRealtimeStateLocked() && canonicalRestored) {
-        canonicalInstalled?.authority?.let(::installRealtimeEngineLocked)
-      }
-      val loadedThreadOperation = runtimeThreadOperationStore.load()
-      if (!VoiceRuntimeThreadRecordingRecovery.restore(
-        loadedThreadOperation,
-        recorder::restoreCompleted,
-      )) {
-      val active = (loadedThreadOperation as? VoiceRuntimeThreadOperationLoadResult.Available)
-        ?.state as? VoiceRuntimeThreadOperationState.Active
-      if (active != null) {
-        runtimeThreadOperationStore.writeActive(
-          active.copy(recording = null, detached = true, cancelRequested = true),
-        )
-      }
-    }
-      restoreBridgeRecordingCompletions(
-        recorder::restoreCompleted,
-        recorder::sweepStaleCache,
-      )
-      T3VoiceStateStore.setServiceReady()
-      if (reconcilePersistedThreadOperationLocked()) {
-        startRuntimeThreadLocked()
-      }
+      executeRecoveryPlanLocked(plan)
     }
   }
 
