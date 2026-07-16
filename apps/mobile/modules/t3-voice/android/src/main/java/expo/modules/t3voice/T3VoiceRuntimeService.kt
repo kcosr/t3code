@@ -1605,8 +1605,11 @@ class T3VoiceRuntimeService : Service() {
       restoreCanonicalAuthorityLocked(effect.authority)
     is VoiceRuntimeRecoveryEffect.InstallRealtime -> {
       when (val install = effect.plan) {
-        is VoiceRuntimeRealtimeInstallPlan.Recovered ->
-          installRecoveredRealtimeStateLocked()
+        is VoiceRuntimeRealtimeInstallPlan.Recovered -> {
+          if (!installRecoveredRealtimeStateLocked() && canonicalConfigured) {
+            canonicalRealtimeAuthorityLocked()?.let(::installRealtimeEngineLocked)
+          }
+        }
         is VoiceRuntimeRealtimeInstallPlan.Canonical ->
           if (canonicalConfigured) installRealtimeEngineLocked(install.authority) else Unit
         VoiceRuntimeRealtimeInstallPlan.None -> Unit
@@ -1722,6 +1725,115 @@ class T3VoiceRuntimeService : Service() {
     }
   }
 
+  private fun createRecoveryController(
+    canonicalRuntimeId: String,
+    initialGeneration: Long?,
+  ) {
+    voiceRuntimeController = VoiceRuntimeActiveThreadController(
+        runtimeId = canonicalRuntimeId,
+        runtimeInstanceId = UUID.randomUUID().toString(),
+        now = System::currentTimeMillis,
+        installedAuthority = ::installedCanonicalAuthorityLocked,
+        execution = object : VoiceRuntimeThreadExecution {
+          override fun start(
+            modeSessionId: String,
+            turnClientOperationId: String,
+            submissionPolicy: String,
+            draftContext: VoiceRuntimeDraftContext?,
+          ): Boolean {
+            startRuntimeThreadLocked(
+              turnClientOperationId,
+              modeSessionId,
+              submissionPolicy,
+              draftContext,
+              detachedThreadContinuationAdmission,
+            )
+            return runtimeThreadAttempt?.clientOperationId == turnClientOperationId
+          }
+
+          override fun finish(outcome: String, draftContext: VoiceRuntimeDraftContext?): Boolean {
+            val attempt = runtimeThreadAttempt ?: return false
+            val owner = recordingOwner?.takeIf {
+              it.domain == T3VoiceOperationOwnerDomain.THREAD_MODE &&
+                attempt.operationId == it.operationId
+            } ?: return false
+            if (outcome == "finish-and-submit") {
+              if (attempt.submissionPolicy != "auto-submit" || draftContext != null) return false
+              return runCatching { recorder.stop(owner.id) }.isSuccess
+            }
+            if (outcome != "finish-to-draft" || attempt.submissionPolicy != "auto-submit") return false
+            val context = draftContext ?: return false
+            val persisted = runtimeThreadOperationStore.prepareDraftDisposition(
+              attempt.clientOperationId,
+              context,
+            ) as? VoiceRuntimeThreadOperationUpdateResult.Updated ?: return false
+            attempt.submissionPolicy = persisted.state.claim.submissionPolicy
+            attempt.draftContext = persisted.state.claim.draftContext
+            attempt.draftDispositionPending = true
+            val stopped = runCatching { recorder.stop(owner.id) }.isSuccess
+            if (!stopped) return false
+            requestRuntimeThreadDraftDisposition(attempt)
+            return true
+          }
+
+          override fun cancel(): Boolean {
+            if (runtimeThreadAttempt == null) return false
+            stopRuntimeThreadLocked(cancelServer = true)
+            return true
+          }
+
+          override fun stop(policy: String): Boolean {
+            if (runtimeThreadAttempt == null) return false
+            when (policy) {
+              "immediate" -> stopRuntimeThreadLocked(cancelServer = true)
+              "drain", "pause-after-turn" -> pauseRuntimeThreadAfterTurnLocked()
+              else -> return false
+            }
+            return true
+          }
+
+          override fun acknowledgeDraft(artifactId: String, outcome: String): Boolean {
+            val attempt = runtimeThreadAttempt ?: return false
+            val operationId = attempt.operationId ?: return false
+            if (artifactId != "draft-$operationId") return false
+            if (outcome == "discarded") {
+              stopRuntimeThreadLocked(cancelServer = true)
+              return true
+            }
+            if (outcome != "appended") return false
+            val persisted = runtimeThreadOperationStore.updateActive(attempt.clientOperationId) {
+              it.copy(draftConsumePending = true)
+            }
+            if (persisted !is VoiceRuntimeThreadOperationUpdateResult.Updated) return false
+            attempt.draftConsumePending = true
+            consumeRuntimeThreadDraft(attempt)
+            return true
+          }
+        },
+        drafts = VoiceRuntimeDurableDraftRepository(applicationContext),
+        retained = VoiceRuntimeDurableJournalRepository(applicationContext),
+        realtimeTerminals = voiceRuntimeRealtimeRepository::terminals,
+        realtimeTerminalAcknowledgement = { key ->
+          val acknowledged = voiceRuntimeRealtimeRepository.acknowledgeTerminal(key)
+          voiceRuntimeRealtimeEngine?.let { engine ->
+            applyRealtimeReduction(
+              engine,
+              engine.acknowledgeTerminal(realtimeState(engine), key, acknowledged),
+            )
+          } ?: acknowledged
+        },
+        onJournalChanged = { cursor ->
+          T3VoiceStateStore.emit(T3VoiceRuntimeEvent.VoiceRuntimeWake(
+            cursor.runtimeId,
+            cursor.runtimeInstanceId,
+            cursor.generation,
+            cursor.sequence,
+          ))
+        },
+        initialGeneration = initialGeneration,
+    )
+  }
+
   override fun onCreate() {
     super.onCreate()
     readinessStore = T3VoiceReadinessStore(applicationContext)
@@ -1736,109 +1848,7 @@ class T3VoiceRuntimeService : Service() {
     val plan = recover(loadedState, permissions, Clock(System::currentTimeMillis))
     val canonicalRuntimeId = VoiceRuntimeDeviceIdentityStore(applicationContext)
       .getOrCreate(plan.installedRuntimeId)
-    voiceRuntimeController = VoiceRuntimeActiveThreadController(
-      runtimeId = canonicalRuntimeId,
-      runtimeInstanceId = UUID.randomUUID().toString(),
-      now = System::currentTimeMillis,
-      installedAuthority = ::installedCanonicalAuthorityLocked,
-      execution = object : VoiceRuntimeThreadExecution {
-        override fun start(
-          modeSessionId: String,
-          turnClientOperationId: String,
-          submissionPolicy: String,
-          draftContext: VoiceRuntimeDraftContext?,
-        ): Boolean {
-          startRuntimeThreadLocked(
-            turnClientOperationId,
-            modeSessionId,
-            submissionPolicy,
-            draftContext,
-            detachedThreadContinuationAdmission,
-          )
-          return runtimeThreadAttempt?.clientOperationId == turnClientOperationId
-        }
-
-        override fun finish(outcome: String, draftContext: VoiceRuntimeDraftContext?): Boolean {
-          val attempt = runtimeThreadAttempt ?: return false
-          val owner = recordingOwner?.takeIf {
-            it.domain == T3VoiceOperationOwnerDomain.THREAD_MODE &&
-              attempt.operationId == it.operationId
-          } ?: return false
-          if (outcome == "finish-and-submit") {
-            if (attempt.submissionPolicy != "auto-submit" || draftContext != null) return false
-            return runCatching { recorder.stop(owner.id) }.isSuccess
-          }
-          if (outcome != "finish-to-draft" || attempt.submissionPolicy != "auto-submit") return false
-          val context = draftContext ?: return false
-          val persisted = runtimeThreadOperationStore.prepareDraftDisposition(
-            attempt.clientOperationId,
-            context,
-          ) as? VoiceRuntimeThreadOperationUpdateResult.Updated ?: return false
-          attempt.submissionPolicy = persisted.state.claim.submissionPolicy
-          attempt.draftContext = persisted.state.claim.draftContext
-          attempt.draftDispositionPending = true
-          val stopped = runCatching { recorder.stop(owner.id) }.isSuccess
-          if (!stopped) return false
-          requestRuntimeThreadDraftDisposition(attempt)
-          return true
-        }
-
-        override fun cancel(): Boolean {
-          if (runtimeThreadAttempt == null) return false
-          stopRuntimeThreadLocked(cancelServer = true)
-          return true
-        }
-
-        override fun stop(policy: String): Boolean {
-          if (runtimeThreadAttempt == null) return false
-          when (policy) {
-            "immediate" -> stopRuntimeThreadLocked(cancelServer = true)
-            "drain", "pause-after-turn" -> pauseRuntimeThreadAfterTurnLocked()
-            else -> return false
-          }
-          return true
-        }
-
-        override fun acknowledgeDraft(artifactId: String, outcome: String): Boolean {
-          val attempt = runtimeThreadAttempt ?: return false
-          val operationId = attempt.operationId ?: return false
-          if (artifactId != "draft-$operationId") return false
-          if (outcome == "discarded") {
-            stopRuntimeThreadLocked(cancelServer = true)
-            return true
-          }
-          if (outcome != "appended") return false
-          val persisted = runtimeThreadOperationStore.updateActive(attempt.clientOperationId) {
-            it.copy(draftConsumePending = true)
-          }
-          if (persisted !is VoiceRuntimeThreadOperationUpdateResult.Updated) return false
-          attempt.draftConsumePending = true
-          consumeRuntimeThreadDraft(attempt)
-          return true
-        }
-      },
-      drafts = VoiceRuntimeDurableDraftRepository(applicationContext),
-      retained = VoiceRuntimeDurableJournalRepository(applicationContext),
-      realtimeTerminals = voiceRuntimeRealtimeRepository::terminals,
-      realtimeTerminalAcknowledgement = { key ->
-        val acknowledged = voiceRuntimeRealtimeRepository.acknowledgeTerminal(key)
-        voiceRuntimeRealtimeEngine?.let { engine ->
-          applyRealtimeReduction(
-            engine,
-            engine.acknowledgeTerminal(realtimeState(engine), key, acknowledged),
-          )
-        } ?: acknowledged
-      },
-      onJournalChanged = { cursor ->
-        T3VoiceStateStore.emit(T3VoiceRuntimeEvent.VoiceRuntimeWake(
-          cursor.runtimeId,
-          cursor.runtimeInstanceId,
-          cursor.generation,
-          cursor.sequence,
-        ))
-      },
-      initialGeneration = plan.initialGeneration,
-    )
+    createRecoveryController(canonicalRuntimeId, plan.initialGeneration)
     configureRecoveryHost(plan)
     mailbox.submitAndAwait(callbackMessage("service-create-recovery")) {
       mediaDriver = VoiceMediaDriver(
@@ -1860,94 +1870,6 @@ class T3VoiceRuntimeService : Service() {
       executeRecoveryPlanLocked(plan)
     }
   }
-
-  private fun reconcilePersistedThreadOperationLocked(): Boolean {
-    val loaded = runtimeThreadOperationStore.load()
-    val now = System.currentTimeMillis()
-    val grant = persistedAuthority()
-    val preparedClaim = ((loaded as? VoiceRuntimeThreadOperationLoadResult.Available)?.state
-      as? VoiceRuntimeThreadOperationState.Prepared)?.claim
-    val parentGrantAvailable =
-      preparedClaim != null &&
-        grant?.let { persisted ->
-          val target = persisted.target as? VoiceRuntimeTarget.Thread
-          target != null && persisted.runtimeId == preparedClaim.runtimeId &&
-            persisted.generation == preparedClaim.readinessGeneration &&
-            persisted.environmentOrigin == preparedClaim.environmentOrigin &&
-            target.projectId == preparedClaim.projectId && target.threadId == preparedClaim.threadId
-        } == true
-    when (VoiceRuntimeThreadStoredStatePolicy.decide(
-      loaded,
-      parentGrantAvailable,
-      now,
-    )) {
-      VoiceRuntimeThreadStoredStateDecision.NONE -> return false
-      VoiceRuntimeThreadStoredStateDecision.RESTORE -> return true
-      VoiceRuntimeThreadStoredStateDecision.CANCEL_PREPARED -> {
-        val prepared = (loaded as VoiceRuntimeThreadOperationLoadResult.Available)
-          .state as VoiceRuntimeThreadOperationState.Prepared
-        runtimeThreadOperationStore.writePrepared(
-          prepared.claim,
-          cancelRequested = true,
-        )
-        return true
-      }
-      VoiceRuntimeThreadStoredStateDecision.CANCEL_UNDISPATCHED -> {
-        val active = (loaded as VoiceRuntimeThreadOperationLoadResult.Available)
-          .state as VoiceRuntimeThreadOperationState.Active
-        runtimeThreadOperationStore.writeActive(
-          active.copy(detached = true, cancelRequested = true),
-        )
-        return true
-      }
-      VoiceRuntimeThreadStoredStateDecision.REVOKE -> Unit
-    }
-    revokePersistedThreadOperationLocked(loaded, grant)
-    return false
-  }
-
-  private fun revokePersistedThreadOperationLocked(
-    loaded: VoiceRuntimeThreadOperationLoadResult,
-    grant: VoiceRuntimePersistedAuthority?,
-  ) {
-    T3VoiceDiagnostics.record(
-      0,
-      T3VoiceDiagnosticCategory.TERMINAL,
-      T3VoiceDiagnosticCode.THREAD_RECONCILIATION_REQUIRED,
-    )
-    val pending = readinessStore.pendingRuntimeRevocation() ?: when (loaded) {
-      is VoiceRuntimeThreadOperationLoadResult.Available ->
-        T3VoicePendingRuntimeRevocation(
-          loaded.state.claim.runtimeId,
-          loaded.state.claim.environmentOrigin,
-        )
-      VoiceRuntimeThreadOperationLoadResult.Locked ->
-        readinessStore.activeAuthority()?.let {
-          T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin)
-        } ?: grant?.let {
-          T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin)
-        }
-      VoiceRuntimeThreadOperationLoadResult.Missing -> null
-    }
-    if (pending != null) {
-      val disabled = T3VoiceCanonicalReadinessPolicy.disabled(
-        readinessConfig,
-        voiceRuntimeController.snapshot().identity.generation,
-      )
-      readinessStore.writeDisabledForRuntimeRevocation(disabled, pending)
-      readinessConfig = disabled
-      canonicalPreparedAuthority = null
-      storeDriver.persist("revoke-thread-operation-clear-authority", driverEpoch(), body = {
-        voiceRuntimeAuthorityStore.clear()
-      })
-      controllerCommands.invalidateReadiness()
-    } else if (loaded == VoiceRuntimeThreadOperationLoadResult.Locked) {
-      runtimeThreadOperationStore.clearLockedAfterAuthorityRevocation()
-      runtimeSnapshotStore.clear()
-      runtimeSnapshot = VoiceRuntimeExecutionSnapshot()
-    }
-  }
-
   override fun onBind(intent: Intent?): IBinder {
     return binder
   }
@@ -2268,7 +2190,7 @@ class T3VoiceRuntimeService : Service() {
             )
           }
           if (restored == null) {
-            revokePersistedThreadOperationLocked(persisted, null)
+            executeThreadOperationRevocationLocked(persisted, null)
             return
           }
           restored
@@ -2371,7 +2293,7 @@ class T3VoiceRuntimeService : Service() {
             candidate.selectedProjectId == claim.projectId &&
             candidate.selectedThreadId == claim.threadId
         } ?: run {
-          revokePersistedThreadOperationLocked(persisted, null)
+          executeThreadOperationRevocationLocked(persisted, null)
           return
         }
       } else {
