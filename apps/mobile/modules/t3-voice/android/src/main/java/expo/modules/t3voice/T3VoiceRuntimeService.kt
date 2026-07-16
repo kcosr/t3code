@@ -4170,9 +4170,20 @@ class T3VoiceRuntimeService : Service() {
         netDriver.execute("realtime-peer-prepare", VoiceNetLane.REALTIME, driverEpoch(), blockingBody = {
           val accepted = realtimePeerPort(peerEpoch).prepare(
             effect.fence.modeSessionId,
-            { offer -> submitCallback {
-              apply(engine.onPeerOffer(realtimeState(engine), effect.fence, effect.sessionId, offer))
-            } },
+            { offer ->
+              VoiceDbg.t("offerCallback.invoked sdpLen=${offer.length}")
+              submitCallback {
+                VoiceDbg.t("offerCallback.body running")
+                val red = try {
+                  engine.onPeerOffer(realtimeState(engine), effect.fence, effect.sessionId, offer)
+                } catch (t: Throwable) {
+                  VoiceDbg.t("onPeerOffer THREW: $t")
+                  throw t
+                }
+                VoiceDbg.t("onPeerOffer -> effects=${red.effects.size}")
+                apply(red)
+              }
+            },
             { code -> submitCallback {
               apply(engine.onPeerTerminated(
                 realtimeState(engine), effect.fence, effect.sessionId, code,

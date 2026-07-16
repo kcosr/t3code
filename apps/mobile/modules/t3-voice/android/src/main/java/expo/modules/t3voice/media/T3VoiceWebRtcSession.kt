@@ -530,6 +530,7 @@ internal class T3VoiceWebRtcSession(
         }
       }
     if (result != null) {
+      android.util.Log.i("T3VoiceDbg","maybeDeliverOffer DELIVER callbackNull=" + (result.first == null))
       onStateChanged(
         sessionId,
         STATE_OFFER_READY,
@@ -537,6 +538,8 @@ internal class T3VoiceWebRtcSession(
         result.third.inputReady,
       )
       result.first?.onSuccess(result.second)
+    } else {
+      android.util.Log.i("T3VoiceDbg","maybeDeliverOffer result=null (gate or blank desc)")
     }
   }
 
