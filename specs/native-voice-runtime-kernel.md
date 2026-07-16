@@ -469,7 +469,8 @@ has **dead reachability in production** today. Audit results:
 - **Delete**: everything listed under Evidence, plus `executeRealtimeHandoff` and
   `completionLock` (dead code), the interrupt lane, and the sticky termination StateFlows.
 
-Net: ~36 functions (from 64), ~6 events (from 11). `nativeRevision` stays an equality gate
+Net: 43 functions (from the 61 live post-W0a), 6 events (from 11) — per the M5 deviation
+above, the two notice groups' functions/event stay. `nativeRevision` stays an equality gate
 through the cutover (the ownership spec forbids dual shapes during migration) and becomes a
 minimum-compatible check in the release after the surface stabilizes.
 

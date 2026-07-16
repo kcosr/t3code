@@ -13,9 +13,16 @@ seed is UNTOUCHED; only its Kotlin reachability dies.
 - F6: the D6 blocking-verify belongs to run 1 (retargeted to `publishThreadVoiceHandoff`
   producers) and was moved there with the whole handoff chain. This run's list is the
   seam-map §1e table MINUS the five handoff functions and the `threadVoiceHandoff` event.
-- L4: handoff readers of the composer slot were resolved in run 1 — nothing
-  handoff-related remains for this run. If any handoff symbol still exists at this run's
-  base, STOP: run 1 did not complete its scope.
+- L4: handoff readers of the composer slot were resolved in run 1. EXPECTED SURVIVORS
+  at this run's base (re-verdict R2-A — do NOT treat as a run-1 failure): the vestigial
+  fields `handoffInProgress`, `awaitingHandoffAction`, `handoffEligibleSessionId`,
+  `handoffEnvironmentOrigin` and helper `clearHandoffEligibilityLocked`. THIS run
+  disposes of them: once the realtime binders die they have zero real writers — delete
+  the four fields + the helper and simplify the constant-false/null conditions at their
+  read sites (svc:424/:1592/:1612/:1645/:1671 old anchors — relocate by symbol).
+  Semantics-preserving on Android: arm was ui-attached-only (died in run 1) and prepare
+  dies here, so the fields are never true/non-null in autonomous production today. Any
+  OTHER handoff symbol at base → STOP: run 1 did not complete its scope.
 - F2 ruling (run 1): groups C/D keep their existing model. This run deletes ONLY the
   caller-less `acknowledgeVoiceRuntimeAuthorityRevocationAsync`; the getter and the
   readiness-disabled pair and `readinessDisabled` event STAY.
@@ -70,6 +77,9 @@ seed is UNTOUCHED; only its Kotlin reachability dies.
 
 - Nothing from the KEEP surface or run 1's conversion machinery changes shape.
 - Groups C/D untouched except the one dead ack function above.
+  `T3VoiceReadinessStore.acknowledgeRuntimeRevocation` (Readiness.kt:437-444) becomes
+  zero-caller as a result and REMAINS AS-IS (R2-B) — the C/D-untouched rule wins over
+  dead-symbol sweeping; it is cleaned up when notice unification is designed post-M7.
 - No TS deletion on the ui-attached path; no interface-member removal.
 - `T3VoiceStateStore.state`/`events` and all claim/release/terminate transitions stay.
 

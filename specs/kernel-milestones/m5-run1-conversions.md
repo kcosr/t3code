@@ -30,15 +30,26 @@ Replace the two global sticky slots (`T3VoiceStateStore.mutableRecordingTerminat
 State.kt:208, `mutablePlaybackTermination` :210) with per-operation completion records
 (ownership spec ~:318-324).
 
-**Store.** New `T3VoiceBridgeCompletionStore`, kernel-thread-only, in-memory (verified
-equal durability: the slots are in-memory `MutableStateFlow`s and no recovery path
-reconstructs them). Records keyed by (ownerDomain, operationId), retained until
-acknowledged, carrying the SAME terminal event body the slots carry today, PLUS the
-owner key. Written where `T3VoiceStateStore.terminateRecording`/`terminatePlayback`
-write the slots today (State.kt:416/:497) for COMPOSER_DICTATION and MANUAL_PLAYBACK
-domains ONLY (thread/realtime-handoff/cue terminals stay native-consumed). Must support
-lookup by recordingId as well as by operationId (`deleteRecordingAsync` addresses by
-recordingId + uri).
+**Store.** New `T3VoiceBridgeCompletionStore`, kernel-thread-only, in-memory, and
+**PROCESS-GLOBAL** (re-verdict R1-A): the slots it replaces live on the process-global
+`T3VoiceStateStore` and survive in-process service destroy/recreate — a service-instance
+field would be a durability regression. Records keyed by (ownerDomain, operationId),
+retained until acknowledged, carrying the SAME terminal event body the slots carry
+today, PLUS the owner key. Written where `T3VoiceStateStore.terminateRecording`/
+`terminatePlayback` write the slots today (State.kt:416/:497) for COMPOSER_DICTATION and
+MANUAL_PLAYBACK domains ONLY (thread/realtime-handoff/cue terminals stay
+native-consumed). Must support lookup by recordingId as well as by operationId
+(`deleteRecordingAsync` addresses by recordingId + uri).
+
+**Restore protection (R1-A — binding).** The service-restore read at svc:2230 (old
+anchors), `recordingTermination.value?.recording?.let(recorder::restoreCompleted)`, is
+NOT dead: on in-process service recreate the surviving slot re-registers the un-acked
+recording via `restoreCompleted` BEFORE `sweepStaleCache()` runs, which is what keeps
+the artifact from being swept. PORT it, do not delete it: on service restore,
+re-register EVERY retained COMPOSER_DICTATION completion record's recording via
+`restoreCompleted` before the sweep. Also delete the binder getters
+`recordingTermination`/`playbackTermination` (svc:310-314) and the State exposures
+(State.kt:222-225) with the slots (R1-B).
 
 **Admission rule (F4 — replaces the slot guards).** `claimRecording` (State.kt:367-368)
 and `claimPlayback` (:457-458) currently reject a new COMPOSER_DICTATION/MANUAL_PLAYBACK
@@ -95,15 +106,19 @@ Delete in this run, one commit with Part 1's slot removal:
   (:215-216/:257-/:272-/:280-/:288-), `realtimeHandoffRecordingTermination` var (:212)
   - its REALTIME_HANDOFF write (:417) + pending/clear (:425/:431), `ThreadVoiceHandoff`
     event body (:143).
-- Service: shutdown clears (svc:2464/:2466 current anchors), protection reads
-  (svc:648 dies inside the old discard body being replaced; svc:5778/:5784-region —
-  `expireThreadVoiceHandoffLocked` and `discardRealtimeHandoffRecordingLocked` with
-  their now-dead call chains — VERIFY each remaining caller is itself handoff/bridge
-  scoped before deleting; if a live autonomous caller exists, STOP and surface), the
-  slot restore read (svc:2230 old anchors, `recordingTermination.value?.recording?.let(
-recorder::restoreCompleted)` — verify what restore behavior remains needed: the slot
-  is always null at cold start, so the line is dead; delete it), `HANDOFF_CLIENT_*`
+- Service: shutdown clears (svc:2464/:2466 old anchors — relocate by symbol),
+  protection reads (svc:648 dies inside the old discard body being replaced;
+  `expireThreadVoiceHandoffLocked`, `discardRealtimeHandoffRecordingLocked`, and
+  `cancelRealtimeHandoffRecordingLocked` with their now-dead call chains — VERIFY each
+  remaining caller is itself handoff/bridge scoped before deleting; if a live autonomous
+  caller exists, STOP and surface), the slot restore read at svc:2230 (PORTED into the
+  completion store per Part 1's Restore protection — not deleted), `HANDOFF_CLIENT_*`
   diagnostic codes if nothing else references them.
+- INTENTIONAL SURVIVORS (do NOT chase them into KEEP functions): the vestigial fields
+  `handoffInProgress`, `awaitingHandoffAction`, `handoffEligibleSessionId`,
+  `handoffEnvironmentOrigin` and helper `clearHandoffEligibilityLocked` remain after
+  this run — they are written by run 2's `prepareRealtimeSession` binder and read
+  inside KEEP realtime-terminal handling. Run 2 disposes of them.
 - The nine `ThreadVoiceHandoff` tests in T3VoiceStateStoreTest + the
   `threadVoiceHandoffReconciler.test.ts` file (its subject dies).
 
@@ -138,7 +153,9 @@ recorder::restoreCompleted)` — verify what restore behavior remains needed: th
   explicitly; useComposerDictation orphan-discard test (:68 area) asserts the artifact
   is DELETED on discard and NOT deleted on plain ack (F5).
 - New: per-operation isolation (two records in one domain coexist; ack of one leaves
-  the other); by-recordingId lookup; wake payload carries exactly (domain, operationId).
+  the other); by-recordingId lookup; wake payload carries exactly (domain, operationId);
+  restore-protects-unacked-record (R1-A: a retained record's recording is re-registered
+  via `restoreCompleted` on service restore and survives `sweepStaleCache`).
 - Delete: the nine handoff State-store tests + reconciler test file (Part 2).
 - TS: hook tests to wake+get/ack model; index.test.ts revision 16.
 - No hollow stubs — test BODIES are diffed at adjudication.
