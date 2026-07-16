@@ -4598,9 +4598,15 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun dispatchVoiceRuntimeRealtimeOffer(block: () -> Unit) {
-    runCatching {
-      netDriver.executeDetached("realtime-offer", VoiceNetLane.REALTIME, driverEpoch()) {
-        block()
+    // The WebRTC peer invokes offer/answer-failure callbacks on its own signaling thread.
+    // driverEpoch() asserts the kernel thread, so it must be computed after marshaling onto
+    // the mailbox — otherwise the assertion throws and runCatching silently swallows the
+    // offer, stalling signaling until the server heartbeat-times-out.
+    submitCallback {
+      runCatching {
+        netDriver.executeDetached("realtime-offer", VoiceNetLane.REALTIME, driverEpoch()) {
+          block()
+        }
       }
     }
   }
