@@ -143,3 +143,14 @@ between each:
   inline choreography and both helpers deleted (service ~6033 → ~5650 per seam map §6);
   fixture matrix + all suites green; both source sets compile;
   `pnpm run typecheck`, `pnpm run lint:mobile` green; tree clean.
+
+## Run notes
+
+- No interpreter dispatch test was added. The interpreter dispatches to service-private
+  `*Locked` methods that require a service harness, while the module's JUnit4 toolchain has no
+  Robolectric support (the W0b constraint). Coverage remains the run-1 fixture matrix plus the
+  instrumented service tests.
+- Loading a recovered thread operation calls
+  `restore(threadOperation, recorder::restoreCompleted)`, and the emitted
+  `RestoreCompletedRecording` effect invokes `recorder.restoreCompleted` again. This duplicate is
+  benign because the completed-recording registry insert is idempotent and keyed by recording ID.

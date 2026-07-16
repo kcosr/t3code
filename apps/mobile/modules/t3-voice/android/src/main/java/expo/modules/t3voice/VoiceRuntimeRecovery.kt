@@ -50,7 +50,10 @@ internal data class VoiceRuntimeRecoveryPlan(
 )
 
 internal sealed interface VoiceRuntimeRecoveryEffect {
-  data class WriteReadiness(val config: T3VoiceReadinessConfig) : VoiceRuntimeRecoveryEffect
+  data class WriteReadiness(
+    val config: T3VoiceReadinessConfig,
+    val bestEffort: Boolean = false,
+  ) : VoiceRuntimeRecoveryEffect
   data class WriteActivatedReadiness(
     val config: T3VoiceReadinessConfig,
     val authority: T3VoicePreparedReadiness,
@@ -136,7 +139,7 @@ internal fun recover(loaded: LoadedState, permissions: Permissions, clock: Clock
     if (!reconciled) {
       effects += VoiceRuntimeRecoveryEffect.ClearAuthority("startup-reconciliation-clear-authority")
       readiness = readiness.copy(enabled = false)
-      effects += VoiceRuntimeRecoveryEffect.WriteReadiness(readiness)
+      effects += VoiceRuntimeRecoveryEffect.WriteReadiness(readiness, bestEffort = true)
       canonical = null
       prepared = null
       active = null

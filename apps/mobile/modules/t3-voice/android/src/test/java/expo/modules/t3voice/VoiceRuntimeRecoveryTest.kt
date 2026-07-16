@@ -68,7 +68,10 @@ class VoiceRuntimeRecoveryTest {
     ))
     assertEquals(listOf(
       VoiceRuntimeRecoveryEffect.ClearAuthority("startup-reconciliation-clear-authority"),
-      VoiceRuntimeRecoveryEffect.WriteReadiness(readiness(enabled = false, generation = 9)),
+      VoiceRuntimeRecoveryEffect.WriteReadiness(
+        readiness(enabled = false, generation = 9),
+        bestEffort = true,
+      ),
     ), plan.effects.take(2))
     assertFalse(plan.effects.any { it is VoiceRuntimeRecoveryEffect.Diagnostic })
     assertNull(plan.installedRuntimeId)
@@ -275,11 +278,39 @@ class VoiceRuntimeRecoveryTest {
     ))
     assertEquals(listOf(
       VoiceRuntimeRecoveryEffect.ClearAuthority("startup-reconciliation-clear-authority"),
-      VoiceRuntimeRecoveryEffect.WriteReadiness(current.config.copy(enabled = false)),
+      VoiceRuntimeRecoveryEffect.WriteReadiness(
+        current.config.copy(enabled = false),
+        bestEffort = true,
+      ),
     ), plan.effects.take(2))
     assertNull(plan.installedRuntimeId)
     assertEquals(3L, plan.initialGeneration)
     assertFalse(plan.readinessConfig.enabled)
+  }
+
+  @Test fun onlyReconcileFailureReadinessWriteIsBestEffort() {
+    val transient = plan(LoadedState(
+      readinessConfig = readiness(enabled = true),
+      canonicalAuthority = VoiceRuntimeAuthorityLoadResult.Available(authority(enabled = false)),
+    ))
+    val attached = plan(LoadedState(
+      readinessConfig = readiness(),
+      attachedPreparation = attached(runtimeId = "runtime", generation = 4),
+    ))
+    val failure = plan(LoadedState(
+      readinessConfig = readiness(enabled = true),
+      canonicalAuthority = VoiceRuntimeAuthorityLoadResult.Available(authority()),
+      persistentReadinessRead = false,
+    ))
+    assertFalse(transient.effects.filterIsInstance<
+      VoiceRuntimeRecoveryEffect.WriteReadiness
+      >().single().bestEffort)
+    assertFalse(attached.effects.filterIsInstance<
+      VoiceRuntimeRecoveryEffect.WriteReadiness
+      >().single().bestEffort)
+    assertTrue(failure.effects.filterIsInstance<
+      VoiceRuntimeRecoveryEffect.WriteReadiness
+      >().single().bestEffort)
   }
 
   @Test fun attachedPreparationWritesVerifiedReadinessAndSeedsPreparedAuthority() {

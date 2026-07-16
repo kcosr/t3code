@@ -1559,7 +1559,11 @@ class T3VoiceRuntimeService : Service() {
     canonicalConfigured: Boolean,
   ): Boolean = when (effect) {
     is VoiceRuntimeRecoveryEffect.WriteReadiness -> {
-      readinessStore.write(effect.config)
+      if (effect.bestEffort) {
+        runCatching { readinessStore.write(effect.config) }
+      } else {
+        readinessStore.write(effect.config)
+      }
       canonicalConfigured
     }
     is VoiceRuntimeRecoveryEffect.WriteActivatedReadiness -> {
@@ -1870,6 +1874,7 @@ class T3VoiceRuntimeService : Service() {
       executeRecoveryPlanLocked(plan)
     }
   }
+
   override fun onBind(intent: Intent?): IBinder {
     return binder
   }
