@@ -15,7 +15,6 @@ import {
   NativeThreadCommandActivationCoordinator,
   shouldStartNativeThreadCommand,
 } from "../voice/nativeVoiceReadiness";
-import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import type { ThreadVoiceComposerControllerInput } from "./threadVoiceComposerControllerTypes";
 
 function pauseMessage(reason: VoiceThreadModePauseReason): string {
@@ -93,14 +92,12 @@ export function useThreadVoiceComposerController(input: ThreadVoiceComposerContr
     state: autoListenState,
     active: autoListenActive,
     activate: activateAutoListen,
-    adoptHandoffRecording,
     deactivateForManualDictation: deactivateAutoListenForManualDictation,
     stopToDraft: stopAutoListenToDraft,
     pause: pauseAutoListen,
   } = autoListen;
   const autoListenAlertCycleRef = useRef(0);
   const nativeThreadActivationRef = useRef(new NativeThreadCommandActivationCoordinator());
-  const handoffAdoptionsRef = useRef(new Set<string>());
 
   useEffect(() => {
     const command = realtimeVoice.nativeThreadCommand;
@@ -127,68 +124,6 @@ export function useThreadVoiceComposerController(input: ThreadVoiceComposerContr
     props.selectedThread.id,
     realtimeVoice.completeNativeThreadCommand,
     realtimeVoice.nativeThreadCommand,
-  ]);
-
-  useEffect(() => {
-    const handoff = realtimeVoice.threadVoiceHandoff;
-    if (
-      handoff === null ||
-      handoff.environmentId !== props.environmentId ||
-      handoff.threadId !== props.selectedThread.id ||
-      handoffAdoptionsRef.current.has(handoff.actionId)
-    ) {
-      return;
-    }
-    const releaseAdoption = realtimeVoice.beginThreadVoiceHandoffAdoption(handoff.actionId);
-    if (releaseAdoption === null) return;
-    handoffAdoptionsRef.current.add(handoff.actionId);
-    void (async () => {
-      const native = getT3VoiceNativeModule();
-      if (native === null) return;
-      for (;;) {
-        try {
-          if (
-            !(await native.beginThreadVoiceHandoffAdoptionAsync({ actionId: handoff.actionId }))
-          ) {
-            return;
-          }
-          break;
-        } catch {
-          await new Promise((resolve) => setTimeout(resolve, 250));
-        }
-      }
-      try {
-        if (!(await dictation.adopt(handoff.recordingId))) {
-          await realtimeVoice.settleThreadVoiceHandoff(handoff.actionId, "failed");
-          return;
-        }
-        if (handoff.autoRearm) adoptHandoffRecording(handoff.recordingId);
-        void native
-          .recordThreadVoiceHandoffClientStageAsync({ stage: "composer-adopted" })
-          .catch(() => undefined);
-        for (;;) {
-          try {
-            await realtimeVoice.settleThreadVoiceHandoff(handoff.actionId, "adopted");
-            break;
-          } catch {
-            await new Promise((resolve) => setTimeout(resolve, 1_000));
-          }
-        }
-      } catch {
-        await realtimeVoice.settleThreadVoiceHandoff(handoff.actionId, "failed");
-      }
-    })()
-      .finally(() => {
-        releaseAdoption();
-        handoffAdoptionsRef.current.delete(handoff.actionId);
-      })
-      .catch(() => undefined);
-  }, [
-    adoptHandoffRecording,
-    dictation,
-    props.environmentId,
-    props.selectedThread.id,
-    realtimeVoice,
   ]);
 
   useEffect(() => {

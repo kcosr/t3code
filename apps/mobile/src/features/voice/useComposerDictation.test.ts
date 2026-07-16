@@ -74,6 +74,8 @@ describe("orphaned dictation termination cleanup", () => {
       },
     } as unknown as T3VoiceNativeModule;
     const event = {
+      ownerDomain: "COMPOSER_DICTATION",
+      operationId: "operation-a",
       recordingId: "recording-a",
       recording: null,
       outcome: "cancelled",
@@ -81,6 +83,6 @@ describe("orphaned dictation termination cleanup", () => {
     } as T3VoiceRecordingTerminatedEvent;
 
     await expect(discardOrphanedRecordingTerminationIfUnowned(native, event)).resolves.toBe(false);
-    expect(calls).toEqual([{ recordingId: "recording-a" }]);
+    expect(calls).toEqual([{ operationId: "operation-a" }]);
   });
 });

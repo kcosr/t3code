@@ -628,18 +628,9 @@ export class RealtimeVoiceController {
         this.client.sessionEvents(active.sessionId, active.afterSequence),
       );
       if (this.detached || this.active !== active) return;
-      const terminalHandoff = result.events.some(
-        (event) => event.type === "client-action" && event.action === "handoff-to-thread-voice",
-      );
       const terminalStop = result.events.some(
         (event) => event.type === "terminal-action" && event.action === "stop-realtime-voice",
       );
-      if (terminalHandoff) {
-        await this.native
-          .armThreadVoiceHandoffAsync({ nativeSessionId: active.nativeSessionId })
-          .catch(() => undefined);
-        if (this.active !== active) return;
-      }
       if (terminalStop) {
         active.terminalStopRequested = true;
         await this.native

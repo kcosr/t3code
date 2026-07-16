@@ -179,7 +179,7 @@ export function useThreadSpeech(input: {
         while (mountedRef.current) {
           try {
             await native.acknowledgePlaybackTerminationAsync({
-              playbackId: event.playbackId,
+              operationId: event.operationId,
             });
             return;
           } catch {
@@ -225,8 +225,10 @@ export function useThreadSpeech(input: {
               }
               return;
             }
-            const pendingTermination = await native.getPendingPlaybackTerminationAsync();
-            if (pendingTermination !== null) await handlePlaybackTerminated(pendingTermination);
+            const pendingTerminations = await native.getPendingPlaybackTerminationAsync();
+            for (const pendingTermination of pendingTerminations) {
+              await handlePlaybackTerminated(pendingTermination);
+            }
             if (pendingPlaybackAcknowledgementRef.current !== null) {
               await pendingPlaybackAcknowledgementRef.current.promise;
             }
@@ -434,15 +436,18 @@ export function useThreadSpeech(input: {
 
   useEffect(() => {
     if (native === null) return;
-    const terminatedSubscription = native.addListener("playbackTerminated", (event) => {
-      void handlePlaybackTerminated(event).catch(() => undefined);
+    const loadPending = () => {
+      void native
+        .getPendingPlaybackTerminationAsync()
+        .then(async (events) => {
+          for (const event of events) await handlePlaybackTerminated(event);
+        })
+        .catch(() => undefined);
+    };
+    const terminatedSubscription = native.addListener("playbackTerminated", () => {
+      loadPending();
     });
-    void native
-      .getPendingPlaybackTerminationAsync()
-      .then((event) => {
-        if (event !== null) return handlePlaybackTerminated(event);
-      })
-      .catch(() => undefined);
+    loadPending();
     const consumedSubscription = native.addListener("playbackChunkConsumed", (event) => {
       if (playbackRef.current?.playbackId !== event.playbackId) return;
       consumedChunkIndexRef.current = Math.max(consumedChunkIndexRef.current, event.chunkIndex);

@@ -25,5 +25,5 @@ export async function discardOrphanedRecordingTerminationIfUnowned(
   native: T3VoiceNativeModule,
   event: T3VoiceRecordingTerminatedEvent,
 ): Promise<boolean> {
-  return native.discardUnownedRecordingTerminationAsync({ recordingId: event.recordingId });
+  return native.discardUnownedRecordingTerminationAsync({ operationId: event.operationId });
 }

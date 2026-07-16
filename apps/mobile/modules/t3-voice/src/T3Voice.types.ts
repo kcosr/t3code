@@ -123,12 +123,16 @@ export interface T3VoicePlaybackChunkConsumedEvent {
 }
 
 export interface T3VoicePlaybackTerminatedEvent {
+  readonly ownerDomain: "MANUAL_PLAYBACK";
+  readonly operationId: string;
   readonly playbackId: string;
   readonly outcome: "completed" | "failed" | "cancelled";
 }
 
 export type T3VoiceRecordingTerminatedEvent =
   | {
+      readonly ownerDomain: "COMPOSER_DICTATION";
+      readonly operationId: string;
       readonly recordingId: string;
       readonly recording: T3VoiceRecordingResult;
       readonly outcome: "completed";
@@ -139,12 +143,16 @@ export type T3VoiceRecordingTerminatedEvent =
         | "media-file-size-limit";
     }
   | {
+      readonly ownerDomain: "COMPOSER_DICTATION";
+      readonly operationId: string;
       readonly recordingId: string;
       readonly recording: null;
       readonly outcome: "cancelled";
       readonly reason: "no-speech";
     }
   | {
+      readonly ownerDomain: "COMPOSER_DICTATION";
+      readonly operationId: string;
       readonly recordingId: string;
       readonly recording: null;
       readonly outcome: "failed";
@@ -172,14 +180,9 @@ export interface T3VoiceRealtimeTerminatedEvent {
   readonly retryable: boolean;
 }
 
-export interface T3VoiceThreadVoiceHandoffEvent {
-  readonly actionId: string;
-  readonly projectId: string;
-  readonly threadId: string;
-  readonly recordingId: string;
-  readonly autoRearm: boolean;
-  readonly environmentOrigin: string;
-  readonly expiresAtEpochMillis: number;
+export interface T3VoiceCompletionWakeEvent {
+  readonly ownerDomain: "COMPOSER_DICTATION" | "MANUAL_PLAYBACK";
+  readonly operationId: string;
 }
 
 export type T3VoiceReadinessMode = "realtime" | "thread";
@@ -363,11 +366,11 @@ export interface T3VoiceNativeModule {
     ): T3VoiceEventSubscription;
     (
       eventName: "playbackTerminated",
-      listener: (event: T3VoicePlaybackTerminatedEvent) => void,
+      listener: (event: T3VoiceCompletionWakeEvent) => void,
     ): T3VoiceEventSubscription;
     (
       eventName: "recordingTerminated",
-      listener: (event: T3VoiceRecordingTerminatedEvent) => void,
+      listener: (event: T3VoiceCompletionWakeEvent) => void,
     ): T3VoiceEventSubscription;
     (
       eventName: "runtimeError",
@@ -380,10 +383,6 @@ export interface T3VoiceNativeModule {
     (
       eventName: "realtimeTerminated",
       listener: (event: T3VoiceRealtimeTerminatedEvent) => void,
-    ): T3VoiceEventSubscription;
-    (
-      eventName: "threadVoiceHandoff",
-      listener: (event: T3VoiceThreadVoiceHandoffEvent) => void,
     ): T3VoiceEventSubscription;
     (
       eventName: "voiceCommand",
@@ -463,22 +462,15 @@ export interface T3VoiceNativeModule {
   ) => Promise<T3VoiceRecordingResult>;
   readonly cancelRecordingAsync: (input: T3VoiceRecordingIdentifier) => Promise<void>;
   readonly deleteRecordingAsync: (input: T3VoiceRecordingDeleteInput) => Promise<void>;
-  readonly acknowledgeRecordingTerminationAsync: (
-    input: T3VoiceRecordingIdentifier,
-  ) => Promise<void>;
-  readonly discardUnownedRecordingTerminationAsync: (
-    input: T3VoiceRecordingIdentifier,
-  ) => Promise<boolean>;
-  readonly getPendingRecordingTerminationAsync: () => Promise<T3VoiceRecordingTerminatedEvent | null>;
-  readonly getPendingThreadVoiceHandoffAsync: () => Promise<T3VoiceThreadVoiceHandoffEvent | null>;
-  readonly acknowledgeThreadVoiceHandoffAsync: (input: {
-    readonly actionId: string;
-    readonly outcome: "adopted" | "failed";
+  readonly acknowledgeRecordingTerminationAsync: (input: {
+    readonly operationId: string;
   }) => Promise<void>;
-  readonly beginThreadVoiceHandoffAdoptionAsync: (input: {
-    readonly actionId: string;
+  readonly discardUnownedRecordingTerminationAsync: (input: {
+    readonly operationId: string;
   }) => Promise<boolean>;
-  readonly armThreadVoiceHandoffAsync: (input: T3VoiceRealtimeIdentifier) => Promise<void>;
+  readonly getPendingRecordingTerminationAsync: () => Promise<
+    ReadonlyArray<T3VoiceRecordingTerminatedEvent>
+  >;
   readonly setVoiceCuesEnabledAsync: (input: { readonly enabled: boolean }) => Promise<void>;
   readonly registerVoiceControllerAsync: (input: T3VoiceControllerRegistration) => Promise<void>;
   readonly unregisterVoiceControllerAsync: (input: T3VoiceControllerRegistration) => Promise<void>;
@@ -497,9 +489,11 @@ export interface T3VoiceNativeModule {
   readonly finishPlaybackAsync: (input: T3VoicePlaybackFinishInput) => Promise<void>;
   readonly cancelPlaybackAsync: (input: { readonly playbackId: string }) => Promise<void>;
   readonly acknowledgePlaybackTerminationAsync: (input: {
-    readonly playbackId: string;
+    readonly operationId: string;
   }) => Promise<void>;
-  readonly getPendingPlaybackTerminationAsync: () => Promise<T3VoicePlaybackTerminatedEvent | null>;
+  readonly getPendingPlaybackTerminationAsync: () => Promise<
+    ReadonlyArray<T3VoicePlaybackTerminatedEvent>
+  >;
   readonly prepareRealtimeSessionAsync: (
     input: T3VoiceRealtimePrepareInput,
   ) => Promise<T3VoiceRealtimeOffer>;
@@ -511,9 +505,6 @@ export interface T3VoiceNativeModule {
   ) => Promise<void>;
   readonly getAudioRoutesAsync: () => Promise<ReadonlyArray<T3VoiceAudioRoute>>;
   readonly getDiagnosticsAsync: () => Promise<ReadonlyArray<T3VoiceDiagnosticEntry>>;
-  readonly recordThreadVoiceHandoffClientStageAsync: (input: {
-    readonly stage: "accepted" | "navigation-requested" | "composer-adopted";
-  }) => Promise<void>;
   readonly setAudioRouteAsync: (
     input: T3VoiceRealtimeIdentifier & {
       readonly routeId: T3VoiceAudioRoute["id"];

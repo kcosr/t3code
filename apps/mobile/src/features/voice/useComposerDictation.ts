@@ -6,6 +6,7 @@ import * as Stream from "effect/Stream";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { getT3VoiceNativeModule, type T3VoiceRecordingResult } from "@t3tools/mobile-voice-native";
+import type { T3VoiceRecordingTerminatedEvent } from "@t3tools/mobile-voice-native";
 import { uuidv4 } from "../../lib/uuid";
 import { usePreparedConnection } from "../../state/session";
 import {
@@ -305,10 +306,14 @@ export function useComposerDictation(input: {
       const runtime = await native.getStateAsync();
       const generation = ++operationGenerationRef.current;
       if (runtime.phase !== "recording" || runtime.activeRecordingId !== recordingId) {
-        const terminal = await native.getPendingRecordingTerminationAsync();
-        if (terminal?.recordingId !== recordingId) return false;
+        const terminal = (await native.getPendingRecordingTerminationAsync()).find(
+          (candidate) => candidate.recordingId === recordingId,
+        );
+        if (terminal === undefined) return false;
         if (terminal.outcome !== "completed") {
-          await native.acknowledgeRecordingTerminationAsync({ recordingId }).catch(() => undefined);
+          await native
+            .acknowledgeRecordingTerminationAsync({ operationId: terminal.operationId })
+            .catch(() => undefined);
           return false;
         }
         setError(null);
@@ -324,9 +329,9 @@ export function useComposerDictation(input: {
     [native, prepared, transcribeCompletedRecording],
   );
 
-  useEffect(() => {
-    if (native === null) return;
-    const subscription = native.addListener("recordingTerminated", (event) => {
+  const handleRecordingTermination = useCallback(
+    (event: T3VoiceRecordingTerminatedEvent) => {
+      if (native === null) return;
       const ownership = dictationTerminationOwnership({
         recordingId: event.recordingId,
         activeRecordingId: recordingIdRef.current,
@@ -339,7 +344,7 @@ export function useComposerDictation(input: {
       }
       if (ownership === "transcribing") {
         void native
-          .acknowledgeRecordingTerminationAsync({ recordingId: event.recordingId })
+          .acknowledgeRecordingTerminationAsync({ operationId: event.operationId })
           .catch(() => undefined);
         return;
       }
@@ -357,7 +362,7 @@ export function useComposerDictation(input: {
         });
         setPhase("idle");
         void native
-          .acknowledgeRecordingTerminationAsync({ recordingId: event.recordingId })
+          .acknowledgeRecordingTerminationAsync({ operationId: event.operationId })
           .catch(() => undefined);
         return;
       }
@@ -371,16 +376,29 @@ export function useComposerDictation(input: {
         setError("The recording could not be finalized.");
         setPhase("idle");
         void native
-          .acknowledgeRecordingTerminationAsync({ recordingId: event.recordingId })
+          .acknowledgeRecordingTerminationAsync({ operationId: event.operationId })
           .catch(() => undefined);
         return;
       }
       setPhase("transcribing");
       const generation = operationGenerationRef.current;
       void transcribeCompletedRecording(event.recording, generation, draftRef.current);
-    });
+    },
+    [native, transcribeCompletedRecording],
+  );
+
+  useEffect(() => {
+    if (native === null) return;
+    const loadPending = () => {
+      void native
+        .getPendingRecordingTerminationAsync()
+        .then((events) => events.forEach(handleRecordingTermination))
+        .catch(() => undefined);
+    };
+    const subscription = native.addListener("recordingTerminated", loadPending);
+    loadPending();
     return () => subscription.remove();
-  }, [native, transcribeCompletedRecording]);
+  }, [handleRecordingTermination, native]);
 
   useEffect(() => {
     const previous = lifecycleRef.current;

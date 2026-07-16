@@ -6,10 +6,7 @@ import type {
   VoiceRuntimePresentationAction,
   VoiceRuntimeSnapshot,
 } from "@t3tools/contracts";
-import type {
-  T3VoiceCommandEvent,
-  T3VoiceThreadVoiceHandoffEvent,
-} from "@t3tools/mobile-voice-native";
+import type { T3VoiceCommandEvent } from "@t3tools/mobile-voice-native";
 import { createContext, use } from "react";
 
 import type { CanonicalVoiceViewModel } from "./canonicalVoiceViewModel";
@@ -48,18 +45,6 @@ export interface UiAttachedMasterVoiceContextValue {
   readonly registerTraditionalAudioInterruption: (
     interrupt: () => void | (() => void) | Promise<void | (() => void)>,
   ) => () => void;
-  readonly threadVoiceHandoff:
-    | (T3VoiceThreadVoiceHandoffEvent & {
-        readonly environmentId: EnvironmentId;
-        readonly threadId: ThreadId;
-        readonly acceptedAtEpochMillis: number;
-      })
-    | null;
-  readonly settleThreadVoiceHandoff: (
-    actionId: string,
-    outcome: "adopted" | "failed",
-  ) => Promise<void>;
-  readonly beginThreadVoiceHandoffAdoption: (actionId: string) => (() => void) | null;
   readonly nativeThreadCommand:
     | (T3VoiceCommandEvent & {
         readonly environmentId: EnvironmentId;

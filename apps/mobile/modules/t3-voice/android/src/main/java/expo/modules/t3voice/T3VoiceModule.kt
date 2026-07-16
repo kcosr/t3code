@@ -37,10 +37,7 @@ class T3VoiceModule : Module() {
   private val bindingRealtimeOwner = T3VoiceBindingRealtimeOwnerPolicy()
   private var stateCollection: Job? = null
   private var eventCollection: Job? = null
-  private var recordingTerminationCollection: Job? = null
-  private var playbackTerminationCollection: Job? = null
   private var realtimeTerminationCollection: Job? = null
-  private var threadVoiceHandoffCollection: Job? = null
   private var voiceCommandCollection: Job? = null
   private var rebindScheduled = false
   private var rebindAttemptedSinceConnection = false
@@ -115,13 +112,20 @@ class T3VoiceModule : Module() {
                   sendEvent(PLAYBACK_CHUNK_CONSUMED_EVENT, event.toEventBody())
                 is T3VoiceRuntimeEvent.PlaybackTerminated -> Unit
                 is T3VoiceRuntimeEvent.RecordingTerminated -> Unit
+                is T3VoiceRuntimeEvent.CompletionWake ->
+                  when (event.ownerDomain) {
+                    T3VoiceOperationOwnerDomain.COMPOSER_DICTATION ->
+                      sendEvent(RECORDING_TERMINATED_EVENT, event.toEventBody())
+                    T3VoiceOperationOwnerDomain.MANUAL_PLAYBACK ->
+                      sendEvent(PLAYBACK_TERMINATED_EVENT, event.toEventBody())
+                    else -> Unit
+                  }
                 is T3VoiceRuntimeEvent.RuntimeError ->
                   sendEvent(RUNTIME_ERROR_EVENT, event.toEventBody())
                 is T3VoiceRuntimeEvent.AudioRouteChanged ->
                   sendEvent(AUDIO_ROUTE_CHANGED_EVENT, event.toEventBody())
                 is T3VoiceRuntimeEvent.RealtimeTerminated ->
                   sendEvent(REALTIME_TERMINATED_EVENT, event.toEventBody())
-                is T3VoiceRuntimeEvent.ThreadVoiceHandoff -> Unit
                 is T3VoiceRuntimeEvent.ReadinessDisabled ->
                   sendEvent(READINESS_DISABLED_EVENT, event.toEventBody())
                 is T3VoiceRuntimeEvent.VoiceRuntimeWake ->
@@ -129,32 +133,11 @@ class T3VoiceModule : Module() {
               }
             }
           }
-        recordingTerminationCollection?.cancel()
-        recordingTerminationCollection =
-          appContext.mainQueue.launch {
-            connectedBinder.recordingTermination.collectLatest { event ->
-              if (event != null) sendEvent(RECORDING_TERMINATED_EVENT, event.toEventBody())
-            }
-          }
-        playbackTerminationCollection?.cancel()
-        playbackTerminationCollection =
-          appContext.mainQueue.launch {
-            connectedBinder.playbackTermination.collectLatest { event ->
-              if (event != null) sendEvent(PLAYBACK_TERMINATED_EVENT, event.toEventBody())
-            }
-          }
         realtimeTerminationCollection?.cancel()
         realtimeTerminationCollection =
           appContext.mainQueue.launch {
             connectedBinder.realtimeTermination.collectLatest { event ->
               if (event != null) sendEvent(REALTIME_TERMINATED_EVENT, event.toEventBody())
-            }
-          }
-        threadVoiceHandoffCollection?.cancel()
-        threadVoiceHandoffCollection =
-          appContext.mainQueue.launch {
-            connectedBinder.threadVoiceHandoff.collectLatest { event ->
-              if (event != null) sendEvent(THREAD_VOICE_HANDOFF_EVENT, event.toEventBody())
             }
           }
         voiceCommandCollection?.cancel()
@@ -199,14 +182,13 @@ class T3VoiceModule : Module() {
         RUNTIME_ERROR_EVENT,
         AUDIO_ROUTE_CHANGED_EVENT,
         REALTIME_TERMINATED_EVENT,
-        THREAD_VOICE_HANDOFF_EVENT,
         VOICE_COMMAND_EVENT,
         READINESS_DISABLED_EVENT,
         VOICE_RUNTIME_WAKE_EVENT,
       )
 
       Constants(
-        "nativeRevision" to 15,
+        "nativeRevision" to 16,
       )
 
       OnCreate {
@@ -723,7 +705,7 @@ class T3VoiceModule : Module() {
       AsyncFunction("acknowledgeRecordingTerminationAsync") {
         input: Map<String, String>, promise: Promise ->
         withBinder(promise, "recording-acknowledgement-failed") { voice, result ->
-          voice.acknowledgeRecordingTermination(requireIdentifier(input, "recordingId"))
+          voice.acknowledgeRecordingTermination(requireIdentifier(input, "operationId"))
           result.resolve()
         }
       }
@@ -732,7 +714,7 @@ class T3VoiceModule : Module() {
         input: Map<String, String>, promise: Promise ->
         withBinder(promise, "recording-orphan-discard-failed") { voice, result ->
           result.resolve(
-            voice.discardUnownedRecordingTermination(requireIdentifier(input, "recordingId")),
+            voice.discardUnownedRecordingTermination(requireIdentifier(input, "operationId")),
           )
         }
       }
@@ -779,47 +761,23 @@ class T3VoiceModule : Module() {
       AsyncFunction("acknowledgePlaybackTerminationAsync") {
         input: Map<String, String>, promise: Promise ->
         withBinder(promise, "playback-acknowledgement-failed") { voice, result ->
-          voice.acknowledgePlaybackTermination(requireIdentifier(input, "playbackId"))
+          voice.acknowledgePlaybackTermination(requireIdentifier(input, "operationId"))
           result.resolve()
         }
       }
 
       AsyncFunction("getPendingPlaybackTerminationAsync") { promise: Promise ->
         withBinder(promise, "playback-termination-read-failed") { voice, result ->
-          result.resolve(voice.pendingPlaybackTermination())
+          result.resolve(voice.pendingPlaybackTerminations())
         }
       }
 
       AsyncFunction("getPendingRecordingTerminationAsync") { promise: Promise ->
         withBinder(promise, "recording-termination-query-failed") { voice, result ->
-          result.resolve(voice.pendingRecordingTermination())
+          result.resolve(voice.pendingRecordingTerminations())
         }
       }
 
-      AsyncFunction("getPendingThreadVoiceHandoffAsync") { promise: Promise ->
-        withBinder(promise, "thread-voice-handoff-query-failed") { voice, result ->
-          result.resolve(voice.pendingThreadVoiceHandoff())
-        }
-      }
-
-      AsyncFunction("acknowledgeThreadVoiceHandoffAsync") { input: Map<String, String>, promise: Promise ->
-        requireExactKeys(input, setOf("actionId", "outcome"))
-        withBinder(promise, "thread-voice-handoff-acknowledgement-failed") { voice, result ->
-          val outcome = requireText(input, "outcome", 16)
-          check(outcome == "adopted" || outcome == "failed") {
-            "outcome must be adopted or failed."
-          }
-          voice.acknowledgeThreadVoiceHandoff(requireIdentifier(input, "actionId"), outcome)
-          result.resolve()
-        }
-      }
-
-      AsyncFunction("armThreadVoiceHandoffAsync") { input: Map<String, String>, promise: Promise ->
-        withBinder(promise, "thread-voice-handoff-arm-failed") { voice, result ->
-          voice.armThreadVoiceHandoff(requireIdentifier(input, "nativeSessionId"))
-          result.resolve()
-        }
-      }
 
       AsyncFunction("prepareRealtimeSessionAsync") { input: Map<String, Any>, promise: Promise ->
         requireExactKeys(
@@ -949,23 +907,6 @@ class T3VoiceModule : Module() {
       AsyncFunction("getDiagnosticsAsync") { promise: Promise ->
         withBinder(promise, "diagnostics-read-failed") { voice, result ->
           result.resolve(voice.getDiagnostics())
-        }
-      }
-
-      AsyncFunction("recordThreadVoiceHandoffClientStageAsync") {
-        input: Map<String, String>, promise: Promise ->
-        requireExactKeys(input, setOf("stage"))
-        withBinder(promise, "handoff-diagnostic-failed") { voice, result ->
-          voice.recordThreadVoiceHandoffClientStage(requireText(input, "stage", 64))
-          result.resolve()
-        }
-      }
-
-      AsyncFunction("beginThreadVoiceHandoffAdoptionAsync") {
-        input: Map<String, String>, promise: Promise ->
-        requireExactKeys(input, setOf("actionId"))
-        withBinder(promise, "handoff-adoption-claim-failed") { voice, result ->
-          result.resolve(voice.beginThreadVoiceHandoffAdoption(requireIdentifier(input, "actionId")))
         }
       }
 
@@ -1311,14 +1252,8 @@ class T3VoiceModule : Module() {
     eventCollection = null
     realtimeTerminationCollection?.cancel()
     realtimeTerminationCollection = null
-    threadVoiceHandoffCollection?.cancel()
-    threadVoiceHandoffCollection = null
     voiceCommandCollection?.cancel()
     voiceCommandCollection = null
-    recordingTerminationCollection?.cancel()
-    recordingTerminationCollection = null
-    playbackTerminationCollection?.cancel()
-    playbackTerminationCollection = null
   }
 
   private fun publicRealtimeFailureMessage(code: String): String =
@@ -1340,7 +1275,6 @@ class T3VoiceModule : Module() {
     private const val RUNTIME_ERROR_EVENT = "runtimeError"
     private const val AUDIO_ROUTE_CHANGED_EVENT = "audioRouteChanged"
     private const val REALTIME_TERMINATED_EVENT = "realtimeTerminated"
-    private const val THREAD_VOICE_HANDOFF_EVENT = "threadVoiceHandoff"
     private const val VOICE_COMMAND_EVENT = "voiceCommand"
     private const val READINESS_DISABLED_EVENT = "readinessDisabled"
     private const val VOICE_RUNTIME_WAKE_EVENT = "voiceRuntimeWake"

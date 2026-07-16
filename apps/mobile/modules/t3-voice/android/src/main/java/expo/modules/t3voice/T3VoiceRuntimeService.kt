@@ -307,15 +307,6 @@ class T3VoiceRuntimeService : Service() {
     val realtimeTermination: StateFlow<T3VoiceRuntimeEvent.RealtimeTerminated?>
       get() = T3VoiceStateStore.realtimeTermination
 
-    val recordingTermination: StateFlow<T3VoiceRuntimeEvent.RecordingTerminated?>
-      get() = T3VoiceStateStore.recordingTermination
-
-    val playbackTermination: StateFlow<T3VoiceRuntimeEvent.PlaybackTerminated?>
-      get() = T3VoiceStateStore.playbackTermination
-
-    val threadVoiceHandoff: StateFlow<T3VoiceRuntimeEvent.ThreadVoiceHandoff?>
-      get() = T3VoiceStateStore.threadVoiceHandoff
-
     val voiceCommands: StateFlow<T3VoicePendingCommand?>
       get() = controllerCommands.pending
 
@@ -626,128 +617,58 @@ class T3VoiceRuntimeService : Service() {
     fun deleteRecording(recordingId: String, uri: String) {
       mailbox.submit(binderMessage("delete-recording")) {
         run {
-          val recording = checkNotNull(
-            T3VoiceStateStore.recordingTermination.value
-              ?.takeIf { it.recordingId == recordingId }
-              ?.recording,
-          ) { "Recording $recordingId is not owned by the bridge." }
+          val completion = checkNotNull(T3VoiceBridgeCompletionStore.recordingById(recordingId)) {
+            "Recording $recordingId is not owned by the bridge."
+          }
+          val recording = checkNotNull(completion.terminal.recording) {
+            "Recording $recordingId is not owned by the bridge."
+          }
           check(recording.uri == uri) { "Recording $recordingId URI does not match its terminal result." }
           recorder.delete(recordingId, recording.uri)
-          T3VoiceStateStore.clearRecordingTermination(recordingId)
-        }
-      }
-    }
-
-    fun acknowledgeRecordingTermination(recordingId: String) {
-      T3VoiceStateStore.clearRecordingTermination(recordingId)
-    }
-
-    fun discardUnownedRecordingTermination(recordingId: String): Boolean =
-      mailbox.submitAndAwait(binderMessage("discard-recording-termination")) {
-        run {
-        if (T3VoiceStateStore.isThreadVoiceHandoffRecordingProtected(recordingId)) {
-          return@run false
-        }
-        val termination = T3VoiceStateStore.recordingTermination.value
-          ?.takeIf { it.recordingId == recordingId }
-          ?: return@run false
-        termination.recording?.let { recording ->
-          runCatching { recorder.delete(recordingId, recording.uri) }
-            .onFailure {
-              T3VoiceDiagnostics.record(
-                0,
-                T3VoiceDiagnosticCategory.TERMINAL,
-                T3VoiceDiagnosticCode.FAILED,
-              )
-            }
-        }
-        T3VoiceStateStore.clearRecordingTermination(recordingId)
-          true
-        }
-      }
-
-    fun pendingRecordingTermination(): Map<String, Any?>? =
-      T3VoiceStateStore.recordingTermination.value?.toEventBody()
-
-    fun pendingThreadVoiceHandoff(): Map<String, Any>? =
-      mailbox.submitAndAwait(binderMessage("pending-thread-handoff")) {
-        run {
-        val handoff = T3VoiceStateStore.pendingThreadVoiceHandoff() ?: return@run null
-        if (
-          handoff.expiresAtEpochMillis <= System.currentTimeMillis() &&
-            !isThreadVoiceHandoffProtected(handoff.actionId)
-        ) {
-          discardRealtimeHandoffRecordingLocked(handoff.recordingId, "handoff-adoption-expired")
-          T3VoiceStateStore.clearThreadVoiceHandoff(handoff.actionId)
-          return@run null
-        }
-          handoff.toEventBody()
-        }
-      }
-
-    fun beginThreadVoiceHandoffAdoption(actionId: String): Boolean =
-      mailbox.submitAndAwait(binderMessage("begin-thread-handoff-adoption")) {
-        run {
-        val handoff = T3VoiceStateStore.pendingThreadVoiceHandoff()
-          ?.takeIf { it.actionId == actionId }
-          ?: return@run false
-        if (T3VoiceStateStore.isThreadVoiceHandoffAdopted(actionId)) {
-          return@run true
-        }
-        val protectUntil = handoff.expiresAtEpochMillis + HANDOFF_ADOPTION_CLAIM_GRACE_MILLIS
-        if (protectUntil <= System.currentTimeMillis()) {
-          expireThreadVoiceHandoffLocked(actionId, handoff.recordingId)
-          return@run false
-        }
-        if (!T3VoiceStateStore.beginThreadVoiceHandoffAdoption(actionId, protectUntil)) {
-          return@run false
-        }
-        recordingOwner?.takeIf {
-          it.id == handoff.recordingId &&
-            it.domain == T3VoiceOperationOwnerDomain.REALTIME_HANDOFF
-        }?.let { owner ->
-          recordingOwner = owner.copy(
-            domain = T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
-            operationId = handoff.recordingId,
+          T3VoiceBridgeCompletionStore.acknowledgeRecording(
+            completion.owner.domain,
+            completion.owner.operationId,
           )
         }
-        mailbox.submitDelayed(
-          callbackMessage("handoff-protect-expiry"),
-          maxOf(0L, protectUntil - System.currentTimeMillis()),
-          {
-            run {
-              expireThreadVoiceHandoffLocked(actionId, handoff.recordingId)
-            }
-          },
-        )
+      }
+    }
+
+    fun acknowledgeRecordingTermination(operationId: String) {
+      T3VoiceBridgeCompletionStore.acknowledgeRecording(
+        T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
+        operationId,
+      )
+    }
+
+    fun discardUnownedRecordingTermination(operationId: String): Boolean =
+      mailbox.submitAndAwait(binderMessage("discard-recording-termination")) {
+        run {
+          val completion = T3VoiceBridgeCompletionStore.pendingRecordings(
+            T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
+          ).firstOrNull { it.owner.operationId == operationId }
+            ?: return@run false
+          completion.terminal.recording?.let { recording ->
+            runCatching { recorder.delete(completion.terminal.recordingId, recording.uri) }
+              .onFailure {
+                T3VoiceDiagnostics.record(
+                  0,
+                  T3VoiceDiagnosticCategory.TERMINAL,
+                  T3VoiceDiagnosticCode.FAILED,
+                )
+              }
+          }
+          T3VoiceBridgeCompletionStore.acknowledgeRecording(
+            completion.owner.domain,
+            completion.owner.operationId,
+          )
           true
         }
       }
 
-    fun acknowledgeThreadVoiceHandoff(actionId: String, outcome: String) {
-      mailbox.submit(binderMessage("acknowledge-thread-handoff")) {
-        run {
-        val handoff = T3VoiceStateStore.pendingThreadVoiceHandoff()
-          ?.takeIf { it.actionId == actionId }
-          ?: return@run
-        if (outcome == "adopted") {
-          T3VoiceStateStore.markThreadVoiceHandoffAdopted(actionId)
-        } else if (!T3VoiceStateStore.isThreadVoiceHandoffAdopted(actionId)) {
-          discardRealtimeHandoffRecordingLocked(handoff.recordingId, "handoff-adoption-failed")
-          T3VoiceStateStore.clearThreadVoiceHandoff(actionId)
-          }
-        }
-      }
-    }
-
-    fun armThreadVoiceHandoff(nativeSessionId: String) {
-      mailbox.submit(binderMessage("arm-thread-handoff")) {
-        run {
-          if (handoffEligibleSessionId != nativeSessionId) return@run
-          awaitingHandoffAction = true
-        }
-      }
-    }
+    fun pendingRecordingTerminations(): List<Map<String, Any?>> =
+      T3VoiceBridgeCompletionStore.pendingRecordings(
+        T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
+      ).map(T3VoiceRecordingCompletion::toEventBody)
 
     fun startPlayback(playbackId: String, sampleRate: Int, channelCount: Int) {
       mailbox.submit(binderMessage("start-playback")) {
@@ -790,12 +711,17 @@ class T3VoiceRuntimeService : Service() {
       }
     }
 
-    fun acknowledgePlaybackTermination(playbackId: String) {
-      T3VoiceStateStore.clearPlaybackTermination(playbackId)
+    fun acknowledgePlaybackTermination(operationId: String) {
+      T3VoiceBridgeCompletionStore.acknowledgePlayback(
+        T3VoiceOperationOwnerDomain.MANUAL_PLAYBACK,
+        operationId,
+      )
     }
 
-    fun pendingPlaybackTermination(): Map<String, Any>? =
-      T3VoiceStateStore.playbackTermination.value?.toEventBody()
+    fun pendingPlaybackTerminations(): List<Map<String, Any>> =
+      T3VoiceBridgeCompletionStore.pendingPlaybacks(
+        T3VoiceOperationOwnerDomain.MANUAL_PLAYBACK,
+      ).map(T3VoicePlaybackCompletion::toEventBody)
 
     fun prepareRealtimeSession(
       nativeSessionId: String,
@@ -888,16 +814,6 @@ class T3VoiceRuntimeService : Service() {
     fun getAudioRoutes(): List<Map<String, Any>> = realtime.routes()
 
     fun getDiagnostics(): List<Map<String, Any>> = T3VoiceDiagnostics.snapshot()
-
-    fun recordThreadVoiceHandoffClientStage(stage: String) {
-      val code = when (stage) {
-        "accepted" -> T3VoiceDiagnosticCode.HANDOFF_CLIENT_ACCEPTED
-        "navigation-requested" -> T3VoiceDiagnosticCode.HANDOFF_NAVIGATION_REQUESTED
-        "composer-adopted" -> T3VoiceDiagnosticCode.HANDOFF_COMPOSER_ADOPTED
-        else -> error("Unsupported thread voice handoff client stage.")
-      }
-      T3VoiceDiagnostics.record(0, T3VoiceDiagnosticCategory.STATE, code)
-    }
 
     fun setVoiceCuesEnabled(enabled: Boolean): T3VoiceCueSettings =
       mailbox.submitAndAwait(binderMessage("set-cues-enabled")) {
@@ -2236,7 +2152,9 @@ class T3VoiceRuntimeService : Service() {
         )
       }
     }
-      T3VoiceStateStore.recordingTermination.value?.recording?.let(recorder::restoreCompleted)
+      T3VoiceBridgeCompletionStore.pendingRecordings(
+        T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
+      ).mapNotNull { it.terminal.recording }.forEach(recorder::restoreCompleted)
       recorder.sweepStaleCache()
       T3VoiceStateStore.setServiceReady()
       if (reconcilePersistedThreadOperationLocked()) {
@@ -2469,10 +2387,6 @@ class T3VoiceRuntimeService : Service() {
           T3VoiceRuntimeEvent.PlaybackTerminated(owner.id, "cancelled"),
           stopForeground = false,
         )
-      }
-      T3VoiceStateStore.pendingThreadVoiceHandoff()?.let { handoff ->
-        discardRealtimeHandoffRecordingLocked(handoff.recordingId, "service-destroyed")
-        T3VoiceStateStore.clearThreadVoiceHandoff(handoff.actionId)
       }
       stopRuntimeThreadLocked(cancelServer = true)
       cancelVoiceRuntimeRealtimeTasksLocked()
@@ -5808,43 +5722,6 @@ class T3VoiceRuntimeService : Service() {
     awaitingHandoffAction = false
   }
 
-  private fun cancelRealtimeHandoffRecordingLocked(recordingId: String, reason: String) {
-    val state = T3VoiceStateStore.state.value
-    stopTraditionalAudioLocked(
-      state,
-      reason,
-      ownsRecording = { it == recordingId },
-      ownsPlayback = { false },
-    )
-  }
-
-  private fun discardRealtimeHandoffRecordingLocked(recordingId: String, reason: String) {
-    cancelRealtimeHandoffRecordingLocked(recordingId, reason)
-    val termination = T3VoiceStateStore.pendingRealtimeHandoffRecordingTermination(recordingId)
-      ?: T3VoiceStateStore.recordingTermination.value?.takeIf { it.recordingId == recordingId }
-      ?: return
-    termination.recording?.let { recording ->
-      runCatching { recorder.delete(recordingId, recording.uri) }
-    }
-    T3VoiceStateStore.clearRealtimeHandoffRecordingTermination(recordingId)
-    T3VoiceStateStore.clearRecordingTermination(recordingId)
-  }
-
-  private fun isThreadVoiceHandoffProtected(actionId: String): Boolean =
-    T3VoiceStateStore.isThreadVoiceHandoffAdopted(actionId) ||
-      T3VoiceStateStore.isThreadVoiceHandoffAdoptionClaimed(actionId, System.currentTimeMillis())
-
-  private fun expireThreadVoiceHandoffLocked(actionId: String, recordingId: String) {
-    val pending = T3VoiceStateStore.pendingThreadVoiceHandoff()
-      ?.takeIf { it.actionId == actionId && it.recordingId == recordingId }
-      ?: return
-    if (pending.expiresAtEpochMillis > System.currentTimeMillis() || isThreadVoiceHandoffProtected(actionId)) {
-      return
-    }
-    discardRealtimeHandoffRecordingLocked(recordingId, "handoff-adoption-expired")
-    T3VoiceStateStore.clearThreadVoiceHandoff(actionId)
-  }
-
   private fun requireRecordingOwner(
     recordingId: String,
     domain: T3VoiceOperationOwnerDomain,
@@ -6428,7 +6305,6 @@ class T3VoiceRuntimeService : Service() {
     private const val ACTION_START_REALTIME = "expo.modules.t3voice.action.START_REALTIME"
     private const val EXTRA_OPERATION_ID = "operationId"
     private const val RUNTIME_HANDOFF_ACTIVATION_TIMEOUT_MILLIS = 60_000L
-    private const val HANDOFF_ADOPTION_CLAIM_GRACE_MILLIS = 30_000L
     fun requestStop(context: Context) {
       start(context, ACTION_STOP, null)
     }
