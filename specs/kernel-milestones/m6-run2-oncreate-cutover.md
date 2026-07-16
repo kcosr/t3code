@@ -39,6 +39,26 @@ choreography. The fixture matrix from run 1 pins behavior across the cutover.
   RECOVERED install is not so gated. Encode this as interpreter sequencing, not a new
   decision.
 
+## Staging (MANDATORY — three sequential commits, each compiling and green)
+
+A previous run blocked declaring the atomic rewrite infeasible in one turn. Do NOT
+attempt it atomically. Land three commits in this order, running the module tests
+between each:
+
+1. **Commit 1 (additive scaffolding):** add to the service, UNCALLED from onCreate: the
+   loader private method (assembles LoadedState + Permissions per the ordering below —
+   roughly 80 lines), the effect-interpreter private method (a single `when` over
+   `VoiceRuntimeRecoveryEffect`, each arm delegating to the existing executor method —
+   roughly 120 lines including the ReconcileThreadOperation carve-out), and the
+   host-sequence private method. Everything compiles; onCreate byte-identical; all
+   suites green.
+2. **Commit 2 (flip):** replace the onCreate body with the new ~15-line core (stores →
+   loader → recover → deviceIdentity → controller → field assigns → kernel block
+   executing plan.effects). The old choreography code and the two helpers remain in the
+   file, now uncalled. Run-1 fixtures + all suites green.
+3. **Commit 3 (delete):** remove the dead inline choreography remnants, the two
+   helpers, and the superseded inline scenario-5 fallback. Zero references remain.
+
 ## The cutover (host sequence per run-1 ruling R-2)
 
 `onCreate` becomes, in order:
