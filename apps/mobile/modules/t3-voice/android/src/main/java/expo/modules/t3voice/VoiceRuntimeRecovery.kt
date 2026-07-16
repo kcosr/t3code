@@ -118,7 +118,10 @@ internal fun recover(loaded: LoadedState, permissions: Permissions, clock: Clock
         is VoiceRuntimeCommittedReadinessDecision.Current -> readiness = verify(decision.authority.config)
         is VoiceRuntimeCommittedReadinessDecision.Promote -> {
           readiness = verify(decision.authority.config)
-          effects += VoiceRuntimeRecoveryEffect.WriteActivatedReadiness(readiness, decision.authority)
+          effects += VoiceRuntimeRecoveryEffect.WriteActivatedReadiness(
+            decision.authority.config,
+            decision.authority,
+          )
           active = decision.authority
           prepared = null
         }
@@ -132,7 +135,6 @@ internal fun recover(loaded: LoadedState, permissions: Permissions, clock: Clock
       canonical = null
       prepared = null
       active = null
-      effects += VoiceRuntimeRecoveryEffect.Diagnostic(T3VoiceDiagnosticCode.CLEANUP_RECONCILIATION_REQUIRED)
     }
   }
 
@@ -155,7 +157,20 @@ internal fun recover(loaded: LoadedState, permissions: Permissions, clock: Clock
   )
   var attached = loaded.attachedPreparation
   if (resolution.discardPreparation) {
-    val generation = maxOf(resolution.initialGeneration ?: 0, readiness.generation)
+    val readinessRuntimeIds = listOfNotNull(
+      active?.runtimeId,
+      prepared?.runtimeId,
+      attached?.fence?.runtimeId,
+    )
+    val readinessGeneration = readiness.generation.takeIf {
+      resolution.runtimeId == null || readinessRuntimeIds.any { runtimeId ->
+        runtimeId == resolution.runtimeId
+      }
+    }
+    val generation = maxOf(
+      resolution.initialGeneration ?: 0,
+      readinessGeneration ?: 0,
+    )
     readiness = readiness.copy(enabled = false, generation = generation)
     val pending = prepared?.let { T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin) }
       ?: attached?.let { T3VoicePendingRuntimeRevocation(it.fence.runtimeId, it.fence.environmentOrigin) }
@@ -168,6 +183,11 @@ internal fun recover(loaded: LoadedState, permissions: Permissions, clock: Clock
     active = null
   }
   var canonicalPrepared: T3VoicePreparedReadiness? = null
+  prepared?.takeIf { canonical == null && attached == null }?.let {
+    readiness = verify(it.config)
+    effects += VoiceRuntimeRecoveryEffect.WriteReadiness(readiness)
+    canonicalPrepared = it.copy(config = readiness)
+  }
   attached?.takeIf { canonical == null }?.let {
     readiness = verify(it.readiness)
     effects += VoiceRuntimeRecoveryEffect.WriteReadiness(readiness)
