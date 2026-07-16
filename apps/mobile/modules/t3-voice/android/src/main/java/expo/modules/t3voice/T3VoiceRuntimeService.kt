@@ -1731,10 +1731,6 @@ class T3VoiceRuntimeService : Service() {
     val prepared = runCatching { readinessStore.prepared() }
     val active = runCatching { readinessStore.activeAuthority() }
     val threadOperation = runtimeThreadOperationStore.load()
-    val threadRecordingRestored = VoiceRuntimeThreadRecordingRecovery.restore(
-      threadOperation,
-      recorder::restoreCompleted,
-    )
     val permissions = Permissions(
       microphoneGranted = hasPermission(Manifest.permission.RECORD_AUDIO),
       notificationGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
@@ -1757,7 +1753,6 @@ class T3VoiceRuntimeService : Service() {
       activeAuthorityRead = active.isSuccess,
       finalizationRead = finalization.isSuccess,
       checkpointRead = checkpoint.isSuccess,
-      threadRecordingRestored = threadRecordingRestored,
     )
     val authority = (canonical as? VoiceRuntimeAuthorityLoadResult.Available)?.authority
     val reconciliation = authority?.let {
@@ -1850,12 +1845,16 @@ class T3VoiceRuntimeService : Service() {
       }
       canonicalConfigured
     }
-    is VoiceRuntimeRecoveryEffect.RestoreCompletedRecording -> {
-      recorder.restoreCompleted(effect.recording)
-      canonicalConfigured
-    }
-    is VoiceRuntimeRecoveryEffect.DetachActiveThread -> {
-      runtimeThreadOperationStore.writeActive(effect.state)
+    VoiceRuntimeRecoveryEffect.RestoreThreadRecording -> {
+      val loaded = runtimeThreadOperationStore.load()
+      if (!VoiceRuntimeThreadRecordingRecovery.restore(loaded, recorder::restoreCompleted)) {
+        ((loaded as? VoiceRuntimeThreadOperationLoadResult.Available)?.state
+          as? VoiceRuntimeThreadOperationState.Active)?.let { active ->
+          runtimeThreadOperationStore.writeActive(
+            active.copy(recording = null, detached = true, cancelRequested = true),
+          )
+        }
+      }
       canonicalConfigured
     }
     VoiceRuntimeRecoveryEffect.RestoreBridgeCompletions -> {

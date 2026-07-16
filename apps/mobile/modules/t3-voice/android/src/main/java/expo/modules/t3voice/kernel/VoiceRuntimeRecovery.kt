@@ -43,7 +43,6 @@ internal data class LoadedState(
   val activeAuthorityRead: Boolean = true,
   val finalizationRead: Boolean = true,
   val checkpointRead: Boolean = true,
-  val threadRecordingRestored: Boolean = true,
   val canonicalReadinessWriteStatus: CanonicalReadinessWriteStatus =
     CanonicalReadinessWriteStatus.NOT_ATTEMPTED,
 )
@@ -140,8 +139,14 @@ internal sealed interface VoiceRuntimeRecoveryEffect {
   data class Diagnostic(val code: T3VoiceDiagnosticCode, val generation: Long = 0) : VoiceRuntimeRecoveryEffect
   data class ConfigureCanonicalAuthority(val authority: VoiceRuntimePersistedAuthority) : VoiceRuntimeRecoveryEffect
   data class InstallRealtime(val plan: VoiceRuntimeRealtimeInstallPlan) : VoiceRuntimeRecoveryEffect
-  data class RestoreCompletedRecording(val recording: T3VoiceRecordingResult) : VoiceRuntimeRecoveryEffect
-  data class DetachActiveThread(val state: VoiceRuntimeThreadOperationState.Active) : VoiceRuntimeRecoveryEffect
+  /**
+   * Execution-time (like ReconcileThreadOperation): the restore decision needs the live
+   * recorder, which exists only after the kernel-block media driver is built. The
+   * executor re-loads the thread operation, runs
+   * VoiceRuntimeThreadRecordingRecovery.restore(loaded, recorder::restoreCompleted), and
+   * on false writes the Active detach (recording=null, detached, cancelRequested).
+   */
+  data object RestoreThreadRecording : VoiceRuntimeRecoveryEffect
   data object RestoreBridgeCompletions : VoiceRuntimeRecoveryEffect
   data object SweepStaleCache : VoiceRuntimeRecoveryEffect
   data object SetServiceReady : VoiceRuntimeRecoveryEffect
@@ -282,16 +287,7 @@ internal fun recover(loaded: LoadedState, permissions: Permissions, clock: Clock
     else -> VoiceRuntimeRealtimeInstallPlan.None
   }
   if (realtimeInstall !is VoiceRuntimeRealtimeInstallPlan.None) effects += VoiceRuntimeRecoveryEffect.InstallRealtime(realtimeInstall)
-  val recording = ((loaded.threadOperation as? VoiceRuntimeThreadOperationLoadResult.Available)?.state as? VoiceRuntimeThreadOperationState.Active)?.recording
-  if (recording != null && loaded.threadRecordingRestored) {
-    effects += VoiceRuntimeRecoveryEffect.RestoreCompletedRecording(recording)
-  } else if (recording != null) {
-    val active = (loaded.threadOperation as VoiceRuntimeThreadOperationLoadResult.Available)
-      .state as VoiceRuntimeThreadOperationState.Active
-    effects += VoiceRuntimeRecoveryEffect.DetachActiveThread(
-      active.copy(recording = null, detached = true, cancelRequested = true),
-    )
-  }
+  effects += VoiceRuntimeRecoveryEffect.RestoreThreadRecording
   effects += VoiceRuntimeRecoveryEffect.RestoreBridgeCompletions
   effects += VoiceRuntimeRecoveryEffect.SweepStaleCache
   effects += VoiceRuntimeRecoveryEffect.SetServiceReady

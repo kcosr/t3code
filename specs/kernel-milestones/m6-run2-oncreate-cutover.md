@@ -154,3 +154,17 @@ between each:
   `restore(threadOperation, recorder::restoreCompleted)`, and the emitted
   `RestoreCompletedRecording` effect invokes `recorder.restoreCompleted` again. This duplicate is
   benign because the completed-recording registry insert is idempotent and keyed by recording ID.
+
+## Post-deploy device finding (2026-07-16)
+
+First on-device boot after M7 crashed every service create:
+`lateinit property mediaDriver has not been initialized` — the loader ran
+`VoiceRuntimeThreadRecordingRecovery.restore(…, recorder::restoreCompleted)` but
+`recorder` lives on `mediaDriver`, which the host builds later in the kernel block.
+Neither the pure fixtures (never construct the service) nor the pc gate (compiles but
+cannot run instrumented tests) could catch it; the run-2 adjudication had examined the
+call for idempotency only. Fix: `RestoreThreadRecording` is now an execution-time
+effect (the second and last interpreter carve-out) — the executor re-loads the thread
+operation, restores with the live recorder, and writes the Active detach on failure,
+mirroring the pre-M6 kernel-block step exactly. `threadRecordingRestored` left
+LoadedState; rows 9/10 re-pinned at the plan level.

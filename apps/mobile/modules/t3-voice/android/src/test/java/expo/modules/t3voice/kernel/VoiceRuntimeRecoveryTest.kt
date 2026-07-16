@@ -176,28 +176,32 @@ class VoiceRuntimeRecoveryTest {
     })
   }
 
-  @Test fun row9CompletedRecordingRestoresBeforeSweep() {
+  @Test fun row9ThreadRecordingRestoreOrderedBeforeSweep() {
     val recording = recording()
     val effects = plan(LoadedState(
       readinessConfig = readiness(),
       threadOperation = VoiceRuntimeThreadOperationLoadResult.Available(active(recording)),
     )).effects
-    assertBefore<VoiceRuntimeRecoveryEffect.RestoreCompletedRecording,
+    assertBefore<VoiceRuntimeRecoveryEffect.RestoreThreadRecording,
       VoiceRuntimeRecoveryEffect.SweepStaleCache>(effects)
   }
 
-  @Test fun row10FailedRecordingRestoreDetachesActiveClaim() {
+  @Test fun row10ThreadRecordingRestoreIsExecutionTimeAndAlwaysEmitted() {
+    // The restore decision needs the live recorder (built in the kernel block), so the
+    // plan carries no pre-decided Restore/Detach — the executor re-loads and branches.
+    // A plan built with NO thread operation still emits the effect (old step 23 ran
+    // unconditionally; restore() no-ops without an Active recording).
     val plan = plan(LoadedState(
       readinessConfig = readiness(),
       threadOperation = VoiceRuntimeThreadOperationLoadResult.Available(active(recording())),
-      threadRecordingRestored = false,
     ))
-    val detached = plan.effects.filterIsInstance<
-      VoiceRuntimeRecoveryEffect.DetachActiveThread
-      >().single().state
-    assertNull(detached.recording)
-    assertTrue(detached.detached)
-    assertTrue(detached.cancelRequested)
+    plan.effects.filterIsInstance<
+      VoiceRuntimeRecoveryEffect.RestoreThreadRecording
+      >().single()
+    val emptyPlan = plan(LoadedState(readinessConfig = readiness()))
+    emptyPlan.effects.filterIsInstance<
+      VoiceRuntimeRecoveryEffect.RestoreThreadRecording
+      >().single()
   }
 
   @Test fun row11CheckpointChoosesRecoveredInstallOverCanonical() {
@@ -404,7 +408,7 @@ class VoiceRuntimeRecoveryTest {
       VoiceRuntimeRecoveryEffect.ReconcileThreadOperation>(plan.effects)
     assertBefore<VoiceRuntimeRecoveryEffect.SetServiceReady,
       VoiceRuntimeRecoveryEffect.ReconcileThreadOperation>(plan.effects)
-    assertBefore<VoiceRuntimeRecoveryEffect.RestoreCompletedRecording,
+    assertBefore<VoiceRuntimeRecoveryEffect.RestoreThreadRecording,
       VoiceRuntimeRecoveryEffect.SweepStaleCache>(plan.effects)
   }
 
