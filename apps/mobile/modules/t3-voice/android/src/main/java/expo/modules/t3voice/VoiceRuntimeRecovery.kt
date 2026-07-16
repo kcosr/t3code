@@ -9,6 +9,12 @@ internal fun interface Clock {
   fun nowMillis(): Long
 }
 
+internal enum class CanonicalReadinessWriteStatus {
+  NOT_ATTEMPTED,
+  SUCCEEDED,
+  FAILED,
+}
+
 internal data class LoadedState(
   val readinessConfig: T3VoiceReadinessConfig,
   val preparedReadiness: T3VoicePreparedReadiness? = null,
@@ -27,7 +33,60 @@ internal data class LoadedState(
   val finalizationRead: Boolean = true,
   val checkpointRead: Boolean = true,
   val threadRecordingRestored: Boolean = true,
+  val canonicalReadinessWriteStatus: CanonicalReadinessWriteStatus =
+    CanonicalReadinessWriteStatus.NOT_ATTEMPTED,
 )
+
+internal sealed interface CanonicalReadinessReconciliation {
+  data class Transient(val config: T3VoiceReadinessConfig) : CanonicalReadinessReconciliation
+  data class Current(val config: T3VoiceReadinessConfig) : CanonicalReadinessReconciliation
+  data class Promote(
+    val config: T3VoiceReadinessConfig,
+    val authority: T3VoicePreparedReadiness,
+  ) : CanonicalReadinessReconciliation
+}
+
+internal fun canonicalReadinessReconciliation(
+  loaded: LoadedState,
+  permissions: Permissions,
+  authority: VoiceRuntimePersistedAuthority,
+): CanonicalReadinessReconciliation {
+  fun verify(config: T3VoiceReadinessConfig): T3VoiceReadinessConfig {
+    val verified = config.copy(
+      microphonePermissionGranted = config.microphonePermissionGranted && permissions.microphoneGranted,
+      notificationPermissionGranted = config.notificationPermissionGranted && permissions.notificationGranted,
+    )
+    require(!verified.enabled || verified.mode != T3VoiceReadinessMode.THREAD || verified.targetId != null) {
+      "Thread readiness requires a target."
+    }
+    return verified
+  }
+  if (!authority.readinessEnabled) {
+    val readiness = loaded.readinessConfig.copy(
+      microphonePermissionGranted = permissions.microphoneGranted,
+      notificationPermissionGranted = permissions.notificationGranted,
+    )
+    return CanonicalReadinessReconciliation.Transient(
+      verify(T3VoiceCanonicalReadinessPolicy.transient(readiness, authority)),
+    )
+  }
+  check(loaded.persistentReadinessRead)
+  check(loaded.activeAuthorityRead)
+  return when (val decision = VoiceRuntimeCommittedReadinessPolicy.reconcile(
+    authority,
+    loaded.preparedReadiness,
+    loaded.activeAuthority,
+  )) {
+    is VoiceRuntimeCommittedReadinessDecision.Current ->
+      CanonicalReadinessReconciliation.Current(verify(decision.authority.config))
+    is VoiceRuntimeCommittedReadinessDecision.Promote ->
+      CanonicalReadinessReconciliation.Promote(
+        verify(decision.authority.config),
+        decision.authority,
+      )
+    else -> error("Canonical authority and readiness state do not match.")
+  }
+}
 
 internal sealed interface VoiceRuntimeRealtimeInstallPlan {
   data object None : VoiceRuntimeRealtimeInstallPlan
@@ -112,27 +171,29 @@ internal fun recover(loaded: LoadedState, permissions: Permissions, clock: Clock
 
   canonical?.let { authority ->
     val reconciled = runCatching {
-      if (!authority.readinessEnabled) {
-        readiness = verify(T3VoiceCanonicalReadinessPolicy.transient(readiness, authority))
-        effects += VoiceRuntimeRecoveryEffect.WriteReadiness(readiness)
-        prepared = null
-        active = null
-      } else {
-        check(loaded.persistentReadinessRead)
-        check(loaded.activeAuthorityRead)
-        when (val decision = VoiceRuntimeCommittedReadinessPolicy.reconcile(authority, prepared, active)) {
-          is VoiceRuntimeCommittedReadinessDecision.Current ->
-            readiness = verify(decision.authority.config)
-          is VoiceRuntimeCommittedReadinessDecision.Promote -> {
-            readiness = verify(decision.authority.config)
-            effects += VoiceRuntimeRecoveryEffect.WriteActivatedReadiness(
-              decision.authority.config,
-              decision.authority,
-            )
-            active = decision.authority
-            prepared = null
+      when (val reconciliation = canonicalReadinessReconciliation(loaded, permissions, authority)) {
+        is CanonicalReadinessReconciliation.Transient -> {
+          check(loaded.canonicalReadinessWriteStatus != CanonicalReadinessWriteStatus.FAILED)
+          readiness = reconciliation.config
+          if (loaded.canonicalReadinessWriteStatus == CanonicalReadinessWriteStatus.NOT_ATTEMPTED) {
+            effects += VoiceRuntimeRecoveryEffect.WriteReadiness(readiness)
           }
-          else -> error("Canonical authority and readiness state do not match.")
+          prepared = null
+          active = null
+        }
+        is CanonicalReadinessReconciliation.Current ->
+          readiness = reconciliation.config
+        is CanonicalReadinessReconciliation.Promote -> {
+          check(loaded.canonicalReadinessWriteStatus != CanonicalReadinessWriteStatus.FAILED)
+          readiness = reconciliation.config
+          if (loaded.canonicalReadinessWriteStatus == CanonicalReadinessWriteStatus.NOT_ATTEMPTED) {
+            effects += VoiceRuntimeRecoveryEffect.WriteActivatedReadiness(
+              reconciliation.authority.config,
+              reconciliation.authority,
+            )
+          }
+          active = reconciliation.authority
+          prepared = null
         }
       }
     }.isSuccess

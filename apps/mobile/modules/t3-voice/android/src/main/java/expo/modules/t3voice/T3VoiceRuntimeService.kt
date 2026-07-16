@@ -1529,7 +1529,12 @@ class T3VoiceRuntimeService : Service() {
       threadOperation,
       recorder::restoreCompleted,
     )
-    return LoadedState(
+    val permissions = Permissions(
+      microphoneGranted = hasPermission(Manifest.permission.RECORD_AUDIO),
+      notificationGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+        hasPermission(Manifest.permission.POST_NOTIFICATIONS),
+    )
+    var loaded = LoadedState(
       readinessConfig = readinessStore.read(),
       preparedReadiness = prepared.getOrNull(),
       activeAuthority = active.getOrNull(),
@@ -1547,11 +1552,30 @@ class T3VoiceRuntimeService : Service() {
       finalizationRead = finalization.isSuccess,
       checkpointRead = checkpoint.isSuccess,
       threadRecordingRestored = threadRecordingRestored,
-    ) to Permissions(
-      microphoneGranted = hasPermission(Manifest.permission.RECORD_AUDIO),
-      notificationGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-        hasPermission(Manifest.permission.POST_NOTIFICATIONS),
     )
+    val authority = (canonical as? VoiceRuntimeAuthorityLoadResult.Available)?.authority
+    val reconciliation = authority?.let {
+      runCatching { canonicalReadinessReconciliation(loaded, permissions, it) }.getOrNull()
+    }
+    val writeSucceeded = when (reconciliation) {
+      is CanonicalReadinessReconciliation.Transient ->
+        runCatching { readinessStore.write(reconciliation.config) }.isSuccess
+      is CanonicalReadinessReconciliation.Promote ->
+        runCatching {
+          readinessStore.writeActivated(reconciliation.authority.config, reconciliation.authority)
+        }.isSuccess
+      else -> null
+    }
+    if (writeSucceeded != null) {
+      loaded = loaded.copy(
+        canonicalReadinessWriteStatus = if (writeSucceeded) {
+          CanonicalReadinessWriteStatus.SUCCEEDED
+        } else {
+          CanonicalReadinessWriteStatus.FAILED
+        },
+      )
+    }
+    return loaded to permissions
   }
 
   private fun executeRecoveryEffectLocked(

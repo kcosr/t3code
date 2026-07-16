@@ -313,6 +313,22 @@ class VoiceRuntimeRecoveryTest {
       >().single().bestEffort)
   }
 
+  @Test fun failedCanonicalReadinessWriteClearsAuthorityAndDisablesBestEffort() {
+    val plan = plan(LoadedState(
+      readinessConfig = readiness(enabled = true, generation = 9),
+      canonicalAuthority = VoiceRuntimeAuthorityLoadResult.Available(authority(enabled = false)),
+      canonicalReadinessWriteStatus = CanonicalReadinessWriteStatus.FAILED,
+    ))
+    assertEquals(listOf(
+      VoiceRuntimeRecoveryEffect.ClearAuthority("startup-reconciliation-clear-authority"),
+      VoiceRuntimeRecoveryEffect.WriteReadiness(
+        readiness(enabled = false, generation = 9),
+        bestEffort = true,
+      ),
+    ), plan.effects.take(2))
+    assertNull(plan.installedRuntimeId)
+  }
+
   @Test fun attachedPreparationWritesVerifiedReadinessAndSeedsPreparedAuthority() {
     val attached = attached(runtimeId = "runtime", generation = 4)
     val plan = recover(
