@@ -34,18 +34,28 @@ class VoiceRuntimeRecoveryTest {
 
   @Test fun transientCanonicalDoesNotRequireUnreadPersistentReadiness() {
     val canonical = authority(enabled = false)
+    val checkpoint = checkpoint().copy(
+      fence = VoiceRuntimeRealtimeFence(
+        VoiceRuntimeIdentity("checkpoint-runtime", "old", 3),
+        "mode",
+      ),
+    )
     val plan = plan(LoadedState(
       readinessConfig = readiness(enabled = true, generation = 1),
       attachedPreparation = attached(runtimeId = "attached", generation = 7),
       canonicalAuthority = VoiceRuntimeAuthorityLoadResult.Available(canonical),
       persistentReadinessRead = false,
+      realtimeCheckpoint = checkpoint,
+      retiredAuthorityFence = VoiceRuntimeRetiredAuthorityFence("retired-runtime", 8),
     ))
     assertEquals(canonical.runtimeId, plan.installedRuntimeId)
     assertNull(plan.initialGeneration)
     assertNull(plan.canonicalPreparedAuthority)
-    assertFalse(plan.effects.any {
-      it is VoiceRuntimeRecoveryEffect.WriteDisabledForRuntimeRevocation ||
-        it is VoiceRuntimeRecoveryEffect.DiscardInitialPreparation
+    assertTrue(plan.effects.any {
+      it is VoiceRuntimeRecoveryEffect.WriteDisabledForRuntimeRevocation
+    })
+    assertTrue(plan.effects.any {
+      it is VoiceRuntimeRecoveryEffect.DiscardInitialPreparation
     })
   }
 
