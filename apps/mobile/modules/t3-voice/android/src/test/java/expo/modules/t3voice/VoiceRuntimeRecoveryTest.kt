@@ -32,6 +32,23 @@ class VoiceRuntimeRecoveryTest {
     assertEquals(expected, plan.readinessConfig)
   }
 
+  @Test fun transientCanonicalDoesNotRequireUnreadPersistentReadiness() {
+    val canonical = authority(enabled = false)
+    val plan = plan(LoadedState(
+      readinessConfig = readiness(enabled = true, generation = 1),
+      attachedPreparation = attached(runtimeId = "attached", generation = 7),
+      canonicalAuthority = VoiceRuntimeAuthorityLoadResult.Available(canonical),
+      persistentReadinessRead = false,
+    ))
+    assertEquals(canonical.runtimeId, plan.installedRuntimeId)
+    assertNull(plan.initialGeneration)
+    assertNull(plan.canonicalPreparedAuthority)
+    assertFalse(plan.effects.any {
+      it is VoiceRuntimeRecoveryEffect.WriteDisabledForRuntimeRevocation ||
+        it is VoiceRuntimeRecoveryEffect.DiscardInitialPreparation
+    })
+  }
+
   @Test fun row2MismatchClearsAuthorityAndUsesPostWipeFenceViews() {
     val plan = plan(LoadedState(
       readinessConfig = readiness(enabled = true, generation = 9),

@@ -148,7 +148,10 @@ internal fun recover(loaded: LoadedState, permissions: Permissions, clock: Clock
     T3VoiceStartupAuthorityFencePolicy.persistentPreparation(prepared)
   } else Result.success(null)
   val selection = persistentFence.mapCatching {
-    check(loaded.persistentReadinessRead && loaded.attachedPreparationRead && loaded.activeAuthorityRead)
+    check(
+      (canonical != null || loaded.persistentReadinessRead) &&
+        loaded.attachedPreparationRead && loaded.activeAuthorityRead,
+    )
     T3VoiceStartupAuthorityFencePolicy.selectPreparation(it, loaded.attachedPreparation?.takeIf { canonical == null })
   }
   val fences = listOf(
