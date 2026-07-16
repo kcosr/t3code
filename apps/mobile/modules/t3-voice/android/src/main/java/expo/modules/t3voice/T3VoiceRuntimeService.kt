@@ -834,6 +834,8 @@ class T3VoiceRuntimeService : Service() {
             handoffEnvironmentOrigin = null
             awaitingHandoffAction = false
             runCatching { realtime.stop(nativeSessionId) }
+            epochRegistry.current(nativeSessionId)?.let(epochRegistry::retire)
+            mediaDriver.disarmRealtime(nativeSessionId)
             T3VoiceStateStore.releaseRealtimeClaim(nativeSessionId)
             stopRuntimeForegroundLocked()
             T3VoiceDiagnostics.record(
@@ -1623,6 +1625,7 @@ class T3VoiceRuntimeService : Service() {
           }
         }
       }) {
+      epochRegistry.retire(epoch)
       completeRealtimeReadyCueLocked(sessionId, generation)
     }
   }
@@ -1696,6 +1699,7 @@ class T3VoiceRuntimeService : Service() {
       }
     }
     if (!started) {
+      epochRegistry.retire(epoch)
       realtimeEndedCue = null
       stopRuntimeForegroundLocked()
     }
@@ -1723,6 +1727,7 @@ class T3VoiceRuntimeService : Service() {
       )
     pendingRecordingStart = pending
     if (!cueSettings.enabled) {
+      epochRegistry.retire(epoch)
       completeRecordingStartLocked(owner, generation)
       return
     }
@@ -1734,7 +1739,10 @@ class T3VoiceRuntimeService : Service() {
           }
         }
       }
-    if (!started) completeRecordingStartLocked(owner, generation)
+    if (!started) {
+      epochRegistry.retire(epoch)
+      completeRecordingStartLocked(owner, generation)
+    }
   }
 
   private fun completeRecordingStartLocked(owner: T3VoiceOperationOwner, cueGeneration: Long) {
@@ -1812,6 +1820,7 @@ class T3VoiceRuntimeService : Service() {
       }
     }
     if (!started) {
+      epochRegistry.retire(epoch)
       recordingEndedCue = null
       if (T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE) {
         stopRuntimeForegroundLocked()
@@ -3995,7 +4004,6 @@ class T3VoiceRuntimeService : Service() {
       return
     }
     runtimeThreadAttempt = null
-    retireThreadTurnEpoch(attempt.clientOperationId)
     val completed = VoiceRuntimeThreadLocalStopCoordinator.complete(
       clearDurableState = {
         runCatching {
@@ -4015,6 +4023,7 @@ class T3VoiceRuntimeService : Service() {
       ))
       fenceRuntimeThreadForReconciliationLocked(attempt)
     } else {
+      retireThreadTurnEpoch(attempt.clientOperationId)
       reconcileAfterRuntimeThreadStopLocked(attempt)
     }
   }
@@ -4831,12 +4840,16 @@ class T3VoiceRuntimeService : Service() {
         val complete = { dispatchVoiceRuntimeRealtimeControl(onComplete) }
         val epoch = armEpoch(VoiceKernelEpochRootKind.CUE, "cue:engine-ready:$generation")
         if (!cueSettings.enabled) {
+          epochRegistry.retire(epoch)
           complete()
         } else {
           val cueGeneration = epoch.attemptOrdinal
           if (!cueCoordinator.requestReady(cueGeneration) {
               postCueCompletion(epoch, complete)
-            }) complete()
+            }) {
+            epochRegistry.retire(epoch)
+            complete()
+          }
         }
       }
       return true
@@ -4847,12 +4860,16 @@ class T3VoiceRuntimeService : Service() {
         val complete = { dispatchVoiceRuntimeRealtimeControl(onComplete) }
         val epoch = armEpoch(VoiceKernelEpochRootKind.CUE, "cue:engine-ended:$generation")
         if (!cueSettings.enabled) {
+          epochRegistry.retire(epoch)
           complete()
         } else {
           val cueGeneration = epoch.attemptOrdinal
           if (!cueCoordinator.requestEnded(cueGeneration) {
               postCueCompletion(epoch, complete)
-            }) complete()
+            }) {
+            epochRegistry.retire(epoch)
+            complete()
+          }
         }
       }
       return true

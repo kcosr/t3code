@@ -70,11 +70,20 @@ ineffective; the record of why is kept here because M5/M6 touch the same seams.
 - CUE: retired in `handleDriverResult` after an admitted `CueCompleted` dispatch. The
   `admitCueTerminal` once-latch stays (unchanged exactly-once); post-retire duplicates now
   drop as `STALE_DRIVER_RESULT(ROOT_OPERATION)` rather than `DUPLICATE_CUE_TERMINAL`
-  (nothing asserts the latter).
+  (nothing asserts the latter). Adversarial-review fix round (finding M1): every cue site
+  that arms but then skips the coordinator (`!cueSettings.enabled`, or
+  `requestReady`/`requestEnded` returning false) retires the armed epoch in that fallback
+  branch — otherwise no `CueCompleted` ever fires and disabled-cue operation leaks one
+  entry per cue event.
 - REALTIME legacy (nativeSessionId roots): retired at the end of the non-canonical
-  `handleRealtimeTerminatedLocked` branch and in `drainRealtimeForStopLocked`'s
-  drain-completed continuation + throw path (all + media disarm). This surface is
-  Android-unreachable and dies in M5; retires keep the interim bounded.
+  `handleRealtimeTerminatedLocked` branch, in `drainRealtimeForStopLocked`'s
+  drain-completed continuation + throw path, and in the prepare-failure catch
+  (review finding L1) — all + media disarm. This surface is Android-unreachable and dies
+  in M5; retires keep the interim bounded.
+- Review finding L2: `stopRuntimeThreadLocked` retires only on the `completed` branch
+  (the `!completed` branch revives the attempt and ends in
+  `fenceRuntimeThreadForReconciliationLocked`, which retires) — symmetric
+  retire-after-verify like the other five thread terminals.
 - REALTIME mode/canonical-peer (modeSessionId shared key): retired in
   `applyRealtimeReduction` when the applied reduction changes the checkpoint's
   modeSessionId (the single funnel every mode-session end passes through), before effect/
