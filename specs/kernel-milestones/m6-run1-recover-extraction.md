@@ -31,7 +31,21 @@ NEW pure helper extracted from the svc:1884-1895 grant-match logic
 (`VoiceRuntimeThreadStoredStatePolicy.parentGrantAvailable(grant?, loaded)` or
 equivalent), calls the existing pure `decide`, and dispatches. The pure policy stays the
 sole decision-maker; only its authority INPUT is fresh. Run 1 ships the helper + its
-tests, including the pinning case: Prepared claim, grant=null → REVOKE.
+tests, including the pinning case: Prepared claim, grant=null → REVOKE. Executor
+details (re-verdict, binding): the executor re-loads the thread-op store fresh (matches
+live svc:1882) and `decide` uses execution-time `now` (live svc:1883), not the plan
+Clock.
+
+**R-1b (re-verdict C-1): the REVOKE selection is ALSO execution-time.** The
+pending-revocation selection (svc:1935-1948) is reached only when decide=REVOKE and its
+Locked branch falls back to the FRESH grant (svc:1944) — on configure-throw the effect
+SHAPE flips (grant-based disable/clear/invalidate vs locked-clear + snapshot reset). It
+can never be a plan effect. Extract it as a SECOND pure helper — inputs: loaded
+thread-op state, the pendingRuntimeRevocation view, the activeAuthority view, and
+`grant` — shipped + tested in run 1 with both fresh-grant cases pinned: (Locked,
+grant=A) → pending-based disable + clear + invalidateReadiness; (Locked, grant=null, no
+active) → clearLockedAfterAuthorityRevocation + snapshot reset. The plan carries NO
+thread-op revoke effects; the run-2 executor invokes this helper with fresh reads.
 
 **R-2: plan seed carries every surviving service field (F1-B).** The KernelState-seed
 MUST include, at minimum: `installedRuntimeId`, `initialGeneration`,
@@ -89,10 +103,15 @@ restoreCompleted, sweepStaleCache, setServiceReady, engine installs, ReconcileTh
 - NOT an effect: `restoreProcess` (F1-E) — it is internal to the RESTORE executor
   (`startRuntimeThreadLocked` svc:2293-2294), not plan-observable. Drop it from the
   plan-effect assertions; it stays covered by the existing execution-recovery tests.
-- The revoke effect's disabled-config generation is CONTROLLER-resolved at execution
-  (svc:1950-1953 reads `controller.snapshot().identity.generation`) — the effect
-  carries the selection, not an absolute generation (F1-H); fixtures assert selection +
-  clear/invalidate effects only.
+- The thread-op REVOKE path contributes NO plan effects (R-1b) — its selection helper
+  runs in the executor with fresh reads, and its disabled-config generation is
+  controller-resolved there (svc:1950-1953). `writeDisabledForRuntimeRevocation` stays
+  in the vocabulary for the step-15 DISCARD block only (which IS plan-computed).
+- Row-10 detach effect is named: `writeActive(recording=null, detached=true,
+cancelRequested=true)` (svc:1865-1867).
+- Promote-path note: the post-`writeActivated` activeAuthority view is derivable purely
+  from the decision's authority; downstream only (runtimeId, config.generation) are
+  consumed.
 - `verifyReadiness` is impure (permissions/SDK reads + require-throw, svc:1462-1476):
   recover() reproduces its overlay from the `Permissions` param INCLUDING the throwing
   require semantics (F1-I) — do not lift the method verbatim.
@@ -102,7 +121,8 @@ restoreCompleted, sweepStaleCache, setServiceReady, engine installs, ReconcileTh
 - NEW `VoiceRuntimeRecovery.kt` (flat package — `kernel/` is M7): LoadedState,
   Permissions, VoiceRuntimeRecoveryPlan, sealed VoiceRuntimeRecoveryEffect, recover().
 - `T3VoiceReadiness.kt`: `resolveWithFallback` (R-3).
-- `VoiceRuntimeThreadExecution.kt`: the pure `parentGrantAvailable` helper (R-1).
+- `VoiceRuntimeThreadExecution.kt`: the pure `parentGrantAvailable` helper (R-1) and
+  the pure revocation-selection helper (R-1b).
 - NEW test file(s): fixture matrix + helper tests. No other production changes;
   onCreate untouched.
 
@@ -115,7 +135,9 @@ uses resolveWithFallback's widened inputs; rows 6/7/8 assert the
 ReconcileThreadOperation effect (loaded state + position after
 ConfigureCanonicalAuthority) — the decide outcomes are covered by the existing decide
 tests plus the new parentGrantAvailable helper tests (including grant=null → REVOKE
-pinning); row 8 asserts revocation selection without absolute generation; the PLAYING
+pinning); row 8's PLAN fixture asserts only the ReconcileThreadOperation payload +
+position — the revocation selection is asserted via the R-1b helper's own tests (both
+fresh-grant cases); the PLAYING
 cross-product row asserts the RESTORE-arm reachability only (no restoreProcess plan
 effect). Ordering fixtures: restore-before-sweep, ready-before-reconcile,
 configure-before-install-and-reconcile, recovered-install-excludes-canonical. All

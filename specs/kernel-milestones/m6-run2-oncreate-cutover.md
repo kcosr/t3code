@@ -8,11 +8,18 @@ choreography. The fixture matrix from run 1 pins behavior across the cutover.
 
 ## Review correspondence (pre-launch findings — binding)
 
-- F2-A: the ReconcileThreadOperation effect is the ONE carve-out from "dumb dispatch":
-  its executor re-reads `authorityStore.load()` fresh (AFTER ConfigureCanonicalAuthority
-  ran, whose failure path clears the store), computes `parentGrantAvailable` via run 1's
-  pure helper, calls the pure `decide`, and dispatches — preserving the live
-  REVOKE-on-failed-restore safety behavior. No other interpreter arm decides anything.
+- F2-A (widened per re-verdict): the ReconcileThreadOperation executor is the ONE
+  carve-out from "dumb dispatch". It: re-loads the thread-op store fresh (live
+  svc:1882); re-reads `authorityStore.load()` fresh (AFTER ConfigureCanonicalAuthority
+  ran, whose failure path clears the store); computes `parentGrantAvailable` via run
+  1's pure helper; calls the pure `decide` with execution-time `now`; and on REVOKE
+  reads `pendingRuntimeRevocation()`/`activeAuthority()` live, invokes run 1's pure
+  revocation-selection helper with the fresh grant, executes the selected effect shape
+  (grant-based disable/clear/invalidate vs locked-clear + snapshot reset), resolves the
+  disabled-config generation from the controller, AND performs the three field
+  mutations the deleted helper performs today: `readinessConfig = disabled`
+  (svc:1955), `canonicalPreparedAuthority = null` (svc:1956), `runtimeSnapshot = empty`
+  on the Locked-clear branch (svc:1964). No other interpreter arm decides anything.
 - F2-B: the host MUST assign `readinessConfig` and `runtimeSnapshot` (and `cueSettings`)
   from the plan before the kernel block — omitting them leaves field defaults and
   silently discards the permission overlay, reconcile results, and healed snapshot
@@ -38,7 +45,8 @@ choreography. The fixture matrix from run 1 pins behavior across the cutover.
 5. Construct `voiceRuntimeController` from plan identity data (the existing ~1719-1794
    execution-closure block moves intact — it is host wiring, not decision logic).
 6. ASSIGN from plan: `readinessConfig = plan.readinessConfig`,
-   `runtimeSnapshot = plan.runtimeSnapshot`, `cueSettings = plan.cueSettings` (F2-B).
+   `runtimeSnapshot = plan.runtimeSnapshot`, `cueSettings = plan.cueSettings`,
+   `canonicalPreparedAuthority = plan.canonicalPreparedAuthority` (F2-B + re-verdict).
    Then `createHostDriver()`; notification channel (unchanged host).
 7. Kernel-thread block (`submitAndAwait("service-create-recovery")`): construct
    mediaDriver (unchanged), then EXECUTE `plan.effects` in emitted order via the
@@ -54,8 +62,10 @@ choreography. The fixture matrix from run 1 pins behavior across the cutover.
 - The inline decision choreography inside `onCreate` (the ~388-line body's steps 2-16,
   18, and the kernel block's decision content of steps 21-26 — everything recover() now
   owns), and the two helpers `reconcilePersistedThreadOperationLocked` +
-  `revokePersistedThreadOperationLocked` (their decision halves live in recover(); their
-  effect halves live in the interpreter).
+  `revokePersistedThreadOperationLocked` (their decision halves live in the pure
+  policies/helpers; the thread-op reconcile and revoke halves are invoked by the
+  interpreter at execution per F2-A; the remaining effect halves live in the
+  interpreter).
 - The now-uncalled inline scenario-5 fallback (superseded by resolveWithFallback).
 - Nothing else. Methods the interpreter calls (restoreCanonicalAuthorityLocked,
   installRecoveredRealtimeStateLocked, installRealtimeEngineLocked,
