@@ -1607,7 +1607,7 @@ class T3VoiceRuntimeService : Service() {
       when (val install = effect.plan) {
         is VoiceRuntimeRealtimeInstallPlan.Recovered -> {
           if (!installRecoveredRealtimeStateLocked() && canonicalConfigured) {
-            canonicalRealtimeAuthorityLocked()?.let(::installRealtimeEngineLocked)
+            persistedAuthority()?.let(::installRealtimeEngineLocked)
           }
         }
         is VoiceRuntimeRealtimeInstallPlan.Canonical ->
