@@ -428,6 +428,46 @@ internal enum class VoiceRuntimeThreadStoredStateDecision {
 }
 
 internal object VoiceRuntimeThreadStoredStatePolicy {
+  fun parentGrantAvailable(
+    grant: VoiceRuntimePersistedAuthority?,
+    loaded: VoiceRuntimeThreadOperationLoadResult,
+  ): Boolean {
+    val claim = ((loaded as? VoiceRuntimeThreadOperationLoadResult.Available)?.state
+      as? VoiceRuntimeThreadOperationState.Prepared)?.claim ?: return false
+    val target = grant?.target as? VoiceRuntimeTarget.Thread ?: return false
+    return grant.runtimeId == claim.runtimeId &&
+      grant.generation == claim.readinessGeneration &&
+      grant.environmentOrigin == claim.environmentOrigin &&
+      target.projectId == claim.projectId && target.threadId == claim.threadId
+  }
+
+  sealed interface RevocationSelection {
+    data class Disable(val pending: T3VoicePendingRuntimeRevocation) : RevocationSelection
+    data object ClearLocked : RevocationSelection
+    data object None : RevocationSelection
+  }
+
+  fun selectRevocation(
+    loaded: VoiceRuntimeThreadOperationLoadResult,
+    pendingRuntimeRevocation: T3VoicePendingRuntimeRevocation?,
+    activeAuthority: T3VoicePreparedReadiness?,
+    grant: VoiceRuntimePersistedAuthority?,
+  ): RevocationSelection {
+    val pending = pendingRuntimeRevocation ?: when (loaded) {
+      is VoiceRuntimeThreadOperationLoadResult.Available ->
+        T3VoicePendingRuntimeRevocation(loaded.state.claim.runtimeId, loaded.state.claim.environmentOrigin)
+      VoiceRuntimeThreadOperationLoadResult.Locked -> activeAuthority?.let {
+        T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin)
+      } ?: grant?.let { T3VoicePendingRuntimeRevocation(it.runtimeId, it.environmentOrigin) }
+      VoiceRuntimeThreadOperationLoadResult.Missing -> null
+    }
+    return when {
+      pending != null -> RevocationSelection.Disable(pending)
+      loaded == VoiceRuntimeThreadOperationLoadResult.Locked -> RevocationSelection.ClearLocked
+      else -> RevocationSelection.None
+    }
+  }
+
   fun decide(
     loaded: VoiceRuntimeThreadOperationLoadResult,
     parentGrantAvailable: Boolean,

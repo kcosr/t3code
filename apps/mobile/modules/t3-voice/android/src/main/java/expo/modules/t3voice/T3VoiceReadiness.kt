@@ -187,6 +187,41 @@ internal object T3VoiceStartupAuthorityFencePolicy {
       discardPreparation = true,
     )
   }
+
+  fun resolveWithFallback(
+    preparation: Result<T3VoiceStartupAuthorityFence?>,
+    recoveredFences: List<T3VoiceRecoveredAuthorityFence?>,
+    persistentReadiness: T3VoicePreparedReadiness?,
+    attachedPreparation: VoiceRuntimePreparedAttachedAuthority?,
+    canonicalInstalledPresent: Boolean,
+    persistentReadinessRead: Boolean,
+    attachedPreparationRead: Boolean,
+    activeAuthorityRead: Boolean,
+  ): T3VoiceStartupAuthorityResolution = preparation.fold(
+    onSuccess = { resolve(it, *recoveredFences.toTypedArray()) },
+    onFailure = {
+      val recoveredRuntimeId = recoveredFences.filterNotNull().firstOrNull()?.runtimeId
+      val preparationRuntimeId = runCatching {
+        selectRuntimeId(persistentReadiness?.runtimeId, attachedPreparation?.fence?.runtimeId)
+      }.getOrNull()
+      val selectedRuntimeId = recoveredRuntimeId ?: preparationRuntimeId
+      val recoveredGeneration = recoveredFences.asSequence().filterNotNull()
+        .filter { it.runtimeId == selectedRuntimeId }.maxOfOrNull { it.generation }
+      val preparationGeneration = sequenceOf(
+        persistentReadiness?.let { it.runtimeId to it.config.generation },
+        attachedPreparation?.fence?.let { it.runtimeId to it.generation },
+      ).filterNotNull().filter { it.first == selectedRuntimeId }.maxOfOrNull { it.second }
+      T3VoiceStartupAuthorityResolution(
+        preparation = null,
+        runtimeId = selectedRuntimeId,
+        initialGeneration = recoveredGeneration ?: preparationGeneration,
+        discardPreparation = !canonicalInstalledPresent && (
+          !persistentReadinessRead || !attachedPreparationRead || persistentReadiness != null ||
+            !activeAuthorityRead || attachedPreparation != null
+          ),
+      )
+    },
+  )
 }
 
 internal object T3VoiceDisabledTerminalCleanupCoordinator {
