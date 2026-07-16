@@ -674,21 +674,6 @@ internal class T3VoiceControllerCommands {
   val pending: StateFlow<T3VoicePendingCommand?> = mutablePending.asStateFlow()
 
   @Synchronized
-  fun register(generation: Long) {
-    if (controllerGeneration == generation) return
-    controllerGeneration = generation
-    mutablePending.value = null
-  }
-
-  @Synchronized
-  fun unregister(generation: Long) {
-    if (controllerGeneration == generation) {
-      controllerGeneration = null
-      mutablePending.value = null
-    }
-  }
-
-  @Synchronized
   fun isAttached(): Boolean = controllerGeneration != null
 
   @Synchronized
@@ -710,14 +695,6 @@ internal class T3VoiceControllerCommands {
     ).also { mutablePending.value = it }
   }
 
-  @Synchronized
-  fun complete(commandId: String, generation: Long, outcome: String): Boolean {
-    require(outcome == "success" || outcome == "failure")
-    val pending = mutablePending.value ?: return false
-    if (pending.commandId != commandId || pending.controllerGeneration != generation) return false
-    mutablePending.value = null
-    return true
-  }
 }
 
 internal object T3VoiceForegroundLifecyclePolicy {
