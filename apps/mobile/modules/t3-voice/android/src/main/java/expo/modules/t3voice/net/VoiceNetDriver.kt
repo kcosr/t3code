@@ -50,7 +50,14 @@ internal class VoiceNetDriver(
     blockingBody: () -> (() -> Unit),
   ) {
     executors.getValue(lane).execute {
-      val continuation = blockingBody()
+      android.util.Log.i("T3VoiceDbg", "net.exec:" + label)
+      val continuation = try {
+        blockingBody()
+      } catch (t: Throwable) {
+        android.util.Log.e("T3VoiceDbg", "net.THREW:" + label, t)
+        throw t
+      }
+      android.util.Log.i("T3VoiceDbg", "net.done:" + label)
       resultSink.post(
         VoiceKernelMessage.DriverResult(
           epoch = epoch,

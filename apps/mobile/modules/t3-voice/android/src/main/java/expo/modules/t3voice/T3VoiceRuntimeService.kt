@@ -321,6 +321,13 @@ internal object T3VoiceRealtimeFinalizationCallbackPolicy {
   ): Boolean = !hasFinalization && !hasCheckpoint
 }
 
+
+internal object VoiceDbg {
+  fun t(msg: String) {
+    android.util.Log.i("T3VoiceDbg", msg)
+  }
+}
+
 internal class T3VoiceRecordingNotStartedException : IllegalStateException(
   "The recording stopped before microphone capture began.",
 )
@@ -403,6 +410,7 @@ class T3VoiceRuntimeService : Service() {
       VoiceKernelEpochPolicy.admit(currentEpoch, result.epoch)
     } ?: VoiceKernelEpochAdmission.DropStale(VoiceKernelEpochStalenessDimension.ROOT_OPERATION)
     if (admission is VoiceKernelEpochAdmission.DropStale) {
+      VoiceDbg.t("DROP:${result.driver}/${result.resultKind}:${admission.dimension}")
       T3VoiceDiagnostics.record(
         generation = 0,
         category = T3VoiceDiagnosticCategory.KERNEL,
@@ -420,6 +428,7 @@ class T3VoiceRuntimeService : Service() {
       )
       return
     }
+    VoiceDbg.t("admit:${result.driver}/${result.resultKind}")
     when (result.driver) {
       VoiceKernelDriver.NET -> {
         val payload = result.payload as VoiceKernelDriverResultPayload.NetCompleted
@@ -1782,7 +1791,8 @@ class T3VoiceRuntimeService : Service() {
   private fun executeRecoveryEffectLocked(
     effect: VoiceRuntimeRecoveryEffect,
     canonicalConfigured: Boolean,
-  ): Boolean = when (effect) {
+  ): Boolean = VoiceDbg.t("recoveryEffect:${effect::class.java.simpleName}")
+    when (effect) {
     is VoiceRuntimeRecoveryEffect.WriteReadiness -> {
       if (effect.bestEffort) {
         runCatching { readinessStore.write(effect.config) }
@@ -3997,8 +4007,10 @@ class T3VoiceRuntimeService : Service() {
     val modeSessionBefore = voiceRuntimeRealtimeEngineSlot.snapshot().current
       ?.state?.checkpoint?.fence?.modeSessionId
     if (voiceRuntimeRealtimeEngineSlot.applyReduction(reduction) == null) {
+      VoiceDbg.t("reduction REJECTED by slot (effects=${reduction.effects.size})")
       return reduction.result
     }
+    VoiceDbg.t("reduction applied: effects=${reduction.effects.size} outputs=${reduction.outputs.size}")
     if (modeSessionBefore != null &&
       realtimeState(engine).checkpoint?.fence?.modeSessionId != modeSessionBefore
     ) {
@@ -4055,6 +4067,7 @@ class T3VoiceRuntimeService : Service() {
     engine: VoiceRuntimeRealtimeReducer,
     effect: VoiceRuntimeRealtimeEffect,
   ) {
+    VoiceDbg.t("effect:${effect::class.java.simpleName}")
     fun apply(reduction: VoiceRuntimeRealtimeReduction<*>) {
       applyRealtimeReduction(engine, reduction)
     }
@@ -4068,6 +4081,7 @@ class T3VoiceRuntimeService : Service() {
         val result = runCatching(operation)
         val continuation: () -> Unit = {
           result.map(complete).onSuccess(::apply).onFailure {
+            VoiceDbg.t("net.opFailed:$name -> $it")
             recordVoiceRuntimeRealtimeControlFailure()
           }
         }
@@ -4604,6 +4618,7 @@ class T3VoiceRuntimeService : Service() {
     // await the kernel or invoke the engine completion inline; control IO re-enters the engine only
     // after the monitor-holding call has returned.
     override fun ready(generation: Long, onComplete: () -> Unit): Boolean {
+      VoiceDbg.t("cuePort.ready gen=$generation")
       mailbox.submit(callbackMessage("realtime-ready-cue-request")) {
         val complete = { dispatchVoiceRuntimeRealtimeControl(onComplete) }
         val epoch = armEpoch(VoiceKernelEpochRootKind.CUE, "cue:engine-ready:$generation")
@@ -4624,6 +4639,7 @@ class T3VoiceRuntimeService : Service() {
     }
 
     override fun ended(generation: Long, onComplete: () -> Unit): Boolean {
+      VoiceDbg.t("cuePort.ended gen=$generation")
       mailbox.submit(callbackMessage("realtime-ended-cue-request")) {
         val complete = { dispatchVoiceRuntimeRealtimeControl(onComplete) }
         val epoch = armEpoch(VoiceKernelEpochRootKind.CUE, "cue:engine-ended:$generation")
@@ -4645,11 +4661,12 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun dispatchVoiceRuntimeRealtimeControl(block: () -> Unit) {
+    VoiceDbg.t("rtControl.dispatch")
     runCatching {
       netDriver.executeDetached("realtime-control", VoiceNetLane.CONTROL, driverEpoch()) {
         block()
       }
-    }
+    }.onFailure { VoiceDbg.t("rtControl.dispatch FAILED: $it") }
   }
 
   private fun realtimeHandoffPort(): VoiceRuntimeRealtimeHandoffCoordinator =

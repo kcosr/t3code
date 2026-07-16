@@ -191,6 +191,7 @@ internal class VoiceRuntimeRealtimeEngineSlot<E : Any>(
             candidateIdentity.generation != installedIdentity.generation + 1
         )
     ) {
+      android.util.Log.i("T3VoiceDbg", "slot.replacementFenceReject")
       throw VoiceRuntimeFenceException("Replacement Realtime authority changed its runtime fence.")
     }
   }
