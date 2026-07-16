@@ -6,24 +6,47 @@ the full fixture matrix all green with onCreate untouched). Binding inventory:
 to loader → `recover()` → host sequence → effect execution, then DELETE the inline
 choreography. The fixture matrix from run 1 pins behavior across the cutover.
 
+## Review correspondence (pre-launch findings — binding)
+
+- F2-A: the ReconcileThreadOperation effect is the ONE carve-out from "dumb dispatch":
+  its executor re-reads `authorityStore.load()` fresh (AFTER ConfigureCanonicalAuthority
+  ran, whose failure path clears the store), computes `parentGrantAvailable` via run 1's
+  pure helper, calls the pure `decide`, and dispatches — preserving the live
+  REVOKE-on-failed-restore safety behavior. No other interpreter arm decides anything.
+- F2-B: the host MUST assign `readinessConfig` and `runtimeSnapshot` (and `cueSettings`)
+  from the plan before the kernel block — omitting them leaves field defaults and
+  silently discards the permission overlay, reconcile results, and healed snapshot
+  (invisible to the pure fixtures; the revoke executor reads `readinessConfig` at
+  svc:1951).
+- F2-C: interpreter arms exist for the readiness write effects
+  (WriteReadiness/WriteActivatedReadiness); there is NO restoreProcess effect (it is
+  internal to `startRuntimeThreadLocked`).
+- F2-E: where seam-map §6/§7 says "relocate recover() to kernel/", the packets govern —
+  no package moves before M7.
+
 ## The cutover (host sequence per run-1 ruling R-2)
 
 `onCreate` becomes, in order:
 
 1. Construct stores + repos (unchanged — these are loader inputs).
 2. LOADER: assemble `LoadedState` (all 13 sources, seam map §2) + Permissions snapshot;
-   `LegacyRealtimeCutover.migrate` runs here in its current shape (loader-side).
+   ordering: `retireLegacyV2` before `authorityStore.load()`; snapshot read before
+   `LegacyRealtimeCutover.migrate` (loader-side, current shape); the healed snapshot
+   enters LoadedState.
 3. `val plan = recover(loadedState, permissions, clock)`.
 4. `deviceIdentity.getOrCreate(plan.installedRuntimeId)` (durable write, host).
 5. Construct `voiceRuntimeController` from plan identity data (the existing ~1719-1794
    execution-closure block moves intact — it is host wiring, not decision logic).
-6. Cue settings from plan; `createHostDriver()`; notification channel (unchanged host).
+6. ASSIGN from plan: `readinessConfig = plan.readinessConfig`,
+   `runtimeSnapshot = plan.runtimeSnapshot`, `cueSettings = plan.cueSettings` (F2-B).
+   Then `createHostDriver()`; notification channel (unchanged host).
 7. Kernel-thread block (`submitAndAwait("service-create-recovery")`): construct
-   mediaDriver (unchanged), then EXECUTE `plan.effects` in emitted order via a single
+   mediaDriver (unchanged), then EXECUTE `plan.effects` in emitted order via the
    effect-interpreter `when` — each effect maps to the existing method per seam map §4
-   (configure authority, engine-slot recovered/canonical install, thread-op writes,
-   revoke sequence, restoreCompleted calls, sweepStaleCache, setServiceReady,
-   startRuntimeThreadLocked, restoreProcess, storeDriver clears with driverEpoch() at
+   (configure authority, engine-slot recovered/canonical install, readiness writes,
+   thread-op writes, revoke sequence — its disabled-config generation resolved from the
+   controller at execution — restoreCompleted calls, sweepStaleCache, setServiceReady,
+   ReconcileThreadOperation per F2-A, storeDriver clears with driverEpoch() at
    execution, diagnostics).
 
 ## Deletions (only after the cutover compiles against the interpreter)
@@ -72,7 +95,9 @@ choreography. The fixture matrix from run 1 pins behavior across the cutover.
 - No changes to recover()'s decisions — if the cutover exposes a divergence between the
   old inline behavior and recover()'s plan, STOP and surface it (that is a run-1 defect
   to fix THERE, with a fixture, not something to absorb in the interpreter).
-- No new decision logic in the service — the interpreter is a dumb dispatch table.
+- No new decision logic in the service — the interpreter is a dumb dispatch table, with
+  EXACTLY ONE carve-out: the ReconcileThreadOperation executor's fresh authority read +
+  pure-helper + pure-decide call (F2-A). Nothing else decides.
 
 ## Done criteria
 
