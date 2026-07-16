@@ -32,14 +32,17 @@ class VoiceRuntimeRecoveryTest {
     assertNull(plan.installedRuntimeId)
   }
 
-  @Test fun row3PersistentPreparationSurvivesAndWritesReadiness() {
+  @Test fun row3PersistentPreparationSurvivesAsFenceWithoutMaterialization() {
     val prepared = prepared(generation = 4)
+    val baseReadiness = readiness(enabled = false, generation = 2)
     val plan = plan(LoadedState(
-      readinessConfig = prepared.config,
+      readinessConfig = baseReadiness,
       preparedReadiness = prepared,
     ))
-    assertEquals(prepared, plan.canonicalPreparedAuthority)
-    assertTrue(plan.effects.first() is VoiceRuntimeRecoveryEffect.WriteReadiness)
+    assertNull(plan.canonicalPreparedAuthority)
+    assertEquals(3L, plan.initialGeneration)
+    assertEquals(baseReadiness, plan.readinessConfig)
+    assertFalse(plan.effects.any { it is VoiceRuntimeRecoveryEffect.WriteReadiness })
   }
 
   @Test fun row4ConflictingFenceDiscardsPreparationInOrder() {

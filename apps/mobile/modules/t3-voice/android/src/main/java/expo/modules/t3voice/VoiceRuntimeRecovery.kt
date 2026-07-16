@@ -183,11 +183,6 @@ internal fun recover(loaded: LoadedState, permissions: Permissions, clock: Clock
     active = null
   }
   var canonicalPrepared: T3VoicePreparedReadiness? = null
-  prepared?.takeIf { canonical == null && attached == null }?.let {
-    readiness = verify(it.config)
-    effects += VoiceRuntimeRecoveryEffect.WriteReadiness(readiness)
-    canonicalPrepared = it.copy(config = readiness)
-  }
   attached?.takeIf { canonical == null }?.let {
     readiness = verify(it.readiness)
     effects += VoiceRuntimeRecoveryEffect.WriteReadiness(readiness)
