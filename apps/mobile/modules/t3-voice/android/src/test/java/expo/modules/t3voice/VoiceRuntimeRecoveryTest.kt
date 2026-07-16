@@ -9,12 +9,27 @@ import org.junit.Test
 class VoiceRuntimeRecoveryTest {
   @Test fun row1CanonicalDisabledWritesTransientReadiness() {
     val canonical = authority(enabled = false)
+    val loadedReadiness = readiness(enabled = true, generation = 1).copy(
+      mode = T3VoiceReadinessMode.REALTIME,
+      targetId = "old-target",
+      audioRouteId = "headset",
+      autoRearm = true,
+    )
     val plan = plan(LoadedState(
-      readinessConfig = readiness(enabled = true, generation = 1),
+      readinessConfig = loadedReadiness,
       canonicalAuthority = VoiceRuntimeAuthorityLoadResult.Available(canonical),
     ))
-    assertTrue(plan.effects.any { it is VoiceRuntimeRecoveryEffect.WriteReadiness })
-    assertEquals(canonical.generation, plan.readinessConfig.generation)
+    val expected = loadedReadiness.copy(
+      enabled = false,
+      mode = T3VoiceReadinessMode.THREAD,
+      targetId = "project/thread",
+      generation = canonical.generation,
+    )
+    assertEquals(
+      VoiceRuntimeRecoveryEffect.WriteReadiness(expected),
+      plan.effects.first(),
+    )
+    assertEquals(expected, plan.readinessConfig)
   }
 
   @Test fun row2MismatchClearsAuthorityAndUsesPostWipeFenceViews() {
@@ -52,11 +67,25 @@ class VoiceRuntimeRecoveryTest {
       preparedReadiness = prepared,
       retiredAuthorityFence = VoiceRuntimeRetiredAuthorityFence("recovered", 8),
     ))
-    val write = plan.effects.indexOfFirst {
-      it is VoiceRuntimeRecoveryEffect.WriteDisabledForRuntimeRevocation
-    }
+    val expectedPending = T3VoicePendingRuntimeRevocation(
+      prepared.runtimeId,
+      prepared.environmentOrigin,
+    )
+    val writeEffect = plan.effects.filterIsInstance<
+      VoiceRuntimeRecoveryEffect.WriteDisabledForRuntimeRevocation
+      >().single()
+    assertEquals(expectedPending, writeEffect.pending)
+    assertEquals(8L, writeEffect.config.generation)
+    val write = plan.effects.indexOf(writeEffect)
     assertTrue(write >= 0)
     assertEquals(VoiceRuntimeRecoveryEffect.DiscardInitialPreparation, plan.effects[write + 1])
+    assertEquals(
+      VoiceRuntimeRecoveryEffect.Diagnostic(
+        T3VoiceDiagnosticCode.CLEANUP_RECONCILIATION_REQUIRED,
+        0,
+      ),
+      plan.effects[write + 2],
+    )
   }
 
   @Test fun row5FallbackUsesWidenedInputsAndGatesUnrelatedReadinessGeneration() {
@@ -182,8 +211,95 @@ class VoiceRuntimeRecoveryTest {
       readinessConfig = readiness(),
       checkpointRead = false,
     ))
-    assertTrue(plan.effects.first() is VoiceRuntimeRecoveryEffect.Diagnostic)
+    assertEquals(
+      VoiceRuntimeRecoveryEffect.Diagnostic(
+        T3VoiceDiagnosticCode.CLEANUP_RECONCILIATION_REQUIRED,
+        0,
+      ),
+      plan.effects.first(),
+    )
     assertTrue(plan.realtimeInstall is VoiceRuntimeRealtimeInstallPlan.None)
+  }
+
+  @Test fun installedCanonicalDropsStalePreparedViewBeforeDiscardMath() {
+    val active = prepared(generation = 3)
+    val plan = plan(LoadedState(
+      readinessConfig = active.config,
+      preparedReadiness = prepared(runtimeId = "stale", generation = 7),
+      activeAuthority = active,
+      canonicalAuthority = VoiceRuntimeAuthorityLoadResult.Available(authority()),
+      retiredAuthorityFence = VoiceRuntimeRetiredAuthorityFence("retired", 8),
+    ))
+    val disabled = plan.effects.filterIsInstance<
+      VoiceRuntimeRecoveryEffect.WriteDisabledForRuntimeRevocation
+      >().single()
+    assertNull(disabled.pending)
+    assertEquals(8L, disabled.config.generation)
+    assertEquals("runtime", plan.installedRuntimeId)
+  }
+
+  @Test fun failedEnabledReadinessReadTakesReconcileFailurePath() {
+    val current = prepared(generation = 3)
+    val plan = plan(LoadedState(
+      readinessConfig = current.config,
+      activeAuthority = current,
+      canonicalAuthority = VoiceRuntimeAuthorityLoadResult.Available(authority()),
+      persistentReadinessRead = false,
+    ))
+    assertEquals(listOf(
+      VoiceRuntimeRecoveryEffect.ClearAuthority("startup-reconciliation-clear-authority"),
+      VoiceRuntimeRecoveryEffect.WriteReadiness(current.config.copy(enabled = false)),
+    ), plan.effects.take(2))
+    assertNull(plan.installedRuntimeId)
+    assertEquals(3L, plan.initialGeneration)
+    assertFalse(plan.readinessConfig.enabled)
+  }
+
+  @Test fun attachedPreparationWritesVerifiedReadinessAndSeedsPreparedAuthority() {
+    val attached = attached(runtimeId = "runtime", generation = 4)
+    val plan = recover(
+      LoadedState(
+        readinessConfig = readiness(),
+        attachedPreparation = attached,
+      ),
+      Permissions(microphoneGranted = false, notificationGranted = true),
+      Clock { 42 },
+    )
+    val verified = attached.readiness.copy(microphonePermissionGranted = false)
+    assertEquals(
+      VoiceRuntimeRecoveryEffect.WriteReadiness(verified),
+      plan.effects.first(),
+    )
+    assertEquals(verified, plan.readinessConfig)
+    assertEquals(
+      T3VoicePreparedReadiness(
+        verified,
+        attached.fence.runtimeId,
+        attached.fence.environmentOrigin,
+        attached.fence.target.grantOperation(),
+        attached.fence.targetDigest,
+      ),
+      plan.canonicalPreparedAuthority,
+    )
+  }
+
+  @Test fun playingSnapshotAndActiveOperationRemainDataOnly() {
+    val snapshot = playingSnapshot()
+    val operation = active(recording = null).copy(snapshot = snapshot)
+    val loaded = VoiceRuntimeThreadOperationLoadResult.Available(operation)
+    val plan = plan(LoadedState(
+      readinessConfig = readiness(),
+      runtimeSnapshot = snapshot,
+      threadOperation = loaded,
+    ))
+    assertEquals(snapshot, plan.runtimeSnapshot)
+    assertEquals(
+      loaded,
+      plan.effects.filterIsInstance<
+        VoiceRuntimeRecoveryEffect.ReconcileThreadOperation
+        >().single().loaded,
+    )
+    assertFalse(plan.effects.any { it::class.java.simpleName.contains("RestoreProcess") })
   }
 
   @Test fun recoveredRecordingAndCanonicalOrderingInvariantsArePinned() {
@@ -348,6 +464,20 @@ class VoiceRuntimeRecoveryTest {
     )
 
   private fun recording() = T3VoiceRecordingResult("recording", "file:///recording", 1, 1)
+
+  private fun playingSnapshot() = VoiceRuntimeExecutionSnapshot(
+    runtimeId = "runtime",
+    readinessGeneration = 3,
+    mode = VoiceRuntimeExecutionMode.THREAD,
+    phase = VoiceRuntimePhase.PLAYING,
+    operationId = "operation",
+    operationGeneration = 3,
+    dispatchAcknowledged = true,
+    eventCursor = 1,
+    highestAdvertisedSpeechSegment = 0,
+    finalSpeechSegment = 0,
+    speechTerminal = true,
+  )
 
   private fun checkpoint() = VoiceRuntimeRealtimeCheckpoint(
     fence = VoiceRuntimeRealtimeFence(VoiceRuntimeIdentity("runtime", "old", 3), "mode"),

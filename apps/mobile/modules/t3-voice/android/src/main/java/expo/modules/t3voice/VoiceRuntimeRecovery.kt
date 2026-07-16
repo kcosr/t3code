@@ -26,7 +26,6 @@ internal data class LoadedState(
   val activeAuthorityRead: Boolean = true,
   val finalizationRead: Boolean = true,
   val checkpointRead: Boolean = true,
-  val completedBridgeRecordings: List<T3VoiceRecordingResult> = emptyList(),
   val threadRecordingRestored: Boolean = true,
 )
 
@@ -61,7 +60,6 @@ internal sealed interface VoiceRuntimeRecoveryEffect {
     val pending: T3VoicePendingRuntimeRevocation?,
   ) : VoiceRuntimeRecoveryEffect
   data object DiscardInitialPreparation : VoiceRuntimeRecoveryEffect
-  data object ClearSessionCredential : VoiceRuntimeRecoveryEffect
   data object InvalidateReadiness : VoiceRuntimeRecoveryEffect
   data object ClearLockedAfterAuthorityRevocation : VoiceRuntimeRecoveryEffect
   data object ClearRuntimeSnapshot : VoiceRuntimeRecoveryEffect
@@ -78,10 +76,12 @@ internal sealed interface VoiceRuntimeRecoveryEffect {
 }
 
 /**
- * Pure recovery decision. The run-2 host applies the seed after controller construction, then
- * executes [VoiceRuntimeRecoveryPlan.effects] in order. Thread reconciliation deliberately carries
- * only the loader snapshot: its executor reloads both the operation and canonical grant and uses
- * execution-time time before calling [VoiceRuntimeThreadStoredStatePolicy.decide].
+ * Pure recovery decision. The run-2 host calls `deviceIdentity.getOrCreate(plan.installedRuntimeId)`,
+ * constructs the controller, applies the seed, then executes [VoiceRuntimeRecoveryPlan.effects] in
+ * order. Legacy-retirement credential clearing remains a loader responsibility. Thread
+ * reconciliation deliberately carries only the loader snapshot: its executor reloads both the
+ * operation and canonical grant and uses execution-time time before calling
+ * [VoiceRuntimeThreadStoredStatePolicy.decide].
  */
 internal fun recover(loaded: LoadedState, permissions: Permissions, clock: Clock): VoiceRuntimeRecoveryPlan {
   clock.nowMillis() // makes the recovery instant explicit without freezing thread reconciliation
@@ -114,18 +114,23 @@ internal fun recover(loaded: LoadedState, permissions: Permissions, clock: Clock
         effects += VoiceRuntimeRecoveryEffect.WriteReadiness(readiness)
         prepared = null
         active = null
-      } else when (val decision = VoiceRuntimeCommittedReadinessPolicy.reconcile(authority, prepared, active)) {
-        is VoiceRuntimeCommittedReadinessDecision.Current -> readiness = verify(decision.authority.config)
-        is VoiceRuntimeCommittedReadinessDecision.Promote -> {
-          readiness = verify(decision.authority.config)
-          effects += VoiceRuntimeRecoveryEffect.WriteActivatedReadiness(
-            decision.authority.config,
-            decision.authority,
-          )
-          active = decision.authority
-          prepared = null
+      } else {
+        check(loaded.persistentReadinessRead)
+        check(loaded.activeAuthorityRead)
+        when (val decision = VoiceRuntimeCommittedReadinessPolicy.reconcile(authority, prepared, active)) {
+          is VoiceRuntimeCommittedReadinessDecision.Current ->
+            readiness = verify(decision.authority.config)
+          is VoiceRuntimeCommittedReadinessDecision.Promote -> {
+            readiness = verify(decision.authority.config)
+            effects += VoiceRuntimeRecoveryEffect.WriteActivatedReadiness(
+              decision.authority.config,
+              decision.authority,
+            )
+            active = decision.authority
+            prepared = null
+          }
+          else -> error("Canonical authority and readiness state do not match.")
         }
-        else -> error("Canonical authority and readiness state do not match.")
       }
     }.isSuccess
     if (!reconciled) {
@@ -137,6 +142,7 @@ internal fun recover(loaded: LoadedState, permissions: Permissions, clock: Clock
       active = null
     }
   }
+  if (canonical != null) prepared = null
 
   val persistentFence = if (canonical == null) runCatching {
     T3VoiceStartupAuthorityFencePolicy.persistentPreparation(prepared)
@@ -180,7 +186,6 @@ internal fun recover(loaded: LoadedState, permissions: Permissions, clock: Clock
     resolution = resolution.copy(preparation = null, initialGeneration = generation)
     attached = null
     prepared = null
-    active = null
   }
   var canonicalPrepared: T3VoicePreparedReadiness? = null
   attached?.takeIf { canonical == null }?.let {
@@ -209,7 +214,6 @@ internal fun recover(loaded: LoadedState, permissions: Permissions, clock: Clock
       active.copy(recording = null, detached = true, cancelRequested = true),
     )
   }
-  loaded.completedBridgeRecordings.forEach { effects += VoiceRuntimeRecoveryEffect.RestoreCompletedRecording(it) }
   effects += VoiceRuntimeRecoveryEffect.RestoreBridgeCompletions
   effects += VoiceRuntimeRecoveryEffect.SweepStaleCache
   effects += VoiceRuntimeRecoveryEffect.SetServiceReady
