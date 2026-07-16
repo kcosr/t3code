@@ -496,6 +496,10 @@ internal class T3VoiceWebRtcSession(
   }
 
   private fun maybeDeliverOffer(sessionId: String) {
+    synchronized(lock) {
+      val sx = active
+      android.util.Log.i("T3VoiceDbg","maybeDeliverOffer local=" + sx?.localDescriptionSet + " ice=" + sx?.iceGatheringComplete + " delivered=" + sx?.offerDelivered)
+    }
     val result =
       synchronized(lock) {
         val session = active
@@ -974,6 +978,7 @@ internal class T3VoiceWebRtcSession(
 
   private inner class OfferObserver(private val sessionId: String) : BaseSdpObserver() {
     override fun onCreateSuccess(description: SessionDescription?) {
+      android.util.Log.i("T3VoiceDbg","webrtc.createOffer.success blank=" + (description?.description.isNullOrBlank()))
       if (description == null || description.description.isBlank()) {
         fail(sessionId, ERROR_OFFER_FAILED, "WebRTC created an empty SDP offer.", null, false)
         return
@@ -983,6 +988,7 @@ internal class T3VoiceWebRtcSession(
       peer.setLocalDescription(
         object : BaseSdpObserver() {
           override fun onSetSuccess() {
+            android.util.Log.i("T3VoiceDbg","webrtc.setLocalDescription.success")
             synchronized(lock) {
               active?.takeIf { it.sessionId == sessionId }?.localDescriptionSet = true
             }
@@ -1004,6 +1010,7 @@ internal class T3VoiceWebRtcSession(
     }
 
     override fun onCreateFailure(message: String?) {
+      android.util.Log.e("T3VoiceDbg","webrtc.createOffer.FAILURE " + message)
       fail(
         sessionId,
         ERROR_OFFER_FAILED,
@@ -1028,6 +1035,7 @@ internal class T3VoiceWebRtcSession(
     }
 
     override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
+      android.util.Log.i("T3VoiceDbg","webrtc.iceGathering=" + state)
       if (state != PeerConnection.IceGatheringState.COMPLETE) return
       synchronized(lock) {
         active?.takeIf { it.sessionId == sessionId }?.iceGatheringComplete = true
