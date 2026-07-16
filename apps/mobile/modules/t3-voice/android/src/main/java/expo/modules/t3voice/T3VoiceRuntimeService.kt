@@ -362,14 +362,20 @@ class T3VoiceRuntimeService : Service() {
           threadAttempt.authority.readinessGeneration,
         )
     }
-    val realtimeCheckpoint = voiceRuntimeRealtimeEngine?.let(::realtimeState)?.checkpoint
-    if (realtimeCheckpoint != null) {
-      val rootOperationId = realtimeCheckpoint.fence.modeSessionId
+    val realtimeState = voiceRuntimeRealtimeEngine?.let(::realtimeState)
+    // Finalization continues the mode session after the checkpoint clears; its network
+    // effects (close/commit/activate) still emit "realtime-" results that admit only
+    // against a REALTIME_MODE/PEER root, so they must carry the mode-session root rather
+    // than falling through to SERVICE — otherwise the completion drops ROOT_OPERATION-stale
+    // and finalization wedges in-flight forever (never terminating the engine).
+    val realtimeFence = realtimeState?.checkpoint?.fence ?: realtimeState?.finalization?.fence
+    if (realtimeFence != null) {
+      val rootOperationId = realtimeFence.modeSessionId
       return epochRegistry.current(rootOperationId)
         ?: armEpoch(
           VoiceKernelEpochRootKind.REALTIME_MODE,
           rootOperationId,
-          realtimeCheckpoint.fence.identity.generation,
+          realtimeFence.identity.generation,
         )
     }
     return serviceEpoch()
