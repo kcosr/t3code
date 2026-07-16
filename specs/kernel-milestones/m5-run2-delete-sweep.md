@@ -103,3 +103,20 @@ seed is UNTOUCHED; only its Kotlin reachability dies.
   `voiceRuntimeWake`, wake-only `recordingTerminated`/`playbackTerminated`,
   `readinessDisabled`); revision 17 both sides; zero references to any deleted symbol;
   `pnpm run typecheck`, `pnpm run lint:mobile`, module unit tests green; tree clean.
+
+## Run notes (adjudication record, 2026-07-15)
+
+- `realtimeSurvivesUnbindAndNotificationStopAfterRebind` (instrumented) was DELETED, not
+  re-expressed: it drove the now-deleted bridge `prepareRealtimeSession`, and the
+  autonomous realtime entry (`realtimePeerPort`, engine-internal) exposes no binder
+  method an instrumented test can drive. The unbind/rebind/notification-stop lifecycle
+  invariant remains instrumented by `recordingSurvivesUnbindAndNotificationStopAfterRebind`.
+- The `NativeVoiceCommand` blocks in `nativeVoiceReadiness.test.ts` were deliberately
+  RETAINED despite seam-map §7's DIE annotation: they cover pure TS reconciler logic
+  used only by the ui-attached seed (`MasterVoiceProvider.tsx`,
+  `useThreadVoiceComposerController.ts`) with no dependency on the deleted native
+  functions or the `voiceCommand` event — the run-2 "No TS deletion on the ui-attached
+  path" rule governs. Future runs must not "finish the DIE list" here.
+- Deleting `register`/`unregister` leaves `T3VoiceControllerCommands.controllerGeneration`
+  writer-less, so `requestPrimary`/`isAttached` are degenerate (always null/false) —
+  retained per seam-map §4 for the future autonomous attach path.
