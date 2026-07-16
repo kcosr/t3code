@@ -1791,8 +1791,9 @@ class T3VoiceRuntimeService : Service() {
   private fun executeRecoveryEffectLocked(
     effect: VoiceRuntimeRecoveryEffect,
     canonicalConfigured: Boolean,
-  ): Boolean = VoiceDbg.t("recoveryEffect:${effect::class.java.simpleName}")
-    when (effect) {
+  ): Boolean {
+    VoiceDbg.t("recoveryEffect:${effect::class.java.simpleName}")
+    return when (effect) {
     is VoiceRuntimeRecoveryEffect.WriteReadiness -> {
       if (effect.bestEffort) {
         runCatching { readinessStore.write(effect.config) }
@@ -1883,6 +1884,7 @@ class T3VoiceRuntimeService : Service() {
       if (reconcileRecoveryThreadOperationLocked()) startRuntimeThreadLocked()
       canonicalConfigured
     }
+  }
   }
 
   private fun reconcileRecoveryThreadOperationLocked(): Boolean {
