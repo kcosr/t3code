@@ -634,21 +634,14 @@ class T3VoiceRuntimeService : Service() {
     }
 
     fun acknowledgeRecordingTermination(operationId: String) {
-      T3VoiceBridgeCompletionStore.acknowledgeRecording(
-        T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
-        operationId,
-      )
+      T3VoiceBridgeCompletionActions.acknowledgeRecording(operationId)
     }
 
     fun discardUnownedRecordingTermination(operationId: String): Boolean =
       mailbox.submitAndAwait(binderMessage("discard-recording-termination")) {
         run {
-          val completion = T3VoiceBridgeCompletionStore.pendingRecordings(
-            T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
-          ).firstOrNull { it.owner.operationId == operationId }
-            ?: return@run false
-          completion.terminal.recording?.let { recording ->
-            runCatching { recorder.delete(completion.terminal.recordingId, recording.uri) }
+          T3VoiceBridgeCompletionActions.discardRecording(operationId) { recordingId, uri ->
+            runCatching { recorder.delete(recordingId, uri) }
               .onFailure {
                 T3VoiceDiagnostics.record(
                   0,
@@ -657,11 +650,6 @@ class T3VoiceRuntimeService : Service() {
                 )
               }
           }
-          T3VoiceBridgeCompletionStore.acknowledgeRecording(
-            completion.owner.domain,
-            completion.owner.operationId,
-          )
-          true
         }
       }
 

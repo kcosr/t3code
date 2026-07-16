@@ -110,18 +110,19 @@ class T3VoiceStateStoreTest {
 
   @Test fun discardDeletesRecordingButAcknowledgementDoesNot() {
     val deleted = mutableListOf<Pair<String, String>>()
-    val bridge = RecordingTerminationBridgeHarness { recordingId, uri ->
-      deleted += recordingId to uri
-    }
     val domain = T3VoiceOperationOwnerDomain.COMPOSER_DICTATION
     val acknowledged = T3VoiceOperationOwner("recording-ack", domain, "operation-ack")
     val discarded = T3VoiceOperationOwner("recording-discard", domain, "operation-discard")
     T3VoiceBridgeCompletionStore.putRecording(acknowledged, recordingTerminal(acknowledged.id))
     T3VoiceBridgeCompletionStore.putRecording(discarded, recordingTerminal(discarded.id))
 
-    bridge.acknowledgeRecordingTermination(acknowledged.operationId)
+    T3VoiceBridgeCompletionActions.acknowledgeRecording(acknowledged.operationId)
     assertTrue(deleted.isEmpty())
-    assertTrue(bridge.discardUnownedRecordingTermination(discarded.operationId))
+    assertTrue(
+      T3VoiceBridgeCompletionActions.discardRecording(discarded.operationId) { recordingId, uri ->
+        deleted += recordingId to uri
+      },
+    )
 
     assertEquals(
       listOf("recording-discard" to "file:///recording-discard.m4a"),
@@ -214,28 +215,4 @@ class T3VoiceStateStoreTest {
   private fun claimManualPlayback(playbackId: String, operationId: String) =
     T3VoiceStateStore.claimPlayback(playbackId, T3VoiceOperationOwnerDomain.MANUAL_PLAYBACK, operationId)
 
-  private class RecordingTerminationBridgeHarness(
-    private val recorderDelete: (recordingId: String, uri: String) -> Unit,
-  ) {
-    fun acknowledgeRecordingTermination(operationId: String) {
-      T3VoiceBridgeCompletionStore.acknowledgeRecording(
-        T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
-        operationId,
-      )
-    }
-
-    fun discardUnownedRecordingTermination(operationId: String): Boolean {
-      val completion = T3VoiceBridgeCompletionStore.pendingRecordings(
-        T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
-      ).firstOrNull { it.owner.operationId == operationId } ?: return false
-      completion.terminal.recording?.let { recording ->
-        recorderDelete(completion.terminal.recordingId, recording.uri)
-      }
-      T3VoiceBridgeCompletionStore.acknowledgeRecording(
-        completion.owner.domain,
-        completion.owner.operationId,
-      )
-      return true
-    }
-  }
 }

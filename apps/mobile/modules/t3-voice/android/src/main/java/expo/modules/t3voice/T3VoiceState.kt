@@ -245,6 +245,32 @@ internal object T3VoiceBridgeCompletionStore {
     playbacks.remove(domain to operationId)
 }
 
+internal object T3VoiceBridgeCompletionActions {
+  fun acknowledgeRecording(operationId: String) {
+    T3VoiceBridgeCompletionStore.acknowledgeRecording(
+      T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
+      operationId,
+    )
+  }
+
+  fun discardRecording(
+    operationId: String,
+    deleteRecording: (recordingId: String, uri: String) -> Unit,
+  ): Boolean {
+    val completion = T3VoiceBridgeCompletionStore.pendingRecordings(
+      T3VoiceOperationOwnerDomain.COMPOSER_DICTATION,
+    ).firstOrNull { it.owner.operationId == operationId } ?: return false
+    completion.terminal.recording?.let { recording ->
+      deleteRecording(completion.terminal.recordingId, recording.uri)
+    }
+    T3VoiceBridgeCompletionStore.acknowledgeRecording(
+      completion.owner.domain,
+      completion.owner.operationId,
+    )
+    return true
+  }
+}
+
 internal fun restoreBridgeRecordingCompletions(
   restoreCompleted: (T3VoiceRecordingResult) -> Unit,
   sweepStaleCache: () -> Unit,

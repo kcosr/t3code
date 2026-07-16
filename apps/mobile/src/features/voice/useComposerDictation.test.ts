@@ -6,6 +6,7 @@ import type {
 } from "@t3tools/mobile-voice-native";
 import { validateRecordingAgainstCapability } from "./dictationPolicy";
 import {
+  acknowledgeOwnedRecordingTermination,
   discardOrphanedRecordingTerminationIfUnowned,
   dictationTerminationOwnership,
 } from "./dictationTermination";
@@ -99,7 +100,16 @@ describe("orphaned dictation termination cleanup", () => {
       },
     } as unknown as T3VoiceNativeModule;
 
-    await native.acknowledgeRecordingTerminationAsync({ operationId: "operation-a" });
+    const event = {
+      ownerDomain: "COMPOSER_DICTATION",
+      operationId: "operation-a",
+      recordingId: "recording-a",
+      recording: null,
+      outcome: "cancelled",
+      reason: "no-speech",
+    } as T3VoiceRecordingTerminatedEvent;
+
+    await acknowledgeOwnedRecordingTermination(native, event);
 
     expect(acknowledgements).toEqual([{ operationId: "operation-a" }]);
     expect(discards).toEqual([]);

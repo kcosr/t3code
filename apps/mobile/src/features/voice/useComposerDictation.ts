@@ -17,6 +17,7 @@ import {
 import { useVoiceCapabilityDescriptor } from "./useVoiceCapabilityAvailability";
 import { validateRecordingAgainstCapability } from "./dictationPolicy";
 import {
+  acknowledgeOwnedRecordingTermination,
   discardOrphanedRecordingTerminationIfUnowned,
   dictationTerminationOwnership,
 } from "./dictationTermination";
@@ -343,9 +344,7 @@ export function useComposerDictation(input: {
         return;
       }
       if (ownership === "transcribing") {
-        void native
-          .acknowledgeRecordingTerminationAsync({ operationId: event.operationId })
-          .catch(() => undefined);
+        void acknowledgeOwnedRecordingTermination(native, event).catch(() => undefined);
         return;
       }
       ++operationGenerationRef.current;
@@ -361,9 +360,7 @@ export function useComposerDictation(input: {
           reason: "no-speech",
         });
         setPhase("idle");
-        void native
-          .acknowledgeRecordingTerminationAsync({ operationId: event.operationId })
-          .catch(() => undefined);
+        void acknowledgeOwnedRecordingTermination(native, event).catch(() => undefined);
         return;
       }
       if (event.outcome === "failed") {
@@ -375,9 +372,7 @@ export function useComposerDictation(input: {
         });
         setError("The recording could not be finalized.");
         setPhase("idle");
-        void native
-          .acknowledgeRecordingTerminationAsync({ operationId: event.operationId })
-          .catch(() => undefined);
+        void acknowledgeOwnedRecordingTermination(native, event).catch(() => undefined);
         return;
       }
       setPhase("transcribing");
