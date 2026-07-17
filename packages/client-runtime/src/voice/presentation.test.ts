@@ -14,7 +14,7 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import {
   admittedClientActionFocusState,
   bindVoiceConversationBrowser,
-  canOfferThreadVoiceSwitch,
+  canStartThreadVoiceFromComposer,
   createVoiceRuntimeRetryCoordinator,
   durableVoiceConversations,
   isThreadVoiceStartAvailable,
@@ -22,13 +22,12 @@ import {
   voiceRuntimeEnvironmentId,
   prepareVoiceRuntimeAttachment,
   realtimeVoiceBarPhase,
-  reconcileVoiceAudioRoutePickerState,
   newVoiceConversationSelection,
   newVoiceConversationTitle,
   resumeVoiceConversationSelection,
-  settleVoiceAudioRoutePickerSelection,
   stopVoiceRuntimeStrict,
   threadVoiceStartForFocus,
+  voiceThreadNavigationRequest,
   voiceRuntimeCommandEnvironmentMatches,
   voiceRuntimeSnapshotEnvironmentId,
   type VoiceRuntimeFocus,
@@ -95,7 +94,7 @@ describe("voice runtime state", () => {
   it("remounts the conversation browser instead of pairing an old row with a new environment", () => {
     const oldEnvironmentId = EnvironmentId.make("environment-old");
     const newEnvironmentId = EnvironmentId.make("environment-new");
-    const context = { focus: null, threadSwitch: null };
+    const context = { focus: null, threadSettings: null };
     const oldBinding = bindVoiceConversationBrowser(oldEnvironmentId, context);
     const newBinding = bindVoiceConversationBrowser(newEnvironmentId, context);
     const oldConversation = continueVoiceConversationSelection(
@@ -138,7 +137,7 @@ describe("voice runtime state", () => {
     expect(continuousSubmit?.target.modelSelection).toEqual(focus.modelSelection);
   });
 
-  it("offers notification Thread switching only for a ready, empty, unblocked composer", () => {
+  it("allows manual Thread voice start only for a ready, empty, unblocked composer", () => {
     const eligible = {
       preferencesReady: true,
       composerDraftsReady: true,
@@ -146,12 +145,49 @@ describe("voice runtime state", () => {
       interactionRequired: false,
       activeThreadBusy: false,
     };
-    expect(canOfferThreadVoiceSwitch(eligible)).toBe(true);
-    expect(canOfferThreadVoiceSwitch({ ...eligible, preferencesReady: false })).toBe(false);
-    expect(canOfferThreadVoiceSwitch({ ...eligible, composerDraftsReady: false })).toBe(false);
-    expect(canOfferThreadVoiceSwitch({ ...eligible, composerContentEmpty: false })).toBe(false);
-    expect(canOfferThreadVoiceSwitch({ ...eligible, interactionRequired: true })).toBe(false);
-    expect(canOfferThreadVoiceSwitch({ ...eligible, activeThreadBusy: true })).toBe(false);
+    expect(canStartThreadVoiceFromComposer(eligible)).toBe(true);
+    expect(canStartThreadVoiceFromComposer({ ...eligible, preferencesReady: false })).toBe(false);
+    expect(canStartThreadVoiceFromComposer({ ...eligible, composerDraftsReady: false })).toBe(
+      false,
+    );
+    expect(canStartThreadVoiceFromComposer({ ...eligible, composerContentEmpty: false })).toBe(
+      false,
+    );
+    expect(canStartThreadVoiceFromComposer({ ...eligible, interactionRequired: true })).toBe(false);
+    expect(canStartThreadVoiceFromComposer({ ...eligible, activeThreadBusy: true })).toBe(false);
+  });
+
+  it("derives one stable navigation request across an incoming Thread handoff", () => {
+    const target = threadVoiceStartForFocus(focus, voicePreferences(), true)!.target;
+    const switching: VoiceRuntimeSnapshot = {
+      mode: "switching-to-thread",
+      phase: "closing-realtime",
+      generation: 7,
+      sequence: 20,
+      target,
+      settings: threadVoiceStartForFocus(focus, voicePreferences(), true)!.settings,
+    };
+    const active: VoiceRuntimeSnapshot = {
+      mode: "thread",
+      phase: "recording",
+      generation: 7,
+      sequence: 21,
+      target,
+      settings: switching.settings,
+      transcript: null,
+      reviewId: null,
+      attention: null,
+    };
+
+    expect(voiceThreadNavigationRequest(switching)).toEqual({
+      key: `7:${target.threadId}`,
+      environmentId: target.environmentId,
+      threadId: target.threadId,
+    });
+    expect(voiceThreadNavigationRequest(active)?.key).toBe(
+      voiceThreadNavigationRequest(switching)?.key,
+    );
+    expect(voiceThreadNavigationRequest({ mode: "idle", generation: 7, sequence: 22 })).toBeNull();
   });
 
   it("offers Thread start only from Idle or connected Realtime", () => {
@@ -164,7 +200,7 @@ describe("voice runtime state", () => {
         environmentId,
         conversation: { type: "new", retention: "durable", title: "Voice" },
         focus: null,
-        threadSwitch: null,
+        threadSettings: null,
       },
       muted: false,
       audioRoutes: [],
@@ -195,39 +231,6 @@ describe("voice runtime state", () => {
         true,
       ),
     ).toBe(false);
-  });
-
-  it("keeps route-picker progress across unrelated snapshots and clears it on route selection", () => {
-    const selecting = { selectingRouteId: "bluetooth", error: null };
-    const unchanged = reconcileVoiceAudioRoutePickerState(selecting, {
-      controlsAvailable: true,
-      routes: [
-        { id: "speaker", label: "Speaker", type: "speaker", selected: true },
-        { id: "bluetooth", label: "Headset", type: "bluetooth", selected: false },
-      ],
-    });
-
-    expect(unchanged).toBe(selecting);
-    expect(settleVoiceAudioRoutePickerSelection(selecting, "bluetooth")).toEqual({
-      selectingRouteId: null,
-      error: null,
-    });
-    expect(settleVoiceAudioRoutePickerSelection(selecting, "speaker")).toBe(selecting);
-    expect(
-      reconcileVoiceAudioRoutePickerState(selecting, {
-        controlsAvailable: true,
-        routes: [
-          { id: "speaker", label: "Speaker", type: "speaker", selected: false },
-          { id: "bluetooth", label: "Headset", type: "bluetooth", selected: true },
-        ],
-      }),
-    ).toEqual({ selectingRouteId: null, error: null });
-    expect(
-      reconcileVoiceAudioRoutePickerState(selecting, {
-        controlsAvailable: false,
-        routes: [],
-      }),
-    ).toBeNull();
   });
 
   it("rejects a captured old-environment conversation against a new ready runtime", () => {
@@ -405,7 +408,7 @@ describe("voice runtime state", () => {
           title: "Voice",
         },
         focus: null,
-        threadSwitch: null,
+        threadSettings: null,
       },
       muted: false,
       audioRoutes: [],

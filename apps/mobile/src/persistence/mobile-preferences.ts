@@ -33,7 +33,6 @@ const PREFERENCES_FALLBACK_KEY = "t3code.preferences.fallback";
 export interface Preferences {
   readonly liveActivitiesEnabled?: boolean;
   readonly threadSpeechEnabled?: boolean;
-  readonly voiceAudioRouteId?: string;
   readonly voiceAutoListenEnabled?: boolean;
   readonly voiceAutoSubmitEnabled?: boolean;
   readonly voiceEndSilenceMs?: number;
@@ -93,7 +92,6 @@ function sanitizePreferences(parsed: Preferences): Preferences {
   const preferences: {
     liveActivitiesEnabled?: boolean;
     threadSpeechEnabled?: boolean;
-    voiceAudioRouteId?: string;
     voiceAutoListenEnabled?: boolean;
     voiceAutoSubmitEnabled?: boolean;
     voiceEndSilenceMs?: number;
@@ -117,9 +115,6 @@ function sanitizePreferences(parsed: Preferences): Preferences {
   }
   if (typeof parsed.threadSpeechEnabled === "boolean") {
     preferences.threadSpeechEnabled = parsed.threadSpeechEnabled;
-  }
-  if (typeof parsed.voiceAudioRouteId === "string" && parsed.voiceAudioRouteId.length > 0) {
-    preferences.voiceAudioRouteId = parsed.voiceAudioRouteId;
   }
   if (typeof parsed.voiceAutoListenEnabled === "boolean") {
     preferences.voiceAutoListenEnabled = parsed.voiceAutoListenEnabled;

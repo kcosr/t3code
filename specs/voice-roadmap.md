@@ -80,10 +80,18 @@ dumps, and raw audio.
 
 ### Expanded headset and platform controls
 
-Android currently exposes state-dependent notification and MediaSession actions plus Realtime output
-route selection with a persisted preferred route. Future work could define richer physical headset
-actions, per-device or automatic routing policies, Bluetooth-specific behavior, or
-platform-equivalent controls after validating device and OS constraints.
+Android currently exposes state-dependent notification and MediaSession actions plus one native
+preferred route shared by Realtime, Thread voice, and one-shot dictation. Future work could define
+richer physical headset actions, per-device or automatic routing policies, Bluetooth-specific
+behavior, or platform-equivalent controls after validating device and OS constraints.
+
+### Notification-initiated Thread voice
+
+Realtime notification controls deliberately do not infer a Thread from the visible, current, or
+last-used UI state. A future product decision could add an explicit notification shortcut based on a
+remembered Thread, but it would need to define how the target is selected, shown, invalidated, and
+authorized. It must still dispatch one explicit target to the native controller rather than making
+the native runtime guess from React state.
 
 ### Additional Thread voice policies
 

@@ -17,6 +17,7 @@ import {
   VoiceSessionId,
   VoiceToolCallId,
 } from "./baseSchemas.ts";
+import { ModelSelection, ProviderInteractionMode, RuntimeMode } from "./orchestration.ts";
 
 export const VoiceCapability = Schema.Literals([
   "transcription.request",
@@ -205,6 +206,28 @@ export type VoiceSessionMode = typeof VoiceSessionMode.Type;
 
 export const VoiceTerminalAction = Schema.Literals(["stop-realtime", "switch-to-thread"]);
 export type VoiceTerminalAction = typeof VoiceTerminalAction.Type;
+
+export const VoiceThreadTarget = Schema.Struct({
+  projectId: ProjectId,
+  threadId: ThreadId,
+  modelSelection: ModelSelection,
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+});
+export type VoiceThreadTarget = typeof VoiceThreadTarget.Type;
+
+export const VoiceTerminalActionRequest = Schema.Union([
+  Schema.Struct({
+    actionId: VoiceClientActionId,
+    action: Schema.Literal("stop-realtime"),
+  }),
+  Schema.Struct({
+    actionId: VoiceClientActionId,
+    action: Schema.Literal("switch-to-thread"),
+    target: VoiceThreadTarget,
+  }),
+]);
+export type VoiceTerminalActionRequest = typeof VoiceTerminalActionRequest.Type;
 
 export const VoiceTerminalActions = Schema.Array(VoiceTerminalAction).check(
   Schema.isMaxLength(2),
@@ -439,8 +462,15 @@ export const VoiceSessionEvent = Schema.Union([
   Schema.Struct({
     ...VoiceEventBase,
     type: Schema.Literal("terminal-action"),
-    action: VoiceTerminalAction,
+    action: Schema.Literal("stop-realtime"),
     actionId: VoiceClientActionId,
+  }),
+  Schema.Struct({
+    ...VoiceEventBase,
+    type: Schema.Literal("terminal-action"),
+    action: Schema.Literal("switch-to-thread"),
+    actionId: VoiceClientActionId,
+    target: VoiceThreadTarget,
   }),
   Schema.Struct({
     ...VoiceEventBase,

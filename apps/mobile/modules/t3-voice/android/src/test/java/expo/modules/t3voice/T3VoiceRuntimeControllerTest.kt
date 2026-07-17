@@ -38,6 +38,14 @@ class T3VoiceRuntimeControllerTest {
       submissionTimeoutMs = 30_000,
       responseTimeoutMs = 600_000,
     )
+  private val remoteThreadTarget =
+    T3VoiceRemoteThreadTarget(
+      projectId = threadTarget.projectId,
+      threadId = threadTarget.threadId,
+      modelSelection = threadTarget.modelSelection,
+      runtimeMode = threadTarget.runtimeMode,
+      interactionMode = threadTarget.interactionMode,
+    )
   private val realtimeTarget =
     T3VoiceRealtimeTarget(
       environmentId = "environment-a",
@@ -47,7 +55,7 @@ class T3VoiceRuntimeControllerTest {
           title = "Voice conversation",
         ),
       focus = T3VoiceRealtimeFocus(projectId = "project-a", threadId = "thread-a"),
-      threadSwitch = T3VoiceThreadStart(threadTarget, continuousSettings),
+      threadSettings = continuousSettings,
     )
   private val session =
     T3VoiceNativeSessionConfig(
@@ -283,40 +291,6 @@ class T3VoiceRuntimeControllerTest {
   }
 
   @Test
-  fun realtimeRouteSelectionIsValidatedAndIdempotent() {
-    val driver = FakeDriver()
-    val controller = T3VoiceRuntimeController(driver)
-    controller.dispatch(T3VoiceRuntimeCommand.StartRealtime(realtimeTarget, session))
-    controller.activateInitialStart(1)
-    controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeConnected)
-    controller.onCallback(
-      1,
-      T3VoiceRuntimeCallback.RealtimeAudioRoutesChanged(
-        listOf(
-          T3VoiceAudioRoute("system", "System", "system", selected = true),
-          T3VoiceAudioRoute("speaker", "Speaker", "speaker", selected = false),
-        ),
-      ),
-    )
-
-    assertEquals(
-      T3VoiceCommandRejection.UNKNOWN_AUDIO_ROUTE,
-      controller.dispatch(T3VoiceRuntimeCommand.SetRealtimeAudioRoute("bluetooth")).rejection,
-    )
-    assertEquals(
-      T3VoiceCommandOutcome.APPLIED,
-      controller.dispatch(T3VoiceRuntimeCommand.SetRealtimeAudioRoute("speaker")).outcome,
-    )
-    val state = controller.snapshot().state as T3VoiceControllerState.Realtime
-    assertTrue(state.audioRoutes.single { it.id == "speaker" }.selected)
-    assertEquals(
-      T3VoiceCommandOutcome.DUPLICATE,
-      controller.dispatch(T3VoiceRuntimeCommand.SetRealtimeAudioRoute("speaker")).outcome,
-    )
-    assertEquals(1, driver.actions.count { it == "route-realtime:1:speaker" })
-  }
-
-  @Test
   fun realtimeContextUpdatesLocallyBeforeSchedulingTheDriver() {
     val driver = FakeDriver()
     lateinit var controller: T3VoiceRuntimeController
@@ -324,7 +298,7 @@ class T3VoiceRuntimeControllerTest {
       if (action == "context-realtime:1:thread-b") {
         val state = controller.snapshot().state as T3VoiceControllerState.Realtime
         assertEquals("thread-b", state.target.focus?.threadId)
-        assertEquals(null, state.target.threadSwitch)
+        assertEquals(null, state.target.threadSettings)
       }
     }
     controller = T3VoiceRuntimeController(driver)
@@ -334,7 +308,7 @@ class T3VoiceRuntimeControllerTest {
     val context =
       T3VoiceRealtimeContext(
         focus = T3VoiceRealtimeFocus("project-b", "thread-b"),
-        threadSwitch = null,
+        threadSettings = null,
       )
 
     assertEquals(
@@ -407,7 +381,7 @@ class T3VoiceRuntimeControllerTest {
     val driver = FakeDriver()
     val controller = connectedRealtimeController(driver)
     val action =
-      T3VoiceRealtimeTerminalAction("terminal-stop", T3VoiceRealtimeTerminalActionType.STOP_REALTIME)
+      T3VoiceRealtimeTerminalAction.StopRealtime("terminal-stop")
 
     assertTrue(
       controller.onCallback(
@@ -430,10 +404,7 @@ class T3VoiceRuntimeControllerTest {
       controller.onCallback(
         1,
         T3VoiceRuntimeCallback.RealtimeTerminalActionReceived(
-          T3VoiceRealtimeTerminalAction(
-            "terminal-stop-other",
-            T3VoiceRealtimeTerminalActionType.STOP_REALTIME,
-          ),
+          T3VoiceRealtimeTerminalAction.StopRealtime("terminal-stop-other"),
         ),
       ),
     )
@@ -444,7 +415,7 @@ class T3VoiceRuntimeControllerTest {
   }
 
   @Test
-  fun agentTerminalSwitchIsAdmittedDuringStartingAndUsesThePreparedTarget() {
+  fun agentTerminalSwitchIsAdmittedDuringStartingAndUsesTheResolvedTarget() {
     val driver = FakeDriver()
     val controller = T3VoiceRuntimeController(driver)
     controller.dispatch(T3VoiceRuntimeCommand.StartRealtime(realtimeTarget, session))
@@ -454,10 +425,7 @@ class T3VoiceRuntimeControllerTest {
       controller.onCallback(
         1,
         T3VoiceRuntimeCallback.RealtimeTerminalActionReceived(
-          T3VoiceRealtimeTerminalAction(
-            "terminal-switch",
-            T3VoiceRealtimeTerminalActionType.SWITCH_TO_THREAD,
-          ),
+          T3VoiceRealtimeTerminalAction.SwitchToThread("terminal-switch", remoteThreadTarget),
         ),
       ),
     )
@@ -471,11 +439,11 @@ class T3VoiceRuntimeControllerTest {
   }
 
   @Test
-  fun missingPreparedTargetClosesRealtimeThenPublishesRecoverableSwitchFailure() {
+  fun missingThreadSettingsClosesRealtimeThenPublishesRecoverableSwitchFailure() {
     val driver = FakeDriver()
     val controller = T3VoiceRuntimeController(driver)
     controller.dispatch(
-      T3VoiceRuntimeCommand.StartRealtime(realtimeTarget.copy(threadSwitch = null), session),
+      T3VoiceRuntimeCommand.StartRealtime(realtimeTarget.copy(threadSettings = null), session),
     )
     controller.activateInitialStart(1)
     controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeConnected)
@@ -484,9 +452,9 @@ class T3VoiceRuntimeControllerTest {
       controller.onCallback(
         1,
         T3VoiceRuntimeCallback.RealtimeTerminalActionReceived(
-          T3VoiceRealtimeTerminalAction(
-            "terminal-missing-target",
-            T3VoiceRealtimeTerminalActionType.SWITCH_TO_THREAD,
+          T3VoiceRealtimeTerminalAction.SwitchToThread(
+            "terminal-missing-settings",
+            remoteThreadTarget,
           ),
         ),
       ),
@@ -496,26 +464,26 @@ class T3VoiceRuntimeControllerTest {
 
     val failed = controller.snapshot().state as T3VoiceControllerState.Failed
     assertEquals(T3VoiceOperation.SWITCHING_TO_THREAD, failed.operation)
-    assertEquals("thread-switch-target-unavailable", failed.failure.code)
+    assertEquals("thread-settings-unavailable", failed.failure.code)
     assertTrue(failed.failure.recoverable)
     assertFalse(driver.actions.any { it.startsWith("start-thread") })
   }
 
   @Test
-  fun userStopOverridesMissingTargetFailureWhileAgentDrainIsPending() {
+  fun userStopOverridesMissingSettingsFailureWhileAgentDrainIsPending() {
     val driver = FakeDriver()
     val controller = T3VoiceRuntimeController(driver)
     controller.dispatch(
-      T3VoiceRuntimeCommand.StartRealtime(realtimeTarget.copy(threadSwitch = null), session),
+      T3VoiceRuntimeCommand.StartRealtime(realtimeTarget.copy(threadSettings = null), session),
     )
     controller.activateInitialStart(1)
     controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeConnected)
     controller.onCallback(
       1,
       T3VoiceRuntimeCallback.RealtimeTerminalActionReceived(
-        T3VoiceRealtimeTerminalAction(
-          "terminal-missing-target-stop",
-          T3VoiceRealtimeTerminalActionType.SWITCH_TO_THREAD,
+        T3VoiceRealtimeTerminalAction.SwitchToThread(
+          "terminal-missing-settings-stop",
+          remoteThreadTarget,
         ),
       ),
     )
@@ -725,7 +693,7 @@ class T3VoiceRuntimeControllerTest {
       if (action.startsWith("context-realtime")) {
         val realtime = controller.snapshot().state as T3VoiceControllerState.Realtime
         assertEquals(T3VoiceRealtimeFocus("project-b", "thread-b"), realtime.target.focus)
-        assertEquals(null, realtime.target.threadSwitch)
+        assertEquals(continuousSettings, realtime.target.threadSettings)
         assertTrue(realtime.pendingClientActions.isEmpty())
       }
     }
@@ -1406,10 +1374,6 @@ internal class FakeDriver(
 
   override fun setRealtimeMuted(generation: Long, muted: Boolean) {
     record("mute-realtime:$generation:$muted")
-  }
-
-  override fun setRealtimeAudioRoute(generation: Long, routeId: String) {
-    record("route-realtime:$generation:$routeId")
   }
 
   override fun updateRealtimeContext(generation: Long, context: T3VoiceRealtimeContext) {

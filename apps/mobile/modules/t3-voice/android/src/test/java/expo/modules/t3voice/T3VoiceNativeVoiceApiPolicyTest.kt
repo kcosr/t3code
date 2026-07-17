@@ -62,9 +62,8 @@ internal class T3VoiceNativeVoiceApiPolicyTest {
   }
 
   @Test
-  fun `Realtime terminal capabilities follow the current native thread switch target`() {
+  fun `Realtime terminal capabilities follow native Thread settings`() {
     val focus = T3VoiceRealtimeFocus("project-a", "thread-a")
-    val switch = T3VoiceThreadStart(THREAD_TARGET, THREAD_SETTINGS)
 
     assertEquals(
       listOf("stop-realtime"),
@@ -72,17 +71,16 @@ internal class T3VoiceNativeVoiceApiPolicyTest {
     )
     assertEquals(
       listOf("stop-realtime", "switch-to-thread"),
-      t3VoiceRealtimeTerminalActions(T3VoiceRealtimeContext(focus, switch)),
+      t3VoiceRealtimeTerminalActions(T3VoiceRealtimeContext(focus, THREAD_SETTINGS)),
     )
   }
 
   @Test
-  fun `Realtime context payload adds and removes switch capability atomically with focus`() {
+  fun `Realtime context payload derives switch capability independently of focus`() {
     val focus = T3VoiceRealtimeFocus("project-a", "thread-a")
-    val switch = T3VoiceThreadStart(THREAD_TARGET, THREAD_SETTINGS)
 
     val withSwitch =
-      t3VoiceRealtimeContextFields(T3VoiceRealtimeContext(focus, switch), leaseGeneration = 7)
+      t3VoiceRealtimeContextFields(T3VoiceRealtimeContext(focus, THREAD_SETTINGS), leaseGeneration = 7)
     assertEquals(7L, withSwitch["leaseGeneration"])
     assertEquals("project-a", withSwitch["projectId"])
     assertEquals("thread-a", withSwitch["threadId"])
@@ -102,31 +100,7 @@ internal class T3VoiceNativeVoiceApiPolicyTest {
     assertEquals(listOf("stop-realtime"), withoutFocus["terminalActions"])
   }
 
-  @Test
-  fun `Realtime terminal action decoder admits both supported values`() {
-    assertEquals(
-      T3VoiceRealtimeTerminalActionType.STOP_REALTIME,
-      t3VoiceRealtimeTerminalActionType("stop-realtime"),
-    )
-    assertEquals(
-      T3VoiceRealtimeTerminalActionType.SWITCH_TO_THREAD,
-      t3VoiceRealtimeTerminalActionType("switch-to-thread"),
-    )
-    assertThrows(IllegalStateException::class.java) {
-      t3VoiceRealtimeTerminalActionType("unsupported")
-    }
-  }
-
   private companion object {
-    val THREAD_TARGET =
-      T3VoiceThreadTarget(
-        environmentId = "environment-a",
-        projectId = "project-a",
-        threadId = "thread-a",
-        modelSelection = T3VoiceModelSelection("codex", "gpt-5.4", null),
-        runtimeMode = T3VoiceThreadRuntimeMode.FULL_ACCESS,
-        interactionMode = T3VoiceThreadInteractionMode.DEFAULT,
-      )
     val THREAD_SETTINGS =
       T3VoiceThreadSettings(
         submissionPolicy = T3VoiceThreadSubmissionPolicy.AUTO_SUBMIT,

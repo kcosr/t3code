@@ -1,5 +1,6 @@
 import type { PermissionResponse } from "expo";
 import type {
+  VoiceAudioRoute,
   VoiceRealtimeContext,
   VoiceRealtimeTarget,
   VoiceRuntimeSnapshot,
@@ -35,8 +36,14 @@ export interface T3VoiceSetRealtimeMutedInput {
   readonly muted: boolean;
 }
 
-export interface T3VoiceSetRealtimeAudioRouteInput {
+export interface T3VoiceSetAudioRoutePreferenceInput {
   readonly routeId: string;
+}
+
+export interface T3VoiceAudioRoutePreferenceState {
+  readonly preferredRouteId: string;
+  readonly activeRouteId: string | null;
+  readonly routes: ReadonlyArray<VoiceAudioRoute>;
 }
 
 export interface T3VoiceDecideRealtimeConfirmationInput {
@@ -242,7 +249,10 @@ export interface T3VoiceNativeModule {
   readonly switchThreadToRealtimeAsync: (input: T3VoiceRealtimeAdmissionInput) => Promise<void>;
   readonly stopRuntimeAsync: () => Promise<void>;
   readonly setRealtimeMutedAsync: (input: T3VoiceSetRealtimeMutedInput) => Promise<void>;
-  readonly setRealtimeAudioRouteAsync: (input: T3VoiceSetRealtimeAudioRouteInput) => Promise<void>;
+  readonly getAudioRoutePreferenceAsync: () => Promise<T3VoiceAudioRoutePreferenceState>;
+  readonly setAudioRoutePreferenceAsync: (
+    input: T3VoiceSetAudioRoutePreferenceInput,
+  ) => Promise<T3VoiceAudioRoutePreferenceState>;
   readonly updateRealtimeContextAsync: (context: VoiceRealtimeContext) => Promise<void>;
   readonly decideRealtimeConfirmationAsync: (
     input: T3VoiceDecideRealtimeConfirmationInput,

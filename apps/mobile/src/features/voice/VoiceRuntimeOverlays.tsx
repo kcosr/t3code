@@ -2,8 +2,6 @@ import {
   realtimeVoiceBarPhase,
   type ActiveVoiceRuntimeAttachment,
   type RealtimeVoiceBarPhase,
-  type VoiceAudioRoute,
-  type VoiceAudioRoutePickerState,
   type VoiceRuntimeSnapshot,
 } from "@t3tools/client-runtime/voice";
 import { ActivityIndicator, FlatList, Modal, Pressable, View } from "react-native";
@@ -13,6 +11,7 @@ import { AppText as Text } from "../../components/AppText";
 import { SymbolView } from "../../components/AppSymbol";
 import { ControlPill } from "../../components/ControlPill";
 import { useThemeColor } from "../../lib/useThemeColor";
+import type { VoiceAudioRoutePreferenceController } from "./VoiceAudioRoutePreference";
 
 export interface RealtimeVoiceTranscriptTurn {
   readonly role: "user" | "assistant";
@@ -85,22 +84,19 @@ export function VoiceTranscriptModal(props: {
 }
 
 export function VoiceAudioRoutePicker(props: {
-  readonly state: VoiceAudioRoutePickerState | null;
-  readonly routes: ReadonlyArray<VoiceAudioRoute> | null;
-  readonly onClose: () => void;
-  readonly onSelect: (route: VoiceAudioRoute) => void;
+  readonly controller: VoiceAudioRoutePreferenceController;
 }) {
   const insets = useSafeAreaInsets();
   const iconColor = useThemeColor("--color-icon");
-  const routes = props.routes ?? [];
-  const loading = props.state !== null && props.routes === null;
-  const selectionInFlight = props.state?.selectingRouteId != null;
+  const routes = props.controller.state?.routes ?? [];
+  const loading = props.controller.loading && props.controller.state === null;
+  const selectionInFlight = props.controller.selectingRouteId !== null;
   return (
     <Modal
       animationType="slide"
       presentationStyle="pageSheet"
-      visible={props.state !== null}
-      onRequestClose={props.onClose}
+      visible={props.controller.visible}
+      onRequestClose={props.controller.close}
     >
       <View
         className="flex-1 bg-screen"
@@ -110,17 +106,17 @@ export function VoiceAudioRoutePicker(props: {
         }}
       >
         <VoiceSheetHeader
-          title="Audio route"
-          closeLabel="Close audio routes"
-          onClose={props.onClose}
+          title="Voice audio device"
+          closeLabel="Close voice audio devices"
+          onClose={props.controller.close}
         />
         {loading ? (
           <View className="flex-1 items-center justify-center">
             <ActivityIndicator accessibilityLabel="Loading audio routes" color={iconColor} />
           </View>
-        ) : props.state?.error && routes.length === 0 ? (
+        ) : props.controller.error && routes.length === 0 ? (
           <Text accessibilityRole="alert" className="px-5 py-8 text-center text-sm text-danger">
-            {props.state.error}
+            {props.controller.error}
           </Text>
         ) : (
           <FlatList
@@ -128,19 +124,27 @@ export function VoiceAudioRoutePicker(props: {
             keyExtractor={(route) => route.id}
             contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 24 }}
             ListHeaderComponent={
-              props.state?.error ? (
-                <Text accessibilityRole="alert" className="px-2 py-4 text-sm text-danger">
-                  {props.state.error}
+              props.controller.error || props.controller.statusMessage ? (
+                <Text
+                  accessibilityRole={props.controller.error ? "alert" : undefined}
+                  className={
+                    props.controller.error
+                      ? "px-2 py-4 text-sm text-danger"
+                      : "px-2 py-4 text-sm text-foreground-muted"
+                  }
+                >
+                  {props.controller.error ?? props.controller.statusMessage}
                 </Text>
               ) : null
             }
             ListEmptyComponent={
               <Text className="px-2 py-8 text-center text-sm text-foreground-muted">
-                No audio routes available
+                No audio devices available
               </Text>
             }
             renderItem={({ item }) => {
-              const selecting = props.state?.selectingRouteId === item.id;
+              const selecting = props.controller.selectingRouteId === item.id;
+              const active = props.controller.state?.activeRouteId === item.id;
               return (
                 <Pressable
                   accessibilityRole="radio"
@@ -151,11 +155,18 @@ export function VoiceAudioRoutePicker(props: {
                   accessibilityLabel={item.label}
                   className="flex-row items-center border-b border-border px-2 py-4"
                   disabled={selectionInFlight}
-                  onPress={() => props.onSelect(item)}
+                  onPress={() => props.controller.select(item)}
                 >
-                  <Text className="min-w-0 flex-1 text-base text-foreground" numberOfLines={1}>
-                    {item.label}
-                  </Text>
+                  <View className="min-w-0 flex-1">
+                    <Text className="text-base text-foreground" numberOfLines={1}>
+                      {item.label}
+                    </Text>
+                    {active ? (
+                      <Text className="text-xs text-foreground-muted" numberOfLines={1}>
+                        Active now
+                      </Text>
+                    ) : null}
+                  </View>
                   {selecting ? (
                     <ActivityIndicator
                       accessibilityLabel={`Selecting ${item.label}`}
@@ -203,6 +214,7 @@ export function RealtimeVoiceCallBar(props: {
   readonly transcript: ReadonlyArray<RealtimeVoiceTranscriptTurn>;
   readonly onMute: () => void;
   readonly onRoute: () => void;
+  readonly routeAvailable: boolean;
   readonly onTranscript: () => void;
   readonly onResume: () => void;
   readonly resumePending: boolean;
@@ -213,7 +225,7 @@ export function RealtimeVoiceCallBar(props: {
   const iconColor = useThemeColor("--color-icon");
   const barPhase = realtimeVoiceBarPhase(props.snapshot);
   if (barPhase === "idle") {
-    if (!props.historyAvailable && !props.callAvailable) return null;
+    if (!props.historyAvailable && !props.callAvailable && !props.routeAvailable) return null;
     return (
       <View
         className="flex-row items-center gap-3 border-t border-border bg-screen px-3 pt-2"
@@ -224,9 +236,19 @@ export function RealtimeVoiceCallBar(props: {
             Voice conversation
           </Text>
           <Text className="text-xs text-foreground-muted" numberOfLines={1}>
-            {props.callAvailable ? "Resume your last conversation" : "Browse saved conversations"}
+            {props.callAvailable
+              ? "Resume your last conversation"
+              : props.historyAvailable
+                ? "Browse saved conversations"
+                : "Choose your preferred audio device"}
           </Text>
         </View>
+        <ControlPill
+          icon="airplayaudio"
+          accessibilityLabel="Choose voice audio device"
+          disabled={!props.routeAvailable}
+          onPress={props.onRoute}
+        />
         {props.historyAvailable ? (
           <ControlPill
             icon="clock.arrow.circlepath"
@@ -280,14 +302,14 @@ export function RealtimeVoiceCallBar(props: {
             disabled={!props.controlsAvailable}
             onPress={props.onMute}
           />
-          <ControlPill
-            icon="airplayaudio"
-            accessibilityLabel="Choose audio route"
-            disabled={!props.controlsAvailable}
-            onPress={props.onRoute}
-          />
         </>
       ) : null}
+      <ControlPill
+        icon="airplayaudio"
+        accessibilityLabel="Choose voice audio device"
+        disabled={!props.routeAvailable}
+        onPress={props.onRoute}
+      />
       <ControlPill
         icon={props.snapshot.mode === "failed" ? "xmark" : "stop.fill"}
         accessibilityLabel={

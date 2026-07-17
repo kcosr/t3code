@@ -350,7 +350,7 @@ internal class T3VoiceRealtimeSessionTest {
   @Test
   fun `duplicate terminal events are admitted only once while Realtime is starting`() {
     val action =
-      T3VoiceRealtimeTerminalAction("terminal-a", T3VoiceRealtimeTerminalActionType.STOP_REALTIME)
+      T3VoiceRealtimeTerminalAction.StopRealtime("terminal-a")
     val api =
       TestRealtimeApi(
         sessionId = "session-terminal-event",
@@ -402,7 +402,7 @@ internal class T3VoiceRealtimeSessionTest {
     session.start()
     assertTrue(media.prepareCompleted.await(1, TimeUnit.SECONDS))
     val focus = T3VoiceRealtimeFocus("project-a", "thread-a")
-    val withSwitch = T3VoiceRealtimeContext(focus, T3VoiceThreadStart(THREAD_TARGET, THREAD_SETTINGS))
+    val withSwitch = T3VoiceRealtimeContext(focus, THREAD_SETTINGS)
 
     session.admitContext(withSwitch)
     assertEquals(withSwitch, api.contextUpdates.poll(1, TimeUnit.SECONDS))
@@ -506,8 +506,6 @@ internal class T3VoiceRealtimeSessionTest {
 
     override fun setMuted(sessionId: String, muted: Boolean) = Unit
 
-    override fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>> =
-      emptyList()
   }
 
   private class TestRealtimeMedia(
@@ -593,8 +591,6 @@ internal class T3VoiceRealtimeSessionTest {
 
     override fun setMuted(sessionId: String, muted: Boolean) = Unit
 
-    override fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>> =
-      emptyList()
 
     fun activeSessionId(): String? = synchronized(lock) { activeSession }
   }
@@ -627,8 +623,6 @@ internal class T3VoiceRealtimeSessionTest {
 
     override fun setMuted(sessionId: String, muted: Boolean) = Unit
 
-    override fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>> =
-      emptyList()
   }
 
   private class TestRealtimeApi(
@@ -757,7 +751,7 @@ internal class T3VoiceRealtimeSessionTest {
         environmentId = "environment-a",
         conversation = T3VoiceConversationSelection.New(T3VoiceConversationRetention.EPHEMERAL, null),
         focus = null,
-        threadSwitch = null,
+        threadSettings = null,
       )
     val THREAD_TARGET =
       T3VoiceThreadTarget(

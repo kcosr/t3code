@@ -20,7 +20,6 @@ class T3VoiceRuntimeBridgeTest {
   @Test
   fun realtimeSnapshotIncludesContextAndNeverIncludesSessionCredential() {
     val settings = settings()
-    val threadStart = T3VoiceThreadStart(threadTarget(), settings)
     val target =
       T3VoiceRealtimeTarget(
         environmentId = "environment-a",
@@ -30,7 +29,7 @@ class T3VoiceRuntimeBridgeTest {
             title = "Voice",
           ),
         focus = T3VoiceRealtimeFocus("project-a", "thread-a"),
-        threadSwitch = threadStart,
+        threadSettings = settings,
       )
     val body =
       T3VoiceControllerSnapshot(
@@ -51,7 +50,7 @@ class T3VoiceRuntimeBridgeTest {
     @Suppress("UNCHECKED_CAST")
     val targetBody = body["target"] as Map<String, Any?>
     assertEquals("environment-a", targetBody["environmentId"])
-    assertTrue(targetBody["threadSwitch"] is Map<*, *>)
+    assertTrue(targetBody["threadSettings"] is Map<*, *>)
     assertFalse(body.toString().contains("accessToken"))
   }
 
@@ -95,7 +94,7 @@ class T3VoiceRuntimeBridgeTest {
             title = "Voice",
           ),
         focus = T3VoiceRealtimeFocus("project-a", "thread-a"),
-        threadSwitch = threadStart,
+        threadSettings = threadStart.settings,
       )
     val body =
       T3VoiceControllerSnapshot(

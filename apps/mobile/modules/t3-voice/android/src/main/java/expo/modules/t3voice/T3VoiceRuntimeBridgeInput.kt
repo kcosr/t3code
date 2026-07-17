@@ -50,10 +50,10 @@ internal object T3VoiceRuntimeBridgeInput {
   }
 
   fun realtimeContext(input: Map<String, Any?>): T3VoiceRealtimeContext {
-    input.requireExactBridgeKeys("Realtime context", setOf("focus", "threadSwitch"))
+    input.requireExactBridgeKeys("Realtime context", setOf("focus", "threadSettings"))
     return T3VoiceRealtimeContext(
       focus = input.optionalBridgeObject("focus")?.let(::realtimeFocus),
-      threadSwitch = input.optionalBridgeObject("threadSwitch")?.let(::threadStart),
+      threadSettings = input.optionalBridgeObject("threadSettings")?.let(::threadSettings),
     )
   }
 
@@ -96,13 +96,13 @@ internal object T3VoiceRuntimeBridgeInput {
   private fun realtimeTarget(input: Map<String, Any?>): T3VoiceRealtimeTarget {
     input.requireExactBridgeKeys(
       "Realtime target",
-      setOf("environmentId", "conversation", "focus", "threadSwitch"),
+      setOf("environmentId", "conversation", "focus", "threadSettings"),
     )
     return T3VoiceRealtimeTarget(
       environmentId = input.requireBridgeIdentifier("environmentId"),
       conversation = conversation(input.requireBridgeObject("conversation")),
       focus = input.optionalBridgeObject("focus")?.let(::realtimeFocus),
-      threadSwitch = input.optionalBridgeObject("threadSwitch")?.let(::threadStart),
+      threadSettings = input.optionalBridgeObject("threadSettings")?.let(::threadSettings),
     )
   }
 

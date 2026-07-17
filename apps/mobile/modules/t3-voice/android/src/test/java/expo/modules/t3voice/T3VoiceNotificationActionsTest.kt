@@ -47,7 +47,7 @@ class T3VoiceNotificationActionsTest {
           takeover = false,
         ),
       focus = T3VoiceRealtimeFocus(projectId = "project-a", threadId = "thread-a"),
-      threadSwitch = T3VoiceThreadStart(threadTarget, settings),
+      threadSettings = settings,
     )
   private val session =
     T3VoiceNativeSessionConfig(
@@ -68,7 +68,6 @@ class T3VoiceNotificationActionsTest {
     assertEquals(
       listOf(
         T3VoiceNotificationActionId.MUTE,
-        T3VoiceNotificationActionId.SWITCH_TO_THREAD,
         T3VoiceNotificationActionId.STOP,
       ),
       connectedActions.map { it.id },
@@ -78,10 +77,6 @@ class T3VoiceNotificationActionsTest {
     assertEquals(T3VoiceCommandOutcome.APPLIED, controller.dispatch(mute.command).outcome)
     val muted = controller.snapshot().state as T3VoiceControllerState.Realtime
     assertTrue(muted.muted)
-
-    val switch = connectedActions.single { it.id == T3VoiceNotificationActionId.SWITCH_TO_THREAD }
-    assertEquals(T3VoiceCommandOutcome.APPLIED, controller.dispatch(switch.command).outcome)
-    assertTrue(controller.snapshot().state is T3VoiceControllerState.SwitchingToThread)
   }
 
   @Test
@@ -323,8 +318,6 @@ private class NotificationFakeDriver : T3VoiceRuntimeDriver {
   override fun cancelRealtimeToThreadSwitch(generation: Long) = Unit
 
   override fun setRealtimeMuted(generation: Long, muted: Boolean) = Unit
-
-  override fun setRealtimeAudioRoute(generation: Long, routeId: String) = Unit
 
   override fun updateRealtimeContext(generation: Long, context: T3VoiceRealtimeContext) = Unit
 

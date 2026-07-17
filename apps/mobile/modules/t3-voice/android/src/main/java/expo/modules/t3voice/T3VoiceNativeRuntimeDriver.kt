@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 internal class T3VoiceNativeRuntimeDriver(
   context: Context,
   private val callback: (generation: Long, callback: T3VoiceRuntimeCallback) -> Unit,
+  private val onUnownedAudioFocusActions: (List<T3VoiceAudioFocusAction>) -> Unit = {},
 ) : T3VoiceRuntimeDriver {
   private val lock = Any()
   private val applicationContext = context.applicationContext
@@ -115,9 +116,15 @@ internal class T3VoiceNativeRuntimeDriver(
     requireRealtime(generation).setMuted(muted)
   }
 
-  override fun setRealtimeAudioRoute(generation: Long, routeId: String) {
-    requireRealtime(generation).setAudioRoute(routeId)
-  }
+  fun audioRoutePreference(): T3VoiceAudioRoutePreference = audioRouter.preference()
+
+  fun setAudioRoutePreference(routeId: String): T3VoiceAudioRoutePreference =
+    audioRouter.setPreference(routeId)
+
+  fun acquireLegacyAudio(): Boolean =
+    audioRouter.start().transition.state != T3VoiceAudioFocusState.TERMINATED
+
+  fun releaseLegacyAudio() = audioRouter.stop()
 
   override fun updateRealtimeContext(generation: Long, context: T3VoiceRealtimeContext) {
     requireRealtime(generation).admitContext(context)
@@ -333,6 +340,7 @@ internal class T3VoiceNativeRuntimeDriver(
     when {
       realtime != null -> webRtc.handleAudioFocusActions(actions)
       thread != null -> thread.onAudioFocusActions(actions)
+      else -> onUnownedAudioFocusActions(actions)
     }
   }
 

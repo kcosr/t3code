@@ -27,6 +27,7 @@ import {
   VoiceConversationEntryId,
   VoiceToolCallId,
   VoiceToolName,
+  VoiceTerminalActionRequest,
   type VoiceTerminalAction,
   type OrchestrationProjectShell,
   type OrchestrationThreadShell,
@@ -68,7 +69,6 @@ import {
   type VoiceToolExecutionResult,
   type VoiceToolExecutorShape,
   type VoiceToolInvokeResult,
-  type VoiceToolTerminalResult,
 } from "../Services/VoiceToolExecutor.ts";
 
 const CONFIRMATION_TTL_MILLIS = 30_000;
@@ -122,7 +122,7 @@ const ReadHistoryArguments = Schema.Struct({
   before: HistoryContextRadius,
   after: HistoryContextRadius,
 });
-const TerminalArguments = Schema.Record(Schema.String, Schema.Unknown);
+const StopRealtimeArguments = Schema.Record(Schema.String, Schema.Unknown);
 type SearchHistoryArguments = typeof SearchHistoryArguments.Type;
 type ReadHistoryArguments = typeof ReadHistoryArguments.Type;
 
@@ -421,6 +421,14 @@ const terminalActionId = (input: {
       .digest("base64url")}`,
   );
 
+const PersistedTerminalResult = Schema.Struct({
+  status: Schema.Literal("accepted"),
+  terminalAction: VoiceTerminalActionRequest,
+});
+const decodePersistedTerminalResult = Schema.decodeUnknownOption(
+  Schema.fromJsonString(PersistedTerminalResult),
+);
+
 const parseArguments = <A>(
   schema: Schema.Codec<A, unknown, never, never>,
   input: VoiceToolCallInput,
@@ -432,31 +440,6 @@ const parseArguments = <A>(
       voiceError("invalid-phase", "tool.arguments", "Voice tool arguments were invalid"),
     ),
   );
-
-const completeTerminalTool = Effect.fn("VoiceToolExecutor.completeTerminalTool")(function* (
-  input: VoiceToolCallInput,
-  tool: TerminalVoiceTool,
-): Effect.fn.Return<VoiceToolTerminalResult, VoiceError> {
-  const args = yield* parseArguments(TerminalArguments, input);
-  if (Object.keys(args).length > 0) {
-    return yield* voiceError(
-      "invalid-phase",
-      "tool.arguments",
-      "Terminal voice tools do not accept arguments",
-    );
-  }
-  const action = terminalActionForTool(tool);
-  const actionId = terminalActionId(input);
-  return {
-    type: "terminal-completed",
-    toolCallId: input.toolCallId,
-    providerFunctionCallId: input.providerFunctionCallId,
-    tool,
-    outcome: "succeeded",
-    output: jsonOutput({ status: "accepted", actionId, action }),
-    terminalAction: { actionId, action },
-  };
-});
 
 const projectOutput = (project: OrchestrationProjectShell) => ({
   projectId: project.id,
@@ -612,6 +595,101 @@ const make = Effect.gen(function* () {
         }),
       ),
     );
+
+  const resolveThreadVoiceTarget = Effect.fn("VoiceToolExecutor.resolveThreadVoiceTarget")(
+    function* (threadId: ThreadId) {
+      const thread = yield* requireThread(threadId);
+      if (thread.archivedAt !== null) {
+        return yield* voiceError(
+          "invalid-phase",
+          "tool.thread",
+          `Thread ${threadId} is archived and unavailable for voice`,
+        );
+      }
+      const project = yield* query.getProjectShellById(thread.projectId);
+      if (Option.isNone(project)) {
+        return yield* voiceError(
+          "invalid-phase",
+          "tool.project",
+          `Project ${thread.projectId} for thread ${threadId} was not found`,
+        );
+      }
+      if (thread.hasPendingApprovals) {
+        return yield* voiceError(
+          "invalid-phase",
+          "tool.thread",
+          `Thread ${threadId} is awaiting approval and cannot start voice`,
+        );
+      }
+      if (thread.hasPendingUserInput) {
+        return yield* voiceError(
+          "invalid-phase",
+          "tool.thread",
+          `Thread ${threadId} is awaiting user input and cannot start voice`,
+        );
+      }
+      if (
+        thread.latestTurn?.state === "running" ||
+        thread.session?.status === "starting" ||
+        thread.session?.status === "running"
+      ) {
+        return yield* voiceError(
+          "invalid-phase",
+          "tool.thread",
+          `Thread ${threadId} is busy and cannot start voice`,
+        );
+      }
+      if (thread.session?.status === "error") {
+        return yield* voiceError(
+          "invalid-phase",
+          "tool.thread",
+          `Thread ${threadId} is unavailable because its provider session is in error`,
+        );
+      }
+      return {
+        projectId: project.value.id,
+        threadId: thread.id,
+        modelSelection: thread.modelSelection,
+        runtimeMode: thread.runtimeMode,
+        interactionMode: thread.interactionMode,
+      };
+    },
+  );
+
+  const completeTerminalTool = Effect.fn("VoiceToolExecutor.completeTerminalTool")(function* (
+    input: VoiceToolCallInput,
+    tool: TerminalVoiceTool,
+  ) {
+    const actionId = terminalActionId(input);
+    let terminalAction: VoiceTerminalActionRequest;
+    if (tool === "stop_realtime_voice") {
+      const args = yield* parseArguments(StopRealtimeArguments, input);
+      if (Object.keys(args).length > 0) {
+        return yield* voiceError(
+          "invalid-phase",
+          "tool.arguments",
+          "stop_realtime_voice does not accept arguments",
+        );
+      }
+      terminalAction = { actionId, action: "stop-realtime" };
+    } else {
+      const args = yield* parseArguments(ThreadArguments, input);
+      terminalAction = {
+        actionId,
+        action: "switch-to-thread",
+        target: yield* resolveThreadVoiceTarget(args.threadId),
+      };
+    }
+    return {
+      type: "terminal-completed",
+      toolCallId: input.toolCallId,
+      providerFunctionCallId: input.providerFunctionCallId,
+      tool,
+      outcome: "succeeded",
+      output: jsonOutput({ status: "accepted", terminalAction }),
+      terminalAction,
+    };
+  });
 
   const prepareMutation = Effect.fn("VoiceToolExecutor.prepareMutation")(function* (
     input: VoiceToolCallInput,
@@ -939,18 +1017,32 @@ const make = Effect.gen(function* () {
       call.status === "succeeded" &&
       call.resultOutput !== null
     ) {
-      const action = terminalActionForTool(call.toolName);
+      const persisted = decodePersistedTerminalResult(call.resultOutput);
+      const expectedAction = terminalActionForTool(call.toolName);
+      const expectedActionId = terminalActionId({ ...call, name: call.toolName });
+      if (
+        Option.isSome(persisted) &&
+        persisted.value.terminalAction.action === expectedAction &&
+        persisted.value.terminalAction.actionId === expectedActionId
+      ) {
+        return {
+          type: "terminal-completed",
+          toolCallId: call.toolCallId,
+          providerFunctionCallId: call.providerFunctionCallId,
+          tool: call.toolName,
+          outcome: "succeeded",
+          output: call.resultOutput,
+          terminalAction: persisted.value.terminalAction,
+        };
+      }
       return {
-        type: "terminal-completed",
+        type: "completed",
         toolCallId: call.toolCallId,
         providerFunctionCallId: call.providerFunctionCallId,
         tool: call.toolName,
-        outcome: "succeeded",
-        output: call.resultOutput,
-        terminalAction: {
-          actionId: terminalActionId({ ...call, name: call.toolName }),
-          action,
-        },
+        outcome: "failed",
+        output: jsonOutput({ error: "Persisted terminal action was invalid" }),
+        submitOutput,
       };
     }
     return {

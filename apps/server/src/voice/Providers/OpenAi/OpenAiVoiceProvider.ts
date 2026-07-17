@@ -337,10 +337,11 @@ const TERMINAL_REALTIME_TOOLS = {
     type: "function",
     name: "switch_to_thread_voice",
     description:
-      "End Realtime and switch to the prepared Thread voice target. You may speak one brief transition sentence immediately before calling this tool, without claiming the switch already completed. The tool call must be your final output action, and you must not speak after it.",
+      "End Realtime and start Thread voice for the exact T3 threadId supplied. Choose the intended thread using list_threads; this tool never uses the focused or last active thread. You may speak one brief transition sentence immediately before calling this tool, without claiming the switch already completed. The tool call must be your final output action, and you must not speak after it.",
     parameters: {
       type: "object",
-      properties: {},
+      properties: { threadId: { type: "string" } },
+      required: ["threadId"],
       additionalProperties: false,
     },
   },

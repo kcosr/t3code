@@ -1,7 +1,9 @@
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
+import { useFocusEffect } from "@react-navigation/native";
 import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import { AsyncResult } from "effect/unstable/reactivity";
 import * as Clipboard from "expo-clipboard";
+import { useCallback } from "react";
 import { Alert, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -26,6 +28,7 @@ import {
   VOICE_TRANSCRIPTION_TIMEOUT_MIN_MS,
 } from "../voice/voicePreferences";
 import { formatVoiceDiagnostics } from "../voice/voiceDiagnostics";
+import { useVoiceAudioRoutePreference } from "../voice/VoiceAudioRoutePreference";
 import { SettingsRow } from "./components/SettingsRow";
 import { SettingsSection } from "./components/SettingsSection";
 import { SettingsStepperRow } from "./components/SettingsStepperRow";
@@ -42,6 +45,12 @@ export function SettingsVoiceRouteScreen() {
   const stored = ready ? preferencesResult.value : {};
   const voice = resolveVoicePreferences(stored);
   const noSpeechEnabled = voice.noSpeechTimeoutMs !== null;
+  const audioRoutePreference = useVoiceAudioRoutePreference();
+  useFocusEffect(
+    useCallback(() => {
+      void audioRoutePreference.refresh();
+    }, [audioRoutePreference.refresh]),
+  );
   const copyDiagnostics = async () => {
     const native = getT3VoiceNativeModule();
     if (native === null) {
@@ -100,6 +109,15 @@ export function SettingsVoiceRouteScreen() {
             label="Play spoken responses"
             value={stored.threadSpeechEnabled === true}
             onValueChange={(value) => savePreferences({ threadSpeechEnabled: value })}
+          />
+        </SettingsSection>
+
+        <SettingsSection title="Audio">
+          <SettingsRow
+            icon="airplayaudio"
+            label="Voice audio device"
+            value={audioRoutePreference.valueLabel}
+            onPress={audioRoutePreference.open}
           />
         </SettingsSection>
 

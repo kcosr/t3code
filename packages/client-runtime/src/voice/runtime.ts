@@ -21,8 +21,8 @@ export interface VoiceRealtimeFocus {
 
 export interface VoiceRealtimeContext {
   readonly focus: VoiceRealtimeFocus | null;
-  /** Complete native Thread input used by the active notification's switch action. */
-  readonly threadSwitch: VoiceThreadStartInput | null;
+  /** Native-owned settings used when an agent targets a Thread by ID. */
+  readonly threadSettings: VoiceThreadSettings | null;
 }
 
 export interface VoiceRealtimeTarget extends VoiceRealtimeContext {
@@ -195,7 +195,6 @@ export interface VoiceRuntimeAdapter {
   readonly switchRealtimeToThread: (input: VoiceThreadStartInput) => Promise<void>;
   readonly stop: () => Promise<void>;
   readonly setRealtimeMuted: (muted: boolean) => Promise<void>;
-  readonly setRealtimeAudioRoute: (routeId: string) => Promise<void>;
   readonly updateRealtimeContext: (context: VoiceRealtimeContext) => Promise<void>;
   readonly decideRealtimeConfirmation: (
     confirmationId: VoiceConfirmationId,

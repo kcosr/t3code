@@ -83,10 +83,6 @@ internal class T3VoiceAndroidControls(
             )
           }
 
-          override fun onSkipToNext() {
-            dispatchFirst(T3VoiceNotificationActionId.SWITCH_TO_THREAD)
-          }
-
           override fun onStop() {
             dispatchFirst(T3VoiceNotificationActionId.STOP)
           }
@@ -232,7 +228,6 @@ internal class T3VoiceAndroidControls(
       T3VoiceNotificationActionId.MUTE,
       T3VoiceNotificationActionId.FINISH_UTTERANCE,
       -> PlaybackState.ACTION_PAUSE
-      T3VoiceNotificationActionId.SWITCH_TO_THREAD -> PlaybackState.ACTION_SKIP_TO_NEXT
       T3VoiceNotificationActionId.STOP -> PlaybackState.ACTION_STOP
     }
 
@@ -243,7 +238,6 @@ internal class T3VoiceAndroidControls(
     when (this) {
       T3VoiceNotificationActionId.MUTE -> "Mute"
       T3VoiceNotificationActionId.UNMUTE -> "Unmute"
-      T3VoiceNotificationActionId.SWITCH_TO_THREAD -> "Use Thread"
       T3VoiceNotificationActionId.FINISH_UTTERANCE -> "Finish"
       T3VoiceNotificationActionId.SUBMIT_TRANSCRIPT -> "Submit"
       T3VoiceNotificationActionId.STOP -> "Stop"
@@ -257,7 +251,6 @@ internal class T3VoiceAndroidControls(
       T3VoiceNotificationActionId.MUTE,
       T3VoiceNotificationActionId.FINISH_UTTERANCE,
       -> android.R.drawable.ic_media_pause
-      T3VoiceNotificationActionId.SWITCH_TO_THREAD -> android.R.drawable.ic_media_next
       T3VoiceNotificationActionId.STOP -> android.R.drawable.ic_menu_close_clear_cancel
     }
 

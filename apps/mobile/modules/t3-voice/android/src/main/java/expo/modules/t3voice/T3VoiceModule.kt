@@ -157,7 +157,7 @@ class T3VoiceModule : Module() {
       )
 
       Constants(
-        "nativeRevision" to 11,
+        "nativeRevision" to 12,
       )
 
       OnCreate {
@@ -238,15 +238,20 @@ class T3VoiceModule : Module() {
         dispatchRuntime(promise, T3VoiceRuntimeCommand.Stop)
       }
 
-      AsyncFunction("setRealtimeAudioRouteAsync") {
+      AsyncFunction("getAudioRoutePreferenceAsync") { promise: Promise ->
+        withBinder(promise, "audio-route-preference-read-failed") { voice, result ->
+          result.resolve(voice.audioRoutePreference())
+        }
+      }
+
+      AsyncFunction("setAudioRoutePreferenceAsync") {
         input: Map<String, Any?>, promise: Promise ->
         input.requireExactBridgeKeys("audio route input", setOf("routeId"))
-        dispatchRuntime(
-          promise,
-          T3VoiceRuntimeCommand.SetRealtimeAudioRoute(
-            input.requireBridgeArgumentIdentifier("routeId"),
-          ),
-        )
+        withBinder(promise, "audio-route-preference-write-failed") { voice, result ->
+          result.resolve(
+            voice.setAudioRoutePreference(input.requireBridgeArgumentIdentifier("routeId")),
+          )
+        }
       }
 
       AsyncFunction("updateRealtimeContextAsync") {
@@ -543,8 +548,6 @@ class T3VoiceModule : Module() {
               "The voice command targets an obsolete runtime generation."
             T3VoiceCommandRejection.STALE_REVIEW ->
               "The voice command targets an obsolete transcript review."
-            T3VoiceCommandRejection.UNKNOWN_AUDIO_ROUTE ->
-              "The requested audio route is not currently available."
           },
         )
       }

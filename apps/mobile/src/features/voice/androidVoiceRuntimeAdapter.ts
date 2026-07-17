@@ -61,25 +61,6 @@ const assertEnvironment = (
   }
 };
 
-const assertRealtimeContext = (
-  runtimeEnvironmentId: EnvironmentId,
-  context: VoiceRealtimeContext,
-): void => {
-  const threadSwitch = context.threadSwitch;
-  if (threadSwitch === null) return;
-  assertEnvironment(runtimeEnvironmentId, threadSwitch.target.environmentId);
-  const focus = context.focus;
-  if (focus === null) {
-    throw new Error("A native voice Thread switch target requires a Realtime focus");
-  }
-  if (
-    focus.projectId !== threadSwitch.target.projectId ||
-    focus.threadId !== threadSwitch.target.threadId
-  ) {
-    throw new Error("The native voice Thread switch target does not match the Realtime focus");
-  }
-};
-
 const ensureInitialStartIdle = async (native: T3VoiceNativeModule): Promise<void> => {
   if ((await native.getRuntimeSnapshotAsync()).mode !== "idle") {
     throw new Error("Native voice runtime is already active");
@@ -229,7 +210,6 @@ export const makeAndroidVoiceRuntimeAdapter = (
     subscribe: (listener) => attachSnapshotListener(input.native, listener),
     startRealtime: async (target: VoiceRealtimeTarget, options?: VoiceRuntimeAdmissionOptions) => {
       assertEnvironment(input.environmentId, target.environmentId);
-      assertRealtimeContext(input.environmentId, target);
       return commands.enqueue(async () => {
         await realtimeAdmissionMode(input.native);
         const session = await prepareNativeSession(target.environmentId, options);
@@ -260,10 +240,7 @@ export const makeAndroidVoiceRuntimeAdapter = (
     stop: () => commands.enqueue(() => stopAndAwaitRelease(input.native)),
     setRealtimeMuted: (muted: boolean) =>
       commands.enqueue(() => input.native.setRealtimeMutedAsync({ muted })),
-    setRealtimeAudioRoute: (routeId: string) =>
-      commands.enqueue(() => input.native.setRealtimeAudioRouteAsync({ routeId })),
     updateRealtimeContext: async (context: VoiceRealtimeContext) => {
-      assertRealtimeContext(input.environmentId, context);
       return commands.enqueue(() => input.native.updateRealtimeContextAsync(context));
     },
     decideRealtimeConfirmation: async (

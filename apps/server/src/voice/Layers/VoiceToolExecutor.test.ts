@@ -159,6 +159,7 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
       ProjectionThreadTurnOutcome & { readonly dispatchedMessageId: MessageId }
     >;
     readonly thread?: OrchestrationThreadShell;
+    readonly project?: OrchestrationProjectShell | null;
     readonly blockMessagePage?: boolean;
     readonly blockTurnLookupAfterFirst?: boolean;
     readonly historyReadContentChars?: number;
@@ -187,10 +188,13 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
   const messagePageStarted = yield* Deferred.make<void>();
   const messagePageRelease = yield* Deferred.make<void>();
   const threadShell = yield* Ref.make(projection?.thread ?? thread);
+  const projectShell = projection?.project === undefined ? project : projection.project;
   const query = {
     getShellSnapshot: () => Effect.succeed(snapshot),
     getProjectShellById: (id: ProjectId) =>
-      Effect.succeed(id === projectId ? Option.some(project) : Option.none()),
+      Effect.succeed(
+        projectShell !== null && id === projectShell.id ? Option.some(projectShell) : Option.none(),
+      ),
     getThreadShellById: (id: ThreadId) =>
       Ref.get(threadShell).pipe(
         Effect.map((current) => (id === threadId ? Option.some(current) : Option.none())),
@@ -652,7 +656,8 @@ it.effect("waits for acknowledged thread activation and deduplicates the client 
 
 it.effect("completes terminal voice tools deterministically and durably deduplicates them", () =>
   Effect.gen(function* () {
-    const test = yield* makeTest();
+    const availableThread = { ...thread, latestTurn: null };
+    const test = yield* makeTest("durable", { thread: availableThread });
     yield* Effect.gen(function* () {
       const tools = yield* VoiceToolExecutor;
       const stopInput = call(
@@ -671,28 +676,104 @@ it.effect("completes terminal voice tools deterministically and durably deduplic
       if (stop.type !== "terminal-completed") return;
       expect(decodeJson(stop.output)).toEqual({
         status: "accepted",
-        actionId: stop.terminalAction.actionId,
-        action: "stop-realtime",
+        terminalAction: {
+          actionId: stop.terminalAction.actionId,
+          action: "stop-realtime",
+        },
       });
       expect(stop.terminalAction.actionId.length).toBeLessThanOrEqual(128);
       expect(yield* tools.invoke(stopInput)).toEqual(stop);
 
       const switching = yield* tools.invoke(
-        call("switch_to_thread_voice", "{}", "terminal-switch", new Set([AuthVoiceUseScope])),
+        call(
+          "switch_to_thread_voice",
+          encodeJson({ threadId }),
+          "terminal-switch",
+          new Set([AuthVoiceUseScope]),
+        ),
       );
       expect(switching).toMatchObject({
         type: "terminal-completed",
         tool: "switch_to_thread_voice",
         outcome: "succeeded",
-        terminalAction: { action: "switch-to-thread" },
+        terminalAction: {
+          action: "switch-to-thread",
+          target: {
+            projectId,
+            threadId,
+            modelSelection: availableThread.modelSelection,
+            runtimeMode: availableThread.runtimeMode,
+            interactionMode: availableThread.interactionMode,
+          },
+        },
       });
+
+      const missingTarget = yield* tools.invoke(
+        call("switch_to_thread_voice", "{}", "terminal-missing-target"),
+      );
+      expect(missingTarget.type === "completed" && missingTarget.outcome).toBe("failed");
+
+      const excessTarget = yield* tools.invoke(
+        call(
+          "switch_to_thread_voice",
+          encodeJson({ threadId, legacy: true }),
+          "terminal-excess-target",
+        ),
+      );
+      expect(excessTarget.type === "completed" && excessTarget.outcome).toBe("failed");
 
       const invalid = yield* tools.invoke(
         call("stop_realtime_voice", '{"legacy":true}', "terminal-invalid"),
       );
       expect(invalid.type === "completed" && invalid.outcome).toBe("failed");
-      expect(yield* Ref.get(test.durableCalls)).toHaveLength(3);
+      expect(yield* Ref.get(test.durableCalls)).toHaveLength(5);
     }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("rejects unavailable thread voice targets instead of accepting another thread", () =>
+  Effect.gen(function* () {
+    for (const [label, unavailableThread] of [
+      ["archived", { ...thread, archivedAt: now, latestTurn: null }],
+      ["approval", { ...thread, hasPendingApprovals: true, latestTurn: null }],
+      ["input", { ...thread, hasPendingUserInput: true, latestTurn: null }],
+      ["busy", thread],
+      [
+        "provider-error",
+        {
+          ...thread,
+          latestTurn: null,
+          session: {
+            threadId,
+            status: "error" as const,
+            providerName: "codex",
+            runtimeMode: thread.runtimeMode,
+            activeTurnId: null,
+            lastError: "provider failed",
+            updatedAt: now,
+          },
+        },
+      ],
+    ] as const) {
+      const test = yield* makeTest("ephemeral", { thread: unavailableThread });
+      yield* Effect.gen(function* () {
+        const result = yield* (yield* VoiceToolExecutor).invoke(
+          call("switch_to_thread_voice", encodeJson({ threadId }), `unavailable-${label}`),
+        );
+        expect(result.type === "completed" && result.outcome).toBe("failed");
+      }).pipe(Effect.provide(test.layer));
+    }
+
+    const missingProject = yield* makeTest("ephemeral", {
+      thread: { ...thread, latestTurn: null },
+      project: null,
+    });
+    yield* Effect.gen(function* () {
+      const result = yield* (yield* VoiceToolExecutor).invoke(
+        call("switch_to_thread_voice", encodeJson({ threadId }), "unavailable-project"),
+      );
+      expect(result.type === "completed" && result.outcome).toBe("failed");
+    }).pipe(Effect.provide(missingProject.layer));
   }),
 );
 

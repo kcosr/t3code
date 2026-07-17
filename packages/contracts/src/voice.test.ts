@@ -238,11 +238,19 @@ describe("voice contracts", () => {
         occurredAt: "2026-07-10T20:00:00.000Z",
         action: "switch-to-thread",
         actionId: "voice-terminal-action-1",
+        target: {
+          projectId: "project-1",
+          threadId: "thread-1",
+          modelSelection: { instanceId: "codex", model: "gpt-test" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+        },
       }),
     ).toMatchObject({
       type: "terminal-action",
       action: "switch-to-thread",
       actionId: "voice-terminal-action-1",
+      target: { projectId: "project-1", threadId: "thread-1" },
     });
   });
 

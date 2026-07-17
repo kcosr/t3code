@@ -686,14 +686,20 @@ internal fun JSONObject.realtimeEvent(
         ),
       )
     }
-    "terminal-action" ->
-      T3VoiceApiRealtimeEvent.TerminalAction(
-        sequence,
-        T3VoiceRealtimeTerminalAction(
-          actionId = requiredString("actionId"),
-          type = t3VoiceRealtimeTerminalActionType(requiredString("action")),
-        ),
-      )
+    "terminal-action" -> {
+      val actionId = requiredString("actionId")
+      val action =
+        when (requiredString("action")) {
+          "stop-realtime" -> T3VoiceRealtimeTerminalAction.StopRealtime(actionId)
+          "switch-to-thread" ->
+            T3VoiceRealtimeTerminalAction.SwitchToThread(
+              actionId = actionId,
+              target = requiredObject("target").remoteThreadTarget(),
+            )
+          else -> error("Realtime terminal action was unsupported.")
+        }
+      T3VoiceApiRealtimeEvent.TerminalAction(sequence, action)
+    }
     "lease-fenced" -> {
       requiredPositiveLong("replacementGeneration")
       T3VoiceApiRealtimeEvent.LeaseFenced(sequence)
@@ -723,19 +729,12 @@ internal fun JSONObject.realtimeEvent(
 }
 
 internal fun t3VoiceRealtimeTerminalActions(target: T3VoiceRealtimeTarget): List<String> =
-  t3VoiceRealtimeTerminalActions(T3VoiceRealtimeContext(target.focus, target.threadSwitch))
+  t3VoiceRealtimeTerminalActions(T3VoiceRealtimeContext(target.focus, target.threadSettings))
 
 internal fun t3VoiceRealtimeTerminalActions(context: T3VoiceRealtimeContext): List<String> =
   buildList {
     add("stop-realtime")
-    if (context.threadSwitch != null) add("switch-to-thread")
-  }
-
-internal fun t3VoiceRealtimeTerminalActionType(value: String): T3VoiceRealtimeTerminalActionType =
-  when (value) {
-    "stop-realtime" -> T3VoiceRealtimeTerminalActionType.STOP_REALTIME
-    "switch-to-thread" -> T3VoiceRealtimeTerminalActionType.SWITCH_TO_THREAD
-    else -> error("Realtime terminal action was unsupported.")
+    if (context.threadSettings != null) add("switch-to-thread")
   }
 
 internal fun t3VoiceRealtimeContextFields(
@@ -808,6 +807,51 @@ private fun JSONObject.requiredArray(name: String): JSONArray =
 
 private fun JSONObject.requiredObject(name: String): JSONObject =
   get(name) as? JSONObject ?: error("Expected JSON object field $name.")
+
+private fun JSONObject.remoteThreadTarget(): T3VoiceRemoteThreadTarget {
+  val selection = requiredObject("modelSelection")
+  val options =
+    if (selection.has("options") && !selection.isNull("options")) {
+      val values = selection.requiredArray("options")
+      List(values.length()) { index ->
+        val option = values.requiredObject(index)
+        T3VoiceModelOption(
+          id = option.requiredString("id"),
+          value =
+            when (val value = option.get("value")) {
+              is String -> T3VoiceModelOptionValue.StringValue(value)
+              is Boolean -> T3VoiceModelOptionValue.BooleanValue(value)
+              else -> error("Thread model option value must be a string or boolean.")
+            },
+        )
+      }
+    } else {
+      null
+    }
+  return T3VoiceRemoteThreadTarget(
+    projectId = requiredString("projectId"),
+    threadId = requiredString("threadId"),
+    modelSelection =
+      T3VoiceModelSelection(
+        instanceId = selection.requiredString("instanceId"),
+        model = selection.requiredString("model"),
+        options = options,
+      ),
+    runtimeMode =
+      when (requiredString("runtimeMode")) {
+        "approval-required" -> T3VoiceThreadRuntimeMode.APPROVAL_REQUIRED
+        "auto-accept-edits" -> T3VoiceThreadRuntimeMode.AUTO_ACCEPT_EDITS
+        "full-access" -> T3VoiceThreadRuntimeMode.FULL_ACCESS
+        else -> error("Thread runtime mode was unsupported.")
+      },
+    interactionMode =
+      when (requiredString("interactionMode")) {
+        "default" -> T3VoiceThreadInteractionMode.DEFAULT
+        "plan" -> T3VoiceThreadInteractionMode.PLAN
+        else -> error("Thread interaction mode was unsupported.")
+      },
+  )
+}
 
 private fun JSONObject.nullableObject(name: String): JSONObject? =
   if (isNull(name)) null else requiredObject(name)

@@ -28,9 +28,7 @@ internal interface T3VoiceRuntimeDriver {
 
   fun setRealtimeMuted(generation: Long, muted: Boolean)
 
-  fun setRealtimeAudioRoute(generation: Long, routeId: String)
-
-  /** Retains notification switch context and schedules the server context update. */
+  /** Schedules the server context update for the current Realtime session. */
   fun updateRealtimeContext(generation: Long, context: T3VoiceRealtimeContext)
 
   fun decideRealtimeConfirmation(
@@ -178,8 +176,6 @@ internal class T3VoiceRuntimeController(
         is T3VoiceRuntimeCommand.SwitchThreadToRealtime ->
           switchToRealtime(command.target, command.session)
         is T3VoiceRuntimeCommand.SetRealtimeMuted -> setRealtimeMuted(command.muted)
-        is T3VoiceRuntimeCommand.SetRealtimeAudioRoute ->
-          setRealtimeAudioRoute(command.routeId)
         is T3VoiceRuntimeCommand.UpdateRealtimeContext ->
           updateRealtimeContext(command.context)
         is T3VoiceRuntimeCommand.DecideRealtimeConfirmation ->
@@ -383,33 +379,15 @@ internal class T3VoiceRuntimeController(
     return applied()
   }
 
-  private fun setRealtimeAudioRoute(routeId: String): T3VoiceCommandResult {
-    val state = current.state as? T3VoiceControllerState.Realtime
-      ?: return rejected(T3VoiceCommandRejection.INVALID_STATE)
-    if (state.stage != T3VoiceRealtimeStage.CONNECTED) {
-      return rejected(T3VoiceCommandRejection.INVALID_STATE)
-    }
-    val selected = state.audioRoutes.firstOrNull { it.id == routeId }
-      ?: return rejected(T3VoiceCommandRejection.UNKNOWN_AUDIO_ROUTE)
-    if (selected.selected) return duplicate()
-    update(
-      state.copy(
-        audioRoutes = state.audioRoutes.map { it.copy(selected = it.id == routeId) },
-      ),
-    )
-    runDriver(T3VoiceOperation.REALTIME) {
-      driver.setRealtimeAudioRoute(current.generation, routeId)
-    }
-    return applied()
-  }
-
   private fun updateRealtimeContext(context: T3VoiceRealtimeContext): T3VoiceCommandResult {
     val state = current.state as? T3VoiceControllerState.Realtime
       ?: return rejected(T3VoiceCommandRejection.INVALID_STATE)
     if (state.stage != T3VoiceRealtimeStage.CONNECTED) {
       return rejected(T3VoiceCommandRejection.INVALID_STATE)
     }
-    if (state.target.focus == context.focus && state.target.threadSwitch == context.threadSwitch) {
+    if (state.target.focus == context.focus &&
+      state.target.threadSettings == context.threadSettings
+    ) {
       return duplicate()
     }
     update(
@@ -417,7 +395,7 @@ internal class T3VoiceRuntimeController(
         target =
           state.target.copy(
             focus = context.focus,
-            threadSwitch = context.threadSwitch,
+            threadSettings = context.threadSettings,
           ),
       ),
     )
@@ -464,13 +442,7 @@ internal class T3VoiceRuntimeController(
     val focus = T3VoiceRealtimeFocus(action.projectId, action.threadId)
     val nextTarget =
       if (outcome == T3VoiceClientActionOutcome.SUCCEEDED) {
-        state.target.copy(
-          focus = focus,
-          threadSwitch =
-            state.target.threadSwitch?.takeIf {
-              it.target.projectId == focus.projectId && it.target.threadId == focus.threadId
-            },
-        )
+        state.target.copy(focus = focus)
       } else {
         state.target
       }
@@ -484,7 +456,7 @@ internal class T3VoiceRuntimeController(
       if (outcome == T3VoiceClientActionOutcome.SUCCEEDED) {
         driver.updateRealtimeContext(
           current.generation,
-          T3VoiceRealtimeContext(nextTarget.focus, nextTarget.threadSwitch),
+          T3VoiceRealtimeContext(nextTarget.focus, nextTarget.threadSettings),
         )
       }
       driver.acknowledgeRealtimeClientAction(
@@ -763,8 +735,8 @@ internal class T3VoiceRuntimeController(
   private fun realtimeTerminalActionReceived(action: T3VoiceRealtimeTerminalAction): Boolean {
     val state = current.state as? T3VoiceControllerState.Realtime ?: return false
     if (state.stage == T3VoiceRealtimeStage.STOPPING) return false
-    when (action.type) {
-      T3VoiceRealtimeTerminalActionType.STOP_REALTIME -> {
+    when (action) {
+      is T3VoiceRealtimeTerminalAction.StopRealtime -> {
         update(state.copy(stage = T3VoiceRealtimeStage.STOPPING))
         runDriver(T3VoiceOperation.REALTIME) {
           driver.closeRealtime(
@@ -773,13 +745,13 @@ internal class T3VoiceRuntimeController(
           )
         }
       }
-      T3VoiceRealtimeTerminalActionType.SWITCH_TO_THREAD -> {
-        val threadStart = state.target.threadSwitch
-        if (threadStart == null) {
+      is T3VoiceRealtimeTerminalAction.SwitchToThread -> {
+        val settings = state.target.threadSettings
+        if (settings == null) {
           terminalCloseFailure =
             T3VoiceFailure(
-              code = "thread-switch-target-unavailable",
-              message = "The prepared Thread voice target is no longer available.",
+              code = "thread-settings-unavailable",
+              message = "Thread voice settings are unavailable for this Realtime session.",
               recoverable = true,
             )
           update(state.copy(stage = T3VoiceRealtimeStage.STOPPING))
@@ -790,6 +762,11 @@ internal class T3VoiceRuntimeController(
             )
           }
         } else {
+          val threadStart =
+            T3VoiceThreadStart(
+              target = action.target.inEnvironment(state.target.environmentId),
+              settings = settings,
+            )
           update(
             T3VoiceControllerState.SwitchingToThread(
               stage = T3VoiceSwitchStage.CLOSING_REALTIME,

@@ -66,7 +66,7 @@ private fun T3VoiceRealtimeTarget.toBridgeBody(): Map<String, Any?> =
     "environmentId" to environmentId,
     "conversation" to conversation.toBridgeBody(),
     "focus" to focus?.toBridgeBody(),
-    "threadSwitch" to threadSwitch?.toBridgeBody(),
+    "threadSettings" to threadSettings?.toBridgeBody(),
   )
 
 private fun T3VoiceConversationSelection.toBridgeBody(): Map<String, Any?> =

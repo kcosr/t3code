@@ -1898,7 +1898,7 @@ it.effect(
     }),
 );
 
-it.effect("preserves a terminal call received while its capability removal is awaiting ACK", () =>
+it.effect("rejects a terminal call whose capability was removed while awaiting ACK", () =>
   Effect.gen(function* () {
     const queue = yield* Queue.unbounded<{
       readonly type: "function-call";
@@ -1908,8 +1908,9 @@ it.effect("preserves a terminal call received while its capability removal is aw
     }>();
     const capabilityUpdateStarted = yield* Deferred.make<void>();
     const capabilityUpdateRelease = yield* Deferred.make<void>();
-    const terminalCompleted = yield* Deferred.make<void>();
-    const actionId = VoiceClientActionId.make("terminal-race-action");
+    const rejectionSubmitted = yield* Deferred.make<void>();
+    const ordinaryOutputs = yield* Ref.make<Array<string>>([]);
+    const invocationCount = yield* Ref.make(0);
     const provider: VoiceProviderAdapter = {
       id: "fake-terminal-focus-race",
       capabilities: new Set(["agent.realtime"]),
@@ -1928,23 +1929,38 @@ it.effect("preserves a terminal call received while its capability removal is aw
               Deferred.succeed(capabilityUpdateStarted, undefined).pipe(
                 Effect.andThen(Deferred.await(capabilityUpdateRelease)),
               ),
-            submitToolOutput: () => Effect.die("terminal tool used ordinary output"),
-            completeTerminalToolCall: () => Deferred.succeed(terminalCompleted, undefined),
+            submitToolOutput: ({ output }) =>
+              Ref.update(ordinaryOutputs, (all) => [...all, output]).pipe(
+                Effect.andThen(Deferred.succeed(rejectionSubmitted, undefined)),
+              ),
+            completeTerminalToolCall: () => Effect.die("removed terminal tool was accepted"),
             terminate: Effect.void,
           }),
       },
     };
     const executor = VoiceToolExecutor.of({
       invoke: (toolCall) =>
-        Effect.succeed({
-          type: "terminal-completed" as const,
-          toolCallId: VoiceToolCallId.make(toolCall.providerFunctionCallId),
-          providerFunctionCallId: toolCall.providerFunctionCallId,
-          tool: "switch_to_thread_voice" as const,
-          outcome: "succeeded" as const,
-          output: JSON.stringify({ status: "accepted", actionId, action: "switch-to-thread" }),
-          terminalAction: { actionId, action: "switch-to-thread" as const },
-        }),
+        Ref.update(invocationCount, (count) => count + 1).pipe(
+          Effect.as({
+            type: "terminal-completed" as const,
+            toolCallId: VoiceToolCallId.make(toolCall.providerFunctionCallId),
+            providerFunctionCallId: toolCall.providerFunctionCallId,
+            tool: "switch_to_thread_voice" as const,
+            outcome: "succeeded" as const,
+            output: "unreachable",
+            terminalAction: {
+              actionId: VoiceClientActionId.make("unreachable"),
+              action: "switch-to-thread" as const,
+              target: {
+                projectId: ProjectId.make("unreachable"),
+                threadId: ThreadId.make("unreachable"),
+                modelSelection: { instanceId: "codex" as never, model: "gpt-test" },
+                runtimeMode: "full-access" as const,
+                interactionMode: "default" as const,
+              },
+            },
+          }),
+        ),
       decide: () => Effect.die("unused"),
       expire: () => Effect.succeed(undefined),
       discardSession: () => Effect.void,
@@ -1973,21 +1989,27 @@ it.effect("preserves a terminal call received while its capability removal is aw
         type: "function-call",
         providerFunctionCallId: "terminal-race-call",
         name: "switch_to_thread_voice",
-        argumentsJson: "{}",
+        argumentsJson: yield* encodeUnknownJson({ threadId: "thread-target" }),
       });
       yield* Effect.yieldNow;
-      expect(yield* Deferred.isDone(terminalCompleted)).toBe(false);
+      expect(yield* Deferred.isDone(rejectionSubmitted)).toBe(false);
 
       yield* Deferred.succeed(capabilityUpdateRelease, undefined);
       yield* Fiber.join(updating);
-      yield* Deferred.await(terminalCompleted);
+      yield* Deferred.await(rejectionSubmitted);
       yield* Effect.yieldNow;
       yield* TestClock.adjust("1 millis");
       expect(
         (yield* sessions.events(owner, created.state.sessionId, 0, 0)).events.filter(
           (event) => event.type === "terminal-action",
         ),
-      ).toEqual([expect.objectContaining({ actionId, action: "switch-to-thread" })]);
+      ).toEqual([]);
+      expect(yield* Ref.get(invocationCount)).toBe(0);
+      expect(yield* Ref.get(ordinaryOutputs)).toEqual([
+        yield* encodeUnknownJson({
+          error: "This terminal voice action is no longer available",
+        }),
+      ]);
     }).pipe(Effect.provide(test.layer));
   }),
 );

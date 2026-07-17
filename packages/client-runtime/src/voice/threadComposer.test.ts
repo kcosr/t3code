@@ -108,7 +108,7 @@ describe("Thread voice composer state", () => {
         environmentId,
         conversation: { type: "new", retention: "durable", title: "Voice" },
         focus: null,
-        threadSwitch: null,
+        threadSettings: null,
       },
       muted: false,
       audioRoutes: [],
@@ -155,7 +155,7 @@ describe("Thread voice composer state", () => {
         environmentId,
         conversation: { type: "new", retention: "durable", title: "Voice" },
         focus: { projectId: thread.target.projectId, threadId: thread.target.threadId },
-        threadSwitch: null,
+        threadSettings: null,
       },
     };
     expect(threadVoiceControlState(switchingToRealtime, target)).toMatchObject({

@@ -181,7 +181,6 @@ describe("mobile connection storage", () => {
     mocks.setPreferencesJson(
       JSON.stringify({
         threadSpeechEnabled: true,
-        voiceAudioRouteId: "speaker",
         voiceAutoListenEnabled: true,
         voiceAutoSubmitEnabled: false,
         voiceEndSilenceMs: 2_200,
@@ -195,7 +194,6 @@ describe("mobile connection storage", () => {
     );
     await expect(loadPreferences()).resolves.toEqual({
       threadSpeechEnabled: true,
-      voiceAudioRouteId: "speaker",
       voiceAutoListenEnabled: true,
       voiceAutoSubmitEnabled: false,
       voiceEndSilenceMs: 2_200,
@@ -208,7 +206,6 @@ describe("mobile connection storage", () => {
     mocks.setPreferencesJson(
       JSON.stringify({
         threadSpeechEnabled: "yes",
-        voiceAudioRouteId: "",
         voiceAutoListenEnabled: "yes",
         voiceEndSilenceMs: Number.NaN,
       }),

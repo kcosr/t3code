@@ -55,8 +55,6 @@ internal interface T3VoiceRealtimeMedia {
   )
 
   fun setMuted(sessionId: String, muted: Boolean)
-
-  fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>>
 }
 
 private enum class T3VoiceRealtimePlayoutDrainOutcome {
@@ -436,17 +434,6 @@ internal class T3VoiceWebRtcSession(
   }
 
   fun routes(): List<Map<String, Any>> = audioRouter.routes().map(T3VoiceAudioRoute::toResultBody)
-
-  override fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>> {
-    val routerGeneration =
-      synchronized(lock) {
-        checkNotNull(requireActive(sessionId).audioRouterGeneration) {
-          "The Realtime audio route owner is unavailable."
-        }
-      }
-    audioRouter.select(routeId, routerGeneration)
-    return routes()
-  }
 
   override fun fenceInputAndDrainPlayout(
     sessionId: String,

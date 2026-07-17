@@ -2,7 +2,6 @@
 // @effect-diagnostics globalDate:off
 // @effect-diagnostics globalTimers:off
 import type {
-  VoiceAudioRoute,
   VoiceRealtimeContext,
   VoiceRealtimeTarget,
   VoiceRuntimeAdapter,
@@ -41,46 +40,6 @@ export interface ActiveVoiceRuntimeAttachment {
 
 export type RealtimeVoiceBarPhase = "idle" | "starting" | "active" | "stopping" | "error";
 
-export interface VoiceAudioRoutePickerState {
-  readonly selectingRouteId: VoiceAudioRoute["id"] | null;
-  readonly error: string | null;
-}
-
-export function settleVoiceAudioRoutePickerSelection(
-  current: VoiceAudioRoutePickerState | null,
-  routeId: VoiceAudioRoute["id"],
-  error?: string,
-): VoiceAudioRoutePickerState | null {
-  if (current?.selectingRouteId !== routeId) return current;
-  return {
-    ...current,
-    selectingRouteId: null,
-    ...(error === undefined ? {} : { error }),
-  };
-}
-
-export function reconcileVoiceAudioRoutePickerState(
-  current: VoiceAudioRoutePickerState | null,
-  input: {
-    readonly controlsAvailable: boolean;
-    readonly routes: ReadonlyArray<VoiceAudioRoute> | null;
-  },
-): VoiceAudioRoutePickerState | null {
-  if (current === null) return null;
-  if (!input.controlsAvailable || input.routes === null) return null;
-  const selectingRouteId = current.selectingRouteId;
-  if (selectingRouteId === null) return current;
-  const selected = input.routes.find((route) => route.id === selectingRouteId);
-  if (selected?.selected === true) return { ...current, selectingRouteId: null };
-  if (selected === undefined) {
-    return {
-      selectingRouteId: null,
-      error: "The selected audio route is no longer available.",
-    };
-  }
-  return current;
-}
-
 export interface AdmittedClientActionFocus {
   readonly actionId: VoiceClientActionId;
   readonly environmentId: EnvironmentId;
@@ -116,24 +75,31 @@ export function threadVoiceStartForFocus(
       runtimeMode: focus.runtimeMode,
       interactionMode: focus.interactionMode,
     },
-    settings: {
-      submission: preferences.autoSubmitEnabled ? "auto-submit" : "review",
-      playResponses,
-      autoRearm: preferences.autoListenEnabled,
-      endpointDetection: {
-        endSilenceMs: preferences.endSilenceMs,
-        noSpeechTimeoutMs: preferences.noSpeechTimeoutMs,
-        maximumUtteranceMs: preferences.maximumUtteranceMs,
-      },
-      rearmDelayMs: preferences.postPlaybackGuardMs,
-      transcriptionTimeoutMs: preferences.transcriptionTimeoutMs,
-      submissionTimeoutMs: preferences.submissionTimeoutMs,
-      responseTimeoutMs: preferences.responseTimeoutMs,
-    },
+    settings: threadVoiceSettings(preferences, playResponses),
   };
 }
 
-export function canOfferThreadVoiceSwitch(input: {
+export function threadVoiceSettings(
+  preferences: ThreadVoiceStartPreferences,
+  playResponses: boolean,
+): VoiceThreadStartInput["settings"] {
+  return {
+    submission: preferences.autoSubmitEnabled ? "auto-submit" : "review",
+    playResponses,
+    autoRearm: preferences.autoListenEnabled,
+    endpointDetection: {
+      endSilenceMs: preferences.endSilenceMs,
+      noSpeechTimeoutMs: preferences.noSpeechTimeoutMs,
+      maximumUtteranceMs: preferences.maximumUtteranceMs,
+    },
+    rearmDelayMs: preferences.postPlaybackGuardMs,
+    transcriptionTimeoutMs: preferences.transcriptionTimeoutMs,
+    submissionTimeoutMs: preferences.submissionTimeoutMs,
+    responseTimeoutMs: preferences.responseTimeoutMs,
+  };
+}
+
+export function canStartThreadVoiceFromComposer(input: {
   readonly preferencesReady: boolean;
   readonly composerDraftsReady: boolean;
   readonly composerContentEmpty: boolean;
@@ -147,6 +113,23 @@ export function canOfferThreadVoiceSwitch(input: {
     !input.interactionRequired &&
     !input.activeThreadBusy
   );
+}
+
+export interface VoiceThreadNavigationRequest {
+  readonly key: string;
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+}
+
+export function voiceThreadNavigationRequest(
+  snapshot: VoiceRuntimeSnapshot,
+): VoiceThreadNavigationRequest | null {
+  if (snapshot.mode !== "switching-to-thread" && snapshot.mode !== "thread") return null;
+  return {
+    key: `${snapshot.generation}:${snapshot.target.threadId}`,
+    environmentId: snapshot.target.environmentId,
+    threadId: snapshot.target.threadId,
+  };
 }
 
 export function isThreadVoiceStartAvailable(
@@ -250,7 +233,7 @@ export function bindVoiceConversationBrowser(
       environmentId,
       conversation,
       focus: context.focus,
-      threadSwitch: context.threadSwitch,
+      threadSettings: context.threadSettings,
     }),
   };
 }

@@ -48,13 +48,6 @@ const prepared: PreparedConnection = {
   }),
 };
 
-const realtimeTarget: VoiceRealtimeTarget = {
-  environmentId: ENVIRONMENT_ID,
-  conversation: { type: "new", retention: "durable", title: "Voice" },
-  focus: { projectId: PROJECT_ID, threadId: THREAD_ID },
-  threadSwitch: null,
-};
-
 const threadInput: VoiceThreadStartInput = {
   target: {
     environmentId: ENVIRONMENT_ID,
@@ -78,6 +71,13 @@ const threadInput: VoiceThreadStartInput = {
     submissionTimeoutMs: 30_000,
     responseTimeoutMs: 120_000,
   },
+};
+
+const realtimeTarget: VoiceRealtimeTarget = {
+  environmentId: ENVIRONMENT_ID,
+  conversation: { type: "new", retention: "durable", title: "Voice" },
+  focus: { projectId: PROJECT_ID, threadId: THREAD_ID },
+  threadSettings: threadInput.settings,
 };
 
 const idleSnapshot = (sequence: number): VoiceRuntimeSnapshot => ({
@@ -132,7 +132,16 @@ const makeHarness = (getSnapshot = async () => idleSnapshot(0)) => {
     switchThreadToRealtimeAsync: vi.fn(async () => undefined),
     stopRuntimeAsync: vi.fn(async () => undefined),
     setRealtimeMutedAsync: vi.fn(async () => undefined),
-    setRealtimeAudioRouteAsync: vi.fn(async () => undefined),
+    getAudioRoutePreferenceAsync: vi.fn(async () => ({
+      preferredRouteId: "system",
+      activeRouteId: null,
+      routes: [],
+    })),
+    setAudioRoutePreferenceAsync: vi.fn(async () => ({
+      preferredRouteId: "system",
+      activeRouteId: null,
+      routes: [],
+    })),
     updateRealtimeContextAsync: vi.fn(async () => undefined),
     decideRealtimeConfirmationAsync: vi.fn(async () => undefined),
     completeRealtimeClientActionAsync: vi.fn(async () => undefined),
@@ -288,46 +297,6 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
     expect(harness.requestNotificationPermission).not.toHaveBeenCalled();
     expect(harness.native.getMicrophonePermissionAsync).not.toHaveBeenCalled();
     expect(harness.native.startRealtimeAsync).not.toHaveBeenCalled();
-  });
-
-  it("validates nested Realtime Thread context before crossing the bridge", async () => {
-    const harness = makeHarness();
-    const wrongEnvironment = {
-      ...threadInput,
-      target: {
-        ...threadInput.target,
-        environmentId: EnvironmentId.make("another-environment"),
-      },
-    };
-    const wrongFocus = {
-      ...threadInput,
-      target: {
-        ...threadInput.target,
-        threadId: ThreadId.make("another-thread"),
-      },
-    };
-
-    await expect(
-      harness.adapter.startRealtime({
-        ...realtimeTarget,
-        threadSwitch: wrongEnvironment,
-      }),
-    ).rejects.toThrow("does not belong to the runtime environment");
-    await expect(
-      harness.adapter.updateRealtimeContext({
-        focus: realtimeTarget.focus,
-        threadSwitch: wrongFocus,
-      }),
-    ).rejects.toThrow("does not match the Realtime focus");
-    await expect(
-      harness.adapter.updateRealtimeContext({
-        focus: null,
-        threadSwitch: threadInput,
-      }),
-    ).rejects.toThrow("requires a Realtime focus");
-    expect(harness.makeClient).not.toHaveBeenCalled();
-    expect(harness.native.startRealtimeAsync).not.toHaveBeenCalled();
-    expect(harness.native.updateRealtimeContextAsync).not.toHaveBeenCalled();
   });
 
   it("requests microphone permission before minting and stops on denial", async () => {
@@ -609,10 +578,9 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
     const actionId = VoiceClientActionId.make("action-1");
 
     await harness.adapter.setRealtimeMuted(true);
-    await harness.adapter.setRealtimeAudioRoute("bluetooth-device");
     await harness.adapter.updateRealtimeContext({
       focus: realtimeTarget.focus,
-      threadSwitch: threadInput,
+      threadSettings: threadInput.settings,
     });
     await harness.adapter.decideRealtimeConfirmation(confirmationId, "approve");
     await harness.adapter.completeRealtimeClientAction(actionId, "failed", "Navigation failed");
@@ -629,12 +597,9 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
 
     expect(harness.makeClient).not.toHaveBeenCalled();
     expect(harness.native.setRealtimeMutedAsync).toHaveBeenCalledWith({ muted: true });
-    expect(harness.native.setRealtimeAudioRouteAsync).toHaveBeenCalledWith({
-      routeId: "bluetooth-device",
-    });
     expect(harness.native.updateRealtimeContextAsync).toHaveBeenCalledWith({
       focus: realtimeTarget.focus,
-      threadSwitch: threadInput,
+      threadSettings: threadInput.settings,
     });
     expect(harness.native.decideRealtimeConfirmationAsync).toHaveBeenCalledWith({
       confirmationId,

@@ -81,7 +81,7 @@ internal class T3VoiceRealtimeSession(
   private var heartbeatFailures = 0
   private var eventFailures = 0
   private var desiredContext =
-    DesiredContext(0, T3VoiceRealtimeContext(target.focus, target.threadSwitch))
+    DesiredContext(0, T3VoiceRealtimeContext(target.focus, target.threadSettings))
   private var contextWorkerScheduled = false
   private var terminalCallback: T3VoiceRuntimeCallback? = null
   private var terminalDeadlineFuture: ScheduledFuture<*>? = null
@@ -177,16 +177,6 @@ internal class T3VoiceRealtimeSession(
       webRtc.setMuted(server.state.sessionId, muted)
     } catch (cause: Throwable) {
       fail(cause, "realtime-mute-failed", "Realtime microphone control failed.")
-    }
-  }
-
-  fun setAudioRoute(routeId: String) {
-    val server = synchronized(lock) { serverSession } ?: return
-    try {
-      webRtc.selectRoute(server.state.sessionId, routeId)
-      emitRoutes()
-    } catch (cause: Throwable) {
-      fail(cause, "realtime-route-failed", "Realtime audio routing failed.")
     }
   }
 

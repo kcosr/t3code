@@ -42,9 +42,12 @@ internal class T3VoiceAudioRouter(
   private val onRouteChanged: (T3VoiceAudioRouteChange) -> Unit = {},
 ) : T3VoiceRealtimeAudioRouting {
   private val audioManager = context.getSystemService(AudioManager::class.java)
+  private val preferenceStore =
+    T3VoiceAudioRoutePreferenceStore(T3VoiceSharedPreferencesAudioRouteStorage(context))
   private var focusRequest: AudioFocusRequest? = null
   private var focusState = T3VoiceAudioFocusState.TERMINATED
-  private var selectedRoute = T3VoiceAudioRouteKind.SYSTEM
+  private var preferredRoute = preferenceStore.get()
+  private var activeRoute: T3VoiceAudioRouteKind? = null
   private var deviceCallbackRegistered = false
   private var active = false
   private var generation = 0L
@@ -84,6 +87,7 @@ internal class T3VoiceAudioRouter(
     if (requestFocus()) {
       recordDiagnostic(T3VoiceDiagnosticCategory.FOCUS, T3VoiceDiagnosticCode.REQUEST_GRANTED)
       registerDeviceCallback()
+      applyPreferredRoute(ownerGeneration, notify = false)
       return T3VoiceAudioRouterStartResult(
         transition = T3VoiceAudioFocusTransition(focusState, emptyList()),
         ownerGeneration = ownerGeneration,
@@ -103,7 +107,7 @@ internal class T3VoiceAudioRouter(
     active = false
     activeGeneration = null
     focusState = T3VoiceAudioFocusState.TERMINATED
-    selectedRoute = T3VoiceAudioRouteKind.SYSTEM
+    activeRoute = null
     runCatching(::clearSelectedRoute)
     runCatching(::abandonFocus)
     runCatching { audioManager.mode = AudioManager.MODE_NORMAL }
@@ -111,61 +115,42 @@ internal class T3VoiceAudioRouter(
 
   @Synchronized
   override fun routes(): List<T3VoiceAudioRoute> {
-    val selectedId = selectedRoute.id
-    val routes = mutableListOf(
-      T3VoiceAudioRoute(
-        id = T3VoiceAudioRouteKind.SYSTEM.id,
-        label = "System default",
-        type = T3VoiceAudioRouteKind.SYSTEM.id,
-        selected = selectedId == T3VoiceAudioRouteKind.SYSTEM.id,
-      ),
-    )
-    availableOutputDevicesOrNull().orEmpty()
-      .groupBy(::routeIdForDevice)
-      .forEach { (routeId, devices) ->
-        if (routeId == null) return@forEach
-        val device = devices.first()
-        routes +=
-          T3VoiceAudioRoute(
-            id = routeId.id,
-            label = routeLabel(routeId, device),
-            type = routeId.id,
-            selected = selectedId == routeId.id,
-          )
+    val devicesByRoute =
+      availableOutputDevicesOrNull().orEmpty()
+        .mapNotNull { device -> routeIdForDevice(device)?.let { route -> route to device } }
+        .groupBy({ it.first }, { it.second })
+    return T3VoiceAudioRouteKind.entries.mapNotNull { route ->
+      val device = devicesByRoute[route]?.firstOrNull()
+      if (route != T3VoiceAudioRouteKind.SYSTEM && device == null) {
+        return@mapNotNull null
       }
-    return routes
+      T3VoiceAudioRoute(
+        id = route.id,
+        label = if (device == null) routeLabel(route, null) else routeLabel(route, device),
+        type = route.id,
+        selected = route == preferredRoute,
+      )
+    }
   }
 
   @Synchronized
-  fun select(routeId: String, ownerGeneration: Long) {
-    check(active) { "An active Realtime session is required to select an audio route." }
-    check(activeGeneration == ownerGeneration) { "The Realtime audio route owner changed." }
-    val route = requireNotNull(T3VoiceAudioRouteKind.fromId(routeId)) { "Unsupported audio route." }
-    if (route == T3VoiceAudioRouteKind.SYSTEM) {
-      clearSelectedRoute()
-    } else {
-      val devices =
-        availableOutputDevicesOrNull() ?: error("Android audio routes are unavailable.")
-      val device =
-        devices.firstOrNull { routeIdForDevice(it) == route }
-          ?: error("The requested audio route is unavailable.")
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        check(audioManager.setCommunicationDevice(device)) {
-          "Android could not select the requested audio route."
-        }
-      } else {
-        selectLegacyRoute(route)
-      }
-    }
-    selectedRoute = route
-    recordDiagnostic(T3VoiceDiagnosticCategory.ROUTE, T3VoiceDiagnosticCode.ROUTE_SELECTED)
-    onRouteChanged(
-      T3VoiceAudioRouteChange(
-        routeId = route.id,
-        routeType = route.id,
-        reason = T3VoiceAudioRouteChangeReason.SELECTED,
-      ),
+  fun preference(): T3VoiceAudioRoutePreference =
+    T3VoiceAudioRoutePreference(
+      preferredRouteId = preferredRoute.id,
+      activeRouteId = activeRoute?.id,
+      routes = routes(),
     )
+
+  @Synchronized
+  fun setPreference(routeId: String): T3VoiceAudioRoutePreference {
+    val route = requireNotNull(T3VoiceAudioRouteKind.fromId(routeId)) { "Unsupported audio route." }
+    val changed = preferredRoute != route
+    preferenceStore.set(route)
+    preferredRoute = route
+    activeGeneration?.let {
+      applyPreferredRoute(it, notify = true, forceNotification = changed)
+    }
+    return preference()
   }
 
   @Suppress("DEPRECATION")
@@ -240,12 +225,14 @@ internal class T3VoiceAudioRouter(
       else -> T3VoiceAudioDeviceKind.UNKNOWN
     }
 
-  private fun routeLabel(route: T3VoiceAudioRouteKind, device: AudioDeviceInfo): String =
+  private fun routeLabel(route: T3VoiceAudioRouteKind, device: AudioDeviceInfo?): String =
     when (route) {
       T3VoiceAudioRouteKind.SPEAKER -> "Speaker"
       T3VoiceAudioRouteKind.EARPIECE -> "Phone"
-      T3VoiceAudioRouteKind.BLUETOOTH -> device.productName.toString().ifBlank { "Bluetooth" }
-      T3VoiceAudioRouteKind.WIRED -> device.productName.toString().ifBlank { "Wired headset" }
+      T3VoiceAudioRouteKind.BLUETOOTH ->
+        device?.productName?.toString()?.ifBlank { "Bluetooth" } ?: "Bluetooth"
+      T3VoiceAudioRouteKind.WIRED ->
+        device?.productName?.toString()?.ifBlank { "Wired headset" } ?: "Wired headset"
       T3VoiceAudioRouteKind.SYSTEM -> "System default"
     }
 
@@ -327,7 +314,7 @@ internal class T3VoiceAudioRouter(
     active = false
     activeGeneration = null
     unregisterDeviceCallback()
-    selectedRoute = T3VoiceAudioRouteKind.SYSTEM
+    activeRoute = null
     runCatching(::clearSelectedRoute)
     runCatching(::abandonFocus)
     runCatching { audioManager.mode = AudioManager.MODE_NORMAL }
@@ -366,32 +353,84 @@ internal class T3VoiceAudioRouter(
   @Synchronized
   private fun reconcileSelectedRoute(ownerGeneration: Long) {
     if (!active || activeGeneration != ownerGeneration) return
-    val availableDevices =
-      availableOutputDevicesOrNull()
-        ?: run {
-          recordDiagnostic(
-            T3VoiceDiagnosticCategory.ROUTE,
-            T3VoiceDiagnosticCode.ROUTE_SCAN_UNAVAILABLE,
-          )
-          return
-        }
-    val availableRoutes = availableDevices.mapNotNull(::routeIdForDevice).toSet()
-    val result = T3VoiceAudioRoutePolicy.reconcile(selectedRoute, availableRoutes)
-    val change = result.change ?: return
-    if (runCatching(::clearSelectedRoute).isFailure) {
+    applyPreferredRoute(ownerGeneration, notify = true)
+  }
+
+  private fun applyPreferredRoute(
+    ownerGeneration: Long,
+    notify: Boolean,
+    forceNotification: Boolean = false,
+  ) {
+    if (!active || activeGeneration != ownerGeneration) return
+    val availableDevices = availableOutputDevicesOrNull()
+    if (availableDevices == null) {
       recordDiagnostic(
         T3VoiceDiagnosticCategory.ROUTE,
         T3VoiceDiagnosticCode.ROUTE_SCAN_UNAVAILABLE,
       )
       return
     }
-    selectedRoute = result.selected
+    val selectedDevice =
+      if (preferredRoute == T3VoiceAudioRouteKind.SYSTEM) {
+        null
+      } else {
+        availableDevices.firstOrNull { routeIdForDevice(it) == preferredRoute }
+      }
+    val requestedActiveRoute =
+      if (preferredRoute == T3VoiceAudioRouteKind.SYSTEM || selectedDevice != null) {
+        preferredRoute
+      } else {
+        T3VoiceAudioRouteKind.SYSTEM
+      }
+    val requestedRouteApplied =
+      runCatching {
+        if (requestedActiveRoute == T3VoiceAudioRouteKind.SYSTEM) {
+          clearSelectedRoute()
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+          check(audioManager.setCommunicationDevice(checkNotNull(selectedDevice))) {
+            "Android could not select the requested audio route."
+          }
+        } else {
+          selectLegacyRoute(requestedActiveRoute)
+        }
+      }
+    val appliedRoute =
+      if (requestedRouteApplied.isSuccess) {
+        requestedActiveRoute
+      } else if (
+        requestedActiveRoute != T3VoiceAudioRouteKind.SYSTEM &&
+          runCatching(::clearSelectedRoute).isSuccess
+      ) {
+        T3VoiceAudioRouteKind.SYSTEM
+      } else {
+        recordDiagnostic(
+          T3VoiceDiagnosticCategory.ROUTE,
+          T3VoiceDiagnosticCode.ROUTE_SCAN_UNAVAILABLE,
+        )
+        return
+      }
+    if (activeRoute == appliedRoute && !forceNotification) return
+    activeRoute = appliedRoute
+    val fallback = appliedRoute != preferredRoute
     recordDiagnostic(
       T3VoiceDiagnosticCategory.ROUTE,
-      T3VoiceDiagnosticCode.ROUTE_FALLBACK,
-      primaryCount = availableRoutes.size,
+      if (fallback) T3VoiceDiagnosticCode.ROUTE_FALLBACK else T3VoiceDiagnosticCode.ROUTE_SELECTED,
+      primaryCount = availableDevices.size,
     )
-    onRouteChanged(change)
+    if (notify) {
+      onRouteChanged(
+        T3VoiceAudioRouteChange(
+          routeId = appliedRoute.id,
+          routeType = appliedRoute.id,
+          reason =
+            if (fallback) {
+              T3VoiceAudioRouteChangeReason.SELECTED_ROUTE_UNAVAILABLE
+            } else {
+              T3VoiceAudioRouteChangeReason.SELECTED
+            },
+        ),
+      )
+    }
   }
 
   private fun recordDiagnostic(

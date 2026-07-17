@@ -21,7 +21,7 @@ class T3VoiceRuntimeBridgeInputTest {
                   "retention" to "ephemeral",
                 ),
               "focus" to focus,
-              "threadSwitch" to threadStart,
+              "threadSettings" to threadStart.getValue("settings"),
             ),
           "session" to session,
         ),
@@ -29,20 +29,7 @@ class T3VoiceRuntimeBridgeInputTest {
 
     assertEquals("environment-a", command.target.environmentId)
     assertEquals("thread-a", command.target.focus?.threadId)
-    assertEquals("thread-a", command.target.threadSwitch?.target?.threadId)
-    val modelSelection = checkNotNull(command.target.threadSwitch?.target?.modelSelection)
-    assertEquals("codex", modelSelection.instanceId)
-    assertEquals("gpt-5.4", modelSelection.model)
-    assertEquals(
-      listOf(
-        T3VoiceModelOption(
-          "reasoningEffort",
-          T3VoiceModelOptionValue.StringValue("high"),
-        ),
-        T3VoiceModelOption("fastMode", T3VoiceModelOptionValue.BooleanValue(true)),
-      ),
-      modelSelection.options,
-    )
+    assertEquals(T3VoiceThreadSubmissionPolicy.REVIEW, command.target.threadSettings?.submissionPolicy)
     assertFalse(command.session.toString().contains("secret-token"))
     assertTrue(command.session.toString().contains("redacted"))
   }
@@ -61,14 +48,14 @@ class T3VoiceRuntimeBridgeInputTest {
                   "retention" to "ephemeral",
                 ),
               "focus" to null,
-              "threadSwitch" to null,
+              "threadSettings" to null,
             ),
           "session" to session,
         ),
       )
 
     assertEquals(null, command.target.focus)
-    assertEquals(null, command.target.threadSwitch)
+    assertEquals(null, command.target.threadSettings)
   }
 
   @Test
@@ -81,7 +68,7 @@ class T3VoiceRuntimeBridgeInputTest {
               "environmentId" to "environment-a",
               "conversation" to mapOf("type" to "new", "retention" to "durable"),
               "focus" to focus,
-              "threadSwitch" to threadStart,
+              "threadSettings" to threadStart.getValue("settings"),
             ),
           "session" to session,
         ),
@@ -107,22 +94,17 @@ class T3VoiceRuntimeBridgeInputTest {
   }
 
   @Test
-  fun rejectsThreadSwitchThatDoesNotMatchRealtimeFocus() {
-    val mismatched =
+  fun parsesThreadSettingsIndependentlyOfRealtimeFocus() {
+    val context =
       mapOf<String, Any?>(
         "focus" to focus,
-        "threadSwitch" to
-          threadStart.toMutableMap().apply {
-            this["target"] =
-              (threadStart.getValue("target") as Map<*, *>).toMutableMap().apply {
-                this["threadId"] = "thread-b"
-              }
-          },
+        "threadSettings" to threadStart.getValue("settings"),
       )
 
-    assertThrows(IllegalArgumentException::class.java) {
-      T3VoiceRuntimeBridgeInput.realtimeContext(mismatched)
-    }
+    assertEquals(
+      T3VoiceThreadSubmissionPolicy.REVIEW,
+      T3VoiceRuntimeBridgeInput.realtimeContext(context).threadSettings?.submissionPolicy,
+    )
   }
 
   @Test

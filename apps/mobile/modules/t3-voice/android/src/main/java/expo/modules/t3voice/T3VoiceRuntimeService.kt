@@ -48,6 +48,12 @@ class T3VoiceRuntimeService : Service() {
     fun dispatchRuntime(command: T3VoiceRuntimeCommand): T3VoiceCommandResult =
       dispatchSemanticCommand(command)
 
+    fun audioRoutePreference(): Map<String, Any?> =
+      semanticDriver.audioRoutePreference().toResultBody()
+
+    fun setAudioRoutePreference(routeId: String): Map<String, Any?> =
+      semanticDriver.setAudioRoutePreference(routeId).toResultBody()
+
     val events: SharedFlow<T3VoiceRuntimeEvent>
       get() = T3VoiceStateStore.events
 
@@ -70,6 +76,7 @@ class T3VoiceRuntimeService : Service() {
         recordingOwner = owner
         try {
           ensureRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+          check(semanticDriver.acquireLegacyAudio()) { "Android denied recording audio focus." }
           recorder.start(recordingId, endpointConfig)
         } catch (cause: Throwable) {
           releaseRecordingLocked(owner)
@@ -118,7 +125,7 @@ class T3VoiceRuntimeService : Service() {
         playbackOwner = owner
         try {
           ensureRuntimeForeground(ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
-          check(playbackAudioFocus.start()) { "Android denied playback audio focus." }
+          check(semanticDriver.acquireLegacyAudio()) { "Android denied playback audio focus." }
           player.start(playbackId, sampleRate, channelCount)
         } catch (cause: Throwable) {
           releasePlaybackLocked(owner)
@@ -170,7 +177,6 @@ class T3VoiceRuntimeService : Service() {
   private var playbackOwner: T3VoiceOperationOwner? = null
   private lateinit var recorder: T3VoiceRecorder
   private lateinit var player: T3VoicePcmPlayer
-  private lateinit var playbackAudioFocus: T3VoicePlaybackAudioFocus
   private lateinit var semanticDriver: T3VoiceNativeRuntimeDriver
   private lateinit var semanticController: T3VoiceRuntimeController
   private lateinit var androidControls: T3VoiceAndroidControls
@@ -182,11 +188,15 @@ class T3VoiceRuntimeService : Service() {
   override fun onCreate() {
     super.onCreate()
     semanticDriver =
-      T3VoiceNativeRuntimeDriver(applicationContext) { generation, callback ->
-        if (this::semanticController.isInitialized) {
-          semanticController.onCallback(generation, callback)
-        }
-      }
+      T3VoiceNativeRuntimeDriver(
+        applicationContext,
+        callback = { generation, callback ->
+          if (this::semanticController.isInitialized) {
+            semanticController.onCallback(generation, callback)
+          }
+        },
+        onUnownedAudioFocusActions = ::handleLegacyAudioFocusActions,
+      )
     semanticController = T3VoiceRuntimeController(semanticDriver)
     semanticWakeLock =
       getSystemService(PowerManager::class.java)
@@ -289,37 +299,6 @@ class T3VoiceRuntimeService : Service() {
           }
         },
       )
-    playbackAudioFocus =
-      T3VoicePlaybackAudioFocus(
-        this,
-        onSuspend = {
-          mainHandler.post {
-            synchronized(operationLock) {
-              playbackOwner?.let { owner -> runCatching { player.pause(owner.id) } }
-            }
-          }
-        },
-        onResume = {
-          mainHandler.post {
-            synchronized(operationLock) {
-              playbackOwner?.let { owner -> runCatching { player.resume(owner.id) } }
-            }
-          }
-        },
-        onTerminate = {
-          mainHandler.post {
-            synchronized(operationLock) {
-              playbackOwner?.let { owner ->
-                runCatching { player.cancel(owner.id) }
-                terminatePlaybackLocked(
-                  owner,
-                  T3VoiceRuntimeEvent.PlaybackTerminated(owner.id, "cancelled"),
-                )
-              }
-            }
-          }
-        },
-      )
     createNotificationChannel()
     T3VoiceStateStore.setServiceReady()
   }
@@ -367,7 +346,6 @@ class T3VoiceRuntimeService : Service() {
     serviceScope.cancel()
     if (this::semanticWakeLock.isInitialized && semanticWakeLock.isHeld) semanticWakeLock.release()
     if (this::androidControls.isInitialized) androidControls.release()
-    if (this::semanticDriver.isInitialized) semanticDriver.shutdown()
     synchronized(operationLock) {
       recordingOwner?.let { owner ->
         runCatching { recorder.cancel(owner.id) }
@@ -391,9 +369,9 @@ class T3VoiceRuntimeService : Service() {
         )
       }
     }
+    if (this::semanticDriver.isInitialized) semanticDriver.shutdown()
     recorder.release()
     player.release()
-    playbackAudioFocus.stop()
     T3VoiceStateStore.setInactive()
     super.onDestroy()
   }
@@ -627,6 +605,7 @@ class T3VoiceRuntimeService : Service() {
     stopForeground: Boolean = true,
   ) {
     if (!T3VoiceStateStore.releaseRecording(owner)) return
+    semanticDriver.releaseLegacyAudio()
     if (recordingOwner == owner) recordingOwner = null
     if (stopForeground) stopRuntimeForegroundLocked()
   }
@@ -637,6 +616,7 @@ class T3VoiceRuntimeService : Service() {
     stopForeground: Boolean = true,
   ) {
     if (!T3VoiceStateStore.terminateRecording(owner, event)) return
+    semanticDriver.releaseLegacyAudio()
     if (recordingOwner == owner) recordingOwner = null
     if (stopForeground) stopRuntimeForegroundLocked()
   }
@@ -646,7 +626,7 @@ class T3VoiceRuntimeService : Service() {
     stopForeground: Boolean = true,
   ) {
     if (!T3VoiceStateStore.releasePlayback(owner)) return
-    playbackAudioFocus.stop()
+    semanticDriver.releaseLegacyAudio()
     if (playbackOwner == owner) playbackOwner = null
     if (stopForeground) stopRuntimeForegroundLocked()
   }
@@ -657,7 +637,7 @@ class T3VoiceRuntimeService : Service() {
     stopForeground: Boolean = true,
   ) {
     if (!T3VoiceStateStore.terminatePlayback(owner, event)) return
-    playbackAudioFocus.stop()
+    semanticDriver.releaseLegacyAudio()
     if (playbackOwner == owner) playbackOwner = null
     if (stopForeground) stopRuntimeForegroundLocked()
   }
@@ -665,6 +645,44 @@ class T3VoiceRuntimeService : Service() {
   private fun stopRuntimeForegroundLocked() {
     if (isCompletelyIdle() && T3VoiceStateStore.state.value.isForeground) {
       foregroundReleaseCoordinator.releaseWhileLocked()
+    }
+  }
+
+  private fun handleLegacyAudioFocusActions(actions: List<T3VoiceAudioFocusAction>) {
+    mainHandler.post {
+      synchronized(operationLock) {
+        actions.forEach { action ->
+          when (action) {
+            T3VoiceAudioFocusAction.MUTE_CAPTURE -> Unit
+            T3VoiceAudioFocusAction.UNMUTE_CAPTURE -> Unit
+            T3VoiceAudioFocusAction.PAUSE_PLAYBACK ->
+              playbackOwner?.let { owner -> runCatching { player.pause(owner.id) } }
+            T3VoiceAudioFocusAction.RESUME_PLAYBACK ->
+              playbackOwner?.let { owner -> runCatching { player.resume(owner.id) } }
+            T3VoiceAudioFocusAction.TERMINATE_SESSION -> {
+              recordingOwner?.let { owner ->
+                runCatching { recorder.cancel(owner.id) }
+                terminateRecordingLocked(
+                  owner,
+                  T3VoiceRuntimeEvent.RecordingTerminated(
+                    recordingId = owner.id,
+                    recording = null,
+                    outcome = "cancelled",
+                    reason = "audio-focus-lost",
+                  ),
+                )
+              }
+              playbackOwner?.let { owner ->
+                runCatching { player.cancel(owner.id) }
+                terminatePlaybackLocked(
+                  owner,
+                  T3VoiceRuntimeEvent.PlaybackTerminated(owner.id, "cancelled"),
+                )
+              }
+            }
+          }
+        }
+      }
     }
   }
 

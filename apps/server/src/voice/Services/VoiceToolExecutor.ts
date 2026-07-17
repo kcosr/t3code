@@ -8,7 +8,7 @@ import type {
   VoiceConfirmationId,
   VoiceConversationId,
   VoiceSessionId,
-  VoiceTerminalAction,
+  VoiceTerminalActionRequest,
   VoiceToolCallId,
   VoiceToolName,
 } from "@t3tools/contracts";
@@ -55,10 +55,7 @@ export interface VoiceToolTerminalResult {
   readonly tool: "stop_realtime_voice" | "switch_to_thread_voice";
   readonly outcome: "succeeded";
   readonly output: string;
-  readonly terminalAction: {
-    readonly actionId: VoiceClientActionId;
-    readonly action: VoiceTerminalAction;
-  };
+  readonly terminalAction: VoiceTerminalActionRequest;
 }
 
 export type VoiceToolExecutionResult = VoiceToolCompletedResult | VoiceToolTerminalResult;

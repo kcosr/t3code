@@ -1,6 +1,6 @@
 # Voice Next Steps
 
-Status: Cleanup cycle complete; retain as the working draft for subsequent voice changes.
+Status: Active working draft; the end-state implementation is present and focused validation remains.
 
 This plan tracks cleanup of the implemented voice system described by
 [voice.md](../docs/architecture/voice.md). It is not an architecture contract and does not authorize
@@ -9,15 +9,15 @@ new product features. Longer-term ideas are isolated in
 
 ## Current objective
 
-Reduce the voice implementation to the smallest clear end state without changing the tested product
-behavior:
+Finish and verify the smallest end state for two related control contracts:
 
-- the composer microphone remains one-shot dictation into the draft;
-- the composer waveform remains Thread voice / Auto Listen;
-- the bottom call bar remains Realtime-only;
-- Realtime and Thread remain native-owned on Android;
-- both native mode-switch directions preserve exact single-owner quiescence; and
-- notification and MediaSession controls continue to operate while React is detached.
+- one native-persisted audio-route preference is shared by the bottom call bar and Voice Settings
+  and applies to one-shot dictation, Thread voice, and Realtime;
+- `switch_to_thread_voice` requires an explicit `threadId`, the server resolves the complete target,
+  and Android performs the Realtime-to-Thread ownership transition without React;
+- React only reconciles navigation after a native switch; and
+- notifications retain controls that have an unambiguous native meaning and do not infer a Thread
+  from current or last-used UI state.
 
 ## Accepted device checkpoint
 
@@ -38,125 +38,61 @@ checkpoint remains the device evidence for this cycle.
 
 ## Workstreams
 
-| Workstream                        | Status   | Scope                                                                                                                                                 |
-| --------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Documentation consolidation       | Complete | Established one as-built document, this active plan, and one non-authoritative roadmap; removed competing voice authority documents.                  |
-| Realtime presentation cleanup     | Complete | Removed dead global phase state, retained one Realtime-bar classifier, removed redundant mode guards, and stabilized empty transcript data.           |
-| Realtime admission cleanup        | Complete | Reserved Resume selection under the shared start transition and consolidated duplicated Realtime start/switch preparation, types, and native parsing. |
-| Native transition cleanup         | Complete | Removed duplicated pending target data, obsolete transient publications, and the one-value Thread-to-Realtime phase hierarchy.                        |
-| Native mechanical deduplication   | Complete | Reused starting/stopping state construction and enum bridge naming where the result is smaller and clearer.                                           |
-| Diagnostics cleanup               | Complete | Confirmed temporary milestone tracing is absent while retaining the bounded Android diagnostic ring and privacy-safe server logs.                     |
-| Dead-code and naming sweep        | Complete | Removed obsolete exports and stale `MasterVoice` ownership names without compatibility aliases or dual contracts.                                     |
-| Final verification and deployment | Complete | All required gates and exact-revision builds passed; server health and the verified in-place Pixel 9 install passed.                                  |
+| Workstream                         | Status      | Scope                                                                                                                           |
+| ---------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Earlier simplification cycle       | Complete    | Presentation, admission, transition-state, diagnostics, naming, and dead-code cleanup described by the accepted baseline above. |
+| Explicit-ID agent handoff          | Implemented | Require `threadId`, resolve and authorize the full target on the server, and publish one discriminated terminal action.         |
+| Native atomic handoff              | Implemented | Consume the resolved target, drain and release Realtime, start Thread voice, and let React reconcile navigation from snapshots. |
+| Global native audio preference     | Implemented | Persist one route choice and apply it across Realtime, Thread voice, and one-shot dictation with non-destructive fallback.      |
+| Shared route controls              | Implemented | Keep the convenience selector in the Realtime bar and expose the same native preference in Voice Settings.                      |
+| Notification destination semantics | Implemented | Remove inferred current/last-Thread switching; notification controls remain state-derived and unambiguous.                      |
+| Contract and regression validation | Remaining   | Run focused server, shared-runtime, Android bridge/controller, audio-routing, and UI tests for the changed contracts.           |
+| Device validation and deployment   | Remaining   | Build exact committed source, install in place, and exercise the changed handoff and routing paths on the Pixel.                |
 
-## Detailed scope and definition of done
+## Remaining near-term work
 
-### 1. Realtime presentation cleanup
+### 1. Focused automated coverage
 
-Scope:
+- Prove that a missing, unknown, unauthorized, or ineligible `threadId` cannot publish a native
+  switch action.
+- Prove that the resolved target survives terminal-action serialization and starts the exact Thread
+  while React is detached.
+- Prove that React follows a completed native switch once without becoming a second transition
+  owner or continuously forcing navigation.
+- Cover preferred-route persistence, temporary device loss, system fallback without preference
+  deletion, and preference reapplication.
+- Cover route selection from both UI surfaces and application by all three native voice paths.
 
-- Remove `MasterVoicePhase`, `voiceRuntimePresentationPhase`, and the unused context `phase` field.
-- Define the Realtime call-bar phase directly and use it as the single ownership classifier.
-- Derive labels from that classifier rather than repeating snapshot-mode switches.
-- Remove callback guards made redundant by conditional rendering.
-- Use stable empty Realtime transcript data outside Realtime snapshots.
+### 2. Repository gates
 
-Definition of done:
+- Run `vp check`.
+- Run `vp run typecheck`.
+- Run `vp run lint:mobile`.
+- Run focused voice suites and `vp test`.
+- Run the complete native JVM suite.
 
-- No consumer-visible behavior changes.
-- Thread snapshots still render the idle/resumable Realtime bar.
-- Realtime failures still render the error/stop surface.
-- Shared presentation tests cover the remaining classifier.
+### 3. Exact-revision deployment and device smoke test
 
-### 2. Realtime admission cleanup
+- Commit before building the server or APK.
+- Build and deploy the server and preview APK from that exact revision.
+- Verify APK package, signature, archive integrity, source revision, and checksum before installation.
+- Confirm that the route button remains available when Realtime is idle and matches Voice Settings.
+- Select routes from each UI surface and exercise one-shot dictation, Thread voice, and Realtime,
+  including temporary route unavailability where practical.
+- From Realtime, invoke `switch_to_thread_voice` with a non-visible Thread ID and confirm native
+  handoff plus subsequent UI reconciliation in foreground and background cases.
+- Confirm the notification offers no guessed Thread-switch action.
 
-Scope:
+### 4. Closeout
 
-- Ensure paginated Resume selection owns or remains cancellable by the same exclusive start
-  transition used for native admission.
-- Prevent another start from winning while Resume continues unnecessary page requests.
-- Share permission, notification, Bluetooth, prepared-connection, and child-session preparation
-  between initial Realtime start and Thread-to-Realtime switch.
-- Collapse identical bridge input types and native target/session parsing.
-
-Definition of done:
-
-- Exactly one start path can proceed at a time.
-- A losing path stops work before credential issuance and native admission.
-- React issues one Realtime admission operation; Android selects initial start or Thread handoff
-  from the current native mode at the bridge boundary.
-- Race and adapter tests cover Resume cancellation and both admission outcomes.
-
-### 3. Native transition cleanup
-
-Scope:
-
-- Retain only the private credential/session data that cannot appear in a public switching snapshot.
-- Derive the Realtime target from the typed controller state instead of duplicating it in pending
-  state.
-- When a pending Thread start has not acquired native resources, advance directly to Realtime rather
-  than publishing a transition snapshot that is immediately obsolete.
-- Evaluate whether the single-value Thread-to-Realtime stage types add useful invariants; remove them
-  if the transition state itself is sufficient.
-
-Definition of done:
-
-- Thread-to-Realtime still waits for exact Thread release whenever Thread acquired resources.
-- Stop still cancels the pending Realtime start.
-- Duplicate switch admission remains harmless.
-- Credentials never enter snapshots, diagnostics, or persisted state.
-- Controller, bridge, notification, and adapter tests pass with fewer duplicated state fields.
-
-### 4. Mechanical cleanup and dead-code sweep
-
-Scope:
-
-- Reuse small state factories only where they remove repeated defaults without hiding transitions.
-- Consolidate repeated enum-to-bridge naming while retaining deliberate special mappings.
-- Search for obsolete native revisions, bridge methods, runtime shapes, unused exports, and stale UI
-  ownership terminology.
-- Delete obsolete code directly; do not retain migration shims.
-
-Definition of done:
-
-- No old and new contract shapes coexist.
-- No dead voice exports or unused presentation state remain.
-- The controller remains readable as an explicit state machine rather than a generic framework.
-
-### 5. Diagnostics cleanup
-
-Scope:
-
-- Distinguish temporary device-pass milestone tracing from durable operational diagnostics.
-- Remove any remaining temporary milestone-only events or helpers.
-- Retain the bounded native diagnostic ring and curated server lifecycle/media logs.
-- Recheck that content-bearing fields cannot enter either path.
-
-Definition of done:
-
-- No temporary trace layer remains.
-- Troubleshooting still has bounded lifecycle, endpoint, route/focus, timing, byte-count, and outcome
-  evidence.
-- Tests continue to reject transcript, audio, SDP, credential, provider payload, and tool content.
-
-### 6. Final verification and deployment
-
-Definition of done:
-
-- `vp check` passes.
-- `vp run typecheck` passes.
-- `vp run lint:mobile` passes for native changes.
-- `vp test` passes.
-- The complete native JVM suite passes.
-- The final source is committed before building release artifacts.
-- Server and preview APK are built from that committed revision.
-- APK package, signature, archive integrity, source revision, and checksum are verified before an
-  in-place install.
-- Focused device smoke tests cover every user-visible path changed during cleanup.
+- Reconcile this plan with observed device behavior and any fixes.
+- Mark validation and deployment complete only after their evidence exists.
+- Keep [voice.md](../docs/architecture/voice.md) limited to implemented behavior and move any
+  unapproved feature ideas to the roadmap.
 
 ## Exclusions
 
-This cleanup does not include:
+This work does not include:
 
 - new voice features from the roadmap;
 - web, desktop, or iOS voice adapters;
@@ -164,6 +100,7 @@ This cleanup does not include:
 - Realtime transcription;
 - automatic summarization or transparent provider-call replacement;
 - Android process-death recovery or durable mode-switch transactions;
+- notification-initiated Thread voice based on a remembered current or last-used Thread;
 - always-on or wake-word capture;
 - a React-owned Android fallback state machine; or
 - compatibility aliases for removed voice contracts.

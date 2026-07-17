@@ -23,8 +23,9 @@ The mobile app exposes four related voice surfaces:
    Thread voice records, detects an endpoint, transcribes, optionally reviews, dispatches the Thread
    turn, waits for the exact result, optionally speaks it, and may rearm according to user settings.
 3. The persistent bottom call bar belongs only to Realtime voice. It opens or resumes a durable voice
-   conversation and, while Realtime is active, exposes transcript, mute, output route, and stop
-   controls. While Thread voice is active, the bar remains a Realtime Resume surface.
+   conversation and always exposes the shared native audio-route selector. While Realtime is active,
+   it also exposes transcript, mute, and stop controls. While Thread voice is active, the bar remains
+   a Realtime Resume surface.
 4. Eligible assistant messages can use bounded streaming speech playback.
 
 Starting Realtime while Thread voice is active performs one native Thread-to-Realtime transition.
@@ -140,11 +141,17 @@ not a claim that downstream work completed. `wait_for_thread_turn` polls the exa
 message and never redispatches it. `interrupt_thread` and `archive_thread` require explicit client
 confirmation.
 
-`activate_thread` changes visible focus while Realtime continues. `stop_realtime_voice` and
-`switch_to_thread_voice` are terminal actions. The server acknowledges the provider function call
-without requesting another response, then publishes one fenced native action. Android fences new
-microphone input, drains already queued final speech within a bounded deadline, and performs the
-native stop or switch. React is not required to be attached.
+`activate_thread` changes visible focus while Realtime continues. `switch_to_thread_voice` requires
+one explicit `threadId`; it never infers a destination from the currently visible or last-used
+Thread. The server validates and resolves that identifier into the complete authorized Thread target
+before publishing an action.
+
+`stop_realtime_voice` and `switch_to_thread_voice` are terminal actions. The server acknowledges the
+provider function call without requesting another response, then publishes one fenced native action.
+Android fences new microphone input, drains already queued final speech within a bounded deadline,
+and performs the native stop or resolved switch. React is not required to be attached. When React is
+attached, it reconciles navigation from the resulting native Thread snapshot; it does not own or
+complete the media transition.
 
 No shell, terminal, filesystem, Git, arbitrary MCP, or coding-agent provider tool is exposed through
 the voice-agent allowlist.
@@ -174,15 +181,18 @@ temporary recording paths.
 
 ### Realtime-to-Thread
 
-The active Realtime snapshot carries a prepared Thread target when the selected Thread is eligible.
-A switch immediately enters the native transition, rejects conflicting controls, closes the server
-session and WebRTC peer, waits for exact peer and microphone release, advances the generation, and
-starts Thread recording. Failure does not roll back into Realtime, and no durable switch transaction
-is created.
+A user-initiated switch from the composer supplies the visible Thread target. An agent-initiated
+`switch_to_thread_voice` action instead carries the complete server-resolved target for its required
+`threadId`. Neither path depends on a cached current or last Thread.
 
-An agent-initiated switch uses the same prepared target. Its playout drain may delay peer close so
-the agent's final transition sentence can finish, but Thread recording still waits for exact native
-quiescence.
+The switch immediately enters the native transition, rejects conflicting controls, closes the
+server session and WebRTC peer, waits for exact peer and microphone release, advances the generation,
+and starts Thread recording for that target. This is one native atomic ownership transition even
+when React is backgrounded or detached. Failure does not roll back into Realtime, and no durable
+switch transaction is created.
+
+For an agent-initiated switch, a bounded playout drain may delay peer close so the agent's final
+transition sentence can finish, but Thread recording still waits for exact native quiescence.
 
 ### Thread-to-Realtime
 
@@ -230,7 +240,8 @@ from persistence.
 
 The notification is derived from the current controller snapshot:
 
-- Realtime exposes mute or unmute, a prepared Thread switch where available, and stop.
+- Realtime exposes mute or unmute and stop. It does not guess a Thread destination from visible,
+  current, or last-used UI state.
 - Thread exposes finish utterance while recording, submit while reviewing, and stop.
 - Transitions expose stop.
 - A failed owner retains a Stop-only foreground notification until native release is known.
@@ -238,9 +249,11 @@ The notification is derived from the current controller snapshot:
 MediaSession transport controls map to the same native commands. Notification permission denial
 reduces drawer visibility but does not create a second control path.
 
-The app persists the user's preferred Realtime output route and reapplies it when that route is
-available in a later Realtime session. Native route loss still falls back to an available system
-route.
+Android owns and persists one global preferred audio route. The always-visible selector in the
+Realtime call bar and the selector in Voice Settings read and write that same native preference.
+Native media owners apply it to Realtime, Thread voice, and one-shot composer dictation without
+requiring React to remain attached. If the preferred device is temporarily unavailable, Android uses
+an available system route without erasing the preference and reapplies it when it becomes available.
 
 ## Authentication and authorization
 

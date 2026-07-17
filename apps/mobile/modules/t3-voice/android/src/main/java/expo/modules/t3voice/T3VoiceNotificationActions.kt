@@ -3,7 +3,6 @@ package expo.modules.t3voice
 internal enum class T3VoiceNotificationActionId {
   MUTE,
   UNMUTE,
-  SWITCH_TO_THREAD,
   FINISH_UTTERANCE,
   SUBMIT_TRANSCRIPT,
   STOP,
@@ -49,18 +48,6 @@ internal object T3VoiceNotificationActions {
           command = T3VoiceRuntimeCommand.SetRealtimeMuted(!state.muted),
         ),
       )
-      state.target.threadSwitch?.let {
-        add(
-          T3VoiceNotificationAction(
-            id = T3VoiceNotificationActionId.SWITCH_TO_THREAD,
-            command =
-              T3VoiceRuntimeCommand.SwitchRealtimeToThread(
-                it.target,
-                it.settings,
-              ),
-          ),
-        )
-      }
       add(stop())
     }
   }

@@ -243,6 +243,6 @@ class T3VoiceRuntimeLifecyclePolicyTest {
       conversation =
         T3VoiceConversationSelection.New(T3VoiceConversationRetention.EPHEMERAL, null),
       focus = T3VoiceRealtimeFocus("project-a", "thread-a"),
-      threadSwitch = T3VoiceThreadStart(threadTarget, settings),
+      threadSettings = settings,
     )
 }

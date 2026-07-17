@@ -24,6 +24,7 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Exit from "effect/Exit";
 import * as Scope from "effect/Scope";
+import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
@@ -57,6 +58,7 @@ const MAX_RETAINED_TERMINAL_SESSIONS = 128;
 const CLIENT_ACTION_TIMEOUT_MILLIS = 10_000;
 const SESSION_CLEANUP_TIMEOUT_MILLIS = 10_000;
 const TERMINAL_PROVIDER_FALLBACK_MILLIS = 12_000;
+const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 const CLIENT_HEARTBEAT_EXPIRY_BY_PHASE = {
   creating: true,
   signaling: true,
@@ -78,6 +80,7 @@ const INSTRUCTIONS = [
   "create_thread dispatches immediately and returns accepted command metadata. Do not claim the thread is fully initialized or that downstream work completed from that receipt.",
   "send_thread_message dispatches immediately and returns a messageId. Never claim the coding turn completed from that receipt. When the user needs the result, call wait_for_thread_turn with that exact messageId; a pending or running timeout is not completion and may be waited on again.",
   "Any supplied terminal voice tool must be the final output action. You may speak one brief completion or transition sentence immediately before calling it, but you must not speak after it or claim a transition already completed.",
+  "switch_to_thread_voice requires the exact target threadId and starts Thread voice for that thread; it never uses the focused or last active thread.",
 ].join(" ");
 
 const BACKGROUND_VOICE_TOOLS = new Set([
@@ -88,6 +91,13 @@ const BACKGROUND_VOICE_TOOLS = new Set([
   "stop_realtime_voice",
   "switch_to_thread_voice",
 ]);
+
+const terminalActionForToolName = (name: string): VoiceTerminalAction | undefined =>
+  name === "stop_realtime_voice"
+    ? "stop-realtime"
+    : name === "switch_to_thread_voice"
+      ? "switch-to-thread"
+      : undefined;
 
 interface ClientActionResolution {
   readonly outcome: "succeeded" | "failed";
@@ -785,8 +795,7 @@ const make = Effect.gen(function* () {
     });
     yield* emit(lease, {
       type: "terminal-action",
-      actionId: result.terminalAction.actionId,
-      action: result.terminalAction.action,
+      ...result.terminalAction,
     });
   });
 
@@ -887,6 +896,7 @@ const make = Effect.gen(function* () {
         return;
       case "function-call":
         if (!(yield* isSessionLive(lease))) return;
+        const requestedTerminalAction = terminalActionForToolName(event.name);
         const invocation = tools.invoke({
           authSessionId: lease.ownerAuthSessionId,
           sessionId: lease.sessionId,
@@ -900,16 +910,44 @@ const make = Effect.gen(function* () {
           requestClientAction: (request) => requestClientAction(lease, request),
         });
         if (BACKGROUND_VOICE_TOOLS.has(event.name)) {
-          yield* invocation.pipe(
+          const executeBackgroundTool = invocation.pipe(
             Effect.flatMap((result) =>
               result.type === "completed"
                 ? submitCompletedTool(lease, providerSession, result)
                 : result.type === "terminal-completed"
-                  ? runtimeSession.operationMutex.withPermits(1)(
-                      submitTerminalTool(lease, providerSession, result),
-                    )
+                  ? submitTerminalTool(lease, providerSession, result)
                   : Effect.void,
             ),
+          );
+          const guardedExecution =
+            requestedTerminalAction === undefined
+              ? executeBackgroundTool
+              : runtimeSession.operationMutex.withPermits(1)(
+                  Effect.gen(function* () {
+                    const current = yield* getLiveSession(lease);
+                    if (Option.isNone(current)) return;
+                    if (!current.value.input.terminalActions.includes(requestedTerminalAction)) {
+                      const tool =
+                        requestedTerminalAction === "stop-realtime"
+                          ? ("stop_realtime_voice" as const)
+                          : ("switch_to_thread_voice" as const);
+                      yield* submitCompletedTool(lease, providerSession, {
+                        type: "completed",
+                        toolCallId: VoiceToolCallId.make(event.providerFunctionCallId),
+                        providerFunctionCallId: event.providerFunctionCallId,
+                        tool,
+                        outcome: "failed",
+                        output: encodeJson({
+                          error: "This terminal voice action is no longer available",
+                        }),
+                        submitOutput: true,
+                      });
+                      return;
+                    }
+                    yield* executeBackgroundTool;
+                  }),
+                );
+          yield* guardedExecution.pipe(
             Effect.catch((error) =>
               Effect.gen(function* () {
                 yield* emit(lease, {

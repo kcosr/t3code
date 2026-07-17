@@ -4,6 +4,7 @@ import type { T3VoiceNativeModule } from "./T3Voice.types";
 
 export type {
   T3VoiceEventSubscription,
+  T3VoiceAudioRoutePreferenceState,
   T3VoiceCompleteRealtimeClientActionInput,
   T3VoiceDecideRealtimeConfirmationInput,
   T3VoiceDiagnosticCategory,
@@ -21,7 +22,7 @@ export type {
   T3VoiceRecordingDeleteInput,
   T3VoiceRecordingResult,
   T3VoiceRecordingTerminatedEvent,
-  T3VoiceSetRealtimeAudioRouteInput,
+  T3VoiceSetAudioRoutePreferenceInput,
   T3VoiceRealtimeAdmissionInput,
   T3VoiceSetRealtimeMutedInput,
   T3VoiceStartThreadInput,

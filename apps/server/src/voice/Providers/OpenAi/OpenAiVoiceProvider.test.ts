@@ -970,6 +970,18 @@ it("exposes only the terminal tools advertised for negotiation", () => {
     "stop_realtime_voice",
     "switch_to_thread_voice",
   ]);
+  expect(
+    __testing
+      .providerSessionConfig("test", new Set(["switch-to-thread"]))
+      .tools.find((tool) => tool.name === "switch_to_thread_voice"),
+  ).toMatchObject({
+    parameters: {
+      type: "object",
+      properties: { threadId: { type: "string" } },
+      required: ["threadId"],
+      additionalProperties: false,
+    },
+  });
   expect(__testing.providerSessionConfig("test", new Set()).parallel_tool_calls).toBe(false);
 });
 

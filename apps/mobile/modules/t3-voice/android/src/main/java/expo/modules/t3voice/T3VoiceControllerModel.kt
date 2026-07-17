@@ -116,6 +116,30 @@ internal data class T3VoiceThreadTarget(
   }
 }
 
+/** Server-resolved Thread target; the owning Realtime runtime supplies its environment. */
+internal data class T3VoiceRemoteThreadTarget(
+  val projectId: String,
+  val threadId: String,
+  val modelSelection: T3VoiceModelSelection,
+  val runtimeMode: T3VoiceThreadRuntimeMode,
+  val interactionMode: T3VoiceThreadInteractionMode,
+) {
+  init {
+    require(projectId.isNotBlank()) { "projectId must be non-empty." }
+    require(threadId.isNotBlank()) { "threadId must be non-empty." }
+  }
+
+  fun inEnvironment(environmentId: String): T3VoiceThreadTarget =
+    T3VoiceThreadTarget(
+      environmentId = environmentId,
+      projectId = projectId,
+      threadId = threadId,
+      modelSelection = modelSelection,
+      runtimeMode = runtimeMode,
+      interactionMode = interactionMode,
+    )
+}
+
 internal enum class T3VoiceThreadSubmissionPolicy {
   REVIEW,
   AUTO_SUBMIT,
@@ -219,30 +243,17 @@ internal data class T3VoiceRealtimeFocus(
 
 internal data class T3VoiceRealtimeContext(
   val focus: T3VoiceRealtimeFocus?,
-  val threadSwitch: T3VoiceThreadStart?,
-) {
-  init {
-    require(
-      threadSwitch == null ||
-        (focus != null &&
-          threadSwitch.target.projectId == focus.projectId &&
-          threadSwitch.target.threadId == focus.threadId)
-    ) { "threadSwitch must match the active Realtime focus." }
-  }
-}
+  val threadSettings: T3VoiceThreadSettings?,
+)
 
 internal data class T3VoiceRealtimeTarget(
   val environmentId: String,
   val conversation: T3VoiceConversationSelection,
   val focus: T3VoiceRealtimeFocus?,
-  val threadSwitch: T3VoiceThreadStart?,
+  val threadSettings: T3VoiceThreadSettings?,
 ) {
   init {
     require(environmentId.isNotBlank()) { "environmentId must be non-empty." }
-    require(threadSwitch == null || threadSwitch.target.environmentId == environmentId) {
-      "Realtime and Thread targets must belong to the same environment."
-    }
-    T3VoiceRealtimeContext(focus, threadSwitch)
   }
 }
 
@@ -260,17 +271,24 @@ internal data class T3VoiceRealtimeClientAction(
   }
 }
 
-internal enum class T3VoiceRealtimeTerminalActionType {
-  STOP_REALTIME,
-  SWITCH_TO_THREAD,
-}
+internal sealed interface T3VoiceRealtimeTerminalAction {
+  val actionId: String
 
-internal data class T3VoiceRealtimeTerminalAction(
-  val actionId: String,
-  val type: T3VoiceRealtimeTerminalActionType,
-) {
-  init {
-    require(actionId.isNotBlank()) { "actionId must be non-empty." }
+  data class StopRealtime(
+    override val actionId: String,
+  ) : T3VoiceRealtimeTerminalAction {
+    init {
+      require(actionId.isNotBlank()) { "actionId must be non-empty." }
+    }
+  }
+
+  data class SwitchToThread(
+    override val actionId: String,
+    val target: T3VoiceRemoteThreadTarget,
+  ) : T3VoiceRealtimeTerminalAction {
+    init {
+      require(actionId.isNotBlank()) { "actionId must be non-empty." }
+    }
   }
 }
 
@@ -451,14 +469,6 @@ internal sealed interface T3VoiceRuntimeCommand {
     val muted: Boolean,
   ) : T3VoiceRuntimeCommand
 
-  data class SetRealtimeAudioRoute(
-    val routeId: String,
-  ) : T3VoiceRuntimeCommand {
-    init {
-      require(routeId.isNotBlank()) { "routeId must be non-empty." }
-    }
-  }
-
   data class UpdateRealtimeContext(
     val context: T3VoiceRealtimeContext,
   ) : T3VoiceRuntimeCommand
@@ -613,7 +623,6 @@ internal enum class T3VoiceCommandRejection {
   INVALID_STATE,
   STALE_GENERATION,
   STALE_REVIEW,
-  UNKNOWN_AUDIO_ROUTE,
 }
 
 internal data class T3VoiceCommandResult(
