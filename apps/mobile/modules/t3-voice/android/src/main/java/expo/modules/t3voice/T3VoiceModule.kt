@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import com.facebook.react.bridge.ReadableMap
 import expo.modules.interfaces.permissions.Permissions
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
@@ -191,25 +192,25 @@ class T3VoiceModule : Module() {
         }
       }
 
-      AsyncFunction("startRealtimeAsync") { input: Map<String, Any?>, promise: Promise ->
+      AsyncFunction("startRealtimeAsync") { input: ReadableMap, promise: Promise ->
         dispatchRuntime(
           promise,
-          T3VoiceRuntimeBridgeInput.startRealtime(input),
+          T3VoiceRuntimeBridgeInput.startRealtime(input.toHashMap()),
         )
       }
 
-      AsyncFunction("startThreadAsync") { input: Map<String, Any?>, promise: Promise ->
+      AsyncFunction("startThreadAsync") { input: ReadableMap, promise: Promise ->
         dispatchRuntime(
           promise,
-          T3VoiceRuntimeBridgeInput.startThread(input),
+          T3VoiceRuntimeBridgeInput.startThread(input.toHashMap()),
         )
       }
 
       AsyncFunction("switchRealtimeToThreadAsync") {
-        input: Map<String, Any?>, promise: Promise ->
+        input: ReadableMap, promise: Promise ->
         dispatchRuntime(
           promise,
-          T3VoiceRuntimeBridgeInput.switchRealtimeToThread(input),
+          T3VoiceRuntimeBridgeInput.switchRealtimeToThread(input.toHashMap()),
         )
       }
 
@@ -229,11 +230,11 @@ class T3VoiceModule : Module() {
       }
 
       AsyncFunction("updateRealtimeContextAsync") {
-        input: Map<String, Any?>, promise: Promise ->
+        input: ReadableMap, promise: Promise ->
         dispatchRuntime(
           promise,
           T3VoiceRuntimeCommand.UpdateRealtimeContext(
-            T3VoiceRuntimeBridgeInput.realtimeContext(input),
+            T3VoiceRuntimeBridgeInput.realtimeContext(input.toHashMap()),
           ),
         )
       }

@@ -48,6 +48,30 @@ class T3VoiceRuntimeBridgeInputTest {
   }
 
   @Test
+  fun parsesExplicitlyNullRealtimeContextFields() {
+    val command =
+      T3VoiceRuntimeBridgeInput.startRealtime(
+        mapOf(
+          "target" to
+            mapOf(
+              "environmentId" to "environment-a",
+              "conversation" to
+                mapOf(
+                  "type" to "new",
+                  "retention" to "ephemeral",
+                ),
+              "focus" to null,
+              "threadSwitch" to null,
+            ),
+          "session" to session,
+        ),
+      )
+
+    assertEquals(null, command.target.focus)
+    assertEquals(null, command.target.threadSwitch)
+  }
+
+  @Test
   fun rejectsUnknownFieldsAtEveryBridgeBoundary() {
     val input =
       mapOf<String, Any?>(

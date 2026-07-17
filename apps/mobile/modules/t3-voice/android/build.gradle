@@ -17,6 +17,7 @@ android {
 
 dependencies {
   implementation project(':expo-modules-core')
+  implementation 'com.facebook.react:react-android'
   implementation 'io.github.webrtc-sdk:android:144.7559.09'
   testImplementation 'junit:junit:4.13.2'
   androidTestImplementation 'androidx.test:core-ktx:1.6.1'
