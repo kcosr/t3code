@@ -24,7 +24,18 @@ class T3VoiceModule : Module() {
   private val binderLock = Any()
   private val mainHandler = Handler(Looper.getMainLooper())
   private val serviceBinding = T3VoiceServiceBindingState()
-  private val serviceBindingAttempts = mutableMapOf<Long, ServiceBindingAttempt>()
+  private val serviceBindingAttempts =
+    T3VoiceServiceBindingAttempts<Context, ServiceConnection>(
+      lock = binderLock,
+      bind = { context, connection ->
+        context.bindService(
+          Intent(context, T3VoiceRuntimeService::class.java),
+          connection,
+          Context.BIND_AUTO_CREATE,
+        )
+      },
+      unbind = Context::unbindService,
+    )
   private val pendingBinderOperations = T3VoiceBinderOperationRegistry<PendingBinderOperation>()
   private var runtimeSnapshotCollection: Job? = null
   private var eventCollection: Job? = null
@@ -32,14 +43,6 @@ class T3VoiceModule : Module() {
   private var playbackTerminationCollection: Job? = null
   private var rebindScheduled = false
   private var rebindAttemptedSinceConnection = false
-
-  private class ServiceBindingAttempt(
-    val context: Context,
-    val connection: ServiceConnection,
-    var bindCompleted: Boolean = false,
-    var bindSucceeded: Boolean = false,
-    var releaseRequested: Boolean = false,
-  )
 
   private class PendingBinderOperation(
     val promise: Promise,
@@ -589,34 +592,14 @@ class T3VoiceModule : Module() {
   }
 
   private fun performServiceBind(context: Context, attemptId: Long): Boolean {
-    val attempt =
-      ServiceBindingAttempt(
+    val completion =
+      serviceBindingAttempts.bind(
+        attemptId = attemptId,
         context = context,
         connection = createServiceConnection(attemptId),
-      )
-    synchronized(binderLock) { serviceBindingAttempts[attemptId] = attempt }
-    val succeeded =
-      runCatching {
-        context.bindService(
-          Intent(context, T3VoiceRuntimeService::class.java),
-          attempt.connection,
-          Context.BIND_AUTO_CREATE,
-        )
-      }.getOrDefault(false)
-    var release: ServiceBindingAttempt? = null
-    val completion =
-      synchronized(binderLock) {
-        attempt.bindCompleted = true
-        attempt.bindSucceeded = succeeded
-        serviceBinding.completeBinding(attemptId, succeeded).also { result ->
-          if (result.releaseAttempt) attempt.releaseRequested = true
-          if (!succeeded || attempt.releaseRequested) {
-            serviceBindingAttempts.remove(attemptId)
-            if (succeeded && attempt.releaseRequested) release = attempt
-          }
-        }
+      ) { succeeded ->
+        serviceBinding.completeBinding(attemptId, succeeded)
       }
-    release?.let(::unbindServiceBindingAttempt)
     if (!completion.available && !synchronized(binderLock) { serviceBinding.isAvailable() }) {
       rejectOperationsWaitingForBinding(
         "The T3 voice runtime service could not be bound.",
@@ -626,20 +609,7 @@ class T3VoiceModule : Module() {
   }
 
   private fun releaseServiceBindingAttempt(attemptId: Long) {
-    var release: ServiceBindingAttempt? = null
-    synchronized(binderLock) {
-      val attempt = serviceBindingAttempts[attemptId] ?: return
-      attempt.releaseRequested = true
-      if (attempt.bindCompleted) {
-        serviceBindingAttempts.remove(attemptId)
-        if (attempt.bindSucceeded) release = attempt
-      }
-    }
-    release?.let(::unbindServiceBindingAttempt)
-  }
-
-  private fun unbindServiceBindingAttempt(attempt: ServiceBindingAttempt) {
-    runCatching { attempt.context.unbindService(attempt.connection) }
+    serviceBindingAttempts.release(attemptId)
   }
 
   private fun rejectOperationsWaitingForBinding(message: String) {
