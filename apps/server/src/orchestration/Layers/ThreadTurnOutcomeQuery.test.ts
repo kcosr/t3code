@@ -6,7 +6,6 @@ import {
   ProviderInstanceId,
   ThreadId,
   TurnId,
-  type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -17,12 +16,15 @@ import {
   type ProjectionThreadMessage,
 } from "../../persistence/Services/ProjectionThreadMessages.ts";
 import {
+  ProjectionThreadRepository,
+  type ProjectionThread,
+} from "../../persistence/Services/ProjectionThreads.ts";
+import {
   ProjectionTurnStartRepository,
   type ProjectionTurnStartOutcome,
   type ProjectionTurnStartState,
 } from "../../persistence/Services/ProjectionTurnStarts.ts";
 import type { ProjectionTurnState } from "../../persistence/Services/ProjectionTurns.ts";
-import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ThreadTurnOutcomeQuery } from "../Services/ThreadTurnOutcomeQuery.ts";
 import { ThreadTurnOutcomeQueryLive } from "./ThreadTurnOutcomeQuery.ts";
 
@@ -34,12 +36,12 @@ const turnId = TurnId.make("turn-one");
 const otherTurnId = TurnId.make("turn-other");
 const now = "2026-07-16T12:00:00.000Z";
 
-const shell = (input?: {
+const thread = (input?: {
   readonly latestTurnId?: TurnId;
   readonly approvals?: boolean;
   readonly userInput?: boolean;
-}): OrchestrationThreadShell => ({
-  id: threadId,
+}): ProjectionThread => ({
+  threadId,
   projectId,
   title: "Voice thread",
   modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-test" },
@@ -47,22 +49,15 @@ const shell = (input?: {
   interactionMode: "default",
   branch: null,
   worktreePath: null,
-  latestTurn: {
-    turnId: input?.latestTurnId ?? turnId,
-    state: "running",
-    requestedAt: now,
-    startedAt: now,
-    completedAt: null,
-    assistantMessageId: null,
-  },
+  latestTurnId: input?.latestTurnId ?? turnId,
   createdAt: now,
   updatedAt: now,
   archivedAt: null,
-  session: null,
   latestUserMessageAt: now,
-  hasPendingApprovals: input?.approvals ?? false,
-  hasPendingUserInput: input?.userInput ?? false,
-  hasActionableProposedPlan: false,
+  pendingApprovalCount: input?.approvals === true ? 1 : 0,
+  pendingUserInputCount: input?.userInput === true ? 1 : 0,
+  hasActionableProposedPlan: 0,
+  deletedAt: null,
 });
 
 const outcome = (input: {
@@ -125,18 +120,18 @@ const userMessage: ProjectionThreadMessage = {
 };
 
 const makeLayer = (input?: {
-  readonly shell?: OrchestrationThreadShell | null;
+  readonly thread?: ProjectionThread | null;
   readonly outcome?: ProjectionTurnStartOutcome | null;
   readonly messages?: ReadonlyArray<ProjectionThreadMessage>;
 }) => {
-  const snapshots = {
-    getThreadShellById: (requestedThreadId: ThreadId) =>
+  const threads = {
+    getById: ({ threadId: requestedThreadId }: { readonly threadId: ThreadId }) =>
       Effect.succeed(
-        requestedThreadId === threadId && input?.shell !== null
-          ? Option.some(input?.shell ?? shell())
+        requestedThreadId === threadId && input?.thread !== null
+          ? Option.some(input?.thread ?? thread())
           : Option.none(),
       ),
-  } as unknown as ProjectionSnapshotQuery["Service"];
+  } as unknown as ProjectionThreadRepository["Service"];
   const turnStarts = {
     getOutcomeByMessageId: () =>
       Effect.succeed(Option.fromUndefinedOr(input?.outcome ?? undefined)),
@@ -155,7 +150,7 @@ const makeLayer = (input?: {
   return ThreadTurnOutcomeQueryLive.pipe(
     Layer.provide(
       Layer.mergeAll(
-        Layer.succeed(ProjectionSnapshotQuery, snapshots),
+        Layer.succeed(ProjectionThreadRepository, threads),
         Layer.succeed(ProjectionTurnStartRepository, turnStarts),
         Layer.succeed(ProjectionThreadMessageRepository, messages),
       ),
@@ -172,7 +167,7 @@ const load = (layer: ReturnType<typeof makeLayer>) =>
 describe("ThreadTurnOutcomeQuery", () => {
   it.effect("distinguishes missing threads and messages from a pending exact message", () =>
     Effect.gen(function* () {
-      const missing = yield* load(makeLayer({ shell: null }));
+      const missing = yield* load(makeLayer({ thread: null }));
       assert.deepStrictEqual(missing, { type: "thread-not-found" });
 
       const missingMessage = yield* load(makeLayer({ messages: [] }));
@@ -219,7 +214,7 @@ describe("ThreadTurnOutcomeQuery", () => {
     Effect.gen(function* () {
       const approval = yield* load(
         makeLayer({
-          shell: shell({ approvals: true }),
+          thread: thread({ approvals: true }),
           outcome: outcome({ turnState: "running" }),
         }),
       );
@@ -230,7 +225,7 @@ describe("ThreadTurnOutcomeQuery", () => {
 
       const userInput = yield* load(
         makeLayer({
-          shell: shell({ userInput: true }),
+          thread: thread({ userInput: true }),
           outcome: outcome({ turnState: "running" }),
         }),
       );
@@ -241,7 +236,7 @@ describe("ThreadTurnOutcomeQuery", () => {
 
       const unrelated = yield* load(
         makeLayer({
-          shell: shell({ latestTurnId: otherTurnId, approvals: true }),
+          thread: thread({ latestTurnId: otherTurnId, approvals: true }),
           outcome: outcome({ turnState: "running" }),
         }),
       );

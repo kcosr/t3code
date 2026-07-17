@@ -7,7 +7,7 @@ package expo.modules.t3voice
  */
 internal class T3VoicePcmStreamSink(
   private val playbackId: String,
-  private val enqueue: (playbackId: String, chunkIndex: Int, pcm: ByteArray) -> Unit,
+  private val enqueueOwned: (playbackId: String, chunkIndex: Int, pcm: ByteArray) -> Unit,
   private val maximumPendingChunks: Int = DEFAULT_MAXIMUM_PENDING_CHUNKS,
   private val maximumPendingBytes: Int = DEFAULT_MAXIMUM_PENDING_BYTES,
 ) {
@@ -48,7 +48,7 @@ internal class T3VoicePcmStreamSink(
       }
 
     try {
-      enqueue(playbackId, chunkIndex, aligned)
+      enqueueOwned(playbackId, chunkIndex, aligned)
     } catch (cause: Throwable) {
       synchronized(lock) {
         pendingBytes -= pendingBytesByIndex.remove(chunkIndex) ?: 0

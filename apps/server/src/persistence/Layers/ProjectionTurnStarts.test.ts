@@ -12,7 +12,7 @@ import { ProjectionTurnRepositoryLive } from "./ProjectionTurns.ts";
 
 const repositories = Layer.mergeAll(
   ProjectionTurnRepositoryLive,
-  ProjectionTurnStartRepositoryLive.pipe(Layer.provide(ProjectionTurnRepositoryLive)),
+  ProjectionTurnStartRepositoryLive,
 ).pipe(Layer.provideMerge(SqlitePersistenceMemory));
 
 const layer = it.layer(repositories);
@@ -131,6 +131,24 @@ layer("ProjectionTurnStartRepository", (it) => {
         Option.getOrThrow(yield* starts.getByMessageId({ threadId, messageId: pendingMessageId }))
           .state,
         "pending",
+      );
+      const failedOutcome = Option.getOrThrow(
+        yield* starts.getOutcomeByMessageId({ threadId, messageId: failedMessageId }),
+      );
+      const pendingOutcome = Option.getOrThrow(
+        yield* starts.getOutcomeByMessageId({ threadId, messageId: pendingMessageId }),
+      );
+      assert.equal(failedOutcome.start.state, "failed");
+      assert.isNull(failedOutcome.turn);
+      assert.equal(pendingOutcome.start.state, "pending");
+      assert.isNull(pendingOutcome.turn);
+      assert.isTrue(
+        Option.isNone(
+          yield* starts.getOutcomeByMessageId({
+            threadId,
+            messageId: MessageId.make("message-missing"),
+          }),
+        ),
       );
     }),
   );

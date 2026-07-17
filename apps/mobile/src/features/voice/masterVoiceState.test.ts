@@ -17,15 +17,16 @@ import {
   continueVoiceConversationSelection,
   masterVoiceEnvironmentId,
   prepareVoiceRuntimeAttachment,
+  reconcileVoiceAudioRoutePickerState,
   newVoiceConversationSelection,
   newVoiceConversationTitle,
   resumeVoiceConversationSelection,
+  settleVoiceAudioRoutePickerSelection,
   threadVoiceStartForFocus,
   voiceRuntimeCommandEnvironmentMatches,
   voiceRuntimePresentationPhase,
   voiceRuntimeSnapshotEnvironmentId,
   type MasterVoiceFocus,
-  VoiceStartAdmission,
 } from "./masterVoiceState";
 import { resolveVoicePreferences } from "./voicePreferences";
 
@@ -57,36 +58,6 @@ const conversation = (
 });
 
 describe("master voice state", () => {
-  it("admits only one voice start transaction without letting a loser roll back audio", async () => {
-    const admission = new VoiceStartAdmission();
-    let releaseWinner!: () => void;
-    const winnerInterruptedAudio = vi.fn();
-    const loserInterruptedAudio = vi.fn();
-    const loserRolledBackAudio = vi.fn();
-
-    const winner = admission.run(async () => {
-      winnerInterruptedAudio();
-      await new Promise<void>((resolve) => {
-        releaseWinner = resolve;
-      });
-    });
-
-    expect(admission.active).toBe(true);
-    await expect(
-      admission.run(async () => {
-        loserInterruptedAudio();
-        loserRolledBackAudio();
-      }),
-    ).resolves.toBe(false);
-    expect(loserInterruptedAudio).not.toHaveBeenCalled();
-    expect(loserRolledBackAudio).not.toHaveBeenCalled();
-
-    releaseWinner();
-    await expect(winner).resolves.toBe(true);
-    expect(winnerInterruptedAudio).toHaveBeenCalledOnce();
-    expect(admission.active).toBe(false);
-  });
-
   it("keeps the active environment authoritative across route focus changes", () => {
     expect(masterVoiceEnvironmentId(environmentId, null)).toBe(environmentId);
     expect(masterVoiceEnvironmentId(null, focus)).toBe(environmentId);
@@ -153,15 +124,46 @@ describe("master voice state", () => {
   it("offers notification Thread switching only for a ready, empty, unblocked composer", () => {
     const eligible = {
       composerDraftsReady: true,
-      draftText: "",
-      attachmentCount: 0,
+      composerContentEmpty: true,
       interactionRequired: false,
     };
     expect(canOfferThreadVoiceSwitch(eligible)).toBe(true);
     expect(canOfferThreadVoiceSwitch({ ...eligible, composerDraftsReady: false })).toBe(false);
-    expect(canOfferThreadVoiceSwitch({ ...eligible, draftText: "Existing draft" })).toBe(false);
-    expect(canOfferThreadVoiceSwitch({ ...eligible, attachmentCount: 1 })).toBe(false);
+    expect(canOfferThreadVoiceSwitch({ ...eligible, composerContentEmpty: false })).toBe(false);
     expect(canOfferThreadVoiceSwitch({ ...eligible, interactionRequired: true })).toBe(false);
+  });
+
+  it("keeps route-picker progress across unrelated snapshots and clears it on route selection", () => {
+    const selecting = { selectingRouteId: "bluetooth", error: null };
+    const unchanged = reconcileVoiceAudioRoutePickerState(selecting, {
+      controlsAvailable: true,
+      routes: [
+        { id: "speaker", label: "Speaker", type: "speaker", selected: true },
+        { id: "bluetooth", label: "Headset", type: "bluetooth", selected: false },
+      ],
+    });
+
+    expect(unchanged).toBe(selecting);
+    expect(settleVoiceAudioRoutePickerSelection(selecting, "bluetooth")).toEqual({
+      selectingRouteId: null,
+      error: null,
+    });
+    expect(settleVoiceAudioRoutePickerSelection(selecting, "speaker")).toBe(selecting);
+    expect(
+      reconcileVoiceAudioRoutePickerState(selecting, {
+        controlsAvailable: true,
+        routes: [
+          { id: "speaker", label: "Speaker", type: "speaker", selected: false },
+          { id: "bluetooth", label: "Headset", type: "bluetooth", selected: true },
+        ],
+      }),
+    ).toEqual({ selectingRouteId: null, error: null });
+    expect(
+      reconcileVoiceAudioRoutePickerState(selecting, {
+        controlsAvailable: false,
+        routes: [],
+      }),
+    ).toBeNull();
   });
 
   it("rejects a captured old-environment conversation against a new ready runtime", () => {

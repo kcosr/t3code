@@ -7,9 +7,8 @@ import { VoiceConversationServiceLive } from "./Layers/VoiceConversationService.
 import { NativeVoiceSessionIssuerLive } from "./Layers/NativeVoiceSessionIssuer.ts";
 import { VoiceConversationRepositoryLive } from "../persistence/Layers/VoiceConversations.ts";
 import { ProjectionThreadMessageRepositoryLive } from "../persistence/Layers/ProjectionThreadMessages.ts";
-import { ProjectionTurnRepositoryLive } from "../persistence/Layers/ProjectionTurns.ts";
-import { ProjectionTurnStartRepositoryLive } from "../persistence/Layers/ProjectionTurnStarts.ts";
 import { VoiceToolCallRepositoryLive } from "../persistence/Layers/VoiceToolCalls.ts";
+import { ThreadTurnOutcomeQueryConfiguredLive } from "../orchestration/Layers/ThreadTurnOutcomeQuery.ts";
 import { VoiceContextCompilerLive } from "./Layers/VoiceContextCompiler.ts";
 import { VoiceSessionServiceLive } from "./Layers/VoiceSessionService.ts";
 import { VoiceSessionLifecycleLive } from "./Layers/VoiceSessionLifecycle.ts";
@@ -63,26 +62,20 @@ const VoiceConversationInfrastructureLive = Layer.mergeAll(
   VoiceConversationServiceConfiguredLive,
 );
 
-const VoiceToolExecutorConfiguredLive = VoiceToolExecutorLive.pipe(
-  Layer.provide(
-    Layer.mergeAll(
-      VoiceConversationInfrastructureLive,
-      VoiceToolCallRepositoryLive,
-      ProjectionThreadMessageRepositoryLive,
-      ProjectionTurnRepositoryLive,
-      ProjectionTurnStartRepositoryLive.pipe(Layer.provide(ProjectionTurnRepositoryLive)),
-      HistoryRuntimeLive,
-    ),
-  ),
-);
-
-const VoiceToolInfrastructureLive = Layer.mergeAll(
+const VoiceToolExecutorDependenciesLive = Layer.mergeAll(
   VoiceConversationInfrastructureLive,
   VoiceToolCallRepositoryLive,
   ProjectionThreadMessageRepositoryLive,
-  ProjectionTurnRepositoryLive,
-  ProjectionTurnStartRepositoryLive.pipe(Layer.provide(ProjectionTurnRepositoryLive)),
+  ThreadTurnOutcomeQueryConfiguredLive,
   HistoryRuntimeLive,
+);
+
+const VoiceToolExecutorConfiguredLive = VoiceToolExecutorLive.pipe(
+  Layer.provide(VoiceToolExecutorDependenciesLive),
+);
+
+const VoiceToolInfrastructureLive = Layer.mergeAll(
+  VoiceToolExecutorDependenciesLive,
   VoiceToolExecutorConfiguredLive,
 );
 

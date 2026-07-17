@@ -19,7 +19,8 @@ internal interface T3VoiceThreadMedia {
 
   fun startPlayback(playbackId: String, sampleRate: Int, channelCount: Int)
 
-  fun enqueuePlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray)
+  /** Transfers exclusive ownership of [pcm] to the playback queue. */
+  fun enqueueOwnedPlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray)
 
   fun finishPlayback(playbackId: String, finalChunkIndex: Int)
 
@@ -56,8 +57,8 @@ internal class T3VoiceAndroidThreadMedia(
   override fun startPlayback(playbackId: String, sampleRate: Int, channelCount: Int) =
     player.start(playbackId, sampleRate, channelCount)
 
-  override fun enqueuePlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray) =
-    player.enqueuePcm(playbackId, chunkIndex, pcm)
+  override fun enqueueOwnedPlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray) =
+    player.enqueueOwnedPcm(playbackId, chunkIndex, pcm)
 
   override fun finishPlayback(playbackId: String, finalChunkIndex: Int) =
     player.finish(playbackId, finalChunkIndex)

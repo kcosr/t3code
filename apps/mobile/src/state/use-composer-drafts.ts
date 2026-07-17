@@ -95,15 +95,28 @@ let loadPromise: Promise<void> | null = null;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 
 function normalizeDraft(draft: ComposerDraft | undefined): ComposerDraft {
-  if (!draft) {
-    return EMPTY_DRAFT;
-  }
-  return {
-    ...draft,
-    text: draft.text,
-    attachments: draft.attachments,
-  };
+  return draft ?? EMPTY_DRAFT;
 }
+
+const EMPTY_COMPOSER_DRAFT_ATOM = Atom.make(EMPTY_DRAFT).pipe(
+  Atom.withLabel("mobile:composer-draft:empty"),
+);
+const composerDraftAtom = Atom.family((draftKey: string) =>
+  Atom.make((get) => normalizeDraft(get(composerDraftsAtom)[draftKey])).pipe(
+    Atom.withLabel(`mobile:composer-draft:${draftKey}`),
+  ),
+);
+const EMPTY_COMPOSER_DRAFT_CONTENT_ATOM = Atom.make(true).pipe(
+  Atom.withLabel("mobile:composer-draft-content:empty"),
+);
+const composerDraftContentEmptyAtom = Atom.family((draftKey: string) =>
+  Atom.make((get) => {
+    const draft = get(composerDraftsAtom)[draftKey];
+    return (
+      draft === undefined || (draft.text.trim().length === 0 && draft.attachments.length === 0)
+    );
+  }).pipe(Atom.withLabel(`mobile:composer-draft-content-empty:${draftKey}`)),
+);
 
 export function getComposerDraftSnapshot(draftKey: string): ComposerDraft {
   return normalizeDraft(appAtomRegistry.get(composerDraftsAtom)[draftKey]);
@@ -432,9 +445,17 @@ export async function clearComposerDraftsEnvironment(environmentId: EnvironmentI
 }
 
 export function useComposerDraft(draftKey: string | null): ComposerDraft {
-  const drafts = useAtomValue(composerDraftsAtom);
+  const draft = useAtomValue(
+    draftKey === null ? EMPTY_COMPOSER_DRAFT_ATOM : composerDraftAtom(draftKey),
+  );
   useEffect(() => {
     ensureComposerDraftsLoaded();
   }, []);
-  return draftKey ? normalizeDraft(drafts[draftKey]) : EMPTY_DRAFT;
+  return draft;
+}
+
+export function useComposerDraftContentEmpty(draftKey: string | null): boolean {
+  return useAtomValue(
+    draftKey === null ? EMPTY_COMPOSER_DRAFT_CONTENT_ATOM : composerDraftContentEmptyAtom(draftKey),
+  );
 }

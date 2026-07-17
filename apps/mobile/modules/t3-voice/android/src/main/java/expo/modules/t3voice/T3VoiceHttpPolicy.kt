@@ -131,55 +131,37 @@ internal object T3VoiceHttpPathSegment {
   private const val HEX = "0123456789ABCDEF"
 }
 
-internal class T3VoiceBearerToken(value: String) {
-  private val headerValue: String
+private fun validatedSecretHeaderValue(value: String, description: String): String {
+  require(
+    value.isNotBlank() &&
+      value.length <= MAXIMUM_SECRET_HEADER_VALUE_LENGTH &&
+      value.all { it.code in VISIBLE_HEADER_ASCII_RANGE },
+  ) { "Invalid native voice $description." }
+  return value
+}
 
-  init {
-    require(value.isNotBlank() && value.length <= MAXIMUM_TOKEN_LENGTH) {
-      "Invalid native voice bearer token."
-    }
-    require(value.all { it.code in VISIBLE_ASCII_RANGE }) {
-      "Invalid native voice bearer token."
-    }
-    headerValue = "Bearer $value"
-  }
+internal class T3VoiceBearerToken(value: String) {
+  private val headerValue = "Bearer ${validatedSecretHeaderValue(value, "bearer token")}"
 
   fun applyTo(connection: HttpURLConnection) {
     connection.setRequestProperty("authorization", headerValue)
   }
 
   override fun toString(): String = "T3VoiceBearerToken(<redacted>)"
-
-  private companion object {
-    const val MAXIMUM_TOKEN_LENGTH = 4_096
-    val VISIBLE_ASCII_RANGE = 0x21..0x7e
-  }
 }
 
 internal class T3VoiceMediaTicketToken(value: String) {
-  private val headerValue: String
-
-  init {
-    require(value.isNotBlank() && value.length <= MAXIMUM_TOKEN_LENGTH) {
-      "Invalid native voice media ticket."
-    }
-    require(value.all { it.code in VISIBLE_ASCII_RANGE }) {
-      "Invalid native voice media ticket."
-    }
-    headerValue = value
-  }
+  private val headerValue = validatedSecretHeaderValue(value, "media ticket")
 
   fun applyTo(connection: HttpURLConnection) {
     connection.setRequestProperty("x-t3-voice-ticket", headerValue)
   }
 
   override fun toString(): String = "T3VoiceMediaTicketToken(<redacted>)"
-
-  private companion object {
-    const val MAXIMUM_TOKEN_LENGTH = 4_096
-    val VISIBLE_ASCII_RANGE = 0x21..0x7e
-  }
 }
+
+private const val MAXIMUM_SECRET_HEADER_VALUE_LENGTH = 4_096
+private val VISIBLE_HEADER_ASCII_RANGE = 0x21..0x7e
 
 internal data class T3VoiceHttpLimits(
   val connectTimeoutMillis: Int = DEFAULT_CONNECT_TIMEOUT_MILLIS,

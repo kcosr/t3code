@@ -200,10 +200,7 @@ class T3VoiceRuntimeService : Service() {
       serviceScope.launch {
         semanticController.snapshots.collectLatest { snapshot ->
           synchronized(operationLock) {
-            androidControls.update(snapshot)
-            reconcileSemanticWakeLock(snapshot.state)
-            updateForegroundNotificationLocked()
-            stopRuntimeForegroundLocked()
+            reconcileSemanticControlsLocked(snapshot)
           }
         }
       }
@@ -455,9 +452,7 @@ class T3VoiceRuntimeService : Service() {
         ),
       )
       val failed = semanticController.snapshot()
-      androidControls.update(failed)
-      reconcileSemanticWakeLock(failed.state)
-      updateForegroundNotificationLocked()
+      reconcileSemanticControlsLocked(failed)
     } finally {
       stopRuntimeForegroundLocked()
     }
@@ -497,11 +492,7 @@ class T3VoiceRuntimeService : Service() {
       return
     }
     semanticController.dispatch(command)
-    val updated = semanticController.snapshot()
-    androidControls.update(updated)
-    reconcileSemanticWakeLock(updated.state)
-    updateForegroundNotificationLocked()
-    stopRuntimeForegroundLocked()
+    reconcileSemanticControlsLocked(semanticController.snapshot())
   }
 
   private fun dispatchSemanticCommand(command: T3VoiceRuntimeCommand): T3VoiceCommandResult {
@@ -519,10 +510,7 @@ class T3VoiceRuntimeService : Service() {
           )
         }
         semanticController.dispatch(command).also {
-          androidControls.update(it.snapshot)
-          reconcileSemanticWakeLock(it.snapshot.state)
-          updateForegroundNotificationLocked()
-          stopRuntimeForegroundLocked()
+          reconcileSemanticControlsLocked(it.snapshot)
         }
       }
     if (
@@ -538,10 +526,7 @@ class T3VoiceRuntimeService : Service() {
             semanticController.dispatch(T3VoiceRuntimeCommand.Stop)
           }
           val rolledBack = semanticController.snapshot()
-          androidControls.update(rolledBack)
-          reconcileSemanticWakeLock(rolledBack.state)
-          updateForegroundNotificationLocked()
-          stopRuntimeForegroundLocked()
+          reconcileSemanticControlsLocked(rolledBack)
         }
         throw IllegalStateException("Android could not start the voice foreground service.", cause)
       }
@@ -696,9 +681,15 @@ class T3VoiceRuntimeService : Service() {
     return rawIdle && semanticIdle
   }
 
-  private fun updateForegroundNotificationLocked() {
-    if (!T3VoiceStateStore.state.value.isForeground || !this::androidControls.isInitialized) return
-    getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, currentNotification())
+  private fun reconcileSemanticControlsLocked(snapshot: T3VoiceControllerSnapshot) {
+    val render = androidControls.render(snapshot, NOTIFICATION_CHANNEL_ID)
+    reconcileSemanticWakeLock(snapshot.state)
+    if (render.changed && T3VoiceStateStore.state.value.isForeground) {
+      render.notification?.let { notification ->
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification)
+      }
+    }
+    stopRuntimeForegroundLocked()
   }
 
   private fun currentNotification(): Notification {
@@ -709,7 +700,9 @@ class T3VoiceRuntimeService : Service() {
         null
       }
     return if (snapshot != null && this::androidControls.isInitialized) {
-      androidControls.buildNotification(snapshot, NOTIFICATION_CHANNEL_ID)
+      checkNotNull(androidControls.render(snapshot, NOTIFICATION_CHANNEL_ID).notification) {
+        "Active semantic voice state did not produce a foreground notification."
+      }
     } else {
       buildNotification()
     }

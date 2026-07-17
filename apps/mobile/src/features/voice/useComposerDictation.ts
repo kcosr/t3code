@@ -20,6 +20,7 @@ import {
   dictationTerminationOwnership,
 } from "./dictationTermination";
 import { canStartComposerDictation } from "./dictationAdmission";
+import { ensureMicrophonePermission } from "./microphonePermission";
 import { releaseRecordingForRealtime } from "./traditionalAudioHandoff";
 import type { ResolvedVoicePreferences } from "./voicePreferences";
 
@@ -178,11 +179,7 @@ export function useComposerDictation(input: {
     startSettlementRef.current = startSettlement;
     setError(null);
     try {
-      const currentPermission = await native.getMicrophonePermissionAsync();
-      const permission = currentPermission.granted
-        ? currentPermission
-        : await native.requestMicrophonePermissionAsync();
-      if (!permission.granted) throw new Error("Microphone permission was not granted");
+      await ensureMicrophonePermission(native);
       if (operationGenerationRef.current !== generation) return null;
       const recordingId = uuidv4();
       await native.startRecordingAsync({

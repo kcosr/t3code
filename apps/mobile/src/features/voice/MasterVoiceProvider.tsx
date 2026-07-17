@@ -36,14 +36,17 @@ import { useThreadShells } from "../../state/entities";
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import { usePreparedConnection } from "../../state/session";
-import { composerDraftsAtom, ensureComposerDraftsLoaded } from "../../state/use-composer-drafts";
+import {
+  ensureComposerDraftsLoaded,
+  useComposerDraftContentEmpty,
+} from "../../state/use-composer-drafts";
 import { makeAndroidVoiceRuntimeAdapter } from "./androidVoiceRuntimeAdapter";
+import { ExclusiveTransition } from "./exclusiveTransition";
 import {
   MasterVoiceCallBar,
   VoiceAudioRoutePicker,
   VoiceTranscriptModal,
   type MasterVoiceTranscriptTurn,
-  type VoiceAudioRoutePickerState,
 } from "./MasterVoiceOverlays";
 import { VoiceConversationBrowser, type VoiceConversationClient } from "./VoiceConversationBrowser";
 import {
@@ -55,18 +58,21 @@ import {
   masterVoiceEnvironmentId,
   newVoiceConversationSelection,
   prepareVoiceRuntimeAttachment,
+  reconcileVoiceAudioRoutePickerState,
   resumeVoiceConversationSelection,
+  settleVoiceAudioRoutePickerSelection,
   threadVoiceStartForFocus,
   voiceRuntimeCommandEnvironmentMatches,
   voiceRuntimePresentationPhase,
   voiceRuntimeSnapshotEnvironmentId,
-  VoiceStartAdmission,
   type ActiveMasterVoiceAttachment,
   type AdmittedClientActionFocus,
   type MasterVoiceFocus,
   type MasterVoicePhase,
+  type VoiceAudioRoutePickerState,
 } from "./masterVoiceState";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
+import { loadVoiceCapabilities } from "./useVoiceCapabilityAvailability";
 import { resolveVoicePreferences } from "./voicePreferences";
 import {
   threadTranscriptSubmissionDisposition,
@@ -162,7 +168,6 @@ export function MasterVoiceProvider(props: {
   const navigation = useNavigation();
   const native = getT3VoiceNativeModule();
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
-  const composerDrafts = useAtomValue(composerDraftsAtom);
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
   const threadShells = useThreadShells();
   const [snapshot, setSnapshot] = useState<VoiceRuntimeSnapshot>(INITIAL_SNAPSHOT);
@@ -182,7 +187,7 @@ export function MasterVoiceProvider(props: {
   const controllerEnvironmentIdRef = useRef<EnvironmentId | null>(null);
   const snapshotRef = useRef(snapshot);
   const lastRealtimeTargetRef = useRef<VoiceRealtimeTarget | null>(null);
-  const voiceStartAdmissionRef = useRef(new VoiceStartAdmission());
+  const voiceStartTransitionRef = useRef(new ExclusiveTransition());
   const resumeInFlightRef = useRef(false);
   const handledFailureSequenceRef = useRef<number | null>(null);
   const handledClientActionsRef = useRef(new Set<string>());
@@ -263,7 +268,9 @@ export function MasterVoiceProvider(props: {
       const client = await makeMobileVoiceClient(prepared);
       if (disposed) return;
       setConversationConnection({ environmentId: controllerEnvironmentId, client });
-      const capabilities = await Effect.runPromise(client.capabilities());
+      const capabilities = await loadVoiceCapabilities(prepared, {
+        load: () => Effect.runPromise(client.capabilities()),
+      });
       if (disposed) return;
       setRealtimeAvailable(
         capabilities.capabilities.some(
@@ -318,20 +325,19 @@ export function MasterVoiceProvider(props: {
 
   useEffect(() => {
     if (snapshot.mode !== "realtime") {
-      setAudioRoutePicker(null);
       lastPreferredRouteAttemptRef.current = null;
     }
   }, [snapshot.mode]);
 
   const visibleFocus = props.focus?.environmentId === controllerEnvironmentId ? props.focus : null;
-  const visibleDraft =
+  const visibleDraftKey =
     visibleFocus === null
-      ? undefined
-      : composerDrafts[scopedThreadKey(visibleFocus.environmentId, visibleFocus.threadId)];
+      ? null
+      : scopedThreadKey(visibleFocus.environmentId, visibleFocus.threadId);
+  const composerContentEmpty = useComposerDraftContentEmpty(visibleDraftKey);
   const canSwitchRealtimeToThread = canOfferThreadVoiceSwitch({
     composerDraftsReady,
-    draftText: visibleDraft?.text ?? "",
-    attachmentCount: visibleDraft?.attachments.length ?? 0,
+    composerContentEmpty,
     interactionRequired: visibleFocus?.interactionRequired ?? false,
   });
   const threadSwitch = useMemo(
@@ -448,7 +454,7 @@ export function MasterVoiceProvider(props: {
           runtime.environmentId,
           controllerEnvironmentIdRef.current,
         ) ||
-        voiceStartAdmissionRef.current.active ||
+        voiceStartTransitionRef.current.active ||
         (snapshotRef.current.mode !== "idle" && snapshotRef.current.mode !== "failed")
       ) {
         return;
@@ -460,7 +466,7 @@ export function MasterVoiceProvider(props: {
           runtime.environmentId,
           controllerEnvironmentIdRef.current,
         );
-      await voiceStartAdmissionRef.current.run(async () => {
+      await voiceStartTransitionRef.current.run(async () => {
         let releaseTraditionalAudio: (() => void) | null = null;
         try {
           releaseTraditionalAudio = await interruptTraditionalAudio();
@@ -557,8 +563,7 @@ export function MasterVoiceProvider(props: {
     }
     if (
       snapshot.operation === "realtime" &&
-      (snapshot.failure.code === "voice_conversation_not_found" ||
-        snapshot.failure.code === "conversation-not-found")
+      snapshot.failure.code === "voice_conversation_not_found"
     ) {
       void runtimeRef.current?.adapter
         .stop()
@@ -686,7 +691,7 @@ export function MasterVoiceProvider(props: {
       conversationClient === null ||
       conversationConnection?.environmentId !== runtime.environmentId ||
       resumeInFlightRef.current ||
-      voiceStartAdmissionRef.current.active ||
+      voiceStartTransitionRef.current.active ||
       snapshotRef.current.mode !== "idle"
     ) {
       return;
@@ -731,7 +736,7 @@ export function MasterVoiceProvider(props: {
         runtime.environmentId,
         controllerEnvironmentIdRef.current,
       );
-    await voiceStartAdmissionRef.current.run(async () => {
+    await voiceStartTransitionRef.current.run(async () => {
       let releaseTraditionalAudio: (() => void) | null = null;
       try {
         releaseTraditionalAudio = await interruptTraditionalAudio();
@@ -848,7 +853,6 @@ export function MasterVoiceProvider(props: {
   const chooseAudioRoute = useCallback(() => {
     if (!controlsAvailable || snapshotRef.current.mode !== "realtime") return;
     setAudioRoutePicker({
-      routes: snapshotRef.current.audioRoutes,
       selectingRouteId: null,
       error: null,
     });
@@ -874,30 +878,28 @@ export function MasterVoiceProvider(props: {
       }
       void runtime.adapter
         .setRealtimeAudioRoute(route.id)
-        .then(() => savePreferences({ voiceAudioRouteId: route.id }))
+        .then(() => {
+          savePreferences({ voiceAudioRouteId: route.id });
+          setAudioRoutePicker((current) => settleVoiceAudioRoutePickerSelection(current, route.id));
+        })
         .catch((cause) =>
           setAudioRoutePicker((current) =>
-            current === null
-              ? null
-              : { ...current, selectingRouteId: null, error: errorMessage(cause) },
+            settleVoiceAudioRoutePickerSelection(current, route.id, errorMessage(cause)),
           ),
         );
     },
     [savePreferences],
   );
 
+  const realtimeAudioRoutes = snapshot.mode === "realtime" ? snapshot.audioRoutes : null;
   useEffect(() => {
-    if (audioRoutePicker === null) return;
-    if (!controlsAvailable || snapshot.mode !== "realtime") {
-      setAudioRoutePicker(null);
-      return;
-    }
     setAudioRoutePicker((current) =>
-      current === null
-        ? null
-        : { routes: snapshot.audioRoutes, selectingRouteId: null, error: current.error },
+      reconcileVoiceAudioRoutePickerState(current, {
+        controlsAvailable,
+        routes: realtimeAudioRoutes,
+      }),
     );
-  }, [audioRoutePicker === null, controlsAvailable, snapshot]);
+  }, [controlsAvailable, realtimeAudioRoutes]);
 
   const toggleMuted = useCallback(() => {
     if (snapshotRef.current.mode !== "realtime") return;
@@ -1029,6 +1031,7 @@ export function MasterVoiceProvider(props: {
       />
       <VoiceAudioRoutePicker
         state={audioRoutePicker}
+        routes={realtimeAudioRoutes}
         onClose={() => setAudioRoutePicker(null)}
         onSelect={selectAudioRoute}
       />

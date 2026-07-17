@@ -7,7 +7,6 @@ import type {
   VoiceRuntimeAdapter,
   VoiceRuntimeSnapshot,
   VoiceRuntimeSnapshotListener,
-  VoiceThreadReviewToken,
   VoiceThreadStartInput,
 } from "@t3tools/client-runtime/voice";
 import type {
@@ -26,6 +25,7 @@ import * as Effect from "effect/Effect";
 import { AndroidVoiceCommandQueue } from "./androidVoiceCommandQueue";
 import { requestAndroidVoiceNotificationPermission } from "./androidVoiceNotificationPermission";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
+import { ensureMicrophonePermission } from "./microphonePermission";
 
 export type AndroidVoiceRuntimeClientFactory = (
   prepared: PreparedConnection,
@@ -37,15 +37,6 @@ export interface AndroidVoiceRuntimeAdapterInput {
   readonly makeClient?: AndroidVoiceRuntimeClientFactory;
   readonly requestNotificationPermission?: () => Promise<"granted" | "denied">;
 }
-
-const ensureMicrophonePermission = async (native: T3VoiceNativeModule): Promise<void> => {
-  const current = await native.getMicrophonePermissionAsync();
-  if (current.granted) return;
-  const requested = await native.requestMicrophonePermissionAsync();
-  if (!requested.granted) {
-    throw new Error("Microphone permission is required for voice");
-  }
-};
 
 const requestOptionalBluetoothPermission = async (native: T3VoiceNativeModule): Promise<void> => {
   try {
@@ -94,7 +85,7 @@ const attachSnapshotListener = async (
   native: T3VoiceNativeModule,
   listener: VoiceRuntimeSnapshotListener,
 ): Promise<() => void> => {
-  const buffered: Array<VoiceRuntimeSnapshot> = [];
+  let buffered: VoiceRuntimeSnapshot | null = null;
   let attached = true;
   let hydrating = true;
   let latestSequence = Number.NEGATIVE_INFINITY;
@@ -107,7 +98,7 @@ const attachSnapshotListener = async (
   const subscription = native.addListener("runtimeSnapshotChanged", (snapshot) => {
     if (!attached) return;
     if (hydrating) {
-      buffered.push(snapshot);
+      if (buffered === null || snapshot.sequence > buffered.sequence) buffered = snapshot;
       return;
     }
     publish(snapshot);
@@ -115,8 +106,7 @@ const attachSnapshotListener = async (
 
   try {
     publish(await native.getRuntimeSnapshotAsync());
-    buffered.sort((left, right) => left.sequence - right.sequence);
-    for (const snapshot of buffered) publish(snapshot);
+    if (buffered !== null) publish(buffered);
     hydrating = false;
   } catch (cause) {
     attached = false;
@@ -169,7 +159,7 @@ const stopAndAwaitRelease = async (native: T3VoiceNativeModule): Promise<void> =
 export const makeAndroidVoiceRuntimeAdapter = (
   input: AndroidVoiceRuntimeAdapterInput,
 ): VoiceRuntimeAdapter => {
-  const commands = new AndroidVoiceCommandQueue<VoiceThreadReviewToken>();
+  const commands = new AndroidVoiceCommandQueue();
   const makeClient = input.makeClient ?? makeMobileVoiceClient;
   const requestNotificationPermission =
     input.requestNotificationPermission ?? requestAndroidVoiceNotificationPermission;

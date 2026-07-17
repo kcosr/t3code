@@ -7,6 +7,7 @@ import kotlin.concurrent.thread
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -18,7 +19,7 @@ internal class T3VoicePcmStreamSinkTest {
     val sink =
       T3VoicePcmStreamSink(
         playbackId = "playback",
-        enqueue = { _, _, pcm -> accepted += pcm },
+        enqueueOwned = { _, _, pcm -> accepted += pcm },
       )
 
     sink.accept(byteArrayOf(1))
@@ -37,7 +38,7 @@ internal class T3VoicePcmStreamSinkTest {
     val sink =
       T3VoicePcmStreamSink(
         playbackId = "playback",
-        enqueue = { _, _, _ -> },
+        enqueueOwned = { _, _, _ -> },
       )
     sink.accept(byteArrayOf(1))
 
@@ -50,7 +51,7 @@ internal class T3VoicePcmStreamSinkTest {
     val sink =
       T3VoicePcmStreamSink(
         playbackId = "playback",
-        enqueue = { _, index, _ -> acceptedIndexes += index },
+        enqueueOwned = { _, index, _ -> acceptedIndexes += index },
       )
     sink.accept(byteArrayOf(1, 2))
 
@@ -69,7 +70,7 @@ internal class T3VoicePcmStreamSinkTest {
     val sink =
       T3VoicePcmStreamSink(
         playbackId = "playback",
-        enqueue = { _, _, _ -> },
+        enqueueOwned = { _, _, _ -> },
         maximumPendingChunks = 1,
         maximumPendingBytes = 4,
       )
@@ -91,5 +92,21 @@ internal class T3VoicePcmStreamSinkTest {
 
     assertFalse(worker.isAlive)
     assertTrue(failure.get() is IllegalStateException)
+  }
+
+  @Test
+  fun `aligned chunks transfer an isolated buffer to the playback owner`() {
+    val source = byteArrayOf(1, 2, 3, 4)
+    lateinit var owned: ByteArray
+    val sink =
+      T3VoicePcmStreamSink(
+        playbackId = "playback",
+        enqueueOwned = { _, _, pcm -> owned = pcm },
+      )
+
+    sink.accept(source)
+    assertNotSame(source, owned)
+    source.fill(9)
+    assertArrayEquals(byteArrayOf(1, 2, 3, 4), owned)
   }
 }

@@ -79,6 +79,25 @@ internal class T3VoiceHttpTransportTest {
   }
 
   @Test
+  fun `secret headers share strict visible ASCII validation and stay redacted`() {
+    val connection = FakeHttpConnection(200, "{}".toByteArray())
+    val bearer = T3VoiceBearerToken("bearer-secret")
+    val ticket = T3VoiceMediaTicketToken("ticket-secret")
+
+    bearer.applyTo(connection)
+    ticket.applyTo(connection)
+
+    assertEquals("Bearer bearer-secret", connection.getRequestProperty("authorization"))
+    assertEquals("ticket-secret", connection.getRequestProperty("x-t3-voice-ticket"))
+    assertFalse(bearer.toString().contains("bearer-secret"))
+    assertFalse(ticket.toString().contains("ticket-secret"))
+    listOf("", " ", "line\nbreak", "\u007f", "x".repeat(4_097)).forEach { invalid ->
+      assertThrows(IllegalArgumentException::class.java) { T3VoiceBearerToken(invalid) }
+      assertThrows(IllegalArgumentException::class.java) { T3VoiceMediaTicketToken(invalid) }
+    }
+  }
+
+  @Test
   fun `JSON helpers apply bearer bounds timeouts and disable redirects`() {
     val connection = FakeHttpConnection(200, "response".toByteArray())
     val requestedUrl = AtomicReference<URL>()

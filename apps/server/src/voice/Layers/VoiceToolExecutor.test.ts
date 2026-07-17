@@ -35,10 +35,15 @@ import {
   type HistoryPrincipal,
 } from "../../history/Services/HistorySearchService.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ThreadTurnOutcomeQueryLive } from "../../orchestration/Layers/ThreadTurnOutcomeQuery.ts";
 import {
   type ProjectionThreadMessage,
   ProjectionThreadMessageRepository,
 } from "../../persistence/Services/ProjectionThreadMessages.ts";
+import {
+  type ProjectionThread,
+  ProjectionThreadRepository,
+} from "../../persistence/Services/ProjectionThreads.ts";
 import type { ProjectionTurn } from "../../persistence/Services/ProjectionTurns.ts";
 import {
   type ProjectionTurnStartOutcome,
@@ -159,6 +164,26 @@ const snapshot: OrchestrationShellSnapshot = {
   threads: [thread],
   updatedAt: now,
 };
+
+const projectionThread = (shell: OrchestrationThreadShell): ProjectionThread => ({
+  threadId: shell.id,
+  projectId: shell.projectId,
+  title: shell.title,
+  modelSelection: shell.modelSelection,
+  runtimeMode: shell.runtimeMode,
+  interactionMode: shell.interactionMode,
+  branch: shell.branch,
+  worktreePath: shell.worktreePath,
+  latestTurnId: shell.latestTurn?.turnId ?? null,
+  createdAt: shell.createdAt,
+  updatedAt: shell.updatedAt,
+  archivedAt: shell.archivedAt,
+  latestUserMessageAt: shell.latestUserMessageAt,
+  pendingApprovalCount: shell.hasPendingApprovals ? 1 : 0,
+  pendingUserInputCount: shell.hasPendingUserInput ? 1 : 0,
+  hasActionableProposedPlan: shell.hasActionableProposedPlan ? 1 : 0,
+  deletedAt: null,
+});
 const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString) as (
   input: string,
@@ -207,6 +232,16 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
         Effect.map((current) => (id === threadId ? Option.some(current) : Option.none())),
       ),
   } as unknown as ProjectionSnapshotQuery["Service"];
+  const threadRepository = {
+    getById: ({ threadId: requestedThreadId }: { readonly threadId: ThreadId }) =>
+      Ref.get(threadShell).pipe(
+        Effect.map((current) =>
+          requestedThreadId === threadId
+            ? Option.some(projectionThread(current))
+            : Option.none<ProjectionThread>(),
+        ),
+      ),
+  } as unknown as ProjectionThreadRepository["Service"];
   const dispatcher = ClientCommandDispatcher.of({
     dispatch: (command) =>
       Ref.update(commands, (all) => [...all, command]).pipe(Effect.as({ sequence: 42 })),
@@ -482,8 +517,9 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
           ),
       ),
   });
-  const dependencies = Layer.mergeAll(
+  const baseDependencies = Layer.mergeAll(
     Layer.succeed(ProjectionSnapshotQuery, query),
+    Layer.succeed(ProjectionThreadRepository, threadRepository),
     Layer.succeed(ProjectionThreadMessageRepository, messageRepository),
     Layer.succeed(ProjectionTurnStartRepository, turnStartRepository),
     Layer.succeed(ClientCommandDispatcher, dispatcher),
@@ -491,6 +527,10 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
     Layer.succeed(VoiceConversationService, conversations),
     Layer.succeed(VoiceToolCallRepository, toolCallRepository),
     NodeServices.layer,
+  );
+  const dependencies = Layer.mergeAll(
+    baseDependencies,
+    ThreadTurnOutcomeQueryLive.pipe(Layer.provide(baseDependencies)),
   );
   return {
     commands,

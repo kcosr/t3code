@@ -33,7 +33,6 @@ import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
 import { ProjectionTurnStartRepository } from "../../persistence/Services/ProjectionTurnStarts.ts";
 import { ProjectionTurnStartRepositoryLive } from "../../persistence/Layers/ProjectionTurnStarts.ts";
-import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
@@ -1265,7 +1264,5 @@ const make = Effect.gen(function* () {
 });
 
 export const ProviderCommandReactorLive = Layer.effect(ProviderCommandReactor, make).pipe(
-  Layer.provide(
-    ProjectionTurnStartRepositoryLive.pipe(Layer.provide(ProjectionTurnRepositoryLive)),
-  ),
+  Layer.provide(ProjectionTurnStartRepositoryLive),
 );

@@ -516,7 +516,7 @@ internal class T3VoiceThreadSessionTest {
       }
     }
 
-    override fun enqueuePlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray) = Unit
+    override fun enqueueOwnedPlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray) = Unit
 
     override fun finishPlayback(playbackId: String, finalChunkIndex: Int) {
       synchronized(lock) {
@@ -631,7 +631,7 @@ internal class T3VoiceThreadSessionTest {
     override fun startPlayback(playbackId: String, sampleRate: Int, channelCount: Int) =
       error("Playback is not used by this test.")
 
-    override fun enqueuePlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray) =
+    override fun enqueueOwnedPlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray) =
       error("Playback is not used by this test.")
 
     override fun finishPlayback(playbackId: String, finalChunkIndex: Int) =
@@ -689,7 +689,7 @@ internal class T3VoiceThreadSessionTest {
       }
     }
 
-    override fun enqueuePlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray) =
+    override fun enqueueOwnedPlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray) =
       error("Synthesis must not begin after focus loss.")
 
     override fun finishPlayback(playbackId: String, finalChunkIndex: Int) =
@@ -822,7 +822,7 @@ internal class T3VoiceThreadSessionTest {
     override fun startPlayback(playbackId: String, sampleRate: Int, channelCount: Int) =
       error("Playback is not used by this test.")
 
-    override fun enqueuePlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray) =
+    override fun enqueueOwnedPlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray) =
       error("Playback is not used by this test.")
 
     override fun finishPlayback(playbackId: String, finalChunkIndex: Int) =
@@ -882,7 +882,7 @@ internal class T3VoiceThreadSessionTest {
       check(activePlayback.compareAndSet(null, playbackId))
     }
 
-    override fun enqueuePlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray) = Unit
+    override fun enqueueOwnedPlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray) = Unit
 
     override fun finishPlayback(playbackId: String, finalChunkIndex: Int) {
       finishCount.incrementAndGet()

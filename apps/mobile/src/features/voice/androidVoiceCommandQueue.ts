@@ -1,3 +1,5 @@
+import type { VoiceThreadReviewToken } from "@t3tools/client-runtime/voice";
+
 interface CommandEntry {
   readonly kind: "command";
   readonly execute: () => Promise<void>;
@@ -8,19 +10,22 @@ interface ReviewUpdateWaiter {
   readonly reject: (cause: unknown) => void;
 }
 
-interface ReviewUpdateEntry<Token> {
+interface ReviewUpdateEntry {
   readonly kind: "review-update";
-  token: Token;
+  readonly token: VoiceThreadReviewToken;
   transcript: string;
   readonly waiters: Array<ReviewUpdateWaiter>;
   readonly execute: () => Promise<void>;
 }
 
-type QueueEntry<Token> = CommandEntry | ReviewUpdateEntry<Token>;
+type QueueEntry = CommandEntry | ReviewUpdateEntry;
+
+const sameReviewToken = (left: VoiceThreadReviewToken, right: VoiceThreadReviewToken): boolean =>
+  left.generation === right.generation && left.reviewId === right.reviewId;
 
 /** Serializes native ownership commands and coalesces consecutive review edits. */
-export class AndroidVoiceCommandQueue<Token> {
-  private readonly entries: Array<QueueEntry<Token>> = [];
+export class AndroidVoiceCommandQueue {
+  private readonly entries: Array<QueueEntry> = [];
   private draining = false;
 
   enqueue<Result>(command: () => Promise<Result>): Promise<Result> {
@@ -40,20 +45,19 @@ export class AndroidVoiceCommandQueue<Token> {
   }
 
   enqueueReviewUpdate(
-    token: Token,
+    token: VoiceThreadReviewToken,
     transcript: string,
-    command: (token: Token, transcript: string) => Promise<void>,
+    command: (token: VoiceThreadReviewToken, transcript: string) => Promise<void>,
   ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       const last = this.entries.at(-1);
-      if (last?.kind === "review-update") {
-        last.token = token;
+      if (last?.kind === "review-update" && sameReviewToken(last.token, token)) {
         last.transcript = transcript;
         last.waiters.push({ resolve, reject });
         return;
       }
 
-      const entry: ReviewUpdateEntry<Token> = {
+      const entry: ReviewUpdateEntry = {
         kind: "review-update",
         token,
         transcript,

@@ -219,10 +219,12 @@ class T3VoiceModule : Module() {
 
       AsyncFunction("setRealtimeAudioRouteAsync") {
         input: Map<String, Any?>, promise: Promise ->
-        requireExactKeys(input, setOf("routeId"))
+        input.requireExactBridgeKeys("audio route input", setOf("routeId"))
         dispatchRuntime(
           promise,
-          T3VoiceRuntimeCommand.SetRealtimeAudioRoute(requireIdentifier(input, "routeId")),
+          T3VoiceRuntimeCommand.SetRealtimeAudioRoute(
+            input.requireBridgeArgumentIdentifier("routeId"),
+          ),
         )
       }
 
@@ -238,9 +240,12 @@ class T3VoiceModule : Module() {
 
       AsyncFunction("decideRealtimeConfirmationAsync") {
         input: Map<String, Any?>, promise: Promise ->
-        requireExactKeys(input, setOf("confirmationId", "decision"))
+        input.requireExactBridgeKeys(
+          "confirmation decision input",
+          setOf("confirmationId", "decision"),
+        )
         val decision =
-          when (requireText(input, "decision", 16)) {
+          when (input.requireBridgeArgumentText("decision", 16)) {
             "approve" -> T3VoiceConfirmationDecision.APPROVE
             "reject" -> T3VoiceConfirmationDecision.REJECT
             else -> error("decision must be approve or reject.")
@@ -248,7 +253,7 @@ class T3VoiceModule : Module() {
         dispatchRuntime(
           promise,
           T3VoiceRuntimeCommand.DecideRealtimeConfirmation(
-            confirmationId = requireIdentifier(input, "confirmationId"),
+            confirmationId = input.requireBridgeArgumentIdentifier("confirmationId"),
             decision = decision,
           ),
         )
@@ -256,13 +261,13 @@ class T3VoiceModule : Module() {
 
       AsyncFunction("completeRealtimeClientActionAsync") {
         input: Map<String, Any?>, promise: Promise ->
-        requireAllowedKeys(
-          input,
+        input.requireAllowedBridgeKeys(
+          "client action completion input",
           required = setOf("actionId", "outcome"),
           allowed = setOf("actionId", "outcome", "message"),
         )
         val outcome =
-          when (requireText(input, "outcome", 16)) {
+          when (input.requireBridgeArgumentText("outcome", 16)) {
             "succeeded" -> T3VoiceClientActionOutcome.SUCCEEDED
             "failed" -> T3VoiceClientActionOutcome.FAILED
             else -> error("outcome must be succeeded or failed.")
@@ -270,11 +275,11 @@ class T3VoiceModule : Module() {
         dispatchRuntime(
           promise,
           T3VoiceRuntimeCommand.CompleteRealtimeClientAction(
-            actionId = requireIdentifier(input, "actionId"),
+            actionId = input.requireBridgeArgumentIdentifier("actionId"),
             outcome = outcome,
             message =
               if (input.containsKey("message")) {
-                requireText(input, "message", MAXIMUM_CLIENT_ACTION_MESSAGE_LENGTH)
+                input.requireBridgeArgumentText("message", MAXIMUM_CLIENT_ACTION_MESSAGE_LENGTH)
               } else {
                 null
               },
@@ -339,21 +344,24 @@ class T3VoiceModule : Module() {
       }
 
       AsyncFunction("startRecordingAsync") { input: Map<String, Any?>, promise: Promise ->
-        requireExactKeys(input, setOf("recordingId", "endpointDetection"))
-        val recordingId = requireIdentifier(input, "recordingId")
+        input.requireExactBridgeKeys(
+          "recording start input",
+          setOf("recordingId", "endpointDetection"),
+        )
+        val recordingId = input.requireBridgeArgumentIdentifier("recordingId")
         val endpointInput =
           input["endpointDetection"] as? Map<*, *>
             ?: error("endpointDetection must be an object.")
-        requireAllowedKeys(
-          endpointInput,
+        endpointInput.requireAllowedBridgeKeys(
+          "endpoint detection input",
           required = setOf("endSilenceMs", "maximumUtteranceMs"),
           allowed = setOf("endSilenceMs", "noSpeechTimeoutMs", "maximumUtteranceMs"),
         )
         val endpointConfig =
           T3VoiceEndpointDetectionConfig(
-            endSilenceMs = requireLong(endpointInput, "endSilenceMs"),
-            noSpeechTimeoutMs = optionalLong(endpointInput, "noSpeechTimeoutMs"),
-            maximumUtteranceMs = requireLong(endpointInput, "maximumUtteranceMs"),
+            endSilenceMs = endpointInput.requireBridgeLong("endSilenceMs"),
+            noSpeechTimeoutMs = endpointInput.optionalBridgeLong("noSpeechTimeoutMs"),
+            maximumUtteranceMs = endpointInput.requireBridgeLong("maximumUtteranceMs"),
           )
         val context = requireNotNull(appContext.reactContext) { "React context is unavailable." }
         T3VoiceRuntimeService.startForRecording(context, recordingId)
@@ -365,13 +373,13 @@ class T3VoiceModule : Module() {
 
       AsyncFunction("stopRecordingAsync") { input: Map<String, String>, promise: Promise ->
         withBinder(promise, "recording-stop-failed") { voice, result ->
-          result.resolve(voice.stopRecording(requireIdentifier(input, "recordingId")))
+          result.resolve(voice.stopRecording(input.requireBridgeArgumentIdentifier("recordingId")))
         }
       }
 
       AsyncFunction("cancelRecordingAsync") { input: Map<String, String>, promise: Promise ->
         withBinder(promise, "recording-cancel-failed") { voice, result ->
-          voice.cancelRecording(requireIdentifier(input, "recordingId"))
+          voice.cancelRecording(input.requireBridgeArgumentIdentifier("recordingId"))
           result.resolve()
         }
       }
@@ -379,8 +387,12 @@ class T3VoiceModule : Module() {
       AsyncFunction("deleteRecordingAsync") { input: Map<String, String>, promise: Promise ->
         withBinder(promise, "recording-delete-failed") { voice, result ->
           voice.deleteRecording(
-            recordingId = requireIdentifier(input, "recordingId"),
-            uri = requireText(input, "uri", T3VoiceBridgeValidation.MAXIMUM_URI_LENGTH),
+            recordingId = input.requireBridgeArgumentIdentifier("recordingId"),
+            uri =
+              input.requireBridgeArgumentText(
+                "uri",
+                T3VoiceBridgeValidation.MAXIMUM_URI_LENGTH,
+              ),
           )
           result.resolve()
         }
@@ -389,15 +401,17 @@ class T3VoiceModule : Module() {
       AsyncFunction("acknowledgeRecordingTerminationAsync") {
         input: Map<String, String>, promise: Promise ->
         withBinder(promise, "recording-acknowledgement-failed") { voice, result ->
-          voice.acknowledgeRecordingTermination(requireIdentifier(input, "recordingId"))
+          voice.acknowledgeRecordingTermination(
+            input.requireBridgeArgumentIdentifier("recordingId"),
+          )
           result.resolve()
         }
       }
 
       AsyncFunction("startPlaybackAsync") { input: Map<String, Any>, promise: Promise ->
-        val playbackId = requireIdentifier(input, "playbackId")
-        val sampleRate = requireInt(input, "sampleRate")
-        val channelCount = requireInt(input, "channelCount")
+        val playbackId = input.requireBridgeArgumentIdentifier("playbackId")
+        val sampleRate = input.requireBridgeInt("sampleRate")
+        val channelCount = input.requireBridgeInt("channelCount")
         val context = requireNotNull(appContext.reactContext) { "React context is unavailable." }
         T3VoiceRuntimeService.startForPlayback(context, playbackId)
         withBinder(promise, "playback-start-failed") { voice, result ->
@@ -409,10 +423,13 @@ class T3VoiceModule : Module() {
       AsyncFunction("enqueuePlaybackChunkAsync") { input: Map<String, Any>, promise: Promise ->
         withBinder(promise, "playback-enqueue-failed") { voice, result ->
           voice.enqueuePlaybackChunk(
-            playbackId = requireIdentifier(input, "playbackId"),
-            chunkIndex = requireInt(input, "chunkIndex"),
+            playbackId = input.requireBridgeArgumentIdentifier("playbackId"),
+            chunkIndex = input.requireBridgeInt("chunkIndex"),
             pcmBase64 =
-              requireText(input, "pcmBase64", T3VoiceBridgeValidation.MAXIMUM_PCM_BASE64_LENGTH),
+              input.requireBridgeArgumentText(
+                "pcmBase64",
+                T3VoiceBridgeValidation.MAXIMUM_PCM_BASE64_LENGTH,
+              ),
           )
           result.resolve()
         }
@@ -421,8 +438,8 @@ class T3VoiceModule : Module() {
       AsyncFunction("finishPlaybackAsync") { input: Map<String, Any>, promise: Promise ->
         withBinder(promise, "playback-finish-failed") { voice, result ->
           voice.finishPlayback(
-            playbackId = requireIdentifier(input, "playbackId"),
-            finalChunkIndex = requireInt(input, "finalChunkIndex"),
+            playbackId = input.requireBridgeArgumentIdentifier("playbackId"),
+            finalChunkIndex = input.requireBridgeInt("finalChunkIndex"),
           )
           result.resolve()
         }
@@ -430,7 +447,7 @@ class T3VoiceModule : Module() {
 
       AsyncFunction("cancelPlaybackAsync") { input: Map<String, String>, promise: Promise ->
         withBinder(promise, "playback-cancel-failed") { voice, result ->
-          voice.cancelPlayback(requireIdentifier(input, "playbackId"))
+          voice.cancelPlayback(input.requireBridgeArgumentIdentifier("playbackId"))
           result.resolve()
         }
       }
@@ -438,7 +455,9 @@ class T3VoiceModule : Module() {
       AsyncFunction("acknowledgePlaybackTerminationAsync") {
         input: Map<String, String>, promise: Promise ->
         withBinder(promise, "playback-acknowledgement-failed") { voice, result ->
-          voice.acknowledgePlaybackTermination(requireIdentifier(input, "playbackId"))
+          voice.acknowledgePlaybackTermination(
+            input.requireBridgeArgumentIdentifier("playbackId"),
+          )
           result.resolve()
         }
       }
@@ -450,8 +469,8 @@ class T3VoiceModule : Module() {
       }
 
       AsyncFunction("setRealtimeMutedAsync") { input: Map<String, Any>, promise: Promise ->
-        requireExactKeys(input, setOf("muted"))
-        val muted = input["muted"] as? Boolean ?: error("muted must be a boolean.")
+        input.requireExactBridgeKeys("mute input", setOf("muted"))
+        val muted = input.requireBridgeBoolean("muted")
         dispatchRuntime(promise, T3VoiceRuntimeCommand.SetRealtimeMuted(muted))
       }
 
@@ -638,43 +657,6 @@ class T3VoiceModule : Module() {
     pending.timeout?.let(mainHandler::removeCallbacks)
     pending.timeout = null
   }
-
-  private fun requireIdentifier(input: Map<String, *>, key: String): String {
-    return requireText(input, key, T3VoiceBridgeValidation.MAXIMUM_IDENTIFIER_LENGTH)
-  }
-
-  private fun requireInt(input: Map<String, Any>, key: String): Int {
-    return T3VoiceBridgeValidation.requireInt(input, key)
-  }
-
-  private fun requireLong(input: Map<*, *>, key: String): Long =
-    optionalLong(input, key) ?: error("$key must be an integer.")
-
-  private fun optionalLong(input: Map<*, *>, key: String): Long? {
-    val value = input[key] ?: return null
-    val number = value as? Number ?: error("$key must be an integer or null.")
-    val long = number.toLong()
-    check(number.toDouble() == long.toDouble()) { "$key must be an integer." }
-    return long
-  }
-
-  private fun requireExactKeys(input: Map<*, *>, expected: Set<String>) {
-    check(input.keys == expected) { "Input fields must be exactly ${expected.sorted().joinToString()}." }
-  }
-
-  private fun requireAllowedKeys(
-    input: Map<*, *>,
-    required: Set<String>,
-    allowed: Set<String>,
-  ) {
-    check(input.keys.containsAll(required) && allowed.containsAll(input.keys)) {
-      "Input fields must include ${required.sorted().joinToString()} and may include " +
-        allowed.sorted().joinToString() + "."
-    }
-  }
-
-  private fun requireText(input: Map<String, *>, key: String, maximumLength: Int): String =
-    T3VoiceBridgeValidation.requireText(input, key, maximumLength)
 
   private fun cancelCollections() {
     runtimeSnapshotCollection?.cancel()

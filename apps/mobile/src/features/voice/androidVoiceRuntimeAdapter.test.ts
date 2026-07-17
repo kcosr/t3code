@@ -363,7 +363,7 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
     expect(harness.native.startThreadAsync).toHaveBeenCalledOnce();
   });
 
-  it("hydrates first and suppresses stale or duplicate buffered snapshots", async () => {
+  it("hydrates first and retains only the newest complete buffered snapshot", async () => {
     let resolveSnapshot!: (snapshot: VoiceRuntimeSnapshot) => void;
     const harness = makeHarness(
       () =>
@@ -376,18 +376,19 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
 
     harness.emit(idleSnapshot(1));
     harness.emit(idleSnapshot(3));
-    resolveSnapshot(idleSnapshot(2));
+    harness.emit(idleSnapshot(2));
+    resolveSnapshot(idleSnapshot(0));
     const detach = await subscribing;
 
-    expect(received).toEqual([2, 3]);
+    expect(received).toEqual([0, 3]);
     harness.emit(idleSnapshot(3));
     harness.emit(idleSnapshot(4));
-    expect(received).toEqual([2, 3, 4]);
+    expect(received).toEqual([0, 3, 4]);
 
     detach();
     detach();
     harness.emit(idleSnapshot(5));
-    expect(received).toEqual([2, 3, 4]);
+    expect(received).toEqual([0, 3, 4]);
     expect(harness.remove).toHaveBeenCalledTimes(1);
     expect(harness.native.stopRuntimeAsync).not.toHaveBeenCalled();
   });
@@ -434,6 +435,42 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
     ).toBeLessThan(
       vi.mocked(harness.native.submitThreadTranscriptAsync).mock.invocationCallOrder[0] ?? 0,
     );
+  });
+
+  it("never coalesces review edits across native review identities", async () => {
+    const harness = makeHarness();
+    let releaseFirst!: () => void;
+    vi.mocked(harness.native.updateThreadReviewTranscriptAsync).mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        }),
+    );
+    const firstReview = { generation: 4, reviewId: 9 };
+    const nextReview = { generation: 5, reviewId: 1 };
+
+    const first = harness.adapter.updateThreadReviewTranscript(firstReview, "old");
+    await vi.waitFor(() =>
+      expect(harness.native.updateThreadReviewTranscriptAsync).toHaveBeenCalledOnce(),
+    );
+    const superseded = harness.adapter.updateThreadReviewTranscript(firstReview, "old edited");
+    const next = harness.adapter.updateThreadReviewTranscript(nextReview, "new");
+    const nextEdited = harness.adapter.updateThreadReviewTranscript(nextReview, "new edited");
+
+    releaseFirst();
+    await Promise.all([first, superseded, next, nextEdited]);
+
+    expect(harness.native.updateThreadReviewTranscriptAsync).toHaveBeenCalledTimes(3);
+    expect(harness.native.updateThreadReviewTranscriptAsync).toHaveBeenNthCalledWith(2, {
+      expectedGeneration: 4,
+      expectedReviewId: 9,
+      transcript: "old edited",
+    });
+    expect(harness.native.updateThreadReviewTranscriptAsync).toHaveBeenNthCalledWith(3, {
+      expectedGeneration: 5,
+      expectedReviewId: 1,
+      transcript: "new edited",
+    });
   });
 
   it("forwards semantic controls without involving the parent credential", async () => {

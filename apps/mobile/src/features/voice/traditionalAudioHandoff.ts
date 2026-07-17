@@ -3,24 +3,6 @@ import type { T3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 type PlaybackControl = Pick<T3VoiceNativeModule, "cancelPlaybackAsync" | "getStateAsync">;
 type RecordingControl = Pick<T3VoiceNativeModule, "cancelRecordingAsync" | "getStateAsync">;
 
-export interface TraditionalAudioTransitionLock {
-  active: boolean;
-}
-
-export async function runExclusiveTraditionalAudioTransition(
-  lock: TraditionalAudioTransitionLock,
-  transition: () => Promise<void>,
-): Promise<boolean> {
-  if (lock.active) return false;
-  lock.active = true;
-  try {
-    await transition();
-    return true;
-  } finally {
-    lock.active = false;
-  }
-}
-
 export async function startDictationWithAudioHandoff(input: {
   readonly stopRealtime: () => Promise<void>;
   readonly interruptPlayback: () => Promise<boolean>;

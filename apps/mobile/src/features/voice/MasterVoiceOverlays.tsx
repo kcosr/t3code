@@ -7,17 +7,11 @@ import { AppText as Text } from "../../components/AppText";
 import { ControlPill } from "../../components/ControlPill";
 import { platformSymbolName } from "../../components/platformSymbolName";
 import { useThemeColor } from "../../lib/useThemeColor";
-import type { ActiveMasterVoiceAttachment } from "./masterVoiceState";
+import type { ActiveMasterVoiceAttachment, VoiceAudioRoutePickerState } from "./masterVoiceState";
 
 export interface MasterVoiceTranscriptTurn {
   readonly role: "user" | "assistant";
   readonly text: string;
-}
-
-export interface VoiceAudioRoutePickerState {
-  readonly routes: ReadonlyArray<VoiceAudioRoute> | null;
-  readonly selectingRouteId: VoiceAudioRoute["id"] | null;
-  readonly error: string | null;
 }
 
 function VoiceSheetHeader(props: {
@@ -87,13 +81,14 @@ export function VoiceTranscriptModal(props: {
 
 export function VoiceAudioRoutePicker(props: {
   readonly state: VoiceAudioRoutePickerState | null;
+  readonly routes: ReadonlyArray<VoiceAudioRoute> | null;
   readonly onClose: () => void;
   readonly onSelect: (route: VoiceAudioRoute) => void;
 }) {
   const insets = useSafeAreaInsets();
   const iconColor = useThemeColor("--color-icon");
-  const routes = props.state?.routes ?? [];
-  const loading = props.state !== null && props.state.routes === null;
+  const routes = props.routes ?? [];
+  const loading = props.state !== null && props.routes === null;
   const selectionInFlight = props.state?.selectingRouteId != null;
   return (
     <Modal

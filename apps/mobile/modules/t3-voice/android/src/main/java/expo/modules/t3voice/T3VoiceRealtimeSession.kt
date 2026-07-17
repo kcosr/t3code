@@ -646,7 +646,7 @@ internal class T3VoiceRealtimeSession(
           publishedBeforeQuiescence = terminalPublished.get(),
         )
       }
-    if (result.publishedBeforeQuiescence) awaitUninterruptibly(terminalPublicationFinished)
+    if (result.publishedBeforeQuiescence) terminalPublicationFinished.awaitUninterruptibly()
     onQuiesced(result)
   }
 
@@ -683,18 +683,6 @@ internal class T3VoiceRealtimeSession(
     } finally {
       terminalPublicationFinished.countDown()
     }
-  }
-
-  private fun awaitUninterruptibly(latch: CountDownLatch) {
-    var interrupted = false
-    while (latch.count > 0) {
-      try {
-        latch.await()
-      } catch (_: InterruptedException) {
-        interrupted = true
-      }
-    }
-    if (interrupted) Thread.currentThread().interrupt()
   }
 
   private fun cancelLiveWork() {

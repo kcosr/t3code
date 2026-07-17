@@ -12,11 +12,24 @@ import {
   GetProjectionTurnStartByTurnIdInput,
   ProjectionTurnStart,
   ProjectionTurnStartRepository,
+  type ProjectionTurnStartOutcome,
   type ProjectionTurnStartRepositoryShape,
 } from "../Services/ProjectionTurnStarts.ts";
-import { ProjectionTurnRepository } from "../Services/ProjectionTurns.ts";
+import { ProjectionTurnById } from "../Services/ProjectionTurns.ts";
 
 const isPersistenceSqlError = Schema.is(PersistenceSqlError);
+
+const ProjectionTurnStartOutcomeDbRow = Schema.Struct({
+  ...ProjectionTurnStart.fields,
+  turn: Schema.NullOr(Schema.fromJsonString(ProjectionTurnById)),
+});
+
+const mapOutcomeRow = (
+  row: typeof ProjectionTurnStartOutcomeDbRow.Type,
+): ProjectionTurnStartOutcome => {
+  const { turn, ...start } = row;
+  return { start, turn };
+};
 
 function toPersistenceSqlOrDecodeError(sqlOperation: string, decodeOperation: string) {
   return (cause: unknown) =>
@@ -27,7 +40,6 @@ function toPersistenceSqlOrDecodeError(sqlOperation: string, decodeOperation: st
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-  const turns = yield* ProjectionTurnRepository;
 
   const upsertRow = SqlSchema.void({
     Request: ProjectionTurnStart,
@@ -77,6 +89,40 @@ const make = Effect.gen(function* () {
       FROM projection_turn_starts
       WHERE thread_id = ${threadId} AND turn_id = ${turnId} AND state = 'accepted'
       ORDER BY requested_at ASC, message_id ASC
+      LIMIT 1
+    `,
+  });
+  const getOutcomeRow = SqlSchema.findOneOption({
+    Request: GetProjectionTurnStartByMessageIdInput,
+    Result: ProjectionTurnStartOutcomeDbRow,
+    execute: ({ threadId, messageId }) => sql`
+      SELECT
+        starts.thread_id AS "threadId",
+        starts.message_id AS "messageId",
+        starts.turn_id AS "turnId",
+        starts.state,
+        starts.source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
+        starts.source_proposed_plan_id AS "sourceProposedPlanId",
+        starts.requested_at AS "requestedAt",
+        starts.resolved_at AS "resolvedAt",
+        CASE WHEN turns.turn_id IS NULL THEN NULL ELSE json_object(
+          'threadId', turns.thread_id,
+          'turnId', turns.turn_id,
+          'assistantMessageId', turns.assistant_message_id,
+          'state', turns.state,
+          'requestedAt', turns.requested_at,
+          'startedAt', turns.started_at,
+          'completedAt', turns.completed_at,
+          'checkpointTurnCount', turns.checkpoint_turn_count,
+          'checkpointRef', turns.checkpoint_ref,
+          'checkpointStatus', turns.checkpoint_status,
+          'checkpointFiles', json(turns.checkpoint_files_json)
+        ) END AS "turn"
+      FROM projection_turn_starts AS starts
+      LEFT JOIN projection_turns AS turns
+        ON turns.thread_id = starts.thread_id
+        AND turns.turn_id = starts.turn_id
+      WHERE starts.thread_id = ${threadId} AND starts.message_id = ${messageId}
       LIMIT 1
     `,
   });
@@ -180,17 +226,15 @@ const make = Effect.gen(function* () {
   const getOutcomeByMessageId: ProjectionTurnStartRepositoryShape["getOutcomeByMessageId"] = (
     input,
   ) =>
-    Effect.gen(function* () {
-      const start = yield* getByMessageId(input);
-      if (Option.isNone(start)) {
-        return Option.none();
-      }
-      const turn =
-        start.value.turnId === null
-          ? Option.none()
-          : yield* turns.getByTurnId({ threadId: input.threadId, turnId: start.value.turnId });
-      return Option.some({ start: start.value, turn: Option.getOrNull(turn) });
-    });
+    getOutcomeRow(input).pipe(
+      Effect.map(Option.map(mapOutcomeRow)),
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionTurnStartRepository.getOutcomeByMessageId:query",
+          "ProjectionTurnStartRepository.getOutcomeByMessageId:decodeRow",
+        ),
+      ),
+    );
   const deleteByThreadId: ProjectionTurnStartRepositoryShape["deleteByThreadId"] = (input) =>
     deleteRows(input).pipe(
       Effect.mapError(

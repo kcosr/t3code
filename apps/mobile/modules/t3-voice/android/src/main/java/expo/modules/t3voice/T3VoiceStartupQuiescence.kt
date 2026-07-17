@@ -4,6 +4,18 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicReference
 
+internal fun CountDownLatch.awaitUninterruptibly() {
+  var interrupted = false
+  while (count > 0) {
+    try {
+      await()
+    } catch (_: InterruptedException) {
+      interrupted = true
+    }
+  }
+  if (interrupted) Thread.currentThread().interrupt()
+}
+
 /** Accounts for startup exactly once, including cancellation while its runnable is still queued. */
 internal class T3VoiceStartupQuiescence(
   private val task: () -> Unit,
@@ -59,15 +71,7 @@ internal class T3VoiceStartupQuiescence(
   }
 
   fun awaitUninterruptibly() {
-    var interrupted = false
-    while (finished.count > 0) {
-      try {
-        finished.await()
-      } catch (_: InterruptedException) {
-        interrupted = true
-      }
-    }
-    if (interrupted) Thread.currentThread().interrupt()
+    finished.awaitUninterruptibly()
   }
 
   internal fun isFinishedForTest(): Boolean = finished.count == 0L

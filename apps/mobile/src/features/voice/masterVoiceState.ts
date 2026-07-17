@@ -1,4 +1,5 @@
 import type {
+  VoiceAudioRoute,
   VoiceRealtimeContext,
   VoiceRealtimeTarget,
   VoiceRuntimeAdapter,
@@ -35,6 +36,46 @@ export interface ActiveMasterVoiceAttachment {
 }
 
 export type MasterVoicePhase = "idle" | "starting" | "active" | "stopping" | "error";
+
+export interface VoiceAudioRoutePickerState {
+  readonly selectingRouteId: VoiceAudioRoute["id"] | null;
+  readonly error: string | null;
+}
+
+export function settleVoiceAudioRoutePickerSelection(
+  current: VoiceAudioRoutePickerState | null,
+  routeId: VoiceAudioRoute["id"],
+  error?: string,
+): VoiceAudioRoutePickerState | null {
+  if (current?.selectingRouteId !== routeId) return current;
+  return {
+    ...current,
+    selectingRouteId: null,
+    ...(error === undefined ? {} : { error }),
+  };
+}
+
+export function reconcileVoiceAudioRoutePickerState(
+  current: VoiceAudioRoutePickerState | null,
+  input: {
+    readonly controlsAvailable: boolean;
+    readonly routes: ReadonlyArray<VoiceAudioRoute> | null;
+  },
+): VoiceAudioRoutePickerState | null {
+  if (current === null) return null;
+  if (!input.controlsAvailable || input.routes === null) return null;
+  const selectingRouteId = current.selectingRouteId;
+  if (selectingRouteId === null) return current;
+  const selected = input.routes.find((route) => route.id === selectingRouteId);
+  if (selected?.selected === true) return { ...current, selectingRouteId: null };
+  if (selected === undefined) {
+    return {
+      selectingRouteId: null,
+      error: "The selected audio route is no longer available.",
+    };
+  }
+  return current;
+}
 
 export interface AdmittedClientActionFocus {
   readonly actionId: VoiceClientActionId;
@@ -76,16 +117,10 @@ export function threadVoiceStartForFocus(
 
 export function canOfferThreadVoiceSwitch(input: {
   readonly composerDraftsReady: boolean;
-  readonly draftText: string;
-  readonly attachmentCount: number;
+  readonly composerContentEmpty: boolean;
   readonly interactionRequired: boolean;
 }): boolean {
-  return (
-    input.composerDraftsReady &&
-    input.draftText.trim().length === 0 &&
-    input.attachmentCount === 0 &&
-    !input.interactionRequired
-  );
+  return input.composerDraftsReady && input.composerContentEmpty && !input.interactionRequired;
 }
 
 export function voiceRuntimeCommandEnvironmentMatches(
@@ -102,25 +137,6 @@ export function voiceRuntimeCommandEnvironmentMatches(
 export interface PendingVoiceRuntimeAttachment<Runtime> {
   readonly runtime: Runtime;
   readonly detach: () => void;
-}
-
-export class VoiceStartAdmission {
-  private running = false;
-
-  get active(): boolean {
-    return this.running;
-  }
-
-  async run(operation: () => Promise<void>): Promise<boolean> {
-    if (this.running) return false;
-    this.running = true;
-    try {
-      await operation();
-      return true;
-    } finally {
-      this.running = false;
-    }
-  }
 }
 
 export interface VoiceConversationBrowserBinding {

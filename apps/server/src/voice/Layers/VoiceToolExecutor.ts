@@ -17,6 +17,7 @@ import {
   type HistoryReadInput as HistoryReadInputType,
   type HistorySearchInput as HistorySearchInputType,
   type HistoryVoiceScope as HistoryVoiceScopeType,
+  type OrchestrationMessageTurnResult,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -47,11 +48,11 @@ import {
   type HistorySearchServiceError,
 } from "../../history/Services/HistorySearchService.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ThreadTurnOutcomeQuery } from "../../orchestration/Services/ThreadTurnOutcomeQuery.ts";
 import {
   ProjectionThreadMessageCursor,
   ProjectionThreadMessageRepository,
 } from "../../persistence/Services/ProjectionThreadMessages.ts";
-import { ProjectionTurnStartRepository } from "../../persistence/Services/ProjectionTurnStarts.ts";
 import {
   type DurableVoiceToolCall,
   VoiceToolCallRepository,
@@ -306,6 +307,54 @@ const boundedText = (text: string, limit: number) => ({
   truncated: text.length > limit,
 });
 
+const waitedTurnState = (result: OrchestrationMessageTurnResult) => {
+  switch (result.state) {
+    case "pending":
+      return { state: "pending", turnId: null } as const;
+    case "running":
+    case "approval-required":
+    case "user-input-required":
+      return { state: result.state, turnId: result.turnId } as const;
+    case "ambiguous":
+      return {
+        state: "failed",
+        turnId: null,
+        assistantMessage: null,
+        ambiguous: true,
+      } as const;
+    case "failed":
+      if (result.turnId === null) {
+        return {
+          state: "failed",
+          turnId: null,
+          assistantMessage: null,
+          ambiguous: false,
+        } as const;
+      }
+      break;
+    case "completed":
+    case "interrupted":
+      break;
+  }
+
+  const assistantMessage =
+    result.assistantMessage === null
+      ? null
+      : (() => {
+          const bounded = boundedText(result.assistantMessage.text, MAX_WAIT_MESSAGE_CHARS);
+          return {
+            ...result.assistantMessage,
+            ...bounded,
+            truncated: result.assistantMessage.truncated || bounded.truncated,
+          };
+        })();
+  return {
+    state: result.state,
+    turnId: result.turnId,
+    assistantMessage,
+  } as const;
+};
+
 const historyErrorOutput = (error: HistorySearchServiceError | VoiceError) => {
   switch (error._tag) {
     case "HistoryInvalidRequestError":
@@ -392,7 +441,7 @@ const mutationOutput = (command: ClientOrchestrationCommand, sequence: number) =
 const make = Effect.gen(function* () {
   const query = yield* ProjectionSnapshotQuery;
   const messages = yield* ProjectionThreadMessageRepository;
-  const turnStarts = yield* ProjectionTurnStartRepository;
+  const turnOutcomes = yield* ThreadTurnOutcomeQuery;
   const dispatcher = yield* ClientCommandDispatcher;
   const history = yield* HistorySearchService;
   const conversations = yield* VoiceConversationService;
@@ -697,96 +746,26 @@ const make = Effect.gen(function* () {
       }
       case "wait_for_thread_turn": {
         const args = yield* parseArguments(WaitForThreadTurnArguments, input);
-        yield* requireThread(args.threadId);
-        const dispatchedMessage = yield* messages.getByMessageId({
-          messageId: args.messageId,
-        });
-        if (
-          Option.isNone(dispatchedMessage) ||
-          dispatchedMessage.value.threadId !== args.threadId ||
-          dispatchedMessage.value.role !== "user"
-        ) {
-          return yield* Effect.fail(
-            voiceError(
+        const readState = Effect.fn("VoiceToolExecutor.readWaitedTurn")(function* () {
+          const lookup = yield* turnOutcomes.getByMessageId({
+            threadId: args.threadId,
+            messageId: args.messageId,
+          });
+          if (lookup.type === "thread-not-found") {
+            return yield* voiceError(
+              "invalid-phase",
+              "tool.thread",
+              `Thread ${args.threadId} was not found`,
+            );
+          }
+          if (lookup.type === "message-not-found") {
+            return yield* voiceError(
               "invalid-phase",
               "tool.wait-for-thread-turn",
               "The dispatched thread message was not found",
-            ),
-          );
-        }
-
-        const readState = Effect.fn("VoiceToolExecutor.readWaitedTurn")(function* () {
-          const [outcome, shell] = yield* Effect.all([
-            turnStarts.getOutcomeByMessageId({
-              threadId: args.threadId,
-              messageId: args.messageId,
-            }),
-            requireThread(args.threadId),
-          ]);
-          if (Option.isNone(outcome) || outcome.value.start.state === "pending") {
-            return { state: "pending", turnId: null } as const;
-          }
-          if (outcome.value.start.state === "failed" || outcome.value.start.state === "ambiguous") {
-            return {
-              state: "failed",
-              turnId: null,
-              assistantMessage: null,
-              ambiguous: outcome.value.start.state === "ambiguous",
-            } as const;
-          }
-          const value = outcome.value.turn;
-          if (value === null) {
-            return {
-              state: "running",
-              turnId: outcome.value.start.turnId,
-            } as const;
-          }
-          if (value.state !== "running") {
-            const assistantMessage =
-              value.assistantMessageId === null
-                ? Option.none()
-                : yield* messages.getByMessageId({
-                    messageId: value.assistantMessageId,
-                  });
-            const assistant = Option.filter(
-              assistantMessage,
-              (message) => message.threadId === args.threadId && message.role === "assistant",
             );
-            if (
-              value.state === "completed" &&
-              value.assistantMessageId !== null &&
-              (Option.isNone(assistant) || assistant.value.isStreaming)
-            ) {
-              return { state: "running", turnId: value.turnId } as const;
-            }
-            const finalAssistant = Option.filter(assistant, (message) => !message.isStreaming);
-            return {
-              state: value.state === "error" ? "failed" : value.state,
-              turnId: value.turnId,
-              assistantMessage: Option.isNone(finalAssistant)
-                ? null
-                : {
-                    messageId: finalAssistant.value.messageId,
-                    ...boundedText(finalAssistant.value.text, MAX_WAIT_MESSAGE_CHARS),
-                    createdAt: finalAssistant.value.createdAt,
-                    updatedAt: finalAssistant.value.updatedAt,
-                  },
-            } as const;
           }
-          const isActiveTurn = value.turnId !== null && shell.latestTurn?.turnId === value.turnId;
-          if (isActiveTurn && shell.hasPendingApprovals) {
-            return {
-              state: "approval-required",
-              turnId: value.turnId,
-            } as const;
-          }
-          if (isActiveTurn && shell.hasPendingUserInput) {
-            return {
-              state: "user-input-required",
-              turnId: value.turnId,
-            } as const;
-          }
-          return { state: value.state, turnId: value.turnId } as const;
+          return waitedTurnState(lookup.result);
         });
 
         type WaitedTurnState = Effect.Success<ReturnType<typeof readState>>;

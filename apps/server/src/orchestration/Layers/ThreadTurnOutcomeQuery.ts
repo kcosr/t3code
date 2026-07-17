@@ -6,9 +6,12 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
+import { ProjectionThreadMessageRepositoryLive } from "../../persistence/Layers/ProjectionThreadMessages.ts";
+import { ProjectionThreadRepositoryLive } from "../../persistence/Layers/ProjectionThreads.ts";
+import { ProjectionTurnStartRepositoryLive } from "../../persistence/Layers/ProjectionTurnStarts.ts";
 import { ProjectionThreadMessageRepository } from "../../persistence/Services/ProjectionThreadMessages.ts";
+import { ProjectionThreadRepository } from "../../persistence/Services/ProjectionThreads.ts";
 import { ProjectionTurnStartRepository } from "../../persistence/Services/ProjectionTurnStarts.ts";
-import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ThreadTurnOutcomeQuery } from "../Services/ThreadTurnOutcomeQuery.ts";
 
 const boundedAssistant = (message: {
@@ -25,19 +28,23 @@ const boundedAssistant = (message: {
 });
 
 const make = Effect.gen(function* () {
-  const snapshots = yield* ProjectionSnapshotQuery;
+  const threads = yield* ProjectionThreadRepository;
   const messages = yield* ProjectionThreadMessageRepository;
   const turnStarts = yield* ProjectionTurnStartRepository;
 
   const getByMessageId: ThreadTurnOutcomeQuery["Service"]["getByMessageId"] = Effect.fn(
     "ThreadTurnOutcomeQuery.getByMessageId",
   )(function* (input) {
-    const [shell, dispatchedMessage, outcome] = yield* Effect.all([
-      snapshots.getThreadShellById(input.threadId),
+    const [thread, dispatchedMessage, outcome] = yield* Effect.all([
+      threads.getById({ threadId: input.threadId }),
       messages.getByMessageId({ messageId: input.messageId }),
       turnStarts.getOutcomeByMessageId(input),
     ]);
-    if (Option.isNone(shell)) {
+    if (
+      Option.isNone(thread) ||
+      thread.value.deletedAt !== null ||
+      thread.value.archivedAt !== null
+    ) {
       return { type: "thread-not-found" } as const;
     }
     if (
@@ -83,11 +90,11 @@ const make = Effect.gen(function* () {
     }
 
     if (turn.state === "running") {
-      const isActiveTurn = shell.value.latestTurn?.turnId === turn.turnId;
-      if (isActiveTurn && shell.value.hasPendingApprovals) {
+      const isActiveTurn = thread.value.latestTurnId === turn.turnId;
+      if (isActiveTurn && thread.value.pendingApprovalCount > 0) {
         return result("approval-required", turn.turnId);
       }
-      if (isActiveTurn && shell.value.hasPendingUserInput) {
+      if (isActiveTurn && thread.value.pendingUserInputCount > 0) {
         return result("user-input-required", turn.turnId);
       }
       return result("running", turn.turnId);
@@ -124,3 +131,13 @@ const make = Effect.gen(function* () {
 });
 
 export const ThreadTurnOutcomeQueryLive = Layer.effect(ThreadTurnOutcomeQuery, make);
+
+export const ThreadTurnOutcomePersistenceLive = Layer.mergeAll(
+  ProjectionThreadRepositoryLive,
+  ProjectionThreadMessageRepositoryLive,
+  ProjectionTurnStartRepositoryLive,
+);
+
+export const ThreadTurnOutcomeQueryConfiguredLive = ThreadTurnOutcomeQueryLive.pipe(
+  Layer.provide(ThreadTurnOutcomePersistenceLive),
+);

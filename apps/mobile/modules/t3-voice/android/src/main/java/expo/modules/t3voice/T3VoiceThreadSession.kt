@@ -246,7 +246,7 @@ internal class T3VoiceThreadSession(
         )
       val segments = T3VoiceSpeechSegmenter.segment(response)
       val id = UUID.randomUUID().toString()
-      val sink = T3VoicePcmStreamSink(id, media::enqueuePlaybackPcm)
+      val sink = T3VoicePcmStreamSink(id, media::enqueueOwnedPlaybackPcm)
       try {
         synchronized(lock) {
           check(active.get()) { "Thread voice session stopped." }

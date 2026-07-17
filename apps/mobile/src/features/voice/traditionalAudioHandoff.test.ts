@@ -6,7 +6,6 @@ import {
   interruptTraditionalAudioForRealtime,
   releaseRecordingForRealtime,
   releasePlaybackForRecording,
-  runExclusiveTraditionalAudioTransition,
   startDictationWithAudioHandoff,
 } from "./traditionalAudioHandoff";
 
@@ -81,26 +80,6 @@ describe("releasePlaybackForRecording", () => {
         timeoutMs: 10,
       }),
     ).rejects.toThrow("timed out");
-  });
-});
-
-describe("runExclusiveTraditionalAudioTransition", () => {
-  it("ignores a second microphone transition while the first is pending", async () => {
-    const lock = { active: false };
-    let finish: (() => void) | undefined;
-    const transition = vi.fn(
-      () =>
-        new Promise<void>((resolve) => {
-          finish = resolve;
-        }),
-    );
-
-    const first = runExclusiveTraditionalAudioTransition(lock, transition);
-    await expect(runExclusiveTraditionalAudioTransition(lock, transition)).resolves.toBe(false);
-    expect(transition).toHaveBeenCalledTimes(1);
-    finish?.();
-    await expect(first).resolves.toBe(true);
-    expect(lock.active).toBe(false);
   });
 });
 

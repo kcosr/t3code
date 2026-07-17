@@ -67,10 +67,10 @@ import { useComposerPathSearch } from "../../state/use-composer-path-search";
 import { mobilePreferencesAtom } from "../../state/preferences";
 import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerCommandPopover";
 import { useComposerDictation } from "../voice/useComposerDictation";
+import { ExclusiveTransition } from "../voice/exclusiveTransition";
 import {
   dictationResumeTransition,
   interruptTraditionalAudioForRealtime,
-  runExclusiveTraditionalAudioTransition,
   startDictationWithAudioHandoff,
 } from "../voice/traditionalAudioHandoff";
 import { useMasterVoice } from "../voice/MasterVoiceProvider";
@@ -333,7 +333,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
         ? runtimeSnapshot.phase
         : "idle";
   const dictationWasActiveRef = useRef(false);
-  const traditionalAudioTransitionLockRef = useRef({ active: false });
+  const audioTransitionRef = useRef(new ExclusiveTransition());
   const canStartAutoListen =
     voiceRuntime.controlsAvailable &&
     props.draftMessage.trim().length === 0 &&
@@ -434,21 +434,18 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   ]);
 
   const toggleDictation = useCallback(async () => {
-    await runExclusiveTraditionalAudioTransition(
-      traditionalAudioTransitionLockRef.current,
-      async () => {
-        if (dictation.phase === "recording" && !nativeRuntimeInUse) {
-          await dictation.stop();
-          return;
-        }
-        await startDictationWithAudioHandoff({
-          stopRealtime: voiceRuntime.stop,
-          interruptPlayback: props.speechPlayback.interrupt,
-          startDictation: async () => (await dictation.start()) !== null,
-          resumePlayback: props.speechPlayback.resumeAfterDictation,
-        });
-      },
-    );
+    await audioTransitionRef.current.run(async () => {
+      if (dictation.phase === "recording" && !nativeRuntimeInUse) {
+        await dictation.stop();
+        return;
+      }
+      await startDictationWithAudioHandoff({
+        stopRealtime: voiceRuntime.stop,
+        interruptPlayback: props.speechPlayback.interrupt,
+        startDictation: async () => (await dictation.start()) !== null,
+        resumePlayback: props.speechPlayback.resumeAfterDictation,
+      });
+    });
   }, [
     dictation.phase,
     dictation.start,
@@ -460,9 +457,8 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   ]);
 
   const toggleAutoListenOperation = useCallback(async () => {
-    await runExclusiveTraditionalAudioTransition(
-      traditionalAudioTransitionLockRef.current,
-      async () => {
+    await audioTransitionRef.current
+      .run(async () => {
         if (autoListenActive) {
           if (runtimeSnapshot.mode === "thread" && runtimeSnapshot.phase === "recording") {
             await voiceRuntime.finishThreadRecording();
@@ -472,8 +468,8 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
           return;
         }
         await voiceRuntime.startThread();
-      },
-    ).catch((cause) => Alert.alert("Thread voice unavailable", String(cause)));
+      })
+      .catch((cause) => Alert.alert("Thread voice unavailable", String(cause)));
   }, [
     autoListenActive,
     runtimeSnapshot,

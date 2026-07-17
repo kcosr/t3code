@@ -1,6 +1,8 @@
 package expo.modules.t3voice
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -188,6 +190,63 @@ class T3VoiceNotificationActionsTest {
     assertEquals(
       listOf(T3VoiceNotificationActionId.STOP),
       T3VoiceNotificationActions.forSnapshot(controller.snapshot()).map { it.id },
+    )
+  }
+
+  @Test
+  fun controlsPresentationSkipsNonVisualReviewUpdatesAndNoOpCommands() {
+    val controller = T3VoiceRuntimeController(NotificationFakeDriver())
+    controller.dispatch(T3VoiceRuntimeCommand.StartThread(threadTarget, settings, session))
+    controller.activateInitialStart(1)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
+    controller.dispatch(T3VoiceRuntimeCommand.FinishThreadUtterance)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingFinalized)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadTranscriptReady("initial transcript"))
+    val reviewId =
+      checkNotNull((controller.snapshot().state as T3VoiceControllerState.Thread).reviewId)
+    val presentations = T3VoiceAndroidControlsPresentationCache()
+
+    assertNotNull(presentations.accept(controller.snapshot()))
+    assertEquals(
+      T3VoiceCommandOutcome.APPLIED,
+      controller.dispatch(
+        T3VoiceRuntimeCommand.UpdateThreadReviewTranscript(1, reviewId, "edited transcript"),
+      ).outcome,
+    )
+    assertNull(presentations.accept(controller.snapshot()))
+
+    assertEquals(
+      T3VoiceCommandOutcome.DUPLICATE,
+      controller.dispatch(
+        T3VoiceRuntimeCommand.UpdateThreadReviewTranscript(1, reviewId, "edited transcript"),
+      ).outcome,
+    )
+    assertNull(presentations.accept(controller.snapshot()))
+
+    assertEquals(
+      T3VoiceCommandOutcome.REJECTED,
+      controller.dispatch(
+        T3VoiceRuntimeCommand.UpdateThreadReviewTranscript(2, reviewId, "stale transcript"),
+      ).outcome,
+    )
+    assertNull(presentations.accept(controller.snapshot()))
+
+    controller.dispatch(T3VoiceRuntimeCommand.UpdateThreadReviewTranscript(1, reviewId, ""))
+    assertNotNull(presentations.accept(controller.snapshot()))
+  }
+
+  @Test
+  fun controlsPresentationRefreshesGenerationFencedActions() {
+    val controller = T3VoiceRuntimeController(NotificationFakeDriver())
+    controller.dispatch(T3VoiceRuntimeCommand.StartRealtime(realtimeTarget, session))
+    val snapshot = controller.snapshot()
+    val presentations = T3VoiceAndroidControlsPresentationCache()
+
+    assertNotNull(presentations.accept(snapshot))
+    assertNotNull(
+      presentations.accept(
+        snapshot.copy(generation = snapshot.generation + 1, sequence = snapshot.sequence + 1),
+      ),
     )
   }
 }
