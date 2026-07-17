@@ -3,9 +3,64 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import {
   acknowledgeClientActionWithRetry,
   clientActionAcknowledgementInput,
+  executeThreadActivation,
+  type ClientActionAcknowledgementInput,
 } from "./clientActionAcknowledgement";
 
 describe("client action acknowledgement", () => {
+  it("reserves focus ordering before acknowledging navigation", async () => {
+    const order: Array<string> = [];
+
+    await executeThreadActivation({
+      navigate: () => order.push("navigate"),
+      updateFocus: async () => {
+        order.push("focus");
+      },
+      acknowledge: async (outcome) => {
+        order.push(`ack:${outcome}`);
+      },
+      errorMessage: String,
+    });
+
+    expect(order).toEqual(["navigate", "focus", "ack:succeeded"]);
+  });
+
+  it("acknowledges a failed activation when navigation fails", async () => {
+    const acknowledgements: Array<ClientActionAcknowledgementInput> = [];
+
+    await executeThreadActivation({
+      navigate: () => {
+        throw new Error("navigation unavailable");
+      },
+      updateFocus: async () => undefined,
+      acknowledge: async (outcome, message) => {
+        acknowledgements.push(clientActionAcknowledgementInput(outcome, message));
+      },
+      errorMessage: (cause) => (cause instanceof Error ? cause.message : String(cause)),
+    });
+
+    expect(acknowledgements).toEqual([{ outcome: "failed", message: "navigation unavailable" }]);
+  });
+
+  it("does not reverse a navigation acknowledgement when later focus sync fails", async () => {
+    const acknowledgements: Array<ClientActionAcknowledgementInput> = [];
+
+    await expect(
+      executeThreadActivation({
+        navigate: () => undefined,
+        updateFocus: async () => {
+          throw new Error("focus unavailable");
+        },
+        acknowledge: async (outcome, message) => {
+          acknowledgements.push(clientActionAcknowledgementInput(outcome, message));
+        },
+        errorMessage: (cause) => (cause instanceof Error ? cause.message : String(cause)),
+      }),
+    ).rejects.toThrow("focus unavailable");
+
+    expect(acknowledgements).toEqual([{ outcome: "succeeded" }]);
+  });
+
   it("attempts once when the server deadline is already past on the client clock", async () => {
     const acknowledge = vi.fn(async () => undefined);
 

@@ -29,11 +29,13 @@ import { useNavigation } from "@react-navigation/native";
 
 import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import { uuidv4 } from "../../lib/uuid";
+import { useThreadShells } from "../../state/entities";
 import { usePreparedConnection } from "../../state/session";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import {
   acknowledgeClientActionWithRetry,
   clientActionAcknowledgementInput,
+  executeThreadActivation,
 } from "./clientActionAcknowledgement";
 import {
   MasterVoiceCallBar,
@@ -51,6 +53,7 @@ import {
   newVoiceConversationSelection,
   reconcileMasterVoiceFocus,
   resumeVoiceConversationSelection,
+  VoiceFocusUpdateQueue,
   type ActiveMasterVoiceAttachment,
   type MasterVoiceFocus,
 } from "./masterVoiceState";
@@ -142,6 +145,7 @@ export function MasterVoiceProvider(props: {
   const navigation = useNavigation();
   const native = getT3VoiceNativeModule();
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
+  const threadShells = useThreadShells();
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
   const [snapshot, setSnapshot] = useState(INITIAL_SNAPSHOT);
   const [attachment, setAttachment] = useState<ActiveMasterVoiceAttachment | null>(null);
@@ -157,10 +161,10 @@ export function MasterVoiceProvider(props: {
   const runtimeRef = useRef<MasterVoiceRuntime | null>(null);
   const startInFlightRef = useRef(false);
   const resumeInFlightRef = useRef(false);
-  const focusUpdateGenerationRef = useRef(0);
-  const focusUpdateTailRef = useRef(Promise.resolve());
+  const focusUpdateQueueRef = useRef(new VoiceFocusUpdateQueue());
   const attachmentRef = useRef(attachment);
   const focusRef = useRef(props.focus);
+  const threadShellsRef = useRef(threadShells);
   const pendingClientActionsRef = useRef(
     new Map<string, Extract<VoiceSessionEvent, { readonly type: "client-action" }>>(),
   );
@@ -169,6 +173,7 @@ export function MasterVoiceProvider(props: {
   );
   attachmentRef.current = attachment;
   focusRef.current = props.focus;
+  threadShellsRef.current = threadShells;
 
   const preferences = Option.getOrNull(AsyncResult.value(preferencesResult));
   const preferredAudioRouteId = preferences?.voiceAudioRouteId ?? null;
@@ -206,6 +211,24 @@ export function MasterVoiceProvider(props: {
       });
       pendingClientActionsRef.current.delete(event.actionId);
     },
+    [],
+  );
+
+  const queueFocusUpdate = useCallback(
+    (runtime: MasterVoiceRuntime, nextAttachment: ActiveMasterVoiceAttachment) =>
+      focusUpdateQueueRef.current.enqueue(
+        async () => {
+          if (runtimeRef.current !== runtime || nextAttachment.focus === null)
+            throw new Error("Voice environment changed during thread activation");
+          await runtime.controller.updateFocus(
+            nextAttachment.focus.projectId,
+            nextAttachment.focus.threadId,
+          );
+          if (runtimeRef.current !== runtime || runtime.controller.getSnapshot().phase !== "active")
+            throw new Error("Voice session ended during thread activation");
+        },
+        () => setAttachment(nextAttachment),
+      ),
     [],
   );
 
@@ -251,25 +274,42 @@ export function MasterVoiceProvider(props: {
             void acknowledgeClientAction(event, "succeeded");
             continue;
           }
-          try {
-            setBrowserVisible(false);
-            setTranscriptVisible(false);
-            const runtimeEnvironmentId = runtimeRef.current?.environmentId;
-            if (runtimeEnvironmentId === undefined) {
-              void acknowledgeClientAction(event, "failed", "Voice environment is unavailable");
-              continue;
-            }
-            navigation.navigate("Thread", {
-              environmentId: String(runtimeEnvironmentId),
-              threadId: String(event.threadId),
-            });
-          } catch (cause) {
-            void acknowledgeClientAction(event, "failed", errorMessage(cause));
+          setBrowserVisible(false);
+          setTranscriptVisible(false);
+          const runtime = runtimeRef.current;
+          if (runtime === null) {
+            void acknowledgeClientAction(event, "failed", "Voice environment is unavailable");
+            continue;
           }
+          void executeThreadActivation({
+            navigate: () =>
+              navigation.navigate("Thread", {
+                environmentId: String(runtime.environmentId),
+                threadId: String(event.threadId),
+              }),
+            updateFocus: async () => {
+              const threadTitle =
+                threadShellsRef.current.find(
+                  (thread) =>
+                    thread.environmentId === runtime.environmentId && thread.id === event.threadId,
+                )?.title ?? "Thread";
+              await queueFocusUpdate(runtime, {
+                environmentId: runtime.environmentId,
+                focus: {
+                  environmentId: runtime.environmentId,
+                  projectId: event.projectId,
+                  threadId: event.threadId,
+                  threadTitle,
+                },
+              });
+            },
+            acknowledge: (outcome, message) => acknowledgeClientAction(event, outcome, message),
+            errorMessage,
+          }).catch(() => undefined);
         }
       }
     },
-    [acknowledgeClientAction, navigation],
+    [acknowledgeClientAction, navigation, queueFocusUpdate],
   );
 
   useEffect(() => {
@@ -387,30 +427,22 @@ export function MasterVoiceProvider(props: {
     const current = attachmentRef.current;
     const reconciliation = reconcileMasterVoiceFocus(current, props.focus);
     if (reconciliation.type === "stop") {
-      focusUpdateGenerationRef.current += 1;
+      focusUpdateQueueRef.current.invalidate();
       void runtimeRef.current?.controller.stop();
+      return;
+    }
+    if (reconciliation.type === "refresh") {
+      setAttachment(reconciliation.attachment);
       return;
     }
     if (reconciliation.type !== "update") return;
 
-    const generation = ++focusUpdateGenerationRef.current;
     const runtime = runtimeRef.current;
     const nextAttachment = reconciliation.attachment;
     if (runtime === null || runtime.environmentId !== nextAttachment.environmentId) return;
-    focusUpdateTailRef.current = focusUpdateTailRef.current
-      .then(async () => {
-        if (generation !== focusUpdateGenerationRef.current) return;
-        await runtime.controller.updateFocus(
-          nextAttachment.focus!.projectId,
-          nextAttachment.focus!.threadId,
-        );
-        if (
-          generation !== focusUpdateGenerationRef.current ||
-          runtimeRef.current !== runtime ||
-          runtime.controller.getSnapshot().phase !== "active"
-        )
-          return;
-        setAttachment(nextAttachment);
+    void queueFocusUpdate(runtime, nextAttachment)
+      .then(async (committed) => {
+        if (!committed) return;
         const actions = [...pendingClientActionsRef.current.values()].filter(
           (candidate) =>
             candidate.projectId === nextAttachment.focus?.projectId &&
@@ -419,7 +451,7 @@ export function MasterVoiceProvider(props: {
         await Promise.all(actions.map((action) => acknowledgeClientAction(action, "succeeded")));
       })
       .catch(async (cause) => {
-        if (generation !== focusUpdateGenerationRef.current) return;
+        if (runtimeRef.current !== runtime) return;
         const actions = [...pendingClientActionsRef.current.values()].filter(
           (candidate) =>
             candidate.projectId === nextAttachment.focus?.projectId &&
@@ -434,7 +466,7 @@ export function MasterVoiceProvider(props: {
           `Could not update thread focus. ${errorMessage(cause)}`,
         );
       });
-  }, [acknowledgeClientAction, props.focus]);
+  }, [acknowledgeClientAction, props.focus, queueFocusUpdate]);
 
   const interruptTraditionalAudio = useCallback(async () => {
     const releases: Array<void | (() => void)> = [];
