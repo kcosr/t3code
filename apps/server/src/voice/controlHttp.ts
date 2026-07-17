@@ -126,6 +126,8 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
               failEnvironmentInternal("native_voice_session_issuance_failed", cause),
             ),
             Effect.catchTags({
+              NativeVoiceParentSessionInactiveError: () =>
+                failEnvironmentOperationForbidden("native_voice_parent_session_inactive"),
               NativeVoiceSessionReissuanceNotAllowedError: () =>
                 failEnvironmentOperationForbidden("native_voice_session_reissuance_not_allowed"),
               NativeVoiceSessionScopeRequiredError: (error) =>

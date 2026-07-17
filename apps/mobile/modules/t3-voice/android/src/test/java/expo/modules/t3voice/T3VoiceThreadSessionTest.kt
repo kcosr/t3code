@@ -182,6 +182,46 @@ internal class T3VoiceThreadSessionTest {
   }
 
   @Test
+  fun `response callback can start playback after response HTTP ownership is released`() {
+    val media = GenerationAwareMedia()
+    val api = CompletedResponseApi(providePcm = true)
+    val submitted = CountDownLatch(1)
+    val responseReady = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    val playbackAdmittedDuringCallback = AtomicBoolean(false)
+    lateinit var voice: T3VoiceThreadSession
+    voice =
+      session(
+        generation = 1,
+        media = media,
+        api = api,
+        emit = { callback ->
+          when (callback) {
+            T3VoiceRuntimeCallback.ThreadSubmitted -> submitted.countDown()
+            is T3VoiceRuntimeCallback.ThreadResponseReady -> {
+              voice.startPlayback()
+              playbackAdmittedDuringCallback.set(api.ticketCreated.await(1, TimeUnit.SECONDS))
+              responseReady.countDown()
+            }
+            else -> Unit
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    voice.submitTranscript("hello")
+    assertTrue(submitted.await(1, TimeUnit.SECONDS))
+    voice.waitForResponse()
+
+    assertTrue(responseReady.await(2, TimeUnit.SECONDS))
+    assertTrue(playbackAdmittedDuringCallback.get())
+    assertTrue(media.playbackPrepared.await(1, TimeUnit.SECONDS))
+
+    voice.stop(reportStopped = false)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
   fun `permanent playback focus loss cancels blocked synthesis without queued continuation`() {
     val media = BlockingSynthesisMedia()
     val api = BlockingSynthesisApi()
@@ -727,12 +767,16 @@ internal class T3VoiceThreadSessionTest {
     private val providePcm: Boolean = false,
   ) : T3VoiceThreadSessionApi {
     val synthesisCount = AtomicInteger(0)
+    val ticketCreated = CountDownLatch(1)
 
     override fun createMediaTicket(
       calls: T3VoiceHttpCallRegistry,
       operation: T3VoiceMediaOperation,
       requestId: String,
-    ) = T3VoiceMediaTicket("ticket", "2099-01-01T00:00:00Z")
+    ): T3VoiceMediaTicket {
+      ticketCreated.countDown()
+      return T3VoiceMediaTicket("ticket", "2099-01-01T00:00:00Z")
+    }
 
     override fun transcribe(
       calls: T3VoiceHttpCallRegistry,
@@ -980,6 +1024,12 @@ internal class T3VoiceThreadSessionTest {
             environmentId = "environment-a",
             projectId = "project-a",
             threadId = "thread-a",
+            modelSelection =
+              T3VoiceModelSelection(
+                instanceId = "codex",
+                model = "gpt-5.4",
+                options = null,
+              ),
             runtimeMode = T3VoiceThreadRuntimeMode.FULL_ACCESS,
             interactionMode = T3VoiceThreadInteractionMode.DEFAULT,
           ),

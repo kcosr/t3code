@@ -73,6 +73,7 @@ class T3VoiceRuntimeLifecyclePolicyTest {
   fun failedSnapshotRetainsForegroundWithoutHoldingAWakeLockUntilExplicitStop() {
     val failed =
       T3VoiceControllerState.Failed(
+        environmentId = "environment-a",
         operation = T3VoiceOperation.THREAD,
         failure = T3VoiceFailure("failed", "Voice stopped.", recoverable = true),
       )
@@ -216,6 +217,12 @@ class T3VoiceRuntimeLifecyclePolicyTest {
       environmentId = "environment-a",
       projectId = "project-a",
       threadId = "thread-a",
+      modelSelection =
+        T3VoiceModelSelection(
+          instanceId = "codex",
+          model = "gpt-5.4",
+          options = null,
+        ),
       runtimeMode = T3VoiceThreadRuntimeMode.FULL_ACCESS,
       interactionMode = T3VoiceThreadInteractionMode.DEFAULT,
     )

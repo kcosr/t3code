@@ -19,11 +19,17 @@ export class NativeVoiceSessionReissuanceNotAllowedError extends Schema.TaggedEr
   {},
 ) {}
 
+export class NativeVoiceParentSessionInactiveError extends Schema.TaggedErrorClass<NativeVoiceParentSessionInactiveError>()(
+  "NativeVoiceParentSessionInactiveError",
+  {},
+) {}
+
 export interface NativeVoiceSessionIssuerShape {
   readonly issue: (
     parent: EnvironmentSessionPrincipalShape,
   ) => Effect.Effect<
     VoiceNativeSessionCredential,
+    | NativeVoiceParentSessionInactiveError
     | NativeVoiceSessionReissuanceNotAllowedError
     | NativeVoiceSessionScopeRequiredError
     | SessionCredentialInternalError

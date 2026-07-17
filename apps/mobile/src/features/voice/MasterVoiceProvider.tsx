@@ -1,5 +1,6 @@
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { useNavigation } from "@react-navigation/native";
+import type { PreparedConnection } from "@t3tools/client-runtime/connection";
 import type {
   VoiceAudioRoute,
   VoiceHttpClient,
@@ -37,8 +38,8 @@ import { scopedThreadKey } from "../../lib/scopedEntities";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import { usePreparedConnection } from "../../state/session";
 import {
-  ensureComposerDraftsLoaded,
   useComposerDraftContentEmpty,
+  useComposerDraftsReady,
 } from "../../state/use-composer-drafts";
 import { makeAndroidVoiceRuntimeAdapter } from "./androidVoiceRuntimeAdapter";
 import { ExclusiveTransition } from "./exclusiveTransition";
@@ -55,12 +56,14 @@ import {
   bindVoiceConversationBrowser,
   canOfferThreadVoiceSwitch,
   durableVoiceConversations,
+  isThreadVoiceStartAvailable,
   masterVoiceEnvironmentId,
   newVoiceConversationSelection,
   prepareVoiceRuntimeAttachment,
   reconcileVoiceAudioRoutePickerState,
   resumeVoiceConversationSelection,
   settleVoiceAudioRoutePickerSelection,
+  stopVoiceRuntimeStrict,
   threadVoiceStartForFocus,
   voiceRuntimeCommandEnvironmentMatches,
   voiceRuntimePresentationPhase,
@@ -72,7 +75,7 @@ import {
   type VoiceAudioRoutePickerState,
 } from "./masterVoiceState";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
-import { loadVoiceCapabilities } from "./useVoiceCapabilityAvailability";
+import { useVoiceCapabilityAvailability } from "./useVoiceCapabilityAvailability";
 import { resolveVoicePreferences } from "./voicePreferences";
 import {
   threadTranscriptSubmissionDisposition,
@@ -96,6 +99,7 @@ interface MasterVoiceContextValue {
   readonly phase: MasterVoicePhase;
   readonly snapshot: VoiceRuntimeSnapshot;
   readonly controlsAvailable: boolean;
+  readonly threadStartAvailable: boolean;
   readonly startThread: () => Promise<void>;
   readonly finishThreadRecording: () => Promise<void>;
   readonly updateThreadReviewTranscript: (input: {
@@ -177,12 +181,10 @@ export function MasterVoiceProvider(props: {
   const [subscribedEnvironmentId, setSubscribedEnvironmentId] = useState<EnvironmentId | null>(
     null,
   );
-  const [realtimeAvailable, setRealtimeAvailable] = useState(false);
   const [browserVisible, setBrowserVisible] = useState(false);
   const [audioRoutePicker, setAudioRoutePicker] = useState<VoiceAudioRoutePickerState | null>(null);
   const [transcriptVisible, setTranscriptVisible] = useState(false);
   const [resumePending, setResumePending] = useState(false);
-  const [composerDraftsReady, setComposerDraftsReady] = useState(false);
   const runtimeRef = useRef<NativeRuntimeConnection | null>(null);
   const controllerEnvironmentIdRef = useRef<EnvironmentId | null>(null);
   const snapshotRef = useRef(snapshot);
@@ -199,6 +201,7 @@ export function MasterVoiceProvider(props: {
   );
 
   const storedPreferences = Option.getOrNull(AsyncResult.value(preferencesResult));
+  const preferencesReady = AsyncResult.isSuccess(preferencesResult);
   const voicePreferences = useMemo(
     () => resolveVoicePreferences(storedPreferences ?? {}),
     [storedPreferences],
@@ -206,15 +209,7 @@ export function MasterVoiceProvider(props: {
   const preferredAudioRouteId = storedPreferences?.voiceAudioRouteId ?? null;
   const playThreadResponses = storedPreferences?.threadSpeechEnabled === true;
 
-  useEffect(() => {
-    let disposed = false;
-    void ensureComposerDraftsLoaded().then(() => {
-      if (!disposed) setComposerDraftsReady(true);
-    });
-    return () => {
-      disposed = true;
-    };
-  }, []);
+  const composerDraftsReady = useComposerDraftsReady();
 
   const acceptSnapshot = useCallback((next: VoiceRuntimeSnapshot) => {
     if (next.sequence < snapshotRef.current.sequence) return;
@@ -252,6 +247,9 @@ export function MasterVoiceProvider(props: {
   const controlsAvailable =
     controllerEnvironmentId !== null && subscribedEnvironmentId === controllerEnvironmentId;
   const prepared = Option.getOrNull(usePreparedConnection(controllerEnvironmentId));
+  const preparedRef = useRef<PreparedConnection | null>(prepared);
+  preparedRef.current = prepared;
+  const realtimeAvailable = useVoiceCapabilityAvailability(prepared, "agent.realtime");
   const browserConnection =
     conversationConnection?.environmentId === controllerEnvironmentId
       ? conversationConnection
@@ -261,37 +259,31 @@ export function MasterVoiceProvider(props: {
   useEffect(() => {
     let disposed = false;
     setConversationConnection(null);
-    setRealtimeAvailable(false);
     if (controllerEnvironmentId === null || prepared === null) return;
 
-    void (async () => {
-      const client = await makeMobileVoiceClient(prepared);
-      if (disposed) return;
-      setConversationConnection({ environmentId: controllerEnvironmentId, client });
-      const capabilities = await loadVoiceCapabilities(prepared, {
-        load: () => Effect.runPromise(client.capabilities()),
-      });
-      if (disposed) return;
-      setRealtimeAvailable(
-        capabilities.capabilities.some(
-          (capability) =>
-            capability.capability === "agent.realtime" && capability.state === "ready",
-        ),
-      );
-    })().catch(() => {
-      if (!disposed) setRealtimeAvailable(false);
-    });
+    void makeMobileVoiceClient(prepared)
+      .then((client) => {
+        if (!disposed)
+          setConversationConnection({ environmentId: controllerEnvironmentId, client });
+      })
+      .catch(() => undefined);
 
     return () => {
       disposed = true;
       setConversationConnection(null);
-      setRealtimeAvailable(false);
     };
   }, [controllerEnvironmentId, prepared]);
 
   useEffect(() => {
-    if (controllerEnvironmentId === null || native === null || prepared === null) return;
-    const adapter = makeAndroidVoiceRuntimeAdapter({ native, prepared });
+    if (controllerEnvironmentId === null || native === null) return;
+    const adapter = makeAndroidVoiceRuntimeAdapter({
+      native,
+      environmentId: controllerEnvironmentId,
+      getPrepared: () => {
+        const current = preparedRef.current;
+        return current?.environmentId === controllerEnvironmentId ? current : null;
+      },
+    });
     const runtime = { environmentId: controllerEnvironmentId, adapter };
     let disposed = false;
     let detach: (() => void) | null = null;
@@ -321,7 +313,7 @@ export function MasterVoiceProvider(props: {
       setSubscribedEnvironmentId(null);
       if (runtimeRef.current === runtime) runtimeRef.current = null;
     };
-  }, [acceptSnapshot, controllerEnvironmentId, native, prepared]);
+  }, [acceptSnapshot, controllerEnvironmentId, native]);
 
   useEffect(() => {
     if (snapshot.mode !== "realtime") {
@@ -336,9 +328,11 @@ export function MasterVoiceProvider(props: {
       : scopedThreadKey(visibleFocus.environmentId, visibleFocus.threadId);
   const composerContentEmpty = useComposerDraftContentEmpty(visibleDraftKey);
   const canSwitchRealtimeToThread = canOfferThreadVoiceSwitch({
+    preferencesReady,
     composerDraftsReady,
     composerContentEmpty,
     interactionRequired: visibleFocus?.interactionRequired ?? false,
+    activeThreadBusy: visibleFocus?.activeThreadBusy ?? true,
   });
   const threadSwitch = useMemo(
     () =>
@@ -357,6 +351,8 @@ export function MasterVoiceProvider(props: {
     }),
     [threadSwitch, visibleFocus],
   );
+  const threadStartAvailable =
+    threadSwitch !== null && isThreadVoiceStartAvailable(snapshot, prepared !== null);
   const realtimeContextKey = JSON.stringify(realtimeContext);
   const nativeRealtimeContextKey =
     snapshot.mode === "realtime"
@@ -830,16 +826,7 @@ export function MasterVoiceProvider(props: {
   );
 
   const stop = useCallback(async () => {
-    const runtime = runtimeRef.current;
-    if (runtime === null) {
-      Alert.alert("Voice controls unavailable", "Voice is still reconnecting to Android.");
-      return;
-    }
-    try {
-      await runtime.adapter.stop();
-    } catch (cause) {
-      Alert.alert("Could not stop voice", errorMessage(cause));
-    }
+    await stopVoiceRuntimeStrict(runtimeRef.current);
   }, []);
 
   const registerTraditionalAudioInterruption = useCallback(
@@ -925,17 +912,23 @@ export function MasterVoiceProvider(props: {
     const shell = threadShells.find(
       (thread) => thread.environmentId === environmentId && thread.id === focus.threadId,
     );
+    if (shell === undefined) return { environmentId, focus: null };
+    const threadTarget =
+      snapshot.mode === "realtime" ? snapshot.target.threadSwitch?.target : snapshot.target;
     return {
       environmentId,
       focus: {
         environmentId,
         projectId: focus.projectId,
         threadId: focus.threadId,
-        threadTitle: shell?.title ?? "Thread",
-        runtimeMode: shell?.runtimeMode ?? "approval-required",
-        interactionMode: shell?.interactionMode ?? "default",
+        threadTitle: shell.title,
+        modelSelection: threadTarget?.modelSelection ?? shell.modelSelection,
+        runtimeMode: threadTarget?.runtimeMode ?? shell.runtimeMode,
+        interactionMode: threadTarget?.interactionMode ?? shell.interactionMode ?? "default",
         interactionRequired:
-          shell?.hasPendingApprovals === true || shell?.hasPendingUserInput === true,
+          shell.hasPendingApprovals === true || shell.hasPendingUserInput === true,
+        activeThreadBusy:
+          shell.session?.status === "starting" || shell.session?.status === "running",
       },
     };
   }, [snapshot, threadShells]);
@@ -953,6 +946,7 @@ export function MasterVoiceProvider(props: {
       phase,
       snapshot,
       controlsAvailable,
+      threadStartAvailable,
       startThread,
       finishThreadRecording,
       updateThreadReviewTranscript,
@@ -969,6 +963,7 @@ export function MasterVoiceProvider(props: {
       startThread,
       stop,
       submitThreadTranscript,
+      threadStartAvailable,
       updateThreadReviewTranscript,
     ],
   );
@@ -1003,7 +998,9 @@ export function MasterVoiceProvider(props: {
           onHistory={() => {
             if (snapshot.mode === "idle") setBrowserVisible(true);
           }}
-          onStop={() => void stop()}
+          onStop={() => {
+            void stop().catch((cause) => Alert.alert("Could not stop voice", errorMessage(cause)));
+          }}
         />
       </View>
       {browserConnection !== null && browserBinding !== null ? (

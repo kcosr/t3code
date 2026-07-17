@@ -120,6 +120,7 @@ export type EnvironmentAuthInvalidReason = typeof EnvironmentAuthInvalidReason.T
 
 export const EnvironmentOperationForbiddenReason = Schema.Literals([
   "current_session_revoke_not_allowed",
+  "native_voice_parent_session_inactive",
   "native_voice_session_reissuance_not_allowed",
 ]);
 export type EnvironmentOperationForbiddenReason = typeof EnvironmentOperationForbiddenReason.Type;
@@ -424,6 +425,7 @@ const EnvironmentOrchestrationDispatchErrors = [
 
 export interface EnvironmentSessionPrincipalShape {
   readonly sessionId: AuthSessionId;
+  readonly parentSessionId?: AuthSessionId;
   readonly subject: string;
   readonly method: ServerAuthSessionMethod;
   readonly scopes: ReadonlySet<AuthEnvironmentScope>;

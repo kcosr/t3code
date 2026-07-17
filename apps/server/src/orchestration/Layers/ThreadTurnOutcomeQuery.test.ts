@@ -2,8 +2,6 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   MessageId,
   ORCHESTRATION_MESSAGE_TURN_ASSISTANT_MAX_CHARS,
-  ProjectId,
-  ProviderInstanceId,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -12,23 +10,13 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
 import {
-  ProjectionThreadMessageRepository,
-  type ProjectionThreadMessage,
-} from "../../persistence/Services/ProjectionThreadMessages.ts";
-import {
-  ProjectionThreadRepository,
-  type ProjectionThread,
-} from "../../persistence/Services/ProjectionThreads.ts";
-import {
-  ProjectionTurnStartRepository,
-  type ProjectionTurnStartOutcome,
-  type ProjectionTurnStartState,
-} from "../../persistence/Services/ProjectionTurnStarts.ts";
-import type { ProjectionTurnState } from "../../persistence/Services/ProjectionTurns.ts";
+  ProjectionThreadTurnOutcomeRepository,
+  type ProjectionSettledAssistant,
+  type ProjectionThreadTurnOutcome,
+} from "../../persistence/Services/ProjectionThreadTurnOutcomes.ts";
 import { ThreadTurnOutcomeQuery } from "../Services/ThreadTurnOutcomeQuery.ts";
 import { ThreadTurnOutcomeQueryLive } from "./ThreadTurnOutcomeQuery.ts";
 
-const projectId = ProjectId.make("project-one");
 const threadId = ThreadId.make("thread-one");
 const messageId = MessageId.make("message-one");
 const assistantMessageId = MessageId.make("assistant-one");
@@ -36,125 +24,64 @@ const turnId = TurnId.make("turn-one");
 const otherTurnId = TurnId.make("turn-other");
 const now = "2026-07-16T12:00:00.000Z";
 
-const thread = (input?: {
-  readonly latestTurnId?: TurnId;
+const outcome = (input?: {
+  readonly threadExists?: boolean;
+  readonly messageExists?: boolean;
+  readonly latestTurnId?: TurnId | null;
   readonly approvals?: boolean;
   readonly userInput?: boolean;
-}): ProjectionThread => ({
-  threadId,
-  projectId,
-  title: "Voice thread",
-  modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-test" },
-  runtimeMode: "full-access",
-  interactionMode: "default",
-  branch: null,
-  worktreePath: null,
-  latestTurnId: input?.latestTurnId ?? turnId,
-  createdAt: now,
-  updatedAt: now,
-  archivedAt: null,
-  latestUserMessageAt: now,
-  pendingApprovalCount: input?.approvals === true ? 1 : 0,
-  pendingUserInputCount: input?.userInput === true ? 1 : 0,
-  hasActionableProposedPlan: 0,
-  deletedAt: null,
-});
-
-const outcome = (input: {
-  readonly startState?: ProjectionTurnStartState;
-  readonly turnState?: ProjectionTurnState;
+  readonly startState?: ProjectionThreadTurnOutcome["startState"];
+  readonly turnState?: ProjectionThreadTurnOutcome["turnState"];
   readonly assistantMessageId?: MessageId | null;
   readonly includeTurn?: boolean;
-}): ProjectionTurnStartOutcome => ({
-  start: {
-    threadId,
-    messageId,
-    turnId: input.startState === "pending" || input.startState === "submitting" ? null : turnId,
-    state: input.startState ?? "accepted",
-    sourceProposedPlanThreadId: null,
-    sourceProposedPlanId: null,
-    requestedAt: now,
-    resolvedAt: input.startState === "pending" ? null : now,
-  },
-  turn:
-    input.includeTurn === false ||
-    (input.startState !== undefined && input.startState !== "accepted")
-      ? null
-      : {
-          threadId,
-          turnId,
-          assistantMessageId: input.assistantMessageId ?? null,
-          state: input.turnState ?? "running",
-          requestedAt: now,
-          startedAt: now,
-          completedAt: input.turnState === "running" ? null : now,
-          checkpointTurnCount: null,
-          checkpointRef: null,
-          checkpointStatus: null,
-          checkpointFiles: [],
-        },
-});
-
-const assistant = (text: string, isStreaming = false): ProjectionThreadMessage => ({
-  messageId: assistantMessageId,
-  threadId,
-  turnId,
-  role: "assistant",
-  text,
-  attachments: [],
-  isStreaming,
-  createdAt: now,
-  updatedAt: now,
-});
-
-const userMessage: ProjectionThreadMessage = {
-  messageId,
-  threadId,
-  turnId: null,
-  role: "user",
-  text: "Run the exact voice turn",
-  attachments: [],
-  isStreaming: false,
-  createdAt: now,
-  updatedAt: now,
+}): ProjectionThreadTurnOutcome => {
+  const startState = input?.startState === undefined ? "accepted" : input.startState;
+  const includeTurn = input?.includeTurn !== false && startState === "accepted";
+  return {
+    threadExists: input?.threadExists ?? true,
+    messageExists: input?.messageExists ?? true,
+    latestTurnId: input?.latestTurnId === undefined ? turnId : input.latestTurnId,
+    pendingApprovalCount: input?.approvals === true ? 1 : 0,
+    pendingUserInputCount: input?.userInput === true ? 1 : 0,
+    startState,
+    turnId: includeTurn ? turnId : null,
+    turnState: includeTurn ? (input?.turnState ?? "running") : null,
+    assistantMessageId: includeTurn ? (input?.assistantMessageId ?? null) : null,
+  };
 };
 
+const assistant = (text: string): ProjectionSettledAssistant => ({
+  messageId: assistantMessageId,
+  text: text.slice(0, ORCHESTRATION_MESSAGE_TURN_ASSISTANT_MAX_CHARS),
+  truncated: text.length > ORCHESTRATION_MESSAGE_TURN_ASSISTANT_MAX_CHARS,
+  createdAt: now,
+  updatedAt: now,
+});
+
 const makeLayer = (input?: {
-  readonly thread?: ProjectionThread | null;
-  readonly outcome?: ProjectionTurnStartOutcome | null;
-  readonly messages?: ReadonlyArray<ProjectionThreadMessage>;
+  readonly threadExists?: boolean;
+  readonly messageExists?: boolean;
+  readonly outcome?: ProjectionThreadTurnOutcome;
+  readonly assistant?: ProjectionSettledAssistant | null;
 }) => {
-  const threads = {
-    getById: ({ threadId: requestedThreadId }: { readonly threadId: ThreadId }) =>
+  const base = input?.outcome ?? outcome({ startState: null, includeTurn: false });
+  const outcomes = ProjectionThreadTurnOutcomeRepository.of({
+    getByMessageId: () =>
+      Effect.succeed({
+        ...base,
+        threadExists: input?.threadExists ?? base.threadExists,
+        messageExists: input?.messageExists ?? base.messageExists,
+      }),
+    getSettledAssistant: () =>
       Effect.succeed(
-        requestedThreadId === threadId && input?.thread !== null
-          ? Option.some(input?.thread ?? thread())
-          : Option.none(),
+        input?.assistant === undefined || input.assistant === null
+          ? Option.none()
+          : Option.some(input.assistant),
       ),
-  } as unknown as ProjectionThreadRepository["Service"];
-  const turnStarts = {
-    getOutcomeByMessageId: () =>
-      Effect.succeed(Option.fromUndefinedOr(input?.outcome ?? undefined)),
-  } as unknown as ProjectionTurnStartRepository["Service"];
-  const messages = {
-    getByMessageId: ({ messageId: requestedMessageId }: { readonly messageId: MessageId }) =>
-      Effect.succeed(
-        Option.fromUndefinedOr(
-          (input?.messages ?? [userMessage]).find(
-            (message) => message.messageId === requestedMessageId,
-          ),
-        ),
-      ),
-  } as unknown as ProjectionThreadMessageRepository["Service"];
+  });
 
   return ThreadTurnOutcomeQueryLive.pipe(
-    Layer.provide(
-      Layer.mergeAll(
-        Layer.succeed(ProjectionThreadRepository, threads),
-        Layer.succeed(ProjectionTurnStartRepository, turnStarts),
-        Layer.succeed(ProjectionThreadMessageRepository, messages),
-      ),
-    ),
+    Layer.provide(Layer.succeed(ProjectionThreadTurnOutcomeRepository, outcomes)),
   );
 };
 
@@ -167,10 +94,10 @@ const load = (layer: ReturnType<typeof makeLayer>) =>
 describe("ThreadTurnOutcomeQuery", () => {
   it.effect("distinguishes missing threads and messages from a pending exact message", () =>
     Effect.gen(function* () {
-      const missing = yield* load(makeLayer({ thread: null }));
+      const missing = yield* load(makeLayer({ threadExists: false }));
       assert.deepStrictEqual(missing, { type: "thread-not-found" });
 
-      const missingMessage = yield* load(makeLayer({ messages: [] }));
+      const missingMessage = yield* load(makeLayer({ messageExists: false }));
       assert.deepStrictEqual(missingMessage, { type: "message-not-found" });
 
       const projectionGap = yield* load(makeLayer());
@@ -214,8 +141,7 @@ describe("ThreadTurnOutcomeQuery", () => {
     Effect.gen(function* () {
       const approval = yield* load(
         makeLayer({
-          thread: thread({ approvals: true }),
-          outcome: outcome({ turnState: "running" }),
+          outcome: outcome({ turnState: "running", approvals: true }),
         }),
       );
       assert.equal(
@@ -225,8 +151,7 @@ describe("ThreadTurnOutcomeQuery", () => {
 
       const userInput = yield* load(
         makeLayer({
-          thread: thread({ userInput: true }),
-          outcome: outcome({ turnState: "running" }),
+          outcome: outcome({ turnState: "running", userInput: true }),
         }),
       );
       assert.equal(
@@ -236,8 +161,7 @@ describe("ThreadTurnOutcomeQuery", () => {
 
       const unrelated = yield* load(
         makeLayer({
-          thread: thread({ latestTurnId: otherTurnId, approvals: true }),
-          outcome: outcome({ turnState: "running" }),
+          outcome: outcome({ turnState: "running", latestTurnId: otherTurnId, approvals: true }),
         }),
       );
       assert.equal(unrelated.type === "found" ? unrelated.result.state : unrelated.type, "running");
@@ -249,7 +173,7 @@ describe("ThreadTurnOutcomeQuery", () => {
       const streaming = yield* load(
         makeLayer({
           outcome: outcome({ turnState: "completed", assistantMessageId }),
-          messages: [userMessage, assistant("partial", true)],
+          assistant: null,
         }),
       );
       assert.equal(streaming.type === "found" ? streaming.result.state : streaming.type, "running");
@@ -258,7 +182,7 @@ describe("ThreadTurnOutcomeQuery", () => {
       const completed = yield* load(
         makeLayer({
           outcome: outcome({ turnState: "completed", assistantMessageId }),
-          messages: [userMessage, assistant(text)],
+          assistant: assistant(text),
         }),
       );
       assert.equal(completed.type, "found");

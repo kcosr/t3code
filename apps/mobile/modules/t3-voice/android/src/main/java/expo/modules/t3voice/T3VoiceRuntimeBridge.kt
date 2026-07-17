@@ -42,6 +42,7 @@ internal fun T3VoiceControllerSnapshot.toBridgeBody(): Map<String, Any?> {
       is T3VoiceControllerState.Failed ->
         mapOf(
           "mode" to "failed",
+          "environmentId" to state.environmentId,
           "operation" to state.operation.bridgeName(),
           "failure" to
             mapOf(
@@ -95,6 +96,7 @@ private fun T3VoiceThreadTarget.toBridgeBody(): Map<String, Any> =
     "environmentId" to environmentId,
     "projectId" to projectId,
     "threadId" to threadId,
+    "modelSelection" to modelSelection.toCanonicalWireBody(),
     "runtimeMode" to runtimeMode.bridgeName(),
     "interactionMode" to interactionMode.name.lowercase(),
   )

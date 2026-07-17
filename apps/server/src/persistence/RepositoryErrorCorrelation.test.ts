@@ -35,6 +35,7 @@ describe("persistence error correlation", () => {
 
       yield* sessions.create({
         sessionId,
+        parentSessionId: null,
         subject,
         scopes,
         method: "browser-session-cookie",
@@ -70,6 +71,7 @@ describe("persistence error correlation", () => {
       const createError = yield* Effect.flip(
         sessions.create({
           sessionId,
+          parentSessionId: null,
           subject,
           scopes,
           method: "browser-session-cookie",

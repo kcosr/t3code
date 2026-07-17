@@ -87,12 +87,13 @@ layer("ProjectionTurnStartRepository", (it) => {
         checkpointFiles: [],
       });
 
-      const first = yield* starts.getOutcomeByMessageId({ threadId, messageId: firstMessageId });
-      const second = yield* starts.getOutcomeByMessageId({ threadId, messageId: secondMessageId });
+      const first = yield* starts.getByMessageId({ threadId, messageId: firstMessageId });
+      const second = yield* starts.getByMessageId({ threadId, messageId: secondMessageId });
+      const projectedTurn = yield* turns.getByTurnId({ threadId, turnId });
       const earliest = yield* starts.getEarliestByTurnId({ threadId, turnId });
-      assert.equal(Option.getOrThrow(first).turn?.turnId, turnId);
-      assert.equal(Option.getOrThrow(second).turn?.turnId, turnId);
-      assert.equal(Option.getOrThrow(first).turn?.state, "completed");
+      assert.equal(Option.getOrThrow(first).turnId, turnId);
+      assert.equal(Option.getOrThrow(second).turnId, turnId);
+      assert.equal(Option.getOrThrow(projectedTurn).state, "completed");
       assert.equal(Option.getOrThrow(earliest).messageId, firstMessageId);
     }),
   );
@@ -133,18 +134,18 @@ layer("ProjectionTurnStartRepository", (it) => {
         "pending",
       );
       const failedOutcome = Option.getOrThrow(
-        yield* starts.getOutcomeByMessageId({ threadId, messageId: failedMessageId }),
+        yield* starts.getByMessageId({ threadId, messageId: failedMessageId }),
       );
       const pendingOutcome = Option.getOrThrow(
-        yield* starts.getOutcomeByMessageId({ threadId, messageId: pendingMessageId }),
+        yield* starts.getByMessageId({ threadId, messageId: pendingMessageId }),
       );
-      assert.equal(failedOutcome.start.state, "failed");
-      assert.isNull(failedOutcome.turn);
-      assert.equal(pendingOutcome.start.state, "pending");
-      assert.isNull(pendingOutcome.turn);
+      assert.equal(failedOutcome.state, "failed");
+      assert.isNull(failedOutcome.turnId);
+      assert.equal(pendingOutcome.state, "pending");
+      assert.isNull(pendingOutcome.turnId);
       assert.isTrue(
         Option.isNone(
-          yield* starts.getOutcomeByMessageId({
+          yield* starts.getByMessageId({
             threadId,
             messageId: MessageId.make("message-missing"),
           }),

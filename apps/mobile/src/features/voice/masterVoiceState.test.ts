@@ -2,6 +2,7 @@ import type { VoiceRuntimeSnapshot } from "@t3tools/client-runtime/voice";
 import {
   EnvironmentId,
   ProjectId,
+  ProviderInstanceId,
   ThreadId,
   VoiceClientActionId,
   VoiceConversationId,
@@ -14,6 +15,7 @@ import {
   bindVoiceConversationBrowser,
   canOfferThreadVoiceSwitch,
   durableVoiceConversations,
+  isThreadVoiceStartAvailable,
   continueVoiceConversationSelection,
   masterVoiceEnvironmentId,
   prepareVoiceRuntimeAttachment,
@@ -22,6 +24,7 @@ import {
   newVoiceConversationTitle,
   resumeVoiceConversationSelection,
   settleVoiceAudioRoutePickerSelection,
+  stopVoiceRuntimeStrict,
   threadVoiceStartForFocus,
   voiceRuntimeCommandEnvironmentMatches,
   voiceRuntimePresentationPhase,
@@ -37,9 +40,11 @@ const focus: MasterVoiceFocus = {
   projectId: ProjectId.make("project-one"),
   threadId: ThreadId.make("thread-one"),
   threadTitle: "Voice work",
+  modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
   runtimeMode: "approval-required",
   interactionMode: "default",
   interactionRequired: false,
+  activeThreadBusy: false,
 };
 
 const conversation = (
@@ -119,18 +124,66 @@ describe("master voice state", () => {
       submission: "auto-submit",
       playResponses: true,
     });
+    expect(continuousSubmit?.target.modelSelection).toEqual(focus.modelSelection);
   });
 
   it("offers notification Thread switching only for a ready, empty, unblocked composer", () => {
     const eligible = {
+      preferencesReady: true,
       composerDraftsReady: true,
       composerContentEmpty: true,
       interactionRequired: false,
+      activeThreadBusy: false,
     };
     expect(canOfferThreadVoiceSwitch(eligible)).toBe(true);
+    expect(canOfferThreadVoiceSwitch({ ...eligible, preferencesReady: false })).toBe(false);
     expect(canOfferThreadVoiceSwitch({ ...eligible, composerDraftsReady: false })).toBe(false);
     expect(canOfferThreadVoiceSwitch({ ...eligible, composerContentEmpty: false })).toBe(false);
     expect(canOfferThreadVoiceSwitch({ ...eligible, interactionRequired: true })).toBe(false);
+    expect(canOfferThreadVoiceSwitch({ ...eligible, activeThreadBusy: true })).toBe(false);
+  });
+
+  it("offers Thread start only from Idle or connected Realtime", () => {
+    const realtime = (phase: "starting" | "connected" | "stopping"): VoiceRuntimeSnapshot => ({
+      mode: "realtime",
+      phase,
+      generation: 2,
+      sequence: 8,
+      target: {
+        environmentId,
+        conversation: { type: "new", retention: "durable", title: "Voice" },
+        focus: null,
+        threadSwitch: null,
+      },
+      muted: false,
+      audioRoutes: [],
+      transcript: [],
+      pendingConfirmations: [],
+      pendingClientActions: [],
+    });
+
+    expect(isThreadVoiceStartAvailable(realtime("connected"), false)).toBe(true);
+    expect(isThreadVoiceStartAvailable(realtime("starting"), true)).toBe(false);
+    expect(isThreadVoiceStartAvailable(realtime("stopping"), true)).toBe(false);
+    expect(isThreadVoiceStartAvailable({ mode: "idle", generation: 3, sequence: 9 }, true)).toBe(
+      true,
+    );
+    expect(isThreadVoiceStartAvailable({ mode: "idle", generation: 3, sequence: 9 }, false)).toBe(
+      false,
+    );
+    expect(
+      isThreadVoiceStartAvailable(
+        {
+          mode: "failed",
+          environmentId,
+          operation: "thread",
+          failure: { code: "failed", message: "Failed", retryable: true },
+          generation: 3,
+          sequence: 9,
+        },
+        true,
+      ),
+    ).toBe(false);
   });
 
   it("keeps route-picker progress across unrelated snapshots and clears it on route selection", () => {
@@ -258,15 +311,40 @@ describe("master voice state", () => {
     expect(
       voiceRuntimePresentationPhase({
         mode: "failed",
+        environmentId,
         operation: "realtime",
         failure: { code: "network", message: "Network failed", retryable: true },
         generation: 2,
         sequence: 9,
       }),
     ).toBe("error");
+    expect(
+      voiceRuntimeSnapshotEnvironmentId({
+        mode: "failed",
+        environmentId,
+        operation: "realtime",
+        failure: { code: "network", message: "Network failed", retryable: true },
+        generation: 2,
+        sequence: 9,
+      }),
+    ).toBe(environmentId);
     expect(voiceRuntimeSnapshotEnvironmentId({ mode: "idle", generation: 3, sequence: 10 })).toBe(
       null,
     );
+  });
+
+  it("propagates stop failures so audio handoffs cannot continue", async () => {
+    await expect(stopVoiceRuntimeStrict(null)).rejects.toThrow(
+      "Native voice controls are unavailable",
+    );
+    const stop = vi.fn(async () => {
+      throw new Error("binder unavailable");
+    });
+
+    await expect(stopVoiceRuntimeStrict({ adapter: { stop } })).rejects.toThrow(
+      "binder unavailable",
+    );
+    expect(stop).toHaveBeenCalledOnce();
   });
 
   it("defers context reconciliation until client-action navigation admits the exact focus", () => {

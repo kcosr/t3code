@@ -35,6 +35,15 @@ internal fun Map<String, *>.optionalBridgeObject(key: String): Map<String, Any?>
   return (value as? Map<*, *>)?.toStringKeyMap(key) ?: error("$key must be an object or null.")
 }
 
+internal fun Map<String, *>.optionalBridgeObjectList(key: String): List<Map<String, Any?>>? {
+  if (!containsKey(key)) return null
+  val values = this[key] as? List<*> ?: error("$key must be an array.")
+  return values.mapIndexed { index, value ->
+    (value as? Map<*, *>)?.toStringKeyMap("$key[$index]")
+      ?: error("$key[$index] must be an object.")
+  }
+}
+
 private fun Map<*, *>.toStringKeyMap(name: String): Map<String, Any?> {
   check(keys.all { it is String }) { "$name must use string field names." }
   @Suppress("UNCHECKED_CAST")

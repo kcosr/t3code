@@ -9,6 +9,7 @@ import type {
 } from "@t3tools/client-runtime/voice";
 import type {
   EnvironmentId,
+  ModelSelection,
   ProjectId,
   ProviderInteractionMode,
   RuntimeMode,
@@ -25,9 +26,11 @@ export interface MasterVoiceFocus {
   readonly projectId: ProjectId;
   readonly threadId: ThreadId;
   readonly threadTitle: string;
+  readonly modelSelection: ModelSelection;
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: ProviderInteractionMode;
   readonly interactionRequired: boolean;
+  readonly activeThreadBusy: boolean;
 }
 
 export interface ActiveMasterVoiceAttachment {
@@ -95,6 +98,7 @@ export function threadVoiceStartForFocus(
       environmentId: focus.environmentId,
       projectId: focus.projectId,
       threadId: focus.threadId,
+      modelSelection: focus.modelSelection,
       runtimeMode: focus.runtimeMode,
       interactionMode: focus.interactionMode,
     },
@@ -116,11 +120,27 @@ export function threadVoiceStartForFocus(
 }
 
 export function canOfferThreadVoiceSwitch(input: {
+  readonly preferencesReady: boolean;
   readonly composerDraftsReady: boolean;
   readonly composerContentEmpty: boolean;
   readonly interactionRequired: boolean;
+  readonly activeThreadBusy: boolean;
 }): boolean {
-  return input.composerDraftsReady && input.composerContentEmpty && !input.interactionRequired;
+  return (
+    input.preferencesReady &&
+    input.composerDraftsReady &&
+    input.composerContentEmpty &&
+    !input.interactionRequired &&
+    !input.activeThreadBusy
+  );
+}
+
+export function isThreadVoiceStartAvailable(
+  snapshot: VoiceRuntimeSnapshot,
+  hasPreparedConnection: boolean,
+): boolean {
+  if (snapshot.mode === "realtime") return snapshot.phase === "connected";
+  return snapshot.mode === "idle" && hasPreparedConnection;
 }
 
 export function voiceRuntimeCommandEnvironmentMatches(
@@ -184,10 +204,18 @@ export function voiceRuntimeSnapshotEnvironmentId(
     case "switching-to-thread":
     case "thread":
       return snapshot.target.environmentId;
-    case "idle":
     case "failed":
+      return snapshot.environmentId;
+    case "idle":
       return null;
   }
+}
+
+export async function stopVoiceRuntimeStrict(
+  runtime: { readonly adapter: Pick<VoiceRuntimeAdapter, "stop"> } | null,
+): Promise<void> {
+  if (runtime === null) throw new Error("Native voice controls are unavailable");
+  await runtime.adapter.stop();
 }
 
 export function voiceRuntimePresentationPhase(snapshot: VoiceRuntimeSnapshot): MasterVoicePhase {

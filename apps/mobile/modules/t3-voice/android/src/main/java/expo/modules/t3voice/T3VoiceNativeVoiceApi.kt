@@ -221,6 +221,7 @@ internal class T3VoiceNativeVoiceApi(
             .put("text", transcript)
             .put("attachments", JSONArray()),
         )
+        .put("modelSelection", JSONObject(target.modelSelection.toCanonicalWireBody()))
         .put("runtimeMode", target.runtimeMode.wireValue())
         .put("interactionMode", target.interactionMode.wireValue())
         .put("createdAt", requireIsoInstant(createdAt, "createdAt"))

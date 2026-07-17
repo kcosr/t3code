@@ -2,10 +2,10 @@ package expo.modules.t3voice
 
 import java.util.ArrayDeque
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -51,7 +51,7 @@ internal class T3VoiceRealtimeSession(
   private val heartbeatExecutor = Executors.newSingleThreadExecutor()
   private val focusExecutor = Executors.newSingleThreadExecutor()
   private val acknowledgementExecutor = Executors.newFixedThreadPool(2)
-  private val activeCalls = ConcurrentHashMap.newKeySet<T3VoiceHttpCallRegistry>()
+  private val activeCalls = mutableSetOf<T3VoiceHttpCallRegistry>()
   private val finalTranscript = ArrayDeque<T3VoiceRealtimeTranscriptTurn>()
   private val confirmationByToolCall = mutableMapOf<String, String>()
   private val actionExpirations =
@@ -318,29 +318,35 @@ internal class T3VoiceRealtimeSession(
 
   private fun offer(server: T3VoiceApiRealtimeSession, offerSdp: String) {
     if (terminal.get()) return
-    startupExecutor.execute {
-      try {
-        val answer = executeCall { calls -> api.offerRealtimeSession(calls, server, offerSdp) }
-        if (terminal.get()) return@execute
-        webRtc.applyAnswer(
-          server.state.sessionId,
-          answer,
-          object : T3VoiceWebRtcResultCallback<Unit> {
-            override fun onSuccess(result: Unit) = Unit
+    try {
+      startupExecutor.execute {
+        try {
+          val answer = executeCall { calls -> api.offerRealtimeSession(calls, server, offerSdp) }
+          if (terminal.get()) return@execute
+          webRtc.applyAnswer(
+            server.state.sessionId,
+            answer,
+            object : T3VoiceWebRtcResultCallback<Unit> {
+              override fun onSuccess(result: Unit) = Unit
 
-            override fun onFailure(code: String, message: String, cause: Throwable?) {
-              fail(
-                cause ?: T3VoiceNativeApiException(code, retryable = true),
-                code,
-                "The Realtime media answer was rejected.",
-              )
-            }
-          },
-        )
-      } catch (cause: Throwable) {
-        if (!terminal.get()) {
-          fail(cause, "realtime-signaling-failed", "Realtime signaling failed.")
+              override fun onFailure(code: String, message: String, cause: Throwable?) {
+                fail(
+                  cause ?: T3VoiceNativeApiException(code, retryable = true),
+                  code,
+                  "The Realtime media answer was rejected.",
+                )
+              }
+            },
+          )
+        } catch (cause: Throwable) {
+          if (!terminal.get()) {
+            fail(cause, "realtime-signaling-failed", "Realtime signaling failed.")
+          }
         }
+      }
+    } catch (cause: RejectedExecutionException) {
+      if (!terminal.get()) {
+        fail(cause, "realtime-signaling-failed", "Realtime signaling failed.")
       }
     }
   }
@@ -563,13 +569,15 @@ internal class T3VoiceRealtimeSession(
   }
 
   private fun <T> executeCall(block: (T3VoiceHttpCallRegistry) -> T): T {
-    check(!terminal.get()) { "Realtime voice session stopped." }
-    val calls = T3VoiceHttpCallRegistry()
-    activeCalls += calls
+    val calls =
+      synchronized(lock) {
+        check(!terminal.get()) { "Realtime voice session stopped." }
+        T3VoiceHttpCallRegistry().also(activeCalls::add)
+      }
     return try {
       block(calls)
     } finally {
-      activeCalls -= calls
+      synchronized(lock) { activeCalls -= calls }
     }
   }
 
@@ -629,6 +637,7 @@ internal class T3VoiceRealtimeSession(
       val publishedServer = synchronized(lock) { serverSession }
       runCatching { publishedServer?.let { webRtc.stop(it.state.sessionId) } }
       audioRouter.stop()
+      awaitLiveExecutors()
       if (publishedServer != null) bestEffortServerClose(publishedServer)
       terminalDeadlineFuture?.cancel(false)
       terminalDeadlineScheduler.shutdownNow()
@@ -686,11 +695,13 @@ internal class T3VoiceRealtimeSession(
   }
 
   private fun cancelLiveWork() {
-    synchronized(lock) {
-      heartbeatFuture?.cancel(false)
-      heartbeatFuture = null
-    }
-    activeCalls.forEach(T3VoiceHttpCallRegistry::cancelAll)
+    val calls =
+      synchronized(lock) {
+        heartbeatFuture?.cancel(false)
+        heartbeatFuture = null
+        activeCalls.toList()
+      }
+    calls.forEach(T3VoiceHttpCallRegistry::cancelAll)
     actionExpirations.clear()
     confirmationExpirations.clear()
   }
@@ -721,6 +732,29 @@ internal class T3VoiceRealtimeSession(
     heartbeatExecutor.shutdownNow()
     focusExecutor.shutdownNow()
     acknowledgementExecutor.shutdownNow()
+  }
+
+  private fun awaitLiveExecutors() {
+    var interrupted = false
+    val executors =
+      listOf(
+        scheduler,
+        startupExecutor,
+        eventExecutor,
+        heartbeatExecutor,
+        focusExecutor,
+        acknowledgementExecutor,
+      )
+    executors.forEach { executor ->
+      while (!executor.isTerminated) {
+        try {
+          executor.awaitTermination(1, TimeUnit.DAYS)
+        } catch (_: InterruptedException) {
+          interrupted = true
+        }
+      }
+    }
+    if (interrupted) Thread.currentThread().interrupt()
   }
 
   private fun sleepControl(delayMs: Long) {

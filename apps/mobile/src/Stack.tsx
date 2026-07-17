@@ -50,8 +50,10 @@ import { SettingsRouteScreen } from "./features/settings/SettingsRouteScreen";
 import { SettingsWaitlistRouteScreen } from "./features/settings/SettingsWaitlistRouteScreen";
 import { SettingsVoiceRouteScreen } from "./features/settings/SettingsVoiceRouteScreen";
 import { MasterVoiceProvider } from "./features/voice/MasterVoiceProvider";
+import { scopedThreadKey } from "./lib/scopedEntities";
 import { nativeHeaderScrollEdgeEffects } from "./native/StackHeader";
 import { useThreadShell } from "./state/entities";
+import { useComposerDraftVoiceSettings } from "./state/use-composer-drafts";
 import { useSavedRemoteConnections } from "./state/use-remote-environment-registry";
 import { useThreadOutboxDrain } from "./state/use-thread-outbox-drain";
 
@@ -287,6 +289,9 @@ function RootStackLayoutContent(props: {
   const workspacePathname = workspacePathFromState(props.state);
   const focusedThreadRef = parseActiveThreadPath(workspacePathname);
   const focusedThread = useThreadShell(focusedThreadRef);
+  const focusedDraftSettings = useComposerDraftVoiceSettings(
+    focusedThread === null ? null : scopedThreadKey(focusedThread.environmentId, focusedThread.id),
+  );
   const { savedConnectionsById } = useSavedRemoteConnections();
   const availableEnvironmentIds = new Set(
     Object.keys(savedConnectionsById) as Array<keyof typeof savedConnectionsById>,
@@ -300,10 +305,15 @@ function RootStackLayoutContent(props: {
           projectId: focusedThread.projectId,
           threadId: focusedThread.id,
           threadTitle: focusedThread.title,
-          runtimeMode: focusedThread.runtimeMode,
-          interactionMode: focusedThread.interactionMode ?? "default",
+          modelSelection: focusedDraftSettings.modelSelection ?? focusedThread.modelSelection,
+          runtimeMode: focusedDraftSettings.runtimeMode ?? focusedThread.runtimeMode,
+          interactionMode:
+            focusedDraftSettings.interactionMode ?? focusedThread.interactionMode ?? "default",
           interactionRequired:
             focusedThread.hasPendingApprovals || focusedThread.hasPendingUserInput,
+          activeThreadBusy:
+            focusedThread.session?.status === "starting" ||
+            focusedThread.session?.status === "running",
         };
   const voiceEnvironmentId =
     voiceFocus?.environmentId ??

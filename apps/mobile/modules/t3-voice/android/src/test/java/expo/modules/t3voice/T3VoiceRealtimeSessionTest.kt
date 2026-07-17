@@ -175,6 +175,50 @@ internal class T3VoiceRealtimeSessionTest {
   }
 
   @Test
+  fun `blocked event lane must exit before Realtime ownership quiesces`() {
+    val api = TestRealtimeApi("session-blocked-events", blockEventsUntilReleased = true)
+    val quiesced = CountDownLatch(1)
+    val session =
+      session(
+        generation = 1,
+        api = api,
+        media = TestRealtimeMedia(),
+        routing = TestAudioRouting(),
+        onQuiesced = { quiesced.countDown() },
+      )
+    session.start()
+    assertTrue(api.eventEntered.await(1, TimeUnit.SECONDS))
+
+    session.close()
+
+    assertFalse(quiesced.await(100, TimeUnit.MILLISECONDS))
+    api.allowEventToReturn.countDown()
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `blocked signaling offer must exit before Realtime ownership quiesces`() {
+    val api = TestRealtimeApi("session-blocked-offer", blockOfferUntilReleased = true)
+    val quiesced = CountDownLatch(1)
+    val session =
+      session(
+        generation = 1,
+        api = api,
+        media = ImmediateOfferRealtimeMedia(),
+        routing = TestAudioRouting(),
+        onQuiesced = { quiesced.countDown() },
+      )
+    session.start()
+    assertTrue(api.offerEntered.await(1, TimeUnit.SECONDS))
+
+    session.close()
+
+    assertFalse(quiesced.await(100, TimeUnit.MILLISECONDS))
+    api.allowOfferToReturn.countDown()
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
   fun `close after peer install fences router reacquisition before startup continues`() {
     val routing = TestAudioRouting()
     val media = InstalledBlockedRealtimeMedia(routing)
@@ -225,10 +269,10 @@ internal class T3VoiceRealtimeSessionTest {
     session.start()
     session.close()
 
-    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+    assertFalse(quiesced.await(100, TimeUnit.MILLISECONDS))
     assertEquals(0, api.createCount.get())
     releaseBlocker.countDown()
-    startupExecutor.shutdownNow()
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
   }
 
   private fun session(
@@ -389,8 +433,41 @@ internal class T3VoiceRealtimeSessionTest {
     fun activeSessionId(): String? = synchronized(lock) { activeSession }
   }
 
-  private class TestRealtimeApi(private val sessionId: String) : T3VoiceRealtimeSessionApi {
+  private class ImmediateOfferRealtimeMedia : T3VoiceRealtimeMedia {
+    override fun cancelStartup(sessionId: String) = Unit
+
+    override fun prepare(
+      sessionId: String,
+      diagnosticGeneration: Long,
+      callback: T3VoiceWebRtcResultCallback<String>,
+    ) {
+      callback.onSuccess("offer")
+    }
+
+    override fun applyAnswer(
+      sessionId: String,
+      answerSdp: String,
+      callback: T3VoiceWebRtcResultCallback<Unit>,
+    ) = Unit
+
+    override fun stop(sessionId: String): Boolean = true
+
+    override fun setMuted(sessionId: String, muted: Boolean) = Unit
+
+    override fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>> =
+      emptyList()
+  }
+
+  private class TestRealtimeApi(
+    private val sessionId: String,
+    private val blockEventsUntilReleased: Boolean = false,
+    private val blockOfferUntilReleased: Boolean = false,
+  ) : T3VoiceRealtimeSessionApi {
     val createCount = AtomicInteger(0)
+    val eventEntered = CountDownLatch(1)
+    val allowEventToReturn = CountDownLatch(1)
+    val offerEntered = CountDownLatch(1)
+    val allowOfferToReturn = CountDownLatch(1)
 
     override fun createRealtimeSession(
       calls: T3VoiceHttpCallRegistry,
@@ -410,7 +487,13 @@ internal class T3VoiceRealtimeSessionTest {
       calls: T3VoiceHttpCallRegistry,
       session: T3VoiceApiRealtimeSession,
       sdp: String,
-    ): String = "answer"
+    ): String {
+      if (blockOfferUntilReleased) {
+        offerEntered.countDown()
+        awaitIgnoringInterrupt(allowOfferToReturn)
+      }
+      return "answer"
+    }
 
     override fun heartbeatRealtimeSession(
       calls: T3VoiceHttpCallRegistry,
@@ -453,6 +536,11 @@ internal class T3VoiceRealtimeSessionTest {
       leaseGeneration: Long,
       afterSequence: Long,
     ): T3VoiceApiRealtimeEvents {
+      if (blockEventsUntilReleased) {
+        eventEntered.countDown()
+        awaitIgnoringInterrupt(allowEventToReturn)
+        return T3VoiceApiRealtimeEvents(state(), emptyList())
+      }
       try {
         Thread.sleep(Long.MAX_VALUE)
       } catch (_: InterruptedException) {

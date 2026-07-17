@@ -61,6 +61,40 @@ export function loadVoiceCapabilities(
   return promise;
 }
 
+export function watchVoiceCapabilities(
+  prepared: PreparedConnection,
+  listener: (capabilities: VoiceCapabilities | null) => void,
+  options: VoiceCapabilityLoadOptions = {},
+): () => void {
+  const refreshIntervalMs = Math.max(1, options.cacheTtlMs ?? CAPABILITY_CACHE_TTL_MS);
+  let disposed = false;
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const scheduleRefresh = () => {
+    refreshTimer = setTimeout(refresh, refreshIntervalMs);
+  };
+  const refresh = () => {
+    void loadVoiceCapabilities(prepared, options).then(
+      (result) => {
+        if (disposed) return;
+        listener(result);
+        scheduleRefresh();
+      },
+      () => {
+        if (disposed) return;
+        listener(null);
+        scheduleRefresh();
+      },
+    );
+  };
+  refresh();
+
+  return () => {
+    disposed = true;
+    if (refreshTimer !== null) clearTimeout(refreshTimer);
+  };
+}
+
 export function useVoiceCapabilityDescriptor(
   prepared: PreparedConnection | null,
   capability: VoiceCapability,
@@ -68,26 +102,20 @@ export function useVoiceCapabilityDescriptor(
   const [descriptor, setDescriptor] = useState<VoiceCapabilityDescriptor | null>(null);
 
   useEffect(() => {
-    let disposed = false;
     setDescriptor(null);
     if (prepared === null) return;
 
-    void loadVoiceCapabilities(prepared)
-      .then((result) => {
-        if (disposed) return;
+    return watchVoiceCapabilities(prepared, (result) => {
+      if (result === null) {
+        setDescriptor(null);
+      } else {
         setDescriptor(
           result.capabilities.find(
             (candidate) => candidate.capability === capability && candidate.state === "ready",
           ) ?? null,
         );
-      })
-      .catch(() => {
-        if (!disposed) setDescriptor(null);
-      });
-
-    return () => {
-      disposed = true;
-    };
+      }
+    });
   }, [capability, prepared]);
 
   return descriptor;

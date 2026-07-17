@@ -11,6 +11,7 @@ import type {
 import {
   EnvironmentId,
   ProjectId,
+  ProviderInstanceId,
   ThreadId,
   VoiceClientActionId,
   VoiceConfirmationId,
@@ -59,6 +60,7 @@ const threadInput: VoiceThreadStartInput = {
     environmentId: ENVIRONMENT_ID,
     projectId: PROJECT_ID,
     threadId: THREAD_ID,
+    modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
     runtimeMode: "approval-required",
     interactionMode: "default",
   },
@@ -85,6 +87,7 @@ const idleSnapshot = (sequence: number): VoiceRuntimeSnapshot => ({
 });
 
 const makeHarness = (getSnapshot = async () => idleSnapshot(0)) => {
+  let currentPrepared: PreparedConnection | null = prepared;
   let snapshotListener: ((snapshot: VoiceRuntimeSnapshot) => void) | null = null;
   const remove = vi.fn();
   const native = {
@@ -123,7 +126,8 @@ const makeHarness = (getSnapshot = async () => idleSnapshot(0)) => {
   const requestNotificationPermission = vi.fn(async (): Promise<"granted" | "denied"> => "granted");
   const adapter = makeAndroidVoiceRuntimeAdapter({
     native,
-    prepared,
+    environmentId: ENVIRONMENT_ID,
+    getPrepared: () => currentPrepared,
     makeClient,
     requestNotificationPermission,
   });
@@ -139,6 +143,9 @@ const makeHarness = (getSnapshot = async () => idleSnapshot(0)) => {
     native,
     remove,
     requestNotificationPermission,
+    setPrepared: (next: PreparedConnection | null) => {
+      currentPrepared = next;
+    },
   };
 };
 
@@ -211,7 +218,7 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
     };
 
     await expect(harness.adapter.startRealtime(target)).rejects.toThrow(
-      "does not belong to the prepared environment",
+      "does not belong to the runtime environment",
     );
     expect(harness.makeClient).not.toHaveBeenCalled();
     expect(harness.requestNotificationPermission).not.toHaveBeenCalled();
@@ -241,7 +248,7 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
         ...realtimeTarget,
         threadSwitch: wrongEnvironment,
       }),
-    ).rejects.toThrow("does not belong to the prepared environment");
+    ).rejects.toThrow("does not belong to the runtime environment");
     await expect(
       harness.adapter.updateRealtimeContext({
         focus: realtimeTarget.focus,
@@ -529,6 +536,27 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
     expect(harness.native.stopRuntimeAsync).toHaveBeenCalledOnce();
   });
 
+  it("keeps snapshots and native-local controls available without a prepared connection", async () => {
+    const harness = makeHarness();
+    harness.setPrepared(null);
+    const listener = vi.fn();
+
+    const detach = await harness.adapter.subscribe(listener);
+    await harness.adapter.setRealtimeMuted(true);
+    await harness.adapter.switchRealtimeToThread(threadInput);
+    await expect(harness.adapter.startThread(threadInput)).rejects.toThrow(
+      "A prepared environment connection is required",
+    );
+
+    expect(listener).toHaveBeenCalledWith(idleSnapshot(0));
+    expect(harness.native.setRealtimeMutedAsync).toHaveBeenCalledWith({ muted: true });
+    expect(harness.native.switchRealtimeToThreadAsync).toHaveBeenCalledWith(threadInput);
+    expect(harness.native.getMicrophonePermissionAsync).not.toHaveBeenCalled();
+    expect(harness.requestNotificationPermission).not.toHaveBeenCalled();
+    expect(harness.makeClient).not.toHaveBeenCalled();
+    detach();
+  });
+
   it("does not resolve stop until native media ownership reaches idle", async () => {
     let current: VoiceRuntimeSnapshot = {
       mode: "realtime",
@@ -554,6 +582,7 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
     expect(harness.native.setRealtimeMutedAsync).not.toHaveBeenCalled();
     current = {
       mode: "failed",
+      environmentId: ENVIRONMENT_ID,
       operation: "realtime",
       generation: 4,
       sequence: 21,

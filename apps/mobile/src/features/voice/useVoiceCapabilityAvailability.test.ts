@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vite-plus/test";
 
 vi.mock("./mobileVoiceClient", () => ({ makeMobileVoiceClient: vi.fn() }));
 
-import { loadVoiceCapabilities } from "./useVoiceCapabilityAvailability";
+import { loadVoiceCapabilities, watchVoiceCapabilities } from "./useVoiceCapabilityAvailability";
 
 const preparedConnection = (): PreparedConnection => ({}) as PreparedConnection;
 const capabilities: VoiceCapabilities = {
@@ -81,5 +81,44 @@ describe("loadVoiceCapabilities", () => {
     now += 1;
     await expect(loadVoiceCapabilities(prepared, options)).resolves.toBe(refreshed);
     expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it("publishes refreshed capabilities while a consumer remains mounted", async () => {
+    vi.useFakeTimers();
+    try {
+      const prepared = preparedConnection();
+      const refreshed: VoiceCapabilities = {
+        ...capabilities,
+        capabilities: [
+          {
+            capability: "agent.realtime",
+            state: "ready",
+            inputFormats: [],
+            outputFormats: [],
+          },
+        ],
+      };
+      const load = vi
+        .fn<() => Promise<VoiceCapabilities>>()
+        .mockResolvedValueOnce(capabilities)
+        .mockResolvedValueOnce(refreshed);
+      const observed: Array<VoiceCapabilities | null> = [];
+      const stop = watchVoiceCapabilities(prepared, (result) => observed.push(result), {
+        load,
+        cacheTtlMs: 30_000,
+      });
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(observed).toEqual([capabilities]);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(observed).toEqual([capabilities, refreshed]);
+      expect(load).toHaveBeenCalledTimes(2);
+
+      stop();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(load).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

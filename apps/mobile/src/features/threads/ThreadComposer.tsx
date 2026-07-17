@@ -65,6 +65,7 @@ import {
 } from "../../lib/providerOptions";
 import { useComposerPathSearch } from "../../state/use-composer-path-search";
 import { mobilePreferencesAtom } from "../../state/preferences";
+import { useComposerDraftsReady } from "../../state/use-composer-drafts";
 import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerCommandPopover";
 import { useComposerDictation } from "../voice/useComposerDictation";
 import { ExclusiveTransition } from "../voice/exclusiveTransition";
@@ -317,6 +318,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     voicePreferences,
   });
   const voiceRuntime = useMasterVoice();
+  const composerDraftsReady = useComposerDraftsReady();
   const runtimeSnapshot = voiceRuntime.snapshot;
   const realtimeInUse =
     runtimeSnapshot.mode === "realtime" || runtimeSnapshot.mode === "switching-to-thread";
@@ -336,9 +338,11 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const audioTransitionRef = useRef(new ExclusiveTransition());
   const canStartAutoListen =
     voiceRuntime.controlsAvailable &&
+    voiceRuntime.threadStartAvailable &&
     props.draftMessage.trim().length === 0 &&
     props.draftAttachments.length === 0 &&
-    !props.interactionRequired;
+    !props.interactionRequired &&
+    !props.activeThreadBusy;
   useEffect(() => {
     const transition = dictationResumeTransition(dictationWasActiveRef.current, dictation.phase);
     dictationWasActiveRef.current = transition.wasActive;
@@ -382,6 +386,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       },
       currentDraft: props.draftMessage,
       hasAttachments: props.draftAttachments.length > 0,
+      draftsReady: composerDraftsReady,
     });
     const nextIdentity = nativeThreadReviewIdentityForDraft(hydration.hydrated);
     setNativeReviewIdentity((current) =>
@@ -392,6 +397,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     );
     if (hydration.draftUpdate !== null) props.onChangeDraftMessage(hydration.draftUpdate);
   }, [
+    composerDraftsReady,
     props.draftAttachments.length,
     props.draftMessage,
     props.environmentId,
@@ -434,18 +440,22 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   ]);
 
   const toggleDictation = useCallback(async () => {
-    await audioTransitionRef.current.run(async () => {
-      if (dictation.phase === "recording" && !nativeRuntimeInUse) {
-        await dictation.stop();
-        return;
-      }
-      await startDictationWithAudioHandoff({
-        stopRealtime: voiceRuntime.stop,
-        interruptPlayback: props.speechPlayback.interrupt,
-        startDictation: async () => (await dictation.start()) !== null,
-        resumePlayback: props.speechPlayback.resumeAfterDictation,
+    try {
+      await audioTransitionRef.current.run(async () => {
+        if (dictation.phase === "recording" && !nativeRuntimeInUse) {
+          await dictation.stop();
+          return;
+        }
+        await startDictationWithAudioHandoff({
+          stopRealtime: voiceRuntime.stop,
+          interruptPlayback: props.speechPlayback.interrupt,
+          startDictation: async () => (await dictation.start()) !== null,
+          resumePlayback: props.speechPlayback.resumeAfterDictation,
+        });
       });
-    });
+    } catch (cause) {
+      Alert.alert("Dictation unavailable", String(cause));
+    }
   }, [
     dictation.phase,
     dictation.start,
@@ -600,7 +610,9 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
           description: "Switch to default mode",
         },
       ];
-      const builtIn = allBuiltIn.filter((item) => item.command.includes(q));
+      const builtIn = nativeReviewCapabilities.configuration
+        ? allBuiltIn.filter((item) => item.command.includes(q))
+        : [];
 
       const providerCommands: ComposerCommandItem[] = [];
       for (const cmd of selectedProviderStatus?.slashCommands ?? []) {
@@ -715,7 +727,12 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     }
 
     return [];
-  }, [composerTrigger, pathSearch.entries, selectedProviderStatus]);
+  }, [
+    composerTrigger,
+    nativeReviewCapabilities.configuration,
+    pathSearch.entries,
+    selectedProviderStatus,
+  ]);
 
   // ── Handle command selection ──────────────────────────────
   const { onChangeDraftMessage, onUpdateInteractionMode, draftMessage, onSendMessage } = props;
@@ -776,6 +793,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
         item.type === "slash-command" &&
         (item.command === "plan" || item.command === "default")
       ) {
+        if (!nativeReviewCapabilities.configuration) return;
         const result = replaceTextRange(
           draftMessage,
           composerTrigger.rangeStart,
@@ -808,7 +826,13 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       setComposerSelection({ start: result.cursor, end: result.cursor });
       onChangeDraftMessage(result.text);
     },
-    [composerTrigger, draftMessage, onChangeDraftMessage, onUpdateInteractionMode],
+    [
+      composerTrigger,
+      draftMessage,
+      nativeReviewCapabilities.configuration,
+      onChangeDraftMessage,
+      onUpdateInteractionMode,
+    ],
   );
 
   // ── Model menu ───────────────────────────────────────────
@@ -909,6 +933,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
 
   // ── Menu handlers ────────────────────────────────────────
   function handleModelMenuAction(event: string) {
+    if (!nativeReviewCapabilities.configuration) return;
     if (!event.startsWith("model:")) {
       return;
     }
@@ -920,6 +945,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   }
 
   function handleOptionsMenuAction(event: string) {
+    if (!nativeReviewCapabilities.configuration) return;
     const providerOptions = applyProviderOptionMenuEvent(providerOptionDescriptors, event);
     if (providerOptions) {
       props.onUpdateModelSelection({

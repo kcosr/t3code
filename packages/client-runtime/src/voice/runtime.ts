@@ -1,6 +1,7 @@
 import type {
   EnvironmentId,
   IsoDateTime,
+  ModelSelection,
   ProjectId,
   ProviderInteractionMode,
   RuntimeMode,
@@ -33,6 +34,7 @@ export interface VoiceThreadTarget {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;
   readonly threadId: ThreadId;
+  readonly modelSelection: ModelSelection;
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: ProviderInteractionMode;
 }
@@ -152,6 +154,7 @@ export type VoiceRuntimeSnapshot = VoiceRuntimeSnapshotIdentity &
       }
     | {
         readonly mode: "failed";
+        readonly environmentId: EnvironmentId;
         readonly operation: "realtime" | "thread" | "switching-to-thread";
         readonly failure: VoiceRuntimeFailure;
       }

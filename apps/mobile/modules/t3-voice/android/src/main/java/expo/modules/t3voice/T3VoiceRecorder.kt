@@ -203,19 +203,19 @@ internal class T3VoiceRecorder(
       finalizeCompleted(recording)
     }
 
-  @Synchronized
   fun cancel(recordingId: String) {
-    val recording = requireActive(recordingId)
-    recordTerminalDiagnostic(recording)
-    active = null
-    terminalPolicy.deactivate(recording.terminalOwner)
-    try {
-      recording.recorder.stop()
-    } catch (_: RuntimeException) {
-      // A short recording may not contain a complete MPEG-4 sample.
-    } finally {
-      recording.recorder.release()
-      recording.file.delete()
+    terminalCoordinator.serialized {
+      val recording =
+        synchronized(this) {
+          val current = requireActive(recordingId)
+          check(terminalPolicy.deactivate(current.terminalOwner)) {
+            "The recording already terminated."
+          }
+          active = null
+          current
+        }
+      recordTerminalDiagnostic(recording)
+      stopAndDelete(recording)
     }
   }
 

@@ -33,7 +33,8 @@ export type AndroidVoiceRuntimeClientFactory = (
 
 export interface AndroidVoiceRuntimeAdapterInput {
   readonly native: T3VoiceNativeModule;
-  readonly prepared: PreparedConnection;
+  readonly environmentId: EnvironmentId;
+  readonly getPrepared: () => PreparedConnection | null;
   readonly makeClient?: AndroidVoiceRuntimeClientFactory;
   readonly requestNotificationPermission?: () => Promise<"granted" | "denied">;
 }
@@ -50,19 +51,22 @@ const requestOptionalBluetoothPermission = async (native: T3VoiceNativeModule): 
   }
 };
 
-const assertEnvironment = (prepared: PreparedConnection, environmentId: EnvironmentId): void => {
-  if (environmentId !== prepared.environmentId) {
-    throw new Error("The native voice target does not belong to the prepared environment");
+const assertEnvironment = (
+  runtimeEnvironmentId: EnvironmentId,
+  environmentId: EnvironmentId,
+): void => {
+  if (environmentId !== runtimeEnvironmentId) {
+    throw new Error("The native voice target does not belong to the runtime environment");
   }
 };
 
 const assertRealtimeContext = (
-  prepared: PreparedConnection,
+  runtimeEnvironmentId: EnvironmentId,
   context: VoiceRealtimeContext,
 ): void => {
   const threadSwitch = context.threadSwitch;
   if (threadSwitch === null) return;
-  assertEnvironment(prepared, threadSwitch.target.environmentId);
+  assertEnvironment(runtimeEnvironmentId, threadSwitch.target.environmentId);
   const focus = context.focus;
   if (focus === null) {
     throw new Error("A native voice Thread switch target requires a Realtime focus");
@@ -164,14 +168,22 @@ export const makeAndroidVoiceRuntimeAdapter = (
   const requestNotificationPermission =
     input.requestNotificationPermission ?? requestAndroidVoiceNotificationPermission;
 
+  const requirePreparedConnection = (environmentId: EnvironmentId): PreparedConnection => {
+    assertEnvironment(input.environmentId, environmentId);
+    const prepared = input.getPrepared();
+    if (prepared === null || prepared.environmentId !== input.environmentId) {
+      throw new Error("A prepared environment connection is required to start native voice");
+    }
+    return prepared;
+  };
+
   const issueNativeSession = async (
-    environmentId: EnvironmentId,
+    prepared: PreparedConnection,
   ): Promise<T3VoiceNativeSessionConfiguration> => {
-    assertEnvironment(input.prepared, environmentId);
-    const client = await makeClient(input.prepared);
+    const client = await makeClient(prepared);
     const credential = await Effect.runPromise(client.createNativeSession());
     return {
-      baseUrl: environmentEndpointUrl(input.prepared.httpBaseUrl, "/"),
+      baseUrl: environmentEndpointUrl(prepared.httpBaseUrl, "/"),
       accessToken: credential.accessToken,
       expiresAt: credential.expiresAt,
     };
@@ -180,33 +192,34 @@ export const makeAndroidVoiceRuntimeAdapter = (
   const prepareInitialStart = async (
     environmentId: EnvironmentId,
   ): Promise<T3VoiceNativeSessionConfiguration> => {
+    const prepared = requirePreparedConnection(environmentId);
     await ensureInitialStartIdle(input.native);
     await ensureMicrophonePermission(input.native);
     await requestNotificationPermission().catch(() => "denied" as const);
     await requestOptionalBluetoothPermission(input.native);
-    return issueNativeSession(environmentId);
+    return issueNativeSession(prepared);
   };
 
   return {
     getSnapshot: async () => input.native.getRuntimeSnapshotAsync(),
     subscribe: (listener) => attachSnapshotListener(input.native, listener),
     startRealtime: async (target: VoiceRealtimeTarget) => {
-      assertEnvironment(input.prepared, target.environmentId);
-      assertRealtimeContext(input.prepared, target);
+      assertEnvironment(input.environmentId, target.environmentId);
+      assertRealtimeContext(input.environmentId, target);
       return commands.enqueue(async () => {
         const session = await prepareInitialStart(target.environmentId);
         await input.native.startRealtimeAsync({ target, session });
       });
     },
     startThread: async (threadInput: VoiceThreadStartInput) => {
-      assertEnvironment(input.prepared, threadInput.target.environmentId);
+      assertEnvironment(input.environmentId, threadInput.target.environmentId);
       return commands.enqueue(async () => {
         const session = await prepareInitialStart(threadInput.target.environmentId);
         await input.native.startThreadAsync({ input: threadInput, session });
       });
     },
     switchRealtimeToThread: async (threadInput: VoiceThreadStartInput) => {
-      assertEnvironment(input.prepared, threadInput.target.environmentId);
+      assertEnvironment(input.environmentId, threadInput.target.environmentId);
       return commands.enqueue(() => input.native.switchRealtimeToThreadAsync(threadInput));
     },
     stop: () => commands.enqueue(() => stopAndAwaitRelease(input.native)),
@@ -215,7 +228,7 @@ export const makeAndroidVoiceRuntimeAdapter = (
     setRealtimeAudioRoute: (routeId: string) =>
       commands.enqueue(() => input.native.setRealtimeAudioRouteAsync({ routeId })),
     updateRealtimeContext: async (context: VoiceRealtimeContext) => {
-      assertRealtimeContext(input.prepared, context);
+      assertRealtimeContext(input.environmentId, context);
       return commands.enqueue(() => input.native.updateRealtimeContextAsync(context));
     },
     decideRealtimeConfirmation: async (

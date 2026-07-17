@@ -175,60 +175,59 @@ internal class T3VoiceThreadSession(
         TimeUnit.MILLISECONDS.toNanos(start.settings.responseTimeoutMs)
       var attention: T3VoiceThreadAttention? = null
       try {
-        withBoundedCalls(start.settings.responseTimeoutMs, "response-timeout") { calls ->
-          while (active.get() && System.nanoTime() < deadlineNanos) {
-            val outcome =
-              readThreadOutcomeWithRetry(
-                deadlineNanos = deadlineNanos,
-                isActive = active::get,
-                nowNanos = System::nanoTime,
-                sleep = ::sleepInterruptibly,
-              ) {
-                api.getMessageTurn(calls, start.target.threadId, messageId)
-              }
-            when (outcome.state) {
-              T3VoiceMessageTurnState.PENDING,
-              T3VoiceMessageTurnState.RUNNING,
-              -> {
-                if (attention != null) {
-                  attention = null
-                  emitIfActive(T3VoiceRuntimeCallback.ThreadAttentionChanged(null))
+        val response =
+          withBoundedCalls(start.settings.responseTimeoutMs, "response-timeout") { calls ->
+            while (active.get() && System.nanoTime() < deadlineNanos) {
+              val outcome =
+                readThreadOutcomeWithRetry(
+                  deadlineNanos = deadlineNanos,
+                  isActive = active::get,
+                  nowNanos = System::nanoTime,
+                  sleep = ::sleepInterruptibly,
+                ) {
+                  api.getMessageTurn(calls, start.target.threadId, messageId)
                 }
-                sleepPollingDelay()
-              }
-              T3VoiceMessageTurnState.APPROVAL_REQUIRED -> {
-                if (attention != T3VoiceThreadAttention.APPROVAL_REQUIRED) {
-                  attention = T3VoiceThreadAttention.APPROVAL_REQUIRED
-                  emitIfActive(T3VoiceRuntimeCallback.ThreadAttentionChanged(attention))
+              when (outcome.state) {
+                T3VoiceMessageTurnState.PENDING,
+                T3VoiceMessageTurnState.RUNNING,
+                -> {
+                  if (attention != null) {
+                    attention = null
+                    emitIfActive(T3VoiceRuntimeCallback.ThreadAttentionChanged(null))
+                  }
+                  sleepPollingDelay()
                 }
-                sleepPollingDelay()
-              }
-              T3VoiceMessageTurnState.USER_INPUT_REQUIRED -> {
-                if (attention != T3VoiceThreadAttention.USER_INPUT_REQUIRED) {
-                  attention = T3VoiceThreadAttention.USER_INPUT_REQUIRED
-                  emitIfActive(T3VoiceRuntimeCallback.ThreadAttentionChanged(attention))
+                T3VoiceMessageTurnState.APPROVAL_REQUIRED -> {
+                  if (attention != T3VoiceThreadAttention.APPROVAL_REQUIRED) {
+                    attention = T3VoiceThreadAttention.APPROVAL_REQUIRED
+                    emitIfActive(T3VoiceRuntimeCallback.ThreadAttentionChanged(attention))
+                  }
+                  sleepPollingDelay()
                 }
-                sleepPollingDelay()
-              }
-              T3VoiceMessageTurnState.COMPLETED -> {
-                val response = outcome.assistantMessage?.text?.takeIf(String::isNotBlank)
-                synchronized(lock) { assistantText = response }
-                if (attention != null) {
-                  emitIfActive(T3VoiceRuntimeCallback.ThreadAttentionChanged(null))
+                T3VoiceMessageTurnState.USER_INPUT_REQUIRED -> {
+                  if (attention != T3VoiceThreadAttention.USER_INPUT_REQUIRED) {
+                    attention = T3VoiceThreadAttention.USER_INPUT_REQUIRED
+                    emitIfActive(T3VoiceRuntimeCallback.ThreadAttentionChanged(attention))
+                  }
+                  sleepPollingDelay()
                 }
-                emitIfActive(T3VoiceRuntimeCallback.ThreadResponseReady(response != null))
-                return@withBoundedCalls
+                T3VoiceMessageTurnState.COMPLETED ->
+                  return@withBoundedCalls outcome.assistantMessage?.text?.takeIf(String::isNotBlank)
+                T3VoiceMessageTurnState.INTERRUPTED ->
+                  throw T3VoiceNativeApiException("thread-interrupted", retryable = true)
+                T3VoiceMessageTurnState.FAILED ->
+                  throw T3VoiceNativeApiException("thread-failed", retryable = true)
+                T3VoiceMessageTurnState.AMBIGUOUS ->
+                  throw T3VoiceNativeApiException("thread-ambiguous", retryable = true)
               }
-              T3VoiceMessageTurnState.INTERRUPTED ->
-                throw T3VoiceNativeApiException("thread-interrupted", retryable = true)
-              T3VoiceMessageTurnState.FAILED ->
-                throw T3VoiceNativeApiException("thread-failed", retryable = true)
-              T3VoiceMessageTurnState.AMBIGUOUS ->
-                throw T3VoiceNativeApiException("thread-ambiguous", retryable = true)
             }
+            throw T3VoiceNativeApiException("response-timeout", retryable = true)
           }
-          throw T3VoiceNativeApiException("response-timeout", retryable = true)
+        synchronized(lock) { assistantText = response }
+        if (attention != null) {
+          emitIfActive(T3VoiceRuntimeCallback.ThreadAttentionChanged(null))
         }
+        emitIfActive(T3VoiceRuntimeCallback.ThreadResponseReady(response != null))
       } catch (cause: Throwable) {
         fail(cause, "response-failed", "Waiting for the Thread response failed.")
       }

@@ -12,6 +12,7 @@ import * as Layer from "effect/Layer";
 import { SessionStore } from "../../auth/SessionStore.ts";
 import {
   NativeVoiceSessionIssuer,
+  NativeVoiceParentSessionInactiveError,
   NativeVoiceSessionReissuanceNotAllowedError,
   NativeVoiceSessionScopeRequiredError,
 } from "../Services/NativeVoiceSessionIssuer.ts";
@@ -31,7 +32,7 @@ const make = Effect.gen(function* () {
   const issue: NativeVoiceSessionIssuer["Service"]["issue"] = Effect.fn(
     "NativeVoiceSessionIssuer.issue",
   )(function* (parent) {
-    if (parent.subject.startsWith(NATIVE_VOICE_SESSION_SUBJECT_PREFIX)) {
+    if (parent.parentSessionId !== undefined) {
       return yield* new NativeVoiceSessionReissuanceNotAllowedError();
     }
 
@@ -48,17 +49,25 @@ const make = Effect.gen(function* () {
         ? maximumTtlMillis
         : Math.max(0, parent.expiresAt.epochMilliseconds - now.epochMilliseconds);
     const ttl = Duration.millis(Math.min(maximumTtlMillis, parentTtlMillis));
-    const issued = yield* sessions.issue({
-      ttl,
-      subject: `${NATIVE_VOICE_SESSION_SUBJECT_PREFIX}${parent.sessionId}`,
-      method: "bearer-access-token",
-      scopes: NATIVE_VOICE_SESSION_SCOPES,
-      client: {
-        label: "Android voice runtime",
-        deviceType: "mobile",
-        os: "Android",
-      },
-    });
+    const issued = yield* sessions
+      .issue({
+        ttl,
+        ...(parent.expiresAt === undefined ? {} : { notAfter: DateTime.toUtc(parent.expiresAt) }),
+        parentSessionId: parent.sessionId,
+        subject: `${NATIVE_VOICE_SESSION_SUBJECT_PREFIX}${parent.sessionId}`,
+        method: "bearer-access-token",
+        scopes: NATIVE_VOICE_SESSION_SCOPES,
+        client: {
+          label: "Android voice runtime",
+          deviceType: "mobile",
+          os: "Android",
+        },
+      })
+      .pipe(
+        Effect.catchTag("SessionParentUnavailableError", () =>
+          Effect.fail(new NativeVoiceParentSessionInactiveError()),
+        ),
+      );
 
     return {
       accessToken: issued.token,

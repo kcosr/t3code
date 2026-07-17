@@ -16,6 +16,7 @@ export interface ThreadReviewHydrationState extends ThreadVoiceComposerTarget {
   readonly reviewId: number;
   readonly ownsDraft: boolean;
   readonly nativeTranscript: string;
+  readonly submittedTranscript: string | null;
 }
 
 export interface ThreadReviewHydrationInput {
@@ -23,6 +24,7 @@ export interface ThreadReviewHydrationInput {
   readonly target: ThreadVoiceComposerTarget;
   readonly currentDraft: string;
   readonly hasAttachments: boolean;
+  readonly draftsReady: boolean;
 }
 
 export type ThreadReviewIdentity = VoiceThreadReviewToken;
@@ -48,6 +50,7 @@ export function threadVoiceComposerCapabilities(
   target: ThreadVoiceComposerTarget,
   review: ThreadReviewIdentity | null,
 ): ThreadVoiceComposerCapabilities {
+  const nativeThreadOwnsConfiguration = targetsThread(snapshot, target);
   const nativeReviewOwnsComposer =
     isThreadReviewForTarget(snapshot, target) &&
     review?.generation === snapshot.generation &&
@@ -55,7 +58,7 @@ export function threadVoiceComposerCapabilities(
   return {
     nativeReviewOwnsComposer,
     richPayload: !nativeReviewOwnsComposer,
-    configuration: !nativeReviewOwnsComposer,
+    configuration: !nativeThreadOwnsConfiguration,
   };
 }
 
@@ -131,6 +134,10 @@ export function reconcileThreadReviewHydration(
   readonly hydrated: ThreadReviewHydrationState | null;
   readonly draftUpdate: string | null;
 } {
+  if (!input.draftsReady) {
+    return { hydrated: input.hydrated, draftUpdate: null };
+  }
+
   if (!isThreadReviewForTarget(input.snapshot, input.target)) {
     const tracksCurrentTarget =
       input.hydrated !== null && sameThreadTarget(input.hydrated, input.target);
@@ -140,7 +147,13 @@ export function reconcileThreadReviewHydration(
       input.snapshot.phase === "submitting" &&
       targetsThread(input.snapshot, input.target)
     ) {
-      return { hydrated: input.hydrated, draftUpdate: null };
+      return {
+        hydrated: {
+          ...input.hydrated,
+          submittedTranscript: input.snapshot.transcript ?? input.hydrated.submittedTranscript,
+        },
+        draftUpdate: null,
+      };
     }
     if (
       tracksCurrentTarget &&
@@ -150,9 +163,19 @@ export function reconcileThreadReviewHydration(
         input.snapshot.phase === "playing" ||
         input.snapshot.phase === "rearming")
     ) {
+      const submittedTranscript =
+        input.snapshot.transcript ??
+        input.hydrated.submittedTranscript ??
+        input.hydrated.nativeTranscript;
       return {
         hydrated: null,
-        draftUpdate: input.hydrated.ownsDraft && input.currentDraft.length > 0 ? "" : null,
+        draftUpdate:
+          input.hydrated.ownsDraft &&
+          !input.hasAttachments &&
+          input.currentDraft.length > 0 &&
+          input.currentDraft === submittedTranscript
+            ? ""
+            : null,
       };
     }
     // Stop, failure, target replacement, or Idle relinquishes native ownership
@@ -168,8 +191,15 @@ export function reconcileThreadReviewHydration(
     existingHydration.reviewId === input.snapshot.reviewId &&
     sameThreadTarget(existingHydration, input.target);
   if (sameReview) {
+    if (existingHydration.ownsDraft) {
+      const synchronizedHydration =
+        input.snapshot.transcript === input.currentDraft &&
+        input.snapshot.transcript !== existingHydration.nativeTranscript
+          ? { ...existingHydration, nativeTranscript: input.snapshot.transcript }
+          : existingHydration;
+      return { hydrated: synchronizedHydration, draftUpdate: null };
+    }
     if (
-      existingHydration.ownsDraft ||
       input.hasAttachments ||
       (input.currentDraft.trim().length > 0 &&
         input.currentDraft !== existingHydration.nativeTranscript)
@@ -187,13 +217,16 @@ export function reconcileThreadReviewHydration(
   }
 
   const transcript = input.snapshot.transcript;
+  const priorSubmittedTranscript =
+    existingHydration?.submittedTranscript ?? existingHydration?.nativeTranscript ?? null;
   const continuesOwnedAutoRearm =
     existingHydration !== null &&
     existingHydration.ownsDraft &&
     existingHydration.generation === input.snapshot.generation &&
     existingHydration.reviewId !== input.snapshot.reviewId &&
     sameThreadTarget(existingHydration, input.target) &&
-    !input.hasAttachments;
+    !input.hasAttachments &&
+    input.currentDraft === priorSubmittedTranscript;
   const ownsDraft =
     continuesOwnedAutoRearm ||
     (input.currentDraft.trim().length === 0 && !input.hasAttachments) ||
@@ -204,11 +237,12 @@ export function reconcileThreadReviewHydration(
     reviewId: input.snapshot.reviewId,
     ownsDraft,
     nativeTranscript: transcript,
+    submittedTranscript: null,
   };
 
-  // Missing the submitting/waiting snapshots while detached must not leave an
-  // accepted prior-cycle draft in the next auto-rearmed review. A new
-  // generation has no such continuity and preserves unrelated draft text.
+  // A confirmed prior-cycle submission may be replaced by the next auto-rearmed
+  // review. Divergent text is a next-message draft and remains untouched. A new
+  // generation has no submission continuity either.
   return {
     hydrated,
     draftUpdate: ownsDraft && input.currentDraft !== transcript ? transcript : null,

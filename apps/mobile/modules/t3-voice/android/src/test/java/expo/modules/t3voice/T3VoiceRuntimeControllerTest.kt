@@ -13,6 +13,12 @@ class T3VoiceRuntimeControllerTest {
       environmentId = "environment-a",
       projectId = "project-a",
       threadId = "thread-a",
+      modelSelection =
+        T3VoiceModelSelection(
+          instanceId = "codex",
+          model = "gpt-5.4",
+          options = null,
+        ),
       runtimeMode = T3VoiceThreadRuntimeMode.FULL_ACCESS,
       interactionMode = T3VoiceThreadInteractionMode.DEFAULT,
     )
@@ -369,6 +375,87 @@ class T3VoiceRuntimeControllerTest {
   }
 
   @Test
+  fun `Stop intent reaches Idle when an already quiesced Realtime failure arrives`() {
+    val controller = T3VoiceRuntimeController(FakeDriver())
+    controller.dispatch(T3VoiceRuntimeCommand.StartRealtime(realtimeTarget, session))
+    controller.activateInitialStart(1)
+    controller.dispatch(T3VoiceRuntimeCommand.Stop)
+
+    assertTrue(
+      controller.onCallback(
+        1,
+        T3VoiceRuntimeCallback.Failed(
+          T3VoiceFailure("peer-failed", "Realtime already quiesced.", true),
+        ),
+      ),
+    )
+    assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
+  }
+
+  @Test
+  fun `Stop intent reaches Idle when an already quiesced Thread failure arrives`() {
+    val controller = T3VoiceRuntimeController(FakeDriver())
+    controller.dispatch(
+      T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session),
+    )
+    controller.activateInitialStart(1)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
+    controller.dispatch(T3VoiceRuntimeCommand.Stop)
+
+    assertTrue(
+      controller.onCallback(
+        1,
+        T3VoiceRuntimeCallback.Failed(
+          T3VoiceFailure("recording-failed", "Thread already quiesced.", true),
+        ),
+      ),
+    )
+    assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
+  }
+
+  @Test
+  fun `driver exception during Stop preserves the explicit Stop intent`() {
+    val controller =
+      T3VoiceRuntimeController(FakeDriver(failAction = "close-realtime:1:false"))
+    controller.dispatch(T3VoiceRuntimeCommand.StartRealtime(realtimeTarget, session))
+    controller.activateInitialStart(1)
+
+    assertEquals(
+      T3VoiceCommandOutcome.APPLIED,
+      controller.dispatch(T3VoiceRuntimeCommand.Stop).outcome,
+    )
+    assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
+  }
+
+  @Test
+  fun `release exception cannot publish Idle until a later Stop proves quiescence`() {
+    val controller = T3VoiceRuntimeController(FakeDriver(failAction = "release-all:1"))
+    controller.dispatch(T3VoiceRuntimeCommand.StartRealtime(realtimeTarget, session))
+    controller.activateInitialStart(1)
+    controller.dispatch(T3VoiceRuntimeCommand.Stop)
+
+    assertTrue(
+      controller.onCallback(
+        1,
+        T3VoiceRuntimeCallback.Failed(
+          T3VoiceFailure("peer-failed", "Realtime cleanup failed.", true),
+        ),
+      ),
+    )
+    assertTrue(controller.snapshot().state is T3VoiceControllerState.Failed)
+    assertEquals(
+      T3VoiceCommandRejection.BUSY,
+      controller.dispatch(T3VoiceRuntimeCommand.StartRealtime(realtimeTarget, session)).rejection,
+    )
+
+    assertEquals(
+      T3VoiceCommandOutcome.APPLIED,
+      controller.dispatch(T3VoiceRuntimeCommand.Stop).outcome,
+    )
+    assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
+  }
+
+  @Test
   fun switchCloseBeforeBoundedFailureDoesNotMasqueradeAsUserStop() {
     val controller = T3VoiceRuntimeController(FakeDriver())
     controller.dispatch(T3VoiceRuntimeCommand.StartRealtime(realtimeTarget, session))
@@ -452,6 +539,93 @@ class T3VoiceRuntimeControllerTest {
   }
 
   @Test
+  fun realtimeClientActionReceivedDuringStartupCanBeCompletedBeforeConnection() {
+    val driver = FakeDriver()
+    val controller = T3VoiceRuntimeController(driver)
+    controller.dispatch(T3VoiceRuntimeCommand.StartRealtime(realtimeTarget, session))
+    controller.activateInitialStart(1)
+    val action =
+      T3VoiceRealtimeClientAction(
+        actionId = "startup-action",
+        projectId = "project-b",
+        threadId = "thread-b",
+        expiresAt = "2099-01-01T00:00:00Z",
+      )
+
+    assertTrue(
+      controller.onCallback(
+        1,
+        T3VoiceRuntimeCallback.RealtimeClientActionReceived(action),
+      ),
+    )
+    assertEquals(
+      T3VoiceCommandOutcome.DUPLICATE,
+      controller.dispatch(
+        T3VoiceRuntimeCommand.CompleteRealtimeClientAction(
+          actionId = "different-action",
+          outcome = T3VoiceClientActionOutcome.SUCCEEDED,
+          message = null,
+        ),
+      ).outcome,
+    )
+    assertFalse(driver.actions.any { it.startsWith("ack-realtime:1:different-action") })
+    assertEquals(
+      T3VoiceCommandOutcome.APPLIED,
+      controller.dispatch(
+        T3VoiceRuntimeCommand.CompleteRealtimeClientAction(
+          actionId = action.actionId,
+          outcome = T3VoiceClientActionOutcome.SUCCEEDED,
+          message = null,
+        ),
+      ).outcome,
+    )
+
+    val starting = controller.snapshot().state as T3VoiceControllerState.Realtime
+    assertEquals(T3VoiceRealtimeStage.STARTING, starting.stage)
+    assertTrue(starting.pendingClientActions.isEmpty())
+    assertEquals(T3VoiceRealtimeFocus("project-b", "thread-b"), starting.target.focus)
+    assertEquals(
+      listOf(
+        "focus-realtime:1:project-b:thread-b",
+        "ack-realtime:1:startup-action:SUCCEEDED",
+      ),
+      driver.actions.takeLast(2),
+    )
+    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeConnected))
+
+    val connected = controller.snapshot().state as T3VoiceControllerState.Realtime
+    assertEquals(T3VoiceRealtimeStage.CONNECTED, connected.stage)
+    assertTrue(connected.pendingClientActions.isEmpty())
+  }
+
+  @Test
+  fun realtimeClientActionCannotCompleteAfterStoppingStarts() {
+    val driver = FakeDriver()
+    val controller = connectedRealtimeController(driver)
+    val action =
+      T3VoiceRealtimeClientAction(
+        actionId = "stopping-action",
+        projectId = "project-b",
+        threadId = "thread-b",
+        expiresAt = "2099-01-01T00:00:00Z",
+      )
+    controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeClientActionReceived(action))
+    controller.dispatch(T3VoiceRuntimeCommand.Stop)
+
+    assertEquals(
+      T3VoiceCommandRejection.INVALID_STATE,
+      controller.dispatch(
+        T3VoiceRuntimeCommand.CompleteRealtimeClientAction(
+          actionId = action.actionId,
+          outcome = T3VoiceClientActionOutcome.SUCCEEDED,
+          message = null,
+        ),
+      ).rejection,
+    )
+    assertFalse(driver.actions.any { it.startsWith("ack-realtime:1:${action.actionId}") })
+  }
+
+  @Test
   fun expiredClientActionIsRemovedWithoutAcknowledgingIt() {
     val driver = FakeDriver()
     val controller = connectedRealtimeController(driver)
@@ -525,6 +699,7 @@ class T3VoiceRuntimeControllerTest {
       ),
     )
     val failed = controller.snapshot().state as T3VoiceControllerState.Failed
+    assertEquals("environment-a", failed.environmentId)
     assertEquals("realtime-client-action-overflow", failed.failure.code)
     assertEquals("release-all:1", driver.actions.last())
     assertEquals(
@@ -967,6 +1142,7 @@ internal class FakeDriver(
 ) : T3VoiceRuntimeDriver {
   val actions = mutableListOf<String>()
   var onAction: (String) -> Unit = {}
+  private var failureDelivered = false
 
   override fun startRealtime(
     generation: Long,
@@ -1069,6 +1245,9 @@ internal class FakeDriver(
   private fun record(action: String) {
     actions.add(action)
     onAction(action)
-    if (action == failAction) error("Test driver failure")
+    if (action == failAction && !failureDelivered) {
+      failureDelivered = true
+      error("Test driver failure")
+    }
   }
 }

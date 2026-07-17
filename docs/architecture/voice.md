@@ -321,10 +321,12 @@ maximum realtime duration, and server policy. It never returns provider credenti
 ```text
 POST /api/voice/conversations
 GET /api/voice/conversations
-GET /api/voice/conversations/:voiceConversationId
-DELETE /api/voice/conversations/:voiceConversationId
-POST /api/voice/conversations/:voiceConversationId/clear-context
-WsVoiceSubscribeSessionRpc(voiceSessionId)
+GET /api/voice/conversations/:conversationId
+PATCH /api/voice/conversations/:conversationId
+GET /api/voice/conversations/:conversationId/transcript
+DELETE /api/voice/conversations/:conversationId
+POST /api/voice/conversations/:conversationId/clear-context
+GET /api/voice/sessions/:sessionId/events
 ```
 
 Conversation creation chooses `ephemeral` or `durable` retention explicitly. Durable conversations
@@ -333,10 +335,10 @@ history. Clear-context creates a new journal epoch. Delete hard-deletes transcri
 context, and tool-call records after ending any lease. Automated age and size retention is not part
 of the current implementation.
 
-The authenticated RPC subscription carries normalized, sequenced `VoiceSessionEvent` values. It is
-authorized against the current lease generation. React may detach without ending native media; the
-native service separately maintains the lease heartbeat and closes its peer if server control is
-lost.
+The authenticated events endpoint returns the current session state and normalized, sequenced
+`VoiceSessionEvent` values after an optional sequence. It supports a bounded `waitMilliseconds`
+long poll. React may detach without ending native media; the native service separately maintains the
+lease heartbeat and closes its peer if server control is lost.
 
 ### Bounded transcription
 
@@ -397,7 +399,7 @@ on the server. Clients cannot submit arbitrary provider configuration.
 
 ```text
 POST /api/voice/sessions
-DELETE /api/voice/sessions/:voiceSessionId
+DELETE /api/voice/sessions/:sessionId
 ```
 
 Create input includes:
@@ -416,9 +418,11 @@ from consuming provider resources.
 ### WebRTC signaling
 
 ```text
-POST /api/voice/sessions/:voiceSessionId/webrtc-offer
-Content-Type: application/sdp
-Accept: application/sdp
+POST /api/voice/sessions/:sessionId/webrtc-offer
+Content-Type: application/json
+Accept: application/json
+
+{ "sessionId": "...", "leaseGeneration": 1, "sdp": "..." }
 ```
 
 The server:
@@ -428,7 +432,7 @@ The server:
 3. forwards multipart SDP plus server-owned session JSON to OpenAI;
 4. reads the OpenAI `Location` header and extracts the call ID;
 5. opens the provider sideband WebSocket for that call;
-6. returns the SDP answer only after the sideband is attached.
+6. returns `{ sessionId, leaseGeneration, sdp }` only after the sideband is attached.
 
 Sideband failure terminates the newly created provider call, marks the T3 session failed, and never
 returns a usable answer. Every signaling operation carries the voice session ID and lease generation
@@ -440,12 +444,12 @@ to the provider session for tools and control.
 ### Confirmation
 
 ```text
-POST /api/voice/sessions/:voiceSessionId/confirmations/:confirmationId
+POST /api/voice/sessions/:sessionId/confirmations/:confirmationId
 ```
 
-The body contains `approve` or `reject`. Confirmation IDs are single-use, short-lived, bound to the
-session principal, normalized tool name, and canonical arguments. A confirmation cannot be replayed
-with changed arguments.
+The JSON body is `{ "decision": "approve" }` or `{ "decision": "reject" }`. Confirmation IDs are
+single-use, short-lived, bound to the session principal, normalized tool name, and canonical
+arguments. A confirmation cannot be replayed with changed arguments.
 
 ### Media tickets
 
@@ -457,10 +461,12 @@ Traditional React-owned one-shot dictation and playback request one-use tickets 
 authenticated client runtime. A native semantic Thread session uses its bounded native child bearer
 to request its own one-use transcription and speech tickets while React is detached or backgrounded.
 
-Every ticket is bound to its issuing auth session, operation (`transcription-upload`,
-`speech-stream`, or `voice-heartbeat`), optional voice session/request ID, method, path audience,
-byte limit, and short expiry. Tickets are stored only in memory, cannot mint credentials or other
-tickets, and are invalidated by use, expiry, auth-session revocation, or voice-session closure.
+Every ticket is bound to its issuing auth session, one operation (`transcription-upload` or
+`speech-stream`), one request ID, and a short expiry. The matching media route consumes the ticket
+once and verifies the request ID. Tickets are stored only in memory, cannot mint credentials or
+other tickets, and are invalidated by use, expiry, or auth-session revocation. Media byte, duration,
+format, timeout, and concurrency limits are enforced separately by the media routes; tickets are not
+bound to a voice-session ID and voice-session closure does not independently revoke them.
 
 ## Provider Interfaces
 
@@ -587,19 +593,26 @@ attempting an atomic peer swap. It never models a Realtime session as a durable 
 
 ## Realtime Tools
 
-The initial allowlist is:
+The allowlist is:
 
 - `list_projects`
 - `list_threads`
 - `get_thread_status`
+- `get_thread_messages`
+- `wait_for_thread_turn`
+- `search_history`
+- `read_history`
+- `activate_thread`
 - `create_thread`
 - `send_thread_message`
 - `interrupt_thread`
 - `archive_thread`
 
-Read tools query `ProjectionSnapshotQuery`. Write tools create canonical orchestration commands and
-dispatch them through `ClientCommandDispatcher`. They do not call HTTP or WebSocket routes from
-inside the server.
+Project and thread summary reads use `ProjectionSnapshotQuery`; bounded messages use the thread
+message projection; exact turn waits use the dedicated narrow message/turn outcome projection; and
+history tools use `HistorySearchService`. `activate_thread` requests a bounded client action. Mutation
+tools create canonical orchestration commands and dispatch them through `ClientCommandDispatcher`;
+they do not call HTTP or WebSocket routes from inside the server.
 
 Tool contracts use stable T3 IDs, bounded strings, and explicit result limits. Lists require a
 limit and return compact summaries. The server rejects unknown fields and unknown tool names.
@@ -607,16 +620,18 @@ limit and return compact summaries. The server rejects unknown fields and unknow
 ### Thread history and bounded turn completion
 
 The Realtime voice agent can inspect existing coding-thread conversation through a bounded
-`get_thread_messages` read tool backed by the orchestration thread-detail projection. It accepts a
+`get_thread_messages` read tool backed by the completed thread-message projection. It accepts a
 thread ID, cursor, and limit, and returns normalized user/assistant messages with turn metadata.
-Activities, diffs, plans, and tool output remain separate bounded queries.
+Activities, diffs, plans, and tool output are excluded from this message-only result.
 
-Sending work and reading its result are separate operations. `send_thread_message` returns stable
-command, message, and turn correlation identifiers as soon as dispatch is accepted.
+Sending work and reading its result are separate operations. `send_thread_message` returns the
+dispatch sequence plus stable thread, command, and message identifiers as soon as dispatch is
+accepted. The turn ID is not available until the exact message-to-turn start projection resolves.
 `wait_for_thread_turn` performs a cancellable bounded wait when the Realtime agent explicitly
-needs the result during its current response. It returns a final assistant message and terminal
-state, or a typed pending/running, interruption, failure, approval-required, or user-input-required
-result.
+needs the result during its current response. It returns `pending`, `running`,
+`approval-required`, `user-input-required`, `completed`, `interrupted`, or `failed`, with a bounded
+settled assistant message when available. An ambiguous dispatch is returned as `failed` with
+`ambiguous: true`; polling never guesses a turn.
 
 There is no asynchronous completion watcher and no synthetic completion message is injected into an
 active or future Realtime provider call. Completion is correlated to the exact T3 message/turn, not
@@ -843,14 +858,17 @@ After a visible user start and permission check, the authenticated React client 
 `POST /api/voice/native-session`. The server returns a bearer child with exactly `voice:use`,
 `orchestration:read`, and `orchestration:operate`. Its lifetime is the lesser of 12 hours and the
 parent session's remaining lifetime, and a native child cannot issue another native child. The
-credential response is non-cacheable. React passes that credential and the normalized root
-environment URL only on the initial native start.
+credential response is non-cacheable. The auth store persists the explicit parent relationship;
+revoking a parent atomically revokes its native child sessions and publishes the ordinary session
+removal events that close child-owned voice provider calls and media tickets. Already accepted
+orchestration turns remain canonical durable work and are not canceled by voice-session teardown.
+React passes the credential and normalized root environment URL only on the initial native start.
 
 The main mobile DPoP credential remains in the existing connection runtime and is never copied into
-the service. The native child, media tickets, and server session identifiers remain in memory and
-are cleared on Idle, failure, expiry, or process termination. Native code never receives an OpenAI
-credential. There is no SharedPreferences credential fallback and no React callback dependency
-while a supported operation is in the background.
+the service. The native client holds the child credential, media tickets, and server session
+identifiers only in memory and clears them on Idle, failure, expiry, or process termination. Native
+code never receives an OpenAI credential. There is no SharedPreferences credential fallback and no
+React callback dependency while a supported operation is in the background.
 
 ### React Native state
 
@@ -945,8 +963,11 @@ old provider session.
 ## Security and Privacy
 
 - Provider credentials remain in `ServerSecretStore`.
-- Every voice endpoint authenticates the T3 principal and checks `voice:use`.
-- Every tool call rechecks its underlying orchestration scope.
+- Voice runtime, conversation, signaling, and ticket-issuance endpoints authenticate the T3
+  principal and check `voice:use`; provider credential status/set/clear endpoints check
+  `voice:manage`. Raw media routes accept either a `voice:use` principal or a matching one-use
+  media ticket.
+- Every tool call rechecks its underlying orchestration or history scope.
 - T3 accepts no client-provided provider instructions, tools, API URLs, model IDs, or secrets.
 - Model, voice, codec, tool, and instruction inputs are allowlisted server-side.
 - Upload size, utterance duration, request rate, and concurrent session quotas are enforced before

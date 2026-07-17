@@ -119,4 +119,32 @@ class T3VoiceRecordingTerminalPolicyTest {
     automatic.join()
     manual.join()
   }
+
+  @Test
+  fun cancellationJoinsAutomaticTerminalizationBeforeReturning() {
+    val coordinator = T3VoiceRecordingTerminalCoordinator(Any())
+    val automaticEntered = CountDownLatch(1)
+    val allowAutomaticCompletion = CountDownLatch(1)
+    val cancellationReturned = CountDownLatch(1)
+
+    val automatic =
+      thread {
+        coordinator.serialized {
+          automaticEntered.countDown()
+          allowAutomaticCompletion.await()
+        }
+      }
+    assertTrue(automaticEntered.await(1, TimeUnit.SECONDS))
+    val cancellation =
+      thread {
+        coordinator.serialized { cancellationReturned.countDown() }
+      }
+
+    assertFalse(cancellationReturned.await(100, TimeUnit.MILLISECONDS))
+    allowAutomaticCompletion.countDown()
+    assertTrue(cancellationReturned.await(1, TimeUnit.SECONDS))
+
+    automatic.join()
+    cancellation.join()
+  }
 }

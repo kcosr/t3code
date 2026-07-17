@@ -11,7 +11,6 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import type { ProjectionRepositoryError } from "../Errors.ts";
-import { ProjectionTurnById } from "./ProjectionTurns.ts";
 
 export const ProjectionTurnStartState = Schema.Literals([
   "pending",
@@ -33,12 +32,6 @@ export const ProjectionTurnStart = Schema.Struct({
   resolvedAt: Schema.NullOr(IsoDateTime),
 });
 export type ProjectionTurnStart = typeof ProjectionTurnStart.Type;
-
-export const ProjectionTurnStartOutcome = Schema.Struct({
-  start: ProjectionTurnStart,
-  turn: Schema.NullOr(ProjectionTurnById),
-});
-export type ProjectionTurnStartOutcome = typeof ProjectionTurnStartOutcome.Type;
 
 export const GetProjectionTurnStartByMessageIdInput = Schema.Struct({
   threadId: ThreadId,
@@ -62,9 +55,6 @@ export interface ProjectionTurnStartRepositoryShape {
   readonly getByMessageId: (
     input: GetProjectionTurnStartByMessageIdInput,
   ) => Effect.Effect<Option.Option<ProjectionTurnStart>, ProjectionRepositoryError>;
-  readonly getOutcomeByMessageId: (
-    input: GetProjectionTurnStartByMessageIdInput,
-  ) => Effect.Effect<Option.Option<ProjectionTurnStartOutcome>, ProjectionRepositoryError>;
   readonly listByThreadId: (
     input: DeleteProjectionTurnStartsByThreadInput,
   ) => Effect.Effect<ReadonlyArray<ProjectionTurnStart>, ProjectionRepositoryError>;

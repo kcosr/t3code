@@ -30,6 +30,19 @@ class T3VoiceRuntimeBridgeInputTest {
     assertEquals("environment-a", command.target.environmentId)
     assertEquals("thread-a", command.target.focus?.threadId)
     assertEquals("thread-a", command.target.threadSwitch?.target?.threadId)
+    val modelSelection = checkNotNull(command.target.threadSwitch?.target?.modelSelection)
+    assertEquals("codex", modelSelection.instanceId)
+    assertEquals("gpt-5.4", modelSelection.model)
+    assertEquals(
+      listOf(
+        T3VoiceModelOption(
+          "reasoningEffort",
+          T3VoiceModelOptionValue.StringValue("high"),
+        ),
+        T3VoiceModelOption("fastMode", T3VoiceModelOptionValue.BooleanValue(true)),
+      ),
+      modelSelection.options,
+    )
     assertFalse(command.session.toString().contains("secret-token"))
     assertTrue(command.session.toString().contains("redacted"))
   }
@@ -64,6 +77,49 @@ class T3VoiceRuntimeBridgeInputTest {
 
     assertThrows(IllegalArgumentException::class.java) {
       T3VoiceRuntimeBridgeInput.realtimeContext(mismatched)
+    }
+  }
+
+  @Test
+  fun rejectsLegacyOrNonCanonicalThreadModelSelections() {
+    fun startWith(modelSelection: Any?) {
+      val target =
+        (threadStart.getValue("target") as Map<*, *>).toMutableMap().apply {
+          if (modelSelection == null) {
+            remove("modelSelection")
+          } else {
+            this["modelSelection"] = modelSelection
+          }
+        }
+      val input =
+        mapOf<String, Any?>(
+          "input" to threadStart.toMutableMap().apply { this["target"] = target },
+          "session" to session,
+        )
+      T3VoiceRuntimeBridgeInput.startThread(input)
+    }
+
+    assertThrows(IllegalStateException::class.java) { startWith(null) }
+    assertThrows(IllegalStateException::class.java) {
+      startWith(mapOf("provider" to "codex", "model" to "gpt-5.4"))
+    }
+    assertThrows(IllegalStateException::class.java) {
+      startWith(
+        mapOf(
+          "instanceId" to "codex",
+          "model" to "gpt-5.4",
+          "options" to mapOf("fastMode" to true),
+        ),
+      )
+    }
+    assertThrows(IllegalStateException::class.java) {
+      startWith(
+        mapOf(
+          "instanceId" to "codex",
+          "model" to "gpt-5.4",
+          "options" to listOf(mapOf("id" to "effort", "value" to 3)),
+        ),
+      )
     }
   }
 
@@ -156,6 +212,16 @@ class T3VoiceRuntimeBridgeInputTest {
           "environmentId" to "environment-a",
           "projectId" to "project-a",
           "threadId" to "thread-a",
+          "modelSelection" to
+            mapOf(
+              "instanceId" to "codex",
+              "model" to "gpt-5.4",
+              "options" to
+                listOf(
+                  mapOf("id" to "reasoningEffort", "value" to "high"),
+                  mapOf("id" to "fastMode", "value" to true),
+                ),
+            ),
           "runtimeMode" to "full-access",
           "interactionMode" to "default",
         ),

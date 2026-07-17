@@ -12,6 +12,12 @@ class T3VoiceNotificationActionsTest {
       environmentId = "environment-a",
       projectId = "project-a",
       threadId = "thread-a",
+      modelSelection =
+        T3VoiceModelSelection(
+          instanceId = "codex",
+          model = "gpt-5.4",
+          options = null,
+        ),
       runtimeMode = T3VoiceThreadRuntimeMode.AUTO_ACCEPT_EDITS,
       interactionMode = T3VoiceThreadInteractionMode.PLAN,
     )

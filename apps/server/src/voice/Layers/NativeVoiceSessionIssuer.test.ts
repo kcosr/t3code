@@ -12,11 +12,10 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 
-import { SessionStore } from "../../auth/SessionStore.ts";
+import { SessionParentUnavailableError, SessionStore } from "../../auth/SessionStore.ts";
 import { NativeVoiceSessionIssuer } from "../Services/NativeVoiceSessionIssuer.ts";
 import {
   NATIVE_VOICE_SESSION_SCOPES,
-  NATIVE_VOICE_SESSION_SUBJECT_PREFIX,
   NATIVE_VOICE_SESSION_TTL,
   NativeVoiceSessionIssuerLive,
 } from "./NativeVoiceSessionIssuer.ts";
@@ -38,16 +37,26 @@ const parent = (
   ...(expiresAt === undefined ? {} : { expiresAt }),
 });
 
-const makeTest = Effect.fn("test.makeNativeVoiceSessionIssuer")(function* () {
+const makeTest = Effect.fn("test.makeNativeVoiceSessionIssuer")(function* (
+  issueError?: SessionParentUnavailableError,
+) {
   const issuedInput = yield* Ref.make<Parameters<SessionStore["Service"]["issue"]>[0] | null>(null);
   const sessionStore = {
     issue: (input: Parameters<SessionStore["Service"]["issue"]>[0]) =>
       Effect.gen(function* () {
         yield* Ref.set(issuedInput, input);
+        if (issueError !== undefined) {
+          return yield* issueError;
+        }
         const issuedAt = yield* DateTime.now;
-        const expiresAt = DateTime.add(issuedAt, {
+        const ttlExpiresAt = DateTime.add(issuedAt, {
           milliseconds: Duration.toMillis(input?.ttl ?? Duration.days(30)),
         });
+        const expiresAt =
+          input?.notAfter !== undefined &&
+          input.notAfter.epochMilliseconds < ttlExpiresAt.epochMilliseconds
+            ? input.notAfter
+            : ttlExpiresAt;
         return {
           sessionId: AuthSessionId.make("native-session"),
           token: "native-bearer-token",
@@ -93,7 +102,8 @@ describe("NativeVoiceSessionIssuer", () => {
         Effect.flatMap((issuer) =>
           issuer.issue({
             ...parent(),
-            subject: `${NATIVE_VOICE_SESSION_SUBJECT_PREFIX}${parentSessionId}`,
+            parentSessionId,
+            subject: "descriptive-native-runtime-subject",
           }),
         ),
         Effect.result,
@@ -104,6 +114,23 @@ describe("NativeVoiceSessionIssuer", () => {
         assert.equal(result.failure._tag, "NativeVoiceSessionReissuanceNotAllowedError");
       }
       assert.isNull(yield* Ref.get(test.issuedInput));
+    }),
+  );
+
+  it.effect("reports a revoked parent as an expected native issuance conflict", () =>
+    Effect.gen(function* () {
+      const test = yield* makeTest(new SessionParentUnavailableError({ parentSessionId }));
+      const result = yield* NativeVoiceSessionIssuer.pipe(
+        Effect.flatMap((issuer) => issuer.issue(parent())),
+        Effect.result,
+        Effect.provide(test.layer),
+      );
+
+      assert.isTrue(result._tag === "Failure");
+      if (result._tag === "Failure") {
+        assert.equal(result.failure._tag, "NativeVoiceParentSessionInactiveError");
+      }
+      assert.isNotNull(yield* Ref.get(test.issuedInput));
     }),
   );
 
@@ -123,6 +150,7 @@ describe("NativeVoiceSessionIssuer", () => {
         Duration.toMillis(NATIVE_VOICE_SESSION_TTL),
       );
       assert.equal(input?.subject, `native-voice:${parentSessionId}`);
+      assert.equal(input?.parentSessionId, parentSessionId);
       assert.deepStrictEqual(input?.client, {
         label: "Android voice runtime",
         deviceType: "mobile",
@@ -147,6 +175,7 @@ describe("NativeVoiceSessionIssuer", () => {
         Duration.toMillis(input?.ttl ?? Duration.zero),
         Duration.toMillis(Duration.hours(1)),
       );
+      assert.equal(input?.notAfter?.epochMilliseconds, parentExpiresAt.epochMilliseconds);
       assert.equal(
         DateTime.makeUnsafe(credential.expiresAt).epochMilliseconds,
         parentExpiresAt.epochMilliseconds,

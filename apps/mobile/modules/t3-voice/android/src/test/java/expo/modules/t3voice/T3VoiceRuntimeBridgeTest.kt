@@ -75,6 +75,30 @@ class T3VoiceRuntimeBridgeTest {
     assertEquals("transcribing", body["phase"])
     assertEquals("approval-required", body["attention"])
     assertNull(body["transcript"])
+    @Suppress("UNCHECKED_CAST")
+    val target = body["target"] as Map<String, Any?>
+    assertEquals(
+      mapOf<String, Any>("instanceId" to "codex", "model" to "gpt-5.4"),
+      target["modelSelection"],
+    )
+  }
+
+  @Test
+  fun failedSnapshotPreservesItsEnvironmentIdentity() {
+    val body =
+      T3VoiceControllerSnapshot(
+        state =
+          T3VoiceControllerState.Failed(
+            environmentId = "environment-a",
+            operation = T3VoiceOperation.THREAD,
+            failure = T3VoiceFailure("thread-failed", "Thread failed.", true),
+          ),
+        generation = 4,
+        sequence = 14,
+      ).toBridgeBody()
+
+    assertEquals("failed", body["mode"])
+    assertEquals("environment-a", body["environmentId"])
   }
 
   @Test
@@ -105,6 +129,12 @@ class T3VoiceRuntimeBridgeTest {
       environmentId = "environment-a",
       projectId = "project-a",
       threadId = "thread-a",
+      modelSelection =
+        T3VoiceModelSelection(
+          instanceId = "codex",
+          model = "gpt-5.4",
+          options = null,
+        ),
       runtimeMode = T3VoiceThreadRuntimeMode.AUTO_ACCEPT_EDITS,
       interactionMode = T3VoiceThreadInteractionMode.DEFAULT,
     )

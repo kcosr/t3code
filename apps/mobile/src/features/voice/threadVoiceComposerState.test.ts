@@ -1,5 +1,5 @@
 import type { VoiceRuntimeSnapshot } from "@t3tools/client-runtime/voice";
-import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -33,6 +33,7 @@ const reviewingSnapshot = (transcript = "Native transcript"): ThreadSnapshot => 
     environmentId,
     projectId: ProjectId.make("project-one"),
     threadId: target.threadId,
+    modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
     runtimeMode: "approval-required",
     interactionMode: "default",
   },
@@ -57,8 +58,16 @@ const reviewingSnapshot = (transcript = "Native transcript"): ThreadSnapshot => 
 
 type ReconcileInput = Parameters<typeof reconcileThreadReviewHydration>[0];
 const reconcileReview = (
-  input: Omit<ReconcileInput, "hasAttachments"> & { readonly hasAttachments?: boolean },
-) => reconcileThreadReviewHydration({ ...input, hasAttachments: input.hasAttachments ?? false });
+  input: Omit<ReconcileInput, "hasAttachments" | "draftsReady"> & {
+    readonly hasAttachments?: boolean;
+    readonly draftsReady?: boolean;
+  },
+) =>
+  reconcileThreadReviewHydration({
+    ...input,
+    hasAttachments: input.hasAttachments ?? false,
+    draftsReady: input.draftsReady ?? true,
+  });
 
 describe("Thread voice composer state", () => {
   it("blocks another Thread while preserving controls for the native owner", () => {
@@ -132,6 +141,26 @@ describe("Thread voice composer state", () => {
     ).toEqual({ hydrated: initial.hydrated, draftUpdate: null });
   });
 
+  it("waits for persisted composer drafts before claiming or changing the review draft", () => {
+    const pending = reconcileReview({
+      snapshot: reviewingSnapshot(),
+      target,
+      currentDraft: "",
+      hydrated: null,
+      draftsReady: false,
+    });
+    expect(pending).toEqual({ hydrated: null, draftUpdate: null });
+
+    const ready = reconcileReview({
+      snapshot: reviewingSnapshot(),
+      target,
+      currentDraft: "Persisted draft",
+      hydrated: pending.hydrated,
+    });
+    expect(ready.hydrated?.ownsDraft).toBe(false);
+    expect(ready.draftUpdate).toBeNull();
+  });
+
   it("does not overwrite a newer local edit when native echoes the same review", () => {
     const initial = reconcileReview({
       snapshot: reviewingSnapshot("Original transcript"),
@@ -182,6 +211,16 @@ describe("Thread voice composer state", () => {
       currentDraft: "",
       hydrated: null,
     });
+    const submitting = reconcileReview({
+      snapshot: {
+        ...reviewingSnapshot("Edited and submitted old transcript"),
+        phase: "submitting",
+        sequence: 13,
+      },
+      target,
+      currentDraft: "Edited and submitted old transcript",
+      hydrated: oldReview.hydrated,
+    });
     const nextReview = reconcileReview({
       snapshot: {
         ...reviewingSnapshot("New native transcript"),
@@ -190,11 +229,43 @@ describe("Thread voice composer state", () => {
       },
       target,
       currentDraft: "Edited and submitted old transcript",
-      hydrated: oldReview.hydrated,
+      hydrated: submitting.hydrated,
     });
 
     expect(nextReview.hydrated?.ownsDraft).toBe(true);
     expect(nextReview.draftUpdate).toBe("New native transcript");
+  });
+
+  it("preserves a next-message draft when auto-rearm skips directly to the next review", () => {
+    const oldReview = reconcileReview({
+      snapshot: reviewingSnapshot("Old native transcript"),
+      target,
+      currentDraft: "",
+      hydrated: null,
+    });
+    const submitting = reconcileReview({
+      snapshot: {
+        ...reviewingSnapshot("Submitted transcript"),
+        phase: "submitting",
+        sequence: 13,
+      },
+      target,
+      currentDraft: "Submitted transcript",
+      hydrated: oldReview.hydrated,
+    });
+    const nextReview = reconcileReview({
+      snapshot: {
+        ...reviewingSnapshot("New native transcript"),
+        sequence: 20,
+        reviewId: 8,
+      },
+      target,
+      currentDraft: "Next message",
+      hydrated: submitting.hydrated,
+    });
+
+    expect(nextReview.hydrated?.ownsDraft).toBe(false);
+    expect(nextReview.draftUpdate).toBeNull();
   });
 
   it("fences a prior auto-rearm review even when the operation generation is unchanged", () => {
@@ -250,7 +321,7 @@ describe("Thread voice composer state", () => {
       hydrated: null,
     });
     const submitting: VoiceRuntimeSnapshot = {
-      ...reviewingSnapshot("First transcript"),
+      ...reviewingSnapshot("Edited first transcript"),
       phase: "submitting",
       sequence: 13,
     };
@@ -260,11 +331,15 @@ describe("Thread voice composer state", () => {
       currentDraft: "Edited first transcript",
       hydrated: first.hydrated,
     });
-    expect(betweenCycles.hydrated).toBe(first.hydrated);
+    expect(betweenCycles.hydrated?.submittedTranscript).toBe("Edited first transcript");
     expect(betweenCycles.draftUpdate).toBeNull();
 
     const waiting = reconcileReview({
-      snapshot: { ...reviewingSnapshot("First transcript"), phase: "waiting", sequence: 14 },
+      snapshot: {
+        ...reviewingSnapshot("Edited first transcript"),
+        phase: "waiting",
+        sequence: 14,
+      },
       target,
       currentDraft: "Edited first transcript",
       hydrated: betweenCycles.hydrated,
@@ -281,6 +356,90 @@ describe("Thread voice composer state", () => {
     expect(second.draftUpdate).toBe("Second transcript");
   });
 
+  it("uses a waiting snapshot to clear the exact submitted edit when submitting was missed", () => {
+    const review = reconcileReview({
+      snapshot: reviewingSnapshot("Original transcript"),
+      target,
+      currentDraft: "",
+      hydrated: null,
+    });
+    const waiting = reconcileReview({
+      snapshot: {
+        ...reviewingSnapshot("Edited and submitted transcript"),
+        phase: "waiting",
+        sequence: 14,
+      },
+      target,
+      currentDraft: "Edited and submitted transcript",
+      hydrated: review.hydrated,
+    });
+
+    expect(waiting).toEqual({ hydrated: null, draftUpdate: "" });
+  });
+
+  it("does not clear a next-message draft after the submitted review advances", () => {
+    const review = reconcileReview({
+      snapshot: reviewingSnapshot("Original transcript"),
+      target,
+      currentDraft: "",
+      hydrated: null,
+    });
+    const submitting = reconcileReview({
+      snapshot: {
+        ...reviewingSnapshot("Submitted transcript"),
+        phase: "submitting",
+        sequence: 13,
+      },
+      target,
+      currentDraft: "Submitted transcript",
+      hydrated: review.hydrated,
+    });
+    const waiting = reconcileReview({
+      snapshot: {
+        ...reviewingSnapshot("Submitted transcript"),
+        phase: "waiting",
+        sequence: 14,
+      },
+      target,
+      currentDraft: "Next message",
+      hydrated: submitting.hydrated,
+    });
+
+    expect(waiting).toEqual({ hydrated: null, draftUpdate: null });
+  });
+
+  it("does not clear submitted text after an attachment is added for the next message", () => {
+    const review = reconcileReview({
+      snapshot: reviewingSnapshot("Original transcript"),
+      target,
+      currentDraft: "",
+      hydrated: null,
+    });
+    const submitting = reconcileReview({
+      snapshot: {
+        ...reviewingSnapshot("Submitted transcript"),
+        phase: "submitting",
+        sequence: 13,
+      },
+      target,
+      currentDraft: "Submitted transcript",
+      hydrated: review.hydrated,
+    });
+    const waiting = reconcileReview({
+      snapshot: {
+        ...reviewingSnapshot("Submitted transcript"),
+        phase: "waiting",
+        sequence: 14,
+      },
+      target,
+      currentDraft: "Submitted transcript",
+      hasAttachments: true,
+      hydrated: submitting.hydrated,
+    });
+
+    expect(waiting).toEqual({ hydrated: null, draftUpdate: null });
+  });
+
   it("retains review-draft ownership across a composer remount until submission succeeds", () => {
     const tracker = new ThreadReviewHydrationTracker();
     const initial = tracker.reconcile({
@@ -288,21 +447,32 @@ describe("Thread voice composer state", () => {
       target,
       currentDraft: "",
       hasAttachments: false,
+      draftsReady: true,
     });
     expect(initial.draftUpdate).toBe("Native transcript");
 
     const submitting = tracker.reconcile({
-      snapshot: { ...reviewingSnapshot(), phase: "submitting", sequence: 13 },
+      snapshot: {
+        ...reviewingSnapshot("Edited before remount"),
+        phase: "submitting",
+        sequence: 13,
+      },
       target,
       currentDraft: "Edited before remount",
       hasAttachments: false,
+      draftsReady: true,
     });
     expect(submitting.draftUpdate).toBeNull();
     const afterNotificationSubmit = tracker.reconcile({
-      snapshot: { ...reviewingSnapshot(), phase: "waiting", sequence: 14 },
+      snapshot: {
+        ...reviewingSnapshot("Edited before remount"),
+        phase: "waiting",
+        sequence: 14,
+      },
       target,
       currentDraft: "Edited before remount",
       hasAttachments: false,
+      draftsReady: true,
     });
     expect(afterNotificationSubmit.draftUpdate).toBe("");
   });
@@ -314,6 +484,7 @@ describe("Thread voice composer state", () => {
       target,
       currentDraft: "",
       hasAttachments: false,
+      draftsReady: true,
     });
     tracker.reconcile({
       snapshot: {
@@ -325,6 +496,7 @@ describe("Thread voice composer state", () => {
       target: otherTarget,
       currentDraft: "",
       hasAttachments: false,
+      draftsReady: true,
     });
 
     const staleFirstTarget = tracker.reconcile({
@@ -332,6 +504,7 @@ describe("Thread voice composer state", () => {
       target,
       currentDraft: "Unrelated current draft",
       hasAttachments: false,
+      draftsReady: true,
     });
     expect(staleFirstTarget.hydrated?.ownsDraft).toBe(false);
     expect(staleFirstTarget.draftUpdate).toBeNull();
@@ -353,6 +526,7 @@ describe("Thread voice composer state", () => {
     const failed = reconcileReview({
       snapshot: {
         mode: "failed",
+        environmentId,
         operation: "thread",
         failure: { code: "dispatch-failed", message: "Dispatch failed", retryable: true },
         generation: 3,
@@ -415,9 +589,10 @@ describe("Thread voice composer state", () => {
     );
   });
 
-  it("limits an owned native review composer to plain text and lifecycle controls", () => {
+  it("keeps native Thread configuration immutable while allowing next-message payloads", () => {
+    const reviewing = reviewingSnapshot();
     expect(
-      threadVoiceComposerCapabilities(reviewingSnapshot(), target, {
+      threadVoiceComposerCapabilities(reviewing, target, {
         generation: 3,
         reviewId: 7,
       }),
@@ -426,11 +601,37 @@ describe("Thread voice composer state", () => {
       richPayload: false,
       configuration: false,
     });
-    expect(threadVoiceComposerCapabilities(reviewingSnapshot(), target, null)).toEqual({
+    expect(threadVoiceComposerCapabilities(reviewing, target, null)).toEqual({
       nativeReviewOwnsComposer: false,
       richPayload: true,
-      configuration: true,
+      configuration: false,
     });
+    expect(
+      threadVoiceComposerCapabilities(
+        { ...reviewing, phase: "waiting", sequence: 13 },
+        target,
+        null,
+      ),
+    ).toEqual({
+      nativeReviewOwnsComposer: false,
+      richPayload: true,
+      configuration: false,
+    });
+    expect(
+      threadVoiceComposerCapabilities(
+        {
+          mode: "switching-to-thread",
+          phase: "closing-realtime",
+          generation: reviewing.generation,
+          sequence: 11,
+          target: reviewing.target,
+          settings: reviewing.settings,
+        },
+        target,
+        null,
+      ).configuration,
+    ).toBe(false);
+    expect(threadVoiceComposerCapabilities(reviewing, otherTarget, null).configuration).toBe(true);
   });
 
   it("never falls back to ordinary send while the native Thread owns the cycle", () => {

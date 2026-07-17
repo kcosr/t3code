@@ -6,6 +6,7 @@ import {
   AuthSessionId,
   AuthVoiceUseScope,
   MessageId,
+  ORCHESTRATION_MESSAGE_TURN_ASSISTANT_MAX_CHARS,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -41,14 +42,10 @@ import {
   ProjectionThreadMessageRepository,
 } from "../../persistence/Services/ProjectionThreadMessages.ts";
 import {
-  type ProjectionThread,
-  ProjectionThreadRepository,
-} from "../../persistence/Services/ProjectionThreads.ts";
+  ProjectionThreadTurnOutcomeRepository,
+  type ProjectionThreadTurnOutcome,
+} from "../../persistence/Services/ProjectionThreadTurnOutcomes.ts";
 import type { ProjectionTurn } from "../../persistence/Services/ProjectionTurns.ts";
-import {
-  type ProjectionTurnStartOutcome,
-  ProjectionTurnStartRepository,
-} from "../../persistence/Services/ProjectionTurnStarts.ts";
 import {
   type DurableVoiceToolCall,
   VoiceToolCallRepository,
@@ -89,33 +86,17 @@ const projectionTurn = (input: {
   readonly state: ProjectionTurn["state"];
   readonly assistantMessageId?: MessageId | null;
   readonly turnId?: TurnId;
-}): ProjectionTurnStartOutcome => ({
-  start: {
-    threadId,
-    messageId: input.pendingMessageId,
-    turnId: input.turnId ?? turnId,
-    state: "accepted",
-    sourceProposedPlanThreadId: null,
-    sourceProposedPlanId: null,
-    requestedAt: now,
-    resolvedAt: now,
-  },
-  turn: {
-    threadId,
-    turnId: input.turnId ?? turnId,
-    assistantMessageId: input.assistantMessageId ?? null,
-    state: input.state,
-    requestedAt: now,
-    startedAt: now,
-    completedAt:
-      input.state === "completed" || input.state === "interrupted" || input.state === "error"
-        ? nextMinute
-        : null,
-    checkpointTurnCount: null,
-    checkpointRef: null,
-    checkpointStatus: null,
-    checkpointFiles: [],
-  },
+}): ProjectionThreadTurnOutcome & { readonly dispatchedMessageId: MessageId } => ({
+  dispatchedMessageId: input.pendingMessageId,
+  threadExists: true,
+  messageExists: true,
+  latestTurnId: input.turnId ?? turnId,
+  pendingApprovalCount: 0,
+  pendingUserInputCount: 0,
+  startState: "accepted",
+  turnId: input.turnId ?? turnId,
+  turnState: input.state,
+  assistantMessageId: input.assistantMessageId ?? null,
 });
 
 const project: OrchestrationProjectShell = {
@@ -165,25 +146,6 @@ const snapshot: OrchestrationShellSnapshot = {
   updatedAt: now,
 };
 
-const projectionThread = (shell: OrchestrationThreadShell): ProjectionThread => ({
-  threadId: shell.id,
-  projectId: shell.projectId,
-  title: shell.title,
-  modelSelection: shell.modelSelection,
-  runtimeMode: shell.runtimeMode,
-  interactionMode: shell.interactionMode,
-  branch: shell.branch,
-  worktreePath: shell.worktreePath,
-  latestTurnId: shell.latestTurn?.turnId ?? null,
-  createdAt: shell.createdAt,
-  updatedAt: shell.updatedAt,
-  archivedAt: shell.archivedAt,
-  latestUserMessageAt: shell.latestUserMessageAt,
-  pendingApprovalCount: shell.hasPendingApprovals ? 1 : 0,
-  pendingUserInputCount: shell.hasPendingUserInput ? 1 : 0,
-  hasActionableProposedPlan: shell.hasActionableProposedPlan ? 1 : 0,
-  deletedAt: null,
-});
 const encodeJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString) as (
   input: string,
@@ -193,7 +155,9 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
   retention: "durable" | "ephemeral" = "durable",
   projection?: {
     readonly messages?: ReadonlyArray<ProjectionThreadMessage>;
-    readonly turns?: ReadonlyArray<ProjectionTurnStartOutcome>;
+    readonly turns?: ReadonlyArray<
+      ProjectionThreadTurnOutcome & { readonly dispatchedMessageId: MessageId }
+    >;
     readonly thread?: OrchestrationThreadShell;
     readonly blockMessagePage?: boolean;
     readonly blockTurnLookupAfterFirst?: boolean;
@@ -232,16 +196,6 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
         Effect.map((current) => (id === threadId ? Option.some(current) : Option.none())),
       ),
   } as unknown as ProjectionSnapshotQuery["Service"];
-  const threadRepository = {
-    getById: ({ threadId: requestedThreadId }: { readonly threadId: ThreadId }) =>
-      Ref.get(threadShell).pipe(
-        Effect.map((current) =>
-          requestedThreadId === threadId
-            ? Option.some(projectionThread(current))
-            : Option.none<ProjectionThread>(),
-        ),
-      ),
-  } as unknown as ProjectionThreadRepository["Service"];
   const dispatcher = ClientCommandDispatcher.of({
     dispatch: (command) =>
       Ref.update(commands, (all) => [...all, command]).pipe(Effect.as({ sequence: 42 })),
@@ -344,32 +298,77 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
       ),
     deleteByThreadId: () => Effect.die("unused"),
   } as unknown as ProjectionThreadMessageRepository["Service"];
-  const turnStartRepository = {
-    upsert: () => Effect.die("unused"),
-    getByMessageId: () => Effect.die("unused"),
-    getOutcomeByMessageId: (input: {
-      readonly threadId: ThreadId;
-      readonly messageId: MessageId;
-    }) =>
+  const turnOutcomeRepository = ProjectionThreadTurnOutcomeRepository.of({
+    getByMessageId: (input: { readonly threadId: ThreadId; readonly messageId: MessageId }) =>
       Deferred.succeed(turnLookupStarted, undefined).pipe(
         Effect.andThen(Ref.getAndUpdate(turnLookupCount, (count) => count + 1)),
         Effect.flatMap((lookupCount) =>
           projection?.blockTurnLookupAfterFirst === true && lookupCount > 0
             ? Effect.never
-            : Ref.get(projectionTurns),
+            : Effect.all([
+                Ref.get(projectionTurns),
+                Ref.get(projectionMessages),
+                Ref.get(threadShell),
+              ]),
         ),
-        Effect.map((all) =>
+        Effect.map(([turns, messages, currentThread]) => {
+          const matching = turns.find((item) => item.dispatchedMessageId === input.messageId);
+          const messageExists = messages.some(
+            (item) =>
+              item.messageId === input.messageId &&
+              item.threadId === input.threadId &&
+              item.role === "user",
+          );
+          const attention = {
+            latestTurnId: currentThread.latestTurn?.turnId ?? null,
+            pendingApprovalCount: currentThread.hasPendingApprovals ? 1 : 0,
+            pendingUserInputCount: currentThread.hasPendingUserInput ? 1 : 0,
+          };
+          return matching === undefined
+            ? {
+                threadExists:
+                  input.threadId === currentThread.id && currentThread.archivedAt === null,
+                messageExists,
+                ...attention,
+                startState: null,
+                turnId: null,
+                turnState: null,
+                assistantMessageId: null,
+              }
+            : {
+                ...matching,
+                threadExists:
+                  input.threadId === currentThread.id && currentThread.archivedAt === null,
+                messageExists,
+                ...attention,
+              };
+        }),
+      ),
+    getSettledAssistant: (input) =>
+      Ref.get(projectionMessages).pipe(
+        Effect.map((messages) =>
           Option.fromUndefinedOr(
-            all.find(
-              (item) =>
-                item.start.threadId === input.threadId && item.start.messageId === input.messageId,
+            messages.find(
+              (message) =>
+                message.messageId === input.messageId &&
+                message.threadId === input.threadId &&
+                message.turnId === input.turnId &&
+                message.role === "assistant" &&
+                !message.isStreaming,
             ),
           ),
         ),
+        Effect.map(
+          Option.map((message) => ({
+            messageId: message.messageId,
+            text: message.text.slice(0, ORCHESTRATION_MESSAGE_TURN_ASSISTANT_MAX_CHARS),
+            truncated: message.text.length > ORCHESTRATION_MESSAGE_TURN_ASSISTANT_MAX_CHARS,
+            createdAt: message.createdAt,
+            updatedAt: message.updatedAt,
+          })),
+        ),
       ),
-    listByThreadId: () => Effect.die("unused"),
-    deleteByThreadId: () => Effect.die("unused"),
-  } as unknown as ProjectionTurnStartRepository["Service"];
+  });
   const conversations = VoiceConversationService.of({
     create: () => Effect.die("unused"),
     listDurable: () => Effect.die("unused"),
@@ -519,9 +518,8 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
   });
   const baseDependencies = Layer.mergeAll(
     Layer.succeed(ProjectionSnapshotQuery, query),
-    Layer.succeed(ProjectionThreadRepository, threadRepository),
     Layer.succeed(ProjectionThreadMessageRepository, messageRepository),
-    Layer.succeed(ProjectionTurnStartRepository, turnStartRepository),
+    Layer.succeed(ProjectionThreadTurnOutcomeRepository, turnOutcomeRepository),
     Layer.succeed(ClientCommandDispatcher, dispatcher),
     Layer.succeed(HistorySearchService, history),
     Layer.succeed(VoiceConversationService, conversations),
@@ -1454,17 +1452,16 @@ it.effect("reports pending, accepted-without-lifecycle, failed, and ambiguous st
       state: "pending" | "accepted" | "failed" | "ambiguous",
       acceptedId: TurnId | null,
     ) => ({
-      start: {
-        threadId,
-        messageId,
-        turnId: acceptedId,
-        state,
-        sourceProposedPlanThreadId: null,
-        sourceProposedPlanId: null,
-        requestedAt: now,
-        resolvedAt: state === "pending" ? null : nextMinute,
-      },
-      turn: null,
+      dispatchedMessageId: messageId,
+      threadExists: true,
+      messageExists: true,
+      latestTurnId: null,
+      pendingApprovalCount: 0,
+      pendingUserInputCount: 0,
+      startState: state,
+      turnId: acceptedId,
+      turnState: null,
+      assistantMessageId: null,
     });
     const test = yield* makeTest("durable", {
       messages: [pendingMessageId, acceptedMessageId, failedMessageId, ambiguousMessageId].map(

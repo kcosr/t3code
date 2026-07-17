@@ -201,6 +201,24 @@ describe("traditional audio handoff coordination", () => {
     expect(order).toEqual(["realtime-stopped", "playback-interrupted", "dictation-started"]);
   });
 
+  it("does not continue a dictation handoff when native voice fails to stop", async () => {
+    const interruptPlayback = vi.fn(async () => true);
+    const startDictation = vi.fn(async () => true);
+
+    await expect(
+      startDictationWithAudioHandoff({
+        stopRealtime: async () => {
+          throw new Error("native media is still active");
+        },
+        interruptPlayback,
+        startDictation,
+        resumePlayback: vi.fn(),
+      }),
+    ).rejects.toThrow("native media is still active");
+    expect(interruptPlayback).not.toHaveBeenCalled();
+    expect(startDictation).not.toHaveBeenCalled();
+  });
+
   it("resumes playback exactly once when dictation fails to start", async () => {
     const resumePlayback = vi.fn();
     await expect(

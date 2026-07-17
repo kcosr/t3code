@@ -137,12 +137,20 @@ internal object T3VoiceRuntimeBridgeInput {
   private fun threadTarget(input: Map<String, Any?>): T3VoiceThreadTarget {
     input.requireExactBridgeKeys(
       "Thread target",
-      setOf("environmentId", "projectId", "threadId", "runtimeMode", "interactionMode"),
+      setOf(
+        "environmentId",
+        "projectId",
+        "threadId",
+        "modelSelection",
+        "runtimeMode",
+        "interactionMode",
+      ),
     )
     return T3VoiceThreadTarget(
       environmentId = input.requireBridgeIdentifier("environmentId"),
       projectId = input.requireBridgeIdentifier("projectId"),
       threadId = input.requireBridgeIdentifier("threadId"),
+      modelSelection = modelSelection(input.requireBridgeObject("modelSelection")),
       runtimeMode =
         when (input.requireBridgeText("runtimeMode")) {
           "approval-required" -> T3VoiceThreadRuntimeMode.APPROVAL_REQUIRED
@@ -155,6 +163,31 @@ internal object T3VoiceRuntimeBridgeInput {
           "default" -> T3VoiceThreadInteractionMode.DEFAULT
           "plan" -> T3VoiceThreadInteractionMode.PLAN
           else -> error("interactionMode must be default or plan.")
+        },
+    )
+  }
+
+  private fun modelSelection(input: Map<String, Any?>): T3VoiceModelSelection {
+    input.requireAllowedBridgeKeys(
+      "Thread model selection",
+      required = setOf("instanceId", "model"),
+      allowed = setOf("instanceId", "model", "options"),
+    )
+    return T3VoiceModelSelection(
+      instanceId = input.requireBridgeIdentifier("instanceId"),
+      model = input.requireBridgeText("model"),
+      options =
+        input.optionalBridgeObjectList("options")?.map { option ->
+          option.requireExactBridgeKeys("Thread model option", setOf("id", "value"))
+          T3VoiceModelOption(
+            id = option.requireBridgeText("id"),
+            value =
+              when (val value = option["value"]) {
+                is String -> T3VoiceModelOptionValue.StringValue(value)
+                is Boolean -> T3VoiceModelOptionValue.BooleanValue(value)
+                else -> error("Thread model option value must be a string or boolean.")
+              },
+          )
         },
     )
   }

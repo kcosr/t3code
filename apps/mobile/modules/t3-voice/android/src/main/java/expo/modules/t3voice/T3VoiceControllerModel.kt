@@ -38,10 +38,74 @@ internal enum class T3VoiceThreadInteractionMode {
   PLAN,
 }
 
+internal sealed interface T3VoiceModelOptionValue {
+  data class StringValue(val value: String) : T3VoiceModelOptionValue {
+    init {
+      require(value.isNotBlank() && value == value.trim()) {
+        "Model option string values must be trimmed and non-empty."
+      }
+    }
+  }
+
+  data class BooleanValue(val value: Boolean) : T3VoiceModelOptionValue
+}
+
+internal data class T3VoiceModelOption(
+  val id: String,
+  val value: T3VoiceModelOptionValue,
+) {
+  init {
+    require(id.isNotBlank() && id == id.trim()) {
+      "Model option ids must be trimmed and non-empty."
+    }
+  }
+}
+
+internal data class T3VoiceModelSelection(
+  val instanceId: String,
+  val model: String,
+  val options: List<T3VoiceModelOption>?,
+) {
+  init {
+    require(PROVIDER_INSTANCE_ID.matches(instanceId)) { "Model instanceId is invalid." }
+    require(model.isNotBlank() && model == model.trim()) {
+      "Model id must be trimmed and non-empty."
+    }
+  }
+
+  private companion object {
+    val PROVIDER_INSTANCE_ID = Regex("^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
+  }
+}
+
+internal fun T3VoiceModelSelection.toCanonicalWireBody(): Map<String, Any> =
+  buildMap {
+    put("instanceId", instanceId)
+    put("model", model)
+    if (options != null) {
+      put(
+        "options",
+        options.map { option ->
+          mapOf(
+            "id" to option.id,
+            "value" to option.value.canonicalWireValue(),
+          )
+        },
+      )
+    }
+  }
+
+private fun T3VoiceModelOptionValue.canonicalWireValue(): Any =
+  when (this) {
+    is T3VoiceModelOptionValue.StringValue -> value
+    is T3VoiceModelOptionValue.BooleanValue -> value
+  }
+
 internal data class T3VoiceThreadTarget(
   val environmentId: String,
   val projectId: String,
   val threadId: String,
+  val modelSelection: T3VoiceModelSelection,
   val runtimeMode: T3VoiceThreadRuntimeMode,
   val interactionMode: T3VoiceThreadInteractionMode,
 ) {
@@ -323,9 +387,14 @@ internal sealed interface T3VoiceControllerState {
   ) : T3VoiceControllerState
 
   data class Failed(
+    val environmentId: String,
     val operation: T3VoiceOperation,
     val failure: T3VoiceFailure,
-  ) : T3VoiceControllerState
+  ) : T3VoiceControllerState {
+    init {
+      require(environmentId.isNotBlank()) { "environmentId must be non-empty." }
+    }
+  }
 }
 
 internal data class T3VoiceControllerSnapshot(
