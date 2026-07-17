@@ -64,7 +64,6 @@ provider control events.
 - Making the Realtime voice agent a coding-agent provider.
 - Relaying Realtime audio through the T3 server.
 - Sharing implementation code between Android and iOS media stacks.
-- Hiding synthetic speech from the user. The UI must disclose that generated voices are AI voices.
 - Representing a voice conversation as a T3 coding thread. A durable voice journal is a separate
   record; the user may explicitly send selected transcript content to a coding thread.
 
@@ -771,9 +770,11 @@ end state.
 - Streaming PCM TTS is written incrementally to `AudioTrack` with cancellation and audio focus.
 - Realtime sessions use WebRTC's native audio device path instead of manually copying realtime PCM
   through JavaScript.
-- The first Android engine is exactly pinned `io.github.webrtc-sdk:android:144.7559.09`, isolated behind
-  `T3VoiceWebRtcSession`, and reviewed for security, version age, ABI size, and 16 KB page support
-  before release. `AudioRecord`/`AudioTrack` are bounded STT/TTS paths only.
+- The first Android engine is exactly pinned `io.github.webrtc-sdk:android:144.7559.09` and isolated
+  behind `T3VoiceWebRtcSession`. Release acceptance requires inspecting the resolved AAR and final
+  APK—not merely relying on the dependency pin or a successful build—for security and version age,
+  packaged ABI set and size, and 16 KB ELF and ZIP alignment. `AudioRecord`/`AudioTrack` are bounded
+  STT/TTS paths only.
 - Only one capture owner exists at a time. Starting capture stops conflicting playback unless the
   active mode explicitly supports barge-in.
 - Bluetooth, wired headset, speaker, and earpiece routes are represented as stable platform-neutral
@@ -911,7 +912,6 @@ The UI provides:
 - a visible Realtime voice-session surface;
 - input/output route status;
 - explicit confirmation UI for mutating tools;
-- synthetic-voice disclosure;
 - clear error and reconnect states.
 
 ## iOS and Desktop
@@ -1045,7 +1045,8 @@ never required for the default suite.
 - recognition delta/final reconciliation and ordered segmented speech queues;
 - audio focus and route changes;
 - service start/stop and notification behavior;
-- activity recreation while playback or Realtime media is active;
+- native-service bind/unbind/rebind and React adapter hydration from simulated active Realtime and
+  Thread snapshots without issuing duplicate starts;
 - WebRTC signaling and event correlation with a fake peer;
 - cancellation and network-loss cleanup;
 - clean Expo prebuild preserves module service and permissions in the merged manifest;

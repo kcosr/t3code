@@ -21,10 +21,10 @@ import kotlinx.coroutines.launch
 
 class T3VoiceModule : Module() {
   @Volatile private var binder: T3VoiceRuntimeService.VoiceBinder? = null
-  @Volatile private var serviceBound = false
-  @Volatile private var destroyed = false
   private val binderLock = Any()
   private val mainHandler = Handler(Looper.getMainLooper())
+  private val serviceBinding = T3VoiceServiceBindingState()
+  private val serviceBindingAttempts = mutableMapOf<Long, ServiceBindingAttempt>()
   private val pendingBinderOperations = T3VoiceBinderOperationRegistry<PendingBinderOperation>()
   private var runtimeSnapshotCollection: Job? = null
   private var eventCollection: Job? = null
@@ -32,6 +32,14 @@ class T3VoiceModule : Module() {
   private var playbackTerminationCollection: Job? = null
   private var rebindScheduled = false
   private var rebindAttemptedSinceConnection = false
+
+  private class ServiceBindingAttempt(
+    val context: Context,
+    val connection: ServiceConnection,
+    var bindCompleted: Boolean = false,
+    var bindSucceeded: Boolean = false,
+    var releaseRequested: Boolean = false,
+  )
 
   private class PendingBinderOperation(
     val promise: Promise,
@@ -56,13 +64,13 @@ class T3VoiceModule : Module() {
     }
   }
 
-  private val serviceConnection =
+  private fun createServiceConnection(attemptId: Long): ServiceConnection =
     object : ServiceConnection {
       override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
         val connectedBinder = service as? T3VoiceRuntimeService.VoiceBinder ?: return
         val dispatches =
           synchronized(binderLock) {
-            if (destroyed) return
+            if (!serviceBinding.connected(attemptId)) return
             binder = connectedBinder
             rebindScheduled = false
             rebindAttemptedSinceConnection = false
@@ -111,6 +119,7 @@ class T3VoiceModule : Module() {
 
       override fun onServiceDisconnected(name: ComponentName?) {
         handleBindingLoss(
+          attemptId,
           "The T3 voice runtime service disconnected during the operation.",
           rebind = false,
         )
@@ -118,6 +127,7 @@ class T3VoiceModule : Module() {
 
       override fun onBindingDied(name: ComponentName?) {
         handleBindingLoss(
+          attemptId,
           "The T3 voice runtime service binding died during the operation.",
           rebind = true,
         )
@@ -125,6 +135,7 @@ class T3VoiceModule : Module() {
 
       override fun onNullBinding(name: ComponentName?) {
         handleBindingLoss(
+          attemptId,
           "The T3 voice runtime service returned an invalid binding.",
           rebind = true,
         )
@@ -148,31 +159,29 @@ class T3VoiceModule : Module() {
 
       OnCreate {
         synchronized(binderLock) {
-          destroyed = false
+          serviceBinding.reset()
           rebindScheduled = false
           rebindAttemptedSinceConnection = false
         }
         val context = appContext.reactContext ?: return@OnCreate
-        val intent = Intent(context, T3VoiceRuntimeService::class.java)
-        serviceBound = context.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        ensureServiceBinding(context)
       }
 
       OnDestroy {
-        destroyed = true
         cancelCollections()
-        val context = appContext.reactContext
-        val pending = synchronized(binderLock) { pendingBinderOperations.destroy() }
+        val (bindingAttemptId, pending) =
+          synchronized(binderLock) {
+            rebindScheduled = false
+            serviceBinding.destroy() to pendingBinderOperations.destroy()
+          }
         pending.forEach { entry ->
           rejectPendingOperation(
             entry.value,
             "The T3 voice module was destroyed before the operation completed.",
           )
         }
-        if (serviceBound && context != null) {
-          runCatching { context.unbindService(serviceConnection) }
-        }
+        bindingAttemptId?.let(::releaseServiceBindingAttempt)
         synchronized(binderLock) { binder = null }
-        serviceBound = false
       }
 
       AsyncFunction("getMediaCapabilitiesAsync") {
@@ -483,12 +492,21 @@ class T3VoiceModule : Module() {
 
     }
 
-  private fun handleBindingLoss(message: String, rebind: Boolean) {
+  private fun handleBindingLoss(attemptId: Long, message: String, rebind: Boolean) {
+    var accepted = false
     val disconnected =
       synchronized(binderLock) {
+        accepted =
+          if (rebind) {
+            serviceBinding.invalidate(attemptId)
+          } else {
+            serviceBinding.disconnected(attemptId)
+          }
+        if (!accepted) return@synchronized emptyList()
         binder = null
         pendingBinderOperations.disconnected()
       }
+    if (!accepted) return
     cancelCollections()
     disconnected.forEach { entry -> rejectPendingOperation(entry.value, message) }
     if (rebind) scheduleServiceRebind()
@@ -525,7 +543,7 @@ class T3VoiceModule : Module() {
   private fun scheduleServiceRebind() {
     val shouldSchedule =
       synchronized(binderLock) {
-        if (destroyed || rebindScheduled) {
+        if (rebindScheduled || !serviceBinding.hasInvalidatedBinding()) {
           false
         } else {
           rebindScheduled = true
@@ -536,37 +554,97 @@ class T3VoiceModule : Module() {
 
     mainHandler.post {
       val context = appContext.reactContext
-      val shouldRebind =
+      val invalidatedBinding =
         synchronized(binderLock) {
           if (!rebindScheduled) return@post
           rebindScheduled = false
-          if (destroyed || context == null) {
-            false
-          } else if (rebindAttemptedSinceConnection) {
-            false
-          } else {
+          val shouldRebind = context != null && !rebindAttemptedSinceConnection
+          if (shouldRebind) {
             rebindAttemptedSinceConnection = true
-            true
           }
+          serviceBinding.takeInvalidatedBinding(shouldRebind)
         }
-      if (serviceBound && context != null) {
-        runCatching { context.unbindService(serviceConnection) }
-        serviceBound = false
+      if (invalidatedBinding != null) {
+        releaseServiceBindingAttempt(invalidatedBinding.invalidatedAttemptId)
       }
-      if (!shouldRebind || context == null) return@post
-
-      synchronized(binderLock) {
-        if (destroyed) return@post
-        serviceBound =
-          runCatching {
-            context.bindService(
-              Intent(context, T3VoiceRuntimeService::class.java),
-              serviceConnection,
-              Context.BIND_AUTO_CREATE,
-            )
-          }.getOrDefault(false)
+      val replacementAttemptId = invalidatedBinding?.replacementAttemptId
+      if (replacementAttemptId != null && context != null) {
+        performServiceBind(context, replacementAttemptId)
+      } else if (invalidatedBinding != null) {
+        rejectOperationsWaitingForBinding(
+          "The T3 voice runtime service binding could not be restored.",
+        )
       }
     }
+  }
+
+  private fun ensureServiceBinding(context: Context): Boolean {
+    val request = synchronized(binderLock) { serviceBinding.requestBinding() }
+    return when (request.kind) {
+      T3VoiceServiceBindingState.BindingRequestKind.DESTROYED -> false
+      T3VoiceServiceBindingState.BindingRequestKind.ACTIVE -> true
+      T3VoiceServiceBindingState.BindingRequestKind.START_BIND ->
+        performServiceBind(context, requireNotNull(request.attemptId))
+    }
+  }
+
+  private fun performServiceBind(context: Context, attemptId: Long): Boolean {
+    val attempt =
+      ServiceBindingAttempt(
+        context = context,
+        connection = createServiceConnection(attemptId),
+      )
+    synchronized(binderLock) { serviceBindingAttempts[attemptId] = attempt }
+    val succeeded =
+      runCatching {
+        context.bindService(
+          Intent(context, T3VoiceRuntimeService::class.java),
+          attempt.connection,
+          Context.BIND_AUTO_CREATE,
+        )
+      }.getOrDefault(false)
+    var release: ServiceBindingAttempt? = null
+    val completion =
+      synchronized(binderLock) {
+        attempt.bindCompleted = true
+        attempt.bindSucceeded = succeeded
+        serviceBinding.completeBinding(attemptId, succeeded).also { result ->
+          if (result.releaseAttempt) attempt.releaseRequested = true
+          if (!succeeded || attempt.releaseRequested) {
+            serviceBindingAttempts.remove(attemptId)
+            if (succeeded && attempt.releaseRequested) release = attempt
+          }
+        }
+      }
+    release?.let(::unbindServiceBindingAttempt)
+    if (!completion.available && !synchronized(binderLock) { serviceBinding.isAvailable() }) {
+      rejectOperationsWaitingForBinding(
+        "The T3 voice runtime service could not be bound.",
+      )
+    }
+    return completion.available
+  }
+
+  private fun releaseServiceBindingAttempt(attemptId: Long) {
+    var release: ServiceBindingAttempt? = null
+    synchronized(binderLock) {
+      val attempt = serviceBindingAttempts[attemptId] ?: return
+      attempt.releaseRequested = true
+      if (attempt.bindCompleted) {
+        serviceBindingAttempts.remove(attemptId)
+        if (attempt.bindSucceeded) release = attempt
+      }
+    }
+    release?.let(::unbindServiceBindingAttempt)
+  }
+
+  private fun unbindServiceBindingAttempt(attempt: ServiceBindingAttempt) {
+    runCatching { attempt.context.unbindService(attempt.connection) }
+  }
+
+  private fun rejectOperationsWaitingForBinding(message: String) {
+    val disconnected = synchronized(binderLock) { pendingBinderOperations.disconnected() }
+    disconnected.forEach { entry -> rejectPendingOperation(entry.value, message) }
   }
 
   private fun withBinder(
@@ -575,13 +653,16 @@ class T3VoiceModule : Module() {
     operation: (T3VoiceRuntimeService.VoiceBinder, BinderSettlement) -> Unit,
   ) {
     val pending = PendingBinderOperation(promise, errorCode, operation)
+    val context = appContext.reactContext
+    if (context != null) ensureServiceBinding(context)
     var dispatch: T3VoiceBinderOperationRegistry.Dispatch<PendingBinderOperation>? = null
     var connectedBinder: T3VoiceRuntimeService.VoiceBinder? = null
     var unavailableMessage: String? = null
     synchronized(binderLock) {
       when {
-        destroyed -> unavailableMessage = "The T3 voice module was destroyed."
-        !serviceBound ->
+        serviceBinding.isDestroyed() ->
+          unavailableMessage = "The T3 voice module was destroyed."
+        !serviceBinding.isAvailable() ->
           unavailableMessage = "The T3 voice runtime service could not be bound."
         else -> {
           val registration = pendingBinderOperations.register(pending)
@@ -616,11 +697,32 @@ class T3VoiceModule : Module() {
   }
 
   private fun timeoutBinderOperation(ticket: T3VoiceBinderOperationRegistry.Ticket) {
-    val timedOut = synchronized(binderLock) { pendingBinderOperations.timeout(ticket) } ?: return
+    var bindingInvalidated = false
+    var disconnected = emptyList<T3VoiceBinderOperationRegistry.Entry<PendingBinderOperation>>()
+    val timedOut =
+      synchronized(binderLock) {
+        val operation = pendingBinderOperations.timeout(ticket) ?: return
+        if (serviceBinding.invalidateCurrent() != null) {
+          bindingInvalidated = true
+          binder = null
+          disconnected = pendingBinderOperations.disconnected()
+        }
+        operation
+      }
     rejectPendingOperation(
       timedOut.value,
       "The T3 voice runtime service did not connect in time.",
     )
+    if (bindingInvalidated) {
+      cancelCollections()
+      disconnected.forEach { entry ->
+        rejectPendingOperation(
+          entry.value,
+          "The T3 voice runtime service did not connect in time.",
+        )
+      }
+      scheduleServiceRebind()
+    }
   }
 
   private fun executeBinderOperation(
