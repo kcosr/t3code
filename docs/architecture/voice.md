@@ -187,10 +187,12 @@ quiescence.
 ### Thread-to-Realtime
 
 Before admission, React performs the visible permission checks and obtains a fresh bounded native
-child credential. Android then stops the active Thread recorder, request, wait, or playback path,
-waits for its exact release callback, advances the generation, and starts the selected Realtime
-conversation. Once admitted, Activity backgrounding or React detachment does not interrupt the
-transition. Stop during the transition cancels the pending Realtime start.
+child credential. The Android adapter re-reads the native mode immediately before admission and
+selects either an Idle start or a Thread handoff, so a mode change during permission prompts cannot
+send the stale command. For a handoff, Android stops the active Thread recorder, request, wait, or
+playback path, waits for its exact release callback, advances the generation, and starts the
+selected Realtime conversation. Once admitted, Activity backgrounding or React detachment does not
+interrupt the transition. Stop during the transition cancels the pending Realtime start.
 
 ## Thread voice
 
@@ -235,6 +237,10 @@ The notification is derived from the current controller snapshot:
 
 MediaSession transport controls map to the same native commands. Notification permission denial
 reduces drawer visibility but does not create a second control path.
+
+The app persists the user's preferred Realtime output route and reapplies it when that route is
+available in a later Realtime session. Native route loss still falls back to an available system
+route.
 
 ## Authentication and authorization
 

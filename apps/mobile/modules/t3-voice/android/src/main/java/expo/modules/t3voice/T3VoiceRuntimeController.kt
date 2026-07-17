@@ -336,6 +336,12 @@ internal class T3VoiceRuntimeController(
         if (state.target.environmentId != target.environmentId) {
           return rejected(T3VoiceCommandRejection.INVALID_STATE)
         }
+        if (
+          state.stage == T3VoiceThreadStage.STARTING &&
+            replacePendingInitialThreadStart(target, session)
+        ) {
+          return applied()
+        }
         val threadStart = T3VoiceThreadStart(state.target, state.settings)
         pendingThreadToRealtime =
           PendingThreadToRealtime(
@@ -348,10 +354,6 @@ internal class T3VoiceRuntimeController(
             threadStart = threadStart,
             realtimeTarget = target,
           )
-        if (state.stage == T3VoiceThreadStage.STARTING && clearPendingInitialStart()) {
-          startRealtimeAfterThread(switching)
-          return applied()
-        }
         update(switching)
         if (state.stage != T3VoiceThreadStage.STOPPING) {
           runDriver(T3VoiceOperation.SWITCHING_TO_REALTIME) {
@@ -1016,7 +1018,7 @@ internal class T3VoiceRuntimeController(
   private fun startRealtimeAfterThread(state: T3VoiceControllerState.SwitchingToRealtime) {
     val pending =
       pendingThreadToRealtime?.takeIf { it.generation == current.generation }
-        ?: error("The pending Realtime target was lost during the Thread switch.")
+        ?: error("The pending Realtime admission was lost during the Thread switch.")
     pendingThreadToRealtime = null
     advanceGeneration(emptyRealtimeState(T3VoiceRealtimeStage.STARTING, state.realtimeTarget))
     runDriver(T3VoiceOperation.SWITCHING_TO_REALTIME) {
@@ -1146,6 +1148,17 @@ internal class T3VoiceRuntimeController(
   private fun clearPendingInitialStart(): Boolean {
     if (pendingInitialStart?.generation != current.generation) return false
     pendingInitialStart = null
+    return true
+  }
+
+  private fun replacePendingInitialThreadStart(
+    target: T3VoiceRealtimeTarget,
+    session: T3VoiceNativeSessionConfig,
+  ): Boolean {
+    val pending = pendingInitialStart as? PendingInitialStart.Thread ?: return false
+    if (pending.generation != current.generation) return false
+    pendingInitialStart = PendingInitialStart.Realtime(current.generation, target, session)
+    update(emptyRealtimeState(T3VoiceRealtimeStage.STARTING, target))
     return true
   }
 

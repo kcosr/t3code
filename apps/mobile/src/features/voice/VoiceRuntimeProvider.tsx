@@ -122,6 +122,9 @@ const EMPTY_REALTIME_TRANSCRIPT: ReadonlyArray<RealtimeVoiceTranscriptTurn> = []
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
 
+const canStartRealtimeFrom = (snapshot: VoiceRuntimeSnapshot): boolean =>
+  snapshot.mode === "idle" || snapshot.mode === "failed" || snapshot.mode === "thread";
+
 export function VoiceRuntimeProvider(props: {
   readonly children: ReactNode;
   readonly environmentId: EnvironmentId | null;
@@ -219,6 +222,10 @@ export function VoiceRuntimeProvider(props: {
     },
     [controllerEnvironmentId, conversationClient],
   );
+
+  useEffect(() => {
+    if (!canStartRealtimeFrom(snapshot)) resumeAbortRef.current?.abort();
+  }, [snapshot]);
 
   useEffect(() => {
     let disposed = false;
@@ -412,13 +419,9 @@ export function VoiceRuntimeProvider(props: {
   }, []);
 
   const performRealtimeStart = useCallback(
-    async (
-      runtime: NativeRuntimeConnection,
-      target: VoiceRealtimeTarget,
-      isCancelled: () => boolean = () => false,
-    ) => {
+    async (runtime: NativeRuntimeConnection, target: VoiceRealtimeTarget, signal?: AbortSignal) => {
       const runtimeStillMatchesTarget = () =>
-        !isCancelled() &&
+        signal?.aborted !== true &&
         runtimeRef.current === runtime &&
         voiceRuntimeCommandEnvironmentMatches(
           target.environmentId,
@@ -433,18 +436,18 @@ export function VoiceRuntimeProvider(props: {
           return;
         }
         const current = snapshotRef.current;
+        if (!canStartRealtimeFrom(current)) {
+          releaseTraditionalAudio();
+          return;
+        }
         if (current.mode === "failed") await runtime.adapter.stop();
         if (!runtimeStillMatchesTarget()) {
           releaseTraditionalAudio();
           return;
         }
+        await runtime.adapter.startRealtime(target, { signal });
         lastRealtimeTargetRef.current = target;
         handledFailureSequenceRef.current = null;
-        if (current.mode === "thread") {
-          await runtime.adapter.switchThreadToRealtime(target);
-        } else {
-          await runtime.adapter.startRealtime(target);
-        }
       } catch (cause) {
         releaseTraditionalAudio?.();
         throw cause;
@@ -465,7 +468,7 @@ export function VoiceRuntimeProvider(props: {
           controllerEnvironmentIdRef.current,
         ) ||
         voiceStartTransitionRef.current.active ||
-        (current.mode !== "idle" && current.mode !== "failed" && current.mode !== "thread")
+        !canStartRealtimeFrom(current)
       ) {
         return;
       }
@@ -700,7 +703,7 @@ export function VoiceRuntimeProvider(props: {
             conversation,
             ...targetContext,
           },
-          () => abort.signal.aborted,
+          abort.signal,
         );
       })
       .catch((cause) => {
@@ -1006,7 +1009,9 @@ export function VoiceRuntimeProvider(props: {
           onTranscript={() => setTranscriptVisible(true)}
           onResume={resume}
           resumePending={resumePending}
-          onHistory={() => setBrowserVisible(true)}
+          onHistory={() => {
+            if (!voiceStartTransitionRef.current.active) setBrowserVisible(true);
+          }}
           onStop={() => {
             void stop().catch((cause) => Alert.alert("Could not stop voice", errorMessage(cause)));
           }}

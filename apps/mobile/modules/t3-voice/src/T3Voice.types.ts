@@ -191,6 +191,7 @@ export type T3VoiceDiagnosticCode =
   | "device-callback-unregistered"
   | "ended"
   | "failed"
+  | "realtime-drain-timed-out"
   | "endpoint-sample"
   | "endpoint-terminated";
 

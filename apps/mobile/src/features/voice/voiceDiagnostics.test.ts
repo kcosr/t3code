@@ -59,4 +59,19 @@ describe("formatVoiceDiagnostics", () => {
       secondaryCount: 0,
     });
   });
+
+  it("accepts the native Realtime drain timeout code", () => {
+    const output = formatVoiceDiagnostics([
+      {
+        elapsedRealtimeMillis: 5_000,
+        generation: 8,
+        category: "terminal",
+        code: "realtime-drain-timed-out",
+        primaryCount: 1,
+        secondaryCount: 0,
+      },
+    ]);
+
+    expect(JSON.parse(output).entries[0].code).toBe("realtime-drain-timed-out");
+  });
 });

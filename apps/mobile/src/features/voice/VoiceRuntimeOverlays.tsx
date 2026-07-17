@@ -232,6 +232,7 @@ export function RealtimeVoiceCallBar(props: {
           <ControlPill
             icon="clock.arrow.circlepath"
             accessibilityLabel="Browse voice conversations"
+            disabled={props.resumePending}
             onPress={props.onHistory}
           />
         ) : null}

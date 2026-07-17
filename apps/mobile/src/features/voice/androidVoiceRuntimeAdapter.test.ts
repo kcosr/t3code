@@ -211,7 +211,7 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
   it("mints a fresh child credential for a native Thread-to-Realtime transition", async () => {
     const harness = makeHarness(async () => activeThreadSnapshot);
 
-    await harness.adapter.switchThreadToRealtime(realtimeTarget);
+    await harness.adapter.startRealtime(realtimeTarget);
 
     expect(harness.createNativeSession).toHaveBeenCalledOnce();
     expect(harness.requestNotificationPermission).toHaveBeenCalledOnce();
@@ -223,6 +223,27 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
         expiresAt: "2026-07-17T08:00:00.000Z",
       },
     });
+  });
+
+  it("selects the current native Realtime admission path after permission prompts", async () => {
+    let current: VoiceRuntimeSnapshot = activeThreadSnapshot;
+    const harness = makeHarness(async () => current);
+    let releaseNotification!: (result: "granted" | "denied") => void;
+    harness.requestNotificationPermission.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseNotification = resolve;
+        }),
+    );
+
+    const starting = harness.adapter.startRealtime(realtimeTarget);
+    await vi.waitFor(() => expect(harness.requestNotificationPermission).toHaveBeenCalledOnce());
+    current = idleSnapshot(19);
+    releaseNotification("granted");
+
+    await expect(starting).resolves.toBeUndefined();
+    expect(harness.native.startRealtimeAsync).toHaveBeenCalledOnce();
+    expect(harness.native.switchThreadToRealtimeAsync).not.toHaveBeenCalled();
   });
 
   it("serializes concurrent cross-mode starts and mints only for the Idle winner", async () => {
@@ -341,6 +362,47 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
     expect(microphoneOrder).toBeLessThan(notificationOrder ?? 0);
     expect(notificationOrder).toBeLessThan(bluetoothOrder ?? 0);
     expect(bluetoothOrder).toBeLessThan(clientOrder ?? 0);
+  });
+
+  it("cancels Realtime admission before credential minting", async () => {
+    const harness = makeHarness();
+    let releaseNotification!: (result: "granted" | "denied") => void;
+    harness.requestNotificationPermission.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseNotification = resolve;
+        }),
+    );
+    const abort = new AbortController();
+
+    const starting = harness.adapter.startRealtime(realtimeTarget, { signal: abort.signal });
+    await vi.waitFor(() => expect(harness.requestNotificationPermission).toHaveBeenCalledOnce());
+    abort.abort();
+    releaseNotification("granted");
+
+    await expect(starting).rejects.toThrow("Voice start was cancelled");
+    expect(harness.makeClient).not.toHaveBeenCalled();
+    expect(harness.native.startRealtimeAsync).not.toHaveBeenCalled();
+  });
+
+  it("revalidates the prepared environment after permission prompts", async () => {
+    const harness = makeHarness();
+    let releaseNotification!: (result: "granted" | "denied") => void;
+    harness.requestNotificationPermission.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseNotification = resolve;
+        }),
+    );
+
+    const starting = harness.adapter.startRealtime(realtimeTarget);
+    await vi.waitFor(() => expect(harness.requestNotificationPermission).toHaveBeenCalledOnce());
+    harness.setPrepared(null);
+    releaseNotification("granted");
+
+    await expect(starting).rejects.toThrow("A prepared environment connection is required");
+    expect(harness.makeClient).not.toHaveBeenCalled();
+    expect(harness.native.startRealtimeAsync).not.toHaveBeenCalled();
   });
 
   it("continues a visible voice start when the user denies drawer notifications", async () => {

@@ -124,6 +124,18 @@ class T3VoiceDiagnosticRingTest {
   }
 
   @Test
+  fun realtimeDrainTimeoutUsesThePublicDiagnosticCode() {
+    val ring = T3VoiceDiagnosticRing(capacity = 1, clock = { 42L })
+    ring.record(
+      generation = 8,
+      category = T3VoiceDiagnosticCategory.TERMINAL,
+      code = T3VoiceDiagnosticCode.REALTIME_DRAIN_TIMED_OUT,
+    )
+
+    assertEquals("realtime-drain-timed-out", ring.snapshot().single().toResultBody()["code"])
+  }
+
+  @Test
   fun capacityItselfHasAHardUpperBound() {
     val failure = runCatching { T3VoiceDiagnosticRing(capacity = 257) }
     assertTrue(failure.isFailure)

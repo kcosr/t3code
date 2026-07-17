@@ -4,6 +4,7 @@ import type {
   VoiceHttpClient,
   VoiceRealtimeContext,
   VoiceRealtimeTarget,
+  VoiceRuntimeAdmissionOptions,
   VoiceRuntimeAdapter,
   VoiceRuntimeSnapshot,
   VoiceRuntimeSnapshotListener,
@@ -83,6 +84,14 @@ const ensureInitialStartIdle = async (native: T3VoiceNativeModule): Promise<void
   if ((await native.getRuntimeSnapshotAsync()).mode !== "idle") {
     throw new Error("Native voice runtime is already active");
   }
+};
+
+const realtimeAdmissionMode = async (native: T3VoiceNativeModule): Promise<"idle" | "thread"> => {
+  const mode = (await native.getRuntimeSnapshotAsync()).mode;
+  if (mode !== "idle" && mode !== "thread") {
+    throw new Error("Native voice runtime cannot admit Realtime from its current state");
+  }
+  return mode;
 };
 
 const attachSnapshotListener = async (
@@ -168,6 +177,10 @@ export const makeAndroidVoiceRuntimeAdapter = (
   const requestNotificationPermission =
     input.requestNotificationPermission ?? requestAndroidVoiceNotificationPermission;
 
+  const assertNotCancelled = (options?: VoiceRuntimeAdmissionOptions): void => {
+    if (options?.signal?.aborted === true) throw new Error("Voice start was cancelled");
+  };
+
   const requirePreparedConnection = (environmentId: EnvironmentId): PreparedConnection => {
     assertEnvironment(input.environmentId, environmentId);
     const prepared = input.getPrepared();
@@ -179,9 +192,15 @@ export const makeAndroidVoiceRuntimeAdapter = (
 
   const issueNativeSession = async (
     prepared: PreparedConnection,
+    options?: VoiceRuntimeAdmissionOptions,
   ): Promise<T3VoiceNativeSessionConfiguration> => {
+    assertNotCancelled(options);
     const client = await makeClient(prepared);
-    const credential = await Effect.runPromise(client.createNativeSession());
+    assertNotCancelled(options);
+    const credential = await Effect.runPromise(client.createNativeSession(), {
+      signal: options?.signal,
+    });
+    assertNotCancelled(options);
     return {
       baseUrl: environmentEndpointUrl(prepared.httpBaseUrl, "/"),
       accessToken: credential.accessToken,
@@ -191,45 +210,52 @@ export const makeAndroidVoiceRuntimeAdapter = (
 
   const prepareNativeSession = async (
     environmentId: EnvironmentId,
-    requireIdle: boolean,
+    options?: VoiceRuntimeAdmissionOptions,
   ): Promise<T3VoiceNativeSessionConfiguration> => {
-    const prepared = requirePreparedConnection(environmentId);
-    if (requireIdle) await ensureInitialStartIdle(input.native);
+    assertNotCancelled(options);
+    requirePreparedConnection(environmentId);
+    assertNotCancelled(options);
     await ensureMicrophonePermission(input.native);
+    assertNotCancelled(options);
     await requestNotificationPermission().catch(() => "denied" as const);
+    assertNotCancelled(options);
     await requestOptionalBluetoothPermission(input.native);
-    return issueNativeSession(prepared);
+    assertNotCancelled(options);
+    return issueNativeSession(requirePreparedConnection(environmentId), options);
   };
 
   return {
     getSnapshot: async () => input.native.getRuntimeSnapshotAsync(),
     subscribe: (listener) => attachSnapshotListener(input.native, listener),
-    startRealtime: async (target: VoiceRealtimeTarget) => {
+    startRealtime: async (target: VoiceRealtimeTarget, options?: VoiceRuntimeAdmissionOptions) => {
       assertEnvironment(input.environmentId, target.environmentId);
       assertRealtimeContext(input.environmentId, target);
       return commands.enqueue(async () => {
-        const session = await prepareNativeSession(target.environmentId, true);
-        await input.native.startRealtimeAsync({ target, session });
+        await realtimeAdmissionMode(input.native);
+        const session = await prepareNativeSession(target.environmentId, options);
+        assertNotCancelled(options);
+        requirePreparedConnection(target.environmentId);
+        const mode = await realtimeAdmissionMode(input.native);
+        assertNotCancelled(options);
+        if (mode === "thread") {
+          await input.native.switchThreadToRealtimeAsync({ target, session });
+        } else {
+          await input.native.startRealtimeAsync({ target, session });
+        }
       });
     },
     startThread: async (threadInput: VoiceThreadStartInput) => {
       assertEnvironment(input.environmentId, threadInput.target.environmentId);
       return commands.enqueue(async () => {
-        const session = await prepareNativeSession(threadInput.target.environmentId, true);
+        await ensureInitialStartIdle(input.native);
+        const session = await prepareNativeSession(threadInput.target.environmentId);
+        await ensureInitialStartIdle(input.native);
         await input.native.startThreadAsync({ input: threadInput, session });
       });
     },
     switchRealtimeToThread: async (threadInput: VoiceThreadStartInput) => {
       assertEnvironment(input.environmentId, threadInput.target.environmentId);
       return commands.enqueue(() => input.native.switchRealtimeToThreadAsync(threadInput));
-    },
-    switchThreadToRealtime: async (target: VoiceRealtimeTarget) => {
-      assertEnvironment(input.environmentId, target.environmentId);
-      assertRealtimeContext(input.environmentId, target);
-      return commands.enqueue(async () => {
-        const session = await prepareNativeSession(target.environmentId, false);
-        await input.native.switchThreadToRealtimeAsync({ target, session });
-      });
     },
     stop: () => commands.enqueue(() => stopAndAwaitRelease(input.native)),
     setRealtimeMuted: (muted: boolean) =>

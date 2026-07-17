@@ -218,12 +218,14 @@ class T3VoiceRuntimeControllerTest {
       ).outcome,
     )
 
-    assertFalse(controller.activateInitialStart(1))
-    assertEquals(listOf("start-realtime:2:environment-a"), driver.actions)
-    assertEquals(2, controller.snapshot().generation)
+    assertEquals(emptyList<String>(), driver.actions)
+    assertEquals(1, controller.snapshot().generation)
     val starting = controller.snapshot().state as T3VoiceControllerState.Realtime
     assertEquals(T3VoiceRealtimeStage.STARTING, starting.stage)
     assertEquals(realtimeTarget, starting.target)
+
+    assertTrue(controller.activateInitialStart(1))
+    assertEquals(listOf("start-realtime:1:environment-a"), driver.actions)
   }
 
   @Test

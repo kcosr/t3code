@@ -81,9 +81,9 @@ dumps, and raw audio.
 ### Expanded headset and platform controls
 
 Android currently exposes state-dependent notification and MediaSession actions plus Realtime output
-route selection. Future work could define richer physical headset actions, route preferences,
-Bluetooth-specific behavior, or platform-equivalent controls after validating device and OS
-constraints.
+route selection with a persisted preferred route. Future work could define richer physical headset
+actions, per-device or automatic routing policies, Bluetooth-specific behavior, or
+platform-equivalent controls after validating device and OS constraints.
 
 ### Additional Thread voice policies
 

@@ -31,16 +31,16 @@ was insufficient.
 
 ## Workstreams
 
-| Workstream                        | Status   | Scope                                                                                                                                                                              |
-| --------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Documentation consolidation       | Complete | Established one as-built document, this active plan, and one non-authoritative roadmap; removed competing voice authority documents.                                               |
-| Realtime presentation cleanup     | Complete | Removed dead global phase state, retained one Realtime-bar classifier, removed redundant mode guards, and stabilized empty transcript data.                                        |
-| Realtime admission cleanup        | Complete | Reserved Resume selection under the shared start transition and consolidated duplicated Realtime start/switch preparation, types, and native parsing.                              |
-| Native transition cleanup         | Complete | Removed duplicated pending target data, obsolete transient publications, and the one-value Thread-to-Realtime phase hierarchy.                                                     |
-| Native mechanical deduplication   | Complete | Reused starting/stopping state construction and enum bridge naming where the result is smaller and clearer.                                                                        |
-| Diagnostics cleanup               | Complete | Confirmed temporary milestone tracing is absent while retaining the bounded Android diagnostic ring and privacy-safe server logs.                                                  |
-| Dead-code and naming sweep        | Complete | Removed obsolete exports and stale `MasterVoice` ownership names without compatibility aliases or dual contracts.                                                                  |
-| Final verification and deployment | Pending  | Run required gates, review the final diff, commit, build from the committed revision, deploy server and preview APK, and perform focused smoke tests for paths touched by cleanup. |
+| Workstream                        | Status      | Scope                                                                                                                                                 |
+| --------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Documentation consolidation       | Complete    | Established one as-built document, this active plan, and one non-authoritative roadmap; removed competing voice authority documents.                  |
+| Realtime presentation cleanup     | Complete    | Removed dead global phase state, retained one Realtime-bar classifier, removed redundant mode guards, and stabilized empty transcript data.           |
+| Realtime admission cleanup        | Complete    | Reserved Resume selection under the shared start transition and consolidated duplicated Realtime start/switch preparation, types, and native parsing. |
+| Native transition cleanup         | Complete    | Removed duplicated pending target data, obsolete transient publications, and the one-value Thread-to-Realtime phase hierarchy.                        |
+| Native mechanical deduplication   | Complete    | Reused starting/stopping state construction and enum bridge naming where the result is smaller and clearer.                                           |
+| Diagnostics cleanup               | Complete    | Confirmed temporary milestone tracing is absent while retaining the bounded Android diagnostic ring and privacy-safe server logs.                     |
+| Dead-code and naming sweep        | Complete    | Removed obsolete exports and stale `MasterVoice` ownership names without compatibility aliases or dual contracts.                                     |
+| Final verification and deployment | In progress | Required static, type, focused voice, and native JVM checks pass; full repository tests, exact-revision builds, deployment, and focused smoke remain. |
 
 ## Detailed scope and definition of done
 
@@ -76,8 +76,8 @@ Definition of done:
 
 - Exactly one start path can proceed at a time.
 - A losing path stops work before credential issuance and native admission.
-- Initial Realtime start and Thread-to-Realtime switch use one admission shape without compatibility
-  aliases.
+- React issues one Realtime admission operation; Android selects initial start or Thread handoff
+  from the current native mode at the bridge boundary.
 - Race and adapter tests cover Resume cancellation and both admission outcomes.
 
 ### 3. Native transition cleanup

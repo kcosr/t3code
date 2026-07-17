@@ -167,6 +167,10 @@ export type VoiceRuntimeSnapshot = VoiceRuntimeSnapshotIdentity &
 
 export type VoiceRuntimeSnapshotListener = (snapshot: VoiceRuntimeSnapshot) => void;
 
+export interface VoiceRuntimeAdmissionOptions {
+  readonly signal?: AbortSignal | undefined;
+}
+
 /**
  * Platform-neutral ownership boundary for one live voice operation.
  *
@@ -183,10 +187,12 @@ export interface VoiceRuntimeAdapter {
    */
   readonly subscribe: (listener: VoiceRuntimeSnapshotListener) => Promise<() => void>;
 
-  readonly startRealtime: (target: VoiceRealtimeTarget) => Promise<void>;
+  readonly startRealtime: (
+    target: VoiceRealtimeTarget,
+    options?: VoiceRuntimeAdmissionOptions,
+  ) => Promise<void>;
   readonly startThread: (input: VoiceThreadStartInput) => Promise<void>;
   readonly switchRealtimeToThread: (input: VoiceThreadStartInput) => Promise<void>;
-  readonly switchThreadToRealtime: (target: VoiceRealtimeTarget) => Promise<void>;
   readonly stop: () => Promise<void>;
   readonly setRealtimeMuted: (muted: boolean) => Promise<void>;
   readonly setRealtimeAudioRoute: (routeId: string) => Promise<void>;
