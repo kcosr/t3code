@@ -75,10 +75,26 @@ describe("Thread voice composer state", () => {
     expect(threadVoiceControlState(snapshot, target)).toEqual({
       active: true,
       blockedByAnotherTarget: false,
+      command: "stop",
+      accessibilityLabel: "Stop Thread voice",
     });
     expect(threadVoiceControlState(snapshot, otherTarget)).toEqual({
       active: false,
       blockedByAnotherTarget: true,
+      command: "start",
+      accessibilityLabel: "Start Auto Listen",
+    });
+
+    expect(
+      threadVoiceControlState(
+        { ...snapshot, phase: "recording", transcript: null, reviewId: null },
+        target,
+      ),
+    ).toEqual({
+      active: true,
+      blockedByAnotherTarget: false,
+      command: "finish-recording",
+      accessibilityLabel: "Finish Thread voice recording",
     });
   });
 
@@ -100,13 +116,50 @@ describe("Thread voice composer state", () => {
       pendingConfirmations: [],
       pendingClientActions: [],
     };
-    expect(threadVoiceControlState(realtime, target).blockedByAnotherTarget).toBe(false);
+    expect(threadVoiceControlState(realtime, target)).toEqual({
+      active: false,
+      blockedByAnotherTarget: false,
+      command: "start",
+      accessibilityLabel: "Start Auto Listen",
+    });
     expect(
       threadVoiceControlState(realtime, {
         ...target,
         environmentId: EnvironmentId.make("environment-two"),
       }).blockedByAnotherTarget,
     ).toBe(true);
+  });
+
+  it("stops an admitted switch and offers a fresh start after failure", () => {
+    const thread = reviewingSnapshot();
+    const switching: VoiceRuntimeSnapshot = {
+      mode: "switching-to-thread",
+      phase: "closing-realtime",
+      generation: thread.generation,
+      sequence: thread.sequence,
+      target: thread.target,
+      settings: thread.settings,
+    };
+    expect(threadVoiceControlState(switching, target)).toMatchObject({
+      active: true,
+      command: "stop",
+      accessibilityLabel: "Stop Thread voice",
+    });
+
+    const failed: VoiceRuntimeSnapshot = {
+      mode: "failed",
+      generation: thread.generation,
+      sequence: thread.sequence + 1,
+      environmentId,
+      operation: "thread",
+      failure: { code: "test", message: "failed", retryable: true },
+    };
+    expect(threadVoiceControlState(failed, target)).toEqual({
+      active: false,
+      blockedByAnotherTarget: false,
+      command: "start",
+      accessibilityLabel: "Start Auto Listen",
+    });
   });
 
   it("correlates native review submission to the exact environment and Thread", () => {

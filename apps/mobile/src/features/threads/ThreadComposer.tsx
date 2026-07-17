@@ -3,10 +3,10 @@ import { useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/unstable/reactivity";
 import {
   nativeThreadReviewIdentityForDraft,
-  threadReviewHydrationTracker,
   threadVoiceComposerCapabilities,
   threadVoiceControlState,
   type ThreadReviewIdentity,
+  type ThreadVoiceControlCommand,
 } from "@t3tools/client-runtime/voice";
 import type {
   EnvironmentId,
@@ -82,7 +82,6 @@ import {
   startDictationWithAudioHandoff,
 } from "../voice/traditionalAudioHandoff";
 import { useMasterVoice } from "../voice/MasterVoiceProvider";
-import { threadVoiceControlPresentation } from "../voice/threadVoiceControlPresentation";
 import { resolveVoicePreferences } from "../voice/voicePreferences";
 
 /**
@@ -96,6 +95,12 @@ export const COMPOSER_COLLAPSED_CHROME = 60;
  * Used by the parent to compute the larger feed bottom inset when the composer is focused.
  */
 export const COMPOSER_EXPANDED_CHROME = 174;
+
+const THREAD_VOICE_CONTROL_ICONS = {
+  start: "waveform",
+  "finish-recording": "checkmark",
+  stop: "stop.fill",
+} as const satisfies Record<ThreadVoiceControlCommand, "waveform" | "checkmark" | "stop.fill">;
 
 export interface ThreadComposerProps {
   readonly draftMessage: string;
@@ -328,8 +333,6 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     environmentId: props.environmentId,
     threadId: props.selectedThread.id,
   });
-  const autoListenActive = threadVoiceControl.active;
-  const autoListenControl = threadVoiceControlPresentation(runtimeSnapshot, autoListenActive);
   const dictationWasActiveRef = useRef(false);
   const audioTransitionRef = useRef(new ExclusiveTransition());
   const canStartAutoListen =
@@ -374,7 +377,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   }, [nativeRuntimeInUse, props.speechPlayback.interruptForRealtime]);
 
   useEffect(() => {
-    const hydration = threadReviewHydrationTracker.reconcile({
+    const hydration = voiceRuntime.threadReviewHydrationTracker.reconcile({
       snapshot: runtimeSnapshot,
       target: {
         environmentId: props.environmentId,
@@ -400,6 +403,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     props.onChangeDraftMessage,
     props.selectedThread.id,
     runtimeSnapshot,
+    voiceRuntime.threadReviewHydrationTracker,
   ]);
   const nativeReviewCapabilities = threadVoiceComposerCapabilities(
     runtimeSnapshot,
@@ -465,7 +469,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const toggleAutoListenOperation = useCallback(async () => {
     await audioTransitionRef.current
       .run(async () => {
-        switch (autoListenControl.command) {
+        switch (threadVoiceControl.command) {
           case "finish-recording":
             await voiceRuntime.finishThreadRecording();
             return;
@@ -478,7 +482,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       })
       .catch((cause) => Alert.alert("Thread voice unavailable", String(cause)));
   }, [
-    autoListenControl.command,
+    threadVoiceControl.command,
     voiceRuntime.finishThreadRecording,
     voiceRuntime.startThread,
     voiceRuntime.stop,
@@ -1100,14 +1104,14 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
             >
               {dictation.available ? (
                 <ControlPill
-                  accessibilityLabel={autoListenControl.accessibilityLabel}
-                  active={autoListenControl.active}
+                  accessibilityLabel={threadVoiceControl.accessibilityLabel}
+                  active={threadVoiceControl.active}
                   disabled={
                     !voiceRuntime.controlsAvailable ||
-                    (!autoListenActive &&
+                    (!threadVoiceControl.active &&
                       (!canStartAutoListen || threadVoiceControl.blockedByAnotherTarget))
                   }
-                  icon={autoListenControl.icon}
+                  icon={THREAD_VOICE_CONTROL_ICONS[threadVoiceControl.command]}
                   onPress={() => void toggleAutoListenOperation()}
                 />
               ) : null}
@@ -1173,12 +1177,12 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                 ) : null}
                 {dictation.available ? (
                   <ComposerToolbarButton
-                    accessibilityLabel={autoListenControl.accessibilityLabel}
-                    icon={autoListenControl.icon}
-                    active={autoListenControl.active}
+                    accessibilityLabel={threadVoiceControl.accessibilityLabel}
+                    icon={THREAD_VOICE_CONTROL_ICONS[threadVoiceControl.command]}
+                    active={threadVoiceControl.active}
                     disabled={
                       !voiceRuntime.controlsAvailable ||
-                      (!autoListenActive &&
+                      (!threadVoiceControl.active &&
                         (!canStartAutoListen || threadVoiceControl.blockedByAnotherTarget))
                     }
                     onPress={() => void toggleAutoListenOperation()}

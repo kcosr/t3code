@@ -1,4 +1,5 @@
 import type { Preferences } from "../../persistence/mobile-preferences";
+import type { ThreadVoiceStartPreferences } from "@t3tools/client-runtime/voice";
 import {
   clampVoicePreference,
   VOICE_END_SILENCE_MAX_MS,
@@ -31,17 +32,7 @@ export const VOICE_TRANSCRIPTION_TIMEOUT_DEFAULT_MS = 10 * 60_000;
 export const VOICE_SUBMISSION_TIMEOUT_DEFAULT_MS = 30_000;
 export const VOICE_RESPONSE_TIMEOUT_DEFAULT_MS = 10 * 60_000;
 
-export interface ResolvedVoicePreferences {
-  readonly autoListenEnabled: boolean;
-  readonly autoSubmitEnabled: boolean;
-  readonly endSilenceMs: number;
-  readonly noSpeechTimeoutMs: number | null;
-  readonly maximumUtteranceMs: number;
-  readonly postPlaybackGuardMs: number;
-  readonly transcriptionTimeoutMs: number;
-  readonly submissionTimeoutMs: number;
-  readonly responseTimeoutMs: number;
-}
+export type ResolvedVoicePreferences = ThreadVoiceStartPreferences;
 
 const clampRounded = (
   value: number | undefined,

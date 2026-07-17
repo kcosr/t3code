@@ -9,7 +9,14 @@ export interface ThreadVoiceComposerTarget {
 export interface ThreadVoiceControlState {
   readonly active: boolean;
   readonly blockedByAnotherTarget: boolean;
+  readonly command: "start" | "finish-recording" | "stop";
+  readonly accessibilityLabel:
+    | "Start Auto Listen"
+    | "Finish Thread voice recording"
+    | "Stop Thread voice";
 }
+
+export type ThreadVoiceControlCommand = ThreadVoiceControlState["command"];
 
 export interface ThreadReviewHydrationState extends ThreadVoiceComposerTarget {
   readonly generation: number;
@@ -88,13 +95,41 @@ export function threadVoiceControlState(
     return {
       active: false,
       blockedByAnotherTarget: snapshot.target.environmentId !== target.environmentId,
+      command: "start",
+      accessibilityLabel: "Start Auto Listen",
     };
   }
   if (snapshot.mode !== "thread" && snapshot.mode !== "switching-to-thread") {
-    return { active: false, blockedByAnotherTarget: false };
+    return {
+      active: false,
+      blockedByAnotherTarget: false,
+      command: "start",
+      accessibilityLabel: "Start Auto Listen",
+    };
   }
   const active = targetsThread(snapshot, target);
-  return { active, blockedByAnotherTarget: !active };
+  if (!active) {
+    return {
+      active: false,
+      blockedByAnotherTarget: true,
+      command: "start",
+      accessibilityLabel: "Start Auto Listen",
+    };
+  }
+  if (snapshot.mode === "thread" && snapshot.phase === "recording") {
+    return {
+      active: true,
+      blockedByAnotherTarget: false,
+      command: "finish-recording",
+      accessibilityLabel: "Finish Thread voice recording",
+    };
+  }
+  return {
+    active: true,
+    blockedByAnotherTarget: false,
+    command: "stop",
+    accessibilityLabel: "Stop Thread voice",
+  };
 }
 
 export function isThreadReviewForTarget(
@@ -264,5 +299,3 @@ export class ThreadReviewHydrationTracker {
     return result;
   }
 }
-
-export const threadReviewHydrationTracker = new ThreadReviewHydrationTracker();

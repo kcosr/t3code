@@ -16,6 +16,7 @@ import {
   resumeVoiceConversationSelection,
   settleVoiceAudioRoutePickerSelection,
   stopVoiceRuntimeStrict,
+  ThreadReviewHydrationTracker,
   threadTranscriptSubmissionDisposition,
   threadVoiceStartForFocus,
   voiceRuntimeCommandEnvironmentMatches,
@@ -99,6 +100,7 @@ interface MasterVoiceContextValue {
   readonly threadStartAvailable: boolean;
   readonly startThread: () => Promise<void>;
   readonly finishThreadRecording: () => Promise<void>;
+  readonly threadReviewHydrationTracker: ThreadReviewHydrationTracker;
   readonly updateThreadReviewTranscript: (input: {
     readonly environmentId: EnvironmentId;
     readonly threadId: ThreadId;
@@ -187,6 +189,7 @@ export function MasterVoiceProvider(props: {
   const snapshotRef = useRef(snapshot);
   const lastRealtimeTargetRef = useRef<VoiceRealtimeTarget | null>(null);
   const voiceStartTransitionRef = useRef(new ExclusiveTransition());
+  const threadReviewHydrationTracker = useMemo(() => new ThreadReviewHydrationTracker(), []);
   const resumeInFlightRef = useRef(false);
   const handledFailureSequenceRef = useRef<number | null>(null);
   const handledClientActionsRef = useRef(new Set<string>());
@@ -951,6 +954,7 @@ export function MasterVoiceProvider(props: {
       threadStartAvailable,
       startThread,
       finishThreadRecording,
+      threadReviewHydrationTracker,
       updateThreadReviewTranscript,
       submitThreadTranscript,
       stop,
@@ -965,6 +969,7 @@ export function MasterVoiceProvider(props: {
       startThread,
       stop,
       submitThreadTranscript,
+      threadReviewHydrationTracker,
       threadStartAvailable,
       updateThreadReviewTranscript,
     ],
