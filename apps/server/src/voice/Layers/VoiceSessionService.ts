@@ -20,6 +20,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Exit from "effect/Exit";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
@@ -52,6 +53,7 @@ const SESSION_DURATION_SECONDS = 55 * 60;
 const MAX_BUFFERED_EVENTS = 512;
 const MAX_RETAINED_TERMINAL_SESSIONS = 128;
 const CLIENT_ACTION_TIMEOUT_MILLIS = 10_000;
+const PROVIDER_TERMINATION_TIMEOUT_MILLIS = 10_000;
 const CLIENT_HEARTBEAT_EXPIRY_BY_PHASE = {
   creating: true,
   signaling: true,
@@ -142,7 +144,7 @@ interface RuntimeSession {
   readonly grantedScopes: ReadonlySet<AuthEnvironmentScope>;
   readonly eventSignal: Deferred.Deferred<void>;
   readonly terminationSignal: Deferred.Deferred<void>;
-  readonly toolScope: Scope.Closeable;
+  readonly sessionScope: Scope.Closeable;
   readonly operationMutex: Semaphore.Semaphore;
   readonly terminalAt?: number;
   readonly terminalOrder?: number;
@@ -157,6 +159,17 @@ interface RuntimeState {
   readonly idempotency: ReadonlyMap<string, VoiceSessionId>;
   readonly nextTerminalOrder: number;
 }
+
+type EmitResult =
+  | {
+      readonly appended: false;
+      readonly phase: VoiceSessionPhase;
+    }
+  | {
+      readonly appended: true;
+      readonly signal: Deferred.Deferred<void>;
+      readonly phase: VoiceSessionPhase;
+    };
 
 interface VoiceSessionFocus {
   readonly projectId?: ProjectId;
@@ -183,7 +196,7 @@ const make = Effect.gen(function* () {
   const settingsService = yield* ServerSettingsService;
   const tickets = yield* VoiceMediaTicketRegistry;
   const projection = yield* ProjectionSnapshotQuery;
-  const serviceScope = yield* Scope.make("sequential");
+  const serviceScope = yield* Scope.make("parallel");
   const lifecycleMutex = yield* Semaphore.make(1);
   const runtime = yield* SynchronizedRef.make<RuntimeState>({
     sessions: new Map(),
@@ -262,11 +275,23 @@ const make = Effect.gen(function* () {
   const emit = Effect.fn("VoiceSessionService.emit")(function* (
     lease: VoiceSessionLease,
     event: PendingVoiceSessionEvent,
+    allowFencedLease = false,
   ) {
-    if (!(yield* registry.isCurrent(lease)) && event.type !== "lease-fenced") return;
+    if (!allowFencedLease && !(yield* registry.isCurrent(lease)) && event.type !== "lease-fenced")
+      return;
     const occurredAt = yield* nowIso;
     const nextSignal = yield* Deferred.make<void>();
-    const previous = yield* mutateSession(lease.sessionId, (session) => {
+    const previous = yield* mutateSession<EmitResult>(lease.sessionId, (session) => {
+      const terminalEvent = allowFencedLease || event.type === "lease-fenced";
+      if (
+        !terminalEvent &&
+        (session.terminating ||
+          session.terminalAt !== undefined ||
+          session.state.phase === "ended" ||
+          session.state.phase === "error")
+      ) {
+        return [{ appended: false, phase: session.state.phase }, session] as const;
+      }
       const sequence = session.state.sequence + 1;
       const normalized = {
         ...event,
@@ -282,9 +307,12 @@ const make = Effect.gen(function* () {
         events: [...session.events, normalized].slice(-MAX_BUFFERED_EVENTS),
         eventSignal: nextSignal,
       };
-      return [{ signal: session.eventSignal, phase: session.state.phase }, updated] as const;
+      return [
+        { appended: true, signal: session.eventSignal, phase: session.state.phase },
+        updated,
+      ] as const;
     });
-    if (Option.isSome(previous)) {
+    if (Option.isSome(previous) && previous.value.appended) {
       yield* Deferred.succeed(previous.value.signal, undefined).pipe(Effect.ignore);
       if (event.type === "state" && previous.value.phase !== event.phase) {
         yield* logVoiceDiagnostic({
@@ -445,25 +473,52 @@ const make = Effect.gen(function* () {
     }));
   });
 
-  const terminateProvider = (
-    session: RuntimeSession,
-    options: {
-      readonly interruptEventFiber?: boolean;
-      readonly interruptHeartbeatFiber?: boolean;
-    } = {},
+  const cleanupStep = <E>(
+    lease: VoiceSessionLease,
+    message: string,
+    effect: Effect.Effect<void, E>,
   ) =>
-    Effect.gen(function* () {
-      if (options.interruptHeartbeatFiber !== false && session.heartbeatFiber !== undefined) {
-        yield* Fiber.interrupt(session.heartbeatFiber);
-      }
-      if (options.interruptEventFiber !== false && session.eventFiber !== undefined) {
-        yield* Fiber.interrupt(session.eventFiber);
-      }
-      yield* Scope.close(session.toolScope, Exit.void);
-      if (session.providerSession !== undefined)
-        yield* session.providerSession.terminate.pipe(Effect.ignore);
-      yield* tools.discardSession(session.lease.sessionId);
-    });
+    effect.pipe(
+      Effect.timeoutOption(`${PROVIDER_TERMINATION_TIMEOUT_MILLIS} millis`),
+      Effect.flatMap(
+        Option.match({
+          onNone: () =>
+            Effect.logWarning(`${message} (timed out)`).pipe(
+              Effect.annotateLogs({
+                sessionId: lease.sessionId,
+                leaseGeneration: lease.generation,
+              }),
+            ),
+          onSome: () => Effect.void,
+        }),
+      ),
+      Effect.catchCause(() =>
+        Effect.logWarning(message).pipe(
+          Effect.annotateLogs({
+            sessionId: lease.sessionId,
+            leaseGeneration: lease.generation,
+          }),
+        ),
+      ),
+    );
+
+  const terminateProvider = Effect.fn("VoiceSessionService.terminateProvider")(function* (
+    lease: VoiceSessionLease,
+    providerSession: RealtimeProviderSession,
+  ) {
+    yield* cleanupStep(lease, "Voice provider termination failed", providerSession.terminate);
+  });
+
+  const scheduleScopeCleanup = Effect.fn("VoiceSessionService.scheduleScopeCleanup")(function* (
+    scope: Scope.Closeable,
+  ) {
+    yield* Scope.close(scope, Exit.void).pipe(
+      Effect.forkIn(serviceScope, { startImmediately: true, uninterruptible: true }),
+    );
+  });
+
+  const scheduleSessionCleanup = (session: RuntimeSession) =>
+    scheduleScopeCleanup(session.sessionScope);
 
   const retainTerminalSession = Effect.fn("VoiceSessionService.retainTerminalSession")(function* (
     sessionId: VoiceSessionId,
@@ -493,13 +548,46 @@ const make = Effect.gen(function* () {
     });
   });
 
+  const completeClaimedTermination = Effect.fn("VoiceSessionService.completeClaimedTermination")(
+    function* (
+      session: RuntimeSession,
+      phase: "ended" | "error",
+      options: {
+        readonly reason: VoiceSessionEndReason;
+      },
+    ) {
+      yield* Deferred.succeed(session.terminationSignal, undefined).pipe(Effect.ignore);
+      yield* emit(session.lease, { type: "state", phase }, true);
+      yield* registry.release(session.lease);
+      yield* SynchronizedRef.update(runtime, (current) => {
+        const idempotency = new Map(current.idempotency);
+        idempotency.delete(session.idempotencyId);
+        return { ...current, idempotency };
+      });
+      yield* retainTerminalSession(session.lease.sessionId);
+      const current = (yield* SynchronizedRef.get(runtime)).sessions.get(session.lease.sessionId);
+      yield* scheduleSessionCleanup(current ?? session);
+      const endedAt = yield* Clock.currentTimeMillis;
+      yield* logVoiceDiagnostic({
+        type: "session-ended",
+        sessionId: session.lease.sessionId,
+        leaseGeneration: session.lease.generation,
+        outcome: phase,
+        reason: options.reason,
+        previousPhase: session.state.phase,
+        sessionDurationMs: Math.max(0, endedAt - session.startedAtMillis),
+        providerAttached: session.providerSession !== undefined,
+        providerActivityObserved: session.providerActivityObserved,
+      });
+    },
+    Effect.uninterruptible,
+  );
+
   const endRuntimeSession = Effect.fn("VoiceSessionService.endRuntimeSession")(function* (
     session: RuntimeSession,
     phase: "ended" | "error",
     options: {
       readonly reason: VoiceSessionEndReason;
-      readonly interruptEventFiber?: boolean;
-      readonly interruptHeartbeatFiber?: boolean;
     },
   ) {
     const claimed = yield* mutateSession<RuntimeSession | undefined>(
@@ -512,44 +600,20 @@ const make = Effect.gen(function* () {
       },
     );
     if (Option.isNone(claimed) || claimed.value === undefined) return false;
-    const terminationSnapshot = claimed.value;
-    yield* Deferred.succeed(session.terminationSignal, undefined).pipe(Effect.ignore);
-    yield* emit(session.lease, { type: "state", phase });
-    const current = (yield* SynchronizedRef.get(runtime)).sessions.get(session.lease.sessionId);
-    yield* terminateProvider(current ?? session, options);
-    yield* registry.release(session.lease);
-    yield* SynchronizedRef.update(runtime, (current) => {
-      const idempotency = new Map(current.idempotency);
-      idempotency.delete(session.idempotencyId);
-      return { ...current, idempotency };
-    });
-    yield* retainTerminalSession(session.lease.sessionId);
-    const endedAt = yield* Clock.currentTimeMillis;
-    yield* logVoiceDiagnostic({
-      type: "session-ended",
-      sessionId: session.lease.sessionId,
-      leaseGeneration: session.lease.generation,
-      outcome: phase,
-      reason: options.reason,
-      previousPhase: terminationSnapshot.state.phase,
-      sessionDurationMs: Math.max(0, endedAt - terminationSnapshot.startedAtMillis),
-      providerAttached: terminationSnapshot.providerSession !== undefined,
-      providerActivityObserved: terminationSnapshot.providerActivityObserved,
-    });
+    yield* completeClaimedTermination(claimed.value, phase, options);
     return true;
-  });
+  }, Effect.uninterruptible);
 
   yield* Effect.addFinalizer(() =>
-    SynchronizedRef.get(runtime).pipe(
-      Effect.flatMap((state) =>
-        Effect.forEach(state.sessions.values(), (session) =>
-          Scope.close(session.toolScope, Exit.void).pipe(
-            Effect.andThen(session.providerSession?.terminate.pipe(Effect.ignore) ?? Effect.void),
-          ),
-        ),
-      ),
-      Effect.andThen(Scope.close(serviceScope, Exit.void)),
-    ),
+    Effect.gen(function* () {
+      const sessions = Array.from((yield* SynchronizedRef.get(runtime)).sessions.values());
+      yield* Effect.forEach(
+        sessions,
+        (session) => Deferred.succeed(session.terminationSignal, undefined).pipe(Effect.ignore),
+        { concurrency: "unbounded", discard: true },
+      );
+      yield* Scope.close(serviceScope, Exit.void);
+    }),
   );
 
   const requireOwned = Effect.fn("VoiceSessionService.requireOwned")(function* (
@@ -635,11 +699,26 @@ const make = Effect.gen(function* () {
     },
   );
 
+  const isSessionLive = Effect.fn("VoiceSessionService.isSessionLive")(function* (
+    lease: VoiceSessionLease,
+  ) {
+    const session = (yield* SynchronizedRef.get(runtime)).sessions.get(lease.sessionId);
+    return (
+      session !== undefined &&
+      !session.terminating &&
+      session.terminalAt === undefined &&
+      session.state.phase !== "ended" &&
+      session.state.phase !== "error" &&
+      (yield* registry.isCurrent(lease))
+    );
+  });
+
   const submitCompletedTool = Effect.fn("VoiceSessionService.submitCompletedTool")(function* (
     lease: VoiceSessionLease,
     providerSession: RealtimeProviderSession,
     result: VoiceToolCompletedResult,
   ) {
+    if (!(yield* isSessionLive(lease))) return;
     if (result.tool !== "unknown") {
       yield* emit(lease, {
         type: "tool",
@@ -649,6 +728,7 @@ const make = Effect.gen(function* () {
       });
     }
     if (result.submitOutput) {
+      if (!(yield* isSessionLive(lease))) return;
       yield* providerSession.submitToolOutput({
         providerFunctionCallId: result.providerFunctionCallId,
         output: result.output,
@@ -664,7 +744,7 @@ const make = Effect.gen(function* () {
     ) {
       const now = yield* Clock.currentTimeMillis;
       yield* Effect.sleep(`${Math.max(0, Date.parse(confirmation.expiresAt) - now)} millis`);
-      if (!(yield* registry.isCurrent(lease))) return;
+      if (!(yield* isSessionLive(lease))) return;
       const result = yield* tools.expire({
         sessionId: lease.sessionId,
         confirmationId: confirmation.confirmationId,
@@ -682,7 +762,7 @@ const make = Effect.gen(function* () {
     providerSession: RealtimeProviderSession,
     event: RealtimeProviderEvent,
   ) {
-    if (!(yield* registry.isCurrent(lease))) return;
+    if (!(yield* isSessionLive(lease))) return;
     if (
       event.type === "transcript" ||
       event.type === "function-call" ||
@@ -693,10 +773,9 @@ const make = Effect.gen(function* () {
         { ...current, providerActivityObserved: true },
       ]);
     }
-    const grantedScopes = (yield* SynchronizedRef.get(runtime)).sessions.get(
-      lease.sessionId,
-    )?.grantedScopes;
-    if (grantedScopes === undefined) return;
+    const runtimeSession = (yield* SynchronizedRef.get(runtime)).sessions.get(lease.sessionId);
+    if (runtimeSession === undefined) return;
+    const grantedScopes = runtimeSession.grantedScopes;
     switch (event.type) {
       case "activity":
         if (
@@ -722,7 +801,7 @@ const make = Effect.gen(function* () {
             final: false,
           });
         }
-        if (event.final) {
+        if (event.final && (yield* isSessionLive(lease))) {
           yield* conversations.appendContextIdempotent({
             entryId: transcriptEntryId(lease, event.role, event.sourceId),
             conversationId: lease.conversationId,
@@ -733,6 +812,7 @@ const make = Effect.gen(function* () {
         }
         return;
       case "function-call":
+        if (!(yield* isSessionLive(lease))) return;
         const invocation = tools.invoke({
           authSessionId: lease.ownerAuthSessionId,
           sessionId: lease.sessionId,
@@ -769,7 +849,7 @@ const make = Effect.gen(function* () {
                 }
               }),
             ),
-            Effect.forkIn(session.toolScope),
+            Effect.forkIn(session.sessionScope),
           );
           return;
         }
@@ -779,6 +859,7 @@ const make = Effect.gen(function* () {
           return;
         }
         if (result.newlyCreated) {
+          if (!(yield* isSessionLive(lease))) return;
           yield* addPendingConfirmation(lease, result.confirmationId);
           yield* emit(lease, {
             type: "tool",
@@ -802,7 +883,7 @@ const make = Effect.gen(function* () {
                 recoverable: error.retryable,
               }),
             ),
-            Effect.forkIn(serviceScope),
+            Effect.forkIn(runtimeSession.sessionScope),
           );
         }
         return;
@@ -817,7 +898,6 @@ const make = Effect.gen(function* () {
           if (session !== undefined) {
             yield* endRuntimeSession(session, "error", {
               reason: "provider-error",
-              interruptEventFiber: false,
             });
           }
         }
@@ -827,7 +907,6 @@ const make = Effect.gen(function* () {
         if (session !== undefined) {
           yield* endRuntimeSession(session, "ended", {
             reason: "provider-closed",
-            interruptEventFiber: false,
           });
         }
         return;
@@ -928,188 +1007,185 @@ const make = Effect.gen(function* () {
               }),
             ),
           );
-    const acquired = yield* registry.acquire({
-      conversationId: conversation.conversationId,
-      contextEpoch: conversation.activeEpoch,
-      ownerAuthSessionId,
-      takeover: input.conversation.type === "continue" && input.conversation.takeover,
-    });
-    if (Option.isSome(acquired.replacedSessionId)) {
-      const displaced = (yield* SynchronizedRef.get(runtime)).sessions.get(
-        acquired.replacedSessionId.value,
-      );
-      if (displaced !== undefined) {
-        const claimedDisplaced = yield* mutateSession<RuntimeSession | undefined>(
-          displaced.lease.sessionId,
-          (current) => {
-            if (current.terminating || current.terminalAt !== undefined) {
-              return [undefined, current] as const;
-            }
-            return [current, { ...current, terminating: true }] as const;
-          },
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const acquired = yield* registry.acquire({
+          conversationId: conversation.conversationId,
+          contextEpoch: conversation.activeEpoch,
+          ownerAuthSessionId,
+          takeover: input.conversation.type === "continue" && input.conversation.takeover,
+        });
+        const published = yield* Ref.make(false);
+        const sessionScope = yield* Scope.fork(serviceScope, "sequential");
+        yield* Scope.addFinalizer(
+          sessionScope,
+          cleanupStep(
+            acquired.lease,
+            "Voice session tool state cleanup failed",
+            tools.discardSession(acquired.lease.sessionId),
+          ),
         );
-        if (Option.isSome(claimedDisplaced) && claimedDisplaced.value !== undefined) {
-          const displacedSnapshot = claimedDisplaced.value;
-          yield* Deferred.succeed(displaced.terminationSignal, undefined).pipe(Effect.ignore);
+        const terminateDisplacedSession = Effect.gen(function* () {
+          if (Option.isNone(acquired.replacedSessionId)) return;
+          const displaced = (yield* SynchronizedRef.get(runtime)).sessions.get(
+            acquired.replacedSessionId.value,
+          );
+          if (displaced === undefined) return;
           yield* emit(displaced.lease, {
             type: "lease-fenced",
             replacementGeneration: acquired.lease.generation,
           });
-          yield* terminateProvider(displacedSnapshot);
-          const occurredAt = yield* nowIso;
-          yield* mutateSession(
+          const claimedDisplaced = yield* mutateSession<RuntimeSession | undefined>(
             displaced.lease.sessionId,
-            (current) =>
-              [
-                undefined,
-                {
-                  ...current,
-                  state: {
-                    ...current.state,
-                    phase: "ended",
-                    sequence: current.state.sequence + 1,
-                  },
-                  events: [
-                    ...current.events,
-                    {
-                      type: "state",
-                      sessionId: current.lease.sessionId,
-                      leaseGeneration: current.lease.generation,
-                      sequence: current.state.sequence + 1,
-                      occurredAt,
-                      phase: "ended",
-                    } as VoiceSessionEvent,
-                  ].slice(-MAX_BUFFERED_EVENTS),
-                },
-              ] as const,
+            (current) => {
+              if (current.terminating || current.terminalAt !== undefined) {
+                return [undefined, current] as const;
+              }
+              return [current, { ...current, terminating: true }] as const;
+            },
           );
+          if (Option.isSome(claimedDisplaced) && claimedDisplaced.value !== undefined) {
+            yield* completeClaimedTermination(claimedDisplaced.value, "ended", {
+              reason: "takeover",
+            });
+          }
+        });
+        const createSession = Effect.gen(function* () {
+          yield* conversations
+            .markCallStarted(conversation.conversationId, conversation.activeEpoch)
+            .pipe(Effect.tapError(() => registry.release(acquired.lease).pipe(Effect.ignore)));
+          const createdAt = yield* DateTime.now;
+          const createdAtMillis = yield* Clock.currentTimeMillis;
+          const expiresAt = DateTime.formatIso(
+            DateTime.addDuration(createdAt, `${SESSION_DURATION_SECONDS} seconds`),
+          );
+          const state: VoiceSessionState = {
+            sessionId: acquired.lease.sessionId,
+            conversationId: conversation.conversationId,
+            mode: input.mode,
+            phase: "signaling",
+            leaseGeneration: acquired.lease.generation,
+            sequence: 0,
+          };
+          const eventSignal = yield* Deferred.make<void>();
+          const terminationSignal = yield* Deferred.make<void>();
+          const operationMutex = yield* Semaphore.make(1);
           yield* SynchronizedRef.update(runtime, (current) => {
+            const sessions = new Map(current.sessions);
+            sessions.set(acquired.lease.sessionId, {
+              lease: acquired.lease,
+              input: { ...input, ...initialFocus },
+              state,
+              events: [],
+              expiresAt,
+              idempotencyId,
+              lastHeartbeatAt: createdAtMillis,
+              startedAtMillis: createdAtMillis,
+              providerActivityObserved: false,
+              pendingConfirmations: new Set(),
+              clientActions: new Map(),
+              grantedScopes: new Set(principal.scopes),
+              eventSignal,
+              terminationSignal,
+              sessionScope,
+              operationMutex,
+            });
             const idempotency = new Map(current.idempotency);
-            idempotency.delete(displaced.idempotencyId);
-            return { ...current, idempotency };
+            idempotency.set(idempotencyId, acquired.lease.sessionId);
+            return { ...current, sessions, idempotency };
           });
-          yield* retainTerminalSession(displaced.lease.sessionId);
-          const displacedAt = yield* Clock.currentTimeMillis;
           yield* logVoiceDiagnostic({
-            type: "session-ended",
-            sessionId: displaced.lease.sessionId,
-            leaseGeneration: displaced.lease.generation,
-            outcome: "ended",
-            reason: "takeover",
-            previousPhase: displacedSnapshot.state.phase,
-            sessionDurationMs: Math.max(0, displacedAt - displacedSnapshot.startedAtMillis),
-            providerAttached: displacedSnapshot.providerSession !== undefined,
-            providerActivityObserved: displacedSnapshot.providerActivityObserved,
+            type: "session-created",
+            sessionId: acquired.lease.sessionId,
+            conversationId: acquired.lease.conversationId,
+            leaseGeneration: acquired.lease.generation,
+            mode: input.mode,
+            conversationType: input.conversation.type,
+            hasProjectFocus: initialFocus.projectId !== undefined,
+            hasThreadFocus: initialFocus.threadId !== undefined,
           });
-        }
-      }
-    }
-    yield* conversations
-      .markCallStarted(conversation.conversationId, conversation.activeEpoch)
-      .pipe(Effect.tapError(() => registry.release(acquired.lease).pipe(Effect.ignore)));
-    const createdAt = yield* DateTime.now;
-    const createdAtMillis = yield* Clock.currentTimeMillis;
-    const expiresAt = DateTime.formatIso(
-      DateTime.addDuration(createdAt, `${SESSION_DURATION_SECONDS} seconds`),
-    );
-    const state: VoiceSessionState = {
-      sessionId: acquired.lease.sessionId,
-      conversationId: conversation.conversationId,
-      mode: input.mode,
-      phase: "signaling",
-      leaseGeneration: acquired.lease.generation,
-      sequence: 0,
-    };
-    const eventSignal = yield* Deferred.make<void>();
-    const terminationSignal = yield* Deferred.make<void>();
-    const toolScope = yield* Scope.make("sequential");
-    const operationMutex = yield* Semaphore.make(1);
-    yield* SynchronizedRef.update(runtime, (current) => {
-      const sessions = new Map(current.sessions);
-      sessions.set(acquired.lease.sessionId, {
-        lease: acquired.lease,
-        input: { ...input, ...initialFocus },
-        state,
-        events: [],
-        expiresAt,
-        idempotencyId,
-        lastHeartbeatAt: createdAtMillis,
-        startedAtMillis: createdAtMillis,
-        providerActivityObserved: false,
-        pendingConfirmations: new Set(),
-        clientActions: new Map(),
-        grantedScopes: new Set(principal.scopes),
-        eventSignal,
-        terminationSignal,
-        toolScope,
-        operationMutex,
-      });
-      const idempotency = new Map(current.idempotency);
-      idempotency.set(idempotencyId, acquired.lease.sessionId);
-      return { ...current, sessions, idempotency };
-    });
-    yield* logVoiceDiagnostic({
-      type: "session-created",
-      sessionId: acquired.lease.sessionId,
-      conversationId: acquired.lease.conversationId,
-      leaseGeneration: acquired.lease.generation,
-      mode: input.mode,
-      conversationType: input.conversation.type,
-      hasProjectFocus: initialFocus.projectId !== undefined,
-      hasThreadFocus: initialFocus.threadId !== undefined,
-    });
-    const heartbeatFiber = yield* Effect.gen(function* () {
-      while (true) {
-        yield* Effect.sleep(`${HEARTBEAT_INTERVAL_SECONDS} seconds`);
-        const current = (yield* SynchronizedRef.get(runtime)).sessions.get(
-          acquired.lease.sessionId,
+          yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              const heartbeatFiber = yield* Effect.gen(function* () {
+                while (true) {
+                  yield* Effect.sleep(`${HEARTBEAT_INTERVAL_SECONDS} seconds`);
+                  const current = (yield* SynchronizedRef.get(runtime)).sessions.get(
+                    acquired.lease.sessionId,
+                  );
+                  if (
+                    current === undefined ||
+                    current.state.phase === "ended" ||
+                    current.state.phase === "error"
+                  )
+                    return;
+                  const now = yield* Clock.currentTimeMillis;
+                  const heartbeatExpired =
+                    (CLIENT_HEARTBEAT_EXPIRY_BY_PHASE[current.state.phase] ||
+                      !current.providerActivityObserved) &&
+                    now - current.lastHeartbeatAt >= HEARTBEAT_INTERVAL_SECONDS * 3 * 1_000;
+                  const durationExpired = now >= Date.parse(current.expiresAt);
+                  if (!heartbeatExpired && !durationExpired) continue;
+                  if (durationExpired) {
+                    yield* emit(current.lease, {
+                      type: "rotation-required",
+                      reason: "duration-limit",
+                    });
+                  }
+                  yield* emit(current.lease, {
+                    type: "error",
+                    reason: durationExpired
+                      ? "Voice session duration limit reached"
+                      : "Voice session heartbeat timed out",
+                    recoverable: false,
+                  });
+                  yield* endRuntimeSession(current, "ended", {
+                    reason: durationExpired ? "duration-limit" : "heartbeat-timeout",
+                  });
+                  return;
+                }
+              }).pipe(Effect.interruptible, Effect.forkIn(sessionScope));
+              yield* mutateSession(
+                acquired.lease.sessionId,
+                (current) => [undefined, { ...current, heartbeatFiber }] as const,
+              );
+              yield* Ref.set(published, true);
+            }),
+          );
+          return {
+            state,
+            transport: {
+              kind: "webrtc-sdp-v1" as const,
+              signalingPath: `/api/voice/sessions/${acquired.lease.sessionId}/webrtc-offer`,
+            },
+            expiresAt,
+            heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
+          };
+        });
+        return yield* terminateDisplacedSession.pipe(
+          Effect.andThen(restore(createSession)),
+          Effect.ensuring(
+            Ref.get(published).pipe(
+              Effect.flatMap((isPublished) => {
+                if (isPublished) return Effect.void;
+                return Effect.gen(function* () {
+                  yield* registry.release(acquired.lease).pipe(Effect.ignore);
+                  yield* SynchronizedRef.update(runtime, (current) => {
+                    const sessions = new Map(current.sessions);
+                    sessions.delete(acquired.lease.sessionId);
+                    const idempotency = new Map(current.idempotency);
+                    if (idempotency.get(idempotencyId) === acquired.lease.sessionId) {
+                      idempotency.delete(idempotencyId);
+                    }
+                    return { ...current, sessions, idempotency };
+                  });
+                  yield* scheduleScopeCleanup(sessionScope);
+                });
+              }),
+            ),
+          ),
         );
-        if (
-          current === undefined ||
-          current.state.phase === "ended" ||
-          current.state.phase === "error"
-        )
-          return;
-        const now = yield* Clock.currentTimeMillis;
-        const heartbeatExpired =
-          (CLIENT_HEARTBEAT_EXPIRY_BY_PHASE[current.state.phase] ||
-            !current.providerActivityObserved) &&
-          now - current.lastHeartbeatAt >= HEARTBEAT_INTERVAL_SECONDS * 3 * 1_000;
-        const durationExpired = now >= Date.parse(current.expiresAt);
-        if (!heartbeatExpired && !durationExpired) continue;
-        if (durationExpired) {
-          yield* emit(current.lease, {
-            type: "rotation-required",
-            reason: "duration-limit",
-          });
-        }
-        yield* emit(current.lease, {
-          type: "error",
-          reason: durationExpired
-            ? "Voice session duration limit reached"
-            : "Voice session heartbeat timed out",
-          recoverable: false,
-        });
-        yield* endRuntimeSession(current, "ended", {
-          reason: durationExpired ? "duration-limit" : "heartbeat-timeout",
-          interruptHeartbeatFiber: false,
-        });
-        return;
-      }
-    }).pipe(Effect.forkIn(serviceScope));
-    yield* mutateSession(
-      acquired.lease.sessionId,
-      (current) => [undefined, { ...current, heartbeatFiber }] as const,
+      }),
     );
-    return {
-      state,
-      transport: {
-        kind: "webrtc-sdp-v1",
-        signalingPath: `/api/voice/sessions/${acquired.lease.sessionId}/webrtc-offer`,
-      },
-      expiresAt,
-      heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
-    };
   });
 
   const create: VoiceSessionServiceShape["create"] = (principal, input) =>
@@ -1306,7 +1382,8 @@ const make = Effect.gen(function* () {
     const capability: VoiceCapability =
       session.input.mode === "realtime-agent" ? "agent.realtime" : "transcription.realtime";
     const adapter = yield* providers.resolve(capability);
-    if (adapter.realtime === undefined) {
+    const realtime = adapter.realtime;
+    if (realtime === undefined) {
       return yield* sessionError(
         "provider-unavailable",
         "session.offer",
@@ -1344,29 +1421,39 @@ const make = Effect.gen(function* () {
     const initialFocusItem = voiceFocusContextItem(initialFocus);
     const contextPreparationCompletedAt = yield* Clock.currentTimeMillis;
     const providerNegotiationStartedAt = contextPreparationCompletedAt;
-    const providerSession = yield* adapter.realtime
-      .negotiate({
-        sessionId,
-        leaseGeneration: session.lease.generation,
-        offer,
-        instructions: INSTRUCTIONS,
-        continuationContext:
-          initialFocusItem === undefined ? context.items : [...context.items, initialFocusItem],
-      })
-      .pipe(
+    const { providerAttached, providerSession } = yield* Effect.uninterruptibleMask((restore) =>
+      restore(
+        realtime.negotiate({
+          sessionId,
+          leaseGeneration: session.lease.generation,
+          offer,
+          instructions: INSTRUCTIONS,
+          continuationContext:
+            initialFocusItem === undefined ? context.items : [...context.items, initialFocusItem],
+        }),
+      ).pipe(
         Effect.tapError(() =>
           endRuntimeSession(session, "error", { reason: "negotiation-failed" }),
         ),
-      );
+        Effect.flatMap((providerSession) =>
+          Effect.gen(function* () {
+            yield* Scope.addFinalizer(
+              session.sessionScope,
+              terminateProvider(session.lease, providerSession),
+            );
+            const providerAttached = yield* mutateSession(sessionId, (current) => {
+              if (current.terminating || current.terminalAt !== undefined) {
+                return [false, current] as const;
+              }
+              return [true, { ...current, providerSession }] as const;
+            });
+            return { providerAttached, providerSession };
+          }),
+        ),
+      ),
+    );
     const providerNegotiationCompletedAt = yield* Clock.currentTimeMillis;
-    const providerAttached = yield* mutateSession(sessionId, (current) => {
-      if (current.terminating || current.terminalAt !== undefined) {
-        return [false, current] as const;
-      }
-      return [true, { ...current, providerSession }] as const;
-    });
     if (Option.isNone(providerAttached) || !providerAttached.value) {
-      yield* providerSession.terminate.pipe(Effect.ignore);
       return yield* sessionError(
         "lease-conflict",
         "session.offer",
@@ -1374,7 +1461,6 @@ const make = Effect.gen(function* () {
       );
     }
     if (!(yield* registry.isCurrent(session.lease))) {
-      yield* providerSession.terminate.pipe(Effect.ignore);
       return yield* sessionError(
         "lease-conflict",
         "session.offer",
@@ -1395,7 +1481,7 @@ const make = Effect.gen(function* () {
               Effect.flatMap((state) => {
                 const current = state.sessions.get(sessionId);
                 return current === undefined
-                  ? providerSession.terminate.pipe(Effect.ignore)
+                  ? Effect.void
                   : endRuntimeSession(current, "error", {
                       reason: "context-persistence-failed",
                     });
@@ -1417,12 +1503,11 @@ const make = Effect.gen(function* () {
           if (current !== undefined) {
             yield* endRuntimeSession(current, "error", {
               reason: "event-stream-failed",
-              interruptEventFiber: false,
             });
           }
         }),
       ),
-      Effect.forkIn(serviceScope),
+      Effect.forkIn(session.sessionScope),
     );
     const eventFiberAttached = yield* mutateSession(sessionId, (current) => {
       if (current.terminating || current.terminalAt !== undefined) {

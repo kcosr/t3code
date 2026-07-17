@@ -98,6 +98,7 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
   },
   projection: Partial<ProjectionSnapshotQuery["Service"]> = {},
   appendContextOverride?: VoiceConversationService["Service"]["appendContext"],
+  markCallStartedOverride?: VoiceConversationService["Service"]["markCallStarted"],
 ) {
   const appended = yield* Ref.make<Array<VoiceConversationJournalEntry>>([]);
   const conversationEpoch = yield* Ref.make(1);
@@ -138,18 +139,20 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
         Effect.map((activeEpoch) => Option.some({ ...summary, activeEpoch })),
       ),
     updateTitle: () => Effect.die("unused"),
-    markCallStarted: (_conversationId, expectedEpoch) =>
-      Effect.gen(function* () {
-        const activeEpoch = yield* Ref.get(conversationEpoch);
-        if (activeEpoch !== expectedEpoch) return yield* Effect.die("stale test epoch");
-        yield* Ref.update(callStarts, (count) => count + 1);
-        return {
-          ...summary,
-          activeEpoch,
-          lastCallAt: "2026-07-10T12:00:01.000Z",
-          updatedAt: "2026-07-10T12:00:01.000Z",
-        };
-      }),
+    markCallStarted:
+      markCallStartedOverride ??
+      ((_conversationId, expectedEpoch) =>
+        Effect.gen(function* () {
+          const activeEpoch = yield* Ref.get(conversationEpoch);
+          if (activeEpoch !== expectedEpoch) return yield* Effect.die("stale test epoch");
+          yield* Ref.update(callStarts, (count) => count + 1);
+          return {
+            ...summary,
+            activeEpoch,
+            lastCallAt: "2026-07-10T12:00:01.000Z",
+            updatedAt: "2026-07-10T12:00:01.000Z",
+          };
+        })),
     delete: () => Effect.succeed(true),
     clearContext: (_conversationId, expectedEpoch, idempotencyKey) =>
       Effect.gen(function* () {
@@ -383,6 +386,185 @@ it.effect(
         ),
       );
     }),
+);
+
+const makeBlockedTerminationProvider = Effect.fn("test.makeBlockedTerminationProvider")(function* (
+  id: string,
+) {
+  const terminationStarted = yield* Deferred.make<void>();
+  const releaseTermination = yield* Deferred.make<void>();
+  const terminationCompleted = yield* Deferred.make<void>();
+  const terminations = yield* Ref.make(0);
+  const provider: VoiceProviderAdapter = {
+    id,
+    capabilities: new Set(["agent.realtime"]),
+    realtime: {
+      negotiate: (request) =>
+        Effect.succeed({
+          answer: {
+            sessionId: request.sessionId,
+            leaseGeneration: request.leaseGeneration,
+            sdp: "answer",
+          },
+          events: Stream.empty,
+          updateContext: () => Effect.void,
+          submitToolOutput: () => Effect.void,
+          terminate: Ref.update(terminations, (count) => count + 1).pipe(
+            Effect.andThen(Deferred.succeed(terminationStarted, undefined)),
+            Effect.andThen(Deferred.await(releaseTermination)),
+            Effect.ensuring(Deferred.succeed(terminationCompleted, undefined)),
+          ),
+        }),
+    },
+  };
+  return {
+    provider,
+    releaseTermination,
+    terminationCompleted,
+    terminationStarted,
+    terminations,
+  };
+});
+
+it.effect("releases a conversation before slow provider termination completes", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeBlockedTerminationProvider("slow-close-provider");
+    const test = yield* makeLayer(fixture.provider);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("slow-close-owner");
+      const createInput = input(false, "slow-close-idempotency");
+      const first = yield* sessions.create(principal(owner), createInput);
+      yield* sessions.offer(owner, first.state.sessionId, {
+        sessionId: first.state.sessionId,
+        leaseGeneration: first.state.leaseGeneration,
+        sdp: "offer",
+      });
+
+      const closed = yield* sessions
+        .close(owner, first.state.sessionId, first.state.leaseGeneration)
+        .pipe(Effect.timeout("1 second"));
+      expect(closed).toMatchObject({ closed: true, state: { phase: "ended" } });
+      yield* Deferred.await(fixture.terminationStarted);
+
+      const restarted = yield* sessions.create(principal(owner), createInput);
+      expect(restarted.state.sessionId).not.toBe(first.state.sessionId);
+      expect(restarted.state.leaseGeneration).toBe(2);
+      expect(restarted.state.phase).toBe("signaling");
+      expect(yield* Ref.get(test.callStarts)).toBe(2);
+      expect(yield* Ref.get(fixture.terminations)).toBe(1);
+
+      yield* Deferred.succeed(fixture.releaseTermination, undefined);
+      yield* Deferred.await(fixture.terminationCompleted);
+      yield* sessions.close(owner, restarted.state.sessionId, restarted.state.leaseGeneration);
+      expect(yield* Ref.get(fixture.terminations)).toBe(1);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("releases an acquired lease when create is interrupted before publication", () =>
+  Effect.gen(function* () {
+    const firstCallStarted = yield* Deferred.make<void>();
+    const firstCallInterrupted = yield* Deferred.make<void>();
+    const callCount = yield* Ref.make(0);
+    const markCallStarted: VoiceConversationService["Service"]["markCallStarted"] = () =>
+      Ref.getAndUpdate(callCount, (count) => count + 1).pipe(
+        Effect.flatMap((count) =>
+          count === 0
+            ? Deferred.succeed(firstCallStarted, undefined).pipe(
+                Effect.andThen(Effect.never),
+                Effect.onInterrupt(() => Deferred.succeed(firstCallInterrupted, undefined)),
+              )
+            : Effect.succeed({
+                ...summary,
+                lastCallAt: "2026-07-10T12:00:01.000Z",
+                updatedAt: "2026-07-10T12:00:01.000Z",
+              }),
+        ),
+      );
+    const provider: VoiceProviderAdapter = {
+      id: "interrupted-create-provider",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: { negotiate: () => Effect.die("unused") },
+    };
+    const test = yield* makeLayer(provider, undefined, undefined, {}, undefined, markCallStarted);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("interrupted-create-owner");
+      const createInput = input(false, "interrupted-create-idempotency");
+      const creating = yield* sessions
+        .create(principal(owner), createInput)
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(firstCallStarted);
+      yield* Fiber.interrupt(creating);
+      yield* Deferred.await(firstCallInterrupted);
+
+      const restarted = yield* sessions.create(principal(owner), createInput);
+      expect(restarted.state.phase).toBe("signaling");
+      expect(restarted.state.leaseGeneration).toBe(2);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("terminalizes the displaced session before an interrupted takeover publishes", () =>
+  Effect.gen(function* () {
+    const takeoverPublishStarted = yield* Deferred.make<void>();
+    const takeoverPublishInterrupted = yield* Deferred.make<void>();
+    const callCount = yield* Ref.make(0);
+    const markCallStarted: VoiceConversationService["Service"]["markCallStarted"] = () =>
+      Ref.getAndUpdate(callCount, (count) => count + 1).pipe(
+        Effect.flatMap((count) =>
+          count === 1
+            ? Deferred.succeed(takeoverPublishStarted, undefined).pipe(
+                Effect.andThen(Effect.never),
+                Effect.onInterrupt(() => Deferred.succeed(takeoverPublishInterrupted, undefined)),
+              )
+            : Effect.succeed({
+                ...summary,
+                lastCallAt: "2026-07-10T12:00:01.000Z",
+                updatedAt: "2026-07-10T12:00:01.000Z",
+              }),
+        ),
+      );
+    const provider: VoiceProviderAdapter = {
+      id: "interrupted-takeover-provider",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: { negotiate: () => Effect.die("unused") },
+    };
+    const test = yield* makeLayer(
+      provider,
+      undefined,
+      { enabled: true, maxConcurrentSessions: 1 },
+      {},
+      undefined,
+      markCallStarted,
+    );
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const firstOwner = AuthSessionId.make("interrupted-takeover-first-owner");
+      const takeoverOwner = AuthSessionId.make("interrupted-takeover-second-owner");
+      const recoveryOwner = AuthSessionId.make("interrupted-takeover-recovery-owner");
+      const first = yield* sessions.create(
+        principal(firstOwner),
+        input(false, "interrupted-takeover-first"),
+      );
+      const takeover = yield* sessions
+        .create(principal(takeoverOwner), input(true, "interrupted-takeover-second"))
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(takeoverPublishStarted);
+
+      expect((yield* sessions.get(firstOwner, first.state.sessionId)).phase).toBe("ended");
+      yield* Fiber.interrupt(takeover);
+      yield* Deferred.await(takeoverPublishInterrupted);
+
+      const recovered = yield* sessions.create(
+        principal(recoveryOwner),
+        input(false, "interrupted-takeover-recovery"),
+      );
+      expect(recovered.state.phase).toBe("signaling");
+      expect(recovered.state.leaseGeneration).toBe(3);
+    }).pipe(Effect.provide(test.layer));
+  }),
 );
 
 it.effect("validates, acknowledges, and journals realtime focus changes in order", () =>
@@ -971,7 +1153,7 @@ it.effect("takeover terminates a provider that negotiates while displaced cleanu
   }),
 );
 
-it.effect("does not let an old-owner heartbeat race past takeover fencing", () =>
+it.effect("rejects an old-owner heartbeat while displaced cleanup is still running", () =>
   Effect.gen(function* () {
     const cleanupStarted = yield* Deferred.make<void>();
     const cleanupRelease = yield* Deferred.make<void>();
@@ -1010,12 +1192,15 @@ it.effect("does not let an old-owner heartbeat race past takeover fencing", () =
       yield* Effect.yieldNow;
       expect(Option.isSome(yield* Deferred.poll(heartbeatCompleted))).toBe(true);
       const error = yield* Fiber.join(heartbeat);
-      expect(error.reason).toBe("lease-conflict");
+      expect(error.reason).toBe("invalid-phase");
 
       yield* Deferred.succeed(cleanupRelease, undefined);
       const replacement = yield* Fiber.join(takeover);
       expect(replacement.state.leaseGeneration).toBe(2);
-    }).pipe(Effect.provide(test.layer));
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(cleanupRelease, undefined)),
+      Effect.provide(test.layer),
+    );
   }),
 );
 
