@@ -7,6 +7,7 @@ import android.content.Intent
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 
@@ -37,6 +38,19 @@ internal data class T3VoiceAndroidControlsRender(
   val changed: Boolean,
   val notification: Notification?,
 )
+
+internal data class T3VoiceNotificationPendingIntentIdentity(
+  val requestCode: Int,
+  val dataUri: String,
+)
+
+internal fun T3VoiceNotificationActionId.pendingIntentIdentity(
+  generation: Long,
+): T3VoiceNotificationPendingIntentIdentity =
+  T3VoiceNotificationPendingIntentIdentity(
+    requestCode = ACTION_REQUEST_CODE_BASE + ordinal,
+    dataUri = "$SEMANTIC_CONTROL_URI_PREFIX/$generation/$name",
+  )
 
 /** Renders notification and MediaSession controls from the controller's current state. */
 internal class T3VoiceAndroidControls(
@@ -194,15 +208,17 @@ internal class T3VoiceAndroidControls(
     context: Context,
     generation: Long,
   ): PendingIntent {
+    val identity = pendingIntentIdentity(generation)
     val intent =
       Intent(context, T3VoiceRuntimeService::class.java).apply {
         action = T3VoiceRuntimeService.ACTION_SEMANTIC_CONTROL
+        data = Uri.parse(identity.dataUri)
         putExtra(T3VoiceRuntimeService.EXTRA_SEMANTIC_ACTION, name)
         putExtra(T3VoiceRuntimeService.EXTRA_SEMANTIC_GENERATION, generation)
       }
     return PendingIntent.getService(
       context,
-      ACTION_REQUEST_CODE_BASE + ordinal,
+      identity.requestCode,
       intent,
       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
     )
@@ -249,13 +265,15 @@ internal class T3VoiceAndroidControls(
     const val MEDIA_SESSION_TAG = "T3VoiceRuntime"
     const val MEDIA_CUSTOM_ACTION_PREFIX = "expo.modules.t3voice.media."
     const val CONTENT_REQUEST_CODE = 3140
-    const val ACTION_REQUEST_CODE_BASE = 3150
     const val MAXIMUM_COMPACT_ACTIONS = 3
 
     fun idleSnapshot() =
       T3VoiceControllerSnapshot(T3VoiceControllerState.Idle, generation = 0, sequence = 0)
   }
 }
+
+private const val ACTION_REQUEST_CODE_BASE = 3150
+private const val SEMANTIC_CONTROL_URI_PREFIX = "t3voice-runtime://semantic-control"
 
 internal fun T3VoiceControllerSnapshot.androidControlsPresentation():
   T3VoiceAndroidControlsPresentation {

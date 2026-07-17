@@ -708,6 +708,11 @@ apps/mobile/src/features/voice/
   androidVoiceRuntimeAdapter.ts
   MasterVoiceProvider.tsx
   MasterVoiceOverlays.tsx
+
+packages/client-runtime/src/voice/
+  runtime.ts
+  presentation.ts
+  threadComposer.ts
 ```
 
 The local module is autolinked using `expo-module.config.json`, matching existing T3 native modules.
@@ -851,6 +856,11 @@ its event listener before reading the complete snapshot and deduplicates by publ
 attachment has no snapshot/subscription gap. A failed attachment does not expose a command-capable
 adapter.
 
+Stop, notification, and MediaSession callbacks never wait for worker-executor termination. They
+begin cleanup and return; terminal publication occurs asynchronously after media and network work
+has reached exact quiescence. This keeps Android callback threads responsive while preserving the
+single-owner admission fence until cleanup is complete.
+
 ### Credential boundary
 
 After a visible user start and permission check, the authenticated React client calls
@@ -871,11 +881,13 @@ React callback dependency while a supported operation is in the background.
 
 ### React Native state
 
-`@t3tools/client-runtime/voice` defines the platform-neutral semantic snapshot and adapter contract.
+`@t3tools/client-runtime/voice` defines the platform-neutral semantic snapshot, adapter contract,
+attachment/retry coordination, presentation derivation, and Thread composer/review reconciliation.
 The Android adapter issues the child credential, validates environment/context identity, and
 forwards controls. Android native code implements the runtime today; future web/desktop adapters
-implement the same semantic contract with their platform media stack. Shared React presentation is
-therefore a controller/view over the adapter, not the owner of an Android session.
+reuse that shared behavior with their platform media stack. Mobile keeps only native permission,
+navigation, and visual control wiring. Shared React presentation is therefore a controller/view over
+the adapter, not the owner of an Android session.
 
 Parity means that platforms share this semantic adapter, settings, snapshots, and presentation
 behavior. It does not mean retaining a second React-owned Android state machine beside the native
@@ -1079,15 +1091,17 @@ The server voice foundation, bounded media routes, Realtime control plane, durab
 conversation model, tool/confirmation policies, and Android native media primitives predate the
 Android runtime rebaseline.
 
-The rebaseline replaces React-owned Android session orchestration and the abandoned durable
-kernel/mailbox direction with one process-local native controller. It includes the typed semantic
-adapter, native Realtime and Thread drivers, foreground-service notification/MediaSession controls,
-exact native-session and thread-outcome server seams, generation/review fencing, and deletion of the
-superseded Android bridge/state-machine shapes.
+The implemented rebaseline replaces React-owned Android session orchestration and the abandoned
+durable kernel/mailbox direction with one process-local native controller. It includes the typed
+semantic adapter, shared presentation/composer state, native Realtime and Thread drivers,
+foreground-service notification/MediaSession controls, exact native-session and thread-outcome
+server seams, generation/review fencing, and deletion of the superseded Android bridge/state-machine
+shapes.
 
 Completion is determined by the repository gates and the connected-device matrix in the rebaseline
-spec, not by the old phased workstream sequence. Temporary Realtime milestone tracing is removed
-after the first traced device pass; the bounded privacy-safe diagnostic ring remains.
+spec, not by the old phased workstream sequence. The temporary Realtime milestone layer was removed
+after the traced device pass; the bounded privacy-safe operational and endpoint diagnostic ring
+remains for troubleshooting.
 
 ## Operational Setup
 

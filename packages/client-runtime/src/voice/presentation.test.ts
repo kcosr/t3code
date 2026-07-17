@@ -1,4 +1,5 @@
-import type { VoiceRuntimeSnapshot } from "@t3tools/client-runtime/voice";
+// @effect-diagnostics globalDate:off
+import type { VoiceRuntimeSnapshot } from "./runtime.ts";
 import {
   EnvironmentId,
   ProjectId,
@@ -31,8 +32,23 @@ import {
   voiceRuntimePresentationPhase,
   voiceRuntimeSnapshotEnvironmentId,
   type MasterVoiceFocus,
-} from "./masterVoiceState";
-import { resolveVoicePreferences } from "./voicePreferences";
+  type ThreadVoiceStartPreferences,
+} from "./presentation.ts";
+
+const voicePreferences = (
+  overrides: Partial<ThreadVoiceStartPreferences> = {},
+): ThreadVoiceStartPreferences => ({
+  autoListenEnabled: false,
+  autoSubmitEnabled: true,
+  endSilenceMs: 2_200,
+  noSpeechTimeoutMs: null,
+  maximumUtteranceMs: 120_000,
+  postPlaybackGuardMs: 750,
+  transcriptionTimeoutMs: 600_000,
+  submissionTimeoutMs: 30_000,
+  responseTimeoutMs: 600_000,
+  ...overrides,
+});
 
 const environmentId = EnvironmentId.make("environment-one");
 const localDateTime = new Date(2026, 6, 11, 14, 5);
@@ -100,18 +116,12 @@ describe("master voice state", () => {
   it("maps Auto Listen and Auto Submit settings into the native Thread runtime", () => {
     const oneShotReview = threadVoiceStartForFocus(
       focus,
-      resolveVoicePreferences({
-        voiceAutoListenEnabled: false,
-        voiceAutoSubmitEnabled: false,
-      }),
+      voicePreferences({ autoListenEnabled: false, autoSubmitEnabled: false }),
       false,
     );
     const continuousSubmit = threadVoiceStartForFocus(
       focus,
-      resolveVoicePreferences({
-        voiceAutoListenEnabled: true,
-        voiceAutoSubmitEnabled: true,
-      }),
+      voicePreferences({ autoListenEnabled: true, autoSubmitEnabled: true }),
       true,
     );
 

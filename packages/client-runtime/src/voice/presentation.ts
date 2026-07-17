@@ -1,3 +1,6 @@
+// This presentation helper intentionally uses the host's local clock and cancellable timers.
+// @effect-diagnostics globalDate:off
+// @effect-diagnostics globalTimers:off
 import type {
   VoiceAudioRoute,
   VoiceRealtimeContext,
@@ -6,7 +9,7 @@ import type {
   VoiceRuntimeSnapshot,
   VoiceRuntimeSnapshotListener,
   VoiceThreadStartInput,
-} from "@t3tools/client-runtime/voice";
+} from "./runtime.ts";
 import type {
   EnvironmentId,
   ModelSelection,
@@ -18,8 +21,6 @@ import type {
   VoiceConversationSelection,
   VoiceConversationSummary,
 } from "@t3tools/contracts";
-
-import type { ResolvedVoicePreferences } from "./voicePreferences";
 
 export interface MasterVoiceFocus {
   readonly environmentId: EnvironmentId;
@@ -87,9 +88,22 @@ export interface AdmittedClientActionFocus {
   readonly threadId: ThreadId;
 }
 
+/** Portable preference fields needed to configure a native Thread voice session. */
+export interface ThreadVoiceStartPreferences {
+  readonly autoListenEnabled: boolean;
+  readonly autoSubmitEnabled: boolean;
+  readonly endSilenceMs: number;
+  readonly noSpeechTimeoutMs: number | null;
+  readonly maximumUtteranceMs: number;
+  readonly postPlaybackGuardMs: number;
+  readonly transcriptionTimeoutMs: number;
+  readonly submissionTimeoutMs: number;
+  readonly responseTimeoutMs: number;
+}
+
 export function threadVoiceStartForFocus(
   focus: MasterVoiceFocus | null,
-  preferences: ResolvedVoicePreferences,
+  preferences: ThreadVoiceStartPreferences,
   playResponses: boolean,
 ): VoiceThreadStartInput | null {
   if (focus === null) return null;

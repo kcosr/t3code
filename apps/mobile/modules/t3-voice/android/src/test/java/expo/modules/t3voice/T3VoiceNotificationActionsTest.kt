@@ -1,6 +1,7 @@
 package expo.modules.t3voice
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -254,6 +255,31 @@ class T3VoiceNotificationActionsTest {
         snapshot.copy(generation = snapshot.generation + 1, sequence = snapshot.sequence + 1),
       ),
     )
+  }
+
+  @Test
+  fun notificationPendingIntentIdentityIsStableForTheSameActionAndGeneration() {
+    val first = T3VoiceNotificationActionId.MUTE.pendingIntentIdentity(generation = 42)
+    val second = T3VoiceNotificationActionId.MUTE.pendingIntentIdentity(generation = 42)
+
+    assertEquals(first, second)
+    assertEquals("t3voice-runtime://semantic-control/42/MUTE", first.dataUri)
+  }
+
+  @Test
+  fun notificationPendingIntentIdentityFencesGenerationsAndActions() {
+    val muteGenerationOne =
+      T3VoiceNotificationActionId.MUTE.pendingIntentIdentity(generation = 1)
+    val muteGenerationTwo =
+      T3VoiceNotificationActionId.MUTE.pendingIntentIdentity(generation = 2)
+    val stopGenerationOne =
+      T3VoiceNotificationActionId.STOP.pendingIntentIdentity(generation = 1)
+
+    assertEquals(muteGenerationOne.requestCode, muteGenerationTwo.requestCode)
+    assertNotEquals(muteGenerationOne.dataUri, muteGenerationTwo.dataUri)
+    assertNotEquals(muteGenerationOne.dataUri, stopGenerationOne.dataUri)
+    assertNotEquals(muteGenerationOne, muteGenerationTwo)
+    assertNotEquals(muteGenerationOne, stopGenerationOne)
   }
 }
 

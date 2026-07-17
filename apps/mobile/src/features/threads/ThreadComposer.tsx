@@ -1,6 +1,13 @@
 import { isLiquidGlassSupported, LiquidGlassView } from "@callstack/liquid-glass";
 import { useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/unstable/reactivity";
+import {
+  nativeThreadReviewIdentityForDraft,
+  threadReviewHydrationTracker,
+  threadVoiceComposerCapabilities,
+  threadVoiceControlState,
+  type ThreadReviewIdentity,
+} from "@t3tools/client-runtime/voice";
 import type {
   EnvironmentId,
   MessageId,
@@ -75,13 +82,7 @@ import {
   startDictationWithAudioHandoff,
 } from "../voice/traditionalAudioHandoff";
 import { useMasterVoice } from "../voice/MasterVoiceProvider";
-import {
-  nativeThreadReviewIdentityForDraft,
-  threadReviewHydrationTracker,
-  threadVoiceComposerCapabilities,
-  threadVoiceControlState,
-  type ThreadReviewIdentity,
-} from "../voice/threadVoiceComposerState";
+import { threadVoiceControlPresentation } from "../voice/threadVoiceControlPresentation";
 import { resolveVoicePreferences } from "../voice/voicePreferences";
 
 /**
@@ -328,12 +329,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     threadId: props.selectedThread.id,
   });
   const autoListenActive = threadVoiceControl.active;
-  const autoListenPhase =
-    runtimeSnapshot.mode === "thread"
-      ? runtimeSnapshot.phase
-      : runtimeSnapshot.mode === "switching-to-thread"
-        ? runtimeSnapshot.phase
-        : "idle";
+  const autoListenControl = threadVoiceControlPresentation(runtimeSnapshot, autoListenActive);
   const dictationWasActiveRef = useRef(false);
   const audioTransitionRef = useRef(new ExclusiveTransition());
   const canStartAutoListen =
@@ -469,20 +465,20 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const toggleAutoListenOperation = useCallback(async () => {
     await audioTransitionRef.current
       .run(async () => {
-        if (autoListenActive) {
-          if (runtimeSnapshot.mode === "thread" && runtimeSnapshot.phase === "recording") {
+        switch (autoListenControl.command) {
+          case "finish-recording":
             await voiceRuntime.finishThreadRecording();
             return;
-          }
-          await voiceRuntime.stop();
-          return;
+          case "stop":
+            await voiceRuntime.stop();
+            return;
+          case "start":
+            await voiceRuntime.startThread();
         }
-        await voiceRuntime.startThread();
       })
       .catch((cause) => Alert.alert("Thread voice unavailable", String(cause)));
   }, [
-    autoListenActive,
-    runtimeSnapshot,
+    autoListenControl.command,
     voiceRuntime.finishThreadRecording,
     voiceRuntime.startThread,
     voiceRuntime.stop,
@@ -1104,16 +1100,14 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
             >
               {dictation.available ? (
                 <ControlPill
-                  accessibilityLabel={
-                    autoListenActive ? `Pause Auto Listen, ${autoListenPhase}` : "Start Auto Listen"
-                  }
-                  active={autoListenActive}
+                  accessibilityLabel={autoListenControl.accessibilityLabel}
+                  active={autoListenControl.active}
                   disabled={
                     !voiceRuntime.controlsAvailable ||
                     (!autoListenActive &&
                       (!canStartAutoListen || threadVoiceControl.blockedByAnotherTarget))
                   }
-                  icon="waveform"
+                  icon={autoListenControl.icon}
                   onPress={() => void toggleAutoListenOperation()}
                 />
               ) : null}
@@ -1179,13 +1173,9 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                 ) : null}
                 {dictation.available ? (
                   <ComposerToolbarButton
-                    accessibilityLabel={
-                      autoListenActive
-                        ? `Pause Auto Listen, ${autoListenPhase}`
-                        : "Start Auto Listen"
-                    }
-                    icon="waveform"
-                    active={autoListenActive}
+                    accessibilityLabel={autoListenControl.accessibilityLabel}
+                    icon={autoListenControl.icon}
+                    active={autoListenControl.active}
                     disabled={
                       !voiceRuntime.controlsAvailable ||
                       (!autoListenActive &&

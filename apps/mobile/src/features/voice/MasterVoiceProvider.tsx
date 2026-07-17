@@ -1,13 +1,39 @@
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { useNavigation } from "@react-navigation/native";
 import type { PreparedConnection } from "@t3tools/client-runtime/connection";
-import type {
-  VoiceAudioRoute,
-  VoiceHttpClient,
-  VoiceRealtimeContext,
-  VoiceRealtimeTarget,
-  VoiceRuntimeAdapter,
-  VoiceRuntimeSnapshot,
+import {
+  admittedClientActionFocusState,
+  bindVoiceConversationBrowser,
+  canOfferThreadVoiceSwitch,
+  continueVoiceConversationSelection,
+  createVoiceRuntimeRetryCoordinator,
+  durableVoiceConversations,
+  isThreadVoiceStartAvailable,
+  masterVoiceEnvironmentId,
+  newVoiceConversationSelection,
+  prepareVoiceRuntimeAttachment,
+  reconcileVoiceAudioRoutePickerState,
+  resumeVoiceConversationSelection,
+  settleVoiceAudioRoutePickerSelection,
+  stopVoiceRuntimeStrict,
+  threadTranscriptSubmissionDisposition,
+  threadVoiceStartForFocus,
+  voiceRuntimeCommandEnvironmentMatches,
+  voiceRuntimePresentationPhase,
+  voiceRuntimeSnapshotEnvironmentId,
+  type ActiveMasterVoiceAttachment,
+  type AdmittedClientActionFocus,
+  type MasterVoiceFocus,
+  type MasterVoicePhase,
+  type ThreadReviewIdentity,
+  type ThreadTranscriptSubmissionDisposition,
+  type VoiceAudioRoute,
+  type VoiceHttpClient,
+  type VoiceRealtimeContext,
+  type VoiceRealtimeTarget,
+  type VoiceRuntimeAdapter,
+  type VoiceRuntimeSnapshot,
+  type VoiceAudioRoutePickerState,
 } from "@t3tools/client-runtime/voice";
 import {
   VOICE_CONVERSATION_LIST_PAGE_MAX_ENTRIES,
@@ -50,41 +76,11 @@ import {
   type MasterVoiceTranscriptTurn,
 } from "./MasterVoiceOverlays";
 import { VoiceConversationBrowser, type VoiceConversationClient } from "./VoiceConversationBrowser";
-import {
-  continueVoiceConversationSelection,
-  admittedClientActionFocusState,
-  bindVoiceConversationBrowser,
-  canOfferThreadVoiceSwitch,
-  createVoiceRuntimeRetryCoordinator,
-  durableVoiceConversations,
-  isThreadVoiceStartAvailable,
-  masterVoiceEnvironmentId,
-  newVoiceConversationSelection,
-  prepareVoiceRuntimeAttachment,
-  reconcileVoiceAudioRoutePickerState,
-  resumeVoiceConversationSelection,
-  settleVoiceAudioRoutePickerSelection,
-  stopVoiceRuntimeStrict,
-  threadVoiceStartForFocus,
-  voiceRuntimeCommandEnvironmentMatches,
-  voiceRuntimePresentationPhase,
-  voiceRuntimeSnapshotEnvironmentId,
-  type ActiveMasterVoiceAttachment,
-  type AdmittedClientActionFocus,
-  type MasterVoiceFocus,
-  type MasterVoicePhase,
-  type VoiceAudioRoutePickerState,
-} from "./masterVoiceState";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
 import { useVoiceCapabilityAvailability } from "./useVoiceCapabilityAvailability";
 import { resolveVoicePreferences } from "./voicePreferences";
-import {
-  threadTranscriptSubmissionDisposition,
-  type ThreadReviewIdentity,
-  type ThreadTranscriptSubmissionDisposition,
-} from "./threadVoiceComposerState";
 
-export type { MasterVoicePhase } from "./masterVoiceState";
+export type { MasterVoicePhase } from "@t3tools/client-runtime/voice";
 
 interface NativeRuntimeConnection {
   readonly environmentId: EnvironmentId;
@@ -1003,6 +999,11 @@ export function MasterVoiceProvider(props: {
           resumePending={resumePending}
           onHistory={() => {
             if (snapshot.mode === "idle") setBrowserVisible(true);
+          }}
+          onFinishThreadRecording={() => {
+            void finishThreadRecording().catch((cause) =>
+              Alert.alert("Could not finish voice recording", errorMessage(cause)),
+            );
           }}
           onStop={() => {
             void stop().catch((cause) => Alert.alert("Could not stop voice", errorMessage(cause)));

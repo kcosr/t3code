@@ -1,4 +1,4 @@
-import type { VoiceRuntimeSnapshot, VoiceThreadReviewToken } from "@t3tools/client-runtime/voice";
+import type { VoiceRuntimeSnapshot, VoiceThreadReviewToken } from "./runtime.ts";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 
 export interface ThreadVoiceComposerTarget {

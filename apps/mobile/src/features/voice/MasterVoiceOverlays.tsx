@@ -1,4 +1,9 @@
-import type { VoiceAudioRoute, VoiceRuntimeSnapshot } from "@t3tools/client-runtime/voice";
+import type {
+  ActiveMasterVoiceAttachment,
+  VoiceAudioRoute,
+  VoiceAudioRoutePickerState,
+  VoiceRuntimeSnapshot,
+} from "@t3tools/client-runtime/voice";
 import { SymbolView } from "expo-symbols";
 import { ActivityIndicator, FlatList, Modal, Pressable, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -7,7 +12,6 @@ import { AppText as Text } from "../../components/AppText";
 import { ControlPill } from "../../components/ControlPill";
 import { platformSymbolName } from "../../components/platformSymbolName";
 import { useThemeColor } from "../../lib/useThemeColor";
-import type { ActiveMasterVoiceAttachment, VoiceAudioRoutePickerState } from "./masterVoiceState";
 
 export interface MasterVoiceTranscriptTurn {
   readonly role: "user" | "assistant";
@@ -223,6 +227,7 @@ export function MasterVoiceCallBar(props: {
   readonly onResume: () => void;
   readonly resumePending: boolean;
   readonly onHistory: () => void;
+  readonly onFinishThreadRecording: () => void;
   readonly onStop: () => void;
 }) {
   const insets = useSafeAreaInsets();
@@ -306,6 +311,14 @@ export function MasterVoiceCallBar(props: {
             onPress={props.onRoute}
           />
         </>
+      ) : null}
+      {props.snapshot.mode === "thread" && props.snapshot.phase === "recording" ? (
+        <ControlPill
+          icon="checkmark"
+          accessibilityLabel="Finish Thread voice recording"
+          disabled={!props.controlsAvailable}
+          onPress={props.onFinishThreadRecording}
+        />
       ) : null}
       <ControlPill
         icon={props.snapshot.mode === "failed" ? "xmark" : "stop.fill"}

@@ -56,7 +56,7 @@ internal class T3VoiceNativeRuntimeDriver(
           synchronized(lock) { realtimeSession }
             ?.onWebRtcError(sessionId, code, recoverable)
         },
-        onTerminated = { sessionId, _, code, retryable, _ ->
+        onTerminated = { sessionId, _, code, retryable ->
           synchronized(lock) { realtimeSession }
             ?.onWebRtcTerminated(sessionId, code, retryable)
         },

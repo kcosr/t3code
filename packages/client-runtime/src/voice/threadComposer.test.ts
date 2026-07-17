@@ -1,4 +1,4 @@
-import type { VoiceRuntimeSnapshot } from "@t3tools/client-runtime/voice";
+import type { VoiceRuntimeSnapshot } from "./runtime.ts";
 import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -10,7 +10,7 @@ import {
   threadTranscriptSubmissionDisposition,
   threadVoiceComposerCapabilities,
   threadVoiceControlState,
-} from "./threadVoiceComposerState";
+} from "./threadComposer.ts";
 
 const environmentId = EnvironmentId.make("environment-one");
 const target = {
