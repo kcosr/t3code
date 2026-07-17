@@ -183,7 +183,8 @@ class T3VoiceRuntimeControllerTest {
       ).outcome,
     )
     val switching = controller.snapshot().state as T3VoiceControllerState.SwitchingToRealtime
-    assertEquals(T3VoiceSwitchToRealtimeStage.STOPPING_THREAD, switching.stage)
+    assertEquals(threadTarget, switching.threadStart.target)
+    assertEquals(realtimeTarget, switching.realtimeTarget)
     assertEquals(listOf("start-thread:1:thread-a", "stop-thread:1"), driver.actions)
     assertEquals(
       T3VoiceCommandOutcome.DUPLICATE,
@@ -220,6 +221,9 @@ class T3VoiceRuntimeControllerTest {
     assertFalse(controller.activateInitialStart(1))
     assertEquals(listOf("start-realtime:2:environment-a"), driver.actions)
     assertEquals(2, controller.snapshot().generation)
+    val starting = controller.snapshot().state as T3VoiceControllerState.Realtime
+    assertEquals(T3VoiceRealtimeStage.STARTING, starting.stage)
+    assertEquals(realtimeTarget, starting.target)
   }
 
   @Test

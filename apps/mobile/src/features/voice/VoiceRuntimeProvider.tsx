@@ -7,25 +7,21 @@ import {
   canOfferThreadVoiceSwitch,
   continueVoiceConversationSelection,
   createVoiceRuntimeRetryCoordinator,
-  durableVoiceConversations,
   isThreadVoiceStartAvailable,
-  masterVoiceEnvironmentId,
+  voiceRuntimeEnvironmentId,
   newVoiceConversationSelection,
   prepareVoiceRuntimeAttachment,
   reconcileVoiceAudioRoutePickerState,
-  resumeVoiceConversationSelection,
   settleVoiceAudioRoutePickerSelection,
   stopVoiceRuntimeStrict,
   ThreadReviewHydrationTracker,
   threadTranscriptSubmissionDisposition,
   threadVoiceStartForFocus,
   voiceRuntimeCommandEnvironmentMatches,
-  voiceRuntimePresentationPhase,
   voiceRuntimeSnapshotEnvironmentId,
-  type ActiveMasterVoiceAttachment,
+  type ActiveVoiceRuntimeAttachment,
   type AdmittedClientActionFocus,
-  type MasterVoiceFocus,
-  type MasterVoicePhase,
+  type VoiceRuntimeFocus,
   type ThreadReviewIdentity,
   type ThreadTranscriptSubmissionDisposition,
   type VoiceAudioRoute,
@@ -37,15 +33,12 @@ import {
   type VoiceAudioRoutePickerState,
 } from "@t3tools/client-runtime/voice";
 import {
-  VOICE_CONVERSATION_LIST_PAGE_MAX_ENTRIES,
   type EnvironmentId,
   type ThreadId,
   type VoiceConversationId,
   type VoiceConversationSelection,
-  type VoiceConversationSummary,
 } from "@t3tools/contracts";
 import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
-import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
 import {
@@ -75,13 +68,12 @@ import {
   VoiceAudioRoutePicker,
   VoiceTranscriptModal,
   type RealtimeVoiceTranscriptTurn,
-} from "./MasterVoiceOverlays";
+} from "./VoiceRuntimeOverlays";
 import { VoiceConversationBrowser, type VoiceConversationClient } from "./VoiceConversationBrowser";
+import { loadResumeSelection } from "./voiceConversationResume";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
 import { useVoiceCapabilityAvailability } from "./useVoiceCapabilityAvailability";
 import { resolveVoicePreferences } from "./voicePreferences";
-
-export type { MasterVoicePhase } from "@t3tools/client-runtime/voice";
 
 interface NativeRuntimeConnection {
   readonly environmentId: EnvironmentId;
@@ -93,8 +85,7 @@ interface VoiceConversationConnection {
   readonly client: VoiceHttpClient;
 }
 
-interface MasterVoiceContextValue {
-  readonly phase: MasterVoicePhase;
+interface VoiceRuntimeContextValue {
   readonly snapshot: VoiceRuntimeSnapshot;
   readonly controlsAvailable: boolean;
   readonly threadStartAvailable: boolean;
@@ -125,48 +116,16 @@ const INITIAL_SNAPSHOT: VoiceRuntimeSnapshot = {
   sequence: -1,
 };
 
-const MasterVoiceContext = createContext<MasterVoiceContextValue | null>(null);
+const VoiceRuntimeContext = createContext<VoiceRuntimeContextValue | null>(null);
+const EMPTY_REALTIME_TRANSCRIPT: ReadonlyArray<RealtimeVoiceTranscriptTurn> = [];
 
 const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
 
-const loadResumeSelection = async (
-  client: Pick<VoiceHttpClient, "listConversations">,
-): Promise<VoiceConversationSelection> => {
-  const conversations: Array<VoiceConversationSummary> = [];
-  let cursor: string | undefined;
-  let shouldLoad = true;
-  do {
-    const page = await Effect.runPromise(
-      client.listConversations({
-        ...(cursor === undefined ? {} : { cursor }),
-        limit: VOICE_CONVERSATION_LIST_PAGE_MAX_ENTRIES,
-      }),
-    );
-    conversations.push(...page.conversations);
-    if (page.nextCursor === null) {
-      shouldLoad = false;
-      continue;
-    }
-
-    const best = durableVoiceConversations(conversations)[0];
-    const oldestUpdatedAt = page.conversations.at(-1)?.updatedAt;
-    if (
-      best !== undefined &&
-      oldestUpdatedAt !== undefined &&
-      (best.lastCallAt ?? best.createdAt).localeCompare(oldestUpdatedAt) >= 0
-    ) {
-      shouldLoad = false;
-    }
-    cursor = page.nextCursor;
-  } while (shouldLoad);
-  return resumeVoiceConversationSelection(conversations);
-};
-
-export function MasterVoiceProvider(props: {
+export function VoiceRuntimeProvider(props: {
   readonly children: ReactNode;
   readonly environmentId: EnvironmentId | null;
-  readonly focus: MasterVoiceFocus | null;
+  readonly focus: VoiceRuntimeFocus | null;
 }) {
   const navigation = useNavigation();
   const native = getT3VoiceNativeModule();
@@ -190,7 +149,7 @@ export function MasterVoiceProvider(props: {
   const lastRealtimeTargetRef = useRef<VoiceRealtimeTarget | null>(null);
   const voiceStartTransitionRef = useRef(new ExclusiveTransition());
   const threadReviewHydrationTracker = useMemo(() => new ThreadReviewHydrationTracker(), []);
-  const resumeInFlightRef = useRef(false);
+  const resumeAbortRef = useRef<AbortController | null>(null);
   const handledFailureSequenceRef = useRef<number | null>(null);
   const handledClientActionsRef = useRef(new Set<string>());
   const admittedClientActionFocusRef = useRef<AdmittedClientActionFocus | null>(null);
@@ -236,7 +195,7 @@ export function MasterVoiceProvider(props: {
     return retry.cancel;
   }, [native]);
 
-  const controllerEnvironmentId = masterVoiceEnvironmentId(
+  const controllerEnvironmentId = voiceRuntimeEnvironmentId(
     voiceRuntimeSnapshotEnvironmentId(snapshot) ?? runtimeEnvironmentId,
     props.focus,
     props.environmentId,
@@ -253,6 +212,13 @@ export function MasterVoiceProvider(props: {
       ? conversationConnection
       : null;
   const conversationClient: VoiceConversationClient | null = browserConnection?.client ?? null;
+
+  useEffect(
+    () => () => {
+      resumeAbortRef.current?.abort();
+    },
+    [controllerEnvironmentId, conversationClient],
+  );
 
   useEffect(() => {
     let disposed = false;
@@ -445,9 +411,52 @@ export function MasterVoiceProvider(props: {
     };
   }, []);
 
+  const performRealtimeStart = useCallback(
+    async (
+      runtime: NativeRuntimeConnection,
+      target: VoiceRealtimeTarget,
+      isCancelled: () => boolean = () => false,
+    ) => {
+      const runtimeStillMatchesTarget = () =>
+        !isCancelled() &&
+        runtimeRef.current === runtime &&
+        voiceRuntimeCommandEnvironmentMatches(
+          target.environmentId,
+          runtime.environmentId,
+          controllerEnvironmentIdRef.current,
+        );
+      let releaseTraditionalAudio: (() => void) | null = null;
+      try {
+        releaseTraditionalAudio = await interruptTraditionalAudio();
+        if (!runtimeStillMatchesTarget()) {
+          releaseTraditionalAudio();
+          return;
+        }
+        const current = snapshotRef.current;
+        if (current.mode === "failed") await runtime.adapter.stop();
+        if (!runtimeStillMatchesTarget()) {
+          releaseTraditionalAudio();
+          return;
+        }
+        lastRealtimeTargetRef.current = target;
+        handledFailureSequenceRef.current = null;
+        if (current.mode === "thread") {
+          await runtime.adapter.switchThreadToRealtime(target);
+        } else {
+          await runtime.adapter.startRealtime(target);
+        }
+      } catch (cause) {
+        releaseTraditionalAudio?.();
+        throw cause;
+      }
+    },
+    [interruptTraditionalAudio],
+  );
+
   const startRealtime = useCallback(
     async (target: VoiceRealtimeTarget) => {
       const runtime = runtimeRef.current;
+      const current = snapshotRef.current;
       if (
         runtime === null ||
         !voiceRuntimeCommandEnvironmentMatches(
@@ -456,47 +465,15 @@ export function MasterVoiceProvider(props: {
           controllerEnvironmentIdRef.current,
         ) ||
         voiceStartTransitionRef.current.active ||
-        (snapshotRef.current.mode !== "idle" &&
-          snapshotRef.current.mode !== "failed" &&
-          snapshotRef.current.mode !== "thread")
+        (current.mode !== "idle" && current.mode !== "failed" && current.mode !== "thread")
       ) {
         return;
       }
-      const runtimeStillMatchesTarget = () =>
-        runtimeRef.current === runtime &&
-        voiceRuntimeCommandEnvironmentMatches(
-          target.environmentId,
-          runtime.environmentId,
-          controllerEnvironmentIdRef.current,
-        );
-      await voiceStartTransitionRef.current.run(async () => {
-        let releaseTraditionalAudio: (() => void) | null = null;
-        try {
-          releaseTraditionalAudio = await interruptTraditionalAudio();
-          if (!runtimeStillMatchesTarget()) {
-            releaseTraditionalAudio();
-            return;
-          }
-          const current = snapshotRef.current;
-          if (current.mode === "failed") await runtime.adapter.stop();
-          if (!runtimeStillMatchesTarget()) {
-            releaseTraditionalAudio();
-            return;
-          }
-          lastRealtimeTargetRef.current = target;
-          handledFailureSequenceRef.current = null;
-          if (current.mode === "thread") {
-            await runtime.adapter.switchThreadToRealtime(target);
-          } else {
-            await runtime.adapter.startRealtime(target);
-          }
-        } catch (cause) {
-          releaseTraditionalAudio?.();
-          Alert.alert("Voice conversation failed", errorMessage(cause));
-        }
-      });
+      await voiceStartTransitionRef.current
+        .run(() => performRealtimeStart(runtime, target))
+        .catch((cause) => Alert.alert("Voice conversation failed", errorMessage(cause)));
     },
-    [interruptTraditionalAudio],
+    [performRealtimeStart],
   );
 
   useEffect(() => {
@@ -694,36 +671,58 @@ export function MasterVoiceProvider(props: {
 
   const resume = useCallback(() => {
     const runtime = runtimeRef.current;
+    const current = snapshotRef.current;
     if (
       runtime === null ||
       conversationClient === null ||
       conversationConnection?.environmentId !== runtime.environmentId ||
-      resumeInFlightRef.current ||
       voiceStartTransitionRef.current.active ||
-      (snapshotRef.current.mode !== "idle" &&
-        snapshotRef.current.mode !== "thread" &&
-        snapshotRef.current.mode !== "failed")
+      (current.mode !== "idle" && current.mode !== "thread" && current.mode !== "failed")
     ) {
       return;
     }
     const targetEnvironmentId = runtime.environmentId;
     const targetContext = realtimeContext;
-    resumeInFlightRef.current = true;
+    const abort = new AbortController();
+    resumeAbortRef.current?.abort();
+    resumeAbortRef.current = abort;
     setResumePending(true);
-    void loadResumeSelection(conversationClient)
-      .then((conversation) =>
-        startRealtime({
-          environmentId: targetEnvironmentId,
-          conversation,
-          ...targetContext,
-        }),
-      )
-      .catch((cause) => Alert.alert("Voice conversation unavailable", errorMessage(cause)))
+    let loadingSelection = true;
+    void voiceStartTransitionRef.current
+      .run(async () => {
+        const conversation = await loadResumeSelection(conversationClient, abort.signal);
+        if (conversation === null || abort.signal.aborted) return;
+        loadingSelection = false;
+        await performRealtimeStart(
+          runtime,
+          {
+            environmentId: targetEnvironmentId,
+            conversation,
+            ...targetContext,
+          },
+          () => abort.signal.aborted,
+        );
+      })
+      .catch((cause) => {
+        if (!abort.signal.aborted) {
+          Alert.alert(
+            loadingSelection ? "Voice conversation unavailable" : "Voice conversation failed",
+            errorMessage(cause),
+          );
+        }
+      })
       .finally(() => {
-        resumeInFlightRef.current = false;
-        setResumePending(false);
+        if (resumeAbortRef.current === abort) {
+          resumeAbortRef.current = null;
+          setResumePending(false);
+        }
       });
-  }, [conversationClient, conversationConnection?.environmentId, realtimeContext, startRealtime]);
+  }, [
+    conversationClient,
+    conversationConnection?.environmentId,
+    performRealtimeStart,
+    realtimeContext,
+  ]);
 
   const startThread = useCallback(async () => {
     const runtime = runtimeRef.current;
@@ -914,7 +913,7 @@ export function MasterVoiceProvider(props: {
       .catch((cause) => Alert.alert("Microphone unavailable", errorMessage(cause)));
   }, []);
 
-  const attachment = useMemo<ActiveMasterVoiceAttachment | null>(() => {
+  const attachment = useMemo<ActiveVoiceRuntimeAttachment | null>(() => {
     const environmentId = voiceRuntimeSnapshotEnvironmentId(snapshot);
     if (environmentId === null || snapshot.mode === "failed" || snapshot.mode === "idle")
       return null;
@@ -951,12 +950,10 @@ export function MasterVoiceProvider(props: {
 
   const transcript = useMemo<ReadonlyArray<RealtimeVoiceTranscriptTurn>>(() => {
     if (snapshot.mode === "realtime") return snapshot.transcript;
-    return [];
+    return EMPTY_REALTIME_TRANSCRIPT;
   }, [snapshot]);
-  const phase = voiceRuntimePresentationPhase(snapshot);
-  const contextValue = useMemo<MasterVoiceContextValue>(
+  const contextValue = useMemo<VoiceRuntimeContextValue>(
     () => ({
-      phase,
       snapshot,
       controlsAvailable,
       threadStartAvailable,
@@ -971,7 +968,6 @@ export function MasterVoiceProvider(props: {
     [
       finishThreadRecording,
       controlsAvailable,
-      phase,
       registerTraditionalAudioInterruption,
       snapshot,
       startThread,
@@ -991,7 +987,7 @@ export function MasterVoiceProvider(props: {
   );
 
   return (
-    <MasterVoiceContext.Provider value={contextValue}>
+    <VoiceRuntimeContext.Provider value={contextValue}>
       <View className="flex-1">
         {props.children}
         <RealtimeVoiceCallBar
@@ -1010,15 +1006,7 @@ export function MasterVoiceProvider(props: {
           onTranscript={() => setTranscriptVisible(true)}
           onResume={resume}
           resumePending={resumePending}
-          onHistory={() => {
-            if (
-              snapshot.mode === "idle" ||
-              snapshot.mode === "thread" ||
-              (snapshot.mode === "failed" && snapshot.operation === "thread")
-            ) {
-              setBrowserVisible(true);
-            }
-          }}
+          onHistory={() => setBrowserVisible(true)}
           onStop={() => {
             void stop().catch((cause) => Alert.alert("Could not stop voice", errorMessage(cause)));
           }}
@@ -1053,12 +1041,12 @@ export function MasterVoiceProvider(props: {
         onClose={() => setAudioRoutePicker(null)}
         onSelect={selectAudioRoute}
       />
-    </MasterVoiceContext.Provider>
+    </VoiceRuntimeContext.Provider>
   );
 }
 
-export function useMasterVoice(): MasterVoiceContextValue {
-  const context = use(MasterVoiceContext);
-  if (context === null) throw new Error("useMasterVoice must be used inside MasterVoiceProvider");
+export function useVoiceRuntime(): VoiceRuntimeContextValue {
+  const context = use(VoiceRuntimeContext);
+  if (context === null) throw new Error("useVoiceRuntime must be used inside VoiceRuntimeProvider");
   return context;
 }

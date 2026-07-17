@@ -101,7 +101,6 @@ class T3VoiceRuntimeBridgeTest {
       T3VoiceControllerSnapshot(
         state =
           T3VoiceControllerState.SwitchingToRealtime(
-            stage = T3VoiceSwitchToRealtimeStage.STOPPING_THREAD,
             threadStart = threadStart,
             realtimeTarget = realtimeTarget,
           ),
@@ -110,7 +109,7 @@ class T3VoiceRuntimeBridgeTest {
       ).toBridgeBody()
 
     assertEquals("switching-to-realtime", body["mode"])
-    assertEquals("stopping-thread", body["phase"])
+    assertFalse(body.containsKey("phase"))
     @Suppress("UNCHECKED_CAST")
     val source = body["source"] as Map<String, Any?>
     assertEquals("thread-a", source["threadId"])

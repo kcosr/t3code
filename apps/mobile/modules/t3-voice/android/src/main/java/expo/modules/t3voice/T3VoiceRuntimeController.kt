@@ -120,7 +120,6 @@ internal class T3VoiceRuntimeController(
 
   private data class PendingThreadToRealtime(
     val generation: Long,
-    val target: T3VoiceRealtimeTarget,
     val session: T3VoiceNativeSessionConfig,
   )
 
@@ -258,15 +257,7 @@ internal class T3VoiceRuntimeController(
     if (state !is T3VoiceControllerState.Idle) return rejected(T3VoiceCommandRejection.BUSY)
 
     begin(
-      T3VoiceControllerState.Realtime(
-        stage = T3VoiceRealtimeStage.STARTING,
-        target = target,
-        muted = false,
-        pendingClientActions = emptyList(),
-        audioRoutes = emptyList(),
-        transcript = emptyList(),
-        pendingConfirmations = emptyList(),
-      ),
+      emptyRealtimeState(T3VoiceRealtimeStage.STARTING, target),
     )
     pendingInitialStart = PendingInitialStart.Realtime(current.generation, target, session)
     return applied()
@@ -290,13 +281,7 @@ internal class T3VoiceRuntimeController(
     if (state !is T3VoiceControllerState.Idle) return rejected(T3VoiceCommandRejection.BUSY)
 
     begin(
-      T3VoiceControllerState.Thread(
-        T3VoiceThreadStage.STARTING,
-        target,
-        settings,
-        transcript = null,
-        attention = null,
-      ),
+      emptyThreadState(T3VoiceThreadStage.STARTING, requested),
     )
     pendingInitialStart = PendingInitialStart.Thread(current.generation, requested, session)
     return applied()
@@ -355,24 +340,23 @@ internal class T3VoiceRuntimeController(
         pendingThreadToRealtime =
           PendingThreadToRealtime(
             generation = current.generation,
-            target = target,
             session = session,
           )
         stopRequestedGeneration = null
-        update(
+        val switching =
           T3VoiceControllerState.SwitchingToRealtime(
-            stage = T3VoiceSwitchToRealtimeStage.STOPPING_THREAD,
             threadStart = threadStart,
             realtimeTarget = target,
-          ),
-        )
-        when {
-          state.stage == T3VoiceThreadStage.STARTING && clearPendingInitialStart() ->
-            startRealtimeAfterThread()
-          state.stage != T3VoiceThreadStage.STOPPING ->
-            runDriver(T3VoiceOperation.SWITCHING_TO_REALTIME) {
-              driver.stopThread(current.generation)
-            }
+          )
+        if (state.stage == T3VoiceThreadStage.STARTING && clearPendingInitialStart()) {
+          startRealtimeAfterThread(switching)
+          return applied()
+        }
+        update(switching)
+        if (state.stage != T3VoiceThreadStage.STOPPING) {
+          runDriver(T3VoiceOperation.SWITCHING_TO_REALTIME) {
+            driver.stopThread(current.generation)
+          }
         }
         applied()
       }
@@ -642,15 +626,7 @@ internal class T3VoiceRuntimeController(
           T3VoiceSwitchStage.CLOSING_REALTIME -> {
             stopRequestedGeneration = current.generation
             update(
-              T3VoiceControllerState.Realtime(
-                stage = T3VoiceRealtimeStage.STOPPING,
-                target = state.realtimeTarget,
-                muted = false,
-                pendingClientActions = emptyList(),
-                audioRoutes = emptyList(),
-                transcript = emptyList(),
-                pendingConfirmations = emptyList(),
-              ),
+              emptyRealtimeState(T3VoiceRealtimeStage.STOPPING, state.realtimeTarget),
             )
             runDriver(T3VoiceOperation.SWITCHING_TO_THREAD) {
               driver.cancelRealtimeToThreadSwitch(current.generation)
@@ -659,13 +635,7 @@ internal class T3VoiceRuntimeController(
           T3VoiceSwitchStage.STARTING_RECORDER -> {
             stopRequestedGeneration = current.generation
             update(
-              T3VoiceControllerState.Thread(
-                T3VoiceThreadStage.STOPPING,
-                state.threadStart.target,
-                state.threadStart.settings,
-                transcript = null,
-                attention = null,
-              ),
+              emptyThreadState(T3VoiceThreadStage.STOPPING, state.threadStart),
             )
             runDriver(T3VoiceOperation.SWITCHING_TO_THREAD) {
               driver.stopThread(current.generation)
@@ -676,13 +646,7 @@ internal class T3VoiceRuntimeController(
         pendingThreadToRealtime = null
         stopRequestedGeneration = current.generation
         update(
-          T3VoiceControllerState.Thread(
-            stage = T3VoiceThreadStage.STOPPING,
-            target = state.threadStart.target,
-            settings = state.threadStart.settings,
-            transcript = null,
-            attention = null,
-          ),
+          emptyThreadState(T3VoiceThreadStage.STOPPING, state.threadStart),
         )
       }
       is T3VoiceControllerState.Thread -> {
@@ -759,13 +723,7 @@ internal class T3VoiceRuntimeController(
       is T3VoiceControllerState.SwitchingToThread -> {
         if (state.stage != T3VoiceSwitchStage.STARTING_RECORDER) return false
         update(
-          T3VoiceControllerState.Thread(
-            T3VoiceThreadStage.RECORDING,
-            state.threadStart.target,
-            state.threadStart.settings,
-            transcript = null,
-            attention = null,
-          ),
+          emptyThreadState(T3VoiceThreadStage.RECORDING, state.threadStart),
         )
         true
       }
@@ -1048,34 +1006,49 @@ internal class T3VoiceRuntimeController(
         true
       }
       is T3VoiceControllerState.SwitchingToRealtime -> {
-        if (state.stage != T3VoiceSwitchToRealtimeStage.STOPPING_THREAD) return false
-        startRealtimeAfterThread()
+        startRealtimeAfterThread(state)
         true
       }
       else -> false
     }
   }
 
-  private fun startRealtimeAfterThread() {
+  private fun startRealtimeAfterThread(state: T3VoiceControllerState.SwitchingToRealtime) {
     val pending =
       pendingThreadToRealtime?.takeIf { it.generation == current.generation }
         ?: error("The pending Realtime target was lost during the Thread switch.")
     pendingThreadToRealtime = null
-    advanceGeneration(
-      T3VoiceControllerState.Realtime(
-        stage = T3VoiceRealtimeStage.STARTING,
-        target = pending.target,
-        muted = false,
-        pendingClientActions = emptyList(),
-        audioRoutes = emptyList(),
-        transcript = emptyList(),
-        pendingConfirmations = emptyList(),
-      ),
-    )
+    advanceGeneration(emptyRealtimeState(T3VoiceRealtimeStage.STARTING, state.realtimeTarget))
     runDriver(T3VoiceOperation.SWITCHING_TO_REALTIME) {
-      driver.startRealtime(current.generation, pending.target, pending.session)
+      driver.startRealtime(current.generation, state.realtimeTarget, pending.session)
     }
   }
+
+  private fun emptyRealtimeState(
+    stage: T3VoiceRealtimeStage,
+    target: T3VoiceRealtimeTarget,
+  ) =
+    T3VoiceControllerState.Realtime(
+      stage = stage,
+      target = target,
+      muted = false,
+      pendingClientActions = emptyList(),
+      audioRoutes = emptyList(),
+      transcript = emptyList(),
+      pendingConfirmations = emptyList(),
+    )
+
+  private fun emptyThreadState(
+    stage: T3VoiceThreadStage,
+    start: T3VoiceThreadStart,
+  ) =
+    T3VoiceControllerState.Thread(
+      stage = stage,
+      target = start.target,
+      settings = start.settings,
+      transcript = null,
+      attention = null,
+    )
 
   private fun fail(failure: T3VoiceFailure, releasePending: Boolean): Boolean {
     val state = current.state

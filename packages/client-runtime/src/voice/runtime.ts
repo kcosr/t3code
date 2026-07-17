@@ -97,8 +97,6 @@ export type VoiceRealtimePhase = "starting" | "connected" | "stopping";
 
 export type VoiceSwitchToThreadPhase = "closing-realtime" | "starting-recorder";
 
-export type VoiceSwitchToRealtimePhase = "stopping-thread";
-
 export type VoiceThreadPhase =
   | "starting"
   | "recording"
@@ -147,7 +145,6 @@ export type VoiceRuntimeSnapshot = VoiceRuntimeSnapshotIdentity &
       }
     | {
         readonly mode: "switching-to-realtime";
-        readonly phase: VoiceSwitchToRealtimePhase;
         readonly source: VoiceThreadTarget;
         readonly target: VoiceRealtimeTarget;
       }

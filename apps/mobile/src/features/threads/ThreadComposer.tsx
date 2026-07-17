@@ -81,7 +81,7 @@ import {
   interruptTraditionalAudioForRealtime,
   startDictationWithAudioHandoff,
 } from "../voice/traditionalAudioHandoff";
-import { useMasterVoice } from "../voice/MasterVoiceProvider";
+import { useVoiceRuntime } from "../voice/VoiceRuntimeProvider";
 import { resolveVoicePreferences } from "../voice/voicePreferences";
 
 /**
@@ -323,7 +323,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     onChangeDraftMessage: props.onChangeDraftMessage,
     voicePreferences,
   });
-  const voiceRuntime = useMasterVoice();
+  const voiceRuntime = useVoiceRuntime();
   const composerDraftsReady = useComposerDraftsReady();
   const runtimeSnapshot = voiceRuntime.snapshot;
   const realtimeInUse =

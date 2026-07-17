@@ -339,10 +339,6 @@ internal enum class T3VoiceSwitchStage {
   STARTING_RECORDER,
 }
 
-internal enum class T3VoiceSwitchToRealtimeStage {
-  STOPPING_THREAD,
-}
-
 internal enum class T3VoiceThreadStage {
   STARTING,
   RECORDING,
@@ -399,7 +395,6 @@ internal sealed interface T3VoiceControllerState {
   ) : T3VoiceControllerState
 
   data class SwitchingToRealtime(
-    val stage: T3VoiceSwitchToRealtimeStage,
     val threadStart: T3VoiceThreadStart,
     val realtimeTarget: T3VoiceRealtimeTarget,
   ) : T3VoiceControllerState

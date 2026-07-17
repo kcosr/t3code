@@ -21,18 +21,13 @@ export interface T3VoiceNativeSessionConfiguration extends VoiceNativeSessionCre
   readonly baseUrl: string;
 }
 
-export interface T3VoiceStartRealtimeInput {
+export interface T3VoiceRealtimeAdmissionInput {
   readonly target: VoiceRealtimeTarget;
   readonly session: T3VoiceNativeSessionConfiguration;
 }
 
 export interface T3VoiceStartThreadInput {
   readonly input: VoiceThreadStartInput;
-  readonly session: T3VoiceNativeSessionConfiguration;
-}
-
-export interface T3VoiceSwitchThreadToRealtimeInput {
-  readonly target: VoiceRealtimeTarget;
   readonly session: T3VoiceNativeSessionConfiguration;
 }
 
@@ -240,12 +235,10 @@ export interface T3VoiceNativeModule {
     ): T3VoiceEventSubscription;
   };
   readonly getRuntimeSnapshotAsync: () => Promise<VoiceRuntimeSnapshot>;
-  readonly startRealtimeAsync: (input: T3VoiceStartRealtimeInput) => Promise<void>;
+  readonly startRealtimeAsync: (input: T3VoiceRealtimeAdmissionInput) => Promise<void>;
   readonly startThreadAsync: (input: T3VoiceStartThreadInput) => Promise<void>;
   readonly switchRealtimeToThreadAsync: (input: VoiceThreadStartInput) => Promise<void>;
-  readonly switchThreadToRealtimeAsync: (
-    input: T3VoiceSwitchThreadToRealtimeInput,
-  ) => Promise<void>;
+  readonly switchThreadToRealtimeAsync: (input: T3VoiceRealtimeAdmissionInput) => Promise<void>;
   readonly stopRuntimeAsync: () => Promise<void>;
   readonly setRealtimeMutedAsync: (input: T3VoiceSetRealtimeMutedInput) => Promise<void>;
   readonly setRealtimeAudioRouteAsync: (input: T3VoiceSetRealtimeAudioRouteInput) => Promise<void>;

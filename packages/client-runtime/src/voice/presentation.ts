@@ -22,7 +22,7 @@ import type {
   VoiceConversationSummary,
 } from "@t3tools/contracts";
 
-export interface MasterVoiceFocus {
+export interface VoiceRuntimeFocus {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;
   readonly threadId: ThreadId;
@@ -34,14 +34,12 @@ export interface MasterVoiceFocus {
   readonly activeThreadBusy: boolean;
 }
 
-export interface ActiveMasterVoiceAttachment {
+export interface ActiveVoiceRuntimeAttachment {
   readonly environmentId: EnvironmentId;
-  readonly focus: MasterVoiceFocus | null;
+  readonly focus: VoiceRuntimeFocus | null;
 }
 
-export type MasterVoicePhase = "idle" | "starting" | "active" | "stopping" | "error";
-
-export type RealtimeVoiceBarPhase = MasterVoicePhase;
+export type RealtimeVoiceBarPhase = "idle" | "starting" | "active" | "stopping" | "error";
 
 export interface VoiceAudioRoutePickerState {
   readonly selectingRouteId: VoiceAudioRoute["id"] | null;
@@ -104,7 +102,7 @@ export interface ThreadVoiceStartPreferences {
 }
 
 export function threadVoiceStartForFocus(
-  focus: MasterVoiceFocus | null,
+  focus: VoiceRuntimeFocus | null,
   preferences: ThreadVoiceStartPreferences,
   playResponses: boolean,
 ): VoiceThreadStartInput | null {
@@ -296,27 +294,6 @@ export async function stopVoiceRuntimeStrict(
   await runtime.adapter.stop();
 }
 
-export function voiceRuntimePresentationPhase(snapshot: VoiceRuntimeSnapshot): MasterVoicePhase {
-  switch (snapshot.mode) {
-    case "idle":
-      return "idle";
-    case "failed":
-      return "error";
-    case "switching-to-thread":
-      return "starting";
-    case "switching-to-realtime":
-      return "starting";
-    case "realtime":
-      if (snapshot.phase === "starting") return "starting";
-      if (snapshot.phase === "stopping") return "stopping";
-      return "active";
-    case "thread":
-      if (snapshot.phase === "starting" || snapshot.phase === "rearming") return "starting";
-      if (snapshot.phase === "stopping") return "stopping";
-      return "active";
-  }
-}
-
 /** Presentation ownership for the dedicated Realtime call bar. */
 export function realtimeVoiceBarPhase(snapshot: VoiceRuntimeSnapshot): RealtimeVoiceBarPhase {
   switch (snapshot.mode) {
@@ -338,7 +315,7 @@ export function realtimeVoiceBarPhase(snapshot: VoiceRuntimeSnapshot): RealtimeV
 
 export function admittedClientActionFocusState(
   admitted: AdmittedClientActionFocus | null,
-  visible: MasterVoiceFocus | null,
+  visible: VoiceRuntimeFocus | null,
 ): "none" | "waiting" | "admitted" {
   if (admitted === null) return "none";
   return visible?.environmentId === admitted.environmentId &&
@@ -400,9 +377,9 @@ export function continueVoiceConversationSelection(
   return { type: "continue", conversationId, takeover: false };
 }
 
-export function masterVoiceEnvironmentId(
+export function voiceRuntimeEnvironmentId(
   activeEnvironmentId: EnvironmentId | null,
-  focus: MasterVoiceFocus | null,
+  focus: VoiceRuntimeFocus | null,
   fallbackEnvironmentId: EnvironmentId | null = null,
 ): EnvironmentId | null {
   return activeEnvironmentId ?? focus?.environmentId ?? fallbackEnvironmentId;

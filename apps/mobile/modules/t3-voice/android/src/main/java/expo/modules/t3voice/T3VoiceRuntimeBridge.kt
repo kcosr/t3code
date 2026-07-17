@@ -32,7 +32,6 @@ internal fun T3VoiceControllerSnapshot.toBridgeBody(): Map<String, Any?> {
       is T3VoiceControllerState.SwitchingToRealtime ->
         mapOf(
           "mode" to "switching-to-realtime",
-          "phase" to state.stage.bridgeName(),
           "source" to state.threadStart.target.toBridgeBody(),
           "target" to state.realtimeTarget.toBridgeBody(),
         )
@@ -148,12 +147,11 @@ private fun T3VoiceRealtimeClientAction.toBridgeBody(): Map<String, Any> =
     "expiresAt" to expiresAt,
   )
 
-private fun T3VoiceRealtimeStage.bridgeName(): String = name.lowercase()
+private fun Enum<*>.kebabName(): String = name.lowercase().replace('_', '-')
 
-private fun T3VoiceSwitchStage.bridgeName(): String = name.lowercase().replace('_', '-')
+private fun T3VoiceRealtimeStage.bridgeName(): String = kebabName()
 
-private fun T3VoiceSwitchToRealtimeStage.bridgeName(): String =
-  name.lowercase().replace('_', '-')
+private fun T3VoiceSwitchStage.bridgeName(): String = kebabName()
 
 private fun T3VoiceThreadStage.bridgeName(): String =
   when (this) {
@@ -161,11 +159,10 @@ private fun T3VoiceThreadStage.bridgeName(): String =
     else -> name.lowercase()
   }
 
-private fun T3VoiceThreadRuntimeMode.bridgeName(): String = name.lowercase().replace('_', '-')
+private fun T3VoiceThreadRuntimeMode.bridgeName(): String = kebabName()
 
-private fun T3VoiceThreadSubmissionPolicy.bridgeName(): String =
-  name.lowercase().replace('_', '-')
+private fun T3VoiceThreadSubmissionPolicy.bridgeName(): String = kebabName()
 
-private fun T3VoiceThreadAttention.bridgeName(): String = name.lowercase().replace('_', '-')
+private fun T3VoiceThreadAttention.bridgeName(): String = kebabName()
 
-private fun T3VoiceOperation.bridgeName(): String = name.lowercase().replace('_', '-')
+private fun T3VoiceOperation.bridgeName(): String = kebabName()

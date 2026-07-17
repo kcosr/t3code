@@ -1,6 +1,7 @@
 import {
   realtimeVoiceBarPhase,
-  type ActiveMasterVoiceAttachment,
+  type ActiveVoiceRuntimeAttachment,
+  type RealtimeVoiceBarPhase,
   type VoiceAudioRoute,
   type VoiceAudioRoutePickerState,
   type VoiceRuntimeSnapshot,
@@ -179,14 +180,19 @@ export function VoiceAudioRoutePicker(props: {
   );
 }
 
-function realtimePhaseLabel(snapshot: VoiceRuntimeSnapshot): string {
-  if (snapshot.mode === "failed") return "Realtime voice failed";
-  if (snapshot.mode === "switching-to-thread") return "Ending Realtime voice";
-  if (snapshot.mode === "switching-to-realtime") return "Connecting Realtime voice";
-  if (snapshot.mode !== "realtime") return "Realtime voice";
-  if (snapshot.phase === "starting") return "Connecting Realtime voice";
-  if (snapshot.phase === "stopping") return "Ending Realtime voice";
-  return "Realtime voice active";
+function realtimePhaseLabel(phase: RealtimeVoiceBarPhase): string {
+  switch (phase) {
+    case "idle":
+      return "Realtime voice";
+    case "starting":
+      return "Connecting Realtime voice";
+    case "active":
+      return "Realtime voice active";
+    case "stopping":
+      return "Ending Realtime voice";
+    case "error":
+      return "Realtime voice failed";
+  }
 }
 
 export function RealtimeVoiceCallBar(props: {
@@ -194,7 +200,7 @@ export function RealtimeVoiceCallBar(props: {
   readonly callAvailable: boolean;
   readonly snapshot: VoiceRuntimeSnapshot;
   readonly controlsAvailable: boolean;
-  readonly attachment: ActiveMasterVoiceAttachment | null;
+  readonly attachment: ActiveVoiceRuntimeAttachment | null;
   readonly transcript: ReadonlyArray<RealtimeVoiceTranscriptTurn>;
   readonly onMute: () => void;
   readonly onRoute: () => void;
@@ -206,7 +212,8 @@ export function RealtimeVoiceCallBar(props: {
 }) {
   const insets = useSafeAreaInsets();
   const iconColor = useThemeColor("--color-icon");
-  if (realtimeVoiceBarPhase(props.snapshot) === "idle") {
+  const barPhase = realtimeVoiceBarPhase(props.snapshot);
+  if (barPhase === "idle") {
     if (!props.historyAvailable && !props.callAvailable) return null;
     return (
       <View
@@ -260,7 +267,7 @@ export function RealtimeVoiceCallBar(props: {
         onPress={props.onTranscript}
       >
         <Text className="text-sm font-t3-bold text-foreground" numberOfLines={1}>
-          {realtimePhaseLabel(props.snapshot)}
+          {realtimePhaseLabel(barPhase)}
           {props.attachment?.focus === null || props.attachment === null
             ? ""
             : ` · ${props.attachment.focus.threadTitle}`}

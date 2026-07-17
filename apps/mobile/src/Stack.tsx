@@ -49,7 +49,7 @@ import { SettingsEnvironmentsRouteScreen } from "./features/settings/SettingsEnv
 import { SettingsRouteScreen } from "./features/settings/SettingsRouteScreen";
 import { SettingsWaitlistRouteScreen } from "./features/settings/SettingsWaitlistRouteScreen";
 import { SettingsVoiceRouteScreen } from "./features/settings/SettingsVoiceRouteScreen";
-import { MasterVoiceProvider } from "./features/voice/MasterVoiceProvider";
+import { VoiceRuntimeProvider } from "./features/voice/VoiceRuntimeProvider";
 import { scopedThreadKey } from "./lib/scopedEntities";
 import { nativeHeaderScrollEdgeEffects } from "./native/StackHeader";
 import { useThreadShell } from "./state/entities";
@@ -324,11 +324,11 @@ function RootStackLayoutContent(props: {
   return (
     <HardwareKeyboardCommandProvider pathname={pathname}>
       <ClerkSettingsSheetDetentProvider initiallyExpanded={false}>
-        <MasterVoiceProvider environmentId={voiceEnvironmentId} focus={voiceFocus}>
+        <VoiceRuntimeProvider environmentId={voiceEnvironmentId} focus={voiceFocus}>
           <AdaptiveWorkspaceLayout pathname={workspacePathname}>
             {props.children}
           </AdaptiveWorkspaceLayout>
-        </MasterVoiceProvider>
+        </VoiceRuntimeProvider>
       </ClerkSettingsSheetDetentProvider>
     </HardwareKeyboardCommandProvider>
   );

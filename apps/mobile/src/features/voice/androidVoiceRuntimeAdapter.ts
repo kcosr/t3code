@@ -189,11 +189,12 @@ export const makeAndroidVoiceRuntimeAdapter = (
     };
   };
 
-  const prepareInitialStart = async (
+  const prepareNativeSession = async (
     environmentId: EnvironmentId,
+    requireIdle: boolean,
   ): Promise<T3VoiceNativeSessionConfiguration> => {
     const prepared = requirePreparedConnection(environmentId);
-    await ensureInitialStartIdle(input.native);
+    if (requireIdle) await ensureInitialStartIdle(input.native);
     await ensureMicrophonePermission(input.native);
     await requestNotificationPermission().catch(() => "denied" as const);
     await requestOptionalBluetoothPermission(input.native);
@@ -207,14 +208,14 @@ export const makeAndroidVoiceRuntimeAdapter = (
       assertEnvironment(input.environmentId, target.environmentId);
       assertRealtimeContext(input.environmentId, target);
       return commands.enqueue(async () => {
-        const session = await prepareInitialStart(target.environmentId);
+        const session = await prepareNativeSession(target.environmentId, true);
         await input.native.startRealtimeAsync({ target, session });
       });
     },
     startThread: async (threadInput: VoiceThreadStartInput) => {
       assertEnvironment(input.environmentId, threadInput.target.environmentId);
       return commands.enqueue(async () => {
-        const session = await prepareInitialStart(threadInput.target.environmentId);
+        const session = await prepareNativeSession(threadInput.target.environmentId, true);
         await input.native.startThreadAsync({ input: threadInput, session });
       });
     },
@@ -226,11 +227,7 @@ export const makeAndroidVoiceRuntimeAdapter = (
       assertEnvironment(input.environmentId, target.environmentId);
       assertRealtimeContext(input.environmentId, target);
       return commands.enqueue(async () => {
-        const prepared = requirePreparedConnection(target.environmentId);
-        await ensureMicrophonePermission(input.native);
-        await requestNotificationPermission().catch(() => "denied" as const);
-        await requestOptionalBluetoothPermission(input.native);
-        const session = await issueNativeSession(prepared);
+        const session = await prepareNativeSession(target.environmentId, false);
         await input.native.switchThreadToRealtimeAsync({ target, session });
       });
     },

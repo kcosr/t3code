@@ -19,7 +19,7 @@ import {
   durableVoiceConversations,
   isThreadVoiceStartAvailable,
   continueVoiceConversationSelection,
-  masterVoiceEnvironmentId,
+  voiceRuntimeEnvironmentId,
   prepareVoiceRuntimeAttachment,
   realtimeVoiceBarPhase,
   reconcileVoiceAudioRoutePickerState,
@@ -30,9 +30,8 @@ import {
   stopVoiceRuntimeStrict,
   threadVoiceStartForFocus,
   voiceRuntimeCommandEnvironmentMatches,
-  voiceRuntimePresentationPhase,
   voiceRuntimeSnapshotEnvironmentId,
-  type MasterVoiceFocus,
+  type VoiceRuntimeFocus,
   type ThreadVoiceStartPreferences,
 } from "./presentation.ts";
 
@@ -53,7 +52,7 @@ const voicePreferences = (
 
 const environmentId = EnvironmentId.make("environment-one");
 const localDateTime = new Date(2026, 6, 11, 14, 5);
-const focus: MasterVoiceFocus = {
+const focus: VoiceRuntimeFocus = {
   environmentId,
   projectId: ProjectId.make("project-one"),
   threadId: ThreadId.make("thread-one"),
@@ -80,12 +79,12 @@ const conversation = (
   updatedAt,
 });
 
-describe("master voice state", () => {
+describe("voice runtime state", () => {
   it("keeps the active environment authoritative across route focus changes", () => {
-    expect(masterVoiceEnvironmentId(environmentId, null)).toBe(environmentId);
-    expect(masterVoiceEnvironmentId(null, focus)).toBe(environmentId);
+    expect(voiceRuntimeEnvironmentId(environmentId, null)).toBe(environmentId);
+    expect(voiceRuntimeEnvironmentId(null, focus)).toBe(environmentId);
     expect(
-      masterVoiceEnvironmentId(
+      voiceRuntimeEnvironmentId(
         environmentId,
         { ...focus, environmentId: EnvironmentId.make("environment-two") },
         EnvironmentId.make("environment-three"),
@@ -415,10 +414,9 @@ describe("master voice state", () => {
       pendingClientActions: [],
     };
     expect(voiceRuntimeSnapshotEnvironmentId(realtime)).toBe(environmentId);
-    expect(voiceRuntimePresentationPhase(realtime)).toBe("active");
+    expect(realtimeVoiceBarPhase(realtime)).toBe("active");
     const switchingToRealtime: VoiceRuntimeSnapshot = {
       mode: "switching-to-realtime",
-      phase: "stopping-thread",
       generation: 3,
       sequence: 9,
       source: {
@@ -432,7 +430,6 @@ describe("master voice state", () => {
       target: realtime.target,
     };
     expect(voiceRuntimeSnapshotEnvironmentId(switchingToRealtime)).toBe(environmentId);
-    expect(voiceRuntimePresentationPhase(switchingToRealtime)).toBe("starting");
     expect(realtimeVoiceBarPhase(switchingToRealtime)).toBe("starting");
     expect(
       realtimeVoiceBarPhase({
@@ -458,7 +455,7 @@ describe("master voice state", () => {
       }),
     ).toBe("idle");
     expect(
-      voiceRuntimePresentationPhase({
+      realtimeVoiceBarPhase({
         mode: "failed",
         environmentId,
         operation: "realtime",

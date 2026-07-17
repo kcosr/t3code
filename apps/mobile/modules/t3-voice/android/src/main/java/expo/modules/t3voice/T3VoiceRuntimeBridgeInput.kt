@@ -3,10 +3,10 @@ package expo.modules.t3voice
 /** Strict conversion from the Expo/JavaScript bridge shape into native runtime commands. */
 internal object T3VoiceRuntimeBridgeInput {
   fun startRealtime(input: Map<String, Any?>): T3VoiceRuntimeCommand.StartRealtime {
-    input.requireExactBridgeKeys("startRealtime", setOf("target", "session"))
+    val admission = realtimeAdmission(input, "startRealtime")
     return T3VoiceRuntimeCommand.StartRealtime(
-      target = realtimeTarget(input.requireBridgeObject("target")),
-      session = nativeSession(input.requireBridgeObject("session")),
+      target = admission.target,
+      session = admission.session,
     )
   }
 
@@ -26,8 +26,24 @@ internal object T3VoiceRuntimeBridgeInput {
   }
 
   fun switchThreadToRealtime(input: Map<String, Any?>): T3VoiceRuntimeCommand.SwitchThreadToRealtime {
-    input.requireExactBridgeKeys("switchThreadToRealtime", setOf("target", "session"))
+    val admission = realtimeAdmission(input, "switchThreadToRealtime")
     return T3VoiceRuntimeCommand.SwitchThreadToRealtime(
+      target = admission.target,
+      session = admission.session,
+    )
+  }
+
+  private data class RealtimeAdmission(
+    val target: T3VoiceRealtimeTarget,
+    val session: T3VoiceNativeSessionConfig,
+  )
+
+  private fun realtimeAdmission(
+    input: Map<String, Any?>,
+    operation: String,
+  ): RealtimeAdmission {
+    input.requireExactBridgeKeys(operation, setOf("target", "session"))
+    return RealtimeAdmission(
       target = realtimeTarget(input.requireBridgeObject("target")),
       session = nativeSession(input.requireBridgeObject("session")),
     )

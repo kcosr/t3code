@@ -148,7 +148,6 @@ describe("Thread voice composer state", () => {
 
     const switchingToRealtime: VoiceRuntimeSnapshot = {
       mode: "switching-to-realtime",
-      phase: "stopping-thread",
       generation: thread.generation,
       sequence: thread.sequence + 1,
       source: thread.target,
