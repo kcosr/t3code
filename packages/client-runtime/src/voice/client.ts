@@ -2,8 +2,6 @@ import {
   VoiceTranscriptionStreamEvent,
   VoiceSpeechRequest,
   VoiceTranscriptionMetadata,
-  type ProjectId,
-  type ThreadId,
   type VoiceConfirmationDecision,
   type VoiceConfirmationId,
   type VoiceConfirmationResult,
@@ -29,10 +27,10 @@ import {
   type VoiceSessionCreateInput,
   type VoiceSessionCreateResult,
   type VoiceSessionFocusResult,
+  type VoiceSessionFocusInput,
   type VoiceSessionEventsResult,
   type VoiceSessionId,
   type VoiceSessionState,
-  type VoiceTerminalAction,
   type VoiceTranscriptionStreamEvent as VoiceTranscriptionStreamEventType,
   type VoiceWebRtcAnswer,
   type VoiceWebRtcOffer,
@@ -165,6 +163,12 @@ export interface VoiceSpeechInput {
   readonly ticket?: VoiceMediaTicket;
 }
 
+type VoiceSessionFocusUpdate = VoiceSessionFocusInput extends infer Focus
+  ? Focus extends unknown
+    ? Omit<Focus, "leaseGeneration">
+    : never
+  : never;
+
 export interface VoiceHttpClient {
   readonly createNativeSession: () => Effect.Effect<
     VoiceNativeSessionCredential,
@@ -183,17 +187,7 @@ export interface VoiceHttpClient {
   readonly updateSessionFocus: (
     sessionId: VoiceSessionId,
     leaseGeneration: number,
-    focus:
-      | {
-          readonly projectId: ProjectId;
-          readonly threadId?: ThreadId;
-          readonly terminalActions: ReadonlyArray<VoiceTerminalAction>;
-        }
-      | {
-          readonly projectId?: never;
-          readonly threadId?: never;
-          readonly terminalActions: ReadonlyArray<VoiceTerminalAction>;
-        },
+    focus: VoiceSessionFocusUpdate,
   ) => Effect.Effect<VoiceSessionFocusResult, RemoteEnvironmentRequestError>;
   readonly closeSession: (
     sessionId: VoiceSessionId,

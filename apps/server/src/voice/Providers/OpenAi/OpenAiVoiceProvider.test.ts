@@ -6,6 +6,7 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 
 import { VoiceError } from "../../Errors.ts";
@@ -1048,6 +1049,10 @@ it.effect(
       yield* Deferred.await(firstUpdateSent);
       yield* Queue.offer(queue, {
         type: "message",
+        data: encodeJson({ type: "response.done", response: { output: [] } }),
+      });
+      yield* Queue.offer(queue, {
+        type: "message",
         data: encodeJson({ type: "session.updated", session: { type: "realtime" } }),
       });
       yield* Fiber.join(adding);
@@ -1131,6 +1136,194 @@ it.effect(
       yield* Fiber.interrupt(eventFiber);
       yield* session.terminate;
     }),
+);
+
+it.effect("retries a terminal tool output after the sideband send fails", () =>
+  Effect.gen(function* () {
+    const queueReady = yield* Deferred.make<Queue.Queue<OpenAiRealtimeSocketEvent>>();
+    const retrySent = yield* Deferred.make<void>();
+    const sent: Array<string> = [];
+    let terminalSendCount = 0;
+    const httpClient = HttpClient.make((request) =>
+      Effect.succeed(
+        HttpClientResponse.fromWeb(
+          request,
+          request.url.endsWith("/hangup")
+            ? new Response(null, { status: 200 })
+            : new Response("answer-sdp", {
+                status: 201,
+                headers: { location: "/v1/realtime/calls/rtc_terminal_send_retry" },
+              }),
+        ),
+      ),
+    );
+    const socket = OpenAiRealtimeSocket.of({
+      connect: () =>
+        Effect.gen(function* () {
+          const queue = yield* Queue.unbounded<OpenAiRealtimeSocketEvent>();
+          yield* Deferred.succeed(queueReady, queue);
+          return {
+            events: Stream.fromQueue(queue),
+            receive: Queue.take(queue),
+            send: (data: string) =>
+              Effect.gen(function* () {
+                sent.push(data);
+                const message = decodeJson(data) as { readonly type?: string };
+                if (message.type !== "conversation.item.create") return;
+                terminalSendCount += 1;
+                if (terminalSendCount === 1) {
+                  return yield* new VoiceError({
+                    reason: "provider-unavailable",
+                    operation: "test.terminal-output.send",
+                    detail: "Terminal output send failed",
+                    retryable: true,
+                  });
+                }
+                yield* Deferred.succeed(retrySent, undefined);
+              }),
+            close: Effect.void,
+          } satisfies OpenAiRealtimeSocketConnection;
+        }),
+    });
+    const provider = yield* __testing.make.pipe(
+      Effect.provideService(HttpClient.HttpClient, httpClient),
+      Effect.provideService(VoiceCredentialStore, credentialStore(Option.some("sk-test"))),
+      Effect.provideService(OpenAiRealtimeSocket, socket),
+    );
+    const session = yield* provider.realtime!.negotiate({
+      sessionId: "voice-session-terminal-send-retry" as never,
+      leaseGeneration: 1,
+      offer: {
+        sessionId: "voice-session-terminal-send-retry" as never,
+        leaseGeneration: 1,
+        sdp: "offer-sdp",
+      },
+      instructions: "test",
+      terminalActions: new Set(["stop-realtime"]),
+      continuationContext: [],
+    });
+    const eventFiber = yield* session.events.pipe(Stream.runDrain, Effect.forkScoped);
+    const queue = yield* Deferred.await(queueReady);
+    const output = {
+      providerFunctionCallId: "call-terminal-send-retry",
+      output: '{"status":"accepted"}',
+      itemId: "t3t_terminal_send_retry",
+    };
+
+    const sendFailure = yield* session.completeTerminalToolCall(output).pipe(Effect.flip);
+    expect(sendFailure.detail).toContain("send failed");
+
+    const retry = yield* session.completeTerminalToolCall(output).pipe(Effect.forkScoped);
+    yield* Deferred.await(retrySent);
+    yield* Queue.offer(queue, {
+      type: "message",
+      data: encodeJson({ type: "conversation.item.done", item: { id: output.itemId } }),
+    });
+    yield* Fiber.join(retry);
+
+    const messages = sent.map((message) => decodeJson(message)) as ReadonlyArray<{
+      readonly type?: string;
+    }>;
+    expect(messages.filter((message) => message.type === "conversation.item.create")).toHaveLength(
+      2,
+    );
+    expect(messages.some((message) => message.type === "response.create")).toBe(false);
+    yield* Fiber.interrupt(eventFiber);
+    yield* session.terminate;
+  }),
+);
+
+it.effect("retries a terminal tool output after its acknowledgement times out", () =>
+  Effect.gen(function* () {
+    const queueReady = yield* Deferred.make<Queue.Queue<OpenAiRealtimeSocketEvent>>();
+    const firstSent = yield* Deferred.make<void>();
+    const retrySent = yield* Deferred.make<void>();
+    const sent: Array<string> = [];
+    let terminalSendCount = 0;
+    const httpClient = HttpClient.make((request) =>
+      Effect.succeed(
+        HttpClientResponse.fromWeb(
+          request,
+          request.url.endsWith("/hangup")
+            ? new Response(null, { status: 200 })
+            : new Response("answer-sdp", {
+                status: 201,
+                headers: { location: "/v1/realtime/calls/rtc_terminal_timeout_retry" },
+              }),
+        ),
+      ),
+    );
+    const socket = OpenAiRealtimeSocket.of({
+      connect: () =>
+        Effect.gen(function* () {
+          const queue = yield* Queue.unbounded<OpenAiRealtimeSocketEvent>();
+          yield* Deferred.succeed(queueReady, queue);
+          return {
+            events: Stream.fromQueue(queue),
+            receive: Queue.take(queue),
+            send: (data: string) =>
+              Effect.gen(function* () {
+                sent.push(data);
+                const message = decodeJson(data) as { readonly type?: string };
+                if (message.type !== "conversation.item.create") return;
+                terminalSendCount += 1;
+                yield* Deferred.succeed(terminalSendCount === 1 ? firstSent : retrySent, undefined);
+              }),
+            close: Effect.void,
+          } satisfies OpenAiRealtimeSocketConnection;
+        }),
+    });
+    const provider = yield* __testing.make.pipe(
+      Effect.provideService(HttpClient.HttpClient, httpClient),
+      Effect.provideService(VoiceCredentialStore, credentialStore(Option.some("sk-test"))),
+      Effect.provideService(OpenAiRealtimeSocket, socket),
+    );
+    const session = yield* provider.realtime!.negotiate({
+      sessionId: "voice-session-terminal-timeout-retry" as never,
+      leaseGeneration: 1,
+      offer: {
+        sessionId: "voice-session-terminal-timeout-retry" as never,
+        leaseGeneration: 1,
+        sdp: "offer-sdp",
+      },
+      instructions: "test",
+      terminalActions: new Set(["stop-realtime"]),
+      continuationContext: [],
+    });
+    const eventFiber = yield* session.events.pipe(Stream.runDrain, Effect.forkScoped);
+    const queue = yield* Deferred.await(queueReady);
+    const output = {
+      providerFunctionCallId: "call-terminal-timeout-retry",
+      output: '{"status":"accepted"}',
+      itemId: "t3t_terminal_timeout_retry",
+    };
+
+    const firstAttempt = yield* session
+      .completeTerminalToolCall(output)
+      .pipe(Effect.flip, Effect.forkScoped);
+    yield* Deferred.await(firstSent);
+    yield* TestClock.adjust("10 seconds");
+    const timeout = yield* Fiber.join(firstAttempt);
+    expect(timeout.detail).toContain("did not acknowledge");
+
+    const retry = yield* session.completeTerminalToolCall(output).pipe(Effect.forkScoped);
+    yield* Deferred.await(retrySent);
+    yield* Queue.offer(queue, {
+      type: "message",
+      data: encodeJson({ type: "conversation.item.done", item: { id: output.itemId } }),
+    });
+    yield* Fiber.join(retry);
+
+    const messages = sent.map((message) => decodeJson(message)) as ReadonlyArray<{
+      readonly type?: string;
+    }>;
+    expect(messages.filter((message) => message.type === "conversation.item.create")).toHaveLength(
+      2,
+    );
+    expect(messages.some((message) => message.type === "response.create")).toBe(false);
+    yield* Fiber.interrupt(eventFiber);
+    yield* session.terminate;
+  }),
 );
 
 it.effect("hangs up the provider call when sideband attachment fails", () =>

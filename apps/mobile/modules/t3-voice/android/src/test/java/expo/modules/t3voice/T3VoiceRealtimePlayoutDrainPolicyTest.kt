@@ -33,11 +33,16 @@ class T3VoiceRealtimePlayoutDrainPolicyTest {
   fun `playout monitor accepts only audible complete pcm16 samples`() {
     val monitor = T3VoiceRealtimePlayoutMonitor()
 
+    monitor.observePcm16LittleEndian(byteArrayOf(33, 0), 50)
+    assertEquals(null, monitor.lastAudibleAtMillis())
+    monitor.arm()
     monitor.observePcm16LittleEndian(byteArrayOf(0, 0, 32, 0, 1), 100)
     assertEquals(null, monitor.lastAudibleAtMillis())
     monitor.observePcm16LittleEndian(byteArrayOf(33, 0), 200)
     assertEquals(200L, monitor.lastAudibleAtMillis())
     monitor.observePcm16LittleEndian(byteArrayOf(0, 0), 300)
     assertEquals(200L, monitor.lastAudibleAtMillis())
+    monitor.disarm()
+    assertEquals(null, monitor.lastAudibleAtMillis())
   }
 }

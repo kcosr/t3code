@@ -296,7 +296,7 @@ internal class T3VoiceRealtimeSessionTest {
     assertTrue(media.drainEntered.await(1, TimeUnit.SECONDS))
     assertEquals(1L, media.stopEntered.count)
     assertFalse(quiesced.await(100, TimeUnit.MILLISECONDS))
-    media.completeDrain(T3VoiceRealtimePlayoutDrainOutcome.DRAINED)
+    media.completeDrain()
     assertTrue(media.stopEntered.await(1, TimeUnit.SECONDS))
     assertTrue(quiesced.await(1, TimeUnit.SECONDS))
   }
@@ -325,7 +325,7 @@ internal class T3VoiceRealtimeSessionTest {
   }
 
   @Test
-  fun `session-ended playout completion tears down without waiting for the deadline`() {
+  fun `playout completion tears down without waiting for the deadline`() {
     val media = TestRealtimeMedia()
     val quiesced = CountDownLatch(1)
     val session =
@@ -341,7 +341,7 @@ internal class T3VoiceRealtimeSessionTest {
     session.closeAfterPlayoutDrain()
     assertTrue(media.drainEntered.await(1, TimeUnit.SECONDS))
 
-    media.completeDrain(T3VoiceRealtimePlayoutDrainOutcome.SESSION_ENDED)
+    media.completeDrain()
 
     assertTrue(media.stopEntered.await(1, TimeUnit.SECONDS))
     assertTrue(quiesced.await(1, TimeUnit.SECONDS))
@@ -499,9 +499,9 @@ internal class T3VoiceRealtimeSessionTest {
 
     override fun fenceInputAndDrainPlayout(
       sessionId: String,
-      onComplete: (T3VoiceRealtimePlayoutDrainOutcome) -> Unit,
+      onComplete: () -> Unit,
     ) {
-      onComplete(T3VoiceRealtimePlayoutDrainOutcome.DRAINED)
+      onComplete()
     }
 
     override fun setMuted(sessionId: String, muted: Boolean) = Unit
@@ -528,7 +528,7 @@ internal class T3VoiceRealtimeSessionTest {
     private val lock = Any()
     private val cancelled = mutableSetOf<String>()
     private var activeSession: String? = null
-    private var drainCompletion: ((T3VoiceRealtimePlayoutDrainOutcome) -> Unit)? = null
+    private var drainCompletion: (() -> Unit)? = null
 
     override fun cancelStartup(sessionId: String) {
       synchronized(lock) { cancelled += sessionId }
@@ -576,7 +576,7 @@ internal class T3VoiceRealtimeSessionTest {
 
     override fun fenceInputAndDrainPlayout(
       sessionId: String,
-      onComplete: (T3VoiceRealtimePlayoutDrainOutcome) -> Unit,
+      onComplete: () -> Unit,
     ) {
       synchronized(lock) {
         check(activeSession == sessionId)
@@ -586,9 +586,9 @@ internal class T3VoiceRealtimeSessionTest {
       drainEntered.countDown()
     }
 
-    fun completeDrain(outcome: T3VoiceRealtimePlayoutDrainOutcome) {
+    fun completeDrain() {
       val completion = synchronized(lock) { drainCompletion.also { drainCompletion = null } }
-      checkNotNull(completion).invoke(outcome)
+      checkNotNull(completion).invoke()
     }
 
     override fun setMuted(sessionId: String, muted: Boolean) = Unit
@@ -620,9 +620,9 @@ internal class T3VoiceRealtimeSessionTest {
 
     override fun fenceInputAndDrainPlayout(
       sessionId: String,
-      onComplete: (T3VoiceRealtimePlayoutDrainOutcome) -> Unit,
+      onComplete: () -> Unit,
     ) {
-      onComplete(T3VoiceRealtimePlayoutDrainOutcome.DRAINED)
+      onComplete()
     }
 
     override fun setMuted(sessionId: String, muted: Boolean) = Unit

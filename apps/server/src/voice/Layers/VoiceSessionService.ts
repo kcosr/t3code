@@ -183,7 +183,11 @@ interface VoiceSessionFocus {
 const terminalActionsEqual = (
   left: ReadonlyArray<VoiceTerminalAction>,
   right: ReadonlyArray<VoiceTerminalAction>,
-): boolean => left.length === right.length && left.every((action) => right.includes(action));
+): boolean => {
+  const leftSet = new Set(left);
+  const rightSet = new Set(right);
+  return leftSet.size === rightSet.size && leftSet.isSubsetOf(rightSet);
+};
 
 const sessionError = (
   reason: VoiceError["reason"],

@@ -294,8 +294,7 @@ private class NotificationFakeDriver : T3VoiceRuntimeDriver {
 
   override fun closeRealtime(
     generation: Long,
-    preserveSessionForThread: Boolean,
-    drainPlayout: Boolean,
+    policy: T3VoiceRealtimeClosePolicy,
   ) = Unit
 
   override fun cancelRealtimeToThreadSwitch(generation: Long) = Unit

@@ -10,6 +10,7 @@ import {
   VoiceSpeechRequest,
   VoiceSessionCreateInput,
   VoiceSessionFocusInput,
+  VoiceTerminalActions,
   VoiceSessionEvent,
   VoiceSessionEventsResult,
   VoiceClientActionAckInput,
@@ -106,6 +107,13 @@ describe("voice contracts", () => {
         terminalActions: ["handoff-to-thread"],
       }),
     ).toThrow();
+    expect(() =>
+      decodeUnknownSync(VoiceTerminalActions)(["stop-realtime", "stop-realtime"]),
+    ).toThrow();
+    expect(decodeUnknownSync(VoiceTerminalActions)(["switch-to-thread", "stop-realtime"])).toEqual([
+      "switch-to-thread",
+      "stop-realtime",
+    ]);
   });
 
   it("bounds public transcript and conversation management inputs", () => {
@@ -168,6 +176,12 @@ describe("voice contracts", () => {
       decodeUnknownSync(VoiceSessionFocusInput)({
         leaseGeneration: 1,
         projectId: "project-1",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeUnknownSync(VoiceSessionFocusInput)({
+        leaseGeneration: 1,
+        terminalActions: ["switch-to-thread", "switch-to-thread"],
       }),
     ).toThrow();
   });

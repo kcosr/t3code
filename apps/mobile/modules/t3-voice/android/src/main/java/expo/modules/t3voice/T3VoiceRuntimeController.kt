@@ -21,8 +21,7 @@ internal interface T3VoiceRuntimeDriver {
 
   fun closeRealtime(
     generation: Long,
-    preserveSessionForThread: Boolean,
-    drainPlayout: Boolean,
+    policy: T3VoiceRealtimeClosePolicy,
   )
 
   fun cancelRealtimeToThreadSwitch(generation: Long)
@@ -31,7 +30,7 @@ internal interface T3VoiceRuntimeDriver {
 
   fun setRealtimeAudioRoute(generation: Long, routeId: String)
 
-  /** Retains notification switch context and schedules the server focus update. */
+  /** Retains notification switch context and schedules the server context update. */
   fun updateRealtimeContext(generation: Long, context: T3VoiceRealtimeContext)
 
   fun decideRealtimeConfirmation(
@@ -77,6 +76,20 @@ internal interface T3VoiceRuntimeDriver {
   fun releaseAll(generation: Long): Boolean
 }
 
+internal enum class T3VoiceRealtimeClosePolicy {
+  STOP_IMMEDIATELY,
+  SWITCH_IMMEDIATELY,
+  STOP_AFTER_PLAYOUT,
+  SWITCH_AFTER_PLAYOUT,
+  ;
+
+  val preservesSessionForThread: Boolean
+    get() = this == SWITCH_IMMEDIATELY || this == SWITCH_AFTER_PLAYOUT
+
+  val drainsPlayout: Boolean
+    get() = this == STOP_AFTER_PLAYOUT || this == SWITCH_AFTER_PLAYOUT
+}
+
 /**
  * One process-local, serialized voice-mode state machine.
  *
@@ -111,7 +124,6 @@ internal class T3VoiceRuntimeController(
   private var failedReleasePending = false
   private var failedReleaseUncertain = false
   private var failedStopRequested = false
-  private var admittedTerminalActionId: String? = null
   private var terminalCloseFailure: T3VoiceFailure? = null
 
   @Volatile
@@ -304,8 +316,7 @@ internal class T3VoiceRuntimeController(
         runDriver(T3VoiceOperation.SWITCHING_TO_THREAD) {
           driver.closeRealtime(
             current.generation,
-            preserveSessionForThread = true,
-            drainPlayout = false,
+            T3VoiceRealtimeClosePolicy.SWITCH_IMMEDIATELY,
           )
         }
         applied()
@@ -556,8 +567,7 @@ internal class T3VoiceRuntimeController(
           runDriver(T3VoiceOperation.REALTIME) {
             driver.closeRealtime(
               current.generation,
-              preserveSessionForThread = false,
-              drainPlayout = false,
+              T3VoiceRealtimeClosePolicy.STOP_IMMEDIATELY,
             )
           }
           return applied()
@@ -572,8 +582,7 @@ internal class T3VoiceRuntimeController(
         runDriver(T3VoiceOperation.REALTIME) {
           driver.closeRealtime(
             current.generation,
-            preserveSessionForThread = false,
-            drainPlayout = false,
+            T3VoiceRealtimeClosePolicy.STOP_IMMEDIATELY,
           )
         }
       }
@@ -729,18 +738,14 @@ internal class T3VoiceRuntimeController(
 
   private fun realtimeTerminalActionReceived(action: T3VoiceRealtimeTerminalAction): Boolean {
     val state = current.state as? T3VoiceControllerState.Realtime ?: return false
-    if (state.stage == T3VoiceRealtimeStage.STOPPING || admittedTerminalActionId != null) {
-      return false
-    }
-    admittedTerminalActionId = action.actionId
+    if (state.stage == T3VoiceRealtimeStage.STOPPING) return false
     when (action.type) {
       T3VoiceRealtimeTerminalActionType.STOP_REALTIME -> {
         update(state.copy(stage = T3VoiceRealtimeStage.STOPPING))
         runDriver(T3VoiceOperation.REALTIME) {
           driver.closeRealtime(
             current.generation,
-            preserveSessionForThread = false,
-            drainPlayout = true,
+            T3VoiceRealtimeClosePolicy.STOP_AFTER_PLAYOUT,
           )
         }
       }
@@ -757,8 +762,7 @@ internal class T3VoiceRuntimeController(
           runDriver(T3VoiceOperation.SWITCHING_TO_THREAD) {
             driver.closeRealtime(
               current.generation,
-              preserveSessionForThread = false,
-              drainPlayout = true,
+              T3VoiceRealtimeClosePolicy.STOP_AFTER_PLAYOUT,
             )
           }
         } else {
@@ -772,8 +776,7 @@ internal class T3VoiceRuntimeController(
           runDriver(T3VoiceOperation.SWITCHING_TO_THREAD) {
             driver.closeRealtime(
               current.generation,
-              preserveSessionForThread = true,
-              drainPlayout = true,
+              T3VoiceRealtimeClosePolicy.SWITCH_AFTER_PLAYOUT,
             )
           }
         }
@@ -992,7 +995,6 @@ internal class T3VoiceRuntimeController(
     failedReleasePending = false
     failedReleaseUncertain = false
     failedStopRequested = false
-    admittedTerminalActionId = null
     terminalCloseFailure = null
     publish(
       T3VoiceControllerSnapshot(
@@ -1004,7 +1006,6 @@ internal class T3VoiceRuntimeController(
   }
 
   private fun advanceGeneration(state: T3VoiceControllerState) {
-    admittedTerminalActionId = null
     terminalCloseFailure = null
     publish(
       current.copy(

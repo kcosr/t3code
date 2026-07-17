@@ -74,6 +74,11 @@ const input = (takeover: boolean, idempotencyKey: string) => ({
   idempotencyKey,
 });
 
+const noOpRealtimeTerminalControls = {
+  updateTerminalActions: () => Effect.void,
+  completeTerminalToolCall: () => Effect.void,
+} satisfies Pick<RealtimeProviderSession, "updateTerminalActions" | "completeTerminalToolCall">;
+
 const principal = (
   sessionId: AuthSessionId,
   scopes: ReadonlySet<AuthEnvironmentScope> = new Set([
@@ -233,6 +238,7 @@ const makeActivateThreadFixture = Effect.fn("test.makeActivateThreadFixture")(fu
             name: "activate_thread",
             argumentsJson: JSON.stringify({ threadId }),
           }),
+          ...noOpRealtimeTerminalControls,
           updateContext: () => Effect.void,
           submitToolOutput: ({ output }) => Ref.update(outputs, (all) => [...all, output]),
           terminate: Effect.void,
@@ -302,6 +308,7 @@ it.effect(
                     sourceId: "fake-input:1",
                   } as const,
                 ]),
+                ...noOpRealtimeTerminalControls,
                 updateContext: () => Effect.void,
                 submitToolOutput: () => Effect.void,
                 terminate: Ref.update(terminated, (count) => count + 1),
@@ -418,6 +425,7 @@ const makeBlockedTerminationProvider = Effect.fn("test.makeBlockedTerminationPro
             sdp: "answer",
           },
           events: Stream.empty,
+          ...noOpRealtimeTerminalControls,
           updateContext: () => Effect.void,
           submitToolOutput: () => Effect.void,
           terminate: Ref.update(terminations, (count) => count + 1).pipe(
@@ -516,6 +524,7 @@ it.effect("bounds provider termination without abandoning session cleanup", () =
               sdp: "answer",
             },
             events: Stream.empty,
+            ...noOpRealtimeTerminalControls,
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
             terminate: Deferred.succeed(terminationStarted, undefined).pipe(
@@ -646,6 +655,7 @@ it.effect("validates, acknowledges, and journals realtime focus changes in order
                 sdp: "focus-answer",
               },
               events: Stream.empty,
+              ...noOpRealtimeTerminalControls,
               updateContext: (item) =>
                 Ref.update(updatedItems, (items) => [...items, item.text]).pipe(
                   Effect.andThen(Deferred.succeed(focusUpdateStarted, undefined)),
@@ -734,6 +744,71 @@ it.effect("validates, acknowledges, and journals realtime focus changes in order
   }),
 );
 
+it.effect(
+  "treats terminal action permutations as equal and propagates real capability changes",
+  () =>
+    Effect.gen(function* () {
+      const updates = yield* Ref.make<ReadonlyArray<ReadonlyArray<string>>>([]);
+      const provider: VoiceProviderAdapter = {
+        id: "terminal-capability-provider",
+        capabilities: new Set(["agent.realtime"]),
+        realtime: {
+          negotiate: (request) =>
+            Effect.succeed({
+              answer: {
+                sessionId: request.sessionId,
+                leaseGeneration: request.leaseGeneration,
+                sdp: "terminal-capability-answer",
+              },
+              events: Stream.empty,
+              ...noOpRealtimeTerminalControls,
+              updateContext: () => Effect.die("terminal capability update changed focus"),
+              updateTerminalActions: (actions) =>
+                Ref.update(updates, (current) => [...current, [...actions]]),
+              submitToolOutput: () => Effect.void,
+              completeTerminalToolCall: () => Effect.void,
+              terminate: Effect.void,
+            }),
+        },
+      };
+      const test = yield* makeLayer(provider);
+
+      yield* Effect.gen(function* () {
+        const sessions = yield* VoiceSessionService;
+        const owner = AuthSessionId.make("terminal-capability-owner");
+        const created = yield* sessions.create(principal(owner), {
+          ...input(false, "terminal-capability-session"),
+          terminalActions: ["stop-realtime", "switch-to-thread"],
+        });
+        yield* sessions.offer(owner, created.state.sessionId, {
+          sessionId: created.state.sessionId,
+          leaseGeneration: created.state.leaseGeneration,
+          sdp: "terminal-capability-offer",
+        });
+
+        yield* sessions.updateFocus(owner, created.state.sessionId, {
+          leaseGeneration: created.state.leaseGeneration,
+          terminalActions: ["switch-to-thread", "stop-realtime"],
+        });
+        expect(yield* Ref.get(updates)).toEqual([]);
+
+        yield* sessions.updateFocus(owner, created.state.sessionId, {
+          leaseGeneration: created.state.leaseGeneration,
+          terminalActions: ["stop-realtime"],
+        });
+        expect(yield* Ref.get(updates)).toEqual([["stop-realtime"]]);
+
+        yield* sessions.updateFocus(owner, created.state.sessionId, {
+          leaseGeneration: created.state.leaseGeneration,
+          terminalActions: ["stop-realtime"],
+        });
+        expect(yield* Ref.get(updates)).toHaveLength(1);
+
+        yield* sessions.close(owner, created.state.sessionId, created.state.leaseGeneration);
+      }).pipe(Effect.provide(test.layer));
+    }),
+);
+
 it.effect("does not let a blocked focus acknowledgement delay hang-up", () =>
   Effect.gen(function* () {
     const projectId = ProjectId.make("project-blocked-focus");
@@ -755,6 +830,7 @@ it.effect("does not let a blocked focus acknowledgement delay hang-up", () =>
               sdp: "focus-answer",
             },
             events: Stream.empty,
+            ...noOpRealtimeTerminalControls,
             updateContext: () =>
               Deferred.succeed(focusUpdateStarted, undefined).pipe(
                 Effect.andThen(Effect.never),
@@ -830,6 +906,7 @@ it.effect("completes focus journal failure cleanup outside the cancelled update"
               sdp: "focus-answer",
             },
             events: Stream.empty,
+            ...noOpRealtimeTerminalControls,
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
             terminate: Deferred.succeed(terminationStarted, undefined).pipe(
@@ -989,6 +1066,7 @@ it.effect("continues a stopped conversation with facts from the prior call", () 
                           sourceId: "continuity-assistant:2",
                         } as const,
                       ]),
+                ...noOpRealtimeTerminalControls,
                 updateContext: () => Effect.void,
                 submitToolOutput: () => Effect.void,
                 terminate: Effect.void,
@@ -1075,6 +1153,7 @@ it.effect("takeover fences an in-flight negotiation and terminates its late prov
           sdp: "late-answer",
         },
         events: Stream.empty,
+        ...noOpRealtimeTerminalControls,
         updateContext: () => Effect.void,
         submitToolOutput: () => Effect.void,
         terminate: Ref.update(terminated, (count) => count + 1),
@@ -1106,6 +1185,7 @@ it.effect("serializes duplicate offers so only one provider session is negotiate
                 sdp: "answer",
               },
               events: Stream.empty,
+              ...noOpRealtimeTerminalControls,
               updateContext: () => Effect.void,
               submitToolOutput: () => Effect.void,
               terminate: Effect.void,
@@ -1198,6 +1278,7 @@ it.effect("takeover terminates a provider that negotiates while displaced cleanu
           sdp: "late-answer",
         },
         events: Stream.empty,
+        ...noOpRealtimeTerminalControls,
         updateContext: () => Effect.void,
         submitToolOutput: () => Effect.void,
         terminate: Ref.update(terminated, (count) => count + 1),
@@ -1283,6 +1364,7 @@ it.effect("rejects a heartbeat while session termination is in progress", () =>
               sdp: "answer",
             },
             events: Stream.empty,
+            ...noOpRealtimeTerminalControls,
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
             terminate: Deferred.succeed(terminationStarted, undefined).pipe(
@@ -1361,6 +1443,7 @@ it.effect.each(["listening", "speaking"] as const)(
                 sdp: "answer",
               },
               events: Stream.make({ type: "activity" as const, activity }),
+              ...noOpRealtimeTerminalControls,
               updateContext: () => Effect.void,
               submitToolOutput: () => Effect.void,
               terminate: Effect.void,
@@ -1405,6 +1488,7 @@ it.effect("expires a negotiated session until provider media activity is observe
               sdp: "answer",
             },
             events: Stream.never,
+            ...noOpRealtimeTerminalControls,
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
             terminate: Effect.void,
@@ -1448,6 +1532,7 @@ it.effect("ends an active provider session at the absolute duration limit", () =
               sdp: "answer",
             },
             events: Stream.make({ type: "activity" as const, activity: "listening" as const }),
+            ...noOpRealtimeTerminalControls,
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
             terminate: Effect.void,
@@ -1497,6 +1582,7 @@ it.effect("ends an active session when the provider transport closes", () =>
               { type: "activity" as const, activity: "speaking" as const },
               { type: "closed" as const },
             ]),
+            ...noOpRealtimeTerminalControls,
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
             terminate: Effect.void,
@@ -1550,6 +1636,7 @@ it.effect("publishes confirmations and submits decided tool output to the provid
               name: "archive_thread",
               argumentsJson: '{"threadId":"thread-one"}',
             }),
+            ...noOpRealtimeTerminalControls,
             updateContext: () => Effect.void,
             submitToolOutput: (output) => Ref.update(outputs, (all) => [...all, output]),
             terminate: Effect.void,
@@ -1651,6 +1738,7 @@ it.effect("continues handling provider events while a history search is blocked"
               },
               { type: "activity" as const, activity: "speaking" as const },
             ]),
+            ...noOpRealtimeTerminalControls,
             updateContext: () => Effect.void,
             submitToolOutput: ({ output }) => Ref.update(outputs, (all) => [...all, output]),
             terminate: Effect.void,
@@ -1733,6 +1821,7 @@ it.effect(
                   argumentsJson: "{}",
                 },
               ),
+              ...noOpRealtimeTerminalControls,
               updateContext: () => Effect.void,
               updateTerminalActions: () => Effect.void,
               submitToolOutput: () => Effect.die("terminal tool used ordinary output"),
@@ -1833,6 +1922,7 @@ it.effect("preserves a terminal call received while its capability removal is aw
               sdp: "fake-answer",
             },
             events: Stream.fromQueue(queue),
+            ...noOpRealtimeTerminalControls,
             updateContext: () => Effect.void,
             updateTerminalActions: () =>
               Deferred.succeed(capabilityUpdateStarted, undefined).pipe(
@@ -2106,6 +2196,7 @@ it.effect("interrupts a blocked thread-turn wait and fences its output when the 
               name: "wait_for_thread_turn",
               argumentsJson: '{"threadId":"thread-one","messageId":"message-one"}',
             }),
+            ...noOpRealtimeTerminalControls,
             updateContext: () => Effect.void,
             submitToolOutput: ({ output }) => Ref.update(outputs, (all) => [...all, output]),
             terminate: Effect.void,
@@ -2234,6 +2325,7 @@ it.effect("revokes provider sessions and media tickets with their auth session",
               sdp: "answer",
             },
             events: Stream.empty,
+            ...noOpRealtimeTerminalControls,
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
             terminate: Ref.update(terminated, (count) => count + 1),
@@ -2279,6 +2371,7 @@ it.effect("terminates an active call before clearing or deleting its conversatio
               sdp: "answer",
             },
             events: Stream.empty,
+            ...noOpRealtimeTerminalControls,
             updateContext: () => Effect.void,
             submitToolOutput: () => Effect.void,
             terminate: Ref.update(terminated, (count) => count + 1),
@@ -2355,6 +2448,7 @@ const resetRaceProvider = (
           sdp: "answer",
         },
         events: Stream.empty,
+        ...noOpRealtimeTerminalControls,
         updateContext: () => Effect.void,
         submitToolOutput: () => Effect.void,
         terminate: Deferred.succeed(terminationStarted, undefined).pipe(
@@ -2394,6 +2488,7 @@ const immediateResetProvider = (
           sdp: "answer",
         },
         events: Stream.empty,
+        ...noOpRealtimeTerminalControls,
         updateContext: () => Effect.void,
         submitToolOutput: () => Ref.update(outputs, (count) => count + 1),
         terminate: Ref.update(terminations, (count) => count + 1),

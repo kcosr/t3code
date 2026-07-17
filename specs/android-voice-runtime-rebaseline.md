@@ -1,10 +1,9 @@
 # Android Voice Runtime Rebaseline
 
-Status: Accepted product and architecture contract. The baseline runtime is implemented; the
-agent-initiated terminal actions specified below remain pending implementation and acceptance.
-Release acceptance remains governed by the repository, native, artifact, and connected-device
-gates below. This document supersedes the Android ownership, process-death recovery, hands-free
-ownership, and background-control direction in older voice milestone and workstream documents.
+Status: Accepted and implemented product and architecture contract. Release acceptance remains
+governed by the repository, native, artifact, and connected-device gates below. This document
+supersedes the Android ownership, process-death recovery, hands-free ownership, and
+background-control direction in older voice milestone and workstream documents.
 
 ## Why this rebaseline exists
 

@@ -51,7 +51,7 @@ internal interface T3VoiceRealtimeMedia {
 
   fun fenceInputAndDrainPlayout(
     sessionId: String,
-    onComplete: (T3VoiceRealtimePlayoutDrainOutcome) -> Unit,
+    onComplete: () -> Unit,
   )
 
   fun setMuted(sessionId: String, muted: Boolean)
@@ -59,7 +59,7 @@ internal interface T3VoiceRealtimeMedia {
   fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>>
 }
 
-internal enum class T3VoiceRealtimePlayoutDrainOutcome {
+private enum class T3VoiceRealtimePlayoutDrainOutcome {
   DRAINED,
   TIMED_OUT,
   SESSION_ENDED,
@@ -101,7 +101,7 @@ internal class T3VoiceWebRtcSession(
   )
 
   private data class PlayoutDrain(
-    val onComplete: (T3VoiceRealtimePlayoutDrainOutcome) -> Unit,
+    val onComplete: () -> Unit,
     val policy: T3VoiceRealtimePlayoutDrainPolicy,
     var sample: ScheduledFuture<*>? = null,
     var timeout: ScheduledFuture<*>? = null,
@@ -450,7 +450,7 @@ internal class T3VoiceWebRtcSession(
 
   override fun fenceInputAndDrainPlayout(
     sessionId: String,
-    onComplete: (T3VoiceRealtimePlayoutDrainOutcome) -> Unit,
+    onComplete: () -> Unit,
   ) {
     val session =
       synchronized(lock) {
@@ -458,6 +458,7 @@ internal class T3VoiceWebRtcSession(
         check(current.playoutDrain == null) { "Realtime playout is already draining." }
         current.captureState = T3VoiceCapturePolicy.fenceTerminalInput(current.captureState)
         applyCaptureState(current)
+        current.playoutMonitor.arm()
         val drain =
           PlayoutDrain(
             onComplete = onComplete,
@@ -880,7 +881,8 @@ internal class T3VoiceWebRtcSession(
         T3VoiceDiagnosticCode.REALTIME_DRAIN_TIMED_OUT,
       )
     }
-    runCatching { drain.onComplete(outcome) }
+    session.playoutMonitor.disarm()
+    runCatching(drain.onComplete)
   }
 
   private fun releasePreparedPeer(prepared: PreparedPeer) =

@@ -206,6 +206,15 @@ export type VoiceSessionMode = typeof VoiceSessionMode.Type;
 export const VoiceTerminalAction = Schema.Literals(["stop-realtime", "switch-to-thread"]);
 export type VoiceTerminalAction = typeof VoiceTerminalAction.Type;
 
+export const VoiceTerminalActions = Schema.Array(VoiceTerminalAction).check(
+  Schema.isMaxLength(2),
+  Schema.makeFilter(
+    (actions) =>
+      new Set(actions).size === actions.length || "Voice terminal actions must be unique",
+  ),
+);
+export type VoiceTerminalActions = typeof VoiceTerminalActions.Type;
+
 const VoiceSdp = Schema.String.check(Schema.isPattern(/\S/));
 
 export const VoiceSessionPhase = Schema.Literals([
@@ -251,7 +260,7 @@ export const VoiceSessionCreateInput = Schema.Struct({
   conversation: VoiceConversationSelection,
   projectId: Schema.optionalKey(ProjectId),
   threadId: Schema.optionalKey(ThreadId),
-  terminalActions: Schema.Array(VoiceTerminalAction),
+  terminalActions: VoiceTerminalActions,
   media: VoiceClientMediaCapabilities,
   idempotencyKey: TrimmedNonEmptyString,
 });
@@ -289,13 +298,13 @@ export type VoiceSessionLeaseInput = typeof VoiceSessionLeaseInput.Type;
 export const VoiceSessionFocusInput = Schema.Union([
   Schema.Struct({
     leaseGeneration: PositiveInt,
-    terminalActions: Schema.Array(VoiceTerminalAction),
+    terminalActions: VoiceTerminalActions,
     projectId: ProjectId,
     threadId: Schema.optionalKey(ThreadId),
   }),
   Schema.Struct({
     leaseGeneration: PositiveInt,
-    terminalActions: Schema.Array(VoiceTerminalAction),
+    terminalActions: VoiceTerminalActions,
     projectId: Schema.optionalKey(Schema.Never),
     threadId: Schema.optionalKey(Schema.Never),
   }),

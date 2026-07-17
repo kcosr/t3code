@@ -49,7 +49,7 @@ internal class T3VoiceRealtimeSession(
   private val startupQuiescence = T3VoiceStartupQuiescence(::runStartup)
   private val eventExecutor = Executors.newSingleThreadExecutor()
   private val heartbeatExecutor = Executors.newSingleThreadExecutor()
-  private val focusExecutor = Executors.newSingleThreadExecutor()
+  private val contextExecutor = Executors.newSingleThreadExecutor()
   private val acknowledgementExecutor = Executors.newFixedThreadPool(2)
   private val activeCalls = mutableSetOf<T3VoiceHttpCallRegistry>()
   private val finalTranscript = ArrayDeque<T3VoiceRealtimeTranscriptTurn>()
@@ -82,7 +82,7 @@ internal class T3VoiceRealtimeSession(
   private var eventFailures = 0
   private var desiredContext =
     DesiredContext(0, T3VoiceRealtimeContext(target.focus, target.threadSwitch))
-  private var focusWorkerScheduled = false
+  private var contextWorkerScheduled = false
   private var terminalCallback: T3VoiceRuntimeCallback? = null
   private var terminalDeadlineFuture: ScheduledFuture<*>? = null
   private var terminalActionId: String? = null
@@ -190,14 +190,14 @@ internal class T3VoiceRealtimeSession(
     }
   }
 
-  /** Synchronously reserves the newest focus before its independent network lane begins. */
+  /** Synchronously reserves the newest context before its independent network lane begins. */
   fun admitContext(context: T3VoiceRealtimeContext) {
     synchronized(lock) {
       desiredContext = DesiredContext(desiredContext.revision + 1, context)
-      if (focusWorkerScheduled || terminal.get()) return
-      focusWorkerScheduled = true
+      if (contextWorkerScheduled || terminal.get()) return
+      contextWorkerScheduled = true
     }
-    focusExecutor.execute(::drainFocusUpdates)
+    contextExecutor.execute(::drainContextUpdates)
   }
 
   fun acknowledgeClientAction(
@@ -559,7 +559,7 @@ internal class T3VoiceRealtimeSession(
     emitIfLive(T3VoiceRuntimeCallback.RealtimeTranscriptChanged(snapshot))
   }
 
-  private fun drainFocusUpdates() {
+  private fun drainContextUpdates() {
     while (!terminal.get()) {
       val desired = synchronized(lock) { desiredContext }
       try {
@@ -577,13 +577,13 @@ internal class T3VoiceRealtimeSession(
         }
       } catch (cause: Throwable) {
         if (!terminal.get()) {
-          fail(cause, "realtime-focus-failed", "Realtime focus update failed.")
+          fail(cause, "realtime-context-failed", "Realtime context update failed.")
         }
         return
       }
       synchronized(lock) {
         if (desiredContext.revision == desired.revision) {
-          focusWorkerScheduled = false
+          contextWorkerScheduled = false
           return
         }
       }
@@ -767,7 +767,7 @@ internal class T3VoiceRealtimeSession(
     startupExecutor.shutdownNow()
     eventExecutor.shutdownNow()
     heartbeatExecutor.shutdownNow()
-    focusExecutor.shutdownNow()
+    contextExecutor.shutdownNow()
     acknowledgementExecutor.shutdownNow()
   }
 
@@ -779,7 +779,7 @@ internal class T3VoiceRealtimeSession(
         startupExecutor,
         eventExecutor,
         heartbeatExecutor,
-        focusExecutor,
+        contextExecutor,
         acknowledgementExecutor,
       )
     executors.forEach { executor ->

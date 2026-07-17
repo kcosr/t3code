@@ -352,6 +352,12 @@ const realtimeTools = (terminalActions: ReadonlySet<VoiceTerminalAction>) => [
   ...(terminalActions.has("switch-to-thread") ? [TERMINAL_REALTIME_TOOLS["switch-to-thread"]] : []),
 ];
 
+const realtimeToolConfig = (terminalActions: ReadonlySet<VoiceTerminalAction>) => ({
+  tools: realtimeTools(terminalActions),
+  tool_choice: "auto",
+  parallel_tool_calls: false,
+});
+
 const providerError = (operation: string) => (cause: unknown) =>
   new VoiceError({
     reason: "provider-unavailable",
@@ -638,9 +644,7 @@ const providerSessionConfig = (
     },
     output: { format: { type: "audio/pcm" }, voice: VOICE_PRESETS.default },
   },
-  tools: realtimeTools(terminalActions),
-  tool_choice: "auto",
-  parallel_tool_calls: false,
+  ...realtimeToolConfig(terminalActions),
 });
 
 const continuationEvent = (
@@ -1351,60 +1355,53 @@ const make = Effect.gen(function* () {
           }),
         updateTerminalActions: (actions) =>
           terminalActionsUpdateMutex.withPermits(1)(
-            continuationMutex.withPermits(1)(
-              Effect.gen(function* () {
-                const state = yield* Ref.get(continuationState);
-                if (state.terminal) {
-                  return yield* terminalToolOutputError(
-                    "OpenAI Realtime session already accepted a terminal tool output",
-                    { retryable: false },
-                  );
-                }
-                const completion = yield* Deferred.make<void, VoiceError>();
-                yield* SynchronizedRef.set(pendingTerminalActionsUpdate, completion);
-                yield* sideband
-                  .send(
-                    encodeJson({
-                      type: "session.update",
-                      session: {
-                        type: "realtime",
-                        tools: realtimeTools(actions),
-                        tool_choice: "auto",
-                        parallel_tool_calls: false,
-                      },
-                    }),
-                  )
-                  .pipe(
-                    Effect.mapError((cause) =>
-                      terminalToolOutputError(
-                        "OpenAI failed to update terminal tool availability",
-                        { cause },
-                      ),
-                    ),
-                    Effect.andThen(
-                      Deferred.await(completion).pipe(
-                        Effect.timeoutOption(CONTEXT_UPDATE_TIMEOUT),
-                        Effect.flatMap(
-                          Option.match({
-                            onNone: () =>
-                              Effect.fail(
-                                terminalToolOutputError(
-                                  "OpenAI did not acknowledge terminal tool availability",
-                                ),
-                              ),
-                            onSome: Effect.succeed,
-                          }),
+            Effect.gen(function* () {
+              const completion = yield* Deferred.make<void, VoiceError>();
+              yield* continuationMutex.withPermits(1)(
+                Effect.gen(function* () {
+                  const state = yield* Ref.get(continuationState);
+                  if (state.terminal) {
+                    return yield* terminalToolOutputError(
+                      "OpenAI Realtime session already accepted a terminal tool output",
+                      { retryable: false },
+                    );
+                  }
+                  yield* SynchronizedRef.set(pendingTerminalActionsUpdate, completion);
+                  yield* sideband
+                    .send(
+                      encodeJson({
+                        type: "session.update",
+                        session: {
+                          type: "realtime",
+                          ...realtimeToolConfig(actions),
+                        },
+                      }),
+                    )
+                    .pipe(
+                      Effect.mapError((cause) =>
+                        terminalToolOutputError(
+                          "OpenAI failed to update terminal tool availability",
+                          { cause },
                         ),
                       ),
-                    ),
-                    Effect.ensuring(
-                      SynchronizedRef.update(pendingTerminalActionsUpdate, (current) =>
-                        current === completion ? null : current,
+                    );
+                }),
+              );
+              yield* Deferred.await(completion).pipe(
+                Effect.timeoutOption(CONTEXT_UPDATE_TIMEOUT),
+                Effect.flatMap(
+                  Option.match({
+                    onNone: () =>
+                      Effect.fail(
+                        terminalToolOutputError(
+                          "OpenAI did not acknowledge terminal tool availability",
+                        ),
                       ),
-                    ),
-                  );
-              }),
-            ),
+                    onSome: Effect.succeed,
+                  }),
+                ),
+              );
+            }).pipe(Effect.ensuring(SynchronizedRef.set(pendingTerminalActionsUpdate, null))),
           ),
         submitToolOutput: (output) =>
           continuationMutex.withPermits(1)(
@@ -1468,18 +1465,17 @@ const make = Effect.gen(function* () {
                   const existing = (yield* SynchronizedRef.get(pendingContextUpdates)).get(
                     output.itemId,
                   );
-                  if (existing === undefined) return;
-                  return existing.completion;
+                  if (existing !== undefined) return existing.completion;
+                } else {
+                  yield* Ref.set(continuationState, {
+                    ...state,
+                    terminal: true,
+                    terminalToolCallId: output.providerFunctionCallId,
+                    terminalItemId: output.itemId,
+                    continuationNeeded: false,
+                    pendingFunctionCalls: new Set<string>(),
+                  });
                 }
-
-                yield* Ref.set(continuationState, {
-                  ...state,
-                  terminal: true,
-                  terminalToolCallId: output.providerFunctionCallId,
-                  terminalItemId: output.itemId,
-                  continuationNeeded: false,
-                  pendingFunctionCalls: new Set<string>(),
-                });
                 const eventId = `t3_terminal_output_${output.itemId}`;
                 const completion = yield* Deferred.make<void, VoiceError>();
                 yield* SynchronizedRef.update(pendingContextUpdates, (current) => {

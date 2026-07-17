@@ -436,7 +436,7 @@ const parseArguments = <A>(
 const completeTerminalTool = Effect.fn("VoiceToolExecutor.completeTerminalTool")(function* (
   input: VoiceToolCallInput,
   tool: TerminalVoiceTool,
-): Effect.fn.Return<VoiceToolTerminalResult> {
+): Effect.fn.Return<VoiceToolTerminalResult, VoiceError> {
   const args = yield* parseArguments(TerminalArguments, input);
   if (Object.keys(args).length > 0) {
     return yield* voiceError(

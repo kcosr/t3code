@@ -163,7 +163,7 @@ class T3VoiceRuntimeControllerTest {
     )
 
     assertEquals(
-      listOf("start-realtime:1:environment-a", "close-realtime:1:true:false"),
+      listOf("start-realtime:1:environment-a", "close-realtime:1:SWITCH_IMMEDIATELY"),
       driver.actions,
     )
   }
@@ -305,7 +305,7 @@ class T3VoiceRuntimeControllerTest {
       T3VoiceRealtimeStage.STOPPING,
       (controller.snapshot().state as T3VoiceControllerState.Realtime).stage,
     )
-    assertEquals("close-realtime:1:false:true", driver.actions.last())
+    assertEquals("close-realtime:1:STOP_AFTER_PLAYOUT", driver.actions.last())
     assertFalse(
       controller.onCallback(
         1,
@@ -323,7 +323,7 @@ class T3VoiceRuntimeControllerTest {
         ),
       ),
     )
-    assertEquals(1, driver.actions.count { it == "close-realtime:1:false:true" })
+    assertEquals(1, driver.actions.count { it == "close-realtime:1:STOP_AFTER_PLAYOUT" })
 
     assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeClosed))
     assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
@@ -350,7 +350,7 @@ class T3VoiceRuntimeControllerTest {
     val closing = controller.snapshot().state as T3VoiceControllerState.SwitchingToThread
     assertEquals(T3VoiceSwitchStage.CLOSING_REALTIME, closing.stage)
     assertEquals(T3VoiceThreadStart(threadTarget, continuousSettings), closing.threadStart)
-    assertEquals("close-realtime:1:true:true", driver.actions.last())
+    assertEquals("close-realtime:1:SWITCH_AFTER_PLAYOUT", driver.actions.last())
 
     assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeClosed))
     assertEquals("start-thread:2:thread-a", driver.actions.last())
@@ -377,7 +377,7 @@ class T3VoiceRuntimeControllerTest {
         ),
       ),
     )
-    assertEquals("close-realtime:1:false:true", driver.actions.last())
+    assertEquals("close-realtime:1:STOP_AFTER_PLAYOUT", driver.actions.last())
     assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeClosed))
 
     val failed = controller.snapshot().state as T3VoiceControllerState.Failed
@@ -410,7 +410,7 @@ class T3VoiceRuntimeControllerTest {
       T3VoiceCommandOutcome.APPLIED,
       controller.dispatch(T3VoiceRuntimeCommand.Stop).outcome,
     )
-    assertEquals("close-realtime:1:false:false", driver.actions.last())
+    assertEquals("close-realtime:1:STOP_IMMEDIATELY", driver.actions.last())
     assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeClosed))
     assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
   }
@@ -543,7 +543,7 @@ class T3VoiceRuntimeControllerTest {
   @Test
   fun `driver exception during Stop preserves the explicit Stop intent`() {
     val controller =
-      T3VoiceRuntimeController(FakeDriver(failAction = "close-realtime:1:false:false"))
+      T3VoiceRuntimeController(FakeDriver(failAction = "close-realtime:1:STOP_IMMEDIATELY"))
     controller.dispatch(T3VoiceRuntimeCommand.StartRealtime(realtimeTarget, session))
     controller.activateInitialStart(1)
 
@@ -1281,10 +1281,9 @@ internal class FakeDriver(
 
   override fun closeRealtime(
     generation: Long,
-    preserveSessionForThread: Boolean,
-    drainPlayout: Boolean,
+    policy: T3VoiceRealtimeClosePolicy,
   ) {
-    record("close-realtime:$generation:$preserveSessionForThread:$drainPlayout")
+    record("close-realtime:$generation:$policy")
   }
 
   override fun cancelRealtimeToThreadSwitch(generation: Long) {

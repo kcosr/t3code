@@ -11,7 +11,15 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import { ChevronRight, Code2, Eye, FolderTree, Globe2, LoaderCircle } from "lucide-react";
+import {
+  ChevronRight,
+  Code2,
+  Eye,
+  FolderTree,
+  Globe2,
+  LoaderCircle,
+  RefreshCw,
+} from "lucide-react";
 import * as Schema from "effect/Schema";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -740,6 +748,21 @@ export default function FilePreviewPanel({
               enableShortcut={false}
             />
           ) : null}
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <button
+                  type="button"
+                  className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+                  aria-label="Refresh file"
+                  onClick={file.refresh}
+                >
+                  <RefreshCw className={cn("size-3.5", file.isPending && "animate-spin")} />
+                </button>
+              }
+            />
+            <TooltipPopup>Refresh file</TooltipPopup>
+          </Tooltip>
           {isMarkdown ? (
             <Tooltip>
               <TooltipTrigger

@@ -38,8 +38,20 @@ internal class T3VoiceRealtimePlayoutDrainPolicy(
 
 internal class T3VoiceRealtimePlayoutMonitor {
   @Volatile private var lastAudibleAtMillis: Long? = null
+  @Volatile private var armed = false
+
+  fun arm() {
+    lastAudibleAtMillis = null
+    armed = true
+  }
+
+  fun disarm() {
+    armed = false
+    lastAudibleAtMillis = null
+  }
 
   fun observePcm16LittleEndian(data: ByteArray, nowMillis: Long) {
+    if (!armed) return
     var index = 0
     while (index + 1 < data.size) {
       val sample = (data[index].toInt() and 0xff) or (data[index + 1].toInt() shl 8)
