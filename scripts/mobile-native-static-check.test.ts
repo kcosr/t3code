@@ -10,7 +10,12 @@ import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
-import { collectSources, runCommand } from "./mobile-native-static-check.ts";
+import {
+  collectSources,
+  findAndroidVoiceLogViolations,
+  isAndroidVoiceSourcePath,
+  runCommand,
+} from "./mobile-native-static-check.ts";
 
 const processHandle = (
   exitCode: Effect.Effect<ChildProcessSpawner.ExitCode, PlatformError.PlatformError>,
@@ -36,12 +41,66 @@ const runSwiftLint = runCommand("swiftlint", ["lint", "--strict"], "/repo/apps/m
   Effect.provideService(HostProcess.HostProcessPlatform, "linux"),
 );
 
+it("rejects direct output surfaces from native voice sources", () => {
+  assert.deepEqual(
+    findAndroidVoiceLogViolations([
+      { path: "direct.kt", content: 'Log.i("voice", "sessionId=$sessionId")' },
+      {
+        path: "qualified.kt",
+        content: 'android.util.Log.w("voice", "provider payload")',
+      },
+      {
+        path: "imported.kt",
+        content: "import android.util.Log\nclass SafeLooking",
+      },
+      { path: "println.kt", content: 'println("provider payload=$payload")' },
+      { path: "system.kt", content: "System.err.print(sessionId)" },
+      { path: "stack.kt", content: "cause.printStackTrace()" },
+      { path: "timber.kt", content: 'Timber.d("session=%s", sessionId)' },
+      {
+        path: "jul.kt",
+        content: 'java.util.logging.Logger.getLogger("voice").info(payload)',
+      },
+      {
+        path: "ring.kt",
+        content: "T3VoiceDiagnostics.record(generation, category, code)",
+      },
+    ]),
+    [
+      "direct.kt",
+      "qualified.kt",
+      "imported.kt",
+      "println.kt",
+      "system.kt",
+      "stack.kt",
+      "timber.kt",
+      "jul.kt",
+    ],
+  );
+});
+
+it("applies privacy enforcement to every Android voice source set", () => {
+  for (const sourceSet of ["main", "debug", "release", "benchmark"]) {
+    assert.isTrue(
+      isAndroidVoiceSourcePath(
+        `/repo/apps/mobile/modules/t3-voice/android/src/${sourceSet}/java/Voice.kt`,
+      ),
+    );
+  }
+  assert.isFalse(isAndroidVoiceSourcePath("/repo/apps/mobile/android/src/debug/Voice.kt"));
+  assert.isFalse(
+    isAndroidVoiceSourcePath("/repo/apps/mobile/modules/other/android/src/main/Voice.kt"),
+  );
+});
+
 it.layer(NodeServices.layer)("mobile native source discovery", (it) => {
   it.effect("preserves the failed discovery operation, path, and exact cause", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
-      const root = yield* fs.makeTempDirectoryScoped({ prefix: "mobile-native-static-check-" });
+      const root = yield* fs.makeTempDirectoryScoped({
+        prefix: "mobile-native-static-check-",
+      });
       const missingDirectory = path.join(root, "missing");
 
       const error = yield* collectSources(missingDirectory, root).pipe(Effect.flip);

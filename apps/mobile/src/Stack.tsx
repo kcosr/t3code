@@ -23,6 +23,7 @@ import { useConnectOnboardingNavigation } from "./features/cloud/connectOnboardi
 import { ThreadFilesTreeScreen, ThreadFileScreen } from "./features/files/ThreadFilesRouteScreen";
 import { AdaptiveWorkspaceLayout } from "./features/layout/AdaptiveWorkspaceLayout";
 import { HardwareKeyboardCommandProvider } from "./features/keyboard/HardwareKeyboardCommandProvider";
+import { parseActiveThreadPath } from "./features/keyboard/hardwareKeyboardCommands";
 import { ReviewCommentComposerSheet } from "./features/review/ReviewCommentComposerSheet";
 import { ReviewSheet } from "./features/review/ReviewSheet";
 import { ThreadTerminalRouteScreen } from "./features/terminal/ThreadTerminalRouteScreen";
@@ -34,6 +35,7 @@ import { ThreadRouteScreen } from "./features/threads/ThreadRouteScreen";
 import { ConnectionsRouteScreen } from "./features/connection/ConnectionsRouteScreen";
 import { ConnectionsNewRouteScreen } from "./features/connection/ConnectionsNewRouteScreen";
 import { HomeRouteScreen } from "./features/home/HomeRouteScreen";
+import { HomeListOptionsProvider, useHomeListOptions } from "./features/home/home-list-options";
 import { AddProjectDestinationRoute } from "./features/projects/AddProjectDestinationRoute";
 import { AddProjectLocalRoute } from "./features/projects/AddProjectLocalRoute";
 import { AddProjectRepositoryRoute } from "./features/projects/AddProjectRepositoryRoute";
@@ -59,7 +61,13 @@ import {
   EMPTY_INCOMING_SHARE_PRESENTATION_STATE,
   transitionIncomingSharePresentation,
 } from "./features/sharing/incoming-share-presentation";
+import { SettingsVoiceRouteScreen } from "./features/settings/SettingsVoiceRouteScreen";
+import { VoiceRuntimeProvider } from "./features/voice/VoiceRuntimeProvider";
+import { scopedThreadKey } from "./lib/scopedEntities";
 import { nativeHeaderScrollEdgeEffects } from "./native/StackHeader";
+import { useThreadShell } from "./state/entities";
+import { useComposerDraftVoiceSettings } from "./state/use-composer-drafts";
+import { useSavedRemoteConnections } from "./state/use-remote-environment-registry";
 import { useThreadOutboxDrain } from "./state/use-thread-outbox-drain";
 
 const HEADER_SCROLL_EDGE_EFFECTS = nativeHeaderScrollEdgeEffects(Platform.OS, Platform.Version);
@@ -68,7 +76,10 @@ const HEADER_SCROLL_EDGE_EFFECTS = nativeHeaderScrollEdgeEffects(Platform.OS, Pl
 // background stay STATIC config while still adapting to appearance changes.
 const SHEET_BACKGROUND_COLOR =
   Platform.OS === "ios"
-    ? DynamicColorIOS({ light: "rgba(242, 242, 247, 0.98)", dark: "rgba(14, 14, 14, 0.98)" })
+    ? DynamicColorIOS({
+        light: "rgba(242, 242, 247, 0.98)",
+        dark: "rgba(14, 14, 14, 0.98)",
+      })
     : undefined;
 
 type AppScreenOptions = NativeStackNavigationOptions & {
@@ -167,6 +178,13 @@ const SettingsSheetStack = createNativeStackNavigator({
       linking: "appearance",
       options: {
         title: "Appearance",
+      },
+    }),
+    SettingsVoice: createNativeStackScreen({
+      screen: SettingsVoiceRouteScreen,
+      linking: "voice",
+      options: {
+        title: "Voice",
       },
     }),
     SettingsClientStorage: createNativeStackScreen({
@@ -278,7 +296,7 @@ function workspacePathFromState(state: NavigationState): string {
   return path.startsWith("/") ? path : `/${path}`;
 }
 
-function RootStackLayout(props: {
+function RootStackLayoutContent(props: {
   readonly children: React.ReactNode;
   readonly state: NavigationState;
 }) {
@@ -311,16 +329,62 @@ function RootStackLayout(props: {
   const path = getPathFromState(props.state, navigationPathConfig);
   const pathname = path.startsWith("/") ? path : `/${path}`;
   const workspacePathname = workspacePathFromState(props.state);
+  const focusedThreadRef = parseActiveThreadPath(workspacePathname);
+  const focusedThread = useThreadShell(focusedThreadRef);
+  const focusedDraftSettings = useComposerDraftVoiceSettings(
+    focusedThread === null ? null : scopedThreadKey(focusedThread.environmentId, focusedThread.id),
+  );
+  const { savedConnectionsById } = useSavedRemoteConnections();
+  const availableEnvironmentIds = new Set(
+    Object.keys(savedConnectionsById) as Array<keyof typeof savedConnectionsById>,
+  );
+  const { options: homeListOptions } = useHomeListOptions(availableEnvironmentIds);
+  const voiceFocus =
+    focusedThread === null
+      ? null
+      : {
+          environmentId: focusedThread.environmentId,
+          projectId: focusedThread.projectId,
+          threadId: focusedThread.id,
+          threadTitle: focusedThread.title,
+          modelSelection: focusedDraftSettings.modelSelection ?? focusedThread.modelSelection,
+          runtimeMode: focusedDraftSettings.runtimeMode ?? focusedThread.runtimeMode,
+          interactionMode:
+            focusedDraftSettings.interactionMode ?? focusedThread.interactionMode ?? "default",
+          interactionRequired:
+            focusedThread.hasPendingApprovals || focusedThread.hasPendingUserInput,
+          activeThreadBusy:
+            focusedThread.session?.status === "starting" ||
+            focusedThread.session?.status === "running",
+        };
+  const voiceEnvironmentId =
+    voiceFocus?.environmentId ??
+    homeListOptions.selectedEnvironmentId ??
+    [...availableEnvironmentIds].sort()[0] ??
+    null;
 
   return (
     <HardwareKeyboardCommandProvider pathname={pathname}>
       <ShowcaseCaptureCoordinator pathname={pathname} />
       <ClerkSettingsSheetDetentProvider initiallyExpanded={false}>
-        <AdaptiveWorkspaceLayout pathname={workspacePathname}>
-          {props.children}
-        </AdaptiveWorkspaceLayout>
+        <VoiceRuntimeProvider environmentId={voiceEnvironmentId} focus={voiceFocus}>
+          <AdaptiveWorkspaceLayout pathname={workspacePathname}>
+            {props.children}
+          </AdaptiveWorkspaceLayout>
+        </VoiceRuntimeProvider>
       </ClerkSettingsSheetDetentProvider>
     </HardwareKeyboardCommandProvider>
+  );
+}
+
+function RootStackLayout(props: {
+  readonly children: React.ReactNode;
+  readonly state: NavigationState;
+}) {
+  return (
+    <HomeListOptionsProvider>
+      <RootStackLayoutContent {...props} />
+    </HomeListOptionsProvider>
   );
 }
 

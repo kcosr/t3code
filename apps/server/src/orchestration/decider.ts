@@ -621,6 +621,99 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       };
     }
 
+    case "thread.turn.start.submit": {
+      yield* requireThread({ readModel, command, threadId: command.threadId });
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.turn-start-submitted",
+        payload: {
+          threadId: command.threadId,
+          messageId: command.messageId,
+          submittedAt: command.submittedAt,
+        },
+      };
+    }
+
+    case "thread.turn.correlate": {
+      yield* requireThread({ readModel, command, threadId: command.threadId });
+      const correlatedEvent: Omit<OrchestrationEvent, "sequence"> = {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+          metadata: { providerTurnId: command.turnId },
+        })),
+        type: "thread.turn-correlated",
+        payload: {
+          threadId: command.threadId,
+          messageId: command.messageId,
+          turnId: command.turnId,
+          resolvedAt: command.resolvedAt,
+        },
+      };
+      if (command.sourceProposedPlan === undefined) {
+        return correlatedEvent;
+      }
+      const sourceThread = readModel.threads.find(
+        (thread) => thread.id === command.sourceProposedPlan?.threadId,
+      );
+      const sourcePlan = sourceThread?.proposedPlans.find(
+        (entry) => entry.id === command.sourceProposedPlan?.planId,
+      );
+      if (
+        sourceThread === undefined ||
+        sourcePlan === undefined ||
+        sourcePlan.implementedAt !== null
+      ) {
+        return correlatedEvent;
+      }
+      const sourcePlanEvent: Omit<OrchestrationEvent, "sequence"> = {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: sourceThread.id,
+          occurredAt: command.resolvedAt,
+          commandId: command.commandId,
+        })),
+        causationEventId: correlatedEvent.eventId,
+        type: "thread.proposed-plan-upserted",
+        payload: {
+          threadId: sourceThread.id,
+          proposedPlan: {
+            ...sourcePlan,
+            implementedAt: command.resolvedAt,
+            implementationThreadId: command.threadId,
+            updatedAt: command.resolvedAt,
+          },
+        },
+      };
+      return [correlatedEvent, sourcePlanEvent];
+    }
+
+    case "thread.turn.start.fail": {
+      yield* requireThread({ readModel, command, threadId: command.threadId });
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.turn-start-failed",
+        payload: {
+          threadId: command.threadId,
+          messageId: command.messageId,
+          failedAt: command.failedAt,
+          ambiguous: command.ambiguous ?? false,
+        },
+      };
+    }
+
     case "thread.message.assistant.delta": {
       yield* requireThread({
         readModel,

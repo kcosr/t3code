@@ -39,6 +39,27 @@ export const ListProjectionThreadMessagesInput = Schema.Struct({
 });
 export type ListProjectionThreadMessagesInput = typeof ListProjectionThreadMessagesInput.Type;
 
+export const ProjectionThreadMessageCursor = Schema.Struct({
+  createdAt: IsoDateTime,
+  messageId: MessageId,
+});
+export type ProjectionThreadMessageCursor = typeof ProjectionThreadMessageCursor.Type;
+
+export const ListProjectionThreadMessagesPageInput = Schema.Struct({
+  threadId: ThreadId,
+  limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 })),
+  before: Schema.optionalKey(ProjectionThreadMessageCursor),
+  includeStreaming: Schema.optionalKey(Schema.Boolean),
+});
+export type ListProjectionThreadMessagesPageInput =
+  typeof ListProjectionThreadMessagesPageInput.Type;
+
+export const ProjectionThreadMessagePage = Schema.Struct({
+  messages: Schema.Array(ProjectionThreadMessage),
+  nextCursor: Schema.NullOr(ProjectionThreadMessageCursor),
+});
+export type ProjectionThreadMessagePage = typeof ProjectionThreadMessagePage.Type;
+
 export const GetProjectionThreadMessageInput = Schema.Struct({
   messageId: MessageId,
 });
@@ -77,6 +98,16 @@ export interface ProjectionThreadMessageRepositoryShape {
   readonly listByThreadId: (
     input: ListProjectionThreadMessagesInput,
   ) => Effect.Effect<ReadonlyArray<ProjectionThreadMessage>, ProjectionRepositoryError>;
+
+  /**
+   * List a bounded page before an optional exclusive cursor.
+   *
+   * User and assistant messages within the page are returned in ascending
+   * creation order. By default, in-progress streaming messages are excluded.
+   */
+  readonly listPageByThreadId: (
+    input: ListProjectionThreadMessagesPageInput,
+  ) => Effect.Effect<ProjectionThreadMessagePage, ProjectionRepositoryError>;
 
   /**
    * Delete projected thread messages by thread.

@@ -1,9 +1,13 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as ServerConfig from "../config.ts";
 import { PersistenceSqlError } from "../persistence/Errors.ts";
@@ -35,6 +39,13 @@ const makeSessionStoreLayer = (
     Layer.provide(makeServerConfigLayer(overrides)),
   );
 
+const makeSessionStoreWithSqlLayer = () =>
+  SessionStore.layer.pipe(
+    Layer.provideMerge(SqlitePersistenceMemory),
+    Layer.provide(ServerSecretStore.layer),
+    Layer.provide(makeServerConfigLayer()),
+  );
+
 const repositoryFailure = new PersistenceSqlError({
   operation: "AuthSessionRepository.getById:query",
   detail: "sqlite is unavailable",
@@ -42,6 +53,7 @@ const repositoryFailure = new PersistenceSqlError({
 
 const failingSessionLookupRepositoryLayer = Layer.succeed(AuthSessions.AuthSessionRepository, {
   create: () => Effect.void,
+  createWithActiveParent: () => Effect.succeed(true),
   getById: () => Effect.fail(repositoryFailure),
   listActive: () => Effect.succeed([]),
   revoke: () => Effect.fail(repositoryFailure),
@@ -146,7 +158,29 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
         "terminal:operate",
         "review:write",
         "relay:read",
+        "voice:use",
       ]);
+    }).pipe(Effect.provide(Layer.merge(makeSessionStoreLayer(), TestClock.layer()))),
+  );
+
+  it.effect("clamps issuance to an absolute expiration boundary", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const requestedAt = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+      const notAfter = DateTime.makeUnsafe(requestedAt + Duration.toMillis(Duration.hours(1)));
+
+      yield* TestClock.adjust(Duration.minutes(5));
+      const issued = yield* sessions.issue({
+        method: "bearer-access-token",
+        subject: "absolute-expiration-cap",
+        ttl: Duration.hours(1),
+        notAfter,
+      });
+
+      expect(issued.expiresAt.epochMilliseconds).toBe(notAfter.epochMilliseconds);
+      expect((yield* sessions.verify(issued.token)).expiresAt?.epochMilliseconds).toBe(
+        notAfter.epochMilliseconds,
+      );
     }).pipe(Effect.provide(Layer.merge(makeSessionStoreLayer(), TestClock.layer()))),
   );
 
@@ -212,6 +246,36 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
     }).pipe(Effect.provide(Layer.merge(makeSessionStoreLayer(), TestClock.layer()))),
   );
 
+  it.effect("enforces the persisted session expiration when it precedes the signed claim", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const sql = yield* SqlClient.SqlClient;
+      const issuedAt = yield* DateTime.now;
+      const persistedExpiresAt = DateTime.add(issuedAt, { minutes: 5 });
+      const issued = yield* sessions.issue({
+        method: "bearer-access-token",
+        subject: "persisted-expiration",
+        ttl: Duration.hours(1),
+      });
+      yield* sql`
+        UPDATE auth_sessions
+        SET expires_at = ${DateTime.formatIso(persistedExpiresAt)}
+        WHERE session_id = ${issued.sessionId}
+      `;
+
+      const verified = yield* sessions.verify(issued.token);
+      expect(verified.expiresAt?.epochMilliseconds).toBe(persistedExpiresAt.epochMilliseconds);
+
+      yield* TestClock.adjust(Duration.minutes(6));
+      const error = yield* Effect.flip(sessions.verify(issued.token));
+
+      expect(error._tag).toBe("SessionTokenExpiredError");
+      if (error._tag === "SessionTokenExpiredError") {
+        expect(error.expiresAt.epochMilliseconds).toBe(persistedExpiresAt.epochMilliseconds);
+      }
+    }).pipe(Effect.provide(Layer.merge(makeSessionStoreWithSqlLayer(), TestClock.layer()))),
+  );
+
   it.effect("lists active sessions, tracks connectivity, and revokes other sessions", () =>
     Effect.gen(function* () {
       const sessions = yield* SessionStore.SessionStore;
@@ -237,6 +301,12 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
         },
       });
       const clientWebSocket = yield* sessions.issueWebSocketToken(client.sessionId);
+      const nativeChild = yield* sessions.issue({
+        parentSessionId: client.sessionId,
+        subject: `native-voice:${client.sessionId}`,
+        method: "bearer-access-token",
+        scopes: ["orchestration:read", "orchestration:operate", "voice:use"],
+      });
 
       yield* sessions.markConnected(client.sessionId);
       const beforeRevoke = yield* sessions.listActive();
@@ -247,7 +317,7 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
         sessions.verifyWebSocketToken(clientWebSocket.token),
       );
 
-      expect(beforeRevoke).toHaveLength(2);
+      expect(beforeRevoke).toHaveLength(3);
       expect(beforeRevoke.find((entry) => entry.sessionId === client.sessionId)?.connected).toBe(
         true,
       );
@@ -258,7 +328,7 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
         beforeRevoke.find((entry) => entry.sessionId === administrative.sessionId)?.client
           .deviceType,
       ).toBe("desktop");
-      expect(revokedCount).toBe(1);
+      expect(revokedCount).toBe(2);
       expect(afterRevoke).toHaveLength(1);
       expect(afterRevoke[0]?.sessionId).toBe(administrative.sessionId);
       expect(revokedClient._tag).toBe("SessionTokenRevokedError");
@@ -271,6 +341,69 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
         expect(revokedClientWebSocket.sessionId).toBe(client.sessionId);
         expect(revokedClientWebSocket.revokedAt.epochMilliseconds).toBeGreaterThanOrEqual(0);
       }
+      expect((yield* Effect.flip(sessions.verify(nativeChild.token)))._tag).toBe(
+        "SessionTokenRevokedError",
+      );
+    }).pipe(Effect.provide(makeSessionStoreLayer())),
+  );
+
+  it.effect("revokes child sessions and publishes their removals with the parent", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const parent = yield* sessions.issue({
+        subject: "paired-mobile",
+        method: "dpop-access-token",
+      });
+      const child = yield* sessions.issue({
+        parentSessionId: parent.sessionId,
+        subject: `native-voice:${parent.sessionId}`,
+        method: "bearer-access-token",
+      });
+      const removals = yield* sessions.streamChanges.pipe(
+        Stream.filter((change) => change.type === "clientRemoved"),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+
+      expect((yield* sessions.verify(child.token)).parentSessionId).toBe(parent.sessionId);
+      expect(yield* sessions.revoke(parent.sessionId)).toBe(true);
+      const removedSessionIds = Array.from(yield* Fiber.join(removals)).map(
+        (change) => change.sessionId,
+      );
+      const parentError = yield* Effect.flip(sessions.verify(parent.token));
+      const childError = yield* Effect.flip(sessions.verify(child.token));
+
+      expect(new Set(removedSessionIds)).toEqual(new Set([parent.sessionId, child.sessionId]));
+      expect(parentError._tag).toBe("SessionTokenRevokedError");
+      expect(childError._tag).toBe("SessionTokenRevokedError");
+      expect(yield* sessions.listActive()).toHaveLength(0);
+    }).pipe(Effect.provide(makeSessionStoreLayer())),
+  );
+
+  it.effect("rejects child issuance after the parent session is revoked", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const parent = yield* sessions.issue({
+        subject: "paired-mobile",
+        method: "dpop-access-token",
+      });
+
+      expect(yield* sessions.revoke(parent.sessionId)).toBe(true);
+      const error = yield* Effect.flip(
+        sessions.issue({
+          parentSessionId: parent.sessionId,
+          subject: `native-voice:${parent.sessionId}`,
+          method: "bearer-access-token",
+        }),
+      );
+
+      expect(error).toMatchObject({
+        _tag: "SessionParentUnavailableError",
+        parentSessionId: parent.sessionId,
+      });
+      expect(yield* sessions.listActive()).toHaveLength(0);
     }).pipe(Effect.provide(makeSessionStoreLayer())),
   );
 

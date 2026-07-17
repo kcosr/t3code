@@ -42,6 +42,7 @@ export interface IssuedSession {
 
 export interface VerifiedSession {
   readonly sessionId: AuthSessionId;
+  readonly parentSessionId?: AuthSessionId;
   readonly token: string;
   readonly method: ServerAuthSessionMethod;
   readonly client: AuthClientMetadata;
@@ -264,6 +265,17 @@ export class SessionCredentialIssueError extends Schema.TaggedErrorClass<Session
   }
 }
 
+export class SessionParentUnavailableError extends Schema.TaggedErrorClass<SessionParentUnavailableError>()(
+  "SessionParentUnavailableError",
+  {
+    parentSessionId: AuthSessionId,
+  },
+) {
+  override get message(): string {
+    return "Parent session is unavailable for child credential issuance.";
+  }
+}
+
 export class SessionCredentialVerificationError extends Schema.TaggedErrorClass<SessionCredentialVerificationError>()(
   "SessionCredentialVerificationError",
   {
@@ -348,6 +360,12 @@ export const SessionCredentialInternalError = Schema.Union([
 export type SessionCredentialInternalError = typeof SessionCredentialInternalError.Type;
 export const isSessionCredentialInternalError = Schema.is(SessionCredentialInternalError);
 
+export const SessionIssueError = Schema.Union([
+  SessionCredentialInternalError,
+  SessionParentUnavailableError,
+]);
+export type SessionIssueError = typeof SessionIssueError.Type;
+
 export const SessionCredentialError = Schema.Union([
   SessionCredentialInvalidError,
   SessionCredentialInternalError,
@@ -361,12 +379,14 @@ export class SessionStore extends Context.Service<
     readonly cookieName: string;
     readonly issue: (input?: {
       readonly ttl?: Duration.Duration;
+      readonly notAfter?: DateTime.Utc;
       readonly subject?: string;
+      readonly parentSessionId?: AuthSessionId;
       readonly method?: ServerAuthSessionMethod;
       readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
       readonly client?: AuthClientMetadata;
       readonly proofKeyThumbprint?: string;
-    }) => Effect.Effect<IssuedSession, SessionCredentialInternalError>;
+    }) => Effect.Effect<IssuedSession, SessionIssueError>;
     readonly verify: (token: string) => Effect.Effect<VerifiedSession, SessionCredentialError>;
     readonly issueWebSocketToken: (
       sessionId: AuthSessionId,
@@ -576,9 +596,14 @@ export const make = Effect.gen(function* () {
         ),
       );
       const issuedAt = yield* DateTime.now;
-      const expiresAt = DateTime.add(issuedAt, {
+      const ttlExpiresAt = DateTime.add(issuedAt, {
         milliseconds: Duration.toMillis(input?.ttl ?? DEFAULT_SESSION_TTL),
       });
+      const expiresAt =
+        input?.notAfter !== undefined &&
+        input.notAfter.epochMilliseconds < ttlExpiresAt.epochMilliseconds
+          ? input.notAfter
+          : ttlExpiresAt;
       const claims: SessionClaims = {
         v: 1,
         kind: "session",
@@ -607,24 +632,39 @@ export const make = Effect.gen(function* () {
       );
       const signature = signPayload(encodedPayload, signingSecret);
       const client = input?.client ?? createDefaultClientMetadata();
-      yield* authSessions
-        .create({
-          sessionId,
-          subject: claims.sub,
-          scopes: claims.scopes,
-          method: claims.method,
-          client: {
-            label: client.label ?? null,
-            ipAddress: client.ipAddress ?? null,
-            userAgent: client.userAgent ?? null,
-            deviceType: client.deviceType,
-            os: client.os ?? null,
-            browser: client.browser ?? null,
-          },
-          issuedAt,
-          expiresAt,
-        })
-        .pipe(Effect.mapError((cause) => new SessionCredentialIssueError({ sessionId, cause })));
+      const parentSessionId = input?.parentSessionId;
+      const createInput = {
+        sessionId,
+        parentSessionId: parentSessionId ?? null,
+        subject: claims.sub,
+        scopes: claims.scopes,
+        method: claims.method,
+        client: {
+          label: client.label ?? null,
+          ipAddress: client.ipAddress ?? null,
+          userAgent: client.userAgent ?? null,
+          deviceType: client.deviceType,
+          os: client.os ?? null,
+          browser: client.browser ?? null,
+        },
+        issuedAt,
+        expiresAt,
+      } satisfies AuthSessions.CreateAuthSessionInput;
+      if (parentSessionId === undefined) {
+        yield* authSessions
+          .create(createInput)
+          .pipe(Effect.mapError((cause) => new SessionCredentialIssueError({ sessionId, cause })));
+      } else {
+        const created = yield* authSessions
+          .createWithActiveParent({
+            ...createInput,
+            parentSessionId,
+          })
+          .pipe(Effect.mapError((cause) => new SessionCredentialIssueError({ sessionId, cause })));
+        if (!created) {
+          return yield* new SessionParentUnavailableError({ parentSessionId });
+        }
+      }
       yield* emitUpsert(
         toAuthClientSession({
           sessionId,
@@ -699,13 +739,27 @@ export const make = Effect.gen(function* () {
           revokedAt: row.value.revokedAt,
         });
       }
+      if (row.value.expiresAt.epochMilliseconds <= observedAt.epochMilliseconds) {
+        return yield* new SessionTokenExpiredError({
+          sessionId: claims.sid,
+          expiresAt: row.value.expiresAt,
+          observedAt,
+        });
+      }
+      const effectiveExpiresAt =
+        row.value.expiresAt.epochMilliseconds < expiresAt.value.epochMilliseconds
+          ? row.value.expiresAt
+          : expiresAt.value;
 
       return {
         sessionId: claims.sid,
+        ...(row.value.parentSessionId === null
+          ? {}
+          : { parentSessionId: row.value.parentSessionId }),
         token,
         method: claims.method,
         client: toClientMetadata(row.value.client),
-        expiresAt: expiresAt.value,
+        expiresAt: effectiveExpiresAt,
         subject: claims.sub,
         scopes: claims.scopes,
         ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
@@ -808,6 +862,7 @@ export const make = Effect.gen(function* () {
 
     return {
       sessionId: row.value.sessionId,
+      ...(row.value.parentSessionId === null ? {} : { parentSessionId: row.value.parentSessionId }),
       token,
       method: row.value.method,
       client: toClientMetadata(row.value.client),
@@ -843,21 +898,23 @@ export const make = Effect.gen(function* () {
   const revoke: SessionStore["Service"]["revoke"] = Effect.fn("SessionStore.revoke")(
     function* (sessionId) {
       const revokedAt = yield* DateTime.now;
-      const revoked = yield* authSessions
+      const revokedSessionIds = yield* authSessions
         .revoke({
           sessionId,
           revokedAt,
         })
         .pipe(Effect.mapError((cause) => new SessionRevocationError({ sessionId, cause })));
-      if (revoked) {
+      if (revokedSessionIds.length > 0) {
         yield* Ref.update(connectedSessionsRef, (current) => {
           const next = new Map(current);
-          next.delete(sessionId);
+          for (const revokedSessionId of revokedSessionIds) {
+            next.delete(revokedSessionId);
+          }
           return next;
         });
-        yield* emitRemoved(sessionId);
+        yield* Effect.forEach(revokedSessionIds, emitRemoved, { discard: true });
       }
-      return revoked;
+      return revokedSessionIds.includes(sessionId);
     },
   );
 

@@ -17,7 +17,7 @@ import type {
 import { formatElapsed } from "@t3tools/shared/orchestrationTiming";
 import * as Haptics from "expo-haptics";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Platform, View, type GestureResponderEvent } from "react-native";
+import { Alert, Platform, View, type GestureResponderEvent } from "react-native";
 import { KeyboardController, KeyboardStickyView } from "react-native-keyboard-controller";
 import Animated, { FadeInDown, FadeOut, LinearTransition } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -43,6 +43,7 @@ import {
 } from "./ThreadComposer";
 import { ThreadFeed } from "./ThreadFeed";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
+import { useThreadSpeech } from "../voice/useThreadSpeech";
 
 export interface ThreadDetailScreenProps {
   readonly selectedThread: OrchestrationThreadShell;
@@ -118,6 +119,26 @@ function latestStreamingAssistantMessage(
     };
   }
 
+  return null;
+}
+
+function latestAssistantSpeechSnapshot(feed: ReadonlyArray<ThreadFeedEntry>): {
+  readonly id: string;
+  readonly text: string;
+  readonly streaming: boolean;
+  readonly turnId: string | null;
+} | null {
+  for (let index = feed.length - 1; index >= 0; index -= 1) {
+    const entry = feed[index];
+    if (entry?.type === "message" && entry.message.role === "assistant") {
+      return {
+        id: entry.message.id,
+        text: entry.message.text,
+        streaming: entry.message.streaming,
+        turnId: entry.message.turnId,
+      };
+    }
+  }
   return null;
 }
 
@@ -244,6 +265,17 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     }
   })();
   const selectedThreadFeed = props.selectedThreadFeed;
+  const latestAssistant = useMemo(
+    () => latestAssistantSpeechSnapshot(selectedThreadFeed),
+    [selectedThreadFeed],
+  );
+  const speechPlayback = useThreadSpeech({
+    environmentId: props.environmentId,
+    scopeKey: selectedThreadKey,
+    historyReady: contentPresentationKind === "ready",
+    latestAssistant,
+  });
+  const handleSpeechPlaybackToggle = speechPlayback.onToggle;
   const composerChrome = composerExpanded ? COMPOSER_EXPANDED_CHROME : COMPOSER_COLLAPSED_CHROME;
   const composerOverlapHeight = composerChrome + composerBottomInset;
   const activeWorkIndicatorHeight = props.activeWorkStartedAt ? WORKING_INDICATOR_HEIGHT : 0;
@@ -270,6 +302,11 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
   const contentMaxWidth = isSplitLayout ? CHAT_CONTENT_MAX_WIDTH : undefined;
   const selectedInstanceId = props.selectedThread.modelSelection.instanceId;
   useStreamingHaptics(props.selectedThread.id, props.selectedThreadFeed);
+  useEffect(() => {
+    if (speechPlayback.error !== null) {
+      Alert.alert("Spoken response failed", speechPlayback.error);
+    }
+  }, [speechPlayback.error]);
   const selectedProviderSkills = useMemo(
     () =>
       props.serverConfig?.providers.find((provider) => provider.instanceId === selectedInstanceId)
@@ -350,7 +387,6 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     composerEditorRef.current?.blur();
     return messageId;
   }, [props.onSendMessage, selectedThreadKey]);
-
   const collapseComposer = useCallback(() => {
     composerEditorRef.current?.blur();
   }, []);
@@ -482,6 +518,9 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               serverConfig={props.serverConfig}
               queueCount={props.selectedThreadQueueCount}
               activeThreadBusy={props.activeThreadBusy}
+              interactionRequired={
+                props.activePendingApproval !== null || props.activePendingUserInput !== null
+              }
               environmentId={props.environmentId}
               projectCwd={props.projectWorkspaceRoot}
               bottomInset={composerBottomInset}
@@ -496,6 +535,20 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               onUpdateRuntimeMode={props.onUpdateThreadRuntimeMode}
               onUpdateInteractionMode={props.onUpdateThreadInteractionMode}
               onExpandedChange={setComposerExpanded}
+              speechPlayback={{
+                available: speechPlayback.available,
+                enabled: speechPlayback.enabled,
+                playing: speechPlayback.playing,
+                error: speechPlayback.error,
+                onToggle: handleSpeechPlaybackToggle,
+                interrupt: speechPlayback.interrupt,
+                interruptForRealtime: speechPlayback.interruptForRealtime,
+                resumeAfterDictation: speechPlayback.resumeAfterDictation,
+                resumeAfterRealtime: speechPlayback.resumeAfterRealtime,
+                enable: speechPlayback.enable,
+                lifecycleEvent: speechPlayback.lifecycleEvent,
+                latestAssistant: speechPlayback.latestAssistant,
+              }}
             />
           </View>
         </KeyboardStickyView>

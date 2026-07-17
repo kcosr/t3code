@@ -7,7 +7,6 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
-import { normalizeDispatchCommand } from "./Normalizer.ts";
 import {
   annotateEnvironmentRequest,
   failEnvironmentInternal,
@@ -15,15 +14,17 @@ import {
   failEnvironmentNotFound,
   requireEnvironmentScope,
 } from "../auth/http.ts";
-import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
+import { ClientCommandDispatcher } from "./Services/ClientCommandDispatcher.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
+import { ThreadTurnOutcomeQuery } from "./Services/ThreadTurnOutcomeQuery.ts";
 
 export const orchestrationHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
   "orchestration",
   Effect.fnUntraced(function* (handlers) {
     const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
-    const orchestrationEngine = yield* OrchestrationEngineService;
+    const threadTurnOutcomeQuery = yield* ThreadTurnOutcomeQuery;
+    const clientCommandDispatcher = yield* ClientCommandDispatcher;
 
     return handlers
       .handle(
@@ -73,20 +74,39 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
         }),
       )
       .handle(
+        "messageTurn",
+        Effect.fn("environment.orchestration.messageTurn")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          const result = yield* threadTurnOutcomeQuery
+            .getByMessageId(args.params)
+            .pipe(
+              Effect.catch((cause) =>
+                failEnvironmentInternal("orchestration_message_turn_failed", cause),
+              ),
+            );
+          if (result.type === "thread-not-found") {
+            return yield* failEnvironmentNotFound("thread_not_found");
+          }
+          if (result.type === "message-not-found") {
+            return yield* failEnvironmentNotFound("thread_message_not_found");
+          }
+          return result.result;
+        }),
+      )
+      .handle(
         "dispatch",
         Effect.fn("environment.orchestration.dispatch")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
-          const normalizedCommand = yield* normalizeDispatchCommand(args.payload).pipe(
-            Effect.catch(() => failEnvironmentInvalidRequest("invalid_command")),
-          );
-          return yield* orchestrationEngine
-            .dispatch(normalizedCommand)
-            .pipe(
-              Effect.catch((cause) =>
+          return yield* clientCommandDispatcher.dispatch(args.payload).pipe(
+            Effect.catchTags({
+              ClientCommandNormalizationError: () =>
+                failEnvironmentInvalidRequest("invalid_command"),
+              OrchestrationDispatchCommandError: (cause) =>
                 failEnvironmentInternal("orchestration_dispatch_failed", cause),
-              ),
-            );
+            }),
+          );
         }),
       );
   }),

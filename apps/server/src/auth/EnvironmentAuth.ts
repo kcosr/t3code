@@ -60,6 +60,7 @@ export interface IssuedBearerSession {
 
 export interface AuthenticatedSession {
   readonly sessionId: AuthSessionId;
+  readonly parentSessionId?: AuthSessionId;
   readonly subject: string;
   readonly method: ServerAuthSessionMethod;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
@@ -579,6 +580,9 @@ export const make = Effect.gen(function* () {
       ),
       Effect.map((session) => ({
         sessionId: session.sessionId,
+        ...(session.parentSessionId === undefined
+          ? {}
+          : { parentSessionId: session.parentSessionId }),
         subject: session.subject,
         method: session.method,
         scopes: session.scopes,
@@ -942,6 +946,9 @@ export const make = Effect.gen(function* () {
           return yield* sessions.verifyWebSocketToken(websocketTicket).pipe(
             Effect.map((session) => ({
               sessionId: session.sessionId,
+              ...(session.parentSessionId === undefined
+                ? {}
+                : { parentSessionId: session.parentSessionId }),
               subject: session.subject,
               method: session.method,
               scopes: session.scopes,

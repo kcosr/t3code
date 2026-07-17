@@ -20,6 +20,7 @@ export function ControlPill(props: {
   readonly iconNode?: ReactNode;
   readonly label?: string;
   readonly accessibilityLabel?: string;
+  readonly active?: boolean;
   readonly onPress?: () => void;
   readonly variant?: "circle" | "pill" | "primary" | "danger";
   readonly disabled?: boolean;
@@ -53,7 +54,9 @@ export function ControlPill(props: {
         : "bg-primary"
       : variant === "danger"
         ? "bg-danger"
-        : "bg-subtle",
+        : props.active
+          ? "bg-subtle-strong"
+          : "bg-subtle",
   );
   const labelClassName = cn(
     "text-center text-xs font-t3-bold",
@@ -68,6 +71,7 @@ export function ControlPill(props: {
     <Pressable
       accessibilityLabel={props.accessibilityLabel ?? props.label}
       accessibilityRole="button"
+      accessibilityState={{ selected: props.active }}
       onPress={props.onPress}
       disabled={props.disabled}
       className={containerClassName}

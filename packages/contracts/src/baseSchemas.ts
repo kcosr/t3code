@@ -43,6 +43,26 @@ export const TurnId = makeEntityId("TurnId");
 export type TurnId = typeof TurnId.Type;
 export const AuthSessionId = makeEntityId("AuthSessionId");
 export type AuthSessionId = typeof AuthSessionId.Type;
+export const VoiceConversationId = makeEntityId("VoiceConversationId");
+export type VoiceConversationId = typeof VoiceConversationId.Type;
+export const VoiceConversationEntryId = TrimmedNonEmptyString.check(Schema.isMaxLength(1_024)).pipe(
+  Schema.brand("VoiceConversationEntryId"),
+);
+export type VoiceConversationEntryId = typeof VoiceConversationEntryId.Type;
+export const VoiceSessionId = makeEntityId("VoiceSessionId");
+export type VoiceSessionId = typeof VoiceSessionId.Type;
+export const VoiceRequestId = makeEntityId("VoiceRequestId");
+export type VoiceRequestId = typeof VoiceRequestId.Type;
+export const VoicePlaybackId = makeEntityId("VoicePlaybackId");
+export type VoicePlaybackId = typeof VoicePlaybackId.Type;
+export const VoiceToolCallId = makeEntityId("VoiceToolCallId");
+export type VoiceToolCallId = typeof VoiceToolCallId.Type;
+export const VoiceConfirmationId = makeEntityId("VoiceConfirmationId");
+export type VoiceConfirmationId = typeof VoiceConfirmationId.Type;
+export const VoiceClientActionId = makeEntityId("VoiceClientActionId");
+export type VoiceClientActionId = typeof VoiceClientActionId.Type;
+export const VoiceMediaTicketId = makeEntityId("VoiceMediaTicketId");
+export type VoiceMediaTicketId = typeof VoiceMediaTicketId.Type;
 
 export const ProviderItemId = makeEntityId("ProviderItemId");
 export type ProviderItemId = typeof ProviderItemId.Type;

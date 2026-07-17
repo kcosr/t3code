@@ -1,0 +1,282 @@
+# Voice Architecture
+
+## Status and authority
+
+This is the sole authoritative design-as-built document for T3 voice. It describes behavior present
+in the repository today. Source code remains authoritative when this document and the implementation
+disagree.
+
+Active cleanup is tracked in [voice-next-steps.md](../../plans/voice-next-steps.md). Possible future
+features live in [voice-roadmap.md](../../specs/voice-roadmap.md); roadmap entries are not current
+requirements.
+
+Android is the only implemented semantic voice runtime. Shared TypeScript contracts and presentation
+logic are platform-neutral, but there is no web, desktop, or iOS voice-runtime adapter yet.
+
+## Product surfaces
+
+The mobile app exposes four related voice surfaces:
+
+1. The microphone beside the Thread composer performs one bounded dictation. Its transcript remains
+   in the draft and is not submitted automatically.
+2. The waveform beside the Thread composer controls native Thread voice, also called Auto Listen.
+   Thread voice records, detects an endpoint, transcribes, optionally reviews, dispatches the Thread
+   turn, waits for the exact result, optionally speaks it, and may rearm according to user settings.
+3. The persistent bottom call bar belongs only to Realtime voice. It opens or resumes a durable voice
+   conversation and, while Realtime is active, exposes transcript, mute, output route, and stop
+   controls. While Thread voice is active, the bar remains a Realtime Resume surface.
+4. Eligible assistant messages can use bounded streaming speech playback.
+
+Starting Realtime while Thread voice is active performs one native Thread-to-Realtime transition.
+Starting Thread voice while Realtime is active performs one native Realtime-to-Thread transition.
+Only one semantic or bounded media owner may use capture, playback, audio focus, or routing at a
+time.
+
+## Deployed architecture
+
+```text
+React Native UI
+  composer controls / Realtime call bar
+             |
+             | platform-neutral semantic commands and snapshots
+             v
+Android microphone foreground service
+  serialized native controller
+  notification + MediaSession
+  WebRTC / recorder / PCM player / audio focus and routes
+             |
+             | authenticated T3 control and media APIs
+             v
+T3 environment server ---------------------- OpenAI
+  voice sessions and durable conversations     transcription / speech
+  signaling and sideband tool execution        Realtime WebRTC + sideband
+  media tickets and native child sessions
+  orchestration and history services
+```
+
+There are two media paths:
+
+- Bounded transcription and speech use authenticated T3 HTTP endpoints. The server validates media,
+  applies byte, duration, concurrency, and timeout limits, and calls OpenAI.
+- Realtime audio flows directly between Android and OpenAI over WebRTC. The T3 server authenticates
+  session creation, proxies SDP negotiation, attaches a provider sideband connection, executes the
+  allowlisted T3 tools, and publishes normalized session events.
+
+OpenAI is the only configured production voice provider. Its API key remains in the server secret
+store. Clients receive neither the provider credential nor raw provider control events.
+
+## Server capabilities and APIs
+
+`GET /api/voice/capabilities` reports configuration and readiness for:
+
+- `transcription.request` — implemented bounded MP4 transcription;
+- `speech.streaming` — implemented PCM speech streaming;
+- `agent.realtime` — implemented Realtime voice agent; and
+- `transcription.realtime` — part of the contract but currently reported unavailable.
+
+The control API also provides:
+
+- voice-session create, read, heartbeat, focus update, close, event polling, and WebRTC offer;
+- Realtime confirmation decisions and client-action acknowledgements;
+- voice-conversation create, list, read, rename, transcript, clear-context, and delete;
+- one-use media tickets;
+- bounded Android native child sessions; and
+- credential status, set, and clear operations.
+
+`POST /api/voice/transcriptions` accepts one validated `audio/mp4` upload and streams transcript
+deltas followed by one final result. `POST /api/voice/speech` returns cancellable, backpressured
+24 kHz mono signed 16-bit PCM. Android Thread voice requests one-use tickets for these routes while
+React is detached; React-owned dictation and message playback request their own tickets.
+
+## Conversations, sessions, and calls
+
+T3 keeps three identities separate:
+
+- A voice conversation is the T3-owned semantic history represented by `VoiceConversationId`.
+- A voice session is one active client attachment represented by `VoiceSessionId`.
+- A provider call is an ephemeral OpenAI Realtime resource and is never the durable T3 identity.
+
+A new Realtime start selects either a new conversation or a previously saved durable conversation.
+Durable conversations and normalized journal entries are stored in SQLite. Final user and assistant
+transcripts, tool requests and results, context changes, call boundaries, device handoffs, and
+clear-context markers are journal data; raw audio, SDP, credentials, and provider event dumps are
+not.
+
+The server compiles a bounded set of current-epoch journal entries when opening a provider call.
+Clear context advances the conversation epoch, leaving older entries visible in history but
+excluding them from later provider context. Automatic summary generation is not implemented.
+
+Continuing a conversation that already has an active lease requires explicit takeover. The server
+fences and closes the prior session, advances the lease generation, and starts a new provider call
+from the durable conversation context. This is semantic continuation, not transfer of a live WebRTC
+connection.
+
+Realtime sessions are capped below the provider maximum. A rotation event ends the current call;
+continuation requires an explicit new session against the durable conversation. A closed or failed
+provider call is never presented as resumed.
+
+## Realtime tools
+
+The Realtime voice-agent allowlist is:
+
+- `list_projects`
+- `list_threads`
+- `get_thread_status`
+- `get_thread_messages`
+- `wait_for_thread_turn`
+- `search_history`
+- `read_history`
+- `activate_thread`
+- `stop_realtime_voice`
+- `switch_to_thread_voice`
+- `create_thread`
+- `send_thread_message`
+- `interrupt_thread`
+- `archive_thread`
+
+Read tools execute on the server against bounded projections. `create_thread` and
+`send_thread_message` dispatch immediately with deterministic identifiers; a successful receipt is
+not a claim that downstream work completed. `wait_for_thread_turn` polls the exact dispatched
+message and never redispatches it. `interrupt_thread` and `archive_thread` require explicit client
+confirmation.
+
+`activate_thread` changes visible focus while Realtime continues. `stop_realtime_voice` and
+`switch_to_thread_voice` are terminal actions. The server acknowledges the provider function call
+without requesting another response, then publishes one fenced native action. Android fences new
+microphone input, drains already queued final speech within a bounded deadline, and performs the
+native stop or switch. React is not required to be attached.
+
+No shell, terminal, filesystem, Git, arbitrary MCP, or coding-agent provider tool is exposed through
+the voice-agent allowlist.
+
+## Android runtime ownership
+
+The Android foreground service owns one process-local serialized controller. Its top-level states
+are:
+
+```text
+Idle
+Realtime
+SwitchingToThread
+Thread
+SwitchingToRealtime
+Failed
+```
+
+Realtime and Thread contain operation-specific phases. Every public snapshot includes an in-memory
+generation and monotonically increasing publication sequence. Native callbacks carry the generation
+that admitted their work, so late callbacks from an earlier owner cannot mutate its replacement.
+
+React, notification intents, and MediaSession callbacks dispatch the same typed controller commands.
+React subscribes to complete snapshots and does not maintain a second Android voice state machine.
+The native bridge does not expose credentials, provider identifiers, SDP, raw provider events, or
+temporary recording paths.
+
+### Realtime-to-Thread
+
+The active Realtime snapshot carries a prepared Thread target when the selected Thread is eligible.
+A switch immediately enters the native transition, rejects conflicting controls, closes the server
+session and WebRTC peer, waits for exact peer and microphone release, advances the generation, and
+starts Thread recording. Failure does not roll back into Realtime, and no durable switch transaction
+is created.
+
+An agent-initiated switch uses the same prepared target. Its playout drain may delay peer close so
+the agent's final transition sentence can finish, but Thread recording still waits for exact native
+quiescence.
+
+### Thread-to-Realtime
+
+Before admission, React performs the visible permission checks and obtains a fresh bounded native
+child credential. The Android adapter re-reads the native mode immediately before admission and
+selects either an Idle start or a Thread handoff, so a mode change during permission prompts cannot
+send the stale command. For a handoff, Android stops the active Thread recorder, request, wait, or
+playback path, waits for its exact release callback, advances the generation, and starts the
+selected Realtime conversation. Once admitted, Activity backgrounding or React detachment does not
+interrupt the transition. Stop during the transition cancels the pending Realtime start.
+
+## Thread voice
+
+Native Thread voice owns the complete background-capable cycle:
+
+1. record and detect an endpoint;
+2. obtain a one-use transcription ticket and upload the bounded recording;
+3. review or auto-submit according to settings;
+4. dispatch one idempotent `thread.turn.start` command;
+5. poll the exact dispatched message outcome;
+6. optionally obtain speech tickets and play the settled assistant response; and
+7. optionally rearm after the configured guard.
+
+The outcome route is
+`GET /api/orchestration/threads/:threadId/messages/:messageId/turn`. It distinguishes pending,
+running, approval-required, user-input-required, completed, interrupted, failed, and ambiguous
+outcomes. Dispatch retries retain the same command and message identifiers; outcome polling cannot
+create another turn.
+
+Recordings are deleted after their bounded transcription attempt. Startup performs a bounded cleanup
+of abandoned cache files; files are not treated as resumable session state.
+
+## Android lifecycle and controls
+
+A visible user action supplies microphone permission and starts the microphone foreground service.
+The service owns the controller, media resources, network work, notification, MediaSession, and a
+bounded wake lock while an operation is active. It does not retain an Activity, React context, or
+Expo module.
+
+Activity backgrounding, recreation, React remount, navigation, screen lock, and best-effort task
+removal do not themselves stop the service. The service is `START_NOT_STICKY`: process termination,
+force-stop, reboot, application update, or native crash ends the live operation. A fresh process
+starts in `Idle`; sockets, peers, recorders, callbacks, timers, and mode switches are never restored
+from persistence.
+
+The notification is derived from the current controller snapshot:
+
+- Realtime exposes mute or unmute, a prepared Thread switch where available, and stop.
+- Thread exposes finish utterance while recording, submit while reviewing, and stop.
+- Transitions expose stop.
+- A failed owner retains a Stop-only foreground notification until native release is known.
+
+MediaSession transport controls map to the same native commands. Notification permission denial
+reduces drawer visibility but does not create a second control path.
+
+The app persists the user's preferred Realtime output route and reapplies it when that route is
+available in a later Realtime session. Native route loss still falls back to an available system
+route.
+
+## Authentication and authorization
+
+Voice media, conversation, session, event, and confirmation operations require `voice:use`.
+Credential administration requires `voice:manage`. Voice tools recheck the scope required by their
+underlying orchestration or history operation.
+
+After a visible Android start, the authenticated client can request a bounded native child bearer
+with exactly `voice:use`, `orchestration:read`, and `orchestration:operate`. Its lifetime is the
+lesser of twelve hours and the parent session's remaining lifetime. It cannot mint another child.
+Parent revocation invalidates child-owned sessions and media tickets.
+
+Media tickets are short-lived, one-use, operation- and request-bound credentials for transcription
+upload or speech streaming. They do not grant general voice or orchestration access.
+
+## Diagnostics and privacy
+
+Server diagnostics are structured privacy-safe logs containing curated identifiers, enums, counts,
+byte totals, timings, and outcomes. Android keeps a bounded in-memory diagnostic ring for lifecycle,
+route and focus, endpoint, terminal-code, and numeric media events.
+
+Neither diagnostics path may contain transcript or query text, audio, SDP, credentials, provider
+payloads, raw provider identifiers, tool arguments or results, or temporary recording paths. The
+generic diagnostic ring remains part of the product for troubleshooting; temporary milestone
+tracing is not part of the design.
+
+## Current limitations
+
+- The semantic native runtime exists only on Android.
+- Realtime transcription is represented in contracts but unavailable in the configured provider.
+- OpenAI is the only configured production voice provider, with server-pinned models and presets.
+- Automatic conversation summaries and seamless context-limit call replacement are not implemented.
+- Session rotation and terminal provider failures require an explicit new call.
+- Durable conversations have explicit clear and delete controls but no automated age or size
+  retention policy.
+- Live Android sessions do not survive application-process termination.
+
+Possible changes to these limitations belong in the non-authoritative roadmap until separately
+specified and approved.

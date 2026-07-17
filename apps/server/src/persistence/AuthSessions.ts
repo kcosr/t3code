@@ -32,6 +32,7 @@ export type AuthSessionClientMetadataRecord = typeof AuthSessionClientMetadataRe
 
 export const AuthSessionRecord = Schema.Struct({
   sessionId: AuthSessionId,
+  parentSessionId: Schema.NullOr(AuthSessionId),
   subject: Schema.String,
   scopes: AuthEnvironmentScopes,
   method: ServerAuthSessionMethod,
@@ -45,6 +46,7 @@ export type AuthSessionRecord = typeof AuthSessionRecord.Type;
 
 export const CreateAuthSessionInput = Schema.Struct({
   sessionId: AuthSessionId,
+  parentSessionId: Schema.NullOr(AuthSessionId),
   subject: Schema.String,
   scopes: AuthEnvironmentScopes,
   method: ServerAuthSessionMethod,
@@ -53,6 +55,13 @@ export const CreateAuthSessionInput = Schema.Struct({
   expiresAt: Schema.DateTimeUtcFromString,
 });
 export type CreateAuthSessionInput = typeof CreateAuthSessionInput.Type;
+
+export const CreateAuthSessionWithActiveParentInput = Schema.Struct({
+  ...CreateAuthSessionInput.fields,
+  parentSessionId: AuthSessionId,
+});
+export type CreateAuthSessionWithActiveParentInput =
+  typeof CreateAuthSessionWithActiveParentInput.Type;
 
 export const GetAuthSessionByIdInput = Schema.Struct({
   sessionId: AuthSessionId,
@@ -88,6 +97,9 @@ export class AuthSessionRepository extends Context.Service<
     readonly create: (
       input: CreateAuthSessionInput,
     ) => Effect.Effect<void, AuthSessionRepositoryError>;
+    readonly createWithActiveParent: (
+      input: CreateAuthSessionWithActiveParentInput,
+    ) => Effect.Effect<boolean, AuthSessionRepositoryError>;
     readonly getById: (
       input: GetAuthSessionByIdInput,
     ) => Effect.Effect<Option.Option<AuthSessionRecord>, AuthSessionRepositoryError>;
@@ -96,7 +108,7 @@ export class AuthSessionRepository extends Context.Service<
     ) => Effect.Effect<ReadonlyArray<AuthSessionRecord>, AuthSessionRepositoryError>;
     readonly revoke: (
       input: RevokeAuthSessionInput,
-    ) => Effect.Effect<boolean, AuthSessionRepositoryError>;
+    ) => Effect.Effect<ReadonlyArray<AuthSessionId>, AuthSessionRepositoryError>;
     readonly revokeAllExcept: (
       input: RevokeOtherAuthSessionsInput,
     ) => Effect.Effect<ReadonlyArray<AuthSessionId>, AuthSessionRepositoryError>;
@@ -108,6 +120,7 @@ export class AuthSessionRepository extends Context.Service<
 
 const AuthSessionDbRow = Schema.Struct({
   sessionId: AuthSessionId,
+  parentSessionId: Schema.NullOr(AuthSessionId),
   subject: Schema.String,
   scopes: Schema.fromJsonString(AuthEnvironmentScopes),
   method: ServerAuthSessionMethod,
@@ -125,6 +138,7 @@ const AuthSessionDbRow = Schema.Struct({
 
 const AuthSessionRawDbRow = Schema.Struct({
   sessionId: Schema.String,
+  parentSessionId: Schema.Unknown,
   subject: Schema.Unknown,
   scopes: Schema.Unknown,
   method: Schema.Unknown,
@@ -145,6 +159,7 @@ const decodeAuthSessionDbRow = Schema.decodeUnknownEffect(AuthSessionDbRow);
 function toAuthSessionRecord(row: typeof AuthSessionDbRow.Type): AuthSessionRecord {
   return {
     sessionId: row.sessionId,
+    parentSessionId: row.parentSessionId,
     subject: row.subject,
     scopes: row.scopes,
     method: row.method,
@@ -187,6 +202,7 @@ export const make = Effect.gen(function* () {
       sql`
         INSERT INTO auth_sessions (
           session_id,
+          parent_session_id,
           subject,
           scopes,
           method,
@@ -202,6 +218,7 @@ export const make = Effect.gen(function* () {
         )
         VALUES (
           ${input.sessionId},
+          ${input.parentSessionId},
           ${input.subject},
           ${JSON.stringify(input.scopes)},
           ${input.method},
@@ -218,6 +235,51 @@ export const make = Effect.gen(function* () {
       `,
   });
 
+  const createSessionWithActiveParentRow = SqlSchema.findOneOption({
+    Request: CreateAuthSessionWithActiveParentInput,
+    Result: Schema.Struct({ sessionId: AuthSessionId }),
+    execute: (input) =>
+      sql`
+        INSERT INTO auth_sessions (
+          session_id,
+          parent_session_id,
+          subject,
+          scopes,
+          method,
+          client_label,
+          client_ip_address,
+          client_user_agent,
+          client_device_type,
+          client_os,
+          client_browser,
+          issued_at,
+          expires_at,
+          revoked_at
+        )
+        SELECT
+          ${input.sessionId},
+          ${input.parentSessionId},
+          ${input.subject},
+          ${JSON.stringify(input.scopes)},
+          ${input.method},
+          ${input.client.label},
+          ${input.client.ipAddress},
+          ${input.client.userAgent},
+          ${input.client.deviceType},
+          ${input.client.os},
+          ${input.client.browser},
+          ${input.issuedAt},
+          ${input.expiresAt},
+          NULL
+        FROM auth_sessions AS parent
+        WHERE parent.session_id = ${input.parentSessionId}
+          AND parent.revoked_at IS NULL
+          AND parent.expires_at > ${input.issuedAt}
+          AND parent.expires_at >= ${input.expiresAt}
+        RETURNING session_id AS "sessionId"
+      `,
+  });
+
   const getSessionRowById = SqlSchema.findOneOption({
     Request: GetAuthSessionByIdInput,
     Result: AuthSessionRawDbRow,
@@ -225,6 +287,7 @@ export const make = Effect.gen(function* () {
       sql`
         SELECT
           session_id AS "sessionId",
+          parent_session_id AS "parentSessionId",
           subject AS "subject",
           scopes AS "scopes",
           method AS "method",
@@ -250,6 +313,7 @@ export const make = Effect.gen(function* () {
       sql`
         SELECT
           session_id AS "sessionId",
+          parent_session_id AS "parentSessionId",
           subject AS "subject",
           scopes AS "scopes",
           method AS "method",
@@ -288,7 +352,7 @@ export const make = Effect.gen(function* () {
       sql`
         UPDATE auth_sessions
         SET revoked_at = ${revokedAt}
-        WHERE session_id = ${sessionId}
+        WHERE (session_id = ${sessionId} OR parent_session_id = ${sessionId})
           AND revoked_at IS NULL
         RETURNING session_id AS "sessionId"
       `,
@@ -313,6 +377,20 @@ export const make = Effect.gen(function* () {
         toPersistenceSqlOrDecodeError(
           "AuthSessionRepository.create:query",
           "AuthSessionRepository.create:encodeRequest",
+          { sessionId: input.sessionId },
+        ),
+      ),
+    );
+
+  const createWithActiveParent: AuthSessionRepository["Service"]["createWithActiveParent"] = (
+    input,
+  ) =>
+    createSessionWithActiveParentRow(input).pipe(
+      Effect.map(Option.isSome),
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "AuthSessionRepository.createWithActiveParent:query",
+          "AuthSessionRepository.createWithActiveParent:decodeRow",
           { sessionId: input.sessionId },
         ),
       ),
@@ -378,7 +456,7 @@ export const make = Effect.gen(function* () {
           { sessionId: input.sessionId },
         ),
       ),
-      Effect.map((rows) => rows.length > 0),
+      Effect.map((rows) => rows.map((row) => row.sessionId)),
     );
 
   const revokeAllExcept: AuthSessionRepository["Service"]["revokeAllExcept"] = (input) =>
@@ -406,6 +484,7 @@ export const make = Effect.gen(function* () {
 
   return {
     create,
+    createWithActiveParent,
     getById,
     listActive,
     revoke,

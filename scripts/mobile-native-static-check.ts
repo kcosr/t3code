@@ -22,13 +22,24 @@ const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
 export class NativeStaticCheckSourceDiscoveryError extends Schema.TaggedErrorClass<NativeStaticCheckSourceDiscoveryError>()(
   "NativeStaticCheckSourceDiscoveryError",
   {
-    operation: Schema.Literals(["resolve-root", "read-directory", "stat-entry"]),
+    operation: Schema.Literals(["resolve-root", "read-directory", "stat-entry", "read-file"]),
     path: Schema.String,
     cause: Schema.Defect(),
   },
 ) {
   override get message(): string {
     return `Native source discovery operation '${this.operation}' failed.`;
+  }
+}
+
+export class NativeStaticCheckPrivacyError extends Schema.TaggedErrorClass<NativeStaticCheckPrivacyError>()(
+  "NativeStaticCheckPrivacyError",
+  {
+    paths: Schema.Array(Schema.String),
+  },
+) {
+  override get message(): string {
+    return "Android voice diagnostics must use the bounded privacy-safe diagnostic ring.";
   }
 }
 
@@ -89,6 +100,28 @@ const excludedDirectories = new Set([
   "Vendor",
 ]);
 const generatedNativeProjectDirectories = new Set(["android", "ios"]);
+const prohibitedAndroidVoiceOutputPatterns = [
+  /(?:import\s+android\.util\.Log\b|\b(?:android\.util\.)?Log\s*\.)/,
+  /\b(?:kotlin\.io\.)?print(?:ln)?\s*\(/,
+  /\b(?:java\.lang\.)?System\s*\.\s*(?:out|err)\b/,
+  /\.\s*printStackTrace\s*\(/,
+  /(?:import\s+timber\.log\.Timber\b|\bTimber\s*\.)/,
+  /(?:import\s+java\.util\.logging\b|\b(?:java\.util\.logging\.)?Logger\s*\.\s*getLogger\s*\()/,
+] as const;
+
+export function findAndroidVoiceLogViolations(
+  sources: ReadonlyArray<{ readonly path: string; readonly content: string }>,
+): ReadonlyArray<string> {
+  return sources
+    .filter((source) =>
+      prohibitedAndroidVoiceOutputPatterns.some((pattern) => pattern.test(source.content)),
+    )
+    .map((source) => source.path);
+}
+
+export function isAndroidVoiceSourcePath(source: string): boolean {
+  return source.replaceAll("\\", "/").includes("/modules/t3-voice/android/src/");
+}
 
 const mobileAppRootUrl = new URL("../apps/mobile", import.meta.url);
 const appRoot = Effect.service(Path.Path).pipe(
@@ -236,6 +269,30 @@ const runNativeStaticChecks = Effect.fn("runNativeStaticChecks")(function* () {
     const extension = path.extname(source);
     return extension === ".kt" || extension === ".kts";
   });
+  const androidVoiceSources = kotlinSources.filter(isAndroidVoiceSourcePath);
+  const fs = yield* FileSystem.FileSystem;
+  const androidVoiceSourceContents = yield* Effect.forEach(androidVoiceSources, (source) =>
+    fs.readFileString(source).pipe(
+      Effect.map((content) => ({
+        path: path.relative(root, source),
+        content,
+      })),
+      Effect.mapError(
+        (cause) =>
+          new NativeStaticCheckSourceDiscoveryError({
+            operation: "read-file",
+            path: source,
+            cause,
+          }),
+      ),
+    ),
+  );
+  const privacyViolations = findAndroidVoiceLogViolations(androidVoiceSourceContents);
+  if (privacyViolations.length > 0) {
+    return yield* new NativeStaticCheckPrivacyError({
+      paths: privacyViolations,
+    });
+  }
   const availableTools = new Map<string, boolean>();
 
   for (const tool of tools) {

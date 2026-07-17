@@ -10,7 +10,7 @@ import {
   type RuntimeMode,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
-import { useEffect } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Atom } from "effect/unstable/reactivity";
 
 import { DraftComposerImageAttachmentSchema } from "../lib/composer-image-schema";
@@ -102,19 +102,57 @@ export const composerDraftsAtom = Atom.make<Record<string, ComposerDraft>>({}).p
 );
 
 let loadPromise: Promise<void> | null = null;
+let draftsLoaded = false;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 const persistenceQueue = new SerializedAsyncQueue();
 
 function normalizeDraft(draft: ComposerDraft | undefined): ComposerDraft {
-  if (!draft) {
-    return EMPTY_DRAFT;
-  }
-  return {
-    ...draft,
-    text: draft.text,
-    attachments: draft.attachments,
-  };
+  return draft ?? EMPTY_DRAFT;
 }
+
+const EMPTY_COMPOSER_DRAFT_ATOM = Atom.make(EMPTY_DRAFT).pipe(
+  Atom.withLabel("mobile:composer-draft:empty"),
+);
+const composerDraftAtom = Atom.family((draftKey: string) =>
+  Atom.make((get) => normalizeDraft(get(composerDraftsAtom)[draftKey])).pipe(
+    Atom.withLabel(`mobile:composer-draft:${draftKey}`),
+  ),
+);
+const EMPTY_COMPOSER_DRAFT_CONTENT_ATOM = Atom.make(true).pipe(
+  Atom.withLabel("mobile:composer-draft-content:empty"),
+);
+const composerDraftContentEmptyAtom = Atom.family((draftKey: string) =>
+  Atom.make((get) => {
+    const draft = get(composerDraftsAtom)[draftKey];
+    return (
+      draft === undefined || (draft.text.trim().length === 0 && draft.attachments.length === 0)
+    );
+  }).pipe(Atom.withLabel(`mobile:composer-draft-content-empty:${draftKey}`)),
+);
+const EMPTY_COMPOSER_DRAFT_MODEL_SELECTION_ATOM = Atom.make(
+  undefined as ModelSelection | undefined,
+).pipe(Atom.withLabel("mobile:composer-draft-model-selection:empty"));
+const composerDraftModelSelectionAtom = Atom.family((draftKey: string) =>
+  Atom.make((get) => get(composerDraftsAtom)[draftKey]?.modelSelection).pipe(
+    Atom.withLabel(`mobile:composer-draft-model-selection:${draftKey}`),
+  ),
+);
+const EMPTY_COMPOSER_DRAFT_RUNTIME_MODE_ATOM = Atom.make(undefined as RuntimeMode | undefined).pipe(
+  Atom.withLabel("mobile:composer-draft-runtime-mode:empty"),
+);
+const composerDraftRuntimeModeAtom = Atom.family((draftKey: string) =>
+  Atom.make((get) => get(composerDraftsAtom)[draftKey]?.runtimeMode).pipe(
+    Atom.withLabel(`mobile:composer-draft-runtime-mode:${draftKey}`),
+  ),
+);
+const EMPTY_COMPOSER_DRAFT_INTERACTION_MODE_ATOM = Atom.make(
+  undefined as ProviderInteractionMode | undefined,
+).pipe(Atom.withLabel("mobile:composer-draft-interaction-mode:empty"));
+const composerDraftInteractionModeAtom = Atom.family((draftKey: string) =>
+  Atom.make((get) => get(composerDraftsAtom)[draftKey]?.interactionMode).pipe(
+    Atom.withLabel(`mobile:composer-draft-interaction-mode:${draftKey}`),
+  ),
+);
 
 export function getComposerDraftSnapshot(draftKey: string): ComposerDraft {
   return normalizeDraft(appAtomRegistry.get(composerDraftsAtom)[draftKey]);
@@ -221,9 +259,9 @@ function schedulePersistComposerDrafts(drafts: Record<string, ComposerDraft>): v
   }, PERSIST_DEBOUNCE_MS);
 }
 
-export function ensureComposerDraftsLoaded(): void {
+export function ensureComposerDraftsLoaded(): Promise<void> {
   if (loadPromise !== null) {
-    return;
+    return loadPromise;
   }
   loadPromise = loadPersistedComposerDrafts()
     .then((persistedDrafts) => {
@@ -247,7 +285,27 @@ export function ensureComposerDraftsLoaded(): void {
         }),
       );
       // Draft loading is best-effort; in-memory drafts still keep working.
+    })
+    .then(() => {
+      draftsLoaded = true;
     });
+  return loadPromise;
+}
+
+export function useComposerDraftsReady(): boolean {
+  const [ready, setReady] = useState(draftsLoaded);
+
+  useEffect(() => {
+    let disposed = false;
+    void ensureComposerDraftsLoaded().then(() => {
+      if (!disposed) setReady(true);
+    });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  return ready;
 }
 
 function updateComposerDrafts(
@@ -575,9 +633,45 @@ export async function clearComposerDraftsEnvironment(environmentId: EnvironmentI
 }
 
 export function useComposerDraft(draftKey: string | null): ComposerDraft {
-  const drafts = useAtomValue(composerDraftsAtom);
+  const draft = useAtomValue(
+    draftKey === null ? EMPTY_COMPOSER_DRAFT_ATOM : composerDraftAtom(draftKey),
+  );
   useEffect(() => {
     ensureComposerDraftsLoaded();
   }, []);
-  return draftKey ? normalizeDraft(drafts[draftKey]) : EMPTY_DRAFT;
+  return draft;
+}
+
+export function useComposerDraftContentEmpty(draftKey: string | null): boolean {
+  return useAtomValue(
+    draftKey === null ? EMPTY_COMPOSER_DRAFT_CONTENT_ATOM : composerDraftContentEmptyAtom(draftKey),
+  );
+}
+
+export function useComposerDraftVoiceSettings(
+  draftKey: string | null,
+): Pick<ComposerDraft, "modelSelection" | "runtimeMode" | "interactionMode"> {
+  useEffect(() => {
+    void ensureComposerDraftsLoaded();
+  }, []);
+  const modelSelection = useAtomValue(
+    draftKey === null
+      ? EMPTY_COMPOSER_DRAFT_MODEL_SELECTION_ATOM
+      : composerDraftModelSelectionAtom(draftKey),
+  );
+  const runtimeMode = useAtomValue(
+    draftKey === null
+      ? EMPTY_COMPOSER_DRAFT_RUNTIME_MODE_ATOM
+      : composerDraftRuntimeModeAtom(draftKey),
+  );
+  const interactionMode = useAtomValue(
+    draftKey === null
+      ? EMPTY_COMPOSER_DRAFT_INTERACTION_MODE_ATOM
+      : composerDraftInteractionModeAtom(draftKey),
+  );
+
+  return useMemo(
+    () => ({ modelSelection, runtimeMode, interactionMode }),
+    [interactionMode, modelSelection, runtimeMode],
+  );
 }

@@ -13,10 +13,9 @@ import {
   type TurnId,
 } from "@t3tools/contracts";
 import { isTemporaryWorktreeBranch, WORKTREE_BRANCH_PREFIX } from "@t3tools/shared/git";
-import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
-import * as Duration from "effect/Duration";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as Layer from "effect/Layer";
@@ -32,6 +31,8 @@ import type { ProviderServiceError } from "../../provider/Errors.ts";
 import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
+import { ProjectionTurnStartRepository } from "../../persistence/Services/ProjectionTurnStarts.ts";
+import { ProjectionTurnStartRepositoryLive } from "../../persistence/Layers/ProjectionTurnStarts.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
@@ -80,11 +81,6 @@ function mapProviderSessionStatusToOrchestrationStatus(
   }
 }
 
-const turnStartKeyForEvent = (event: ProviderIntentEvent): string =>
-  event.commandId !== null ? `command:${event.commandId}` : `event:${event.eventId}`;
-
-const HANDLED_TURN_START_KEY_MAX = 10_000;
-const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const DEFAULT_THREAD_TITLE = "New thread";
 
@@ -191,6 +187,7 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
+  const projectionTurnStarts = yield* ProjectionTurnStartRepository;
   const providerRegistry = yield* ProviderRegistry;
   const gitWorkflow = yield* GitWorkflowService;
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
@@ -199,19 +196,8 @@ const make = Effect.gen(function* () {
   const serverCommandId = (tag: string) =>
     crypto.randomUUIDv4.pipe(Effect.map((uuid) => CommandId.make(`server:${tag}:${uuid}`)));
   const serverEventId = () => crypto.randomUUIDv4.pipe(Effect.map(EventId.make));
-  const handledTurnStartKeys = yield* Cache.make<string, true>({
-    capacity: HANDLED_TURN_START_KEY_MAX,
-    timeToLive: HANDLED_TURN_START_KEY_TTL,
-    lookup: () => Effect.succeed(true),
-  });
-
-  const hasHandledTurnStartRecently = (key: string) =>
-    Cache.getOption(handledTurnStartKeys, key).pipe(
-      Effect.flatMap((cached) =>
-        Cache.set(handledTurnStartKeys, key, true).pipe(Effect.as(Option.isSome(cached))),
-      ),
-    );
-
+  const turnStartCommandId = (kind: "submit" | "correlate" | "fail", messageId: string) =>
+    CommandId.make(`server:provider-turn-${kind}:${messageId}`);
   const threadModelSelections = new Map<string, ModelSelection>();
 
   const appendProviderFailureActivity = (input: {
@@ -747,8 +733,11 @@ const make = Effect.gen(function* () {
   const processTurnStartRequested = Effect.fn("processTurnStartRequested")(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>,
   ) {
-    const key = turnStartKeyForEvent(event);
-    if (yield* hasHandledTurnStartRecently(key)) {
+    const projectedStart = yield* projectionTurnStarts.getByMessageId({
+      threadId: event.payload.threadId,
+      messageId: event.payload.messageId,
+    });
+    if (Option.isNone(projectedStart) || projectedStart.value.state !== "pending") {
       return;
     }
 
@@ -759,6 +748,14 @@ const make = Effect.gen(function* () {
 
     const message = thread.messages.find((entry) => entry.id === event.payload.messageId);
     if (!message || message.role !== "user") {
+      yield* orchestrationEngine.dispatch({
+        type: "thread.turn.start.fail",
+        commandId: turnStartCommandId("fail", event.payload.messageId),
+        threadId: event.payload.threadId,
+        messageId: event.payload.messageId,
+        failedAt: event.payload.createdAt,
+        createdAt: event.payload.createdAt,
+      });
       yield* appendProviderFailureActivity({
         threadId: event.payload.threadId,
         kind: "provider.turn.start.failed",
@@ -801,41 +798,49 @@ const make = Effect.gen(function* () {
       }
     }
 
-    const handleTurnStartFailure = (cause: Cause.Cause<unknown>) => {
+    const handleTurnStartFailure = (cause: Cause.Cause<unknown>, ambiguous: boolean) => {
       if (Cause.hasInterruptsOnly(cause)) {
         return Effect.void;
       }
       const detail = formatFailureDetail(cause);
-      return setThreadSessionErrorOnTurnStartFailure({
-        threadId: event.payload.threadId,
-        detail,
-        createdAt: event.payload.createdAt,
-      }).pipe(
-        Effect.flatMap(() =>
-          appendProviderFailureActivity({
-            threadId: event.payload.threadId,
-            kind: "provider.turn.start.failed",
-            summary: "Provider turn start failed",
-            detail,
-            turnId: null,
-            createdAt: event.payload.createdAt,
-          }),
-        ),
-        Effect.asVoid,
-      );
+      return Effect.gen(function* () {
+        yield* orchestrationEngine.dispatch({
+          type: "thread.turn.start.fail",
+          commandId: turnStartCommandId("fail", event.payload.messageId),
+          threadId: event.payload.threadId,
+          messageId: event.payload.messageId,
+          failedAt: DateTime.formatIso(yield* DateTime.now),
+          ...(ambiguous ? { ambiguous: true } : {}),
+          createdAt: DateTime.formatIso(yield* DateTime.now),
+        });
+        yield* setThreadSessionErrorOnTurnStartFailure({
+          threadId: event.payload.threadId,
+          detail,
+          createdAt: event.payload.createdAt,
+        });
+        yield* appendProviderFailureActivity({
+          threadId: event.payload.threadId,
+          kind: "provider.turn.start.failed",
+          summary: "Provider turn start failed",
+          detail,
+          turnId: null,
+          createdAt: event.payload.createdAt,
+        });
+      });
     };
 
+    const submittedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* orchestrationEngine.dispatch({
+      type: "thread.turn.start.submit",
+      commandId: turnStartCommandId("submit", event.payload.messageId),
+      threadId: event.payload.threadId,
+      messageId: event.payload.messageId,
+      submittedAt,
+      createdAt: submittedAt,
+    });
+
     const recoverTurnStartFailure = (cause: Cause.Cause<unknown>) =>
-      handleTurnStartFailure(cause).pipe(
-        Effect.catchCause((recoveryCause) =>
-          Effect.logWarning("provider command reactor failed to recover turn start failure", {
-            eventType: event.type,
-            threadId: event.payload.threadId,
-            cause: Cause.pretty(recoveryCause),
-            originalCause: Cause.pretty(cause),
-          }),
-        ),
-      );
+      handleTurnStartFailure(cause, true);
 
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
       threadId: event.payload.threadId,
@@ -848,16 +853,111 @@ const make = Effect.gen(function* () {
       createdAt: event.payload.createdAt,
     }).pipe(
       Effect.map(Option.some),
-      Effect.catchCause((cause) => handleTurnStartFailure(cause).pipe(Effect.as(Option.none()))),
+      Effect.catchCause((cause) =>
+        handleTurnStartFailure(cause, false).pipe(Effect.as(Option.none())),
+      ),
     );
 
     if (Option.isNone(sendTurnRequest)) {
       return;
     }
 
-    yield* providerService
-      .sendTurn(sendTurnRequest.value)
-      .pipe(Effect.catchCause(recoverTurnStartFailure), Effect.forkScoped);
+    const turnResult = yield* providerService.sendTurn(sendTurnRequest.value).pipe(
+      Effect.map(Option.some),
+      Effect.catchCause((cause) => recoverTurnStartFailure(cause).pipe(Effect.as(Option.none()))),
+    );
+    if (Option.isNone(turnResult)) return;
+    const turn = turnResult.value;
+    const resolvedAt = DateTime.formatIso(yield* DateTime.now);
+    const correlationCommand = {
+      type: "thread.turn.correlate",
+      commandId: turnStartCommandId("correlate", event.payload.messageId),
+      threadId: event.payload.threadId,
+      messageId: event.payload.messageId,
+      turnId: turn.turnId,
+      ...(event.payload.sourceProposedPlan !== undefined
+        ? { sourceProposedPlan: event.payload.sourceProposedPlan }
+        : {}),
+      resolvedAt,
+      createdAt: resolvedAt,
+    } as const;
+    let correlationPersisted = yield* orchestrationEngine.dispatch(correlationCommand).pipe(
+      Effect.retry({ times: 4 }),
+      Effect.as(true),
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logError("provider turn correlation persistence failed", {
+              threadId: event.payload.threadId,
+              messageId: event.payload.messageId,
+              turnId: turn.turnId,
+              cause: Cause.pretty(cause),
+            }).pipe(Effect.as(false)),
+      ),
+    );
+    if (!correlationPersisted) {
+      const ambiguousAt = DateTime.formatIso(yield* DateTime.now);
+      const ambiguityPersisted = yield* orchestrationEngine
+        .dispatch({
+          type: "thread.turn.start.fail",
+          commandId: turnStartCommandId("fail", event.payload.messageId),
+          threadId: event.payload.threadId,
+          messageId: event.payload.messageId,
+          failedAt: ambiguousAt,
+          ambiguous: true,
+          createdAt: ambiguousAt,
+        })
+        .pipe(
+          Effect.retry({ times: 4 }),
+          Effect.as(true),
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : Effect.logError("provider turn ambiguity persistence failed", {
+                  threadId: event.payload.threadId,
+                  messageId: event.payload.messageId,
+                  turnId: turn.turnId,
+                  cause: Cause.pretty(cause),
+                }).pipe(Effect.as(false)),
+          ),
+        );
+      if (ambiguityPersisted) return;
+
+      // A correlation dispatch can commit and still lose its acknowledgement.
+      // Resolve that uncertainty from the durable projection before giving up.
+      const durableStart = yield* projectionTurnStarts.getByMessageId({
+        threadId: event.payload.threadId,
+        messageId: event.payload.messageId,
+      });
+      correlationPersisted =
+        Option.isSome(durableStart) &&
+        durableStart.value.state === "accepted" &&
+        durableStart.value.turnId === turn.turnId;
+    }
+    if (!correlationPersisted) return;
+
+    const activeSession = (yield* providerService.listSessions()).find(
+      (session) => session.threadId === event.payload.threadId,
+    );
+    if (activeSession?.activeTurnId !== turn.turnId) return;
+    const sessionUpdatedAt = activeSession.updatedAt;
+    const currentThread = yield* resolveThread(event.payload.threadId);
+    yield* setThreadSession({
+      threadId: event.payload.threadId,
+      session: {
+        threadId: event.payload.threadId,
+        status: "running",
+        providerName: activeSession.provider,
+        ...(activeSession.providerInstanceId !== undefined
+          ? { providerInstanceId: activeSession.providerInstanceId }
+          : {}),
+        runtimeMode: currentThread?.runtimeMode ?? event.payload.runtimeMode,
+        activeTurnId: turn.turnId,
+        lastError: activeSession.lastError ?? null,
+        updatedAt: sessionUpdatedAt,
+      },
+      createdAt: sessionUpdatedAt,
+    });
   });
 
   const processTurnInterruptRequested = Effect.fn("processTurnInterruptRequested")(function* (
@@ -1049,12 +1149,47 @@ const make = Effect.gen(function* () {
     processDomainEvent(event).pipe(
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
-          return Effect.failCause(cause);
+          return Effect.interrupt;
         }
-        return Effect.logWarning("provider command reactor failed to process event", {
+        const logged = Effect.logWarning("provider command reactor failed to process event", {
           eventType: event.type,
           cause: Cause.pretty(cause),
         });
+        if (event.type !== "thread.turn-start-requested") return logged;
+        const recover = Effect.gen(function* () {
+          yield* logged;
+          const start = yield* projectionTurnStarts.getByMessageId({
+            threadId: event.payload.threadId,
+            messageId: event.payload.messageId,
+          });
+          if (Option.isNone(start)) return;
+          if (start.value.state === "pending") {
+            yield* processDomainEvent(event);
+            return;
+          }
+          if (start.value.state !== "submitting") return;
+          const failedAt = DateTime.formatIso(yield* DateTime.now);
+          yield* orchestrationEngine.dispatch({
+            type: "thread.turn.start.fail",
+            commandId: turnStartCommandId("fail", event.payload.messageId),
+            threadId: event.payload.threadId,
+            messageId: event.payload.messageId,
+            failedAt,
+            ambiguous: true,
+            createdAt: failedAt,
+          });
+        });
+        return recover.pipe(
+          Effect.retry({ times: 4 }),
+          Effect.catchCause((retryCause) =>
+            Cause.hasInterruptsOnly(retryCause)
+              ? Effect.interrupt
+              : Effect.logError("provider turn-start recovery stopped unexpectedly", {
+                  eventId: event.eventId,
+                  cause: Cause.pretty(retryCause),
+                }),
+          ),
+        );
       }),
     );
 
@@ -1077,6 +1212,49 @@ const make = Effect.gen(function* () {
     yield* Effect.forkScoped(
       Stream.runForEach(orchestrationEngine.streamDomainEvents, processEvent),
     );
+
+    const reconcileUnresolved = Effect.gen(function* () {
+      const unresolved = yield* projectionTurnStarts.listUnresolved();
+      if (unresolved.length === 0) return;
+      const unresolvedByMessageId = new Map(unresolved.map((start) => [start.messageId, start]));
+      const persistedEvents = Array.from(
+        yield* Stream.runCollect(orchestrationEngine.readEvents(0)),
+      );
+      for (const event of persistedEvents) {
+        if (event.type !== "thread.turn-start-requested") continue;
+        const turnStart = unresolvedByMessageId.get(event.payload.messageId);
+        if (turnStart?.state !== "pending") continue;
+        yield* worker.enqueue(event);
+        unresolvedByMessageId.delete(event.payload.messageId);
+      }
+      const recoveredAt = DateTime.formatIso(yield* DateTime.now);
+      for (const turnStart of unresolvedByMessageId.values()) {
+        yield* orchestrationEngine.dispatch({
+          type: "thread.turn.start.fail",
+          commandId: turnStartCommandId("fail", turnStart.messageId),
+          threadId: turnStart.threadId,
+          messageId: turnStart.messageId,
+          failedAt: recoveredAt,
+          ambiguous: turnStart.state === "submitting",
+          createdAt: recoveredAt,
+        });
+      }
+    }).pipe(
+      Effect.tapCause((cause) =>
+        Effect.logError("provider command reactor unresolved-start recovery failed", {
+          cause: Cause.pretty(cause),
+        }),
+      ),
+      Effect.retry({ times: 4 }),
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logError("provider unresolved-start recovery stopped unexpectedly", {
+              cause: Cause.pretty(cause),
+            }),
+      ),
+    );
+    yield* reconcileUnresolved;
   });
 
   return {
@@ -1085,4 +1263,6 @@ const make = Effect.gen(function* () {
   } satisfies ProviderCommandReactorShape;
 });
 
-export const ProviderCommandReactorLive = Layer.effect(ProviderCommandReactor, make);
+export const ProviderCommandReactorLive = Layer.effect(ProviderCommandReactor, make).pipe(
+  Layer.provide(ProjectionTurnStartRepositoryLive),
+);

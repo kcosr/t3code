@@ -1365,6 +1365,62 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
       assert.deepEqual(settledRows, [
         { state: "completed", completedAt: "2026-01-01T00:01:00.000Z" },
       ]);
+
+      const interruptedTurnId = TurnId.make("turn-lifecycle-interrupted");
+      yield* eventStore.append({
+        type: "thread.session-set",
+        eventId: EventId.make("evt-tl5"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:02:00.000Z",
+        commandId: CommandId.make("cmd-tl5"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-tl5"),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status: "running",
+            providerName: "claude",
+            runtimeMode: "full-access",
+            activeTurnId: interruptedTurnId,
+            lastError: null,
+            updatedAt: "2026-01-01T00:02:00.000Z",
+          },
+        },
+      });
+      yield* eventStore.append({
+        type: "thread.session-set",
+        eventId: EventId.make("evt-tl6"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-01-01T00:03:00.000Z",
+        commandId: CommandId.make("cmd-tl6"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-tl6"),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status: "interrupted",
+            providerName: "claude",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: "2026-01-01T00:03:00.000Z",
+          },
+        },
+      });
+      yield* projectionPipeline.bootstrap;
+
+      const interruptedRows = yield* sql<{ readonly state: string }>`
+        SELECT state
+        FROM projection_turns
+        WHERE thread_id = ${threadId} AND turn_id = ${interruptedTurnId}
+      `;
+      assert.deepEqual(interruptedRows, [{ state: "interrupted" }]);
     }),
   );
 
@@ -2400,7 +2456,7 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
   );
 });
 
-it.effect("restores pending turn-start metadata across projection pipeline restart", () =>
+it.effect("replays exact turn correlations across runtime-first starts and steering", () =>
   Effect.gen(function* () {
     const { dbPath } = yield* ServerConfig;
     const persistenceLayer = makeSqlitePersistenceLive(dbPath);
@@ -2479,14 +2535,87 @@ it.effect("restores pending turn-start metadata across projection pipeline resta
         },
       });
 
+      yield* eventStore.append({
+        type: "thread.turn-start-submitted",
+        eventId: EventId.make("evt-restart-submitted-1"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: sessionSetAt,
+        commandId: CommandId.make("cmd-restart-submitted-1"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-restart-submitted-1"),
+        metadata: {},
+        payload: { threadId, messageId, submittedAt: sessionSetAt },
+      });
+
+      yield* eventStore.append({
+        type: "thread.turn-correlated",
+        eventId: EventId.make("evt-restart-3"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: sessionSetAt,
+        commandId: CommandId.make("cmd-restart-3"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-restart-3"),
+        metadata: { providerTurnId: turnId },
+        payload: { threadId, messageId, turnId, resolvedAt: sessionSetAt },
+      });
+
+      const steeredMessageId = MessageId.make("message-restart-steered");
+      yield* eventStore.append({
+        type: "thread.turn-start-requested",
+        eventId: EventId.make("evt-restart-4"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: sessionSetAt,
+        commandId: CommandId.make("cmd-restart-4"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-restart-4"),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId: steeredMessageId,
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          createdAt: sessionSetAt,
+        },
+      });
+      yield* eventStore.append({
+        type: "thread.turn-start-submitted",
+        eventId: EventId.make("evt-restart-submitted-2"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: sessionSetAt,
+        commandId: CommandId.make("cmd-restart-submitted-2"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-restart-submitted-2"),
+        metadata: {},
+        payload: { threadId, messageId: steeredMessageId, submittedAt: sessionSetAt },
+      });
+      yield* eventStore.append({
+        type: "thread.turn-correlated",
+        eventId: EventId.make("evt-restart-5"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: sessionSetAt,
+        commandId: CommandId.make("cmd-restart-5"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-restart-5"),
+        metadata: { providerTurnId: turnId },
+        payload: {
+          threadId,
+          messageId: steeredMessageId,
+          turnId,
+          resolvedAt: sessionSetAt,
+        },
+      });
+
       yield* projectionPipeline.bootstrap;
 
       const pendingRows = yield* sql<{ readonly threadId: string }>`
         SELECT thread_id AS "threadId"
-        FROM projection_turns
-        WHERE thread_id = ${threadId}
-          AND turn_id IS NULL
-          AND state = 'pending'
+        FROM projection_turn_starts
+        WHERE thread_id = ${threadId} AND state = 'pending'
       `;
       assert.deepEqual(pendingRows, []);
 
@@ -2495,16 +2624,21 @@ it.effect("restores pending turn-start metadata across projection pipeline resta
         readonly userMessageId: string | null;
         readonly sourceProposedPlanThreadId: string | null;
         readonly sourceProposedPlanId: string | null;
+        readonly requestedAt: string;
         readonly startedAt: string;
       }>`
         SELECT
-          turn_id AS "turnId",
-          pending_message_id AS "userMessageId",
-          source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
-          source_proposed_plan_id AS "sourceProposedPlanId",
-          started_at AS "startedAt"
-        FROM projection_turns
-        WHERE turn_id = ${turnId}
+          turns.turn_id AS "turnId",
+          starts.message_id AS "userMessageId",
+          starts.source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
+          starts.source_proposed_plan_id AS "sourceProposedPlanId",
+          turns.requested_at AS "requestedAt",
+          turns.started_at AS "startedAt"
+        FROM projection_turns turns
+        JOIN projection_turn_starts starts
+          ON starts.thread_id = turns.thread_id AND starts.turn_id = turns.turn_id
+        WHERE turns.turn_id = ${turnId}
+        ORDER BY starts.requested_at ASC, starts.message_id ASC
       `;
     }).pipe(Effect.provide(secondProjectionLayer));
 
@@ -2514,7 +2648,16 @@ it.effect("restores pending turn-start metadata across projection pipeline resta
         userMessageId: "message-restart",
         sourceProposedPlanThreadId: "thread-plan-source",
         sourceProposedPlanId: "plan-source",
-        startedAt: turnStartedAt,
+        requestedAt: turnStartedAt,
+        startedAt: sessionSetAt,
+      },
+      {
+        turnId: "turn-restart",
+        userMessageId: "message-restart-steered",
+        sourceProposedPlanThreadId: null,
+        sourceProposedPlanId: null,
+        requestedAt: turnStartedAt,
+        startedAt: sessionSetAt,
       },
     ]);
   }).pipe(
@@ -2522,6 +2665,122 @@ it.effect("restores pending turn-start metadata across projection pipeline resta
       Layer.provideMerge(
         ServerConfig.layerTest(process.cwd(), {
           prefix: "t3-projection-pipeline-restart-",
+        }),
+        NodeServices.layer,
+      ),
+    ),
+  ),
+);
+
+it.effect("materializes an accepted provider turn when correlation replays after restart", () =>
+  Effect.gen(function* () {
+    const { dbPath } = yield* ServerConfig;
+    const persistenceLayer = makeSqlitePersistenceLive(dbPath);
+    const firstProjectionLayer = OrchestrationProjectionPipelineLive.pipe(
+      Layer.provideMerge(OrchestrationEventStoreLive),
+      Layer.provideMerge(persistenceLayer),
+    );
+    const restartedProjectionLayer = OrchestrationProjectionPipelineLive.pipe(
+      Layer.provideMerge(OrchestrationEventStoreLive),
+      Layer.provideMerge(persistenceLayer),
+    );
+    const threadId = ThreadId.make("thread-correlation-restart");
+    const messageId = MessageId.make("message-correlation-restart");
+    const turnId = TurnId.make("turn-correlation-restart");
+    const requestedAt = "2026-02-26T15:00:00.000Z";
+    const resolvedAt = "2026-02-26T15:00:01.000Z";
+
+    yield* Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      yield* eventStore.append({
+        type: "thread.turn-start-requested",
+        eventId: EventId.make("evt-correlation-restart-requested"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: requestedAt,
+        commandId: CommandId.make("cmd-correlation-restart-requested"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-correlation-restart-requested"),
+        metadata: {},
+        payload: {
+          threadId,
+          messageId,
+          runtimeMode: "approval-required",
+          createdAt: requestedAt,
+        },
+      });
+      yield* eventStore.append({
+        type: "thread.turn-start-submitted",
+        eventId: EventId.make("evt-correlation-restart-submitted"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: requestedAt,
+        commandId: CommandId.make("cmd-correlation-restart-submitted"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-correlation-restart-submitted"),
+        metadata: {},
+        payload: { threadId, messageId, submittedAt: requestedAt },
+      });
+      yield* projectionPipeline.bootstrap;
+
+      // Simulate a restart boundary after the provider accepted the turn but
+      // before any runtime turn.started event reached ingestion.
+      yield* eventStore.append({
+        type: "thread.turn-correlated",
+        eventId: EventId.make("evt-correlation-restart-correlated"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: resolvedAt,
+        commandId: CommandId.make("cmd-correlation-restart-correlated"),
+        causationEventId: null,
+        correlationId: CorrelationId.make("cmd-correlation-restart-correlated"),
+        metadata: { providerTurnId: turnId },
+        payload: { threadId, messageId, turnId, resolvedAt },
+      });
+    }).pipe(Effect.provide(firstProjectionLayer));
+
+    const rows = yield* Effect.gen(function* () {
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const sql = yield* SqlClient.SqlClient;
+      yield* projectionPipeline.bootstrap;
+      return yield* sql<{
+        readonly messageId: string;
+        readonly turnId: string;
+        readonly startState: string;
+        readonly turnState: string;
+        readonly requestedAt: string;
+        readonly startedAt: string | null;
+      }>`
+        SELECT
+          starts.message_id AS "messageId",
+          starts.turn_id AS "turnId",
+          starts.state AS "startState",
+          turns.state AS "turnState",
+          turns.requested_at AS "requestedAt",
+          turns.started_at AS "startedAt"
+        FROM projection_turn_starts starts
+        JOIN projection_turns turns
+          ON turns.thread_id = starts.thread_id AND turns.turn_id = starts.turn_id
+        WHERE starts.thread_id = ${threadId} AND starts.message_id = ${messageId}
+      `;
+    }).pipe(Effect.provide(restartedProjectionLayer));
+
+    assert.deepEqual(rows, [
+      {
+        messageId,
+        turnId,
+        startState: "accepted",
+        turnState: "running",
+        requestedAt,
+        startedAt: null,
+      },
+    ]);
+  }).pipe(
+    Effect.provide(
+      Layer.provideMerge(
+        ServerConfig.layerTest(process.cwd(), {
+          prefix: "t3-projection-correlation-restart-",
         }),
         NodeServices.layer,
       ),

@@ -262,7 +262,6 @@ function IosHomeHeader(props: HomeHeaderProps) {
   }, []);
   useHardwareKeyboardCommand("focusSearch", focusSearch);
   const filterMenu = buildHomeListFilterMenu(props);
-
   return (
     <>
       <NativeStackScreenOptions
@@ -318,17 +317,6 @@ function IosHomeHeader(props: HomeHeaderProps) {
                 },
         }}
       />
-
-      {Platform.OS === "ios" ? null : (
-        <NativeHeaderToolbar placement="right">
-          <NativeHeaderToolbar.Button
-            accessibilityLabel="Open settings"
-            icon="gearshape"
-            onPress={props.onOpenSettings}
-            separateBackground
-          />
-        </NativeHeaderToolbar>
-      )}
 
       {Platform.OS === "ios" ? null : (
         <NativeHeaderToolbar placement="bottom">

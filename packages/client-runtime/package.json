@@ -39,6 +39,14 @@
       "types": "./src/relay/index.ts",
       "default": "./src/relay/index.ts"
     },
+    "./voice": {
+      "types": "./src/voice/index.ts",
+      "default": "./src/voice/index.ts"
+    },
+    "./history": {
+      "types": "./src/history/index.ts",
+      "default": "./src/history/index.ts"
+    },
     "./state/auth": {
       "types": "./src/state/auth.ts",
       "default": "./src/state/auth.ts"

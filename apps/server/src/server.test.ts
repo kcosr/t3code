@@ -2,6 +2,7 @@ import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeCrypto from "node:crypto";
+import * as NodeURL from "node:url";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import {
@@ -60,7 +61,6 @@ import {
   HttpClient,
   HttpClientRequest,
   HttpClientResponse,
-  HttpRouter,
   HttpServer,
 } from "effect/unstable/http";
 import { OtlpSerialization, OtlpTracer } from "effect/unstable/observability";
@@ -71,7 +71,7 @@ import { vi } from "vite-plus/test";
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
 
 import * as ServerConfig from "./config.ts";
-import { makeRoutesLayer } from "./server.ts";
+import { makeServedRoutesLayer } from "./server.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -520,7 +520,7 @@ const buildAppUnderTest = (options?: {
         })
       : VcsStatusBroadcaster.layer.pipe(Layer.provide(gitWorkflowLayer));
 
-    const servedRoutesLayer = HttpRouter.serve(makeRoutesLayer, {
+    const servedRoutesLayer = makeServedRoutesLayer({
       disableListenLog: true,
       disableLogger: true,
     }).pipe(
@@ -803,6 +803,7 @@ const buildAppUnderTest = (options?: {
       Layer.provideMerge(ServerSecretStore.layer),
       Layer.provide(workspaceAndProjectServicesLayer),
       Layer.provideMerge(FetchHttpClient.layer),
+      Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provide(layerConfig),
     );
 
@@ -922,7 +923,7 @@ const exchangeAccessToken = (
         requested_token_type: AuthAccessTokenType,
         scope:
           options?.scope ??
-          "orchestration:read orchestration:operate terminal:operate review:write relay:read access:read access:write relay:write",
+          "orchestration:read orchestration:operate terminal:operate review:write relay:read voice:use access:read access:write relay:write voice:manage",
         ...(options?.clientMetadata?.label ? { client_label: options.clientMetadata.label } : {}),
         ...(options?.clientMetadata?.deviceType
           ? { client_device_type: options.clientMetadata.deviceType }
@@ -1102,7 +1103,9 @@ const fetchEffect = (input: Parameters<typeof fetch>[0], init?: RequestInit) => 
           (init.headers as Record<string, string> | undefined)?.["content-type"] ??
             "application/json",
         )
-      : (request) => request,
+      : init?.body instanceof FormData
+        ? HttpClientRequest.bodyFormData(init.body)
+        : (request) => request,
   );
   const effect = HttpClient.execute(request);
   return (
@@ -1200,9 +1203,11 @@ const assertBrowserApiCorsPreflightHeaders = (
 ) => {
   assertBrowserApiCorsResponseHeaders(headers, options);
   assert.deepEqual(splitHeaderTokens(headers["access-control-allow-methods"] ?? null), [
+    "DELETE",
     "GET",
     "OPTIONS",
     "POST",
+    "PUT",
   ]);
   assert.deepEqual(splitHeaderTokens(headers["access-control-allow-headers"]), [
     "authorization",
@@ -1210,6 +1215,7 @@ const assertBrowserApiCorsPreflightHeaders = (
     "content-type",
     "dpop",
     "traceparent",
+    "x-t3-voice-ticket",
   ]);
 };
 const crossOriginClientOrigin = "http://remote-client.test:3773";
@@ -1366,7 +1372,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(tokenBody.token_type, "Bearer");
       assert.equal(
         tokenBody.scope,
-        "orchestration:read orchestration:operate terminal:operate review:write relay:read access:read access:write relay:write",
+        "orchestration:read orchestration:operate terminal:operate review:write relay:read voice:use access:read access:write relay:write voice:manage",
       );
       assert.equal(typeof tokenBody.access_token, "string");
 
@@ -1391,10 +1397,187 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         "terminal:operate",
         "review:write",
         "relay:read",
+        "voice:use",
         "access:read",
         "access:write",
         "relay:write",
+        "voice:manage",
       ]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("never caches a native voice child credential response", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+      const parentToken = yield* getAuthenticatedBearerSessionToken();
+
+      const response = yield* fetchEffect(yield* getHttpServerUrl("/api/voice/native-session"), {
+        method: "POST",
+        headers: { authorization: `Bearer ${parentToken}` },
+      });
+      const body = yield* responseJsonEffect<{
+        readonly accessToken?: string;
+        readonly expiresAt?: string;
+      }>(response);
+
+      assert.equal(response.status, 200);
+      assert.equal(typeof body.accessToken, "string");
+      assert.equal(typeof body.expiresAt, "string");
+      assert.equal(response.headers["cache-control"], "no-store");
+      assert.equal(response.headers.pragma, "no-cache");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rejects a voice media ticket used for a different request", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({
+        layers: {
+          serverSettings: {
+            getSettings: Effect.succeed({
+              ...DEFAULT_SERVER_SETTINGS,
+              voice: { ...DEFAULT_SERVER_SETTINGS.voice, enabled: true },
+            }),
+          },
+        },
+      });
+      const cookie = yield* getAuthenticatedSessionCookieHeader();
+      const ticketResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/voice/media-tickets"),
+        {
+          method: "POST",
+          headers: { cookie, "content-type": "application/json" },
+          body: jsonRequestBody({ operation: "speech-stream", requestId: "voice-request-a" }),
+        },
+      );
+      const ticket = yield* responseJsonEffect<{ readonly token: string }>(ticketResponse);
+      assert.equal(ticketResponse.status, 200);
+
+      const speechResponse = yield* fetchEffect(yield* getHttpServerUrl("/api/voice/speech"), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-t3-voice-ticket": ticket.token,
+        },
+        body: jsonRequestBody({
+          requestId: "voice-request-b",
+          playbackId: "voice-playback-1",
+          segmentIndex: 0,
+          finalSegment: true,
+          text: "This request must not be authorized.",
+          preset: "default",
+        }),
+      });
+
+      assert.equal(speechResponse.status, 401);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("does not consume media capacity for mismatched transcription requests", () =>
+    Effect.gen(function* () {
+      const maximumConcurrentMediaRequests = 2;
+      yield* buildAppUnderTest({
+        layers: {
+          serverSettings: {
+            getSettings: Effect.succeed({
+              ...DEFAULT_SERVER_SETTINGS,
+              voice: {
+                ...DEFAULT_SERVER_SETTINGS.voice,
+                enabled: true,
+                maxConcurrentMediaRequests: maximumConcurrentMediaRequests,
+              },
+            }),
+          },
+        },
+      });
+      const fileSystem = yield* FileSystem.FileSystem;
+      const fixture = yield* fileSystem.readFile(
+        NodeURL.fileURLToPath(
+          new URL("./voice/Services/fixtures/silence-aac-lc-mono.m4a", import.meta.url),
+        ),
+      );
+      const cookie = yield* getAuthenticatedSessionCookieHeader();
+
+      for (let index = 0; index <= maximumConcurrentMediaRequests; index += 1) {
+        const ticketResponse = yield* fetchEffect(
+          yield* getHttpServerUrl("/api/voice/media-tickets"),
+          {
+            method: "POST",
+            headers: { cookie, "content-type": "application/json" },
+            body: jsonRequestBody({
+              operation: "transcription-upload",
+              requestId: `voice-ticket-${index}`,
+            }),
+          },
+        );
+        const ticket = yield* responseJsonEffect<{ readonly token: string }>(ticketResponse);
+        assert.equal(ticketResponse.status, 200);
+
+        const form = new FormData();
+        form.append("audio", new Blob([fixture], { type: "audio/mp4" }), "recording.m4a");
+        form.append(
+          "metadata",
+          jsonRequestBody({ requestId: `voice-upload-${index}`, format: "audio/mp4" }),
+        );
+        const response = yield* Effect.raceFirst(
+          fetchEffect(yield* getHttpServerUrl("/api/voice/transcriptions"), {
+            method: "POST",
+            headers: { "x-t3-voice-ticket": ticket.token },
+            body: form,
+          }),
+          Effect.sleep("2 seconds").pipe(
+            Effect.andThen(
+              Effect.die(new Error("Timed out while draining the multipart voice upload")),
+            ),
+          ),
+        );
+
+        assert.equal(response.status, 401);
+      }
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("consumes a voice media ticket before rejecting an invalid request body", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({
+        layers: {
+          serverSettings: {
+            getSettings: Effect.succeed({
+              ...DEFAULT_SERVER_SETTINGS,
+              voice: { ...DEFAULT_SERVER_SETTINGS.voice, enabled: true },
+            }),
+          },
+        },
+      });
+      const cookie = yield* getAuthenticatedSessionCookieHeader();
+      const ticketResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/voice/media-tickets"),
+        {
+          method: "POST",
+          headers: { cookie, "content-type": "application/json" },
+          body: jsonRequestBody({ operation: "speech-stream", requestId: "voice-request-replay" }),
+        },
+      );
+      const ticket = yield* responseJsonEffect<{ readonly token: string }>(ticketResponse);
+      assert.equal(ticketResponse.status, 200);
+
+      const speechUrl = yield* getHttpServerUrl("/api/voice/speech");
+      const headers = {
+        "content-type": "application/json",
+        "x-t3-voice-ticket": ticket.token,
+      };
+      const first = yield* fetchEffect(speechUrl, {
+        method: "POST",
+        headers,
+        body: jsonRequestBody({}),
+      });
+      const replay = yield* fetchEffect(speechUrl, {
+        method: "POST",
+        headers,
+        body: jsonRequestBody({}),
+      });
+
+      assert.equal(first.status, 400);
+      assert.equal(replay.status, 401);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -3970,9 +4153,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(response.status, 204);
       assert.equal(response.headers["access-control-allow-origin"], "*");
       assert.deepEqual(splitHeaderTokens(response.headers["access-control-allow-methods"]), [
+        "DELETE",
         "GET",
         "OPTIONS",
         "POST",
+        "PUT",
       ]);
       assert.deepEqual(splitHeaderTokens(response.headers["access-control-allow-headers"]), [
         "authorization",
@@ -3980,6 +4165,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         "content-type",
         "dpop",
         "traceparent",
+        "x-t3-voice-ticket",
       ]);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );

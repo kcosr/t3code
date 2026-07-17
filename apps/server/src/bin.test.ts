@@ -6,11 +6,16 @@ import * as NodePath from "node:path";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { EnvironmentOrchestrationHttpApi } from "@t3tools/contracts";
+import {
+  EnvironmentOrchestrationHttpApi,
+  OrchestrationDispatchCommandError,
+} from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
 import * as HttpServer from "effect/unstable/http/HttpServer";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
@@ -22,6 +27,12 @@ import { Command } from "effect/unstable/cli";
 import { cli, makeCli } from "./bin.ts";
 import * as ServerConfig from "./config.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import {
+  ClientCommandDispatcher,
+  ClientCommandNormalizationError,
+} from "./orchestration/Services/ClientCommandDispatcher.ts";
+import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
+import { normalizeDispatchCommand } from "./orchestration/Normalizer.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
 import { orchestrationHttpApiLayer } from "./orchestration/http.ts";
 import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/Sqlite.ts";
@@ -105,12 +116,45 @@ const readPersistedSnapshot = (baseDir: string) =>
     }).pipe(Effect.provide(makeProjectPersistenceLayer(config)));
   });
 
+const projectCliCommandDispatcherLayer = Layer.effect(
+  ClientCommandDispatcher,
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const serverConfig = yield* ServerConfig.ServerConfig;
+    const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
+    const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
+    return ClientCommandDispatcher.of({
+      dispatch: (command) =>
+        normalizeDispatchCommand(command).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+          Effect.provideService(ServerConfig.ServerConfig, serverConfig),
+          Effect.provideService(WorkspacePaths.WorkspacePaths, workspacePaths),
+          Effect.mapError((cause) => new ClientCommandNormalizationError({ cause })),
+          Effect.flatMap((normalized) =>
+            orchestrationEngine.dispatch(normalized).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationDispatchCommandError({
+                    message: "Failed to dispatch orchestration command",
+                    cause,
+                  }),
+              ),
+            ),
+          ),
+        ),
+    });
+  }),
+);
+
 const withLiveProjectCliServer = <A, E, R>(baseDir: string, run: () => Effect.Effect<A, E, R>) =>
   Effect.gen(function* () {
     const config = yield* makeCliTestServerConfig(baseDir);
     const routesLayer = HttpApiBuilder.layer(ProjectCliHttpApi).pipe(
       Layer.provide(orchestrationHttpApiLayer),
       Layer.provide(environmentAuthenticatedAuthLayer),
+      Layer.provide(projectCliCommandDispatcherLayer),
     );
     const appLayer = HttpRouter.serve(routesLayer, {
       disableListenLog: true,
@@ -368,9 +412,11 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
         "terminal:operate",
         "review:write",
         "relay:read",
+        "voice:use",
         "access:read",
         "access:write",
         "relay:write",
+        "voice:manage",
       ]);
       assert.equal(listed.length, 1);
       assert.equal(listed[0]?.sessionId, issued.sessionId);
@@ -380,9 +426,11 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
         "terminal:operate",
         "review:write",
         "relay:read",
+        "voice:use",
         "access:read",
         "access:write",
         "relay:write",
+        "voice:manage",
       ]);
       assert.equal("token" in (listed[0] ?? {}), false);
     }),

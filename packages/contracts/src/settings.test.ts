@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it } from "vitest";
 import * as Schema from "effect/Schema";
 
 import { ProviderInstanceId } from "./providerInstance.ts";
@@ -82,6 +82,45 @@ describe("ServerSettings.providerInstances (slice-2 invariant)", () => {
     expect(() =>
       decodeServerSettings({
         providerInstances: { "1bad": { driver: "codex" } },
+      }),
+    ).toThrow();
+  });
+});
+
+describe("ServerSettings.voice", () => {
+  it("is disabled by default and decodes provider-neutral policy defaults", () => {
+    expect(DEFAULT_SERVER_SETTINGS.voice).toMatchObject({
+      enabled: false,
+      maxUploadBytes: 32 * 1024 * 1024,
+      maxInputDurationSeconds: 30 * 60,
+      maxSpeechTextBytes: 8 * 1024,
+      maxSpeechOutputBytes: 32 * 1024 * 1024,
+      mediaRequestTimeoutSeconds: 120,
+      maxConcurrentMediaRequests: 4,
+      maxConcurrentSessions: 1,
+      contextTokenBudget: 16_000,
+    });
+  });
+
+  it("rejects policy values outside bounded limits", () => {
+    expect(() =>
+      Schema.decodeUnknownSync(ServerSettings)({
+        voice: { maxConcurrentSessions: 0 },
+      }),
+    ).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(ServerSettings)({
+        voice: { maxInputDurationSeconds: 3_601 },
+      }),
+    ).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(ServerSettings)({
+        voice: { maxSpeechTextBytes: 8 * 1024 + 1 },
+      }),
+    ).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(ServerSettings)({
+        voice: { maxSpeechOutputBytes: 64 * 1024 * 1024 + 1 },
       }),
     ).toThrow();
   });

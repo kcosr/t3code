@@ -95,6 +95,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
         "terminal:operate",
         "review:write",
         "relay:read",
+        "voice:use",
       ]);
       expect(verified.subject).toBe("one-time-token");
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
@@ -173,9 +174,11 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
         "terminal:operate",
         "review:write",
         "relay:read",
+        "voice:use",
         "access:read",
         "access:write",
         "relay:write",
+        "voice:manage",
       ]);
       expect(verified.subject).toBe("administrative-bootstrap");
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),

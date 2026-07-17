@@ -8,12 +8,15 @@ import {
   AuthRelayWriteScope,
   AuthReviewWriteScope,
   AuthTerminalOperateScope,
+  AuthVoiceManageScope,
+  AuthVoiceUseScope,
   EnvironmentAuthInvalidError,
   type EnvironmentAuthInvalidReason,
   EnvironmentHttpApi,
   EnvironmentInternalError,
   type EnvironmentInternalErrorReason,
   EnvironmentOperationForbiddenError,
+  type EnvironmentOperationForbiddenReason,
   EnvironmentRequestInvalidError,
   type EnvironmentRequestInvalidReason,
   EnvironmentResourceNotFoundError,
@@ -45,8 +48,9 @@ const CREDENTIAL_RESPONSE_HEADERS = {
   pragma: "no-cache",
 } as const;
 
-const appendCredentialResponseHeaders = HttpEffect.appendPreResponseHandler((_request, response) =>
-  Effect.succeed(HttpServerResponse.setHeaders(response, CREDENTIAL_RESPONSE_HEADERS)),
+export const appendCredentialResponseHeaders = HttpEffect.appendPreResponseHandler(
+  (_request, response) =>
+    Effect.succeed(HttpServerResponse.setHeaders(response, CREDENTIAL_RESPONSE_HEADERS)),
 );
 
 const appendDpopChallengeHeader = HttpEffect.appendPreResponseHandler((_request, response) =>
@@ -125,7 +129,7 @@ export function failEnvironmentScopeRequired(requiredScope: AuthEnvironmentScope
   );
 }
 
-function failEnvironmentOperationForbidden(reason: "current_session_revoke_not_allowed") {
+export function failEnvironmentOperationForbidden(reason: EnvironmentOperationForbiddenReason) {
   return currentEnvironmentTraceId.pipe(
     Effect.flatMap((traceId) =>
       Effect.fail(
@@ -166,6 +170,25 @@ export const requireEnvironmentScope = Effect.fn("environment.auth.requireScope"
 ) {
   const session = yield* EnvironmentAuthenticatedPrincipal;
   if (!session.scopes.has(scope)) {
+    return yield* failEnvironmentScopeRequired(scope);
+  }
+  return session;
+});
+
+export const authenticateRawRouteWithScope = Effect.fn(
+  "environment.auth.authenticateRawRouteWithScope",
+)(function* (scope: AuthEnvironmentScope) {
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+  const session = yield* serverAuth.authenticateHttpRequest(request).pipe(
+    Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, (error) =>
+      failEnvironmentAuthInvalid(EnvironmentAuth.serverAuthCredentialReason(error)),
+    ),
+    Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+      failEnvironmentInternal("internal_error", error),
+    ),
+  );
+  if (!session.scopes.includes(scope)) {
     return yield* failEnvironmentScopeRequired(scope);
   }
   return session;
@@ -271,6 +294,8 @@ export const authHttpApiLayer = HttpApiBuilder.group(
                       AuthAccessWriteScope,
                       AuthRelayReadScope,
                       AuthRelayWriteScope,
+                      AuthVoiceUseScope,
+                      AuthVoiceManageScope,
                     ]),
                   });
             if (requestedScopes === null) {

@@ -361,6 +361,35 @@ export const ObservabilitySettings = Schema.Struct({
 });
 export type ObservabilitySettings = typeof ObservabilitySettings.Type;
 
+export const VoiceSettings = Schema.Struct({
+  enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  maxUploadBytes: Schema.Int.check(
+    Schema.isBetween({ minimum: 1, maximum: 64 * 1024 * 1024 }),
+  ).pipe(Schema.withDecodingDefault(Effect.succeed(32 * 1024 * 1024))),
+  maxInputDurationSeconds: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 3_600 })).pipe(
+    Schema.withDecodingDefault(Effect.succeed(30 * 60)),
+  ),
+  maxSpeechTextBytes: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 8 * 1024 })).pipe(
+    Schema.withDecodingDefault(Effect.succeed(8 * 1024)),
+  ),
+  maxSpeechOutputBytes: Schema.Int.check(
+    Schema.isBetween({ minimum: 1, maximum: 64 * 1024 * 1024 }),
+  ).pipe(Schema.withDecodingDefault(Effect.succeed(32 * 1024 * 1024))),
+  mediaRequestTimeoutSeconds: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 300 })).pipe(
+    Schema.withDecodingDefault(Effect.succeed(120)),
+  ),
+  maxConcurrentMediaRequests: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 16 })).pipe(
+    Schema.withDecodingDefault(Effect.succeed(4)),
+  ),
+  maxConcurrentSessions: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 16 })).pipe(
+    Schema.withDecodingDefault(Effect.succeed(1)),
+  ),
+  contextTokenBudget: Schema.Int.check(Schema.isBetween({ minimum: 1024, maximum: 100_000 })).pipe(
+    Schema.withDecodingDefault(Effect.succeed(16_000)),
+  ),
+});
+export type VoiceSettings = typeof VoiceSettings.Type;
+
 export const DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL = Duration.seconds(30);
 
 export const ServerSettings = Schema.Struct({
@@ -409,6 +438,7 @@ export const ServerSettings = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
   observability: ObservabilitySettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+  voice: VoiceSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
 });
 export type ServerSettings = typeof ServerSettings.Type;
 
@@ -514,6 +544,19 @@ export const ServerSettingsPatch = Schema.Struct({
     Schema.Struct({
       otlpTracesUrl: Schema.optionalKey(TrimmedString),
       otlpMetricsUrl: Schema.optionalKey(TrimmedString),
+    }),
+  ),
+  voice: Schema.optionalKey(
+    Schema.Struct({
+      enabled: Schema.optionalKey(Schema.Boolean),
+      maxUploadBytes: Schema.optionalKey(Schema.Int),
+      maxInputDurationSeconds: Schema.optionalKey(Schema.Int),
+      maxSpeechTextBytes: Schema.optionalKey(Schema.Int),
+      maxSpeechOutputBytes: Schema.optionalKey(Schema.Int),
+      mediaRequestTimeoutSeconds: Schema.optionalKey(Schema.Int),
+      maxConcurrentMediaRequests: Schema.optionalKey(Schema.Int),
+      maxConcurrentSessions: Schema.optionalKey(Schema.Int),
+      contextTokenBudget: Schema.optionalKey(Schema.Int),
     }),
   ),
   providers: Schema.optionalKey(

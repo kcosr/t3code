@@ -3,6 +3,7 @@ import {
   AuthSessionId,
   EnvironmentAuthenticatedAuth,
   EnvironmentAuthenticatedPrincipal,
+  EnvironmentHistoryPrivacyBoundary,
   EnvironmentHttpApi,
   type AuthBrowserSessionRequest,
   type AuthBrowserSessionResult,
@@ -60,6 +61,10 @@ const authenticatedAuth: Context.Service.Shape<typeof EnvironmentAuthenticatedAu
     }),
   );
 
+const historyPrivacyBoundary: Context.Service.Shape<typeof EnvironmentHistoryPrivacyBoundary> = (
+  httpEffect,
+) => httpEffect;
+
 export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestScenario) {
   const calls: EnvironmentHttpTestCalls = {
     descriptor: 0,
@@ -72,6 +77,7 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
     HttpApiTest.groups(EnvironmentHttpApi, ["metadata", "auth"]).pipe(
       Effect.provide([
         NodeHttpServer.layerHttpServices,
+        Layer.succeed(EnvironmentHistoryPrivacyBoundary, historyPrivacyBoundary),
         HttpApiBuilder.group(EnvironmentHttpApi, "metadata", (handlers) =>
           handlers.handle(
             "descriptor",

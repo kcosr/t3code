@@ -1,0 +1,13 @@
+{
+  "name": "@t3tools/mobile-voice-native",
+  "version": "0.0.0",
+  "private": true,
+  "main": "src/index.ts",
+  "expo-module": {
+    "android": {
+      "modules": [
+        "expo.modules.t3voice.T3VoiceModule"
+      ]
+    }
+  }
+}
