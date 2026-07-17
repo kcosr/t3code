@@ -302,6 +302,7 @@ describe("makeVoiceHttpClient", () => {
       const created = yield* client.createSession({
         mode: "realtime-agent",
         conversation: { type: "new", retention: "ephemeral" },
+        terminalActions: ["stop-realtime"],
         media: {
           transports: ["webrtc-sdp-v1"],
           audioFormats: ["audio/pcm;rate=24000;encoding=s16le;channels=1"],
@@ -315,6 +316,7 @@ describe("makeVoiceHttpClient", () => {
       yield* client.updateSessionFocus(SESSION_ID, 1, {
         projectId: PROJECT_ID,
         threadId: THREAD_ID,
+        terminalActions: ["stop-realtime", "switch-to-thread"],
       });
       const answer = yield* client.offerSession({
         sessionId: SESSION_ID,
@@ -350,7 +352,9 @@ describe("makeVoiceHttpClient", () => {
       const focusBody = requests[3]?.body;
       expect(
         focusBody instanceof Uint8Array ? new TextDecoder().decode(focusBody) : focusBody,
-      ).toBe('{"leaseGeneration":1,"projectId":"project-1","threadId":"thread-1"}');
+      ).toBe(
+        '{"leaseGeneration":1,"terminalActions":["stop-realtime","switch-to-thread"],"projectId":"project-1","threadId":"thread-1"}',
+      );
       const clientActionBody = requests[6]?.body;
       expect(
         clientActionBody instanceof Uint8Array

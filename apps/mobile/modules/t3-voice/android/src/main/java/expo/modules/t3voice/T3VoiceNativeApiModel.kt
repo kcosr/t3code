@@ -59,6 +59,11 @@ internal sealed interface T3VoiceApiRealtimeEvent {
     val action: T3VoiceRealtimeClientAction,
   ) : T3VoiceApiRealtimeEvent
 
+  data class TerminalAction(
+    override val sequence: Long,
+    val action: T3VoiceRealtimeTerminalAction,
+  ) : T3VoiceApiRealtimeEvent
+
   data class LeaseFenced(
     override val sequence: Long,
   ) : T3VoiceApiRealtimeEvent

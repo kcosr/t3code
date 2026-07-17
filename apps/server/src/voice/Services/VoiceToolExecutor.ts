@@ -8,6 +8,7 @@ import type {
   VoiceConfirmationId,
   VoiceConversationId,
   VoiceSessionId,
+  VoiceTerminalAction,
   VoiceToolCallId,
   VoiceToolName,
 } from "@t3tools/contracts";
@@ -47,6 +48,21 @@ export interface VoiceToolCompletedResult {
   readonly submitOutput: boolean;
 }
 
+export interface VoiceToolTerminalResult {
+  readonly type: "terminal-completed";
+  readonly toolCallId: VoiceToolCallId;
+  readonly providerFunctionCallId: string;
+  readonly tool: "stop_realtime_voice" | "switch_to_thread_voice";
+  readonly outcome: "succeeded";
+  readonly output: string;
+  readonly terminalAction: {
+    readonly actionId: VoiceClientActionId;
+    readonly action: VoiceTerminalAction;
+  };
+}
+
+export type VoiceToolExecutionResult = VoiceToolCompletedResult | VoiceToolTerminalResult;
+
 export interface VoiceToolConfirmationResult {
   readonly type: "confirmation-required";
   readonly confirmationId: VoiceConfirmationId;
@@ -58,7 +74,7 @@ export interface VoiceToolConfirmationResult {
   readonly newlyCreated: boolean;
 }
 
-export type VoiceToolInvokeResult = VoiceToolCompletedResult | VoiceToolConfirmationResult;
+export type VoiceToolInvokeResult = VoiceToolExecutionResult | VoiceToolConfirmationResult;
 
 export interface VoiceToolExecutorShape {
   readonly invoke: (input: VoiceToolCallInput) => Effect.Effect<VoiceToolInvokeResult, VoiceError>;

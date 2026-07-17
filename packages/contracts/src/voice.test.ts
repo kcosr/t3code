@@ -13,6 +13,7 @@ import {
   VoiceSessionEvent,
   VoiceSessionEventsResult,
   VoiceClientActionAckInput,
+  VoiceToolName,
   VoiceWebRtcOffer,
   VoiceTranscriptionStreamEvent,
   VoiceTranscriptionMetadata,
@@ -32,6 +33,7 @@ describe("voice contracts", () => {
       },
       projectId: "project-1",
       threadId: "thread-1",
+      terminalActions: ["stop-realtime", "switch-to-thread"],
       media: {
         transports: ["webrtc-sdp-v1"],
         audioFormats: ["audio/pcm;rate=24000;encoding=s16le;channels=1"],
@@ -63,6 +65,7 @@ describe("voice contracts", () => {
       decodeUnknownSync(VoiceSessionCreateInput)({
         mode: "realtime-agent",
         conversation: { type: "new", retention: "ephemeral" },
+        terminalActions: [],
         media: {
           transports: ["provider-native-events"],
           audioFormats: ["audio/wav"],
@@ -79,6 +82,28 @@ describe("voice contracts", () => {
       decodeUnknownSync(VoiceConversationSelection)({
         type: "continue",
         conversationId: "voice-conversation-1",
+      }),
+    ).toThrow();
+  });
+
+  it("requires explicit supported terminal actions when creating a session", () => {
+    const input = {
+      mode: "realtime-agent",
+      conversation: { type: "new", retention: "ephemeral" },
+      media: {
+        transports: ["webrtc-sdp-v1"],
+        audioFormats: ["audio/pcm;rate=24000;encoding=s16le;channels=1"],
+        supportsInputRouteSelection: true,
+        supportsOutputRouteSelection: true,
+      },
+      idempotencyKey: "mobile-start-terminal-actions",
+    };
+
+    expect(() => decodeUnknownSync(VoiceSessionCreateInput)(input)).toThrow();
+    expect(() =>
+      decodeUnknownSync(VoiceSessionCreateInput)({
+        ...input,
+        terminalActions: ["handoff-to-thread"],
       }),
     ).toThrow();
   });
@@ -115,12 +140,19 @@ describe("voice contracts", () => {
   });
 
   it("defines clear, project, and project-thread focus without accepting a thread alone", () => {
-    expect(decodeUnknownSync(VoiceSessionFocusInput)({ leaseGeneration: 1 })).toEqual({
+    expect(
+      decodeUnknownSync(VoiceSessionFocusInput)({
+        leaseGeneration: 1,
+        terminalActions: ["stop-realtime"],
+      }),
+    ).toEqual({
       leaseGeneration: 1,
+      terminalActions: ["stop-realtime"],
     });
     expect(
       decodeUnknownSync(VoiceSessionFocusInput)({
         leaseGeneration: 1,
+        terminalActions: ["stop-realtime", "switch-to-thread"],
         projectId: "project-1",
         threadId: "thread-1",
       }),
@@ -128,7 +160,14 @@ describe("voice contracts", () => {
     expect(() =>
       decodeUnknownSync(VoiceSessionFocusInput)({
         leaseGeneration: 1,
+        terminalActions: ["stop-realtime"],
         threadId: "thread-1",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeUnknownSync(VoiceSessionFocusInput)({
+        leaseGeneration: 1,
+        projectId: "project-1",
       }),
     ).toThrow();
   });
@@ -173,6 +212,31 @@ describe("voice contracts", () => {
         message: "Navigation was unavailable",
       }),
     ).toMatchObject({ outcome: "failed" });
+  });
+
+  it("decodes native-owned terminal actions", () => {
+    expect(
+      decodeUnknownSync(VoiceSessionEvent)({
+        type: "terminal-action",
+        sessionId: "voice-session-1",
+        leaseGeneration: 2,
+        sequence: 9,
+        occurredAt: "2026-07-10T20:00:00.000Z",
+        action: "switch-to-thread",
+        actionId: "voice-terminal-action-1",
+      }),
+    ).toMatchObject({
+      type: "terminal-action",
+      action: "switch-to-thread",
+      actionId: "voice-terminal-action-1",
+    });
+  });
+
+  it("defines the end-state terminal tool names", () => {
+    expect(decodeUnknownSync(VoiceToolName)("stop_realtime_voice")).toBe("stop_realtime_voice");
+    expect(decodeUnknownSync(VoiceToolName)("switch_to_thread_voice")).toBe(
+      "switch_to_thread_voice",
+    );
   });
 
   it("preserves partial transcript boundaries and normalizes final transcripts", () => {

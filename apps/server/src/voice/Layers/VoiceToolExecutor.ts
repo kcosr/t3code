@@ -27,11 +27,13 @@ import {
   VoiceConversationEntryId,
   VoiceToolCallId,
   VoiceToolName,
+  type VoiceTerminalAction,
   type OrchestrationProjectShell,
   type OrchestrationThreadShell,
   type VoiceConversationId,
   type VoiceSessionId,
 } from "@t3tools/contracts";
+import * as NodeCrypto from "node:crypto";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -63,8 +65,10 @@ import {
   VoiceToolExecutor,
   type VoiceToolCallInput,
   type VoiceToolCompletedResult,
+  type VoiceToolExecutionResult,
   type VoiceToolExecutorShape,
   type VoiceToolInvokeResult,
+  type VoiceToolTerminalResult,
 } from "../Services/VoiceToolExecutor.ts";
 
 const CONFIRMATION_TTL_MILLIS = 30_000;
@@ -118,6 +122,7 @@ const ReadHistoryArguments = Schema.Struct({
   before: HistoryContextRadius,
   after: HistoryContextRadius,
 });
+const TerminalArguments = Schema.Record(Schema.String, Schema.Unknown);
 type SearchHistoryArguments = typeof SearchHistoryArguments.Type;
 type ReadHistoryArguments = typeof ReadHistoryArguments.Type;
 
@@ -188,6 +193,8 @@ type ReadVoiceTool = Extract<
   | "search_history"
   | "read_history"
   | "activate_thread"
+  | "stop_realtime_voice"
+  | "switch_to_thread_voice"
 >;
 type MutationVoiceTool = Exclude<VoiceToolName, ReadVoiceTool>;
 type HistoryVoiceTool = Extract<VoiceToolName, "search_history" | "read_history">;
@@ -201,13 +208,15 @@ const VOICE_TOOL_ACCESS = {
   search_history: "history-read",
   read_history: "history-read",
   activate_thread: "orchestration-read",
+  stop_realtime_voice: "session",
+  switch_to_thread_voice: "session",
   create_thread: "orchestration-operate",
   send_thread_message: "orchestration-operate",
   interrupt_thread: "orchestration-operate",
   archive_thread: "orchestration-operate",
 } as const satisfies Record<
   VoiceToolName,
-  "orchestration-read" | "history-read" | "orchestration-operate"
+  "session" | "orchestration-read" | "history-read" | "orchestration-operate"
 >;
 
 const isReadTool = (tool: VoiceToolName): tool is ReadVoiceTool =>
@@ -242,14 +251,14 @@ interface PendingCall {
 interface CompletedCall {
   readonly type: "completed";
   readonly sessionId: VoiceSessionId;
-  readonly result: VoiceToolCompletedResult;
+  readonly result: VoiceToolExecutionResult;
   readonly completedAtMillis: number;
 }
 
 interface ExecutingReadCall {
   readonly type: "executing-read";
   readonly sessionId: VoiceSessionId;
-  readonly completion: Deferred.Deferred<VoiceToolCompletedResult, VoiceError>;
+  readonly completion: Deferred.Deferred<VoiceToolExecutionResult, VoiceError>;
 }
 
 type CallState = PendingCall | CompletedCall | ExecutingReadCall;
@@ -384,6 +393,34 @@ const boundedHistoryOutput = (value: Record<string, unknown>) => {
 const deterministicId = (prefix: string, input: VoiceToolCallInput) =>
   `${prefix}:${input.conversationId}:${input.toolCallId}`;
 
+type TerminalVoiceTool = "stop_realtime_voice" | "switch_to_thread_voice";
+
+const terminalActionForTool = (tool: TerminalVoiceTool): VoiceTerminalAction =>
+  tool === "stop_realtime_voice" ? "stop-realtime" : "switch-to-thread";
+
+const terminalActionId = (input: {
+  readonly sessionId: VoiceSessionId;
+  readonly conversationId: VoiceConversationId;
+  readonly contextEpoch: number;
+  readonly toolCallId: VoiceToolCallId;
+  readonly providerFunctionCallId: string;
+  readonly name: string;
+}) =>
+  VoiceClientActionId.make(
+    `voice-terminal:${NodeCrypto.createHash("sha256")
+      .update(
+        [
+          input.sessionId,
+          input.conversationId,
+          String(input.contextEpoch),
+          input.toolCallId,
+          input.providerFunctionCallId,
+          input.name,
+        ].join("\0"),
+      )
+      .digest("base64url")}`,
+  );
+
 const parseArguments = <A>(
   schema: Schema.Codec<A, unknown, never, never>,
   input: VoiceToolCallInput,
@@ -395,6 +432,31 @@ const parseArguments = <A>(
       voiceError("invalid-phase", "tool.arguments", "Voice tool arguments were invalid"),
     ),
   );
+
+const completeTerminalTool = Effect.fn("VoiceToolExecutor.completeTerminalTool")(function* (
+  input: VoiceToolCallInput,
+  tool: TerminalVoiceTool,
+): Effect.fn.Return<VoiceToolTerminalResult> {
+  const args = yield* parseArguments(TerminalArguments, input);
+  if (Object.keys(args).length > 0) {
+    return yield* voiceError(
+      "invalid-phase",
+      "tool.arguments",
+      "Terminal voice tools do not accept arguments",
+    );
+  }
+  const action = terminalActionForTool(tool);
+  const actionId = terminalActionId(input);
+  return {
+    type: "terminal-completed",
+    toolCallId: input.toolCallId,
+    providerFunctionCallId: input.providerFunctionCallId,
+    tool,
+    outcome: "succeeded",
+    output: jsonOutput({ status: "accepted", actionId, action }),
+    terminalAction: { actionId, action },
+  };
+});
 
 const projectOutput = (project: OrchestrationProjectShell) => ({
   projectId: project.id,
@@ -510,7 +572,7 @@ const make = Effect.gen(function* () {
 
   const durableResultOutput = (
     input: VoiceToolCallInput,
-    result: VoiceToolCompletedResult,
+    result: VoiceToolExecutionResult,
   ): string =>
     isHistoryToolName(input.name)
       ? jsonOutput({
@@ -654,7 +716,7 @@ const make = Effect.gen(function* () {
 
   const executeRead = Effect.fn("VoiceToolExecutor.executeRead")(function* (
     input: VoiceToolCallInput,
-    tool: ReadVoiceTool,
+    tool: Exclude<ReadVoiceTool, TerminalVoiceTool>,
   ) {
     switch (tool) {
       case "list_projects": {
@@ -871,18 +933,39 @@ const make = Effect.gen(function* () {
   const completedFromDurable = (
     call: DurableVoiceToolCall,
     submitOutput: boolean,
-  ): VoiceToolCompletedResult => ({
-    type: "completed",
-    toolCallId: call.toolCallId,
-    providerFunctionCallId: call.providerFunctionCallId,
-    tool: isVoiceToolName(call.toolName) ? call.toolName : "unknown",
-    outcome:
-      call.status === "requested" || call.status === "pending-confirmation"
-        ? "failed"
-        : call.status,
-    output: call.resultOutput ?? jsonOutput({ error: "Voice tool result was unavailable" }),
-    submitOutput,
-  });
+  ): VoiceToolExecutionResult => {
+    if (
+      (call.toolName === "stop_realtime_voice" || call.toolName === "switch_to_thread_voice") &&
+      call.status === "succeeded" &&
+      call.resultOutput !== null
+    ) {
+      const action = terminalActionForTool(call.toolName);
+      return {
+        type: "terminal-completed",
+        toolCallId: call.toolCallId,
+        providerFunctionCallId: call.providerFunctionCallId,
+        tool: call.toolName,
+        outcome: "succeeded",
+        output: call.resultOutput,
+        terminalAction: {
+          actionId: terminalActionId({ ...call, name: call.toolName }),
+          action,
+        },
+      };
+    }
+    return {
+      type: "completed",
+      toolCallId: call.toolCallId,
+      providerFunctionCallId: call.providerFunctionCallId,
+      tool: isVoiceToolName(call.toolName) ? call.toolName : "unknown",
+      outcome:
+        call.status === "requested" || call.status === "pending-confirmation"
+          ? "failed"
+          : call.status,
+      output: call.resultOutput ?? jsonOutput({ error: "Voice tool result was unavailable" }),
+      submitOutput,
+    };
+  };
 
   const pendingFromDurable = (
     call: DurableVoiceToolCall,
@@ -936,7 +1019,7 @@ const make = Effect.gen(function* () {
 
   const persistCompleted = (
     input: VoiceToolCallInput,
-    result: VoiceToolCompletedResult,
+    result: VoiceToolExecutionResult,
     updatedAt: string,
   ) =>
     conversations.get(input.conversationId).pipe(
@@ -993,11 +1076,14 @@ const make = Effect.gen(function* () {
           }
           requiredScopes = decodedScopes.value;
         } else {
-          requiredScopes = new Set<AuthEnvironmentScope>([
-            access === "orchestration-read"
-              ? AuthOrchestrationReadScope
-              : AuthOrchestrationOperateScope,
-          ]);
+          requiredScopes =
+            access === "session"
+              ? new Set()
+              : new Set<AuthEnvironmentScope>([
+                  access === "orchestration-read"
+                    ? AuthOrchestrationReadScope
+                    : AuthOrchestrationOperateScope,
+                ]);
         }
         const missingScope = [...requiredScopes].find((scope) => !input.grantedScopes.has(scope));
         if (missingScope !== undefined) {
@@ -1078,11 +1164,11 @@ const make = Effect.gen(function* () {
             readonly action: "execute-read";
             readonly key: string;
             readonly tool: ReadVoiceTool;
-            readonly completion: Deferred.Deferred<VoiceToolCompletedResult, VoiceError>;
+            readonly completion: Deferred.Deferred<VoiceToolExecutionResult, VoiceError>;
           }
         | {
             readonly action: "await-read";
-            readonly completion: Deferred.Deferred<VoiceToolCompletedResult, VoiceError>;
+            readonly completion: Deferred.Deferred<VoiceToolExecutionResult, VoiceError>;
           };
 
       const resolution = yield* SynchronizedRef.modifyEffect<
@@ -1095,7 +1181,12 @@ const make = Effect.gen(function* () {
         const key = callKey(input.conversationId, input.toolCallId);
         const existing = current.calls.get(key);
         if (existing?.type === "completed") {
-          return Effect.succeed([{ ...existing.result, submitOutput: false }, current] as const);
+          return Effect.succeed([
+            existing.result.type === "completed"
+              ? { ...existing.result, submitOutput: false }
+              : existing.result,
+            current,
+          ] as const);
         }
         if (existing?.type === "pending") {
           return Effect.succeed([
@@ -1201,7 +1292,7 @@ const make = Effect.gen(function* () {
           const tool = decodedRequestedTool.value;
           const readTool = isReadTool(tool);
           if (readTool) {
-            const completion = yield* Deferred.make<VoiceToolCompletedResult, VoiceError>();
+            const completion = yield* Deferred.make<VoiceToolExecutionResult, VoiceError>();
             return [
               {
                 action: "execute-read",
@@ -1341,12 +1432,36 @@ const make = Effect.gen(function* () {
       if (!("action" in resolution)) return resolution;
       if (resolution.action === "await-read") {
         return yield* Deferred.await(resolution.completion).pipe(
-          Effect.map((result) => ({ ...result, submitOutput: false })),
+          Effect.map((result) =>
+            result.type === "completed" ? { ...result, submitOutput: false } : result,
+          ),
         );
       }
 
       const execution = Effect.gen(function* () {
         yield* appendJournal(input, "requested");
+        if (
+          resolution.tool === "stop_realtime_voice" ||
+          resolution.tool === "switch_to_thread_voice"
+        ) {
+          const result = yield* completeTerminalTool(input, resolution.tool).pipe(
+            Effect.match({
+              onFailure: (cause) =>
+                completed(
+                  input,
+                  resolution.tool,
+                  "failed",
+                  jsonOutput({
+                    error: cause instanceof Error ? cause.message : "Invalid tool arguments",
+                  }),
+                ),
+              onSuccess: (result) => result,
+            }),
+          );
+          yield* appendJournal(input, result.outcome, result.output);
+          yield* persistCompleted(input, result, requestedAt);
+          return result;
+        }
         const output = yield* executeRead(input, resolution.tool).pipe(
           Effect.match({
             onFailure: (cause) =>

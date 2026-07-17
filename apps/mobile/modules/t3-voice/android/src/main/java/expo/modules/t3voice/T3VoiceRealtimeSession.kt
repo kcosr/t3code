@@ -34,9 +34,9 @@ internal class T3VoiceRealtimeSession(
     Executors.newSingleThreadScheduledExecutor(),
   private val terminalOutcomeDeadlineMs: Long = DEFAULT_TERMINAL_OUTCOME_DEADLINE_MS,
 ) {
-  private data class DesiredFocus(
+  private data class DesiredContext(
     val revision: Long,
-    val focus: T3VoiceRealtimeFocus?,
+    val context: T3VoiceRealtimeContext,
   )
 
   private val lock = Any()
@@ -80,10 +80,12 @@ internal class T3VoiceRealtimeSession(
   private var heartbeatFuture: ScheduledFuture<*>? = null
   private var heartbeatFailures = 0
   private var eventFailures = 0
-  private var desiredFocus = DesiredFocus(0, target.focus)
+  private var desiredContext =
+    DesiredContext(0, T3VoiceRealtimeContext(target.focus, target.threadSwitch))
   private var focusWorkerScheduled = false
   private var terminalCallback: T3VoiceRuntimeCallback? = null
   private var terminalDeadlineFuture: ScheduledFuture<*>? = null
+  private var terminalActionId: String? = null
 
   init {
     require(terminalOutcomeDeadlineMs > 0) { "terminalOutcomeDeadlineMs must be positive." }
@@ -136,11 +138,32 @@ internal class T3VoiceRealtimeSession(
   }
 
   fun close() {
-    if (!terminal.compareAndSet(false, true)) return
-    synchronized(lock) {
-      terminalCallback = T3VoiceRuntimeCallback.RealtimeClosed
+    if (terminal.compareAndSet(false, true)) {
+      synchronized(lock) {
+        terminalCallback = T3VoiceRuntimeCallback.RealtimeClosed
+      }
     }
     beginTerminalCleanup()
+  }
+
+  fun closeAfterPlayoutDrain() {
+    if (!terminal.compareAndSet(false, true)) return
+    val server =
+      synchronized(lock) {
+        terminalCallback = T3VoiceRuntimeCallback.RealtimeClosed
+        serverSession
+      }
+    if (server == null) {
+      beginTerminalCleanup()
+      return
+    }
+    runCatching {
+      webRtc.fenceInputAndDrainPlayout(server.state.sessionId) {
+        beginTerminalCleanup()
+      }
+    }.onFailure {
+      beginTerminalCleanup()
+    }
   }
 
   fun forceRelease() {
@@ -168,9 +191,9 @@ internal class T3VoiceRealtimeSession(
   }
 
   /** Synchronously reserves the newest focus before its independent network lane begins. */
-  fun admitFocus(focus: T3VoiceRealtimeFocus?) {
+  fun admitContext(context: T3VoiceRealtimeContext) {
     synchronized(lock) {
-      desiredFocus = DesiredFocus(desiredFocus.revision + 1, focus)
+      desiredContext = DesiredContext(desiredContext.revision + 1, context)
       if (focusWorkerScheduled || terminal.get()) return
       focusWorkerScheduled = true
     }
@@ -491,6 +514,20 @@ internal class T3VoiceRealtimeSession(
             emitIfLive(T3VoiceRuntimeCallback.RealtimeClientActionReceived(event.action))
           }
         }
+        is T3VoiceApiRealtimeEvent.TerminalAction -> {
+          val admitted =
+            synchronized(lock) {
+              if (terminal.get() || terminalActionId != null) {
+                false
+              } else {
+                terminalActionId = event.action.actionId
+                true
+              }
+            }
+          if (admitted) {
+            emit(T3VoiceRuntimeCallback.RealtimeTerminalActionReceived(event.action))
+          }
+        }
         is T3VoiceApiRealtimeEvent.LeaseFenced ->
           throw T3VoiceNativeApiException("realtime-lease-fenced", retryable = true)
         is T3VoiceApiRealtimeEvent.RotationRequired ->
@@ -524,17 +561,17 @@ internal class T3VoiceRealtimeSession(
 
   private fun drainFocusUpdates() {
     while (!terminal.get()) {
-      val desired = synchronized(lock) { desiredFocus }
+      val desired = synchronized(lock) { desiredContext }
       try {
         retryControl {
           val server = synchronized(lock) { serverSession }
             ?: throw T3VoiceNativeApiException("realtime-session-missing", retryable = true)
           executeCall { calls ->
-            api.updateRealtimeFocus(
+            api.updateRealtimeContext(
               calls,
               server.state.sessionId,
               server.state.leaseGeneration,
-              desired.focus,
+              desired.context,
             )
           }
         }
@@ -545,7 +582,7 @@ internal class T3VoiceRealtimeSession(
         return
       }
       synchronized(lock) {
-        if (desiredFocus.revision == desired.revision) {
+        if (desiredContext.revision == desired.revision) {
           focusWorkerScheduled = false
           return
         }

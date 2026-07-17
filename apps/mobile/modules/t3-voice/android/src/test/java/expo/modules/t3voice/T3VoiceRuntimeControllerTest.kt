@@ -163,7 +163,7 @@ class T3VoiceRuntimeControllerTest {
     )
 
     assertEquals(
-      listOf("start-realtime:1:environment-a", "close-realtime:1:true"),
+      listOf("start-realtime:1:environment-a", "close-realtime:1:true:false"),
       driver.actions,
     )
   }
@@ -286,6 +286,133 @@ class T3VoiceRuntimeControllerTest {
 
     assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
     assertFalse(driver.actions.any { it.startsWith("start-thread") })
+  }
+
+  @Test
+  fun agentTerminalStopDrainsOnceFromConnectedAndReturnsToIdle() {
+    val driver = FakeDriver()
+    val controller = connectedRealtimeController(driver)
+    val action =
+      T3VoiceRealtimeTerminalAction("terminal-stop", T3VoiceRealtimeTerminalActionType.STOP_REALTIME)
+
+    assertTrue(
+      controller.onCallback(
+        1,
+        T3VoiceRuntimeCallback.RealtimeTerminalActionReceived(action),
+      ),
+    )
+    assertEquals(
+      T3VoiceRealtimeStage.STOPPING,
+      (controller.snapshot().state as T3VoiceControllerState.Realtime).stage,
+    )
+    assertEquals("close-realtime:1:false:true", driver.actions.last())
+    assertFalse(
+      controller.onCallback(
+        1,
+        T3VoiceRuntimeCallback.RealtimeTerminalActionReceived(action),
+      ),
+    )
+    assertFalse(
+      controller.onCallback(
+        1,
+        T3VoiceRuntimeCallback.RealtimeTerminalActionReceived(
+          T3VoiceRealtimeTerminalAction(
+            "terminal-stop-other",
+            T3VoiceRealtimeTerminalActionType.STOP_REALTIME,
+          ),
+        ),
+      ),
+    )
+    assertEquals(1, driver.actions.count { it == "close-realtime:1:false:true" })
+
+    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeClosed))
+    assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
+  }
+
+  @Test
+  fun agentTerminalSwitchIsAdmittedDuringStartingAndUsesThePreparedTarget() {
+    val driver = FakeDriver()
+    val controller = T3VoiceRuntimeController(driver)
+    controller.dispatch(T3VoiceRuntimeCommand.StartRealtime(realtimeTarget, session))
+    controller.activateInitialStart(1)
+
+    assertTrue(
+      controller.onCallback(
+        1,
+        T3VoiceRuntimeCallback.RealtimeTerminalActionReceived(
+          T3VoiceRealtimeTerminalAction(
+            "terminal-switch",
+            T3VoiceRealtimeTerminalActionType.SWITCH_TO_THREAD,
+          ),
+        ),
+      ),
+    )
+    val closing = controller.snapshot().state as T3VoiceControllerState.SwitchingToThread
+    assertEquals(T3VoiceSwitchStage.CLOSING_REALTIME, closing.stage)
+    assertEquals(T3VoiceThreadStart(threadTarget, continuousSettings), closing.threadStart)
+    assertEquals("close-realtime:1:true:true", driver.actions.last())
+
+    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeClosed))
+    assertEquals("start-thread:2:thread-a", driver.actions.last())
+  }
+
+  @Test
+  fun missingPreparedTargetClosesRealtimeThenPublishesRecoverableSwitchFailure() {
+    val driver = FakeDriver()
+    val controller = T3VoiceRuntimeController(driver)
+    controller.dispatch(
+      T3VoiceRuntimeCommand.StartRealtime(realtimeTarget.copy(threadSwitch = null), session),
+    )
+    controller.activateInitialStart(1)
+    controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeConnected)
+
+    assertTrue(
+      controller.onCallback(
+        1,
+        T3VoiceRuntimeCallback.RealtimeTerminalActionReceived(
+          T3VoiceRealtimeTerminalAction(
+            "terminal-missing-target",
+            T3VoiceRealtimeTerminalActionType.SWITCH_TO_THREAD,
+          ),
+        ),
+      ),
+    )
+    assertEquals("close-realtime:1:false:true", driver.actions.last())
+    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeClosed))
+
+    val failed = controller.snapshot().state as T3VoiceControllerState.Failed
+    assertEquals(T3VoiceOperation.SWITCHING_TO_THREAD, failed.operation)
+    assertEquals("thread-switch-target-unavailable", failed.failure.code)
+    assertTrue(failed.failure.recoverable)
+    assertFalse(driver.actions.any { it.startsWith("start-thread") })
+  }
+
+  @Test
+  fun userStopOverridesMissingTargetFailureWhileAgentDrainIsPending() {
+    val driver = FakeDriver()
+    val controller = T3VoiceRuntimeController(driver)
+    controller.dispatch(
+      T3VoiceRuntimeCommand.StartRealtime(realtimeTarget.copy(threadSwitch = null), session),
+    )
+    controller.activateInitialStart(1)
+    controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeConnected)
+    controller.onCallback(
+      1,
+      T3VoiceRuntimeCallback.RealtimeTerminalActionReceived(
+        T3VoiceRealtimeTerminalAction(
+          "terminal-missing-target-stop",
+          T3VoiceRealtimeTerminalActionType.SWITCH_TO_THREAD,
+        ),
+      ),
+    )
+
+    assertEquals(
+      T3VoiceCommandOutcome.APPLIED,
+      controller.dispatch(T3VoiceRuntimeCommand.Stop).outcome,
+    )
+    assertEquals("close-realtime:1:false:false", driver.actions.last())
+    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.RealtimeClosed))
+    assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
   }
 
   @Test
@@ -416,7 +543,7 @@ class T3VoiceRuntimeControllerTest {
   @Test
   fun `driver exception during Stop preserves the explicit Stop intent`() {
     val controller =
-      T3VoiceRuntimeController(FakeDriver(failAction = "close-realtime:1:false"))
+      T3VoiceRuntimeController(FakeDriver(failAction = "close-realtime:1:false:false"))
     controller.dispatch(T3VoiceRuntimeCommand.StartRealtime(realtimeTarget, session))
     controller.activateInitialStart(1)
 
@@ -481,7 +608,7 @@ class T3VoiceRuntimeControllerTest {
     val driver = FakeDriver()
     lateinit var controller: T3VoiceRuntimeController
     driver.onAction = { action ->
-      if (action.startsWith("focus-realtime")) {
+      if (action.startsWith("context-realtime")) {
         val realtime = controller.snapshot().state as T3VoiceControllerState.Realtime
         assertEquals(T3VoiceRealtimeFocus("project-b", "thread-b"), realtime.target.focus)
         assertEquals(null, realtime.target.threadSwitch)
@@ -518,7 +645,7 @@ class T3VoiceRuntimeControllerTest {
     )
     assertEquals(
       listOf(
-        "focus-realtime:1:project-b:thread-b",
+        "context-realtime:1:thread-b",
         "ack-realtime:1:action-a:SUCCEEDED",
       ),
       driver.actions.takeLast(2),
@@ -586,7 +713,7 @@ class T3VoiceRuntimeControllerTest {
     assertEquals(T3VoiceRealtimeFocus("project-b", "thread-b"), starting.target.focus)
     assertEquals(
       listOf(
-        "focus-realtime:1:project-b:thread-b",
+        "context-realtime:1:thread-b",
         "ack-realtime:1:startup-action:SUCCEEDED",
       ),
       driver.actions.takeLast(2),
@@ -1152,8 +1279,12 @@ internal class FakeDriver(
     record("start-realtime:$generation:${target.environmentId}")
   }
 
-  override fun closeRealtime(generation: Long, preserveSessionForThread: Boolean) {
-    record("close-realtime:$generation:$preserveSessionForThread")
+  override fun closeRealtime(
+    generation: Long,
+    preserveSessionForThread: Boolean,
+    drainPlayout: Boolean,
+  ) {
+    record("close-realtime:$generation:$preserveSessionForThread:$drainPlayout")
   }
 
   override fun cancelRealtimeToThreadSwitch(generation: Long) {
@@ -1194,10 +1325,6 @@ internal class FakeDriver(
 
   override fun rearmThreadRecording(generation: Long) {
     record("start-thread:$generation:thread-a")
-  }
-
-  override fun admitRealtimeFocusUpdate(generation: Long, focus: T3VoiceRealtimeFocus) {
-    record("focus-realtime:$generation:${focus.projectId}:${focus.threadId}")
   }
 
   override fun acknowledgeRealtimeClientAction(

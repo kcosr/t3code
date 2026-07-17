@@ -292,7 +292,11 @@ private class NotificationFakeDriver : T3VoiceRuntimeDriver {
     session: T3VoiceNativeSessionConfig,
   ) = Unit
 
-  override fun closeRealtime(generation: Long, preserveSessionForThread: Boolean) = Unit
+  override fun closeRealtime(
+    generation: Long,
+    preserveSessionForThread: Boolean,
+    drainPlayout: Boolean,
+  ) = Unit
 
   override fun cancelRealtimeToThreadSwitch(generation: Long) = Unit
 
@@ -317,8 +321,6 @@ private class NotificationFakeDriver : T3VoiceRuntimeDriver {
   override fun startThreadAfterRealtime(generation: Long, start: T3VoiceThreadStart) = Unit
 
   override fun rearmThreadRecording(generation: Long) = Unit
-
-  override fun admitRealtimeFocusUpdate(generation: Long, focus: T3VoiceRealtimeFocus) = Unit
 
   override fun acknowledgeRealtimeClientAction(
     generation: Long,

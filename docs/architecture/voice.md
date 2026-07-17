@@ -289,6 +289,8 @@ Tool execution also checks the scope required by the underlying operation on eve
 
 - read tools require `orchestration:read`;
 - mutating tools require `orchestration:operate`;
+- terminal stop/switch tools act only on the already-owned voice lease and require no authority
+  beyond the session's existing `voice:use` grant;
 - voice confirmation does not add authority; for confirmation-gated operations it only satisfies
   the interaction policy for an already-authorized operation.
 
@@ -578,8 +580,10 @@ sequenceDiagram
     OpenAI-->>T3: completed function call over sideband
     T3->>Tools: validate, authorize, optionally request confirmation
     Tools-->>T3: normalized tool result
-    T3->>OpenAI: function_call_output and response.create
+    T3->>OpenAI: ordinary result: function_call_output and response.create
     OpenAI-->>Client: direct response audio
+    T3->>OpenAI: terminal result: acknowledged function_call_output, no response.create
+    T3-->>Client: sequenced native terminal-action
 ```
 
 Realtime sessions are bounded resources. Before the OpenAI 60-minute maximum, T3 emits a terminal
@@ -600,6 +604,8 @@ The allowlist is:
 - `search_history`
 - `read_history`
 - `activate_thread`
+- `stop_realtime_voice`
+- `switch_to_thread_voice`
 - `create_thread`
 - `send_thread_message`
 - `interrupt_thread`
@@ -607,9 +613,11 @@ The allowlist is:
 
 Project and thread summary reads use `ProjectionSnapshotQuery`; bounded messages use the thread
 message projection; exact turn waits use the dedicated narrow message/turn outcome projection; and
-history tools use `HistorySearchService`. `activate_thread` requests a bounded client action. Mutation
-tools create canonical orchestration commands and dispatch them through `ClientCommandDispatcher`;
-they do not call HTTP or WebSocket routes from inside the server.
+history tools use `HistorySearchService`. `activate_thread` requests a bounded client action. The two
+terminal tools publish native-owned stop or mode-switch actions after provider acknowledgement;
+they do not use the acknowledged React client-action path. Mutation tools create canonical
+orchestration commands and dispatch them through `ClientCommandDispatcher`; they do not call HTTP
+or WebSocket routes from inside the server.
 
 Tool contracts use stable T3 IDs, bounded strings, and explicit result limits. Lists require a
 limit and return compact summaries. The server rejects unknown fields and unknown tool names.
@@ -646,14 +654,41 @@ the turn.
 - T3 holds the completed provider function call without submitting output while confirmation is
   pending; the model prompt requires a spoken preamble before requesting the tool.
 - Only a T3 client confirmation endpoint resolves it. Approval executes the tool; rejection or
-  expiry produces a rejection result. Exactly one final `function_call_output`, followed by
-  `response.create`, is submitted for the provider function-call ID.
+  expiry produces a rejection result. For non-terminal tools, exactly one final
+  `function_call_output`, followed by `response.create`, is submitted for the provider function-call
+  ID.
 
 Each provider function call is normalized to a durable `VoiceToolCallId`. T3 persists canonical
 arguments and pending/terminal state before confirmation or execution and derives a deterministic
 orchestration `CommandId` from conversation ID plus tool-call ID. A tool result is journaled before
 provider acknowledgement. Late events must match the current lease generation; completed writes
 are reconciled from orchestration command receipts after a crash rather than executed again.
+
+### Agent-initiated terminal actions
+
+`stop_realtime_voice` and `switch_to_thread_voice` are terminal provider actions. The model may
+speak one short completion or transition sentence before the tool call, but the call is its final
+output. T3 submits a deterministic `function_call_output`, waits for the provider to acknowledge
+that conversation item, and deliberately does not request another response. It then publishes one
+sequenced `terminal-action` event containing the session lease generation and deterministic action
+ID. A bounded server fallback closes an abandoned provider call only after the native drain window
+and normal event-delivery margin.
+
+Clients advertise the terminal actions they implement when creating the session and on every
+subsequent focus/context update. Android always advertises native stop and advertises native
+Realtime-to-Thread switch only while the current target contains a complete prepared Thread start.
+The server updates the provider tool set when that capability changes. If a previously emitted
+switch arrives after the prepared target disappears, native code still closes Realtime and exposes
+a sanitized recoverable failure instead of reconstructing or guessing Thread settings.
+
+Android consumes terminal actions in its native event-polling lane. Admission immediately moves the
+serialized controller into stopping or switching and fences microphone input. A process-local PCM16
+playout monitor then waits for roughly 400 milliseconds without an audible sample, sampled roughly
+every 100 milliseconds, with a five-second absolute deadline. Peer teardown proceeds after drain or
+timeout. The existing exact quiescence callback remains the only path that can start Thread
+recording, so the old peer and microphone owner are physically released first. React neither
+acknowledges nor coordinates this path; detachment and Activity backgrounding therefore do not
+change its behavior.
 
 ## Server Settings and Secrets
 
@@ -1029,6 +1064,8 @@ audio, SDP, credentials, provider payloads, or general error text.
 - sideband attach failure cleanup;
 - provider event correlation;
 - tool schema validation, authorization, confirmation, durable idempotency, and crash reconciliation;
+- terminal tool provider acknowledgement, continuation suppression, duplicate coalescing, sequenced
+  action delivery, and bounded abandoned-session cleanup;
 - quotas, upload limits, timeouts, and redaction;
 - session scope cleanup and reconnect grace periods;
 - repository migrations, restart rehydration, clear-context epochs, retention, deletion, and
@@ -1048,6 +1085,7 @@ never required for the default suite.
   call;
 - crash between orchestration dispatch and journal completion does not repeat a write;
 - one read tool and one confirmation-gated write tool through a fake Realtime provider.
+- terminal stop and prepared Thread switch through a fake provider without a follow-up response.
 
 ### Android tests
 
@@ -1060,6 +1098,9 @@ never required for the default suite.
 - native-service bind/unbind/rebind and React adapter hydration from simulated active Realtime and
   Thread snapshots without issuing duplicate starts;
 - WebRTC signaling and event correlation with a fake peer;
+- native terminal-action generation/action-ID fencing, immediate microphone fencing, silent and
+  active playout drain, five-second timeout, duplicate delivery, and exact Realtime-to-Thread
+  quiescence;
 - cancellation and network-loss cleanup;
 - clean Expo prebuild preserves module service and permissions in the merged manifest;
 - late SDP answers cannot attach to a replacement native session.
@@ -1069,6 +1110,7 @@ never required for the default suite.
 - built-in microphone, speaker, wired headset, and Bluetooth headset;
 - interruption and barge-in;
 - screen off/on and activity recreation;
+- agent-initiated stop and prepared Thread switch with React detached and the Activity backgrounded;
 - network handoff and temporary loss;
 - permission denial and revocation;
 - long-running session rotation;

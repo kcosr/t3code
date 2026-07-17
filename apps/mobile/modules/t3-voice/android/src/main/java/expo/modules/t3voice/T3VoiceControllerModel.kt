@@ -260,6 +260,20 @@ internal data class T3VoiceRealtimeClientAction(
   }
 }
 
+internal enum class T3VoiceRealtimeTerminalActionType {
+  STOP_REALTIME,
+  SWITCH_TO_THREAD,
+}
+
+internal data class T3VoiceRealtimeTerminalAction(
+  val actionId: String,
+  val type: T3VoiceRealtimeTerminalActionType,
+) {
+  init {
+    require(actionId.isNotBlank()) { "actionId must be non-empty." }
+  }
+}
+
 internal enum class T3VoiceClientActionOutcome {
   SUCCEEDED,
   FAILED,
@@ -288,6 +302,8 @@ internal enum class T3VoiceToolName {
   SEARCH_HISTORY,
   READ_HISTORY,
   ACTIVATE_THREAD,
+  STOP_REALTIME_VOICE,
+  SWITCH_TO_THREAD_VOICE,
   CREATE_THREAD,
   SEND_THREAD_MESSAGE,
   INTERRUPT_THREAD,
@@ -509,6 +525,10 @@ internal sealed interface T3VoiceRuntimeCallback {
       require(actionId.isNotBlank()) { "actionId must be non-empty." }
     }
   }
+
+  data class RealtimeTerminalActionReceived(
+    val action: T3VoiceRealtimeTerminalAction,
+  ) : T3VoiceRuntimeCallback
 
   data class RealtimeAudioRoutesChanged(
     val routes: List<T3VoiceAudioRoute>,

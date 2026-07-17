@@ -71,11 +71,11 @@ internal interface T3VoiceRealtimeSessionApi {
     leaseGeneration: Long,
   )
 
-  fun updateRealtimeFocus(
+  fun updateRealtimeContext(
     calls: T3VoiceHttpCallRegistry,
     sessionId: String,
     leaseGeneration: Long,
-    focus: T3VoiceRealtimeFocus?,
+    context: T3VoiceRealtimeContext,
   ): T3VoiceApiSessionState
 
   fun acknowledgeRealtimeClientAction(
@@ -320,6 +320,10 @@ internal class T3VoiceNativeVoiceApi(
         .put("mode", "realtime-agent")
         .put("conversation", target.conversation.toJson())
         .put(
+          "terminalActions",
+          JSONArray(t3VoiceRealtimeTerminalActions(target)),
+        )
+        .put(
           "media",
           JSONObject()
             .put("transports", JSONArray().put("webrtc-sdp-v1"))
@@ -394,18 +398,14 @@ internal class T3VoiceNativeVoiceApi(
     response.requiredObject("state").sessionState(sessionId, leaseGeneration)
   }
 
-  override fun updateRealtimeFocus(
+  override fun updateRealtimeContext(
     calls: T3VoiceHttpCallRegistry,
     sessionId: String,
     leaseGeneration: Long,
-    focus: T3VoiceRealtimeFocus?,
+    context: T3VoiceRealtimeContext,
   ): T3VoiceApiSessionState {
     ensureCredentialValid()
-    val payload = JSONObject().put("leaseGeneration", leaseGeneration)
-    focus?.let {
-      payload.put("projectId", requireId(it.projectId, "projectId"))
-      payload.put("threadId", requireId(it.threadId, "threadId"))
-    }
+    val payload = t3VoiceRealtimeContextPayload(context, leaseGeneration)
     val path = "/api/voice/sessions/${sessionId.pathSegment()}/focus"
     return calls.execute(transport.postJson(path, payload.toString())).jsonObject()
       .requiredObject("state")
@@ -626,7 +626,7 @@ private fun JSONObject.sessionState(
   return state
 }
 
-private fun JSONObject.realtimeEvent(
+internal fun JSONObject.realtimeEvent(
   expectedSessionId: String,
   expectedLeaseGeneration: Long,
 ): T3VoiceApiRealtimeEvent {
@@ -686,6 +686,14 @@ private fun JSONObject.realtimeEvent(
         ),
       )
     }
+    "terminal-action" ->
+      T3VoiceApiRealtimeEvent.TerminalAction(
+        sequence,
+        T3VoiceRealtimeTerminalAction(
+          actionId = requiredString("actionId"),
+          type = t3VoiceRealtimeTerminalActionType(requiredString("action")),
+        ),
+      )
     "lease-fenced" -> {
       requiredPositiveLong("replacementGeneration")
       T3VoiceApiRealtimeEvent.LeaseFenced(sequence)
@@ -714,6 +722,45 @@ private fun JSONObject.realtimeEvent(
   }
 }
 
+internal fun t3VoiceRealtimeTerminalActions(target: T3VoiceRealtimeTarget): List<String> =
+  t3VoiceRealtimeTerminalActions(T3VoiceRealtimeContext(target.focus, target.threadSwitch))
+
+internal fun t3VoiceRealtimeTerminalActions(context: T3VoiceRealtimeContext): List<String> =
+  buildList {
+    add("stop-realtime")
+    if (context.threadSwitch != null) add("switch-to-thread")
+  }
+
+internal fun t3VoiceRealtimeTerminalActionType(value: String): T3VoiceRealtimeTerminalActionType =
+  when (value) {
+    "stop-realtime" -> T3VoiceRealtimeTerminalActionType.STOP_REALTIME
+    "switch-to-thread" -> T3VoiceRealtimeTerminalActionType.SWITCH_TO_THREAD
+    else -> error("Realtime terminal action was unsupported.")
+  }
+
+internal fun t3VoiceRealtimeContextFields(
+  context: T3VoiceRealtimeContext,
+  leaseGeneration: Long,
+): Map<String, Any> =
+  buildMap {
+    put("leaseGeneration", leaseGeneration)
+    put("terminalActions", t3VoiceRealtimeTerminalActions(context))
+    context.focus?.let {
+      put("projectId", requireId(it.projectId, "projectId"))
+      put("threadId", requireId(it.threadId, "threadId"))
+    }
+  }
+
+internal fun t3VoiceRealtimeContextPayload(
+  context: T3VoiceRealtimeContext,
+  leaseGeneration: Long,
+): JSONObject =
+  JSONObject().also { payload ->
+    t3VoiceRealtimeContextFields(context, leaseGeneration).forEach { (key, value) ->
+      payload.put(key, if (value is List<*>) JSONArray(value) else value)
+    }
+  }
+
 private fun toolName(value: String): T3VoiceToolName =
   when (value) {
     "list_projects" -> T3VoiceToolName.LIST_PROJECTS
@@ -724,6 +771,8 @@ private fun toolName(value: String): T3VoiceToolName =
     "search_history" -> T3VoiceToolName.SEARCH_HISTORY
     "read_history" -> T3VoiceToolName.READ_HISTORY
     "activate_thread" -> T3VoiceToolName.ACTIVATE_THREAD
+    "stop_realtime_voice" -> T3VoiceToolName.STOP_REALTIME_VOICE
+    "switch_to_thread_voice" -> T3VoiceToolName.SWITCH_TO_THREAD_VOICE
     "create_thread" -> T3VoiceToolName.CREATE_THREAD
     "send_thread_message" -> T3VoiceToolName.SEND_THREAD_MESSAGE
     "interrupt_thread" -> T3VoiceToolName.INTERRUPT_THREAD

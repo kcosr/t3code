@@ -91,18 +91,25 @@ internal class T3VoiceNativeRuntimeDriver(
     created.start()
   }
 
-  override fun closeRealtime(generation: Long, preserveSessionForThread: Boolean) {
+  override fun closeRealtime(
+    generation: Long,
+    preserveSessionForThread: Boolean,
+    drainPlayout: Boolean,
+  ) {
     val session = requireRealtime(generation)
     realtimeThreadTransfer.begin(generation, preserveSessionForThread)
-    session.close()
+    if (drainPlayout) session.closeAfterPlayoutDrain() else session.close()
   }
 
   override fun cancelRealtimeToThreadSwitch(generation: Long) {
-    synchronized(lock) {
-      val current = realtimeSession
-      if (current != null && current.generation != generation) return
-      realtimeThreadTransfer.cancel(generation)
-    }
+    val session =
+      synchronized(lock) {
+        val current = realtimeSession
+        if (current != null && current.generation != generation) return
+        realtimeThreadTransfer.cancel(generation)
+        current
+      }
+    session?.close()
   }
 
   override fun setRealtimeMuted(generation: Long, muted: Boolean) {
@@ -114,7 +121,7 @@ internal class T3VoiceNativeRuntimeDriver(
   }
 
   override fun updateRealtimeContext(generation: Long, context: T3VoiceRealtimeContext) {
-    requireRealtime(generation).admitFocus(context.focus)
+    requireRealtime(generation).admitContext(context)
   }
 
   override fun decideRealtimeConfirmation(
@@ -141,10 +148,6 @@ internal class T3VoiceNativeRuntimeDriver(
 
   override fun rearmThreadRecording(generation: Long) {
     requireThread(generation).rearmRecording()
-  }
-
-  override fun admitRealtimeFocusUpdate(generation: Long, focus: T3VoiceRealtimeFocus) {
-    requireRealtime(generation).admitFocus(focus)
   }
 
   override fun acknowledgeRealtimeClientAction(

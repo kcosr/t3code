@@ -2,6 +2,7 @@ import type {
   VoiceCapability,
   VoiceRequestId,
   VoiceSessionId,
+  VoiceTerminalAction,
   VoiceTranscriptionStreamEvent,
   VoiceWebRtcAnswer,
   VoiceWebRtcOffer,
@@ -43,6 +44,7 @@ export interface RealtimeNegotiationRequest {
   readonly leaseGeneration: number;
   readonly offer: VoiceWebRtcOffer;
   readonly instructions: string;
+  readonly terminalActions: ReadonlySet<VoiceTerminalAction>;
   readonly continuationContext: ReadonlyArray<RealtimeContextItem>;
 }
 
@@ -54,6 +56,10 @@ export interface RealtimeContextItem {
 export interface RealtimeToolOutput {
   readonly providerFunctionCallId: string;
   readonly output: string;
+}
+
+export interface RealtimeTerminalToolOutput extends RealtimeToolOutput {
+  readonly itemId: string;
 }
 
 export type RealtimeProviderEvent =
@@ -91,7 +97,13 @@ export interface RealtimeProviderSession {
   readonly answer: VoiceWebRtcAnswer;
   readonly events: Stream.Stream<RealtimeProviderEvent, VoiceError>;
   readonly updateContext: (item: RealtimeContextItem) => Effect.Effect<void, VoiceError>;
+  readonly updateTerminalActions: (
+    actions: ReadonlySet<VoiceTerminalAction>,
+  ) => Effect.Effect<void, VoiceError>;
   readonly submitToolOutput: (output: RealtimeToolOutput) => Effect.Effect<void, VoiceError>;
+  readonly completeTerminalToolCall: (
+    output: RealtimeTerminalToolOutput,
+  ) => Effect.Effect<void, VoiceError>;
   readonly terminate: Effect.Effect<void, VoiceError>;
 }
 

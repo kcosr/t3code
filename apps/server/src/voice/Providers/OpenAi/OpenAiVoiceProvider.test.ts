@@ -503,6 +503,7 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
         sdp: "offer-sdp",
       },
       instructions: "Control T3 threads.",
+      terminalActions: new Set(),
       continuationContext: [
         { role: "system", text: "Previous work was in project one." },
         { role: "assistant", text: "I found the project." },
@@ -762,6 +763,7 @@ it.effect("coalesces parallel tool outputs into one continuation in either compl
           sdp: "offer-sdp",
         },
         instructions: "test",
+        terminalActions: new Set(),
         continuationContext: [],
       });
       yield* session.events.pipe(Stream.runDrain);
@@ -849,6 +851,7 @@ it.effect("does not track malformed completed function calls as pending continua
         sdp: "offer-sdp",
       },
       instructions: "test",
+      terminalActions: new Set(),
       continuationContext: [],
     });
     yield* session.events.pipe(Stream.runDrain);
@@ -921,6 +924,7 @@ it.effect("waits for an acknowledged live context update on the sideband event s
         sdp: "offer-sdp",
       },
       instructions: "test",
+      terminalActions: new Set(),
       continuationContext: [],
     });
     const eventFiber = yield* session.events.pipe(Stream.runDrain, Effect.forkScoped);
@@ -949,6 +953,184 @@ it.effect("waits for an acknowledged live context update on the sideband event s
     yield* Fiber.interrupt(eventFiber);
     yield* session.terminate;
   }),
+);
+
+it("exposes only the terminal tools advertised for negotiation", () => {
+  const names = (actions: ReadonlySet<"stop-realtime" | "switch-to-thread">) =>
+    __testing
+      .providerSessionConfig("test", actions)
+      .tools.map((tool) => tool.name)
+      .filter((name) => name === "stop_realtime_voice" || name === "switch_to_thread_voice");
+
+  expect(names(new Set())).toEqual([]);
+  expect(names(new Set(["stop-realtime"]))).toEqual(["stop_realtime_voice"]);
+  expect(names(new Set(["switch-to-thread"]))).toEqual(["switch_to_thread_voice"]);
+  expect(names(new Set(["stop-realtime", "switch-to-thread"]))).toEqual([
+    "stop_realtime_voice",
+    "switch_to_thread_voice",
+  ]);
+  expect(__testing.providerSessionConfig("test", new Set()).parallel_tool_calls).toBe(false);
+});
+
+it.effect(
+  "updates terminal tools dynamically and completes a terminal call without another response",
+  () =>
+    Effect.gen(function* () {
+      const queueReady = yield* Deferred.make<Queue.Queue<OpenAiRealtimeSocketEvent>>();
+      const firstUpdateSent = yield* Deferred.make<void>();
+      const secondUpdateSent = yield* Deferred.make<void>();
+      const terminalOutputSent = yield* Deferred.make<void>();
+      const sent: Array<string> = [];
+      let updateCount = 0;
+      const httpClient = HttpClient.make((request) =>
+        Effect.succeed(
+          HttpClientResponse.fromWeb(
+            request,
+            request.url.endsWith("/hangup")
+              ? new Response(null, { status: 200 })
+              : new Response("answer-sdp", {
+                  status: 201,
+                  headers: { location: "/v1/realtime/calls/rtc_terminal_tools" },
+                }),
+          ),
+        ),
+      );
+      const socket = OpenAiRealtimeSocket.of({
+        connect: () =>
+          Effect.gen(function* () {
+            const queue = yield* Queue.unbounded<OpenAiRealtimeSocketEvent>();
+            yield* Deferred.succeed(queueReady, queue);
+            return {
+              events: Stream.fromQueue(queue),
+              receive: Queue.take(queue),
+              send: (data: string) =>
+                Effect.gen(function* () {
+                  sent.push(data);
+                  const message = decodeJson(data) as { readonly type?: string };
+                  if (message.type === "session.update") {
+                    updateCount += 1;
+                    yield* Deferred.succeed(
+                      updateCount === 1 ? firstUpdateSent : secondUpdateSent,
+                      undefined,
+                    );
+                  }
+                  if (message.type === "conversation.item.create") {
+                    yield* Deferred.succeed(terminalOutputSent, undefined);
+                  }
+                }),
+              close: Effect.void,
+            } satisfies OpenAiRealtimeSocketConnection;
+          }),
+      });
+      const provider = yield* __testing.make.pipe(
+        Effect.provideService(HttpClient.HttpClient, httpClient),
+        Effect.provideService(VoiceCredentialStore, credentialStore(Option.some("sk-test"))),
+        Effect.provideService(OpenAiRealtimeSocket, socket),
+      );
+      const session = yield* provider.realtime!.negotiate({
+        sessionId: "voice-session-terminal-tools" as never,
+        leaseGeneration: 2,
+        offer: {
+          sessionId: "voice-session-terminal-tools" as never,
+          leaseGeneration: 2,
+          sdp: "offer-sdp",
+        },
+        instructions: "test",
+        terminalActions: new Set(["stop-realtime"]),
+        continuationContext: [],
+      });
+      const eventFiber = yield* session.events.pipe(Stream.runDrain, Effect.forkScoped);
+      const queue = yield* Deferred.await(queueReady);
+
+      const adding = yield* session
+        .updateTerminalActions(new Set(["stop-realtime", "switch-to-thread"]))
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(firstUpdateSent);
+      yield* Queue.offer(queue, {
+        type: "message",
+        data: encodeJson({ type: "session.updated", session: { type: "realtime" } }),
+      });
+      yield* Fiber.join(adding);
+
+      const removing = yield* session
+        .updateTerminalActions(new Set(["stop-realtime"]))
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(secondUpdateSent);
+      yield* Queue.offer(queue, {
+        type: "message",
+        data: encodeJson({ type: "session.updated", session: { type: "realtime" } }),
+      });
+      yield* Fiber.join(removing);
+
+      const terminalOutput = {
+        providerFunctionCallId: "call-terminal-stop",
+        output: '{"status":"accepted"}',
+        itemId: "t3t_terminal_stop_item",
+      };
+      const completing = yield* session
+        .completeTerminalToolCall(terminalOutput)
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(terminalOutputSent);
+      yield* Queue.offer(queue, {
+        type: "message",
+        data: encodeJson({
+          type: "conversation.item.done",
+          item: { id: terminalOutput.itemId },
+        }),
+      });
+      yield* Fiber.join(completing);
+      yield* session.completeTerminalToolCall(terminalOutput);
+
+      const differentTerminal = yield* session
+        .completeTerminalToolCall({ ...terminalOutput, itemId: "different-terminal-item" })
+        .pipe(Effect.flip);
+      expect(differentTerminal.detail).toContain("different terminal tool output");
+      const lateUpdate = yield* session
+        .updateTerminalActions(new Set(["stop-realtime", "switch-to-thread"]))
+        .pipe(Effect.flip);
+      expect(lateUpdate.detail).toContain("already accepted a terminal tool output");
+
+      const messages = sent.map((message) => decodeJson(message)) as ReadonlyArray<{
+        readonly type?: string;
+        readonly session?: {
+          readonly tools?: ReadonlyArray<{ readonly name?: string }>;
+          readonly parallel_tool_calls?: boolean;
+        };
+      }>;
+      expect(
+        messages
+          .filter((message) => message.type === "session.update")
+          .map((message) =>
+            message.session?.tools
+              ?.map((tool) => tool.name)
+              .filter(
+                (name) => name === "stop_realtime_voice" || name === "switch_to_thread_voice",
+              ),
+          ),
+      ).toEqual([["stop_realtime_voice", "switch_to_thread_voice"], ["stop_realtime_voice"]]);
+      expect(
+        messages
+          .filter((message) => message.type === "session.update")
+          .every((message) => message.session?.parallel_tool_calls === false),
+      ).toBe(true);
+      expect(messages.filter((message) => message.type === "conversation.item.create")).toEqual([
+        {
+          type: "conversation.item.create",
+          event_id: `t3_terminal_output_${terminalOutput.itemId}`,
+          item: {
+            id: terminalOutput.itemId,
+            type: "function_call_output",
+            call_id: terminalOutput.providerFunctionCallId,
+            output: terminalOutput.output,
+          },
+        },
+      ]);
+      expect(messages.some((message) => message.type === "response.cancel")).toBe(false);
+      expect(messages.some((message) => message.type === "response.create")).toBe(false);
+
+      yield* Fiber.interrupt(eventFiber);
+      yield* session.terminate;
+    }),
 );
 
 it.effect("hangs up the provider call when sideband attachment fails", () =>
@@ -996,6 +1178,7 @@ it.effect("hangs up the provider call when sideband attachment fails", () =>
           sdp: "offer-sdp",
         },
         instructions: "test",
+        terminalActions: new Set(),
         continuationContext: [],
       })
       .pipe(Effect.flip);
@@ -1062,6 +1245,7 @@ it.effect("rejects startup and hangs up when OpenAI rejects a replay item", () =
           sdp: "offer-sdp",
         },
         instructions: "test",
+        terminalActions: new Set(),
         continuationContext: [{ role: "user", text: "My code word is heliotrope." }],
       })
       .pipe(Effect.flip);
@@ -1129,6 +1313,7 @@ it.effect("rejects startup when the sideband closes before every replay item is 
           sdp: "offer-sdp",
         },
         instructions: "test",
+        terminalActions: new Set(),
         continuationContext: [
           { role: "user", text: "My code word is heliotrope." },
           { role: "assistant", text: "I will remember that." },

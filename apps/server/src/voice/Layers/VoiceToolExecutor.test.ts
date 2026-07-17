@@ -650,6 +650,52 @@ it.effect("waits for acknowledged thread activation and deduplicates the client 
   }),
 );
 
+it.effect("completes terminal voice tools deterministically and durably deduplicates them", () =>
+  Effect.gen(function* () {
+    const test = yield* makeTest();
+    yield* Effect.gen(function* () {
+      const tools = yield* VoiceToolExecutor;
+      const stopInput = call(
+        "stop_realtime_voice",
+        "{}",
+        "terminal-stop",
+        new Set([AuthVoiceUseScope]),
+      );
+      const stop = yield* tools.invoke(stopInput);
+      expect(stop).toMatchObject({
+        type: "terminal-completed",
+        tool: "stop_realtime_voice",
+        outcome: "succeeded",
+        terminalAction: { action: "stop-realtime" },
+      });
+      if (stop.type !== "terminal-completed") return;
+      expect(decodeJson(stop.output)).toEqual({
+        status: "accepted",
+        actionId: stop.terminalAction.actionId,
+        action: "stop-realtime",
+      });
+      expect(stop.terminalAction.actionId.length).toBeLessThanOrEqual(128);
+      expect(yield* tools.invoke(stopInput)).toEqual(stop);
+
+      const switching = yield* tools.invoke(
+        call("switch_to_thread_voice", "{}", "terminal-switch", new Set([AuthVoiceUseScope])),
+      );
+      expect(switching).toMatchObject({
+        type: "terminal-completed",
+        tool: "switch_to_thread_voice",
+        outcome: "succeeded",
+        terminalAction: { action: "switch-to-thread" },
+      });
+
+      const invalid = yield* tools.invoke(
+        call("stop_realtime_voice", '{"legacy":true}', "terminal-invalid"),
+      );
+      expect(invalid.type === "completed" && invalid.outcome).toBe("failed");
+      expect(yield* Ref.get(test.durableCalls)).toHaveLength(3);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
 it.effect("binds history search to the current conversation and requires every source scope", () =>
   Effect.gen(function* () {
     const test = yield* makeTest();

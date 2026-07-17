@@ -40,6 +40,19 @@ it("builds correlated voice diagnostics without accepting content-bearing fields
   });
   expect(
     voiceDiagnostic({
+      type: "session-ended",
+      sessionId: VoiceSessionId.make("voice-session-terminal"),
+      leaseGeneration: 1,
+      outcome: "ended",
+      reason: "agent-terminal-action",
+      previousPhase: "speaking",
+      sessionDurationMs: 500,
+      providerAttached: true,
+      providerActivityObserved: true,
+    }).level,
+  ).toBe("info");
+  expect(
+    voiceDiagnostic({
       type: "provider-sideband-attached",
       sessionId: VoiceSessionId.make("voice-session-1"),
       leaseGeneration: 2,

@@ -203,6 +203,9 @@ export type VoiceConversationDeleteResult = typeof VoiceConversationDeleteResult
 export const VoiceSessionMode = Schema.Literals(["realtime-transcription", "realtime-agent"]);
 export type VoiceSessionMode = typeof VoiceSessionMode.Type;
 
+export const VoiceTerminalAction = Schema.Literals(["stop-realtime", "switch-to-thread"]);
+export type VoiceTerminalAction = typeof VoiceTerminalAction.Type;
+
 const VoiceSdp = Schema.String.check(Schema.isPattern(/\S/));
 
 export const VoiceSessionPhase = Schema.Literals([
@@ -248,6 +251,7 @@ export const VoiceSessionCreateInput = Schema.Struct({
   conversation: VoiceConversationSelection,
   projectId: Schema.optionalKey(ProjectId),
   threadId: Schema.optionalKey(ThreadId),
+  terminalActions: Schema.Array(VoiceTerminalAction),
   media: VoiceClientMediaCapabilities,
   idempotencyKey: TrimmedNonEmptyString,
 });
@@ -285,11 +289,13 @@ export type VoiceSessionLeaseInput = typeof VoiceSessionLeaseInput.Type;
 export const VoiceSessionFocusInput = Schema.Union([
   Schema.Struct({
     leaseGeneration: PositiveInt,
+    terminalActions: Schema.Array(VoiceTerminalAction),
     projectId: ProjectId,
     threadId: Schema.optionalKey(ThreadId),
   }),
   Schema.Struct({
     leaseGeneration: PositiveInt,
+    terminalActions: Schema.Array(VoiceTerminalAction),
     projectId: Schema.optionalKey(Schema.Never),
     threadId: Schema.optionalKey(Schema.Never),
   }),
@@ -350,6 +356,8 @@ export const VoiceToolName = Schema.Literals([
   "search_history",
   "read_history",
   "activate_thread",
+  "stop_realtime_voice",
+  "switch_to_thread_voice",
   "create_thread",
   "send_thread_message",
   "interrupt_thread",
@@ -418,6 +426,12 @@ export const VoiceSessionEvent = Schema.Union([
     projectId: ProjectId,
     threadId: ThreadId,
     expiresAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    ...VoiceEventBase,
+    type: Schema.Literal("terminal-action"),
+    action: VoiceTerminalAction,
+    actionId: VoiceClientActionId,
   }),
   Schema.Struct({
     ...VoiceEventBase,

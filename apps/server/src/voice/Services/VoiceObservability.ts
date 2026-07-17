@@ -73,6 +73,7 @@ export type VoiceDiagnosticEvent =
     };
 
 export type VoiceSessionEndReason =
+  | "agent-terminal-action"
   | "auth-revoked"
   | "client-request"
   | "context-persistence-failed"
@@ -98,6 +99,7 @@ const requestCorrelationKey = (requestId: VoiceRequestId): string =>
   NodeCrypto.createHmac("sha256", requestCorrelationSecret).update(requestId).digest("base64url");
 
 const expectedSessionEndReasons = new Set<VoiceSessionEndReason>([
+  "agent-terminal-action",
   "auth-revoked",
   "client-request",
   "conversation-cleared",

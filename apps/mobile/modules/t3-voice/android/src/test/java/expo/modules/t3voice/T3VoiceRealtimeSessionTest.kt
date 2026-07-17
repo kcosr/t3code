@@ -4,6 +4,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -275,6 +276,145 @@ internal class T3VoiceRealtimeSessionTest {
     assertTrue(quiesced.await(1, TimeUnit.SECONDS))
   }
 
+  @Test
+  fun `agent close fences input and waits for playout before stopping media`() {
+    val media = TestRealtimeMedia()
+    val quiesced = CountDownLatch(1)
+    val session =
+      session(
+        generation = 1,
+        api = TestRealtimeApi("session-drain"),
+        media = media,
+        routing = TestAudioRouting(),
+        onQuiesced = { quiesced.countDown() },
+      )
+    session.start()
+    assertTrue(media.prepareCompleted.await(1, TimeUnit.SECONDS))
+
+    session.closeAfterPlayoutDrain()
+
+    assertTrue(media.drainEntered.await(1, TimeUnit.SECONDS))
+    assertEquals(1L, media.stopEntered.count)
+    assertFalse(quiesced.await(100, TimeUnit.MILLISECONDS))
+    media.completeDrain(T3VoiceRealtimePlayoutDrainOutcome.DRAINED)
+    assertTrue(media.stopEntered.await(1, TimeUnit.SECONDS))
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `user close overrides an agent playout drain immediately`() {
+    val media = TestRealtimeMedia()
+    val quiesced = CountDownLatch(1)
+    val session =
+      session(
+        generation = 1,
+        api = TestRealtimeApi("session-drain-override"),
+        media = media,
+        routing = TestAudioRouting(),
+        onQuiesced = { quiesced.countDown() },
+      )
+    session.start()
+    assertTrue(media.prepareCompleted.await(1, TimeUnit.SECONDS))
+    session.closeAfterPlayoutDrain()
+    assertTrue(media.drainEntered.await(1, TimeUnit.SECONDS))
+
+    session.close()
+
+    assertTrue(media.stopEntered.await(1, TimeUnit.SECONDS))
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `session-ended playout completion tears down without waiting for the deadline`() {
+    val media = TestRealtimeMedia()
+    val quiesced = CountDownLatch(1)
+    val session =
+      session(
+        generation = 1,
+        api = TestRealtimeApi("session-ended-drain"),
+        media = media,
+        routing = TestAudioRouting(),
+        onQuiesced = { quiesced.countDown() },
+      )
+    session.start()
+    assertTrue(media.prepareCompleted.await(1, TimeUnit.SECONDS))
+    session.closeAfterPlayoutDrain()
+    assertTrue(media.drainEntered.await(1, TimeUnit.SECONDS))
+
+    media.completeDrain(T3VoiceRealtimePlayoutDrainOutcome.SESSION_ENDED)
+
+    assertTrue(media.stopEntered.await(1, TimeUnit.SECONDS))
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `duplicate terminal events are admitted only once while Realtime is starting`() {
+    val action =
+      T3VoiceRealtimeTerminalAction("terminal-a", T3VoiceRealtimeTerminalActionType.STOP_REALTIME)
+    val api =
+      TestRealtimeApi(
+        sessionId = "session-terminal-event",
+        initialEvents =
+          listOf(
+            T3VoiceApiRealtimeEvent.TerminalAction(1, action),
+            T3VoiceApiRealtimeEvent.TerminalAction(2, action),
+          ),
+      )
+    val received = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val actionReceived = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    val session =
+      session(
+        generation = 1,
+        api = api,
+        media = TestRealtimeMedia(),
+        routing = TestAudioRouting(),
+        emit = {
+          received += it
+          if (it is T3VoiceRuntimeCallback.RealtimeTerminalActionReceived) {
+            actionReceived.countDown()
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    session.start()
+
+    assertTrue(actionReceived.await(1, TimeUnit.SECONDS))
+    assertEquals(1, received.filterIsInstance<T3VoiceRuntimeCallback.RealtimeTerminalActionReceived>().size)
+    session.close()
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `context updates add and remove the terminal switch capability`() {
+    val api = TestRealtimeApi("session-context")
+    val media = TestRealtimeMedia()
+    val quiesced = CountDownLatch(1)
+    val session =
+      session(
+        generation = 1,
+        api = api,
+        media = media,
+        routing = TestAudioRouting(),
+        onQuiesced = { quiesced.countDown() },
+      )
+    session.start()
+    assertTrue(media.prepareCompleted.await(1, TimeUnit.SECONDS))
+    val focus = T3VoiceRealtimeFocus("project-a", "thread-a")
+    val withSwitch = T3VoiceRealtimeContext(focus, T3VoiceThreadStart(THREAD_TARGET, THREAD_SETTINGS))
+
+    session.admitContext(withSwitch)
+    assertEquals(withSwitch, api.contextUpdates.poll(1, TimeUnit.SECONDS))
+
+    val withoutSwitch = T3VoiceRealtimeContext(focus, null)
+    session.admitContext(withoutSwitch)
+    assertEquals(withoutSwitch, api.contextUpdates.poll(1, TimeUnit.SECONDS))
+
+    session.close()
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
   private fun session(
     generation: Long,
     api: T3VoiceRealtimeSessionApi,
@@ -357,6 +497,13 @@ internal class T3VoiceRealtimeSessionTest {
     override fun stop(sessionId: String): Boolean =
       fence.retireCancelledBeforeBegin(sessionId)
 
+    override fun fenceInputAndDrainPlayout(
+      sessionId: String,
+      onComplete: (T3VoiceRealtimePlayoutDrainOutcome) -> Unit,
+    ) {
+      onComplete(T3VoiceRealtimePlayoutDrainOutcome.DRAINED)
+    }
+
     override fun setMuted(sessionId: String, muted: Boolean) = Unit
 
     override fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>> =
@@ -373,6 +520,7 @@ internal class T3VoiceRealtimeSessionTest {
     val prepareCompleted = CountDownLatch(1)
     val secondPrepareCompleted = CountDownLatch(1)
     val stopEntered = CountDownLatch(1)
+    val drainEntered = CountDownLatch(1)
     val allowStopToReturn = CountDownLatch(1)
     val prepareCount = AtomicInteger(0)
     val cancelledBeforeInstall = AtomicInteger(0)
@@ -380,6 +528,7 @@ internal class T3VoiceRealtimeSessionTest {
     private val lock = Any()
     private val cancelled = mutableSetOf<String>()
     private var activeSession: String? = null
+    private var drainCompletion: ((T3VoiceRealtimePlayoutDrainOutcome) -> Unit)? = null
 
     override fun cancelStartup(sessionId: String) {
       synchronized(lock) { cancelled += sessionId }
@@ -425,6 +574,23 @@ internal class T3VoiceRealtimeSessionTest {
       return true
     }
 
+    override fun fenceInputAndDrainPlayout(
+      sessionId: String,
+      onComplete: (T3VoiceRealtimePlayoutDrainOutcome) -> Unit,
+    ) {
+      synchronized(lock) {
+        check(activeSession == sessionId)
+        check(drainCompletion == null)
+        drainCompletion = onComplete
+      }
+      drainEntered.countDown()
+    }
+
+    fun completeDrain(outcome: T3VoiceRealtimePlayoutDrainOutcome) {
+      val completion = synchronized(lock) { drainCompletion.also { drainCompletion = null } }
+      checkNotNull(completion).invoke(outcome)
+    }
+
     override fun setMuted(sessionId: String, muted: Boolean) = Unit
 
     override fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>> =
@@ -452,6 +618,13 @@ internal class T3VoiceRealtimeSessionTest {
 
     override fun stop(sessionId: String): Boolean = true
 
+    override fun fenceInputAndDrainPlayout(
+      sessionId: String,
+      onComplete: (T3VoiceRealtimePlayoutDrainOutcome) -> Unit,
+    ) {
+      onComplete(T3VoiceRealtimePlayoutDrainOutcome.DRAINED)
+    }
+
     override fun setMuted(sessionId: String, muted: Boolean) = Unit
 
     override fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>> =
@@ -462,12 +635,15 @@ internal class T3VoiceRealtimeSessionTest {
     private val sessionId: String,
     private val blockEventsUntilReleased: Boolean = false,
     private val blockOfferUntilReleased: Boolean = false,
+    private val initialEvents: List<T3VoiceApiRealtimeEvent> = emptyList(),
   ) : T3VoiceRealtimeSessionApi {
     val createCount = AtomicInteger(0)
     val eventEntered = CountDownLatch(1)
     val allowEventToReturn = CountDownLatch(1)
     val offerEntered = CountDownLatch(1)
     val allowOfferToReturn = CountDownLatch(1)
+    val contextUpdates = LinkedBlockingQueue<T3VoiceRealtimeContext>()
+    private val initialEventsDelivered = AtomicBoolean(false)
 
     override fun createRealtimeSession(
       calls: T3VoiceHttpCallRegistry,
@@ -507,12 +683,15 @@ internal class T3VoiceRealtimeSessionTest {
       leaseGeneration: Long,
     ) = Unit
 
-    override fun updateRealtimeFocus(
+    override fun updateRealtimeContext(
       calls: T3VoiceHttpCallRegistry,
       sessionId: String,
       leaseGeneration: Long,
-      focus: T3VoiceRealtimeFocus?,
-    ): T3VoiceApiSessionState = state()
+      context: T3VoiceRealtimeContext,
+    ): T3VoiceApiSessionState {
+      contextUpdates.offer(context)
+      return state()
+    }
 
     override fun acknowledgeRealtimeClientAction(
       calls: T3VoiceHttpCallRegistry,
@@ -536,6 +715,12 @@ internal class T3VoiceRealtimeSessionTest {
       leaseGeneration: Long,
       afterSequence: Long,
     ): T3VoiceApiRealtimeEvents {
+      if (initialEvents.isNotEmpty() && initialEventsDelivered.compareAndSet(false, true)) {
+        return T3VoiceApiRealtimeEvents(
+          state(sequence = initialEvents.maxOf(T3VoiceApiRealtimeEvent::sequence)),
+          events = initialEvents,
+        )
+      }
       if (blockEventsUntilReleased) {
         eventEntered.countDown()
         awaitIgnoringInterrupt(allowEventToReturn)
@@ -550,13 +735,13 @@ internal class T3VoiceRealtimeSessionTest {
       error("Realtime event wait unexpectedly returned.")
     }
 
-    private fun state() =
+    private fun state(sequence: Long = 0) =
       T3VoiceApiSessionState(
         sessionId = sessionId,
         conversationId = "conversation-$sessionId",
         phase = "live",
         leaseGeneration = 1,
-        sequence = 0,
+        sequence = sequence,
       )
   }
 
@@ -573,6 +758,26 @@ internal class T3VoiceRealtimeSessionTest {
         conversation = T3VoiceConversationSelection.New(T3VoiceConversationRetention.EPHEMERAL, null),
         focus = null,
         threadSwitch = null,
+      )
+    val THREAD_TARGET =
+      T3VoiceThreadTarget(
+        environmentId = "environment-a",
+        projectId = "project-a",
+        threadId = "thread-a",
+        modelSelection = T3VoiceModelSelection("codex", "gpt-5.4", null),
+        runtimeMode = T3VoiceThreadRuntimeMode.FULL_ACCESS,
+        interactionMode = T3VoiceThreadInteractionMode.DEFAULT,
+      )
+    val THREAD_SETTINGS =
+      T3VoiceThreadSettings(
+        submissionPolicy = T3VoiceThreadSubmissionPolicy.AUTO_SUBMIT,
+        playResponses = true,
+        autoRearm = true,
+        endpointDetection = T3VoiceThreadEndpointDetection(900, 10_000, 120_000),
+        rearmDelayMs = 750,
+        transcriptionTimeoutMs = 600_000,
+        submissionTimeoutMs = 30_000,
+        responseTimeoutMs = 600_000,
       )
   }
 }

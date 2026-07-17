@@ -25,6 +25,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -63,6 +64,7 @@ const summary: VoiceConversationSummary = {
 const input = (takeover: boolean, idempotencyKey: string) => ({
   mode: "realtime-agent" as const,
   conversation: { type: "continue" as const, conversationId, takeover },
+  terminalActions: [],
   media: {
     transports: ["webrtc-sdp-v1" as const],
     audioFormats: ["audio/pcm;rate=24000;encoding=s16le;channels=1" as const],
@@ -688,6 +690,7 @@ it.effect("validates, acknowledges, and journals realtime focus changes in order
       const updating = yield* sessions
         .updateFocus(owner, created.state.sessionId, {
           leaseGeneration: created.state.leaseGeneration,
+          terminalActions: [],
           projectId,
           threadId: nextThreadId,
         })
@@ -708,6 +711,7 @@ it.effect("validates, acknowledges, and journals realtime focus changes in order
       const stale = yield* sessions
         .updateFocus(owner, created.state.sessionId, {
           leaseGeneration: created.state.leaseGeneration + 1,
+          terminalActions: [],
           projectId,
           threadId: initialThreadId,
         })
@@ -719,6 +723,7 @@ it.effect("validates, acknowledges, and journals realtime focus changes in order
       const ended = yield* sessions
         .updateFocus(owner, created.state.sessionId, {
           leaseGeneration: created.state.leaseGeneration,
+          terminalActions: [],
           projectId,
           threadId: initialThreadId,
         })
@@ -780,6 +785,7 @@ it.effect("does not let a blocked focus acknowledgement delay hang-up", () =>
       const updating = yield* sessions
         .updateFocus(owner, created.state.sessionId, {
           leaseGeneration: created.state.leaseGeneration,
+          terminalActions: [],
           projectId,
           threadId: nextThreadId,
         })
@@ -865,6 +871,7 @@ it.effect("completes focus journal failure cleanup outside the cancelled update"
       const updating = yield* sessions
         .updateFocus(owner, created.state.sessionId, {
           leaseGeneration: created.state.leaseGeneration,
+          terminalActions: [],
           projectId,
           threadId,
         })
@@ -1687,6 +1694,210 @@ it.effect("continues handling provider events while a history search is blocked"
       yield* Deferred.succeed(releaseWait, undefined);
       yield* Effect.yieldNow;
       expect(yield* Ref.get(outputs)).toEqual(['{"state":"completed"}']);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect(
+  "publishes one terminal action only after provider acknowledgement and bounds fallback",
+  () =>
+    Effect.gen(function* () {
+      const terminalOutputStarted = yield* Deferred.make<void>();
+      const terminalOutputRelease = yield* Deferred.make<void>();
+      const terminalOutputs = yield* Ref.make(0);
+      const terminations = yield* Ref.make(0);
+      const actionId = VoiceClientActionId.make("terminal-stop-action");
+      const providerFunctionCallId = "terminal-stop-call";
+      const provider: VoiceProviderAdapter = {
+        id: "fake-terminal-stop",
+        capabilities: new Set(["agent.realtime"]),
+        realtime: {
+          negotiate: (request) =>
+            Effect.succeed({
+              answer: {
+                sessionId: request.sessionId,
+                leaseGeneration: request.leaseGeneration,
+                sdp: "fake-answer",
+              },
+              events: Stream.make(
+                {
+                  type: "function-call" as const,
+                  providerFunctionCallId,
+                  name: "stop_realtime_voice",
+                  argumentsJson: "{}",
+                },
+                {
+                  type: "function-call" as const,
+                  providerFunctionCallId,
+                  name: "stop_realtime_voice",
+                  argumentsJson: "{}",
+                },
+              ),
+              updateContext: () => Effect.void,
+              updateTerminalActions: () => Effect.void,
+              submitToolOutput: () => Effect.die("terminal tool used ordinary output"),
+              completeTerminalToolCall: () =>
+                Ref.update(terminalOutputs, (count) => count + 1).pipe(
+                  Effect.andThen(Deferred.succeed(terminalOutputStarted, undefined)),
+                  Effect.andThen(Deferred.await(terminalOutputRelease)),
+                ),
+              terminate: Ref.update(terminations, (count) => count + 1),
+            }),
+        },
+      };
+      const executor = VoiceToolExecutor.of({
+        invoke: (toolCall) =>
+          Effect.succeed({
+            type: "terminal-completed" as const,
+            toolCallId: VoiceToolCallId.make(toolCall.providerFunctionCallId),
+            providerFunctionCallId: toolCall.providerFunctionCallId,
+            tool: "stop_realtime_voice" as const,
+            outcome: "succeeded" as const,
+            output: JSON.stringify({ status: "accepted", actionId, action: "stop-realtime" }),
+            terminalAction: { actionId, action: "stop-realtime" as const },
+          }),
+        decide: () => Effect.die("unused"),
+        expire: () => Effect.succeed(undefined),
+        discardSession: () => Effect.void,
+      });
+      const test = yield* makeLayer(provider, { toolExecutor: executor });
+      yield* Effect.gen(function* () {
+        const sessions = yield* VoiceSessionService;
+        const owner = AuthSessionId.make("terminal-stop-owner");
+        const created = yield* sessions.create(principal(owner), {
+          ...input(false, "terminal-stop"),
+          terminalActions: ["stop-realtime"],
+        });
+        yield* sessions.offer(owner, created.state.sessionId, {
+          sessionId: created.state.sessionId,
+          leaseGeneration: created.state.leaseGeneration,
+          sdp: "offer",
+        });
+        yield* Deferred.await(terminalOutputStarted);
+        expect(
+          (yield* sessions.events(owner, created.state.sessionId, 0, 0)).events.filter(
+            (event) => event.type === "terminal-action",
+          ),
+        ).toHaveLength(0);
+
+        yield* Deferred.succeed(terminalOutputRelease, undefined);
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("1 millis");
+        const terminalEvents = (yield* sessions.events(
+          owner,
+          created.state.sessionId,
+          0,
+          0,
+        )).events.filter((event) => event.type === "terminal-action");
+        expect(terminalEvents).toEqual([
+          expect.objectContaining({
+            type: "terminal-action",
+            actionId,
+            action: "stop-realtime",
+            sessionId: created.state.sessionId,
+            leaseGeneration: created.state.leaseGeneration,
+          }),
+        ]);
+        expect(yield* Ref.get(terminalOutputs)).toBe(1);
+
+        yield* TestClock.adjust("11998 millis");
+        expect(yield* Ref.get(terminations)).toBe(0);
+        yield* TestClock.adjust("2 millis");
+        yield* Effect.yieldNow;
+        expect(yield* Ref.get(terminations)).toBe(1);
+      }).pipe(Effect.provide(test.layer));
+    }),
+);
+
+it.effect("preserves a terminal call received while its capability removal is awaiting ACK", () =>
+  Effect.gen(function* () {
+    const queue = yield* Queue.unbounded<{
+      readonly type: "function-call";
+      readonly providerFunctionCallId: string;
+      readonly name: string;
+      readonly argumentsJson: string;
+    }>();
+    const capabilityUpdateStarted = yield* Deferred.make<void>();
+    const capabilityUpdateRelease = yield* Deferred.make<void>();
+    const terminalCompleted = yield* Deferred.make<void>();
+    const actionId = VoiceClientActionId.make("terminal-race-action");
+    const provider: VoiceProviderAdapter = {
+      id: "fake-terminal-focus-race",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Effect.succeed({
+            answer: {
+              sessionId: request.sessionId,
+              leaseGeneration: request.leaseGeneration,
+              sdp: "fake-answer",
+            },
+            events: Stream.fromQueue(queue),
+            updateContext: () => Effect.void,
+            updateTerminalActions: () =>
+              Deferred.succeed(capabilityUpdateStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(capabilityUpdateRelease)),
+              ),
+            submitToolOutput: () => Effect.die("terminal tool used ordinary output"),
+            completeTerminalToolCall: () => Deferred.succeed(terminalCompleted, undefined),
+            terminate: Effect.void,
+          }),
+      },
+    };
+    const executor = VoiceToolExecutor.of({
+      invoke: (toolCall) =>
+        Effect.succeed({
+          type: "terminal-completed" as const,
+          toolCallId: VoiceToolCallId.make(toolCall.providerFunctionCallId),
+          providerFunctionCallId: toolCall.providerFunctionCallId,
+          tool: "switch_to_thread_voice" as const,
+          outcome: "succeeded" as const,
+          output: JSON.stringify({ status: "accepted", actionId, action: "switch-to-thread" }),
+          terminalAction: { actionId, action: "switch-to-thread" as const },
+        }),
+      decide: () => Effect.die("unused"),
+      expire: () => Effect.succeed(undefined),
+      discardSession: () => Effect.void,
+    });
+    const test = yield* makeLayer(provider, { toolExecutor: executor });
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("terminal-race-owner");
+      const created = yield* sessions.create(principal(owner), {
+        ...input(false, "terminal-race"),
+        terminalActions: ["stop-realtime", "switch-to-thread"],
+      });
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      const updating = yield* sessions
+        .updateFocus(owner, created.state.sessionId, {
+          leaseGeneration: created.state.leaseGeneration,
+          terminalActions: ["stop-realtime"],
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(capabilityUpdateStarted);
+      yield* Queue.offer(queue, {
+        type: "function-call",
+        providerFunctionCallId: "terminal-race-call",
+        name: "switch_to_thread_voice",
+        argumentsJson: "{}",
+      });
+      yield* Effect.yieldNow;
+      expect(yield* Deferred.isDone(terminalCompleted)).toBe(false);
+
+      yield* Deferred.succeed(capabilityUpdateRelease, undefined);
+      yield* Fiber.join(updating);
+      yield* Deferred.await(terminalCompleted);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("1 millis");
+      expect(
+        (yield* sessions.events(owner, created.state.sessionId, 0, 0)).events.filter(
+          (event) => event.type === "terminal-action",
+        ),
+      ).toEqual([expect.objectContaining({ actionId, action: "switch-to-thread" })]);
     }).pipe(Effect.provide(test.layer));
   }),
 );

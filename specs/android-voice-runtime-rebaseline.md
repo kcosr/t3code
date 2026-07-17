@@ -1,9 +1,10 @@
 # Android Voice Runtime Rebaseline
 
-Status: Accepted and implemented product and architecture contract. Release acceptance remains
-governed by the repository, native, artifact, and connected-device gates below. This document
-supersedes the Android ownership, process-death recovery, hands-free ownership, and
-background-control direction in older voice milestone and workstream documents.
+Status: Accepted product and architecture contract. The baseline runtime is implemented; the
+agent-initiated terminal actions specified below remain pending implementation and acceptance.
+Release acceptance remains governed by the repository, native, artifact, and connected-device
+gates below. This document supersedes the Android ownership, process-death recovery, hands-free
+ownership, and background-control direction in older voice milestone and workstream documents.
 
 ## Why this rebaseline exists
 
@@ -158,6 +159,104 @@ The server sees an ordinary Realtime close followed by ordinary Thread work. Con
 remains in its original durable Realtime conversation; no transition record or copied context is
 needed for the mode switch.
 
+## Agent-initiated terminal Realtime actions
+
+The Realtime agent may end the live interaction or request the same native Realtime-to-Thread mode
+switch that React and the notification expose. These are terminal voice actions, not general tool
+calls that produce another assistant response.
+
+The end-state tool contract is:
+
+| Tool                     | Meaning                                                                       | Arguments        |
+| ------------------------ | ----------------------------------------------------------------------------- | ---------------- |
+| `activate_thread`        | Navigate or focus an existing Thread while Realtime continues.                | Exact Thread ID. |
+| `stop_realtime_voice`    | End Realtime and return the native runtime to `Idle`.                         | None.            |
+| `switch_to_thread_voice` | End Realtime and start Thread voice for the currently prepared Thread target. | None.            |
+
+`activate_thread` remains a non-terminal client action with an acknowledged success or failure. It
+does not transfer microphone ownership or change voice modes. `switch_to_thread_voice` is a distinct
+terminal action and uses the complete native `threadSwitch` target and settings already held by the
+active Realtime state. The model does not reconstruct project, runtime, model, interaction, or voice
+settings. The switch tool is available only when a prepared target exists.
+
+The implementation uses the new end-state names directly. It does not restore
+`handoff_to_thread_voice`, add a compatibility alias, or describe the in-process switch as a durable
+handoff.
+
+### Provider and native ordering
+
+For either terminal tool, the model may speak one brief completion or transition sentence. That
+sentence must precede the tool call, and the tool call must be the final output action. Provider
+instructions explicitly prohibit speech after the terminal call. A suitable switch sentence is
+"I'm switching you to the voice thread now; go ahead and continue there." It must not claim that
+the switch already completed.
+
+The terminal sequence is:
+
+1. The model emits the brief final speech and then calls the terminal tool.
+2. The server submits a deterministic function-call result and waits for the provider to
+   acknowledge it. It does not issue `response.create` or otherwise invite another response.
+3. The server publishes one sequenced terminal action to the owning client. Session ID, lease
+   generation, event sequence, and a bounded deterministic action ID make duplicate delivery
+   harmless.
+4. Android admits the action only for the current Realtime generation, immediately enters the
+   stopping or switching state, and fences microphone input so no new user audio reaches the model.
+5. Android drains already queued WebRTC playout before closing the peer.
+6. Stop closes Realtime and proceeds to `Idle`. Switch closes Realtime and invokes the existing
+   native `SwitchingToThread` transition with the prepared target and settings.
+
+React does not acknowledge, adopt, or coordinate either terminal transition. It observes the native
+snapshot if attached. The same behavior therefore works while the Activity is backgrounded or
+React is detached, provided the application process and foreground service remain alive.
+
+### Realtime playout drain
+
+The function call can reach the server and Android before previously generated speech has finished
+playing on the device. Closing the peer immediately would truncate the final sentence, so the
+WebRTC session maintains a process-local PCM playout activity monitor for its lifetime.
+
+After a terminal action is admitted:
+
+- microphone input is fenced before waiting for playback;
+- playout is considered drained after approximately 400 milliseconds without an audible PCM
+  sample;
+- the policy is evaluated approximately every 100 milliseconds;
+- five seconds from native admission is the absolute drain deadline; and
+- reaching the deadline records a privacy-safe diagnostic and continues teardown rather than
+  leaving the voice owner stuck.
+
+Five seconds is a fail-safe, not a fixed delay. Ordinary speech transitions as soon as its queued
+playout finishes and the silence window elapses. A provider/session close or exact playout
+termination may complete the drain sooner. The server's last-resort provider termination deadline
+must exceed the native five-second drain plus normal terminal-action delivery margin so it does not
+cut off healthy playback.
+
+### Failure and ownership rules
+
+- A terminal action is idempotent for its session generation and action ID. Replayed polling
+  results cannot start a second recording or close a replacement session.
+- If the prepared Thread target disappears before the switch is admitted, the runtime does not
+  guess or synthesize settings. It closes Realtime and publishes a sanitized failed switch outcome
+  that permits an explicit retry.
+- Once a terminal action is admitted, conflicting Realtime controls and additional terminal actions
+  are rejected or coalesced through the existing serialized native controller.
+- A drain timeout permits teardown but does not weaken the exact native quiescence rule: Thread
+  recording still cannot start until the Realtime peer and microphone owner have released.
+- Failure to start Thread after Realtime closes follows the existing switch failure semantics; it
+  does not roll back into Realtime.
+- Provider-side fallback termination is bounded and exists only to clean up an abandoned session.
+  Under normal operation, the native client closes the ordinary Realtime session after its playout
+  drain.
+
+The reusable donor behavior comes from `3ce4c4bec` (playout monitoring and drained switch),
+`9eea7d8b9` (input fencing), and `e7fbca373` (terminal stop and provider completion). Those commits
+are design donors rather than cherry-pick units because they also depend on the discarded durable
+handoff and React adoption topology.
+
+This design intentionally does not restore handoff database rows, native-control grants, heartbeat
+handoff state, React recording adoption or acknowledgement, pending-handoff restore, process-death
+recovery, or server-side prepare/commit/rollback routes.
+
 ## Android lifecycle contract
 
 - The user starts microphone work from a visible Activity so Android foreground-service and
@@ -287,6 +386,16 @@ The lean runtime is complete when device tests prove:
 11. No live operation is claimed after deliberate process termination and relaunch.
 12. Temporary tracing is removed after the traced device pass, followed by a clean rebuild and
     affected-device revalidation.
+13. Agent stop speech remains audible through its final sentence, then Realtime reaches `Idle`
+    without another provider response.
+14. Agent switch speech remains audible through its final sentence, then exactly one prepared
+    Thread recording starts after the Realtime owner quiesces.
+15. Terminal action admission fences microphone input immediately; speech or noise during the
+    playout drain is not sent as a new Realtime turn.
+16. Silent, actively playing, already closed, duplicated, and five-second-timeout drain paths all
+    reach their bounded native outcome.
+17. Agent stop and switch work while React is detached and the Activity is backgrounded, and a
+    later React remount observes the resulting native snapshot.
 
 Repository-required typecheck, lint, native compilation, unit tests, instrumented-source
 compilation, APK inspection, signing verification, and in-place installation remain release gates.
@@ -301,8 +410,8 @@ Delivery requires:
 3. Build the server and preview Android client from the same committed SHA.
 4. Inspect the APK package, signature, archive contents, and checksum before installation.
 5. Install in place and exercise Realtime, Thread, background/return, React remount, notification,
-   MediaSession, permission/focus loss, and the Realtime-to-Thread mode switch on the connected
-   device.
+   MediaSession, permission/focus loss, user-initiated and agent-initiated stop, and user-initiated
+   and agent-initiated Realtime-to-Thread mode switches on the connected device.
 6. Use temporary privacy-safe milestone tracing for the first Realtime device pass, then delete only
    that temporary milestone layer, rerun affected gates, rebuild, reinstall, and revalidate. The
    bounded generic diagnostic ring remains for troubleshooting.

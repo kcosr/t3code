@@ -32,6 +32,7 @@ import {
   type VoiceSessionEventsResult,
   type VoiceSessionId,
   type VoiceSessionState,
+  type VoiceTerminalAction,
   type VoiceTranscriptionStreamEvent as VoiceTranscriptionStreamEventType,
   type VoiceWebRtcAnswer,
   type VoiceWebRtcOffer,
@@ -183,8 +184,16 @@ export interface VoiceHttpClient {
     sessionId: VoiceSessionId,
     leaseGeneration: number,
     focus:
-      | { readonly projectId: ProjectId; readonly threadId?: ThreadId }
-      | { readonly projectId?: never; readonly threadId?: never },
+      | {
+          readonly projectId: ProjectId;
+          readonly threadId?: ThreadId;
+          readonly terminalActions: ReadonlyArray<VoiceTerminalAction>;
+        }
+      | {
+          readonly projectId?: never;
+          readonly threadId?: never;
+          readonly terminalActions: ReadonlyArray<VoiceTerminalAction>;
+        },
   ) => Effect.Effect<VoiceSessionFocusResult, RemoteEnvironmentRequestError>;
   readonly closeSession: (
     sessionId: VoiceSessionId,
@@ -475,13 +484,14 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
             ? client.voice.updateSessionFocus({
                 headers,
                 params: { sessionId },
-                payload: { leaseGeneration },
+                payload: { leaseGeneration, terminalActions: focus.terminalActions },
               })
             : client.voice.updateSessionFocus({
                 headers,
                 params: { sessionId },
                 payload: {
                   leaseGeneration,
+                  terminalActions: focus.terminalActions,
                   projectId: focus.projectId,
                   ...(focus.threadId === undefined ? {} : { threadId: focus.threadId }),
                 },

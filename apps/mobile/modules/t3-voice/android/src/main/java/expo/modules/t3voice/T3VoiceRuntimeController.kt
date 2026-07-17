@@ -19,7 +19,11 @@ internal interface T3VoiceRuntimeDriver {
     session: T3VoiceNativeSessionConfig,
   )
 
-  fun closeRealtime(generation: Long, preserveSessionForThread: Boolean)
+  fun closeRealtime(
+    generation: Long,
+    preserveSessionForThread: Boolean,
+    drainPlayout: Boolean,
+  )
 
   fun cancelRealtimeToThreadSwitch(generation: Long)
 
@@ -45,9 +49,6 @@ internal interface T3VoiceRuntimeDriver {
   fun startThreadAfterRealtime(generation: Long, start: T3VoiceThreadStart)
 
   fun rearmThreadRecording(generation: Long)
-
-  /** Enqueues the focus update without waiting for its network round trip. */
-  fun admitRealtimeFocusUpdate(generation: Long, focus: T3VoiceRealtimeFocus)
 
   /** Enqueues the server acknowledgement after focus-update admission. */
   fun acknowledgeRealtimeClientAction(
@@ -110,6 +111,8 @@ internal class T3VoiceRuntimeController(
   private var failedReleasePending = false
   private var failedReleaseUncertain = false
   private var failedStopRequested = false
+  private var admittedTerminalActionId: String? = null
+  private var terminalCloseFailure: T3VoiceFailure? = null
 
   @Volatile
   private var current =
@@ -195,6 +198,8 @@ internal class T3VoiceRuntimeController(
           realtimeClientActionReceived(callback.action)
         is T3VoiceRuntimeCallback.RealtimeClientActionResolved ->
           realtimeClientActionResolved(callback.actionId)
+        is T3VoiceRuntimeCallback.RealtimeTerminalActionReceived ->
+          realtimeTerminalActionReceived(callback.action)
         is T3VoiceRuntimeCallback.RealtimeAudioRoutesChanged ->
           realtimeAudioRoutesChanged(callback.routes)
         is T3VoiceRuntimeCallback.RealtimeTranscriptChanged ->
@@ -297,7 +302,11 @@ internal class T3VoiceRuntimeController(
           ),
         )
         runDriver(T3VoiceOperation.SWITCHING_TO_THREAD) {
-          driver.closeRealtime(current.generation, preserveSessionForThread = true)
+          driver.closeRealtime(
+            current.generation,
+            preserveSessionForThread = true,
+            drainPlayout = false,
+          )
         }
         applied()
       }
@@ -405,26 +414,30 @@ internal class T3VoiceRuntimeController(
     val action = state.pendingClientActions.firstOrNull { it.actionId == actionId }
       ?: return duplicate()
     val focus = T3VoiceRealtimeFocus(action.projectId, action.threadId)
+    val nextTarget =
+      if (outcome == T3VoiceClientActionOutcome.SUCCEEDED) {
+        state.target.copy(
+          focus = focus,
+          threadSwitch =
+            state.target.threadSwitch?.takeIf {
+              it.target.projectId == focus.projectId && it.target.threadId == focus.threadId
+            },
+        )
+      } else {
+        state.target
+      }
     update(
       state.copy(
-        target =
-          if (outcome == T3VoiceClientActionOutcome.SUCCEEDED) {
-            state.target.copy(
-              focus = focus,
-              threadSwitch =
-                state.target.threadSwitch?.takeIf {
-                  it.target.projectId == focus.projectId && it.target.threadId == focus.threadId
-                },
-            )
-          } else {
-            state.target
-          },
+        target = nextTarget,
         pendingClientActions = state.pendingClientActions.filterNot { it.actionId == actionId },
       ),
     )
     runDriver(T3VoiceOperation.REALTIME) {
       if (outcome == T3VoiceClientActionOutcome.SUCCEEDED) {
-        driver.admitRealtimeFocusUpdate(current.generation, focus)
+        driver.updateRealtimeContext(
+          current.generation,
+          T3VoiceRealtimeContext(nextTarget.focus, nextTarget.threadSwitch),
+        )
       }
       driver.acknowledgeRealtimeClientAction(
         current.generation,
@@ -537,8 +550,17 @@ internal class T3VoiceRuntimeController(
       }
       is T3VoiceControllerState.Realtime -> {
         if (state.stage == T3VoiceRealtimeStage.STOPPING) {
+          val alreadyRequested = stopRequestedGeneration == current.generation
           stopRequestedGeneration = current.generation
-          return duplicate()
+          if (alreadyRequested) return duplicate()
+          runDriver(T3VoiceOperation.REALTIME) {
+            driver.closeRealtime(
+              current.generation,
+              preserveSessionForThread = false,
+              drainPlayout = false,
+            )
+          }
+          return applied()
         }
         if (state.stage == T3VoiceRealtimeStage.STARTING && clearPendingInitialStart()) {
           stopRequestedGeneration = null
@@ -548,7 +570,11 @@ internal class T3VoiceRuntimeController(
         stopRequestedGeneration = current.generation
         update(state.copy(stage = T3VoiceRealtimeStage.STOPPING))
         runDriver(T3VoiceOperation.REALTIME) {
-          driver.closeRealtime(current.generation, preserveSessionForThread = false)
+          driver.closeRealtime(
+            current.generation,
+            preserveSessionForThread = false,
+            drainPlayout = false,
+          )
         }
       }
       is T3VoiceControllerState.SwitchingToThread ->
@@ -615,6 +641,17 @@ internal class T3VoiceRuntimeController(
     return when (val state = current.state) {
       is T3VoiceControllerState.Realtime -> {
         if (state.stage != T3VoiceRealtimeStage.STOPPING) return false
+        val failure = terminalCloseFailure.also { terminalCloseFailure = null }
+        if (failure != null && stopRequestedGeneration != current.generation) {
+          update(
+            T3VoiceControllerState.Failed(
+              environmentId = state.target.environmentId,
+              operation = T3VoiceOperation.SWITCHING_TO_THREAD,
+              failure = failure,
+            ),
+          )
+          return true
+        }
         stopRequestedGeneration = null
         update(T3VoiceControllerState.Idle)
         true
@@ -687,6 +724,61 @@ internal class T3VoiceRuntimeController(
       return true
     }
     update(state.copy(pendingClientActions = state.pendingClientActions + action))
+    return true
+  }
+
+  private fun realtimeTerminalActionReceived(action: T3VoiceRealtimeTerminalAction): Boolean {
+    val state = current.state as? T3VoiceControllerState.Realtime ?: return false
+    if (state.stage == T3VoiceRealtimeStage.STOPPING || admittedTerminalActionId != null) {
+      return false
+    }
+    admittedTerminalActionId = action.actionId
+    when (action.type) {
+      T3VoiceRealtimeTerminalActionType.STOP_REALTIME -> {
+        update(state.copy(stage = T3VoiceRealtimeStage.STOPPING))
+        runDriver(T3VoiceOperation.REALTIME) {
+          driver.closeRealtime(
+            current.generation,
+            preserveSessionForThread = false,
+            drainPlayout = true,
+          )
+        }
+      }
+      T3VoiceRealtimeTerminalActionType.SWITCH_TO_THREAD -> {
+        val threadStart = state.target.threadSwitch
+        if (threadStart == null) {
+          terminalCloseFailure =
+            T3VoiceFailure(
+              code = "thread-switch-target-unavailable",
+              message = "The prepared Thread voice target is no longer available.",
+              recoverable = true,
+            )
+          update(state.copy(stage = T3VoiceRealtimeStage.STOPPING))
+          runDriver(T3VoiceOperation.SWITCHING_TO_THREAD) {
+            driver.closeRealtime(
+              current.generation,
+              preserveSessionForThread = false,
+              drainPlayout = true,
+            )
+          }
+        } else {
+          update(
+            T3VoiceControllerState.SwitchingToThread(
+              stage = T3VoiceSwitchStage.CLOSING_REALTIME,
+              realtimeTarget = state.target,
+              threadStart = threadStart,
+            ),
+          )
+          runDriver(T3VoiceOperation.SWITCHING_TO_THREAD) {
+            driver.closeRealtime(
+              current.generation,
+              preserveSessionForThread = true,
+              drainPlayout = true,
+            )
+          }
+        }
+      }
+    }
     return true
   }
 
@@ -900,6 +992,8 @@ internal class T3VoiceRuntimeController(
     failedReleasePending = false
     failedReleaseUncertain = false
     failedStopRequested = false
+    admittedTerminalActionId = null
+    terminalCloseFailure = null
     publish(
       T3VoiceControllerSnapshot(
         state = state,
@@ -910,6 +1004,8 @@ internal class T3VoiceRuntimeController(
   }
 
   private fun advanceGeneration(state: T3VoiceControllerState) {
+    admittedTerminalActionId = null
+    terminalCloseFailure = null
     publish(
       current.copy(
         state = state,
@@ -949,6 +1045,7 @@ internal class T3VoiceRuntimeController(
     releasePending: Boolean = false,
   ) {
     pendingInitialStart = null
+    terminalCloseFailure = null
     val failedEnvironmentId = checkNotNull(current.state.environmentId()) {
       "An active voice operation must retain its environment identity."
     }

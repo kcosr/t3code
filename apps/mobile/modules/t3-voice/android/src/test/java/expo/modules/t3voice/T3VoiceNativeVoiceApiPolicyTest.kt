@@ -1,6 +1,7 @@
 package expo.modules.t3voice
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Test
@@ -58,5 +59,84 @@ internal class T3VoiceNativeVoiceApiPolicyTest {
     assertThrows(IllegalArgumentException::class.java) {
       t3VoiceValidatedSdp(" \r\n\t")
     }
+  }
+
+  @Test
+  fun `Realtime terminal capabilities follow the current native thread switch target`() {
+    val focus = T3VoiceRealtimeFocus("project-a", "thread-a")
+    val switch = T3VoiceThreadStart(THREAD_TARGET, THREAD_SETTINGS)
+
+    assertEquals(
+      listOf("stop-realtime"),
+      t3VoiceRealtimeTerminalActions(T3VoiceRealtimeContext(focus, null)),
+    )
+    assertEquals(
+      listOf("stop-realtime", "switch-to-thread"),
+      t3VoiceRealtimeTerminalActions(T3VoiceRealtimeContext(focus, switch)),
+    )
+  }
+
+  @Test
+  fun `Realtime context payload adds and removes switch capability atomically with focus`() {
+    val focus = T3VoiceRealtimeFocus("project-a", "thread-a")
+    val switch = T3VoiceThreadStart(THREAD_TARGET, THREAD_SETTINGS)
+
+    val withSwitch =
+      t3VoiceRealtimeContextFields(T3VoiceRealtimeContext(focus, switch), leaseGeneration = 7)
+    assertEquals(7L, withSwitch["leaseGeneration"])
+    assertEquals("project-a", withSwitch["projectId"])
+    assertEquals("thread-a", withSwitch["threadId"])
+    assertEquals(
+      listOf("stop-realtime", "switch-to-thread"),
+      withSwitch["terminalActions"],
+    )
+
+    val withoutSwitch =
+      t3VoiceRealtimeContextFields(T3VoiceRealtimeContext(focus, null), leaseGeneration = 8)
+    assertEquals(listOf("stop-realtime"), withoutSwitch["terminalActions"])
+
+    val withoutFocus =
+      t3VoiceRealtimeContextFields(T3VoiceRealtimeContext(null, null), leaseGeneration = 9)
+    assertFalse(withoutFocus.containsKey("projectId"))
+    assertFalse(withoutFocus.containsKey("threadId"))
+    assertEquals(listOf("stop-realtime"), withoutFocus["terminalActions"])
+  }
+
+  @Test
+  fun `Realtime terminal action decoder admits both supported values`() {
+    assertEquals(
+      T3VoiceRealtimeTerminalActionType.STOP_REALTIME,
+      t3VoiceRealtimeTerminalActionType("stop-realtime"),
+    )
+    assertEquals(
+      T3VoiceRealtimeTerminalActionType.SWITCH_TO_THREAD,
+      t3VoiceRealtimeTerminalActionType("switch-to-thread"),
+    )
+    assertThrows(IllegalStateException::class.java) {
+      t3VoiceRealtimeTerminalActionType("unsupported")
+    }
+  }
+
+  private companion object {
+    val THREAD_TARGET =
+      T3VoiceThreadTarget(
+        environmentId = "environment-a",
+        projectId = "project-a",
+        threadId = "thread-a",
+        modelSelection = T3VoiceModelSelection("codex", "gpt-5.4", null),
+        runtimeMode = T3VoiceThreadRuntimeMode.FULL_ACCESS,
+        interactionMode = T3VoiceThreadInteractionMode.DEFAULT,
+      )
+    val THREAD_SETTINGS =
+      T3VoiceThreadSettings(
+        submissionPolicy = T3VoiceThreadSubmissionPolicy.AUTO_SUBMIT,
+        playResponses = true,
+        autoRearm = true,
+        endpointDetection = T3VoiceThreadEndpointDetection(900, 10_000, 120_000),
+        rearmDelayMs = 750,
+        transcriptionTimeoutMs = 600_000,
+        submissionTimeoutMs = 30_000,
+        responseTimeoutMs = 600_000,
+      )
   }
 }
