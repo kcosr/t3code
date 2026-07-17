@@ -55,6 +55,7 @@ import {
   admittedClientActionFocusState,
   bindVoiceConversationBrowser,
   canOfferThreadVoiceSwitch,
+  createVoiceRuntimeRetryCoordinator,
   durableVoiceConversations,
   isThreadVoiceStartAvailable,
   masterVoiceEnvironmentId,
@@ -223,19 +224,17 @@ export function MasterVoiceProvider(props: {
 
   useEffect(() => {
     if (native === null) return;
-    let disposed = false;
-    void native
-      .getRuntimeSnapshotAsync()
+    const retry = createVoiceRuntimeRetryCoordinator();
+    void retry
+      .run(() => native.getRuntimeSnapshotAsync())
       .then((current) => {
-        if (disposed || current.sequence < snapshotRef.current.sequence) return;
+        if (current === null || current.sequence < snapshotRef.current.sequence) return;
         const environmentId = voiceRuntimeSnapshotEnvironmentId(current);
         if (environmentId !== null) setRuntimeEnvironmentId(environmentId);
         else if (current.mode === "idle") setRuntimeEnvironmentId(null);
       })
       .catch(() => undefined);
-    return () => {
-      disposed = true;
-    };
+    return retry.cancel;
   }, [native]);
 
   const controllerEnvironmentId = masterVoiceEnvironmentId(
@@ -286,13 +285,19 @@ export function MasterVoiceProvider(props: {
     });
     const runtime = { environmentId: controllerEnvironmentId, adapter };
     let disposed = false;
+    const retry = createVoiceRuntimeRetryCoordinator(undefined, (cause) => {
+      if (!disposed) Alert.alert("Voice controls unavailable", errorMessage(cause));
+    });
     let detach: (() => void) | null = null;
 
-    void prepareVoiceRuntimeAttachment({
-      runtime,
-      listener: acceptSnapshot,
-      isDisposed: () => disposed,
-    })
+    void retry
+      .run(() =>
+        prepareVoiceRuntimeAttachment({
+          runtime,
+          listener: acceptSnapshot,
+          isDisposed: () => disposed || retry.isCancelled(),
+        }),
+      )
       .then((attachment) => {
         if (attachment === null) return;
         detach = attachment.detach;
@@ -309,6 +314,7 @@ export function MasterVoiceProvider(props: {
 
     return () => {
       disposed = true;
+      retry.cancel();
       detach?.();
       setSubscribedEnvironmentId(null);
       if (runtimeRef.current === runtime) runtimeRef.current = null;

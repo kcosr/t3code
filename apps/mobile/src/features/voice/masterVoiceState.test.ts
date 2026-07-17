@@ -14,6 +14,7 @@ import {
   admittedClientActionFocusState,
   bindVoiceConversationBrowser,
   canOfferThreadVoiceSwitch,
+  createVoiceRuntimeRetryCoordinator,
   durableVoiceConversations,
   isThreadVoiceStartAvailable,
   continueVoiceConversationSelection,
@@ -282,6 +283,102 @@ describe("master voice state", () => {
       }),
     ).resolves.toBeNull();
     expect(detach).toHaveBeenCalledOnce();
+  });
+
+  it("retries a transient runtime attachment failure with deterministic backoff", async () => {
+    vi.useFakeTimers();
+    try {
+      const expected = { mode: "attached" };
+      const operation = vi
+        .fn(async () => expected)
+        .mockRejectedValueOnce(new Error("binder unavailable"));
+      const retry = createVoiceRuntimeRetryCoordinator([250]);
+
+      const result = retry.run(operation);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(operation).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(250);
+
+      await expect(result).resolves.toBe(expected);
+      expect(operation).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("continues retrying at the capped delay until attachment recovers", async () => {
+    vi.useFakeTimers();
+    try {
+      const expected = { mode: "attached" };
+      const operation = vi
+        .fn(async () => expected)
+        .mockRejectedValueOnce(new Error("first failure"))
+        .mockRejectedValueOnce(new Error("second failure"))
+        .mockRejectedValueOnce(new Error("slow binder recovery"))
+        .mockRejectedValueOnce(new Error("still recovering"))
+        .mockRejectedValueOnce(new Error("final transient failure"));
+      const persistentFailure = vi.fn();
+      const retry = createVoiceRuntimeRetryCoordinator([10, 20], persistentFailure);
+
+      const result = retry.run(operation);
+      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(20);
+      await vi.advanceTimersByTimeAsync(20);
+      await vi.advanceTimersByTimeAsync(20);
+      await vi.advanceTimersByTimeAsync(20);
+
+      await expect(result).resolves.toBe(expected);
+      expect(operation).toHaveBeenCalledTimes(6);
+      expect(persistentFailure).toHaveBeenCalledOnce();
+      expect(persistentFailure).toHaveBeenCalledWith(expect.any(Error));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels retry waits and detaches an attachment that resolves after disposal", async () => {
+    vi.useFakeTimers();
+    try {
+      const delayedOperation = vi.fn(async () => {
+        throw new Error("retry");
+      });
+      const delayedRetry = createVoiceRuntimeRetryCoordinator([250]);
+      const delayedResult = delayedRetry.run(delayedOperation);
+      await vi.advanceTimersByTimeAsync(0);
+      delayedRetry.cancel();
+      await expect(delayedResult).resolves.toBeNull();
+      await vi.advanceTimersByTimeAsync(250);
+      expect(delayedOperation).toHaveBeenCalledOnce();
+
+      let resolveSubscribe!: (detach: () => void) => void;
+      const detach = vi.fn();
+      const runtime = {
+        adapter: {
+          subscribe: vi.fn(
+            () =>
+              new Promise<() => void>((resolve) => {
+                resolveSubscribe = resolve;
+              }),
+          ),
+        },
+      };
+      const attachmentRetry = createVoiceRuntimeRetryCoordinator([]);
+      const attachment = attachmentRetry.run(() =>
+        prepareVoiceRuntimeAttachment({
+          runtime,
+          listener: () => undefined,
+          isDisposed: attachmentRetry.isCancelled,
+        }),
+      );
+
+      attachmentRetry.cancel();
+      resolveSubscribe(detach);
+
+      await expect(attachment).resolves.toBeNull();
+      expect(detach).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("derives active environment and presentation only from the complete native snapshot", () => {

@@ -86,6 +86,31 @@ const idleSnapshot = (sequence: number): VoiceRuntimeSnapshot => ({
   sequence,
 });
 
+const activeRealtimeSnapshot: VoiceRuntimeSnapshot = {
+  mode: "realtime",
+  phase: "connected",
+  generation: 4,
+  sequence: 12,
+  target: realtimeTarget,
+  muted: false,
+  audioRoutes: [],
+  transcript: [],
+  pendingConfirmations: [],
+  pendingClientActions: [],
+};
+
+const activeThreadSnapshot: VoiceRuntimeSnapshot = {
+  mode: "thread",
+  phase: "reviewing",
+  generation: 5,
+  sequence: 18,
+  target: threadInput.target,
+  settings: threadInput.settings,
+  transcript: "Review this transcript",
+  reviewId: 3,
+  attention: null,
+};
+
 const makeHarness = (getSnapshot = async () => idleSnapshot(0)) => {
   let currentPrepared: PreparedConnection | null = prepared;
   let snapshotListener: ((snapshot: VoiceRuntimeSnapshot) => void) | null = null;
@@ -398,6 +423,24 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
     expect(received).toEqual([0, 3, 4]);
     expect(harness.remove).toHaveBeenCalledTimes(1);
     expect(harness.native.stopRuntimeAsync).not.toHaveBeenCalled();
+  });
+
+  it("reattaches to active Realtime and Thread snapshots without issuing another start", async () => {
+    for (const activeSnapshot of [activeRealtimeSnapshot, activeThreadSnapshot]) {
+      const harness = makeHarness(async () => activeSnapshot);
+      const received: Array<VoiceRuntimeSnapshot> = [];
+
+      const detach = await harness.adapter.subscribe((snapshot) => received.push(snapshot));
+
+      expect(received).toEqual([activeSnapshot]);
+      expect(harness.makeClient).not.toHaveBeenCalled();
+      expect(harness.createNativeSession).not.toHaveBeenCalled();
+      expect(harness.native.startRealtimeAsync).not.toHaveBeenCalled();
+      expect(harness.native.startThreadAsync).not.toHaveBeenCalled();
+
+      detach();
+      expect(harness.remove).toHaveBeenCalledOnce();
+    }
   });
 
   it("removes the native listener when initial hydration fails", async () => {

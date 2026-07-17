@@ -159,6 +159,67 @@ export interface PendingVoiceRuntimeAttachment<Runtime> {
   readonly detach: () => void;
 }
 
+export interface VoiceRuntimeRetryCoordinator {
+  readonly isCancelled: () => boolean;
+  readonly run: <Value>(operation: () => Promise<Value>) => Promise<Value | null>;
+  readonly cancel: () => void;
+}
+
+const VOICE_RUNTIME_RETRY_DELAYS_MS = [250, 1_000, 4_000, 10_000] as const;
+
+/** Runs one native attachment operation with cancellable backoff capped at the final delay. */
+export function createVoiceRuntimeRetryCoordinator(
+  retryDelaysMs: ReadonlyArray<number> = VOICE_RUNTIME_RETRY_DELAYS_MS,
+  onPersistentFailure?: (cause: unknown) => void,
+): VoiceRuntimeRetryCoordinator {
+  let cancelled = false;
+  let persistentFailureReported = false;
+  let pendingDelay: {
+    readonly timer: ReturnType<typeof setTimeout>;
+    readonly resolve: () => void;
+  } | null = null;
+
+  const wait = (delayMs: number) =>
+    new Promise<void>((resolve) => {
+      const finish = () => {
+        pendingDelay = null;
+        resolve();
+      };
+      pendingDelay = { timer: setTimeout(finish, delayMs), resolve: finish };
+    });
+
+  return {
+    isCancelled: () => cancelled,
+    run: async <Value>(operation: () => Promise<Value>): Promise<Value | null> => {
+      for (let attempt = 0; ; attempt += 1) {
+        if (cancelled) return null;
+        try {
+          const value = await operation();
+          return cancelled ? null : value;
+        } catch (cause) {
+          if (cancelled) return null;
+          if (retryDelaysMs.length === 0) throw cause;
+          if (!persistentFailureReported && attempt >= retryDelaysMs.length) {
+            persistentFailureReported = true;
+            onPersistentFailure?.(cause);
+          }
+          const retryDelayMs = retryDelaysMs[Math.min(attempt, retryDelaysMs.length - 1)];
+          if (retryDelayMs === undefined) throw cause;
+          await wait(retryDelayMs);
+        }
+      }
+    },
+    cancel: () => {
+      if (cancelled) return;
+      cancelled = true;
+      const delay = pendingDelay;
+      if (delay === null) return;
+      clearTimeout(delay.timer);
+      delay.resolve();
+    },
+  };
+}
+
 export interface VoiceConversationBrowserBinding {
   /** Forces React to discard rows loaded for a previous environment. */
   readonly mountKey: EnvironmentId;
