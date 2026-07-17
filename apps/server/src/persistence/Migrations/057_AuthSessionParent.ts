@@ -1,6 +1,9 @@
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+// Migration IDs 41-56 were deployed by the retired native-runtime design.
+// This replacement schema must remain later than that persistent history.
+
 export default Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
 

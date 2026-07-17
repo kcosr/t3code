@@ -6,11 +6,27 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { runMigrations } from "../Migrations.ts";
 import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 
-it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()))("041_AuthSessionParent", (it) => {
-  it.effect("adds explicit parent linkage and backfills existing native children", () =>
+it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()))("057_AuthSessionParent", (it) => {
+  it.effect("runs after retired voice migrations and backfills existing native children", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       yield* runMigrations({ toMigrationInclusive: 40 });
+
+      // Migrations 41-56 were deployed by the retired native-runtime design. Their
+      // IDs remain part of persistent database history even though that schema is no
+      // longer created for fresh installations.
+      yield* sql`
+        WITH RECURSIVE retired_migrations(migration_id) AS (
+          SELECT 41
+          UNION ALL
+          SELECT migration_id + 1
+          FROM retired_migrations
+          WHERE migration_id < 56
+        )
+        INSERT INTO effect_sql_migrations (migration_id, name)
+        SELECT migration_id, 'RetiredVoiceMigration' || migration_id
+        FROM retired_migrations
+      `;
 
       yield* sql`
         INSERT INTO auth_sessions (
@@ -50,7 +66,7 @@ it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()))("041_AuthSessionParent"
           )
       `;
 
-      yield* runMigrations({ toMigrationInclusive: 41 });
+      yield* runMigrations({ toMigrationInclusive: 57 });
 
       const rows = yield* sql<{
         readonly sessionId: string;
