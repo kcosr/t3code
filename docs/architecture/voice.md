@@ -7,10 +7,8 @@ implementation. The contracts, server seams, and React presentation model are pl
 future web and desktop adapters can implement the same product behavior without changing the
 server protocol.
 
-The simplified native-owned Android runtime is implemented on
-`feature/android-voice-runtime-rebaseline`. Repository, native, artifact, and connected-device
-verification remain release gates; the authoritative Android product contract and acceptance matrix
-live in [the Android voice runtime rebaseline](../../specs/android-voice-runtime-rebaseline.md).
+The authoritative Android product contract, implementation status, and acceptance matrix live in
+[the Android voice runtime rebaseline](../../specs/android-voice-runtime-rebaseline.md).
 
 The design has three independent capabilities:
 
@@ -43,7 +41,7 @@ provider control events.
 - Voice sessions are not provider coding sessions. They are short-lived control sessions that can
   inspect and command durable T3 threads.
 - Provider calls are never the durable conversation identity. T3 owns a `VoiceConversationId` that
-  can span call rotation, reconnects, and device handoff.
+  can span call rotation, reconnects, and cross-device conversation takeover.
 
 ## Goals
 
@@ -155,7 +153,7 @@ a sequence of bounded provider calls:
 VoiceConversationId
   +-- VoiceSessionId on Android
   |     +-- OpenAI call_id A
-  +-- VoiceSessionId on desktop after handoff
+  +-- VoiceSessionId on desktop after takeover
   |     +-- OpenAI call_id B
   +-- VoiceSessionId after expiry and client restart
         +-- OpenAI call_id C
@@ -170,7 +168,7 @@ For conversations with continuity enabled, T3 persists a normalized journal cont
 - compacted summaries;
 - normalized tool name, target IDs, confirmation outcome, and compact result;
 - active project/thread context changes;
-- call boundary and device-handoff markers.
+- call-boundary and `device-handoff` markers recording cross-device takeover.
 
 T3 does not persist raw audio, SDP, provider credentials, provider event dumps, or partial audio
 deltas. Partial transcripts are ephemeral UI events and are persisted only after finalization.
@@ -203,7 +201,7 @@ call starts. Explicit clear-context advances the journal epoch before another ca
 entries. Automatic summary generation and seamless context-limit rotation are follow-up work; an
 unexpected provider context-limit error ends the current call instead of silently dropping history.
 
-### Device handoff
+### Cross-device conversation takeover
 
 A voice conversation has at most one active media lease. To continue on another device:
 
@@ -233,7 +231,7 @@ control side is lost beyond the grace period, the native service closes its peer
 terminates the provider call. Process loss, `failed`/`closed` peers, and terminal provider events
 require a new call from journaled context; no provider-call resumption is assumed.
 
-### Modes
+### Server provider-session modes
 
 ```ts
 type VoiceSessionMode = "realtime-transcription" | "realtime-agent";
@@ -302,7 +300,7 @@ is removed. A final active-session check precedes each write.
 
 Current environments are single-user trust domains: any paired client with `voice:use` can list and
 continue that environment's durable voice conversations and can explicitly request takeover. Auth
-`subject` is not treated as a cross-device user identity. Handoff never moves a journal between T3
+`subject` is not treated as a cross-device user identity. Takeover never moves a journal between T3
 environment servers; multi-user conversation ACLs require a future identity design.
 
 ## Server HTTP Surface
@@ -512,7 +510,7 @@ interface.
 - `VoiceConversationRepository` persists normalized turns, summaries, context epochs, and call
   boundaries without retaining audio.
 - `VoiceContextCompiler` creates the bounded provider-neutral continuation context used for new
-  calls and handoff.
+  calls and cross-device takeover.
 - `VoiceToolExecutor` maps normalized tool calls to T3 application services.
 - `ClientCommandDispatcher` is extracted from `apps/server/src/ws.ts` and owns setup/worktree,
   startup queue, dispatch, archive cleanup, and terminal-close semantics. WebSocket, orchestration
@@ -807,7 +805,7 @@ message is the dispatched user message in that thread and returns one of `pendin
 
 Realtime-to-Thread is a single controller transition. The peer and its microphone are physically
 released before Thread recording starts. The same in-memory child credential may be retained across
-that transition, but no handoff transaction or live state is persisted.
+that transition, but no mode-switch transaction or live state is persisted.
 
 ### Foreground service
 
@@ -995,8 +993,9 @@ Metrics:
 Tracing uses T3 voice request/session IDs. Provider IDs are attributes only after redaction. Audio and
 transcript bodies are excluded from spans.
 
-The Android module writes a bounded app-private diagnostic event log containing state transitions,
-route changes, numeric media counters, and sanitized errors.
+The Android module keeps a bounded in-memory diagnostic ring containing curated lifecycle,
+route/focus, endpoint, terminal-code, and numeric media events. It does not persist transcript,
+audio, SDP, credentials, provider payloads, or general error text.
 
 ## Testing Strategy
 
@@ -1033,7 +1032,8 @@ never required for the default suite.
 - authenticated capability, STT, TTS, signaling, confirmation, and close routes;
 - scope denial for voice and orchestration operations;
 - auth-session revocation and native-control lease loss terminate provider work;
-- two paired devices can explicitly hand off one conversation without sharing a live provider call;
+- one device can explicitly take over a conversation from another without sharing a live provider
+  call;
 - crash between orchestration dispatch and journal completion does not repeat a write;
 - one read tool and one confirmation-gated write tool through a fake Realtime provider.
 

@@ -1,10 +1,9 @@
 # Android Voice Runtime Rebaseline
 
-Status: Accepted product and architecture contract. The implementation exists on
-`feature/android-voice-runtime-rebaseline`; repository, native, artifact, and connected-device
-verification remain release gates. This document supersedes the Android ownership, process-death
-recovery, hands-free ownership, and background-control direction in older voice milestone and
-workstream documents.
+Status: Accepted product and architecture contract. The implementation is undergoing repository,
+native, artifact, and connected-device release verification. This document supersedes the Android
+ownership, process-death recovery, hands-free ownership, and background-control direction in older
+voice milestone and workstream documents.
 
 ## Why this rebaseline exists
 
@@ -51,8 +50,8 @@ Unless a later product decision adds them explicitly, the runtime does not suppo
 
 - resuming an active session after Android kills the application process;
 - resuming across force-stop, reboot, application update, or native crash;
-- durable multi-stage handoff recovery;
-- distributed handoff prepare/commit/rollback semantics;
+- durable multi-stage Realtime-to-Thread recovery;
+- distributed Realtime-to-Thread prepare/commit/rollback semantics;
 - restoring an ambiguous Realtime peer or recorder after process death;
 - durable effect journals, generic compensation ledgers, or persisted timer ownership solely for
   process-death recovery;
@@ -76,7 +75,7 @@ claim to resume that session.
   mode, interaction mode, and voice settings. It does not create a Thread or copy the Realtime
   transcript into the Thread.
 - The mode switch uses ordinary Realtime close and ordinary Thread dispatch contracts. There is no
-  server-side handoff prepare/commit/rollback endpoint.
+  server-side mode-switch prepare/commit/rollback endpoint.
 - Realtime notification controls are mute/unmute, switch to the prepared Thread target when one is
   available, and stop. Thread controls are finish utterance while recording, submit the current
   transcript while reviewing, and stop. MediaSession transport actions map to the same commands.
@@ -111,10 +110,10 @@ Notification / MediaSession actions +--> Android voice foreground service
                                    snapshot and events to React
 ```
 
-The foreground service owns one in-memory state machine. A `HandlerThread`, actor, or single
-coroutine dispatcher may serialize commands and native callbacks. The implementation does not need
-a general-purpose effect runtime; it needs explicit mode transitions and exact callback correlation
-for the small set of live resources.
+The foreground service owns one in-memory state machine. Its process-local controller serializes
+commands and native callbacks. The implementation does not need a general-purpose effect runtime;
+it needs explicit mode transitions and exact callback correlation for the small set of live
+resources.
 
 A representative top-level state is:
 
@@ -131,10 +130,9 @@ Substates may carry operation IDs, target context, and resource handles outside 
 public snapshot. A monotonically increasing in-memory session generation is sufficient to reject
 late callbacks from a previous mode. It does not need to be durable.
 
-## Realtime-to-Thread transition
+## Realtime-to-Thread mode switch
 
-The handoff is equivalent to a native mode-switch command. React and the notification invoke the
-same `switchRealtimeToThread` entry point.
+React and the notification invoke the same native `switchRealtimeToThread` entry point.
 
 1. Admit the command only while Realtime owns the active session.
 2. Enter `SwitchingToThread` immediately and update the notification/public snapshot.
@@ -149,7 +147,7 @@ same `switchRealtimeToThread` entry point.
 If peer shutdown times out, release locally controllable resources and fail the transition while
 retaining ownership until the peer actually exits. If Thread recording cannot start, end in `Idle`
 or `Failed`, release all media resources, and allow an explicit retry. The runtime does not roll
-back into Realtime and does not persist a handoff transaction for later recovery.
+back into Realtime and does not persist a mode-switch transaction for later recovery.
 
 A bounded shutdown deadline may publish `Failed` before a blocking platform peer has fully exited.
 That state releases audio focus, routing, wake lock, and ordinary controls, but retains the native
@@ -183,7 +181,7 @@ Persistence is allowed for product data that is useful independently of session 
 - user voice settings and preferred route;
 - durable Thread/agent records already required by the server contract;
 - bounded temporary recording files until upload, acknowledgement, or cleanup;
-- privacy-safe diagnostics needed during validation.
+- privacy-safe diagnostics needed during validation and later troubleshooting.
 
 Persistence should not model a live peer, live recorder, in-flight callback, active timer, or
 partially completed local mode switch. On fresh process startup, the native runtime starts in
@@ -238,11 +236,11 @@ f83577b03  working foreground Realtime + Thread behavior and native media primit
 
 The kernel branches contain useful fixes and tests, particularly around WebRTC shutdown, bounded
 network lanes, notification/MediaSession rendering, callback fencing, and privacy-safe diagnostics.
-Their journals, elections, recovery workflows, handoff transactions, and process-death authority
-model are not implementation ancestry for this runtime.
+Their journals, elections, recovery workflows, legacy mode-switch transactions, and process-death
+authority model are not implementation ancestry for this runtime.
 
-No production backend contract requires a durable Realtime-to-Thread handoff. Native Thread mode
-does require two small server seams: a bounded, scoped native child session and an exact
+No production backend contract requires a durable Realtime-to-Thread mode-switch protocol. Native
+Thread mode does require two small server seams: a bounded, scoped native child session and an exact
 thread-message outcome query. Both support ordinary live-process work and do not introduce recovery
 authority.
 
@@ -251,8 +249,8 @@ authority.
 The rebaseline reuses the proven recorder, PCM player, audio-focus/routes, WebRTC peer, bounded
 network lanes, foreground notification/MediaSession host, strict bridge validation, and privacy-safe
 diagnostic ring from the selected baseline and inspected donor work. Durable recovery workflows,
-handoff journals, authority migration transactions, persisted retry timers, generic compensation,
-and consumer election were not imported.
+legacy mode-switch journals, authority migration transactions, persisted retry timers, generic
+compensation, and consumer election were not imported.
 
 Native background work uses two general server seams:
 
@@ -281,7 +279,7 @@ The lean runtime is complete when device tests prove:
 4. Notification actions operate without React being mounted.
 5. Notification and React commands cannot create overlapping microphone owners.
 6. Realtime-to-Thread switching closes the peer before starting the recorder.
-7. Duplicate handoff taps do not start duplicate recordings.
+7. Duplicate switch taps do not start duplicate recordings.
 8. Slow or failed peer shutdown reaches a bounded, resource-safe outcome.
 9. Permission denial, audio-focus loss, route loss, network failure, and user cancellation release
    resources and produce an understandable state.
@@ -303,7 +301,8 @@ Delivery requires:
 3. Build the server and preview Android client from the same committed SHA.
 4. Inspect the APK package, signature, archive contents, and checksum before installation.
 5. Install in place and exercise Realtime, Thread, background/return, React remount, notification,
-   MediaSession, permission/focus loss, and Realtime-to-Thread paths on the connected device.
+   MediaSession, permission/focus loss, and the Realtime-to-Thread mode switch on the connected
+   device.
 6. Use temporary privacy-safe milestone tracing for the first Realtime device pass, then delete only
    that temporary milestone layer, rerun affected gates, rebuild, reinstall, and revalidate. The
    bounded generic diagnostic ring remains for troubleshooting.

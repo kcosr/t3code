@@ -50,7 +50,7 @@ The implementation therefore restarted from `f83577b035592feec1b772ded9f0e73f362
 (`fix(voice): distinguish diagnostic copy failures`). The `feature/voice-kernel-m1`,
 `debug/realtime-trace`, and convergence branches remain donor references for tested media,
 shutdown, notification, networking, and diagnostic fixes. Their journals, elections, durable
-handoff transactions, and process-recovery authority are not part of the current Android design.
+mode-switch transactions, and process-recovery authority are not part of the current Android design.
 
 The current Android runtime has one process-local native controller for Realtime and Thread voice.
 React and notification/MediaSession controls call that same controller, and React reattaches by
