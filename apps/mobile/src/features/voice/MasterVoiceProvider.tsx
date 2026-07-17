@@ -515,8 +515,8 @@ export function MasterVoiceProvider(props: {
       };
       const expectedEnvironmentId = target.environmentId;
       Alert.alert(
-        "Continue on this device?",
-        "This conversation is active on another device.",
+        "Take over active voice session?",
+        "An existing voice session is already active for this conversation. Taking over stops it and starts a new session here.",
         [
           {
             text: "Cancel",
