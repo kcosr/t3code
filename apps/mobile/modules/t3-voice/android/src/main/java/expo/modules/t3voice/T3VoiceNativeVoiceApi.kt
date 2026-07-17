@@ -366,7 +366,7 @@ internal class T3VoiceNativeVoiceApi(
     require(answer.requiredPositiveLong("leaseGeneration") == session.state.leaseGeneration) {
       "Realtime answer lease generation did not match."
     }
-    return answer.requiredTrimmedString("sdp")
+    return t3VoiceValidatedSdp(answer.requiredString("sdp"))
   }
 
   override fun heartbeatRealtimeSession(
@@ -766,6 +766,9 @@ private fun JSONObject.nullableObject(name: String): JSONObject? =
 private fun JSONObject.requiredString(name: String): String =
   (get(name) as? String)?.takeIf(String::isNotEmpty)
     ?: error("Expected non-empty JSON string field $name.")
+
+internal fun t3VoiceValidatedSdp(value: String): String =
+  value.also { require(it.isNotBlank()) { "SDP must contain non-whitespace content." } }
 
 private fun JSONObject.requiredTrimmedString(name: String): String =
   requiredString(name).also { require(it == it.trim()) { "JSON string field $name was not trimmed." } }

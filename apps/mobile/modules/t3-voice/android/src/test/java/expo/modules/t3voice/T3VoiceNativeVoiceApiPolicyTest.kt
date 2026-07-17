@@ -2,6 +2,7 @@ package expo.modules.t3voice
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 internal class T3VoiceNativeVoiceApiPolicyTest {
@@ -47,5 +48,15 @@ internal class T3VoiceNativeVoiceApiPolicyTest {
       ),
       selection.toCanonicalWireBody(),
     )
+  }
+
+  @Test
+  fun `Realtime SDP validation preserves framing whitespace`() {
+    val answerSdp = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\n"
+
+    assertEquals(answerSdp, t3VoiceValidatedSdp(answerSdp))
+    assertThrows(IllegalArgumentException::class.java) {
+      t3VoiceValidatedSdp(" \r\n\t")
+    }
   }
 }
