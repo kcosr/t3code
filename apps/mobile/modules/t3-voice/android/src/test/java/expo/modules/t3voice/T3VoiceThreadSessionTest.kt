@@ -249,7 +249,6 @@ internal class T3VoiceThreadSessionTest {
           quiesced.countDown()
         },
         api = api,
-        stopQuiescenceWaitMs = 25,
       )
 
     session.start()
@@ -464,6 +463,74 @@ internal class T3VoiceThreadSessionTest {
     assertNull(media.activeRecordingId())
   }
 
+  @Test
+  fun `stop returns before a quiescence callback finishes`() {
+    val media = GenerationAwareMedia()
+    val callbackEntered = CountDownLatch(1)
+    val allowCallbackReturn = CountDownLatch(1)
+    val stopReturned = CountDownLatch(1)
+    val voice =
+      session(
+        generation = 1,
+        media = media,
+        emit = {},
+        onQuiesced = {
+          callbackEntered.countDown()
+          var interrupted = false
+          while (true) {
+            try {
+              allowCallbackReturn.await()
+              break
+            } catch (_: InterruptedException) {
+              interrupted = true
+            }
+          }
+          if (interrupted) Thread.currentThread().interrupt()
+        },
+      )
+
+    voice.start()
+    assertTrue(media.firstRecordingStarted.await(1, TimeUnit.SECONDS))
+    val stopThread =
+      thread {
+        voice.stop(reportStopped = true)
+        stopReturned.countDown()
+      }
+
+    assertTrue(callbackEntered.await(1, TimeUnit.SECONDS))
+    val returnedBeforeCallback = stopReturned.await(1, TimeUnit.SECONDS)
+    allowCallbackReturn.countDown()
+    stopThread.join(1_000)
+
+    assertTrue("Stop must not wait for its terminal callback.", returnedBeforeCallback)
+    assertFalse(stopThread.isAlive)
+  }
+
+  @Test
+  fun `immediate stop runs both cleanup sweeps before terminal callback`() {
+    val media = GenerationAwareMedia()
+    val quiesced = CountDownLatch(1)
+    val releaseCountAtCallback = AtomicInteger(-1)
+    val terminal = AtomicReference<T3VoiceRuntimeCallback?>()
+    val voice =
+      session(
+        generation = 1,
+        media = media,
+        emit = {},
+        onQuiesced = { callback ->
+          terminal.set(callback)
+          releaseCountAtCallback.set(media.releaseCount.get())
+          quiesced.countDown()
+        },
+      )
+
+    voice.stop(reportStopped = true)
+
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+    assertEquals(T3VoiceRuntimeCallback.ThreadStopped, terminal.get())
+    assertEquals(2, releaseCountAtCallback.get())
+  }
+
   private fun session(
     generation: Long,
     media: T3VoiceThreadMedia,
@@ -479,7 +546,6 @@ internal class T3VoiceThreadSessionTest {
       emit = emit,
       onQuiesced = onQuiesced,
       api = api ?: CompletedResponseApi(),
-      stopQuiescenceWaitMs = 25,
     )
 
   private class GenerationAwareMedia(

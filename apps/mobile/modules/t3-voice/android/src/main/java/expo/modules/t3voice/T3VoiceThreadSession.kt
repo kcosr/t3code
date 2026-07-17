@@ -22,7 +22,6 @@ internal class T3VoiceThreadSession(
   private val api: T3VoiceThreadSessionApi = T3VoiceNativeVoiceApi(config),
   private val nowIso: () -> String = T3VoiceTime::nowIso,
   private val scheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor(),
-  private val stopQuiescenceWaitMs: Long = DEFAULT_STOP_QUIESCENCE_WAIT_MS,
 ) {
   private enum class MediaOwner {
     NONE,
@@ -47,6 +46,10 @@ internal class T3VoiceThreadSession(
     T3VoiceQuiescingExecutor("t3-voice-thread-control-$generation", ::mediaExecutorTerminated)
   private val speechExecutor =
     T3VoiceQuiescingExecutor("t3-voice-thread-speech-$generation", ::mediaExecutorTerminated)
+  private val cleanupExecutor =
+    Executors.newSingleThreadExecutor { runnable ->
+      Thread(runnable, "t3-voice-thread-cleanup-$generation")
+    }
   private val active = AtomicBoolean(true)
   private val currentCalls = AtomicReference<T3VoiceHttpCallRegistry?>()
   private var terminalOutcome: TerminalOutcome? = null
@@ -60,10 +63,6 @@ internal class T3VoiceThreadSession(
   private var pcmSink: T3VoicePcmStreamSink? = null
   private var playbackFocusSuspended = false
   private var inFlightMediaCallbacks = 0
-
-  init {
-    require(stopQuiescenceWaitMs >= 0) { "stopQuiescenceWaitMs must be non-negative." }
-  }
 
   fun start() = startRecording()
 
@@ -584,18 +583,21 @@ internal class T3VoiceThreadSession(
       terminalOutcome = outcome
     }
     beginCleanup()
-    awaitMediaQuiescence()
   }
 
   /**
-   * Interrupts cancellable work immediately. A start call already inside an Android media API may
-   * publish ownership after this first sweep, so the terminal callback is deferred until both
-   * serial media executors have terminated and a second sweep has run.
+   * Interrupts cancellable work immediately and moves native media release off the caller thread.
+   * Android media calls can block while starting or stopping, so neither a bridge call nor a
+   * notification/MediaSession callback may wait for them. The terminal callback remains deferred
+   * until both serial media executors terminate and the cleanup executor runs a second sweep.
    */
   private fun beginCleanup() {
-    runCatching { currentCalls.getAndSet(null)?.cancelAll() }
+    val calls = currentCalls.getAndSet(null)
     scheduler.shutdownNow()
-    cancelOwnedMedia()
+    cleanupExecutor.execute {
+      runCatching { calls?.cancelAll() }
+      cancelOwnedMedia()
+    }
     controlExecutor.shutdownNow()
     speechExecutor.shutdownNow()
   }
@@ -621,21 +623,6 @@ internal class T3VoiceThreadSession(
     runCatching { media.releaseAudio() }
   }
 
-  private fun awaitMediaQuiescence() {
-    if (stopQuiescenceWaitMs == 0L) return
-    if (controlExecutor.ownsCurrentThread() || speechExecutor.ownsCurrentThread()) return
-    val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(stopQuiescenceWaitMs)
-    try {
-      for (executor in listOf(controlExecutor, speechExecutor)) {
-        val remaining = deadline - System.nanoTime()
-        if (remaining <= 0L) return
-        executor.awaitTermination(remaining)
-      }
-    } catch (_: InterruptedException) {
-      Thread.currentThread().interrupt()
-    }
-  }
-
   private fun mediaExecutorTerminated() {
     terminatedMediaExecutors.incrementAndGet()
     tryCompleteTerminal()
@@ -656,15 +643,21 @@ internal class T3VoiceThreadSession(
     if (terminatedMediaExecutors.get() != MEDIA_EXECUTOR_COUNT) return
     if (synchronized(lock) { inFlightMediaCallbacks != 0 }) return
     if (!terminalCompleted.compareAndSet(false, true)) return
-    cancelOwnedMedia()
-    val outcome = synchronized(lock) { checkNotNull(terminalOutcome) }
-    val callback =
-      when (outcome) {
-        TerminalOutcome.Stopped -> T3VoiceRuntimeCallback.ThreadStopped
-        TerminalOutcome.Released -> null
-        is TerminalOutcome.Failed -> T3VoiceRuntimeCallback.Failed(outcome.failure)
-      }
-    onQuiesced(callback)
+    cleanupExecutor.execute {
+      val callback =
+        try {
+          cancelOwnedMedia()
+          val outcome = synchronized(lock) { checkNotNull(terminalOutcome) }
+          when (outcome) {
+            TerminalOutcome.Stopped -> T3VoiceRuntimeCallback.ThreadStopped
+            TerminalOutcome.Released -> null
+            is TerminalOutcome.Failed -> T3VoiceRuntimeCallback.Failed(outcome.failure)
+          }
+        } finally {
+          cleanupExecutor.shutdown()
+        }
+      onQuiesced(callback)
+    }
   }
 
   private fun deleteRecording(recording: T3VoiceRecordingResult) {
@@ -681,7 +674,6 @@ internal class T3VoiceThreadSession(
     const val INITIAL_RETRY_DELAY_MS = 250L
     const val MAXIMUM_RETRY_DELAY_MS = 2_000L
     const val MAXIMUM_PLAYBACK_MILLIS = 15L * 60L * 1_000L
-    const val DEFAULT_STOP_QUIESCENCE_WAIT_MS = 100L
     const val MEDIA_EXECUTOR_COUNT = 2
   }
 }
@@ -691,7 +683,6 @@ private class T3VoiceQuiescingExecutor(
   threadName: String,
   onTerminated: () -> Unit,
 ) {
-  private val workerThread = AtomicReference<Thread?>()
   private val delegate =
     object : ThreadPoolExecutor(
       1,
@@ -699,7 +690,7 @@ private class T3VoiceQuiescingExecutor(
       0L,
       TimeUnit.MILLISECONDS,
       LinkedBlockingQueue(),
-      { runnable -> Thread(runnable, threadName).also(workerThread::set) },
+      { runnable -> Thread(runnable, threadName) },
     ) {
       override fun terminated() {
         try {
@@ -713,12 +704,6 @@ private class T3VoiceQuiescingExecutor(
   fun execute(action: () -> Unit) = delegate.execute(action)
 
   fun shutdownNow() = delegate.shutdownNow()
-
-  @Throws(InterruptedException::class)
-  fun awaitTermination(timeoutNanos: Long): Boolean =
-    delegate.awaitTermination(timeoutNanos, TimeUnit.NANOSECONDS)
-
-  fun ownsCurrentThread(): Boolean = workerThread.get() === Thread.currentThread()
 }
 
 internal fun safeFailureCode(value: String?, fallback: String): String =

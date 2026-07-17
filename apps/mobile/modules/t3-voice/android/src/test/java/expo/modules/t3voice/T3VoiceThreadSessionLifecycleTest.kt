@@ -212,7 +212,6 @@ internal class T3VoiceThreadSessionLifecycleTest {
       emit = emit,
       onQuiesced = onQuiesced,
       api = api,
-      stopQuiescenceWaitMs = 25,
     )
 
   private class LifecycleMedia : T3VoiceThreadMedia {
