@@ -182,10 +182,6 @@
     "./httpReadiness": {
       "types": "./src/httpReadiness.ts",
       "import": "./src/httpReadiness.ts"
-    },
-    "./voiceThreadMode": {
-      "types": "./src/voiceThreadMode.ts",
-      "import": "./src/voiceThreadMode.ts"
     }
   },
   "scripts": {

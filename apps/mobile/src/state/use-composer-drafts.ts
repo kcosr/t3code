@@ -210,9 +210,9 @@ function schedulePersistComposerDrafts(drafts: Record<string, ComposerDraft>): v
   }, PERSIST_DEBOUNCE_MS);
 }
 
-export function ensureComposerDraftsLoaded(): void {
+export function ensureComposerDraftsLoaded(): Promise<void> {
   if (loadPromise !== null) {
-    return;
+    return loadPromise;
   }
   loadPromise = loadPersistedComposerDrafts()
     .then((persistedDrafts) => {
@@ -237,6 +237,7 @@ export function ensureComposerDraftsLoaded(): void {
       );
       // Draft loading is best-effort; in-memory drafts still keep working.
     });
+  return loadPromise;
 }
 
 function updateComposerDrafts(

@@ -2,10 +2,15 @@
 
 ## Status
 
-This document defines the target architecture and implementation plan for T3 voice support.
-Android is the first implementation target. The contracts and server ownership model are shared
-from the beginning so iOS and desktop clients can implement the same capabilities without changing
-the server protocol.
+This document defines the integrated T3 voice architecture. Android is the first semantic-runtime
+implementation. The contracts, server seams, and React presentation model are platform-neutral so
+future web and desktop adapters can implement the same product behavior without changing the
+server protocol.
+
+The simplified native-owned Android runtime is implemented on
+`feature/android-voice-runtime-rebaseline`. Repository, native, artifact, and connected-device
+verification remain release gates; the authoritative Android product contract and acceptance matrix
+live in [the Android voice runtime rebaseline](../../specs/android-voice-runtime-rebaseline.md).
 
 The design has three independent capabilities:
 
@@ -42,8 +47,8 @@ provider control events.
 
 ## Goals
 
-- Add native Android push-to-talk dictation and streamed speech playback.
-- Add an OpenAI Realtime voice agent capable of controlling T3 projects and threads.
+- Provide native Android push-to-talk dictation and streamed speech playback.
+- Provide an OpenAI Realtime voice agent capable of controlling T3 projects and threads.
 - Preserve the same authenticated environment boundary used by other remote T3 operations.
 - Keep media latency low without turning the T3 server into an audio relay for Realtime sessions.
 - Define provider-neutral contracts and services that support additional voice providers.
@@ -279,8 +284,8 @@ instructions, tools, VAD, audio formats, and provider feature flags.
 
 ## Authorization
 
-Add `voice:use` to `AuthEnvironmentScope` and the standard client scope grant. Add administrative
-`voice:manage` for credential status/set/clear. Media, conversation, session, event, and
+`AuthEnvironmentScope` and the standard client scope grant include `voice:use`. Administrative
+`voice:manage` authorizes credential status/set/clear. Media, conversation, session, event, and
 confirmation operations require `voice:use`; provider credential mutation requires `voice:manage`.
 
 Tool execution also checks the scope required by the underlying operation on every call:
@@ -448,11 +453,14 @@ with changed arguments.
 POST /api/voice/media-tickets
 ```
 
-The authenticated React runtime requests a one-use ticket bound to its auth session, operation
-(`transcription-upload`, `speech-stream`, or `voice-heartbeat`), optional voice session/request ID,
-method, path audience, byte limit, and short expiry. Native code uses it for the corresponding
-background-capable HTTP operation. Tickets are stored only in memory, cannot mint other tickets,
-and are invalidated by use, expiry, auth-session revocation, or voice-session closure.
+Traditional React-owned one-shot dictation and playback request one-use tickets through the
+authenticated client runtime. A native semantic Thread session uses its bounded native child bearer
+to request its own one-use transcription and speech tickets while React is detached or backgrounded.
+
+Every ticket is bound to its issuing auth session, operation (`transcription-upload`,
+`speech-stream`, or `voice-heartbeat`), optional voice session/request ID, method, path audience,
+byte limit, and short expiry. Tickets are stored only in memory, cannot mint credentials or other
+tickets, and are invalidated by use, expiry, auth-session revocation, or voice-session closure.
 
 ## Provider Interfaces
 
@@ -596,33 +604,25 @@ inside the server.
 Tool contracts use stable T3 IDs, bounded strings, and explicit result limits. Lists require a
 limit and return compact summaries. The server rejects unknown fields and unknown tool names.
 
-### Thread history and asynchronous turn completion
+### Thread history and bounded turn completion
 
-The voice agent must be able to inspect the existing coding-thread conversation, not merely its
-shell status. Add a bounded `get_thread_messages` read tool backed by the orchestration thread-detail
-snapshot. It accepts a thread ID plus cursor and limit, returns normalized user/assistant messages
-with turn and completion metadata, and never places an unbounded transcript in Realtime context.
-Activities, diffs, plans, and tool output remain separate bounded queries rather than being folded
-into message text.
+The Realtime voice agent can inspect existing coding-thread conversation through a bounded
+`get_thread_messages` read tool backed by the orchestration thread-detail projection. It accepts a
+thread ID, cursor, and limit, and returns normalized user/assistant messages with turn metadata.
+Activities, diffs, plans, and tool output remain separate bounded queries.
 
-Sending work to a coding thread and receiving its result are separate operations because a coding
-turn may take minutes, request approval or user input, or be steered while it is running.
-`send_thread_message` returns the orchestration command, message, and turn identifiers immediately.
-T3 then follows the existing thread-detail event stream and offers both completion mechanisms:
+Sending work and reading its result are separate operations. `send_thread_message` returns stable
+command, message, and turn correlation identifiers as soon as dispatch is accepted.
+`wait_for_thread_turn` performs a cancellable bounded wait when the Realtime agent explicitly
+needs the result during its current response. It returns a final assistant message and terminal
+state, or a typed pending/running, interruption, failure, approval-required, or user-input-required
+result.
 
-- `wait_for_thread_turn` performs a cancellable, bounded wait when the Realtime agent explicitly
-  needs the result during its current response. It returns the final assistant message and terminal
-  state, or a typed timeout, interruption, failure, approval-required, or user-input-required result.
-- An asynchronous watcher journals a compact completion result and injects a normalized completion
-  notification into the active Realtime provider call. If the originating call has ended, the
-  notification remains in the durable voice journal and is included when that conversation is next
-  continued. Provider adapters implement notification delivery; orchestration completion tracking
-  remains provider-neutral.
-
-The server correlates completions by T3 turn ID, not by provider function-call ID or whichever
-thread is currently focused. It deduplicates terminal delivery across reconnects, call rotation,
-and process recovery. The asynchronous path is the default for long-running turns; the bounded wait
-is a convenience, not a permanently blocking HTTP request.
+There is no asynchronous completion watcher and no synthetic completion message is injected into an
+active or future Realtime provider call. Completion is correlated to the exact T3 message/turn, not
+the provider function-call ID or whichever thread is currently focused. Retrying an accepted
+dispatch preserves its deterministic command/message identity; polling completion never redispatches
+the turn.
 
 ### Confirmation policy
 
@@ -645,7 +645,7 @@ are reconciled from orchestration command receipts after a crash rather than exe
 
 ## Server Settings and Secrets
 
-Add provider-neutral voice settings to `ServerSettings`:
+`ServerSettings` contains provider-neutral voice settings:
 
 ```ts
 voice: {
@@ -680,57 +680,74 @@ apps/mobile/modules/t3-voice/
   android/src/main/java/expo/modules/t3voice/
     T3VoiceModule.kt
     T3VoiceRuntimeService.kt
-    T3VoiceMediaEngine.kt
+    T3VoiceRuntimeController.kt
+    T3VoiceNativeRuntimeDriver.kt
+    T3VoiceNativeVoiceApi.kt
+    T3VoiceHttpTransport.kt
+    T3VoiceAndroidControls.kt
     T3VoiceWebRtcSession.kt
-    T3VoiceAudioPlayer.kt
+    T3VoicePcmPlayer.kt
     T3VoiceRecorder.kt
-    T3VoiceStateStore.kt
   src/
     index.ts
     T3Voice.types.ts
 
 apps/mobile/src/features/voice/
-  nativeVoiceModule.ts
-  voiceRuntime.ts
-  voiceState.ts
-  useVoice.ts
-  components/
+  androidVoiceRuntimeAdapter.ts
+  MasterVoiceProvider.tsx
+  MasterVoiceOverlays.tsx
 ```
 
 The local module is autolinked using `expo-module.config.json`, matching existing T3 native modules.
 No durable source change is made only under generated `apps/mobile/android`.
 
-### Native bridge
+### Native runtime ownership
 
-`T3VoiceModule` exports these Android bounded-media operations and events:
+Android owns one process-local serialized controller for both supported modes:
 
-- `getMediaCapabilitiesAsync`
-- `getStateAsync`
-- `getMicrophonePermissionAsync`
-- `requestMicrophonePermissionAsync`
-- `startRecordingAsync`
-- `stopRecordingAsync`
-- `cancelRecordingAsync`
-- `deleteRecordingAsync`
-- `startPlaybackAsync`
-- `enqueuePlaybackChunkAsync`
-- `finishPlaybackAsync`
-- `cancelPlaybackAsync`
-- `stateChanged`
-- `playbackChunkConsumed`
-- `runtimeError`
+```text
+Idle
+Realtime(Starting | Connected | Stopping)
+SwitchingToThread(ClosingRealtime | StartingRecorder)
+Thread(Starting | Recording | Finalizing | Transcribing | Reviewing |
+       Submitting | Waiting | Playing | Rearming | Stopping)
+Failed
+```
 
-The Realtime phase extends the same local module with:
+The immutable public snapshot carries a process-local generation and monotonic publication
+sequence. Driver callbacks carry the generation that admitted their work, so a late callback from
+an earlier mode cannot mutate the replacement. The generation, callbacks, credentials, timers, and
+resource handles are never persisted.
 
-- `prepareRealtimeSession` (returns a native session ID and ICE-complete SDP offer)
-- `applyRealtimeAnswer` (requires the same native session ID)
-- `stopRealtimeSession`
-- `setAudioRoute`
+React, notification intents, and MediaSession callbacks all dispatch the same typed controller
+commands. The service renders notification actions from the current snapshot, so an action cannot
+silently invoke a command that is invalid for the current state.
 
-React Native owns UI composition, authenticated signaling, and selected environment/thread state.
-The foreground service owns active media, audio focus, routing, and the realtime peer connection.
-It creates the provider-required data channel but never exposes raw provider JSON through Expo;
-normalized state arrives on the T3 event subscription.
+### Semantic native bridge
+
+`T3VoiceModule` exports one Android runtime contract:
+
+- `getRuntimeSnapshotAsync` and `runtimeSnapshotChanged`;
+- `startRealtimeAsync` and `startThreadAsync`;
+- `switchRealtimeToThreadAsync` and `stopRuntimeAsync`;
+- `setRealtimeMutedAsync`, `setRealtimeAudioRouteAsync`, and `updateRealtimeContextAsync`;
+- Realtime confirmation and client-action completion commands;
+- `finishThreadRecordingAsync`;
+- `updateThreadReviewTranscriptAsync({ generation, reviewId, transcript })`; and
+- `submitThreadTranscriptAsync({ generation, reviewId, transcript })`.
+
+The generation plus per-cycle review ID is an exact capability for the current review buffer.
+Delayed edits or Submit actions from an earlier review cycle are rejected, including when automatic
+rearming keeps the same top-level session generation.
+
+Initial start commands include the exact target, settings, root environment URL, and a bounded
+native child credential. Subsequent controls do not resend or remint credentials. Snapshot payloads
+never contain credentials, provider identifiers, SDP, raw provider events, or recording paths.
+
+The existing bounded one-shot recording and PCM playback bridge remains available for manual
+dictation and eligible message playback. It shares an exclusive service-level media gate with the
+semantic runtime. Raw React-owned Realtime offer/answer/session methods are not part of the Android
+end state.
 
 ### Media ownership
 
@@ -746,11 +763,40 @@ normalized state arrives on the T3 event subscription.
   active mode explicitly supports barge-in.
 - Bluetooth, wired headset, speaker, and earpiece routes are represented as stable platform-neutral
   route descriptors.
+- Thread mode releases audio focus while it is uploading, submitting, or waiting, then reacquires it
+  before playback or recording. Realtime retains its communication focus for the live peer.
+
+### Native Realtime and Thread flows
+
+Realtime native work includes scoped session creation, ICE-complete offer/answer exchange, WebRTC
+audio, server heartbeat, event polling, focus updates, client-action acknowledgement, confirmation
+decisions, mute, routes, and close. Event polling, heartbeat, focus, and acknowledgement have
+separate bounded execution lanes; a long poll or slow focus update cannot delay Stop or an
+`activate_thread` acknowledgement.
+
+Thread native work includes recording and endpoint detection, native-child-authenticated creation
+of one-use transcription and speech tickets, upload, ordinary idempotent `thread.turn.start`
+dispatch, exact polling by the dispatched message ID, optional bounded speech synthesis and PCM
+playback, and configured rearming. Dispatch retries retain the same command and message IDs; outcome
+polling never redispatches. Speech uses its own bounded data lane and player credit so a slow output
+device cannot block control, Stop, focus-loss handling, or polling. Completed temporary recordings
+are deleted after the transcription attempt; startup cleanup is a bounded sweep, not recovery.
+
+The exact outcome seam is
+`GET /api/orchestration/threads/:threadId/messages/:messageId/turn`. It validates that the requested
+message is the dispatched user message in that thread and returns one of `pending`, `running`,
+`approval-required`, `user-input-required`, `completed`, `interrupted`, `failed`, or
+`ambiguous`, plus the correlated turn ID and at most 32,000 characters of settled assistant text.
+
+Realtime-to-Thread is a single controller transition. The peer and its microphone are physically
+released before Thread recording starts. The same in-memory child credential may be retained across
+that transition, but no handoff transaction or live state is persisted.
 
 ### Foreground service
 
-The foreground service owns media that must survive React activity recreation. It does not start an
-ambient microphone and does not start microphone capture from the background.
+The foreground service owns the controller, network drivers, active media, notification, and
+MediaSession. It is first started from a visible user action and does not start a dormant microphone
+from an arbitrary background event.
 
 The Android library manifest declares:
 
@@ -761,63 +807,84 @@ The Android library manifest declares:
 - `FOREGROUND_SERVICE`
 - `FOREGROUND_SERVICE_MEDIA_PLAYBACK`
 - `FOREGROUND_SERVICE_MICROPHONE`
+- `WAKE_LOCK`;
 - an unexported service with `foregroundServiceType="mediaPlayback|microphone"`.
 
 Microphone permission is requested while the app is visible. A microphone foreground service is
 started only from that user-visible action and calls `startForeground` immediately with matching
 microphone/media-playback types. It uses `START_NOT_STICKY`; process death closes the local peer and
-requires a fresh session. The notification Stop action closes capture, playback, and peer without
-React. Notification denial reduces visibility but does not block service start. Bluetooth denial
-removes Bluetooth route control. The service stops when neither capture nor background playback
-remains.
+requires a fresh session. `stopWithTask=false` makes task removal a best-effort continuation while
+the process remains alive, not a recovery guarantee. A non-reference-counted partial wake lock is
+held only while a semantic operation is active so screen lock does not suspend Thread waiting or
+Realtime control; it is released on Idle, Failed, and service destruction.
+
+The notification exposes mute/unmute, prepared Realtime-to-Thread switch, finish utterance, submit
+review transcript, and stop only where those commands are valid. MediaSession play/pause/next/stop
+map to the same command set. Notification denial reduces drawer visibility but does not block
+service start. Bluetooth denial removes Bluetooth route control.
+
+If a bounded Realtime shutdown deadline expires while platform peer disposal is still blocked, the
+public state becomes Failed and live audio focus/routing plus the wake lock are released. The native
+owner slot and a Stop-only foreground notification remain until the terminal worker reports exact
+quiescence; only then may Stop publish Idle or another mode start.
 
 The service never retains a module, React context, or Activity. A local Binder and process-scoped
-`StateFlow` expose state snapshots. The Expo module subscribes in `OnStartObserving`, detaches in
-`OnStopObserving`/`OnDestroy`, and calls `getState` after reattachment.
+`StateFlow` expose complete snapshots. The Expo module binds and collects for the module's lifetime,
+then unbinds on module teardown without stopping an active service. The JavaScript adapter registers
+its event listener before reading the complete snapshot and deduplicates by publication sequence, so
+attachment has no snapshot/subscription gap. A failed attachment does not expose a command-capable
+adapter.
 
 ### Credential boundary
 
-The native module receives only the selected T3 environment endpoint and one-use media tickets
-minted by the server through the existing authenticated React client runtime. It does not receive
-an OpenAI credential or the main long-lived T3 credential.
+After a visible user start and permission check, the authenticated React client calls
+`POST /api/voice/native-session`. The server returns a bearer child with exactly `voice:use`,
+`orchestration:read`, and `orchestration:operate`. Its lifetime is the lesser of 12 hours and the
+parent session's remaining lifetime, and a native child cannot issue another native child. The
+credential response is non-cacheable. React passes that credential and the normalized root
+environment URL only on the initial native start.
 
-Long-lived T3 bearer or DPoP credentials remain in existing mobile secure storage and are never
-copied into the native service or plain SharedPreferences. Media tickets live in memory only and
-are refreshed by the authenticated runtime while attached.
+The main mobile DPoP credential remains in the existing connection runtime and is never copied into
+the service. The native child, media tickets, and server session identifiers remain in memory and
+are cleared on Idle, failure, expiry, or process termination. Native code never receives an OpenAI
+credential. There is no SharedPreferences credential fallback and no React callback dependency
+while a supported operation is in the background.
 
 ### React Native state
 
-Voice state is environment-scoped. Switching environments or removing the active environment ends
-the active voice session. Switching threads updates the context available to the voice agent but
-does not silently retarget a pending mutating tool call.
+`@t3tools/client-runtime/voice` defines the platform-neutral semantic snapshot and adapter contract.
+The Android adapter issues the child credential, validates environment/context identity, and
+forwards controls. Android native code implements the runtime today; future web/desktop adapters
+implement the same semantic contract with their platform media stack. Shared React presentation is
+therefore a controller/view over the adapter, not the owner of an Android session.
 
-### Follow-up addendum: application-level master voice
+Parity means that platforms share this semantic adapter, settings, snapshots, and presentation
+behavior. It does not mean retaining a second React-owned Android state machine beside the native
+controller.
 
-The Realtime agent is an environment-level master voice conversation, not a child of the coding
-thread from which it was started. Its controller and transcript surface live above thread-detail
-navigation. Opening another ordinary T3 thread therefore does not close the Realtime call. The
-selected project and thread become the agent's visible focus for subsequent discussion, while every
-tool invocation continues to carry an explicit project or thread ID. A focus change never rewrites
-the target of a pending confirmation or an already-issued mutation.
+The Realtime agent remains an environment-level master voice conversation. Opening another coding
+thread does not close it; React updates native focus and the prepared Thread switch target. Focus
+changes do not retarget pending confirmations or already-issued mutations. If React navigates to a
+different environment while native work is active, the active snapshot's environment remains
+authoritative until the user stops it; React cannot silently attach another environment's client.
 
 The mobile UI keeps a persistent master-voice call bar available across project and thread screens.
 It shows call state, mute, audio route, current focus, transcript access, and hangup. The separate
 durable voice conversation remains the source of history; it is not inserted into the ordinary
 coding-thread list or represented as a provider-backed coding thread.
 
-T3 permits only one microphone-owning voice mode at a time. If the user starts a thread-local voice
-interaction, such as bounded dictation or a future thread-scoped hands-free mode, while the master
-Realtime call is active, the client explicitly stops the Realtime session before starting the
-thread-local mode. Stopping closes the native peer, terminates the provider call and sideband, and
-invalidates or rejects unresolved tool confirmations. Finalized transcript and tool history remain
-in the durable master voice conversation.
+T3 permits only one microphone-owning voice mode at a time. Starting Thread voice from Realtime uses
+the serialized native switch: it closes the peer and server session, waits for exact local release,
+then starts the recorder. Starting unrelated one-shot dictation explicitly stops or is rejected by
+the active semantic owner. Finalized Realtime transcript and tool history remain in the durable
+master voice conversation.
 
 Returning to master voice does not attempt to resurrect the previous WebRTC connection or provider
 call. The user explicitly resumes the same durable voice conversation, and T3 creates a new
 `VoiceSessionId`, compiles the retained context, and negotiates a new provider call. The UI labels
-this action Resume rather than implying that the old media connection remained alive. Switching
-environments still ends the master call because voice conversations, authorization, tools, and
-thread identities are environment-scoped.
+this action Resume rather than implying that the old media connection remained alive. An active
+call remains bound to its original environment until explicitly stopped; navigation cannot retarget
+it to another environment.
 
 The UI provides:
 
@@ -858,8 +925,8 @@ All clients use the same server signaling, capability, confirmation, and bounded
 - Client heartbeat expiry fences only pre-media setup in `creating`, `signaling`, and `connecting`.
   After provider media attaches, provider closure and the absolute session-duration limit own
   liveness so React timer suspension cannot end healthy background media.
-- Ordinary React event-subscription disconnect does not close healthy native media. A recreated
-  controller explicitly stops and reconciles an orphaned native peer before starting another call.
+- Ordinary React event-subscription disconnect does not close healthy native media. Recreated React
+  presentation attaches to the complete native snapshot and never treats the peer as orphaned.
 - Provider errors are normalized into recoverable, terminal, or policy failures.
 - Tool execution survives duplicate provider events through idempotency records.
 - Session duration is capped below the provider maximum and exposed to the client.
@@ -982,105 +1049,21 @@ With explicit credentials and opt-in:
 - execute a read tool and a confirmation-gated write tool;
 - measure interruption and first-audio latency.
 
-## Implementation Plan
+## Implementation status
 
-### 1. Contracts, authorization, and canonical command dispatch
+The server voice foundation, bounded media routes, Realtime control plane, durable voice
+conversation model, tool/confirmation policies, and Android native media primitives predate the
+Android runtime rebaseline.
 
-- Add shared voice schemas and public errors.
-- Add `voice:use` and administrative `voice:manage` authorization scopes.
-- Add voice settings, redaction, secret persistence, and capability descriptors.
-- Extract `ClientCommandDispatcher` from WebSocket-owned orchestration workflow and route existing
-  WebSocket and HTTP commands through it before voice uses it.
-- Add contract and settings tests.
+The rebaseline replaces React-owned Android session orchestration and the abandoned durable
+kernel/mailbox direction with one process-local native controller. It includes the typed semantic
+adapter, native Realtime and Thread drivers, foreground-service notification/MediaSession controls,
+exact native-session and thread-outcome server seams, generation/review fencing, and deletion of the
+superseded Android bridge/state-machine shapes.
 
-Acceptance criteria:
-
-- Existing settings remain decodable through schema defaults.
-- No secret appears in serialized server settings.
-- A paired standard client receives `voice:use`; restricted clients can omit it.
-- Existing WebSocket/HTTP command behavior remains covered through the shared dispatcher.
-
-### 2. Durable conversation foundation
-
-- Add SQLite migrations for voice conversations, journal entries, compactions, and tool calls.
-- Add `VoiceConversationRepository`, retention/deletion, and `VoiceContextCompiler` layers.
-- Add create/list/get/delete/clear-context APIs and the atomic generation-fenced media lease.
-- Persist only final normalized content and mark interrupted partial responses non-final.
-
-Acceptance criteria:
-
-- Durable context rehydrates deterministically after server restart; ephemeral context does not.
-- Clear-context, hard delete, age/size retention, compaction, and call-boundary behavior are tested.
-- Concurrent takeover permits one generation; stale provider events cannot journal or execute tools.
-
-### 3. Server provider foundation
-
-- Add provider-neutral Effect services and test layers.
-- Add `OpenAiVoiceProvider` bounded STT and streaming TTS.
-- Add authenticated media routes, one-use media tickets, cancellation, limits, and telemetry.
-- Add credential status/set/clear APIs guarded by `voice:manage`.
-
-Acceptance criteria:
-
-- Fake-provider integration tests cover success, limits, cancellation, and authorization.
-- Gated OpenAI STT/TTS verification succeeds without exposing the API key to a client.
-
-### 4. Android native media and UI
-
-- Add the local Expo module, library manifest, and native checks.
-- Implement bounded recorder and streaming PCM playback.
-- Add composer dictation and message play/stop controls.
-- Add settings, route state, and synthetic-voice disclosure.
-- Pin and isolate native WebRTC, and implement service-owned Binder/`StateFlow` lifecycle.
-
-Acceptance criteria:
-
-- Dictation inserts a transcript into the selected composer.
-- Playback starts before the complete provider response is buffered and stops immediately.
-- Native behavior survives activity recreation and cleans up after cancellation.
-
-### 5. Realtime server control
-
-- Add T3 session registry and WebRTC signaling route.
-- Implement OpenAI negotiation and sideband adapter.
-- Implement normalized state events, expiry, quotas, and cleanup.
-- Implement read-only voice tools.
-- Disable provider automatic truncation and rotate from compiled T3 context before provider limits.
-
-Acceptance criteria:
-
-- Android establishes direct WebRTC media while T3 observes the same session over sideband.
-- The voice agent lists projects/threads and reads thread status through server tools.
-
-### 6. Mutating tools and confirmation
-
-- Add create/send/interrupt/archive tools.
-- Add confirmation contracts, endpoint, UI, expiration, persisted tool calls, deterministic command
-  IDs, and crash reconciliation.
-- Add audit telemetry and adversarial tests.
-
-Acceptance criteria:
-
-- Create and send execute immediately with deterministic durable deduplication; interrupt and
-  archive require valid server-side confirmation.
-- Duplicate provider calls and confirmation replays do not duplicate orchestration commands.
-
-### 7. Hardening and cross-platform readiness
-
-- Complete Android route, Bluetooth, lifecycle, and network testing.
-- Document server setup and provider configuration.
-- Extract the platform media interface used by future iOS and desktop adapters.
-- Run full repository and native quality checks.
-
-Acceptance criteria:
-
-- Android end-to-end device checklist passes.
-- Server behavior is independent of Android implementation details.
-- iOS and desktop adapters can be implemented without changing server contracts.
-- `vp check`, `vp run typecheck`, and `vp run lint:mobile` pass.
-- Clean Android prebuild, merged-manifest inspection, module unit tests, APK assembly/install, and
-  connected device tests pass. Native voice changes are delivered in a rebuilt dev client, not
-  Expo Go or an OTA-only update.
+Completion is determined by the repository gates and the connected-device matrix in the rebaseline
+spec, not by the old phased workstream sequence. Temporary Realtime milestone tracing is removed
+after the first traced device pass; the bounded privacy-safe diagnostic ring remains.
 
 ## Operational Setup
 
@@ -1110,38 +1093,33 @@ separate capability and never blocks server startup.
 - [Expo Continuous Native Generation](https://docs.expo.dev/workflow/continuous-native-generation/)
 - [Android foreground service types](https://developer.android.com/develop/background-work/services/fgs/service-types)
 
-## Follow-Up: Hands-Free Bounded Conversation Mode
+## Native Thread Voice
 
-This is a follow-up task. Do not add it to the initial voice implementation or use it to expand the
-initial acceptance criteria. Begin implementation only after bounded push-to-talk STT, streaming
-TTS, cancellation, Realtime sessions, and Android lifecycle behavior are complete and have passed
-the documented server, native, and connected-device tests.
-
-The follow-up provides a hands-free conversation loop for an ordinary, non-Realtime T3 thread. It
-composes the existing bounded STT and streaming TTS capabilities; it does not create an OpenAI
-Realtime session or introduce another provider protocol.
+Thread voice is the non-Realtime native mode. It composes bounded STT, ordinary T3 thread turns,
+exact response correlation, and optional streaming TTS; it does not create an OpenAI Realtime
+session or introduce another provider protocol.
 
 ### User flow
 
-1. The user explicitly enables hands-free mode for the selected thread.
+1. The user explicitly starts Thread voice for the selected thread.
 2. Android arms the microphone and uses local audio energy or VAD to detect speech onset.
 3. End-of-speech silence, a maximum utterance duration, or an explicit control ends capture.
 4. The bounded recording is transcribed and, according to the selected policy, either inserted for
    review or submitted to the thread automatically.
-5. The ordinary thread response continues streaming as text. Phrase-chunked TTS begins before the
-   text response completes.
-6. After playback completes, the client waits for a short configurable guard interval and re-arms
-   the microphone. The loop continues until explicitly paused or stopped.
+5. Native code waits for the exact dispatched message's turn outcome. If response playback is
+   enabled, it phrase-chunks the bounded final assistant text and streams TTS into one playback.
+6. When `autoRearm` is enabled, Android waits for the configured guard interval and starts the next
+   cycle. When it is disabled, Thread voice performs one cycle and returns to Idle.
 
-The controller state machine is:
+The native controller stages are:
 
 ```text
-paused -> arming -> listening -> endpointing -> transcribing
-       -> submitting -> waiting -> speaking -> arming
+starting -> recording -> finalizing -> transcribing -> reviewing/submitting
+         -> waiting -> playing -> rearming -> recording
 ```
 
-Any active state may enter `recovering` for a bounded retry or `paused` for an explicit stop,
-permission loss, environment change, thread retarget, repeated failure, or unsafe lifecycle state.
+Any active state may enter `stopping` or `failed`. Failures perform bounded cleanup and do not
+automatically retry a whole utterance or restore it after process death.
 
 ### Required behavior
 
@@ -1151,96 +1129,78 @@ permission loss, environment change, thread retarget, repeated failure, or unsaf
   timers are independently bounded.
 - Playback completion and cancellation are explicit native events; the controller does not infer
   completion from elapsed time.
-- Canceling speech aborts current and queued TTS work but does not interrupt the underlying thread
-  or its text stream.
-- Stopping the thread response is a separate action from stopping speech or pausing hands-free
-  listening.
+- Stopping Thread voice cancels current native media/network waiting and prevents rearm. It does not
+  silently interrupt an ordinary agent turn that the server has already accepted.
 - The microphone does not re-arm while TTS owns audio focus. A post-playback guard interval and
   platform echo controls prevent synthesized speech from being submitted as user input.
-- Optional barge-in may stop TTS and begin a new bounded utterance without interrupting the thread
-  text stream. It is disabled until echo rejection is verified on connected devices.
+- Barge-in is disabled until echo rejection is verified on connected devices.
 - Auto-submit and transcript-review are explicit modes. Auto-submit is never silently enabled by
   entering ordinary dictation.
+- If no speech arrives before the configured timeout, an auto-rearming session starts a bounded new
+  cycle; a one-cycle session enters Failed so the outcome remains visible.
 - Network loss, permission revocation, audio-route changes, repeated empty transcripts, and repeated
-  provider errors pause the loop instead of retrying indefinitely.
-- Environment or thread changes cancel the current recording and playback and require an explicit
-  re-arm against the new target.
+  provider errors fail the bounded cycle instead of retrying indefinitely.
+- Navigation, Activity recreation, React detachment, and app backgrounding do not cancel the active
+  target. A different visible thread cannot silently retarget the operation.
 
 ### Implementation boundary
 
-The first implementation should keep endpoint detection and foreground audio ownership in the
-Android service. Shared TypeScript owns the product state machine, thread targeting, STT/TTS
-requests, and submission policy. Final energy thresholds, silence windows, Kotlin event names, and
-UI placement should be selected after the initial native recorder and playback APIs have passed
-device testing.
+Android owns endpoint detection, the semantic state machine, target, submission policy, native
+child credential, STT/TTS requests, exact thread correlation, timers, foreground lifecycle, and
+media resources. React supplies initial target/settings, renders snapshots, edits/submits review
+text, and exposes controls. The platform-neutral TypeScript runtime contract preserves the same
+product model for a future web/desktop implementation.
 
-No server contract change should be required. If implementation reveals that bounded STT, TTS
-cancellation, playback completion, or independent thread cancellation cannot support this mode,
-fix those primitives first rather than adding hands-free-specific server routes.
+The server additions are general seams rather than hands-free routes: scoped native-session
+issuance and an exact bounded thread-message outcome query.
 
-### Follow-up verification
+### Verification
 
-- Unit-test every state transition, timeout, cancellation path, and retry limit with a virtual
-  clock.
-- Verify that stopping speech leaves the thread text response running and that stopping the thread
-  does not silently re-arm listening.
+- Unit-test every state transition, timeout, cancellation path, retry limit, and generation fence.
+- Verify Stop does not silently rearm and does not duplicate a server-accepted message.
 - Verify no self-transcription across speaker, wired headset, and Bluetooth routes.
-- Verify pause/stop from both the app and foreground notification while the activity is recreated,
-  backgrounded, or the screen is off.
+- Verify finish/submit/stop from both the app and foreground notification while the activity is
+  recreated, backgrounded, or the screen is off.
 - Measure speech-onset detection, endpoint latency, transcript latency, first-audio latency, false
   starts, empty turns, and re-arm latency without retaining raw audio.
 
-## Follow-Up: Screen-Off Headset Controls
+## MediaSession and screen-off controls
 
-This is a follow-up task modeled on the existing Assistant Android voice runtime. It is opt-in and
-must not make the operation-scoped foreground service permanently active for users who do not want
-headset controls.
-
-Android cannot reliably start a microphone foreground service from an arbitrary background media
-button event. When the user enables headset controls while T3 is visible, T3 therefore starts and
-retains its voice foreground service, registers an active Android `MediaSession`, and displays an
-ongoing notification. The already-running service can then receive headset events and begin audio
-capture while the activity is backgrounded or the screen is off.
+The operation-scoped foreground service registers an active MediaSession only while Realtime,
+Thread, or their transition is active. This supports lock-screen and headset transport controls for
+the existing operation without introducing an idle always-ready microphone mode.
 
 ### Headset behavior
 
-- An initial `ACTION_DOWN` event with repeat count zero for play, pause, stop, headset hook, or
-  play/pause is eligible; key-up and repeated events are ignored.
-- When no interaction is active, a supported button starts the configured action: bounded
-  dictation, hands-free listening, or a Realtime conversation.
-- While listening, speaking, or otherwise active, the same button stops the current voice
-  interaction without implicitly stopping an ordinary T3 thread response.
-- Media-session playback state mirrors idle versus listening/speaking state so Android and the
-  headset route subsequent controls consistently.
-- A notification action enables or disables headset controls and always exposes Stop while an
-  interaction is active.
-- Disabling headset controls deactivates and releases the media session. If no other voice feature
-  needs persistent background ownership, it also stops the persistent foreground service.
+- Realtime play/pause maps to unmute/mute, next maps to the prepared Thread switch, and stop ends the
+  operation.
+- Thread pause finishes the active utterance, play submits a review transcript, and stop ends the
+  native voice loop when those commands are valid.
+- MediaSession state and custom actions are derived from the same snapshot as notification actions.
+- Repeated, stale-generation, or invalid-state controls are rejected or coalesced by the controller.
 
 ### Lifecycle and safety
 
-- Microphone and notification permissions are obtained before enabling the persistent mode.
-- The initial foreground-service start occurs while the activity is visible; headset presses do
-  not attempt to launch a dormant microphone service from the background.
-- The service restores only explicitly persisted headset-control configuration after process
-  recreation and uses a sticky restart policy only while that mode remains enabled.
-- An actual Realtime call holds a partial CPU wake lock and, where device testing shows it is
-  necessary, a high-performance Wi-Fi lock. Locks are scoped to active work, not the entire idle
-  headset-control period.
+- Microphone permission and initial foreground-service start occur while the Activity is visible.
+- Media buttons never launch a dormant service or start a new microphone operation from Idle.
+- MediaSession readiness and controls are not persisted or restored after process death.
+- A partial CPU wake lock is scoped to the active semantic operation.
 - Audio focus, Bluetooth routing, call interruptions, permission revocation, and competing media
-  sessions must move the runtime to a coherent idle or stopped state.
-- The persistent notification must make background microphone readiness apparent and provide a
-  one-tap way to disable it.
+  sessions must move the runtime to a coherent failed, idle, or stopped state and release live
+  media.
 
-### Follow-up verification
+An idle opt-in headset-readiness feature would be a separate product decision with its own battery,
+permission, background-start, and persistence contract. It is not implied by active-session
+controls.
 
-- Verify idle-to-listen and active-to-stop headset toggles with wired, classic Bluetooth, and BLE
-  headsets.
+### Verification
+
+- Verify active mute/unmute, finish/submit, switch, and stop with wired, classic Bluetooth, and BLE
+  headsets where Android exposes the corresponding transport action.
 - Verify behavior with the activity backgrounded, removed from recents, recreated, and with the
   screen off through Doze entry.
-- Verify the service cannot start capture after headset controls are disabled or permissions are
-  revoked.
+- Verify Idle media buttons cannot start capture and revoked permissions terminate active capture.
 - Verify competing music and podcast media sessions regain control after T3 releases its media
   session.
-- Verify persistent notification controls, process restart behavior, wake-lock release, and
-  Realtime network continuity on the connected Android device.
+- Verify notification controls, non-sticky process behavior, wake-lock release, and Realtime network
+  continuity on the connected Android device.

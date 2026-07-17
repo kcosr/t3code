@@ -4,6 +4,7 @@ import * as Layer from "effect/Layer";
 import { HistoryRuntimeLive } from "../history/runtimeLayer.ts";
 import { VoiceCredentialStoreLive } from "./Layers/VoiceCredentialStore.ts";
 import { VoiceConversationServiceLive } from "./Layers/VoiceConversationService.ts";
+import { NativeVoiceSessionIssuerLive } from "./Layers/NativeVoiceSessionIssuer.ts";
 import { VoiceConversationRepositoryLive } from "../persistence/Layers/VoiceConversations.ts";
 import { ProjectionThreadMessageRepositoryLive } from "../persistence/Layers/ProjectionThreadMessages.ts";
 import { ProjectionTurnRepositoryLive } from "../persistence/Layers/ProjectionTurns.ts";
@@ -106,6 +107,7 @@ const VoiceLifecycleConfiguredLive = VoiceSessionLifecycleLive.pipe(
 );
 
 export const VoiceRuntimeLive = Layer.mergeAll(
+  NativeVoiceSessionIssuerLive,
   VoiceSessionServiceConfiguredLive,
   VoiceCoreDependenciesLive,
   VoiceLifecycleConfiguredLive,

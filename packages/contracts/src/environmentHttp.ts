@@ -26,6 +26,7 @@ import {
 } from "./auth.ts";
 import {
   AuthSessionId,
+  MessageId,
   ThreadId,
   TrimmedNonEmptyString,
   VoiceConversationId,
@@ -37,6 +38,7 @@ import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import {
   ClientOrchestrationCommand,
   DispatchResult,
+  OrchestrationMessageTurnResult,
   OrchestrationReadModel,
   OrchestrationShellSnapshot,
   OrchestrationThreadDetailSnapshot,
@@ -70,6 +72,7 @@ import {
   VoiceConversationUpdateInput,
   VoiceMediaTicket,
   VoiceMediaTicketRequest,
+  VoiceNativeSessionCredential,
   VoicePublicErrorReason,
   VoiceSessionCloseResult,
   VoiceSessionCreateInput,
@@ -117,6 +120,7 @@ export type EnvironmentAuthInvalidReason = typeof EnvironmentAuthInvalidReason.T
 
 export const EnvironmentOperationForbiddenReason = Schema.Literals([
   "current_session_revoke_not_allowed",
+  "native_voice_session_reissuance_not_allowed",
 ]);
 export type EnvironmentOperationForbiddenReason = typeof EnvironmentOperationForbiddenReason.Type;
 
@@ -133,7 +137,9 @@ export const EnvironmentInternalErrorReason = Schema.Literals([
   "client_session_revoke_failed",
   "orchestration_snapshot_failed",
   "orchestration_thread_snapshot_failed",
+  "orchestration_message_turn_failed",
   "orchestration_dispatch_failed",
+  "native_voice_session_issuance_failed",
   "history_search_failed",
   "history_read_failed",
   "internal_error",
@@ -254,6 +260,7 @@ export class EnvironmentInternalError extends Schema.TaggedErrorClass<Environmen
 
 export const EnvironmentResourceNotFoundReason = Schema.Literals([
   "thread_not_found",
+  "thread_message_not_found",
   "voice_conversation_not_found",
   "history_item_not_found",
 ]);
@@ -385,6 +392,11 @@ const EnvironmentScopedOperationErrors = [
 const EnvironmentVoiceMediaTicketErrors = [
   EnvironmentRequestInvalidError,
   ...EnvironmentScopedOperationErrors,
+] as const;
+const EnvironmentNativeVoiceSessionErrors = [
+  EnvironmentScopeRequiredError,
+  EnvironmentOperationForbiddenError,
+  EnvironmentInternalError,
 ] as const;
 const EnvironmentPairingCredentialErrors = [
   EnvironmentRequestInvalidError,
@@ -573,6 +585,11 @@ const EnvironmentOrchestrationThreadSnapshotParams = Schema.Struct({
   threadId: ThreadId,
 });
 
+const EnvironmentOrchestrationMessageTurnParams = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+});
+
 export class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestration")
   .add(
     HttpApiEndpoint.get("snapshot", "/api/orchestration/snapshot", {
@@ -595,6 +612,18 @@ export class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestr
       success: OrchestrationThreadDetailSnapshot,
       error: EnvironmentOrchestrationThreadSnapshotErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get(
+      "messageTurn",
+      "/api/orchestration/threads/:threadId/messages/:messageId/turn",
+      {
+        headers: OptionalBearerHeaders,
+        params: EnvironmentOrchestrationMessageTurnParams,
+        success: OrchestrationMessageTurnResult,
+        error: EnvironmentOrchestrationThreadSnapshotErrors,
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
     HttpApiEndpoint.post("dispatch", "/api/orchestration/dispatch", {
@@ -632,6 +661,13 @@ export class EnvironmentHistoryHttpApi extends HttpApiGroup.make("history")
   .middleware(EnvironmentHistoryPrivacyBoundary) {}
 
 export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
+  .add(
+    HttpApiEndpoint.post("createNativeSession", "/api/voice/native-session", {
+      headers: OptionalBearerHeaders,
+      success: VoiceNativeSessionCredential,
+      error: EnvironmentNativeVoiceSessionErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
   .add(
     HttpApiEndpoint.post("createSession", "/api/voice/sessions", {
       headers: OptionalBearerHeaders,

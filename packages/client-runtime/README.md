@@ -16,6 +16,7 @@ subpath. The package intentionally has no root export.
 | `platform`            | Platform capability and persistence service contracts            |
 | `relay`               | Managed relay API and environment discovery                      |
 | `rpc`                 | HTTP/RPC clients, protocol, sessions, and subscriptions          |
+| `voice`               | Voice HTTP clients and platform-neutral runtime contracts        |
 | `state/<domain>`      | Focused shared state, retention, reducers, and Atom constructors |
 
 ## Dependency direction

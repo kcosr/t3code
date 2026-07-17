@@ -16,12 +16,14 @@ import {
 } from "../auth/http.ts";
 import { ClientCommandDispatcher } from "./Services/ClientCommandDispatcher.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
+import { ThreadTurnOutcomeQuery } from "./Services/ThreadTurnOutcomeQuery.ts";
 
 export const orchestrationHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
   "orchestration",
   Effect.fnUntraced(function* (handlers) {
     const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+    const threadTurnOutcomeQuery = yield* ThreadTurnOutcomeQuery;
     const clientCommandDispatcher = yield* ClientCommandDispatcher;
 
     return handlers
@@ -69,6 +71,27 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
             return yield* failEnvironmentNotFound("thread_not_found");
           }
           return snapshot.value;
+        }),
+      )
+      .handle(
+        "messageTurn",
+        Effect.fn("environment.orchestration.messageTurn")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          const result = yield* threadTurnOutcomeQuery
+            .getByMessageId(args.params)
+            .pipe(
+              Effect.catch((cause) =>
+                failEnvironmentInternal("orchestration_message_turn_failed", cause),
+              ),
+            );
+          if (result.type === "thread-not-found") {
+            return yield* failEnvironmentNotFound("thread_not_found");
+          }
+          if (result.type === "message-not-found") {
+            return yield* failEnvironmentNotFound("thread_message_not_found");
+          }
+          return result.result;
         }),
       )
       .handle(

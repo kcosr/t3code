@@ -1,17 +1,21 @@
 import { expect, it } from "@effect/vitest";
+import { VoiceRequestId, VoiceSessionId } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Logger from "effect/Logger";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import { observeVoiceMediaStream, voiceDiagnostic } from "./VoiceObservability.ts";
+
+const encodeUnknownJson = Schema.encodeSync(Schema.UnknownFromJsonString);
 
 it("builds correlated voice diagnostics without accepting content-bearing fields", () => {
   expect(
     voiceDiagnostic({
       type: "session-ended",
-      sessionId: "voice-session-1",
+      sessionId: VoiceSessionId.make("voice-session-1"),
       leaseGeneration: 2,
       outcome: "error",
       reason: "provider-closed",
@@ -24,7 +28,7 @@ it("builds correlated voice diagnostics without accepting content-bearing fields
     level: "warning",
     message: "voice.session.ended",
     annotations: {
-      sessionId: "voice-session-1",
+      sessionId: VoiceSessionId.make("voice-session-1"),
       leaseGeneration: 2,
       outcome: "error",
       reason: "provider-closed",
@@ -37,7 +41,7 @@ it("builds correlated voice diagnostics without accepting content-bearing fields
   expect(
     voiceDiagnostic({
       type: "provider-sideband-attached",
-      sessionId: "voice-session-1",
+      sessionId: VoiceSessionId.make("voice-session-1"),
       leaseGeneration: 2,
       outcome: "success",
       durationMs: 87,
@@ -62,12 +66,12 @@ it.effect("logs successful and failed media stream completion", () => {
   return Effect.gen(function* () {
     yield* observeVoiceMediaStream(Stream.make(new Uint8Array(3), new Uint8Array(2)), {
       operation: "speech",
-      requestId: "voice-request-success",
+      requestId: VoiceRequestId.make("voice-request-success"),
       inputBytes: 5,
     }).pipe(Stream.runDrain);
     yield* observeVoiceMediaStream(Stream.fail("provider-failed"), {
       operation: "transcription",
-      requestId: "voice-request-failure",
+      requestId: VoiceRequestId.make("voice-request-failure"),
       inputBytes: 855,
       inputDurationMs: 1_000,
     }).pipe(Stream.runDrain, Effect.flip);
@@ -102,7 +106,7 @@ it.effect("logs successful and failed media stream completion", () => {
       ),
       {
         operation: "speech",
-        requestId: "voice-request-cancelled",
+        requestId: VoiceRequestId.make("voice-request-cancelled"),
       },
     ).pipe(Stream.runDrain, Effect.forkChild);
     yield* Deferred.await(streamStarted);
@@ -120,7 +124,7 @@ it.effect("logs successful and failed media stream completion", () => {
 });
 
 it("reports media counters and timings without text, audio, or provider payloads", () => {
-  const privateRequestId = "PRIVATE transcript\napi-key";
+  const privateRequestId = VoiceRequestId.make("PRIVATE transcript\napi-key");
   const diagnostic = voiceDiagnostic({
     type: "media-completed",
     operation: "speech",
@@ -147,6 +151,6 @@ it("reports media counters and timings without text, audio, or provider payloads
   expect(Object.keys(diagnostic.annotations)).not.toContain("text");
   expect(Object.keys(diagnostic.annotations)).not.toContain("audio");
   expect(Object.keys(diagnostic.annotations)).not.toContain("providerMessage");
-  expect(JSON.stringify(diagnostic)).not.toContain(privateRequestId);
-  expect(JSON.stringify(diagnostic)).not.toContain("PRIVATE transcript");
+  expect(encodeUnknownJson(diagnostic)).not.toContain(privateRequestId);
+  expect(encodeUnknownJson(diagnostic)).not.toContain("PRIVATE transcript");
 });

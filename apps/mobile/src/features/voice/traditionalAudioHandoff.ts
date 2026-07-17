@@ -34,36 +34,6 @@ export async function startDictationWithAudioHandoff(input: {
   return started;
 }
 
-export async function startManualDictationWithAudioHandoff(input: {
-  readonly autoListenActive: boolean;
-  readonly deactivateAutoListen: () => Promise<void>;
-  readonly stopRealtime: () => Promise<void>;
-  readonly interruptPlayback: () => Promise<boolean>;
-  readonly startDictation: () => Promise<boolean>;
-  readonly resumePlayback: () => void;
-}): Promise<boolean> {
-  if (input.autoListenActive) await input.deactivateAutoListen();
-  return startDictationWithAudioHandoff(input);
-}
-
-export async function activateAutoListenWithAudioHandoff(input: {
-  readonly releaseManualDictation: () => Promise<void>;
-  readonly activateAutoListen: () => Promise<boolean>;
-}): Promise<boolean> {
-  await input.releaseManualDictation();
-  return input.activateAutoListen();
-}
-
-export async function releaseAutoListenForManualDictation(input: {
-  readonly pause: () => void;
-  readonly waitForMediaCommands: () => Promise<void>;
-  readonly verifyRecordingReleased: () => Promise<void>;
-}): Promise<void> {
-  input.pause();
-  await input.waitForMediaCommands();
-  await input.verifyRecordingReleased();
-}
-
 export async function interruptTraditionalAudioForRealtime(input: {
   readonly cancelDictation: () => Promise<void>;
   readonly interruptPlayback: () => Promise<boolean>;

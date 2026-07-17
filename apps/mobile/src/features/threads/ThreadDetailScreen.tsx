@@ -80,11 +80,6 @@ export interface ThreadDetailScreenProps {
   readonly onRemoveDraftImage: (imageId: string) => void;
   readonly onStopThread: () => void;
   readonly onSendMessage: () => Promise<MessageId | null>;
-  readonly onSendVoiceMessage: (input: {
-    readonly environmentId: EnvironmentId;
-    readonly threadId: ThreadId;
-    readonly text: string;
-  }) => Promise<MessageId | null>;
   readonly onReconnectEnvironment: () => void;
   readonly onUpdateThreadModelSelection: (modelSelection: ModelSelection) => void;
   readonly onUpdateThreadRuntimeMode: (runtimeMode: RuntimeMode) => void;
@@ -392,18 +387,6 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     composerEditorRef.current?.blur();
     return messageId;
   }, [props.onSendMessage, selectedThreadKey]);
-  const handleSendVoiceMessage = useCallback(
-    async (input: { environmentId: EnvironmentId; threadId: ThreadId; text: string }) => {
-      const targetThreadKey = selectedThreadKeyRef.current;
-      const messageId = await props.onSendVoiceMessage(input);
-      if (messageId !== null && selectedThreadKeyRef.current === targetThreadKey) {
-        setAnchorMessageId(messageId);
-      }
-      return messageId;
-    },
-    [props.onSendVoiceMessage],
-  );
-
   const collapseComposer = useCallback(() => {
     composerEditorRef.current?.blur();
   }, []);
@@ -535,18 +518,6 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               serverConfig={props.serverConfig}
               queueCount={props.selectedThreadQueueCount}
               activeThreadBusy={props.activeThreadBusy}
-              threadMessages={selectedThreadFeed.flatMap((entry) =>
-                entry.type === "message"
-                  ? [
-                      {
-                        id: entry.message.id,
-                        role: entry.message.role,
-                        turnId: entry.message.turnId,
-                        streaming: entry.message.streaming,
-                      },
-                    ]
-                  : [],
-              )}
               interactionRequired={
                 props.activePendingApproval !== null || props.activePendingUserInput !== null
               }
@@ -559,7 +530,6 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               onRemoveDraftImage={props.onRemoveDraftImage}
               onStopThread={props.onStopThread}
               onSendMessage={handleSendMessage}
-              onSendVoiceMessage={handleSendVoiceMessage}
               onReconnectEnvironment={props.onReconnectEnvironment}
               onUpdateModelSelection={props.onUpdateThreadModelSelection}
               onUpdateRuntimeMode={props.onUpdateThreadRuntimeMode}

@@ -29,11 +29,18 @@ internal data class T3VoiceAudioRouterStartResult(
   val ownerGeneration: Long,
 )
 
+/** The narrow Realtime-session view of the process-owned Android audio router. */
+internal interface T3VoiceRealtimeAudioRouting {
+  fun stop()
+
+  fun routes(): List<T3VoiceAudioRoute>
+}
+
 internal class T3VoiceAudioRouter(
   context: Context,
   private val onFocusActions: (List<T3VoiceAudioFocusAction>) -> Unit = {},
   private val onRouteChanged: (T3VoiceAudioRouteChange) -> Unit = {},
-) {
+) : T3VoiceRealtimeAudioRouting {
   private val audioManager = context.getSystemService(AudioManager::class.java)
   private var focusRequest: AudioFocusRequest? = null
   private var focusState = T3VoiceAudioFocusState.TERMINATED
@@ -89,7 +96,7 @@ internal class T3VoiceAudioRouter(
   }
 
   @Synchronized
-  fun stop() {
+  override fun stop() {
     if (!active) return
     recordDiagnostic(T3VoiceDiagnosticCategory.LIFECYCLE, T3VoiceDiagnosticCode.STOPPED)
     unregisterDeviceCallback()
@@ -103,7 +110,7 @@ internal class T3VoiceAudioRouter(
   }
 
   @Synchronized
-  fun routes(): List<T3VoiceAudioRoute> {
+  override fun routes(): List<T3VoiceAudioRoute> {
     val selectedId = selectedRoute.id
     val routes = mutableListOf(
       T3VoiceAudioRoute(

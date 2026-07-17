@@ -27,13 +27,6 @@ class T3VoiceStateStoreTest {
   }
 
   @Test
-  fun realtimeOwnershipIsClaimedAtomically() {
-    assertTrue(T3VoiceStateStore.claimRealtime("session-a"))
-    assertFalse(T3VoiceStateStore.claimRealtime("session-b"))
-    assertEquals("session-a", T3VoiceStateStore.state.value.activeRealtimeSessionId)
-  }
-
-  @Test
   fun recordingAndPlaybackRejectStaleGenerationsEvenWhenIdsAreReused() {
     val firstRecording = checkNotNull(T3VoiceStateStore.claimRecording("recording"))
     assertTrue(T3VoiceStateStore.releaseRecording(firstRecording))
@@ -54,29 +47,13 @@ class T3VoiceStateStoreTest {
   }
 
   @Test
-  fun modeClaimsClearMutuallyExclusiveAndTerminalRealtimeFields() {
-    assertTrue(T3VoiceStateStore.claimRealtime("session-a"))
-    assertTrue(
-      T3VoiceStateStore.terminateRealtime(
-        T3VoiceRuntimeEvent.RealtimeTerminated(
-          nativeSessionId = "session-a",
-          outcome = "failed",
-          code = "test-failure",
-          retryable = true,
-        ),
-      ),
-    )
-    assertEquals("failed", T3VoiceStateStore.state.value.realtimeConnectionState)
-
+  fun recordingAndPlaybackClaimsClearMutuallyExclusiveFields() {
     val recording = checkNotNull(T3VoiceStateStore.claimRecording("recording-a"))
     val recordingState = T3VoiceStateStore.state.value
     assertEquals(T3VoiceRuntimePhase.RECORDING, recordingState.phase)
     assertEquals(recording.generation, recordingState.activeRecordingGeneration)
     assertNull(recordingState.activePlaybackId)
     assertNull(recordingState.activePlaybackGeneration)
-    assertNull(recordingState.activeRealtimeSessionId)
-    assertNull(recordingState.realtimeConnectionState)
-    assertFalse(recordingState.realtimeMuted)
     assertTrue(T3VoiceStateStore.releaseRecording(recording))
 
     val playback = checkNotNull(T3VoiceStateStore.claimPlayback("playback-a"))
@@ -85,29 +62,7 @@ class T3VoiceStateStoreTest {
     assertEquals(playback.generation, playbackState.activePlaybackGeneration)
     assertNull(playbackState.activeRecordingId)
     assertNull(playbackState.activeRecordingGeneration)
-    assertNull(playbackState.activeRealtimeSessionId)
-    assertNull(playbackState.realtimeConnectionState)
-    assertFalse(playbackState.realtimeMuted)
     assertTrue(T3VoiceStateStore.releasePlayback(playback))
-  }
-
-  @Test
-  fun terminalStateIsDurableAndRejectsStaleUpdates() {
-    assertTrue(T3VoiceStateStore.claimRealtime("session-a"))
-    val terminal =
-      T3VoiceRuntimeEvent.RealtimeTerminated(
-        nativeSessionId = "session-a",
-        outcome = "failed",
-        code = "realtime-connection-failed",
-        retryable = true,
-      )
-
-    T3VoiceStateStore.terminateRealtime(terminal)
-    T3VoiceStateStore.setRealtime("session-a", "connected", false)
-
-    assertNull(T3VoiceStateStore.state.value.activeRealtimeSessionId)
-    assertEquals("failed", T3VoiceStateStore.state.value.realtimeConnectionState)
-    assertEquals(terminal, T3VoiceStateStore.realtimeTermination.value)
   }
 
   @Test
@@ -131,7 +86,7 @@ class T3VoiceStateStoreTest {
   }
 
   @Test
-  fun pendingRecordingTerminationBlocksReplacementButSurvivesRealtime() {
+  fun pendingRecordingTerminationBlocksReplacementButDoesNotBlockPlayback() {
     val owner = checkNotNull(T3VoiceStateStore.claimRecording("recording-a"))
     val terminal =
       T3VoiceRuntimeEvent.RecordingTerminated(
@@ -143,9 +98,9 @@ class T3VoiceStateStoreTest {
     assertTrue(T3VoiceStateStore.terminateRecording(owner, terminal))
 
     assertNull(T3VoiceStateStore.claimRecording("recording-b"))
-    assertTrue(T3VoiceStateStore.claimRealtime("session-a"))
+    val playback = checkNotNull(T3VoiceStateStore.claimPlayback("playback-a"))
     assertEquals(terminal, T3VoiceStateStore.recordingTermination.value)
-    T3VoiceStateStore.releaseRealtimeClaim("session-a")
+    assertTrue(T3VoiceStateStore.releasePlayback(playback))
     T3VoiceStateStore.clearRecordingTermination("recording-a")
     assertTrue(T3VoiceStateStore.claimRecording("recording-b") != null)
   }

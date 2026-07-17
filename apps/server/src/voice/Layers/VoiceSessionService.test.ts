@@ -27,6 +27,7 @@ import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -47,6 +48,7 @@ import { VoiceToolExecutor } from "../Services/VoiceToolExecutor.ts";
 import { VoiceContextCompilerLive } from "./VoiceContextCompiler.ts";
 import { VoiceSessionServiceLive } from "./VoiceSessionService.ts";
 
+const encodeUnknownJson = Schema.encodeEffect(Schema.UnknownFromJsonString);
 const conversationId = VoiceConversationId.make("conversation-test");
 const summary: VoiceConversationSummary = {
   conversationId,
@@ -372,11 +374,13 @@ it.effect(
           providerAttached: true,
           providerActivityObserved: true,
         });
-        expect(JSON.stringify(diagnostics)).not.toContain("show threads");
-        expect(JSON.stringify(diagnostics)).not.toContain("fake-offer");
+        const encodedDiagnostics = yield* encodeUnknownJson(diagnostics);
+        expect(encodedDiagnostics).not.toContain("show threads");
+        expect(encodedDiagnostics).not.toContain("fake-offer");
       }).pipe(
-        Effect.provide(test.layer),
-        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        Effect.provide(
+          Layer.merge(test.layer, Logger.layer([logger], { mergeWithExisting: false })),
+        ),
       );
     }),
 );

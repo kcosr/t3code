@@ -77,6 +77,12 @@ export const VoiceCredentialSetInput = Schema.Struct({
 });
 export type VoiceCredentialSetInput = typeof VoiceCredentialSetInput.Type;
 
+export const VoiceNativeSessionCredential = Schema.Struct({
+  accessToken: TrimmedNonEmptyString,
+  expiresAt: IsoDateTime,
+});
+export type VoiceNativeSessionCredential = typeof VoiceNativeSessionCredential.Type;
+
 export const VoiceConversationRetention = Schema.Literals(["ephemeral", "durable"]);
 export type VoiceConversationRetention = typeof VoiceConversationRetention.Type;
 

@@ -189,12 +189,6 @@ describe("mobile connection storage", () => {
         voiceMaximumUtteranceMs: 1_799_000,
         voicePostPlaybackGuardMs: 750,
         voiceResponseTimeoutMs: 600_000,
-        voiceMode: "thread",
-        voiceThreadTarget: {
-          environmentId: "environment-1",
-          threadId: "thread-1",
-          generation: 3,
-        },
         unsupportedSpeechSetting: "ignored",
       }),
       10,
@@ -209,12 +203,6 @@ describe("mobile connection storage", () => {
       voiceMaximumUtteranceMs: 1_799_000,
       voicePostPlaybackGuardMs: 750,
       voiceResponseTimeoutMs: 600_000,
-      voiceMode: "thread",
-      voiceThreadTarget: {
-        environmentId: "environment-1",
-        threadId: "thread-1",
-        generation: 3,
-      },
     });
 
     mocks.setPreferencesJson(
@@ -223,8 +211,6 @@ describe("mobile connection storage", () => {
         voiceAudioRouteId: "",
         voiceAutoListenEnabled: "yes",
         voiceEndSilenceMs: Number.NaN,
-        voiceMode: "invalid",
-        voiceThreadTarget: { environmentId: "", threadId: "thread", generation: 0 },
       }),
       20,
     );

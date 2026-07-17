@@ -1,5 +1,6 @@
 package expo.modules.t3voice
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -13,8 +14,16 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 
 internal class T3VoiceForegroundReleaseCoordinator(
   private val isIdle: () -> Boolean,
@@ -31,14 +40,16 @@ internal class T3VoiceForegroundReleaseCoordinator(
 
 class T3VoiceRuntimeService : Service() {
   internal inner class VoiceBinder : Binder() {
-    val state: StateFlow<T3VoiceRuntimeState>
-      get() = T3VoiceStateStore.state
+    val runtimeSnapshots: StateFlow<T3VoiceControllerSnapshot>
+      get() = semanticController.snapshots
+
+    fun runtimeSnapshot(): T3VoiceControllerSnapshot = semanticController.snapshot()
+
+    fun dispatchRuntime(command: T3VoiceRuntimeCommand): T3VoiceCommandResult =
+      dispatchSemanticCommand(command)
 
     val events: SharedFlow<T3VoiceRuntimeEvent>
       get() = T3VoiceStateStore.events
-
-    val realtimeTermination: StateFlow<T3VoiceRuntimeEvent.RealtimeTerminated?>
-      get() = T3VoiceStateStore.realtimeTermination
 
     val recordingTermination: StateFlow<T3VoiceRuntimeEvent.RecordingTerminated?>
       get() = T3VoiceStateStore.recordingTermination
@@ -51,6 +62,7 @@ class T3VoiceRuntimeService : Service() {
       endpointConfig: T3VoiceEndpointDetectionConfig,
     ) {
       synchronized(operationLock) {
+        requireLegacyMediaAdmissionLocked()
         val owner =
           checkNotNull(T3VoiceStateStore.claimRecording(recordingId)) {
             "The voice runtime is already in use."
@@ -98,6 +110,7 @@ class T3VoiceRuntimeService : Service() {
 
     fun startPlayback(playbackId: String, sampleRate: Int, channelCount: Int) {
       synchronized(operationLock) {
+        requireLegacyMediaAdmissionLocked()
         val owner =
           checkNotNull(T3VoiceStateStore.claimPlayback(playbackId)) {
             "The voice runtime is already in use."
@@ -143,70 +156,13 @@ class T3VoiceRuntimeService : Service() {
     fun pendingPlaybackTermination(): Map<String, Any>? =
       T3VoiceStateStore.playbackTermination.value?.toEventBody()
 
-    fun prepareRealtimeSession(
-      nativeSessionId: String,
-      callback: T3VoiceWebRtcResultCallback<String>,
-    ) {
-      synchronized(operationLock) {
-        check(T3VoiceStateStore.claimRealtime(nativeSessionId)) {
-          "The voice runtime is already in use."
-        }
-        val diagnosticGeneration = T3VoiceDiagnostics.nextGeneration()
-        T3VoiceDiagnostics.record(
-          diagnosticGeneration,
-          T3VoiceDiagnosticCategory.LIFECYCLE,
-          T3VoiceDiagnosticCode.PREPARE_STARTED,
-        )
-        try {
-          ensureRuntimeForeground(
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
-              ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
-          )
-          realtime.prepare(nativeSessionId, diagnosticGeneration, callback)
-        } catch (cause: Throwable) {
-          T3VoiceStateStore.releaseRealtimeClaim(nativeSessionId)
-          stopRuntimeForegroundLocked()
-          T3VoiceDiagnostics.record(
-            diagnosticGeneration,
-            T3VoiceDiagnosticCategory.TERMINAL,
-            T3VoiceDiagnosticCode.FAILED,
-          )
-          T3VoiceDiagnostics.record(
-            diagnosticGeneration,
-            T3VoiceDiagnosticCategory.LIFECYCLE,
-            T3VoiceDiagnosticCode.FOREGROUND_RELEASED,
-          )
-          throw cause
-        }
-      }
-    }
-
-    fun applyRealtimeAnswer(
-      nativeSessionId: String,
-      sdp: String,
-      callback: T3VoiceWebRtcResultCallback<Unit>,
-    ) {
-      realtime.applyAnswer(nativeSessionId, sdp, callback)
-    }
-
-    fun stopRealtimeSession(nativeSessionId: String): Boolean = realtime.stop(nativeSessionId)
-
-    fun setRealtimeMuted(nativeSessionId: String, muted: Boolean) {
-      realtime.setMuted(nativeSessionId, muted)
-    }
-
-    fun getAudioRoutes(): List<Map<String, Any>> = realtime.routes()
-
     fun getDiagnostics(): List<Map<String, Any>> = T3VoiceDiagnostics.snapshot()
-
-    fun setAudioRoute(nativeSessionId: String, routeId: String): List<Map<String, Any>> =
-      realtime.selectRoute(nativeSessionId, routeId)
   }
 
   private val binder = VoiceBinder()
   private val foregroundReleaseCoordinator =
     T3VoiceForegroundReleaseCoordinator(
-      isIdle = { T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE },
+      isIdle = ::isCompletelyIdle,
       releaseForeground = ::stopRuntimeForeground,
     )
   private val operationLock = foregroundReleaseCoordinator.lock
@@ -215,66 +171,42 @@ class T3VoiceRuntimeService : Service() {
   private lateinit var recorder: T3VoiceRecorder
   private lateinit var player: T3VoicePcmPlayer
   private lateinit var playbackAudioFocus: T3VoicePlaybackAudioFocus
+  private lateinit var semanticDriver: T3VoiceNativeRuntimeDriver
+  private lateinit var semanticController: T3VoiceRuntimeController
+  private lateinit var androidControls: T3VoiceAndroidControls
+  private lateinit var semanticWakeLock: PowerManager.WakeLock
+  private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+  private var semanticSnapshotCollection: Job? = null
+  private var foregroundServiceTypes = 0
   private val mainHandler = Handler(Looper.getMainLooper())
-  private val realtimeDelegate =
-    lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
-      T3VoiceWebRtcSession(
-        context = applicationContext,
-        onStateChanged = { sessionId, connectionState, muted ->
-          T3VoiceStateStore.setRealtime(
-            sessionId = sessionId,
-            connectionState = connectionState,
-            muted = muted,
-          )
-        },
-        onRouteChanged = { sessionId, change ->
-          T3VoiceStateStore.emit(
-            T3VoiceRuntimeEvent.AudioRouteChanged(
-              nativeSessionId = sessionId,
-              routeId = change.routeId,
-              routeType = change.routeType,
-              reason = change.reason.name.lowercase().replace('_', '-'),
-            ),
-          )
-        },
-        onError = { sessionId, code, message, recoverable ->
-          T3VoiceStateStore.emit(
-            T3VoiceRuntimeEvent.RuntimeError(
-              operation = "realtime:$sessionId",
-              code = code,
-              message = message,
-              recoverable = recoverable,
-            ),
-          )
-        },
-        onTerminated = { sessionId, outcome, code, retryable, diagnosticGeneration ->
-          synchronized(operationLock) {
-            val terminated =
-              T3VoiceStateStore.terminateRealtime(
-                T3VoiceRuntimeEvent.RealtimeTerminated(
-                  nativeSessionId = sessionId,
-                  outcome = outcome,
-                  code = code,
-                  retryable = retryable,
-                ),
-              )
-            if (terminated) {
-              stopRuntimeForegroundLocked()
-              T3VoiceDiagnostics.record(
-                diagnosticGeneration,
-                T3VoiceDiagnosticCategory.LIFECYCLE,
-                T3VoiceDiagnosticCode.FOREGROUND_RELEASED,
-              )
-            }
-          }
-        },
-      )
-    }
-  private val realtime: T3VoiceWebRtcSession
-    get() = realtimeDelegate.value
-
   override fun onCreate() {
     super.onCreate()
+    semanticDriver =
+      T3VoiceNativeRuntimeDriver(applicationContext) { generation, callback ->
+        if (this::semanticController.isInitialized) {
+          semanticController.onCallback(generation, callback)
+        }
+      }
+    semanticController = T3VoiceRuntimeController(semanticDriver)
+    semanticWakeLock =
+      getSystemService(PowerManager::class.java)
+        .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, SEMANTIC_WAKE_LOCK_TAG)
+        .apply { setReferenceCounted(false) }
+    androidControls =
+      T3VoiceAndroidControls(applicationContext) { command ->
+        dispatchSemanticCommand(command)
+      }
+    semanticSnapshotCollection =
+      serviceScope.launch {
+        semanticController.snapshots.collectLatest { snapshot ->
+          synchronized(operationLock) {
+            androidControls.update(snapshot)
+            reconcileSemanticWakeLock(snapshot.state)
+            updateForegroundNotificationLocked()
+            stopRuntimeForegroundLocked()
+          }
+        }
+      }
     recorder =
       T3VoiceRecorder(applicationContext, terminalLock = operationLock) { termination ->
         synchronized(operationLock) {
@@ -401,6 +333,17 @@ class T3VoiceRuntimeService : Service() {
     synchronized(operationLock) {
       when (intent?.action) {
         ACTION_STOP -> stopActiveOperationLocked()
+        ACTION_START_SEMANTIC_RUNTIME ->
+          reconcileSemanticStartCommand(
+            generation = intent.getLongExtra(EXTRA_SEMANTIC_GENERATION, INVALID_GENERATION),
+            startId = startId,
+          )
+        ACTION_SEMANTIC_CONTROL ->
+          dispatchSemanticControlLocked(
+            generation = intent.getLongExtra(EXTRA_SEMANTIC_GENERATION, INVALID_GENERATION),
+            actionName = intent.getStringExtra(EXTRA_SEMANTIC_ACTION),
+            startId = startId,
+          )
         ACTION_START_RECORDING ->
           reconcileStartCommand(
             expectedOwnerId = intent.getStringExtra(EXTRA_OPERATION_ID),
@@ -415,22 +358,19 @@ class T3VoiceRuntimeService : Service() {
             foregroundServiceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
             startId = startId,
           )
-        ACTION_START_REALTIME ->
-          reconcileStartCommand(
-            expectedOwnerId = intent.getStringExtra(EXTRA_OPERATION_ID),
-            activeOwnerId = T3VoiceStateStore.state.value.activeRealtimeSessionId,
-            foregroundServiceType =
-              ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
-            startId = startId,
-          )
-        else -> stopSelf(startId)
+        else -> if (isCompletelyIdle()) stopSelf(startId)
       }
     }
     return START_NOT_STICKY
   }
 
   override fun onDestroy() {
+    semanticSnapshotCollection?.cancel()
+    semanticSnapshotCollection = null
+    serviceScope.cancel()
+    if (this::semanticWakeLock.isInitialized && semanticWakeLock.isHeld) semanticWakeLock.release()
+    if (this::androidControls.isInitialized) androidControls.release()
+    if (this::semanticDriver.isInitialized) semanticDriver.shutdown()
     synchronized(operationLock) {
       recordingOwner?.let { owner ->
         runCatching { recorder.cancel(owner.id) }
@@ -457,19 +397,179 @@ class T3VoiceRuntimeService : Service() {
     recorder.release()
     player.release()
     playbackAudioFocus.stop()
-    if (realtimeDelegate.isInitialized()) realtime.release()
     T3VoiceStateStore.setInactive()
     super.onDestroy()
   }
 
   private fun startRuntimeForeground(foregroundServiceType: Int) {
-    val notification = buildNotification()
+    val requestedTypes = foregroundServiceTypes or foregroundServiceType
+    val notification = currentNotification()
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-      startForeground(NOTIFICATION_ID, notification, foregroundServiceType)
+      startForeground(NOTIFICATION_ID, notification, requestedTypes)
     } else {
       startForeground(NOTIFICATION_ID, notification)
     }
+    foregroundServiceTypes = requestedTypes
     T3VoiceStateStore.setForeground(true)
+  }
+
+  private fun reconcileSemanticStartCommand(generation: Long, startId: Int) {
+    val snapshot = semanticController.snapshot()
+    when (
+      T3VoiceSemanticStartIntentPolicy.decide(
+        requestedGeneration = generation,
+        snapshot = snapshot,
+        serviceCompletelyIdle = isCompletelyIdle(),
+      )
+    ) {
+      T3VoiceSemanticStartIntentDecision.ACTIVATE -> Unit
+      T3VoiceSemanticStartIntentDecision.IGNORE_STALE -> return
+      T3VoiceSemanticStartIntentDecision.STOP_IDLE_SERVICE -> {
+        stopSelf(startId)
+        return
+      }
+    }
+
+    try {
+      ensureRuntimeForeground(SEMANTIC_FOREGROUND_SERVICE_TYPES)
+      if (semanticController.activateInitialStart(generation)) return
+      semanticController.onCallback(
+        generation,
+        T3VoiceRuntimeCallback.Failed(
+          T3VoiceFailure(
+            code = "voice-start-activation-lost",
+            message = "The admitted voice start could not be activated.",
+            recoverable = true,
+          ),
+        ),
+      )
+    } catch (_: Throwable) {
+      semanticController.onCallback(
+        generation,
+        T3VoiceRuntimeCallback.Failed(
+          T3VoiceFailure(
+            code = "foreground-service-start-failed",
+            message = "Android could not start voice in the foreground.",
+            recoverable = true,
+          ),
+        ),
+      )
+      val failed = semanticController.snapshot()
+      androidControls.update(failed)
+      reconcileSemanticWakeLock(failed.state)
+      updateForegroundNotificationLocked()
+    } finally {
+      stopRuntimeForegroundLocked()
+    }
+    when (
+      T3VoiceSemanticStartFailurePolicy.decide(
+        foregroundAcquired = T3VoiceStateStore.state.value.isForeground,
+      )
+    ) {
+      T3VoiceSemanticStartFailureDecision.RETAIN_FOREGROUND_FAILURE ->
+        if (isCompletelyIdle()) stopSelf(startId)
+      T3VoiceSemanticStartFailureDecision.STOP_UNPROMOTED_START -> {
+        // Clear the startForegroundService obligation immediately. An attached binder may keep
+        // this instance alive long enough for React to observe the in-memory Failed snapshot.
+        stopSelf(startId)
+      }
+    }
+  }
+
+  private fun dispatchSemanticControlLocked(
+    generation: Long,
+    actionName: String?,
+    startId: Int,
+  ) {
+    val snapshot = semanticController.snapshot()
+    val actionId =
+      actionName?.let {
+        runCatching { T3VoiceNotificationActionId.valueOf(it) }.getOrNull()
+      }
+    val command =
+      if (generation == snapshot.generation && actionId != null) {
+        T3VoiceNotificationActions.forSnapshot(snapshot).firstOrNull { it.id == actionId }?.command
+      } else {
+        null
+      }
+    if (command == null) {
+      if (isCompletelyIdle()) stopSelf(startId)
+      return
+    }
+    semanticController.dispatch(command)
+    val updated = semanticController.snapshot()
+    androidControls.update(updated)
+    reconcileSemanticWakeLock(updated.state)
+    updateForegroundNotificationLocked()
+    stopRuntimeForegroundLocked()
+  }
+
+  private fun dispatchSemanticCommand(command: T3VoiceRuntimeCommand): T3VoiceCommandResult {
+    val result =
+      synchronized(operationLock) {
+        if (
+          (command is T3VoiceRuntimeCommand.StartRealtime ||
+            command is T3VoiceRuntimeCommand.StartThread) &&
+            !T3VoiceRuntimeAdmissionPolicy.canStartSemantic(hasActiveLegacyMediaOwnerLocked())
+        ) {
+          return@synchronized T3VoiceCommandResult(
+            outcome = T3VoiceCommandOutcome.REJECTED,
+            snapshot = semanticController.snapshot(),
+            rejection = T3VoiceCommandRejection.BUSY,
+          )
+        }
+        semanticController.dispatch(command).also {
+          androidControls.update(it.snapshot)
+          reconcileSemanticWakeLock(it.snapshot.state)
+          updateForegroundNotificationLocked()
+          stopRuntimeForegroundLocked()
+        }
+      }
+    if (
+      result.outcome == T3VoiceCommandOutcome.APPLIED &&
+        (command is T3VoiceRuntimeCommand.StartRealtime ||
+          command is T3VoiceRuntimeCommand.StartThread)
+    ) {
+      try {
+        startForSemanticRuntime(this, result.snapshot.generation)
+      } catch (cause: Throwable) {
+        synchronized(operationLock) {
+          if (semanticController.snapshot().generation == result.snapshot.generation) {
+            semanticController.dispatch(T3VoiceRuntimeCommand.Stop)
+          }
+          val rolledBack = semanticController.snapshot()
+          androidControls.update(rolledBack)
+          reconcileSemanticWakeLock(rolledBack.state)
+          updateForegroundNotificationLocked()
+          stopRuntimeForegroundLocked()
+        }
+        throw IllegalStateException("Android could not start the voice foreground service.", cause)
+      }
+    }
+    return result
+  }
+
+  private fun requireLegacyMediaAdmissionLocked() {
+    check(
+      T3VoiceRuntimeAdmissionPolicy.canStartLegacy(semanticController.snapshot().state),
+    ) { "A native voice runtime operation is already active." }
+  }
+
+  private fun hasActiveLegacyMediaOwnerLocked(): Boolean {
+    val state = T3VoiceStateStore.state.value
+    return recordingOwner != null ||
+      playbackOwner != null ||
+      state.activeRecordingId != null ||
+      state.activePlaybackId != null
+  }
+
+  @SuppressLint("WakelockTimeout")
+  private fun reconcileSemanticWakeLock(state: T3VoiceControllerState) {
+    if (T3VoiceRuntimeLifecyclePolicy.shouldHoldWakeLock(state)) {
+      if (!semanticWakeLock.isHeld) semanticWakeLock.acquire()
+    } else if (semanticWakeLock.isHeld) {
+      semanticWakeLock.release()
+    }
   }
 
   private fun reconcileStartCommand(
@@ -481,7 +581,8 @@ class T3VoiceRuntimeService : Service() {
     when (T3VoiceStartCommandPolicy.decide(expectedOwnerId, activeOwnerId)) {
       T3VoiceStartCommandDecision.PROMOTE_ACTIVE_OWNER ->
         ensureRuntimeForeground(foregroundServiceType)
-      T3VoiceStartCommandDecision.STOP_STALE_START -> stopSelf(startId)
+      T3VoiceStartCommandDecision.STOP_STALE_START ->
+        if (isCompletelyIdle()) stopSelf(startId)
     }
   }
 
@@ -489,7 +590,10 @@ class T3VoiceRuntimeService : Service() {
     check(Thread.holdsLock(operationLock)) {
       "Foreground acquisition must hold the operation lock."
     }
-    if (!T3VoiceStateStore.state.value.isForeground) {
+    if (
+      !T3VoiceStateStore.state.value.isForeground ||
+        foregroundServiceTypes and foregroundServiceType != foregroundServiceType
+    ) {
       startRuntimeForeground(foregroundServiceType)
     }
     check(T3VoiceStateStore.state.value.isForeground) {
@@ -519,10 +623,6 @@ class T3VoiceRuntimeService : Service() {
         T3VoiceRuntimeEvent.PlaybackTerminated(owner.id, "cancelled"),
         stopForeground = false,
       )
-    }
-    state.activeRealtimeSessionId?.let {
-      val stopped = runCatching { realtime.stop(it) }.getOrDefault(false)
-      if (!stopped) T3VoiceStateStore.releaseRealtimeClaim(it)
     }
     stopRuntimeForegroundLocked()
   }
@@ -578,7 +678,41 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun stopRuntimeForegroundLocked() {
-    foregroundReleaseCoordinator.releaseWhileLocked()
+    if (isCompletelyIdle() && T3VoiceStateStore.state.value.isForeground) {
+      foregroundReleaseCoordinator.releaseWhileLocked()
+    }
+  }
+
+  private fun isCompletelyIdle(): Boolean {
+    val raw = T3VoiceStateStore.state.value
+    val rawIdle =
+      recordingOwner == null &&
+        playbackOwner == null &&
+        raw.activeRecordingId == null &&
+        raw.activePlaybackId == null
+    val semanticIdle =
+      !this::semanticController.isInitialized ||
+        !semanticController.snapshot().state.needsForeground()
+    return rawIdle && semanticIdle
+  }
+
+  private fun updateForegroundNotificationLocked() {
+    if (!T3VoiceStateStore.state.value.isForeground || !this::androidControls.isInitialized) return
+    getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, currentNotification())
+  }
+
+  private fun currentNotification(): Notification {
+    val snapshot =
+      if (this::semanticController.isInitialized) {
+        semanticController.snapshot().takeIf { it.state.needsForeground() }
+      } else {
+        null
+      }
+    return if (snapshot != null && this::androidControls.isInitialized) {
+      androidControls.buildNotification(snapshot, NOTIFICATION_CHANNEL_ID)
+    } else {
+      buildNotification()
+    }
   }
 
   private fun stopRuntimeForeground() {
@@ -588,6 +722,7 @@ class T3VoiceRuntimeService : Service() {
       @Suppress("DEPRECATION")
       stopForeground(true)
     }
+    foregroundServiceTypes = 0
     T3VoiceStateStore.setForeground(false)
     stopSelf()
   }
@@ -656,8 +791,18 @@ class T3VoiceRuntimeService : Service() {
     private const val ACTION_STOP = "expo.modules.t3voice.action.STOP"
     private const val ACTION_START_RECORDING = "expo.modules.t3voice.action.START_RECORDING"
     private const val ACTION_START_PLAYBACK = "expo.modules.t3voice.action.START_PLAYBACK"
-    private const val ACTION_START_REALTIME = "expo.modules.t3voice.action.START_REALTIME"
     private const val EXTRA_OPERATION_ID = "operationId"
+    internal const val ACTION_SEMANTIC_CONTROL =
+      "expo.modules.t3voice.action.SEMANTIC_CONTROL"
+    internal const val EXTRA_SEMANTIC_ACTION = "semanticAction"
+    internal const val EXTRA_SEMANTIC_GENERATION = "semanticGeneration"
+    private const val ACTION_START_SEMANTIC_RUNTIME =
+      "expo.modules.t3voice.action.START_SEMANTIC_RUNTIME"
+    private const val INVALID_GENERATION = -1L
+    private const val SEMANTIC_WAKE_LOCK_TAG = "t3tools:voice-runtime"
+    private val SEMANTIC_FOREGROUND_SERVICE_TYPES =
+      ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
 
     fun startForRecording(context: Context, recordingId: String) {
       start(context, ACTION_START_RECORDING, recordingId)
@@ -667,8 +812,13 @@ class T3VoiceRuntimeService : Service() {
       start(context, ACTION_START_PLAYBACK, playbackId)
     }
 
-    fun startForRealtime(context: Context, nativeSessionId: String) {
-      start(context, ACTION_START_REALTIME, nativeSessionId)
+    fun startForSemanticRuntime(context: Context, generation: Long) {
+      val intent =
+        Intent(context, T3VoiceRuntimeService::class.java).apply {
+          action = ACTION_START_SEMANTIC_RUNTIME
+          putExtra(EXTRA_SEMANTIC_GENERATION, generation)
+        }
+      start(context, intent)
     }
 
     fun requestStop(context: Context) {
@@ -681,6 +831,10 @@ class T3VoiceRuntimeService : Service() {
           this.action = action
           if (operationId != null) putExtra(EXTRA_OPERATION_ID, operationId)
         }
+      start(context, intent)
+    }
+
+    private fun start(context: Context, intent: Intent) {
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         context.startForegroundService(intent)
       } else {

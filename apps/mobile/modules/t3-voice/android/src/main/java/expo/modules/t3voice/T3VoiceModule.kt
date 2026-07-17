@@ -25,12 +25,10 @@ class T3VoiceModule : Module() {
   private val binderLock = Any()
   private val mainHandler = Handler(Looper.getMainLooper())
   private val pendingBinderOperations = T3VoiceBinderOperationRegistry<PendingBinderOperation>()
-  private val bindingRealtimeOwner = T3VoiceBindingRealtimeOwnerPolicy()
-  private var stateCollection: Job? = null
+  private var runtimeSnapshotCollection: Job? = null
   private var eventCollection: Job? = null
   private var recordingTerminationCollection: Job? = null
   private var playbackTerminationCollection: Job? = null
-  private var realtimeTerminationCollection: Job? = null
   private var rebindScheduled = false
   private var rebindAttemptedSinceConnection = false
 
@@ -61,33 +59,23 @@ class T3VoiceModule : Module() {
     object : ServiceConnection {
       override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
         val connectedBinder = service as? T3VoiceRuntimeService.VoiceBinder ?: return
-        val (bindingGeneration, dispatches) =
+        val dispatches =
           synchronized(binderLock) {
             if (destroyed) return
-            val generation = bindingRealtimeOwner.connected()
             binder = connectedBinder
-            bindingRealtimeOwner.observe(
-              generation,
-              connectedBinder.state.value.activeRealtimeSessionId,
-            )
             rebindScheduled = false
             rebindAttemptedSinceConnection = false
-            generation to pendingBinderOperations.connected()
+            pendingBinderOperations.connected()
           }
         dispatches.forEach { dispatch ->
           cancelBinderTimeout(dispatch.value)
           executeBinderOperation(connectedBinder, dispatch)
         }
-        stateCollection?.cancel()
-        stateCollection =
+        runtimeSnapshotCollection?.cancel()
+        runtimeSnapshotCollection =
           appContext.mainQueue.launch {
-            connectedBinder.state.collectLatest { state ->
-              synchronized(binderLock) {
-                if (binder === connectedBinder) {
-                  bindingRealtimeOwner.observe(bindingGeneration, state.activeRealtimeSessionId)
-                }
-              }
-              sendEvent(STATE_CHANGED_EVENT, state.toEventBody())
+            connectedBinder.runtimeSnapshots.collectLatest { snapshot ->
+              sendEvent(RUNTIME_SNAPSHOT_CHANGED_EVENT, snapshot.toBridgeBody())
             }
           }
         eventCollection?.cancel()
@@ -101,10 +89,6 @@ class T3VoiceModule : Module() {
                 is T3VoiceRuntimeEvent.RecordingTerminated -> Unit
                 is T3VoiceRuntimeEvent.RuntimeError ->
                   sendEvent(RUNTIME_ERROR_EVENT, event.toEventBody())
-                is T3VoiceRuntimeEvent.AudioRouteChanged ->
-                  sendEvent(AUDIO_ROUTE_CHANGED_EVENT, event.toEventBody())
-                is T3VoiceRuntimeEvent.RealtimeTerminated ->
-                  sendEvent(REALTIME_TERMINATED_EVENT, event.toEventBody())
               }
             }
           }
@@ -120,13 +104,6 @@ class T3VoiceModule : Module() {
           appContext.mainQueue.launch {
             connectedBinder.playbackTermination.collectLatest { event ->
               if (event != null) sendEvent(PLAYBACK_TERMINATED_EVENT, event.toEventBody())
-            }
-          }
-        realtimeTerminationCollection?.cancel()
-        realtimeTerminationCollection =
-          appContext.mainQueue.launch {
-            connectedBinder.realtimeTermination.collectLatest { event ->
-              if (event != null) sendEvent(REALTIME_TERMINATED_EVENT, event.toEventBody())
             }
           }
       }
@@ -157,17 +134,15 @@ class T3VoiceModule : Module() {
     ModuleDefinition {
       Name(MODULE_NAME)
       Events(
-        STATE_CHANGED_EVENT,
+        RUNTIME_SNAPSHOT_CHANGED_EVENT,
         PLAYBACK_CHUNK_CONSUMED_EVENT,
         PLAYBACK_TERMINATED_EVENT,
         RECORDING_TERMINATED_EVENT,
         RUNTIME_ERROR_EVENT,
-        AUDIO_ROUTE_CHANGED_EVENT,
-        REALTIME_TERMINATED_EVENT,
       )
 
       Constants(
-        "nativeRevision" to 7,
+        "nativeRevision" to 10,
       )
 
       OnCreate {
@@ -207,6 +182,123 @@ class T3VoiceModule : Module() {
           "orderedPcmPlayback" to true,
           "realtimeWebRtc" to true,
           "bluetoothRouting" to (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S),
+        )
+      }
+
+      AsyncFunction("getRuntimeSnapshotAsync") { promise: Promise ->
+        withBinder(promise, "voice-runtime-snapshot-failed") { voice, result ->
+          result.resolve(voice.runtimeSnapshot().toBridgeBody())
+        }
+      }
+
+      AsyncFunction("startRealtimeAsync") { input: Map<String, Any?>, promise: Promise ->
+        dispatchRuntime(
+          promise,
+          T3VoiceRuntimeBridgeInput.startRealtime(input),
+        )
+      }
+
+      AsyncFunction("startThreadAsync") { input: Map<String, Any?>, promise: Promise ->
+        dispatchRuntime(
+          promise,
+          T3VoiceRuntimeBridgeInput.startThread(input),
+        )
+      }
+
+      AsyncFunction("switchRealtimeToThreadAsync") {
+        input: Map<String, Any?>, promise: Promise ->
+        dispatchRuntime(
+          promise,
+          T3VoiceRuntimeBridgeInput.switchRealtimeToThread(input),
+        )
+      }
+
+      AsyncFunction("stopRuntimeAsync") { promise: Promise ->
+        dispatchRuntime(promise, T3VoiceRuntimeCommand.Stop)
+      }
+
+      AsyncFunction("setRealtimeAudioRouteAsync") {
+        input: Map<String, Any?>, promise: Promise ->
+        requireExactKeys(input, setOf("routeId"))
+        dispatchRuntime(
+          promise,
+          T3VoiceRuntimeCommand.SetRealtimeAudioRoute(requireIdentifier(input, "routeId")),
+        )
+      }
+
+      AsyncFunction("updateRealtimeContextAsync") {
+        input: Map<String, Any?>, promise: Promise ->
+        dispatchRuntime(
+          promise,
+          T3VoiceRuntimeCommand.UpdateRealtimeContext(
+            T3VoiceRuntimeBridgeInput.realtimeContext(input),
+          ),
+        )
+      }
+
+      AsyncFunction("decideRealtimeConfirmationAsync") {
+        input: Map<String, Any?>, promise: Promise ->
+        requireExactKeys(input, setOf("confirmationId", "decision"))
+        val decision =
+          when (requireText(input, "decision", 16)) {
+            "approve" -> T3VoiceConfirmationDecision.APPROVE
+            "reject" -> T3VoiceConfirmationDecision.REJECT
+            else -> error("decision must be approve or reject.")
+          }
+        dispatchRuntime(
+          promise,
+          T3VoiceRuntimeCommand.DecideRealtimeConfirmation(
+            confirmationId = requireIdentifier(input, "confirmationId"),
+            decision = decision,
+          ),
+        )
+      }
+
+      AsyncFunction("completeRealtimeClientActionAsync") {
+        input: Map<String, Any?>, promise: Promise ->
+        requireAllowedKeys(
+          input,
+          required = setOf("actionId", "outcome"),
+          allowed = setOf("actionId", "outcome", "message"),
+        )
+        val outcome =
+          when (requireText(input, "outcome", 16)) {
+            "succeeded" -> T3VoiceClientActionOutcome.SUCCEEDED
+            "failed" -> T3VoiceClientActionOutcome.FAILED
+            else -> error("outcome must be succeeded or failed.")
+          }
+        dispatchRuntime(
+          promise,
+          T3VoiceRuntimeCommand.CompleteRealtimeClientAction(
+            actionId = requireIdentifier(input, "actionId"),
+            outcome = outcome,
+            message =
+              if (input.containsKey("message")) {
+                requireText(input, "message", MAXIMUM_CLIENT_ACTION_MESSAGE_LENGTH)
+              } else {
+                null
+              },
+          ),
+        )
+      }
+
+      AsyncFunction("finishThreadRecordingAsync") { promise: Promise ->
+        dispatchRuntime(promise, T3VoiceRuntimeCommand.FinishThreadUtterance)
+      }
+
+      AsyncFunction("updateThreadReviewTranscriptAsync") {
+        input: Map<String, Any?>, promise: Promise ->
+        dispatchRuntime(
+          promise,
+          T3VoiceRuntimeBridgeInput.updateThreadReviewTranscript(input),
+        )
+      }
+
+      AsyncFunction("submitThreadTranscriptAsync") {
+        input: Map<String, Any?>, promise: Promise ->
+        dispatchRuntime(
+          promise,
+          T3VoiceRuntimeBridgeInput.submitThreadTranscript(input),
         )
       }
 
@@ -357,99 +449,10 @@ class T3VoiceModule : Module() {
         }
       }
 
-      AsyncFunction("prepareRealtimeSessionAsync") { input: Map<String, String>, promise: Promise ->
-        val nativeSessionId = requireIdentifier(input, "nativeSessionId")
-        val context = requireNotNull(appContext.reactContext) { "React context is unavailable." }
-        try {
-          T3VoiceRuntimeService.startForRealtime(context, nativeSessionId)
-          withBinder(
-            promise,
-            "realtime-prepare-failed",
-          ) { voice, settlement ->
-            voice.prepareRealtimeSession(
-              nativeSessionId,
-              object : T3VoiceWebRtcResultCallback<String> {
-                override fun onSuccess(result: String) {
-                  settlement.resolve(
-                    mapOf(
-                      "nativeSessionId" to nativeSessionId,
-                      "sdp" to result,
-                    ),
-                  )
-                }
-
-                override fun onFailure(
-                  code: String,
-                  @Suppress("UNUSED_PARAMETER") message: String,
-                  @Suppress("UNUSED_PARAMETER") cause: Throwable?,
-                ) {
-                  settlement.reject(code, publicRealtimeFailureMessage(code))
-                }
-              },
-            )
-          }
-        } catch (_: Throwable) {
-          promise.reject(
-            "realtime-prepare-failed",
-            publicRealtimeFailureMessage("realtime-prepare-failed"),
-            null,
-          )
-        }
-      }
-
-      AsyncFunction("applyRealtimeAnswerAsync") { input: Map<String, String>, promise: Promise ->
-        val nativeSessionId = requireIdentifier(input, "nativeSessionId")
-        val sdp = requireText(input, "sdp", T3VoiceBridgeValidation.MAXIMUM_SDP_LENGTH)
-        try {
-          withBinder(promise, "realtime-answer-rejected") { voice, settlement ->
-            voice.applyRealtimeAnswer(
-              nativeSessionId,
-              sdp,
-              object : T3VoiceWebRtcResultCallback<Unit> {
-                override fun onSuccess(result: Unit) {
-                  settlement.resolve()
-                }
-
-                override fun onFailure(
-                  code: String,
-                  @Suppress("UNUSED_PARAMETER") message: String,
-                  @Suppress("UNUSED_PARAMETER") cause: Throwable?,
-                ) {
-                  settlement.reject(code, publicRealtimeFailureMessage(code))
-                }
-              },
-            )
-          }
-        } catch (_: Throwable) {
-          promise.reject(
-            "realtime-answer-rejected",
-            publicRealtimeFailureMessage("realtime-answer-rejected"),
-            null,
-          )
-        }
-      }
-
-      AsyncFunction("stopRealtimeSessionAsync") { input: Map<String, String>, promise: Promise ->
-        withBinder(promise, "realtime-stop-failed") { voice, result ->
-          result.resolve(voice.stopRealtimeSession(requireIdentifier(input, "nativeSessionId")))
-        }
-      }
-
       AsyncFunction("setRealtimeMutedAsync") { input: Map<String, Any>, promise: Promise ->
+        requireExactKeys(input, setOf("muted"))
         val muted = input["muted"] as? Boolean ?: error("muted must be a boolean.")
-        withBinder(promise, "realtime-mute-failed") { voice, result ->
-          voice.setRealtimeMuted(
-            nativeSessionId = requireIdentifier(input, "nativeSessionId"),
-            muted = muted,
-          )
-          result.resolve()
-        }
-      }
-
-      AsyncFunction("getAudioRoutesAsync") { promise: Promise ->
-        withBinder(promise, "audio-routes-failed") { voice, result ->
-          result.resolve(voice.getAudioRoutes())
-        }
+        dispatchRuntime(promise, T3VoiceRuntimeCommand.SetRealtimeMuted(muted))
       }
 
       AsyncFunction("getDiagnosticsAsync") { promise: Promise ->
@@ -458,39 +461,45 @@ class T3VoiceModule : Module() {
         }
       }
 
-      AsyncFunction("setAudioRouteAsync") { input: Map<String, String>, promise: Promise ->
-        withBinder(promise, "audio-route-selection-failed") { voice, result ->
-          result.resolve(
-            voice.setAudioRoute(
-              nativeSessionId = requireIdentifier(input, "nativeSessionId"),
-              routeId = requireIdentifier(input, "routeId"),
-            ),
-          )
-        }
-      }
     }
 
   private fun handleBindingLoss(message: String, rebind: Boolean) {
-    val (disconnected, realtimeOwner) =
+    val disconnected =
       synchronized(binderLock) {
-        val owner = bindingRealtimeOwner.disconnected()
         binder = null
-        pendingBinderOperations.disconnected() to owner
+        pendingBinderOperations.disconnected()
       }
     cancelCollections()
-    if (realtimeOwner != null) {
-      sendEvent(
-        REALTIME_TERMINATED_EVENT,
-        T3VoiceRuntimeEvent.RealtimeTerminated(
-          nativeSessionId = realtimeOwner.sessionId,
-          outcome = "failed",
-          code = "realtime-service-disconnected",
-          retryable = true,
-        ).toEventBody(),
-      )
-    }
     disconnected.forEach { entry -> rejectPendingOperation(entry.value, message) }
     if (rebind) scheduleServiceRebind()
+  }
+
+  private fun dispatchRuntime(
+    promise: Promise,
+    command: T3VoiceRuntimeCommand,
+  ) {
+    withBinder(promise, "voice-runtime-command-failed") { voice, result ->
+      val dispatched = voice.dispatchRuntime(command)
+      if (dispatched.outcome != T3VoiceCommandOutcome.REJECTED) {
+        result.resolve()
+      } else {
+        val rejection = checkNotNull(dispatched.rejection)
+        result.reject(
+          "voice-runtime-${rejection.name.lowercase().replace('_', '-')}",
+          when (rejection) {
+            T3VoiceCommandRejection.BUSY -> "Another voice operation is active."
+            T3VoiceCommandRejection.INVALID_STATE ->
+              "The voice command is not valid in the current state."
+            T3VoiceCommandRejection.STALE_GENERATION ->
+              "The voice command targets an obsolete runtime generation."
+            T3VoiceCommandRejection.STALE_REVIEW ->
+              "The voice command targets an obsolete transcript review."
+            T3VoiceCommandRejection.UNKNOWN_AUDIO_ROUTE ->
+              "The requested audio route is not currently available."
+          },
+        )
+      }
+    }
   }
 
   private fun scheduleServiceRebind() {
@@ -668,35 +677,24 @@ class T3VoiceModule : Module() {
     T3VoiceBridgeValidation.requireText(input, key, maximumLength)
 
   private fun cancelCollections() {
-    stateCollection?.cancel()
-    stateCollection = null
+    runtimeSnapshotCollection?.cancel()
+    runtimeSnapshotCollection = null
     eventCollection?.cancel()
     eventCollection = null
-    realtimeTerminationCollection?.cancel()
-    realtimeTerminationCollection = null
     recordingTerminationCollection?.cancel()
     recordingTerminationCollection = null
     playbackTerminationCollection?.cancel()
     playbackTerminationCollection = null
   }
 
-  private fun publicRealtimeFailureMessage(code: String): String =
-    when (code) {
-      "realtime-answer-rejected" -> "The Realtime answer was rejected."
-      "realtime-ice-timeout" -> "The Realtime connection timed out."
-      "realtime-offer-failed" -> "The Realtime offer could not be created."
-      else -> "The Realtime media session could not be prepared."
-    }
-
   companion object {
     private const val MODULE_NAME = "T3Voice"
-    private const val STATE_CHANGED_EVENT = "stateChanged"
+    private const val RUNTIME_SNAPSHOT_CHANGED_EVENT = "runtimeSnapshotChanged"
     private const val PLAYBACK_CHUNK_CONSUMED_EVENT = "playbackChunkConsumed"
     private const val PLAYBACK_TERMINATED_EVENT = "playbackTerminated"
     private const val RECORDING_TERMINATED_EVENT = "recordingTerminated"
     private const val RUNTIME_ERROR_EVENT = "runtimeError"
-    private const val AUDIO_ROUTE_CHANGED_EVENT = "audioRouteChanged"
-    private const val REALTIME_TERMINATED_EVENT = "realtimeTerminated"
     private const val BINDER_CONNECTION_TIMEOUT_MS = 5_000L
+    private const val MAXIMUM_CLIENT_ACTION_MESSAGE_LENGTH = 512
   }
 }

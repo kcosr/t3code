@@ -1,28 +1,74 @@
 import type { PermissionResponse } from "expo";
+import type {
+  VoiceRealtimeContext,
+  VoiceRealtimeTarget,
+  VoiceRuntimeSnapshot,
+  VoiceThreadStartInput,
+} from "@t3tools/client-runtime/voice";
+import type {
+  VoiceClientActionId,
+  VoiceClientActionOutcome,
+  VoiceConfirmationDecision,
+  VoiceConfirmationId,
+  VoiceNativeSessionCredential,
+} from "@t3tools/contracts";
 
 export interface T3VoiceEventSubscription {
   readonly remove: () => void;
 }
 
-export type T3VoiceRuntimePhase = "inactive" | "idle" | "recording" | "playing" | "realtime";
+export interface T3VoiceNativeSessionConfiguration extends VoiceNativeSessionCredential {
+  readonly baseUrl: string;
+}
 
-export type T3VoiceRealtimeConnectionState =
-  | "preparing"
-  | "offer-ready"
-  | "connecting"
-  | "connected"
-  | "disconnected"
-  | "failed"
-  | "closed";
+export interface T3VoiceStartRealtimeInput {
+  readonly target: VoiceRealtimeTarget;
+  readonly session: T3VoiceNativeSessionConfiguration;
+}
+
+export interface T3VoiceStartThreadInput {
+  readonly input: VoiceThreadStartInput;
+  readonly session: T3VoiceNativeSessionConfiguration;
+}
+
+export interface T3VoiceSetRealtimeMutedInput {
+  readonly muted: boolean;
+}
+
+export interface T3VoiceSetRealtimeAudioRouteInput {
+  readonly routeId: string;
+}
+
+export interface T3VoiceDecideRealtimeConfirmationInput {
+  readonly confirmationId: VoiceConfirmationId;
+  readonly decision: VoiceConfirmationDecision;
+}
+
+export interface T3VoiceCompleteRealtimeClientActionInput {
+  readonly actionId: VoiceClientActionId;
+  readonly outcome: VoiceClientActionOutcome;
+  readonly message?: string;
+}
+
+export interface T3VoiceSubmitThreadTranscriptInput {
+  readonly expectedGeneration: number;
+  readonly expectedReviewId: number;
+  readonly transcript: string;
+}
+
+export interface T3VoiceUpdateThreadReviewTranscriptInput {
+  readonly expectedGeneration: number;
+  readonly expectedReviewId: number;
+  readonly transcript: string;
+}
+
+export type T3VoiceRuntimePhase = "inactive" | "idle" | "recording" | "playing";
 
 export interface T3VoiceRuntimeState {
   readonly phase: T3VoiceRuntimePhase;
   readonly isForeground: boolean;
   readonly activeRecordingId: string | null;
   readonly activePlaybackId: string | null;
-  readonly activeRealtimeSessionId: string | null;
-  readonly realtimeConnectionState: T3VoiceRealtimeConnectionState | null;
-  readonly realtimeMuted: boolean;
   readonly sequence: number;
 }
 
@@ -118,40 +164,6 @@ export interface T3VoiceRuntimeErrorEvent {
   readonly recoverable: boolean;
 }
 
-export interface T3VoiceAudioRouteChangedEvent {
-  readonly nativeSessionId: string;
-  readonly routeId: T3VoiceAudioRoute["id"];
-  readonly routeType: T3VoiceAudioRoute["type"];
-  readonly reason: "selected" | "selected-route-unavailable";
-}
-
-export interface T3VoiceRealtimeTerminatedEvent {
-  readonly nativeSessionId: string;
-  readonly outcome: "ended" | "failed";
-  readonly code: string;
-  readonly retryable: boolean;
-}
-
-export interface T3VoiceRealtimePrepareInput {
-  readonly nativeSessionId: string;
-}
-
-export interface T3VoiceRealtimeOffer {
-  readonly nativeSessionId: string;
-  readonly sdp: string;
-}
-
-export interface T3VoiceRealtimeAnswerInput extends T3VoiceRealtimePrepareInput {
-  readonly sdp: string;
-}
-
-export interface T3VoiceAudioRoute {
-  readonly id: "system" | "speaker" | "earpiece" | "wired" | "bluetooth";
-  readonly label: string;
-  readonly type: "system" | "speaker" | "earpiece" | "wired" | "bluetooth";
-  readonly selected: boolean;
-}
-
 export type T3VoiceDiagnosticCategory =
   | "lifecycle"
   | "state"
@@ -202,8 +214,8 @@ export interface T3VoiceNativeModule {
   readonly nativeRevision: number;
   readonly addListener: {
     (
-      eventName: "stateChanged",
-      listener: (state: T3VoiceRuntimeState) => void,
+      eventName: "runtimeSnapshotChanged",
+      listener: (snapshot: VoiceRuntimeSnapshot) => void,
     ): T3VoiceEventSubscription;
     (
       eventName: "playbackChunkConsumed",
@@ -221,15 +233,28 @@ export interface T3VoiceNativeModule {
       eventName: "runtimeError",
       listener: (event: T3VoiceRuntimeErrorEvent) => void,
     ): T3VoiceEventSubscription;
-    (
-      eventName: "audioRouteChanged",
-      listener: (event: T3VoiceAudioRouteChangedEvent) => void,
-    ): T3VoiceEventSubscription;
-    (
-      eventName: "realtimeTerminated",
-      listener: (event: T3VoiceRealtimeTerminatedEvent) => void,
-    ): T3VoiceEventSubscription;
   };
+  readonly getRuntimeSnapshotAsync: () => Promise<VoiceRuntimeSnapshot>;
+  readonly startRealtimeAsync: (input: T3VoiceStartRealtimeInput) => Promise<void>;
+  readonly startThreadAsync: (input: T3VoiceStartThreadInput) => Promise<void>;
+  readonly switchRealtimeToThreadAsync: (input: VoiceThreadStartInput) => Promise<void>;
+  readonly stopRuntimeAsync: () => Promise<void>;
+  readonly setRealtimeMutedAsync: (input: T3VoiceSetRealtimeMutedInput) => Promise<void>;
+  readonly setRealtimeAudioRouteAsync: (input: T3VoiceSetRealtimeAudioRouteInput) => Promise<void>;
+  readonly updateRealtimeContextAsync: (context: VoiceRealtimeContext) => Promise<void>;
+  readonly decideRealtimeConfirmationAsync: (
+    input: T3VoiceDecideRealtimeConfirmationInput,
+  ) => Promise<void>;
+  readonly completeRealtimeClientActionAsync: (
+    input: T3VoiceCompleteRealtimeClientActionInput,
+  ) => Promise<void>;
+  readonly finishThreadRecordingAsync: () => Promise<void>;
+  readonly updateThreadReviewTranscriptAsync: (
+    input: T3VoiceUpdateThreadReviewTranscriptInput,
+  ) => Promise<void>;
+  readonly submitThreadTranscriptAsync: (
+    input: T3VoiceSubmitThreadTranscriptInput,
+  ) => Promise<void>;
   readonly getMediaCapabilitiesAsync: () => Promise<T3VoiceMediaCapabilities>;
   readonly getStateAsync: () => Promise<T3VoiceRuntimeState>;
   readonly getMicrophonePermissionAsync: () => Promise<PermissionResponse>;
@@ -253,19 +278,5 @@ export interface T3VoiceNativeModule {
     readonly playbackId: string;
   }) => Promise<void>;
   readonly getPendingPlaybackTerminationAsync: () => Promise<T3VoicePlaybackTerminatedEvent | null>;
-  readonly prepareRealtimeSessionAsync: (
-    input: T3VoiceRealtimePrepareInput,
-  ) => Promise<T3VoiceRealtimeOffer>;
-  readonly applyRealtimeAnswerAsync: (input: T3VoiceRealtimeAnswerInput) => Promise<void>;
-  readonly stopRealtimeSessionAsync: (input: T3VoiceRealtimePrepareInput) => Promise<boolean>;
-  readonly setRealtimeMutedAsync: (
-    input: T3VoiceRealtimePrepareInput & { readonly muted: boolean },
-  ) => Promise<void>;
-  readonly getAudioRoutesAsync: () => Promise<ReadonlyArray<T3VoiceAudioRoute>>;
   readonly getDiagnosticsAsync: () => Promise<ReadonlyArray<T3VoiceDiagnosticEntry>>;
-  readonly setAudioRouteAsync: (
-    input: T3VoiceRealtimePrepareInput & {
-      readonly routeId: T3VoiceAudioRoute["id"];
-    },
-  ) => Promise<ReadonlyArray<T3VoiceAudioRoute>>;
 }

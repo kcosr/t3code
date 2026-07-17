@@ -2,6 +2,7 @@ package expo.modules.t3voice
 
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -81,5 +82,41 @@ class T3VoiceRecordingTerminalPolicyTest {
 
     manual.join()
     automatic.join()
+  }
+
+  @Test
+  fun manualFinishJoinsAutomaticTerminalizationAndObservesItsExactResult() {
+    val coordinator = T3VoiceRecordingTerminalCoordinator(Any())
+    val automaticEntered = CountDownLatch(1)
+    val allowAutomaticCompletion = CountDownLatch(1)
+    val manualCompleted = CountDownLatch(1)
+    val published = AtomicReference<T3VoiceRecordingResult?>()
+    val observed = AtomicReference<T3VoiceRecordingResult?>()
+    val recording = T3VoiceRecordingResult("recording", "file:///recording.m4a", 1_000, 4_096)
+
+    val automatic =
+      thread {
+        coordinator.serialized {
+          automaticEntered.countDown()
+          allowAutomaticCompletion.await()
+          published.set(recording)
+        }
+      }
+    assertTrue(automaticEntered.await(1, TimeUnit.SECONDS))
+    val manual =
+      thread {
+        coordinator.serialized {
+          observed.set(published.get())
+          manualCompleted.countDown()
+        }
+      }
+
+    assertFalse(manualCompleted.await(100, TimeUnit.MILLISECONDS))
+    allowAutomaticCompletion.countDown()
+    assertTrue(manualCompleted.await(1, TimeUnit.SECONDS))
+    assertEquals(recording, observed.get())
+
+    automatic.join()
+    manual.join()
   }
 }

@@ -300,6 +300,10 @@ function RootStackLayoutContent(props: {
           projectId: focusedThread.projectId,
           threadId: focusedThread.id,
           threadTitle: focusedThread.title,
+          runtimeMode: focusedThread.runtimeMode,
+          interactionMode: focusedThread.interactionMode ?? "default",
+          interactionRequired:
+            focusedThread.hasPendingApprovals || focusedThread.hasPendingUserInput,
         };
   const voiceEnvironmentId =
     voiceFocus?.environmentId ??

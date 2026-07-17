@@ -60,7 +60,7 @@ class T3VoiceRuntimeServiceInstrumentedTest {
     val first = bindService()
     try {
       assertNotNull(first.binder.get())
-      assertEquals(T3VoiceRuntimePhase.IDLE, first.binder.get()!!.state.value.phase)
+      assertEquals(T3VoiceRuntimePhase.IDLE, T3VoiceStateStore.state.value.phase)
     } finally {
       context.unbindService(first.connection)
     }
@@ -69,7 +69,7 @@ class T3VoiceRuntimeServiceInstrumentedTest {
     val second = bindService()
     try {
       assertNotNull(second.binder.get())
-      assertEquals(T3VoiceRuntimePhase.IDLE, second.binder.get()!!.state.value.phase)
+      assertEquals(T3VoiceRuntimePhase.IDLE, T3VoiceStateStore.state.value.phase)
     } finally {
       context.unbindService(second.connection)
     }
@@ -88,15 +88,15 @@ class T3VoiceRuntimeServiceInstrumentedTest {
       val binder = checkNotNull(first.binder.get())
       binder.startRecording(recordingId, T3VoiceEndpointDetectionConfig(noSpeechTimeoutMs = null))
       waitUntil {
-        binder.state.value.phase == T3VoiceRuntimePhase.RECORDING &&
-          binder.state.value.isForeground &&
-          binder.state.value.activeRecordingId == recordingId
+        T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.RECORDING &&
+          T3VoiceStateStore.state.value.isForeground &&
+          T3VoiceStateStore.state.value.activeRecordingId == recordingId
       }
       binder.cancelRecording(recordingId)
       waitUntil {
-        binder.state.value.phase == T3VoiceRuntimePhase.IDLE &&
-          !binder.state.value.isForeground &&
-          binder.state.value.activeRecordingId == null
+        T3VoiceStateStore.state.value.phase == T3VoiceRuntimePhase.IDLE &&
+          !T3VoiceStateStore.state.value.isForeground &&
+          T3VoiceStateStore.state.value.activeRecordingId == null
       }
     } finally {
       context.unbindService(first.connection)
@@ -105,7 +105,7 @@ class T3VoiceRuntimeServiceInstrumentedTest {
 
     val second = bindService()
     try {
-      assertEquals(T3VoiceRuntimePhase.IDLE, second.binder.get()!!.state.value.phase)
+      assertEquals(T3VoiceRuntimePhase.IDLE, T3VoiceStateStore.state.value.phase)
     } finally {
       context.unbindService(second.connection)
     }

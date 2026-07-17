@@ -1,4 +1,4 @@
-import type { T3VoiceAudioRoute } from "@t3tools/mobile-voice-native";
+import type { VoiceAudioRoute, VoiceRuntimeSnapshot } from "@t3tools/client-runtime/voice";
 import { SymbolView } from "expo-symbols";
 import { ActivityIndicator, FlatList, Modal, Pressable, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -8,7 +8,6 @@ import { ControlPill } from "../../components/ControlPill";
 import { platformSymbolName } from "../../components/platformSymbolName";
 import { useThemeColor } from "../../lib/useThemeColor";
 import type { ActiveMasterVoiceAttachment } from "./masterVoiceState";
-import type { RealtimeVoiceControllerSnapshot } from "./realtimeVoiceController";
 
 export interface MasterVoiceTranscriptTurn {
   readonly role: "user" | "assistant";
@@ -16,8 +15,8 @@ export interface MasterVoiceTranscriptTurn {
 }
 
 export interface VoiceAudioRoutePickerState {
-  readonly routes: ReadonlyArray<T3VoiceAudioRoute> | null;
-  readonly selectingRouteId: T3VoiceAudioRoute["id"] | null;
+  readonly routes: ReadonlyArray<VoiceAudioRoute> | null;
+  readonly selectingRouteId: VoiceAudioRoute["id"] | null;
   readonly error: string | null;
 }
 
@@ -89,7 +88,7 @@ export function VoiceTranscriptModal(props: {
 export function VoiceAudioRoutePicker(props: {
   readonly state: VoiceAudioRoutePickerState | null;
   readonly onClose: () => void;
-  readonly onSelect: (route: T3VoiceAudioRoute) => void;
+  readonly onSelect: (route: VoiceAudioRoute) => void;
 }) {
   const insets = useSafeAreaInsets();
   const iconColor = useThemeColor("--color-icon");
@@ -180,19 +179,47 @@ export function VoiceAudioRoutePicker(props: {
   );
 }
 
-function phaseLabel(snapshot: RealtimeVoiceControllerSnapshot): string {
-  if (snapshot.phase === "starting") return "Connecting";
-  if (snapshot.phase === "stopping") return "Ending voice session";
-  if (snapshot.phase === "error") return "Voice session failed";
-  if (snapshot.native?.realtimeConnectionState === "connecting") return "Connecting media";
-  if (snapshot.native?.realtimeConnectionState === "connected") return "Voice active";
-  return "Voice";
+function phaseLabel(snapshot: VoiceRuntimeSnapshot): string {
+  switch (snapshot.mode) {
+    case "idle":
+      return "Voice";
+    case "failed":
+      return "Voice session failed";
+    case "switching-to-thread":
+      return "Switching to Thread voice";
+    case "realtime":
+      if (snapshot.phase === "starting") return "Connecting";
+      if (snapshot.phase === "stopping") return "Ending voice session";
+      return "Voice active";
+    case "thread":
+      switch (snapshot.phase) {
+        case "starting":
+        case "rearming":
+          return "Starting Thread voice";
+        case "recording":
+          return "Listening";
+        case "finalizing":
+        case "transcribing":
+          return "Transcribing";
+        case "reviewing":
+          return "Review voice message";
+        case "submitting":
+          return "Sending voice message";
+        case "waiting":
+          return "Waiting for response";
+        case "playing":
+          return "Playing response";
+        case "stopping":
+          return "Ending Thread voice";
+      }
+  }
 }
 
 export function MasterVoiceCallBar(props: {
   readonly historyAvailable: boolean;
   readonly callAvailable: boolean;
-  readonly snapshot: RealtimeVoiceControllerSnapshot;
+  readonly snapshot: VoiceRuntimeSnapshot;
+  readonly controlsAvailable: boolean;
   readonly attachment: ActiveMasterVoiceAttachment | null;
   readonly transcript: ReadonlyArray<MasterVoiceTranscriptTurn>;
   readonly onMute: () => void;
@@ -205,7 +232,7 @@ export function MasterVoiceCallBar(props: {
 }) {
   const insets = useSafeAreaInsets();
   const iconColor = useThemeColor("--color-icon");
-  if (props.snapshot.phase === "idle") {
+  if (props.snapshot.mode === "idle") {
     if (!props.historyAvailable && !props.callAvailable) return null;
     return (
       <View
@@ -268,29 +295,30 @@ export function MasterVoiceCallBar(props: {
           {lastTurn?.text ?? "Tap to view the voice transcript"}
         </Text>
       </Pressable>
-      {props.snapshot.phase === "active" ? (
+      {props.snapshot.mode === "realtime" && props.snapshot.phase === "connected" ? (
         <>
           <ControlPill
-            icon={props.snapshot.native?.realtimeMuted ? "mic.slash.fill" : "mic.fill"}
-            accessibilityLabel={
-              props.snapshot.native?.realtimeMuted ? "Unmute microphone" : "Mute microphone"
-            }
-            active={props.snapshot.native?.realtimeMuted ?? false}
+            icon={props.snapshot.muted ? "mic.slash.fill" : "mic.fill"}
+            accessibilityLabel={props.snapshot.muted ? "Unmute microphone" : "Mute microphone"}
+            active={props.snapshot.muted}
+            disabled={!props.controlsAvailable}
             onPress={props.onMute}
           />
           <ControlPill
             icon="airplayaudio"
             accessibilityLabel="Choose audio route"
+            disabled={!props.controlsAvailable}
             onPress={props.onRoute}
           />
         </>
       ) : null}
       <ControlPill
-        icon={props.snapshot.phase === "error" ? "xmark" : "stop.fill"}
+        icon={props.snapshot.mode === "failed" ? "xmark" : "stop.fill"}
         accessibilityLabel={
-          props.snapshot.phase === "error" ? "Dismiss voice error" : "End voice session"
+          props.snapshot.mode === "failed" ? "Dismiss voice error" : "End voice session"
         }
         variant="danger"
+        disabled={!props.controlsAvailable}
         onPress={props.onStop}
       />
     </View>

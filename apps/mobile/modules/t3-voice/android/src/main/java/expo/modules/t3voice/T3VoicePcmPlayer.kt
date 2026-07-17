@@ -108,11 +108,15 @@ internal class T3VoicePcmPlayer(
   }
 
   fun enqueue(playbackId: String, chunkIndex: Int, pcmBase64: String) {
-    require(chunkIndex >= 0) { "PCM chunk indexes must be non-negative." }
     require(pcmBase64.length <= limits.maximumEncodedChunkBytes) { "PCM chunk is too large." }
+    synchronized(lock) { requireActive(playbackId) }
+    enqueuePcm(playbackId, chunkIndex, decodePcm(pcmBase64))
+  }
+
+  fun enqueuePcm(playbackId: String, chunkIndex: Int, pcm: ByteArray) {
+    require(chunkIndex >= 0) { "PCM chunk indexes must be non-negative." }
     synchronized(lock) {
       val playback = requireActive(playbackId)
-      val pcm = decodePcm(pcmBase64)
       require(pcm.isNotEmpty()) { "PCM chunks must not be empty." }
       require(pcm.size <= limits.maximumDecodedChunkBytes) { "PCM chunk is too large." }
       require(pcm.size % playback.bytesPerFrame == 0) { "PCM chunk ended on a partial frame." }
@@ -137,7 +141,7 @@ internal class T3VoicePcmPlayer(
       check(playback.acceptedFrames + frames <= maximumFrames) {
         "PCM playback duration limit was exceeded."
       }
-      playback.pending[chunkIndex] = pcm
+      playback.pending[chunkIndex] = pcm.copyOf()
       playback.queuedBytes += pcm.size
       playback.acceptedBytes += pcm.size
       playback.acceptedFrames += frames

@@ -1,4 +1,6 @@
 import {
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
   AuthVoiceManageScope,
   AuthVoiceUseScope,
   EnvironmentResourceNotFoundError,
@@ -11,17 +13,22 @@ import * as Option from "effect/Option";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import {
+  appendCredentialResponseHeaders,
   annotateEnvironmentRequest,
   currentEnvironmentTraceId,
   failEnvironmentInternal,
   failEnvironmentInvalidRequest,
   failEnvironmentNotFound,
+  failEnvironmentOperationForbidden,
+  failEnvironmentScopeRequired,
   requireEnvironmentScope,
 } from "../auth/http.ts";
+import { isSessionCredentialInternalError } from "../auth/SessionStore.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
 import { VoiceCredentialStore } from "./Services/VoiceCredentialStore.ts";
 import { VoiceConversationService } from "./Services/VoiceConversationService.ts";
 import { VoiceMediaTicketRegistry } from "./Services/VoiceMediaTicketRegistry.ts";
+import { NativeVoiceSessionIssuer } from "./Services/NativeVoiceSessionIssuer.ts";
 import { VoiceSessionService } from "./Services/VoiceSessionService.ts";
 import type { VoiceError } from "./Errors.ts";
 
@@ -102,9 +109,31 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
     const conversations = yield* VoiceConversationService;
     const credentials = yield* VoiceCredentialStore;
     const tickets = yield* VoiceMediaTicketRegistry;
+    const nativeSessions = yield* NativeVoiceSessionIssuer;
     const sessions = yield* VoiceSessionService;
 
     return handlers
+      .handle(
+        "createNativeSession",
+        Effect.fn("environment.voice.createNativeSession")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireEnvironmentScope(AuthVoiceUseScope);
+          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          const principal = yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
+          yield* appendCredentialResponseHeaders;
+          return yield* nativeSessions.issue(principal).pipe(
+            Effect.catchIf(isSessionCredentialInternalError, (cause) =>
+              failEnvironmentInternal("native_voice_session_issuance_failed", cause),
+            ),
+            Effect.catchTags({
+              NativeVoiceSessionReissuanceNotAllowedError: () =>
+                failEnvironmentOperationForbidden("native_voice_session_reissuance_not_allowed"),
+              NativeVoiceSessionScopeRequiredError: (error) =>
+                failEnvironmentScopeRequired(error.requiredScope),
+            }),
+          );
+        }),
+      )
       .handle(
         "createSession",
         Effect.fn("environment.voice.createSession")(function* (args) {

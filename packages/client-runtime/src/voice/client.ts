@@ -24,6 +24,7 @@ import {
   type VoiceConversationUpdateInput,
   type VoiceMediaTicket,
   type VoiceMediaTicketRequest,
+  type VoiceNativeSessionCredential,
   type VoiceSessionCloseResult,
   type VoiceSessionCreateInput,
   type VoiceSessionCreateResult,
@@ -164,6 +165,10 @@ export interface VoiceSpeechInput {
 }
 
 export interface VoiceHttpClient {
+  readonly createNativeSession: () => Effect.Effect<
+    VoiceNativeSessionCredential,
+    RemoteEnvironmentRequestError
+  >;
   readonly createSession: (
     input: VoiceSessionCreateInput,
   ) => Effect.Effect<VoiceSessionCreateResult, RemoteEnvironmentRequestError>;
@@ -432,6 +437,12 @@ export const makeVoiceHttpClient = (input: MakeVoiceHttpClientInput): VoiceHttpC
     });
 
   return {
+    createNativeSession: () =>
+      control({
+        method: "POST",
+        pathname: "/api/voice/native-session",
+        run: (client, headers) => client.voice.createNativeSession({ headers }),
+      }),
     createSession: (payload) =>
       control({
         method: "POST",

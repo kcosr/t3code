@@ -124,19 +124,22 @@ internal class T3VoiceRecorder(
   )
 
   private var active: ActiveRecording? = null
-  private val completed = mutableMapOf<String, File>()
+  private val completed = mutableMapOf<String, T3VoiceRecordingResult>()
   private val recordingCache = T3VoiceRecordingCache(context.cacheDir)
   private val terminalPolicy = T3VoiceRecordingTerminalPolicy()
   private val terminalCoordinator = T3VoiceRecordingTerminalCoordinator(terminalLock)
   private val endpointThread = HandlerThread("t3-voice-endpoint").apply { start() }
   private val endpointHandler = Handler(endpointThread.looper)
 
-  fun sweepStaleCache(): Int = recordingCache.sweep(completed.values.toSet())
+  fun sweepStaleCache(): Int =
+    recordingCache.sweep(
+      completed.values.mapNotNullTo(mutableSetOf()) { recordingFile(it) },
+    )
 
   @Synchronized
   fun restoreCompleted(recording: T3VoiceRecordingResult) {
-    val file = Uri.parse(recording.uri).path?.let(::File) ?: return
-    if (file.exists() && recordingCache.owns(file)) completed[recording.recordingId] = file
+    val file = recordingFile(recording) ?: return
+    if (file.exists() && recordingCache.owns(file)) completed[recording.recordingId] = recording
   }
 
   @Synchronized
@@ -145,6 +148,9 @@ internal class T3VoiceRecorder(
     endpointConfig: T3VoiceEndpointDetectionConfig,
   ) {
     check(active == null) { "A voice recording is already active." }
+    check(recordingId !in completed) {
+      "Recording $recordingId cannot be reused until its completed file is deleted."
+    }
     val outputFile = recordingCache.createTempFile()
     val recorder = createMediaRecorder()
     val terminalOwner = terminalPolicy.activate(recordingId)
@@ -183,14 +189,19 @@ internal class T3VoiceRecorder(
     scheduleEndpointPoll(terminalOwner)
   }
 
-  @Synchronized
-  fun stop(recordingId: String): T3VoiceRecordingResult {
-    val recording = requireActive(recordingId)
-    check(terminalPolicy.claim(recording.terminalOwner)) { "The recording already terminated." }
-    recordTerminalDiagnostic(recording)
-    active = null
-    return finalizeCompleted(recording)
-  }
+  fun stop(recordingId: String): T3VoiceRecordingResult =
+    terminalCoordinator.serialized {
+      val recording =
+        synchronized(this) {
+          completed[recordingId]?.let { return@serialized it }
+          val current = requireActive(recordingId)
+          check(terminalPolicy.claim(current.terminalOwner)) { "The recording already terminated." }
+          active = null
+          current
+        }
+      recordTerminalDiagnostic(recording)
+      finalizeCompleted(recording)
+    }
 
   @Synchronized
   fun cancel(recordingId: String) {
@@ -210,7 +221,11 @@ internal class T3VoiceRecorder(
 
   @Synchronized
   fun delete(recordingId: String, uri: String) {
-    val ownedFile = completed[recordingId] ?: error("Recording $recordingId is not owned by T3 voice.")
+    val ownedRecording =
+      completed[recordingId] ?: error("Recording $recordingId is not owned by T3 voice.")
+    val ownedFile = checkNotNull(recordingFile(ownedRecording)) {
+      "Recording $recordingId has an invalid owned URI."
+    }
     val requestedFile = Uri.parse(uri).path?.let(::File) ?: error("Recording URI is invalid.")
     val canonicalOwned = ownedFile.canonicalFile
     val canonicalRequested = requestedFile.canonicalFile
@@ -340,9 +355,12 @@ internal class T3VoiceRecorder(
         durationMs = SystemClock.elapsedRealtime() - recording.startedAtMs,
         byteLength = recording.file.length(),
       )
-    synchronized(this) { completed[recording.recordingId] = recording.file }
+    synchronized(this) { completed[recording.recordingId] = result }
     return result
   }
+
+  private fun recordingFile(recording: T3VoiceRecordingResult): File? =
+    Uri.parse(recording.uri).path?.let(::File)
 
   private fun stopAndDelete(recording: ActiveRecording) {
     try {

@@ -2,6 +2,7 @@ import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeCrypto from "node:crypto";
+import * as NodeURL from "node:url";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import {
@@ -1405,6 +1406,28 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("never caches a native voice child credential response", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+      const parentToken = yield* getAuthenticatedBearerSessionToken();
+
+      const response = yield* fetchEffect(yield* getHttpServerUrl("/api/voice/native-session"), {
+        method: "POST",
+        headers: { authorization: `Bearer ${parentToken}` },
+      });
+      const body = yield* responseJsonEffect<{
+        readonly accessToken?: string;
+        readonly expiresAt?: string;
+      }>(response);
+
+      assert.equal(response.status, 200);
+      assert.equal(typeof body.accessToken, "string");
+      assert.equal(typeof body.expiresAt, "string");
+      assert.equal(response.headers["cache-control"], "no-store");
+      assert.equal(response.headers.pragma, "no-cache");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("rejects a voice media ticket used for a different request", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest({
@@ -1468,7 +1491,9 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       });
       const fileSystem = yield* FileSystem.FileSystem;
       const fixture = yield* fileSystem.readFile(
-        new URL("./voice/Services/fixtures/silence-aac-lc-mono.m4a", import.meta.url),
+        NodeURL.fileURLToPath(
+          new URL("./voice/Services/fixtures/silence-aac-lc-mono.m4a", import.meta.url),
+        ),
       );
       const cookie = yield* getAuthenticatedSessionCookieHeader();
 
@@ -1491,7 +1516,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         form.append("audio", new Blob([fixture], { type: "audio/mp4" }), "recording.m4a");
         form.append(
           "metadata",
-          JSON.stringify({ requestId: `voice-upload-${index}`, format: "audio/mp4" }),
+          jsonRequestBody({ requestId: `voice-upload-${index}`, format: "audio/mp4" }),
         );
         const response = yield* Effect.raceFirst(
           fetchEffect(yield* getHttpServerUrl("/api/voice/transcriptions"), {

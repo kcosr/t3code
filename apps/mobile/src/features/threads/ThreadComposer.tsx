@@ -16,7 +16,6 @@ import {
   serializeComposerFileLink,
   type ComposerTrigger,
 } from "@t3tools/shared/composerTrigger";
-import type { VoiceThreadModePauseReason } from "@t3tools/shared/voiceThreadMode";
 import type { ReactNode } from "react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
@@ -69,15 +68,20 @@ import { mobilePreferencesAtom } from "../../state/preferences";
 import { ComposerCommandPopover, type ComposerCommandItem } from "./ComposerCommandPopover";
 import { useComposerDictation } from "../voice/useComposerDictation";
 import {
-  activateAutoListenWithAudioHandoff,
   dictationResumeTransition,
   interruptTraditionalAudioForRealtime,
   runExclusiveTraditionalAudioTransition,
-  startManualDictationWithAudioHandoff,
+  startDictationWithAudioHandoff,
 } from "../voice/traditionalAudioHandoff";
 import { useMasterVoice } from "../voice/MasterVoiceProvider";
+import {
+  nativeThreadReviewIdentityForDraft,
+  threadReviewHydrationTracker,
+  threadVoiceComposerCapabilities,
+  threadVoiceControlState,
+  type ThreadReviewIdentity,
+} from "../voice/threadVoiceComposerState";
 import { resolveVoicePreferences } from "../voice/voicePreferences";
-import { useAutoListenController } from "../voice/useAutoListenController";
 
 /**
  * Height of the collapsed composer (pill + vertical padding, excluding safe-area inset).
@@ -90,42 +94,6 @@ export const COMPOSER_COLLAPSED_CHROME = 60;
  * Used by the parent to compute the larger feed bottom inset when the composer is focused.
  */
 export const COMPOSER_EXPANDED_CHROME = 174;
-
-function autoListenPauseMessage(reason: VoiceThreadModePauseReason): string {
-  switch (reason) {
-    case "permission":
-      return "Microphone permission is unavailable.";
-    case "audio-route":
-      return "The selected audio route is unavailable.";
-    case "no-speech":
-    case "empty-transcript":
-      return "No speech was recognized.";
-    case "recording-failed":
-      return "Recording could not continue.";
-    case "transcription-failed":
-      return "Transcription failed.";
-    case "transcription-timeout":
-      return "Transcription timed out.";
-    case "submission-failed":
-      return "The message could not be sent.";
-    case "submission-timeout":
-      return "Sending the message timed out.";
-    case "interaction-required":
-      return "The thread needs approval or user input.";
-    case "response-timeout":
-      return "The thread response timed out.";
-    case "playback-cancelled":
-      return "Spoken response playback was stopped.";
-    case "playback-failed":
-      return "Spoken response playback failed.";
-    case "user":
-    case "disabled":
-    case "target-changed":
-    case "realtime-active":
-    case "lifecycle":
-      return "Auto Listen stopped.";
-  }
-}
 
 export interface ThreadComposerProps {
   readonly draftMessage: string;
@@ -146,12 +114,6 @@ export interface ThreadComposerProps {
   readonly serverConfig: T3ServerConfig | null;
   readonly queueCount: number;
   readonly activeThreadBusy: boolean;
-  readonly threadMessages: ReadonlyArray<{
-    readonly id: string;
-    readonly role: "user" | "assistant" | "system";
-    readonly turnId: string | null;
-    readonly streaming: boolean;
-  }>;
   readonly interactionRequired: boolean;
   readonly environmentId: EnvironmentId;
   readonly projectCwd: string | null;
@@ -162,11 +124,6 @@ export interface ThreadComposerProps {
   readonly onRemoveDraftImage: (imageId: string) => void;
   readonly onStopThread: () => void;
   readonly onSendMessage: () => Promise<MessageId | null>;
-  readonly onSendVoiceMessage: (input: {
-    readonly environmentId: EnvironmentId;
-    readonly threadId: import("@t3tools/contracts").ThreadId;
-    readonly text: string;
-  }) => Promise<MessageId | null>;
   readonly onUpdateModelSelection: (modelSelection: ModelSelection) => void;
   readonly onUpdateRuntimeMode: (runtimeMode: RuntimeMode) => void;
   readonly onUpdateInteractionMode: (interactionMode: ProviderInteractionMode) => void;
@@ -341,16 +298,17 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const [isFocused, setIsFocused] = useState(false);
   const wasExpandedBeforePreviewRef = useRef(false);
   const inFlightThreadIdsRef = useRef(new Set<string>());
+  const reviewSyncAlertedRef = useRef<string | null>(null);
   const { onExpandedChange } = props;
 
   const [previewImageUri, setPreviewImageUri] = useState<string | null>(null);
+  const [nativeReviewIdentity, setNativeReviewIdentity] = useState<ThreadReviewIdentity | null>(
+    null,
+  );
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
   const voicePreferences = resolveVoicePreferences(
     AsyncResult.isSuccess(preferencesResult) ? preferencesResult.value : {},
   );
-  const spokenResponsesEnabled =
-    AsyncResult.isSuccess(preferencesResult) &&
-    preferencesResult.value.threadSpeechEnabled === true;
   const dictation = useComposerDictation({
     environmentId: props.environmentId,
     scopeKey: props.selectedThread.id,
@@ -358,70 +316,29 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     onChangeDraftMessage: props.onChangeDraftMessage,
     voicePreferences,
   });
-  const realtimeVoice = useMasterVoice();
+  const voiceRuntime = useMasterVoice();
+  const runtimeSnapshot = voiceRuntime.snapshot;
   const realtimeInUse =
-    realtimeVoice.phase === "active" ||
-    realtimeVoice.phase === "starting" ||
-    realtimeVoice.phase === "stopping";
+    runtimeSnapshot.mode === "realtime" || runtimeSnapshot.mode === "switching-to-thread";
+  const nativeRuntimeInUse = runtimeSnapshot.mode !== "idle" && runtimeSnapshot.mode !== "failed";
+  const threadVoiceControl = threadVoiceControlState(runtimeSnapshot, {
+    environmentId: props.environmentId,
+    threadId: props.selectedThread.id,
+  });
+  const autoListenActive = threadVoiceControl.active;
+  const autoListenPhase =
+    runtimeSnapshot.mode === "thread"
+      ? runtimeSnapshot.phase
+      : runtimeSnapshot.mode === "switching-to-thread"
+        ? runtimeSnapshot.phase
+        : "idle";
   const dictationWasActiveRef = useRef(false);
   const traditionalAudioTransitionLockRef = useRef({ active: false });
   const canStartAutoListen =
+    voiceRuntime.controlsAvailable &&
     props.draftMessage.trim().length === 0 &&
     props.draftAttachments.length === 0 &&
     !props.interactionRequired;
-  const autoListen = useAutoListenController({
-    environmentId: props.environmentId,
-    threadId: props.selectedThread.id,
-    preferences: voicePreferences,
-    persistedTargetGeneration: AsyncResult.isSuccess(preferencesResult)
-      ? (preferencesResult.value.voiceThreadTarget?.generation ?? 0)
-      : 0,
-    activeThreadBusy: props.activeThreadBusy,
-    threadMessages: props.threadMessages,
-    interactionRequired: props.interactionRequired,
-    canStartFromComposer: canStartAutoListen,
-    dictation,
-    speech: {
-      ...props.speechPlayback,
-      playbackRequired: spokenResponsesEnabled,
-    },
-    realtimePhase: realtimeVoice.phase,
-    stopRealtime: realtimeVoice.stop,
-    onSendVoiceMessage: props.onSendVoiceMessage,
-  });
-  const {
-    state: autoListenState,
-    active: autoListenActive,
-    activate: activateAutoListen,
-    deactivateForManualDictation: deactivateAutoListenForManualDictation,
-    stopToDraft: stopAutoListenToDraft,
-    pause: pauseAutoListen,
-    submitReview: submitAutoListenReview,
-  } = autoListen;
-  const autoListenAlertCycleRef = useRef(0);
-
-  useEffect(() => {
-    if (
-      autoListenState.phase !== "paused" ||
-      autoListenState.cycle <= autoListenAlertCycleRef.current
-    ) {
-      return;
-    }
-    autoListenAlertCycleRef.current = autoListenState.cycle;
-    const reason = autoListenState.pauseReason;
-    if (
-      reason === null ||
-      reason === "user" ||
-      reason === "disabled" ||
-      reason === "target-changed" ||
-      reason === "realtime-active" ||
-      reason === "lifecycle"
-    ) {
-      return;
-    }
-    Alert.alert("Auto Listen paused", autoListenPauseMessage(reason));
-  }, [autoListenState]);
-
   useEffect(() => {
     const transition = dictationResumeTransition(dictationWasActiveRef.current, dictation.phase);
     dictationWasActiveRef.current = transition.wasActive;
@@ -429,48 +346,103 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   }, [dictation.phase, props.speechPlayback.resumeAfterDictation]);
 
   useEffect(() => {
-    if (realtimeVoice.phase === "idle" || realtimeVoice.phase === "error") {
+    if (!nativeRuntimeInUse) {
       props.speechPlayback.resumeAfterRealtime();
     }
-  }, [props.speechPlayback.resumeAfterRealtime, realtimeVoice.phase]);
+  }, [nativeRuntimeInUse, props.speechPlayback.resumeAfterRealtime]);
 
   useEffect(
     () =>
-      realtimeVoice.registerTraditionalAudioInterruption(async () => {
-        const restoreAutoListen = autoListenActive;
-        pauseAutoListen("realtime-active");
-        return interruptTraditionalAudioForRealtime({
+      voiceRuntime.registerTraditionalAudioInterruption(() =>
+        interruptTraditionalAudioForRealtime({
           cancelDictation: dictation.cancelForRealtime,
           interruptPlayback: props.speechPlayback.interruptForRealtime,
-          rollback: () => {
-            props.speechPlayback.resumeAfterRealtime();
-            if (restoreAutoListen) void activateAutoListen(true);
-          },
-        });
-      }),
+          rollback: props.speechPlayback.resumeAfterRealtime,
+        }),
+      ),
     [
-      activateAutoListen,
-      autoListenActive,
       dictation.cancelForRealtime,
-      pauseAutoListen,
       props.speechPlayback.interruptForRealtime,
       props.speechPlayback.resumeAfterRealtime,
-      realtimeVoice.registerTraditionalAudioInterruption,
+      voiceRuntime.registerTraditionalAudioInterruption,
     ],
   );
+
+  useEffect(() => {
+    if (!nativeRuntimeInUse) return;
+    void props.speechPlayback.interruptForRealtime();
+  }, [nativeRuntimeInUse, props.speechPlayback.interruptForRealtime]);
+
+  useEffect(() => {
+    const hydration = threadReviewHydrationTracker.reconcile({
+      snapshot: runtimeSnapshot,
+      target: {
+        environmentId: props.environmentId,
+        threadId: props.selectedThread.id,
+      },
+      currentDraft: props.draftMessage,
+      hasAttachments: props.draftAttachments.length > 0,
+    });
+    const nextIdentity = nativeThreadReviewIdentityForDraft(hydration.hydrated);
+    setNativeReviewIdentity((current) =>
+      current?.generation === nextIdentity?.generation &&
+      current?.reviewId === nextIdentity?.reviewId
+        ? current
+        : nextIdentity,
+    );
+    if (hydration.draftUpdate !== null) props.onChangeDraftMessage(hydration.draftUpdate);
+  }, [
+    props.draftAttachments.length,
+    props.draftMessage,
+    props.environmentId,
+    props.onChangeDraftMessage,
+    props.selectedThread.id,
+    runtimeSnapshot,
+  ]);
+  const nativeReviewCapabilities = threadVoiceComposerCapabilities(
+    runtimeSnapshot,
+    { environmentId: props.environmentId, threadId: props.selectedThread.id },
+    nativeReviewIdentity,
+  );
+  const nativeReviewOwnsComposer = nativeReviewCapabilities.nativeReviewOwnsComposer;
+
+  useEffect(() => {
+    if (!nativeReviewOwnsComposer || nativeReviewIdentity === null) return;
+    const reviewKey = `${nativeReviewIdentity.generation}:${nativeReviewIdentity.reviewId}`;
+    void voiceRuntime
+      .updateThreadReviewTranscript({
+        environmentId: props.environmentId,
+        threadId: props.selectedThread.id,
+        transcript: props.draftMessage,
+        review: nativeReviewIdentity,
+      })
+      .then((updated) => {
+        if (updated) reviewSyncAlertedRef.current = null;
+      })
+      .catch((cause) => {
+        if (reviewSyncAlertedRef.current === reviewKey) return;
+        reviewSyncAlertedRef.current = reviewKey;
+        Alert.alert("Voice review edit could not be synced", String(cause));
+      });
+  }, [
+    nativeReviewIdentity,
+    nativeReviewOwnsComposer,
+    props.draftMessage,
+    props.environmentId,
+    props.selectedThread.id,
+    voiceRuntime.updateThreadReviewTranscript,
+  ]);
 
   const toggleDictation = useCallback(async () => {
     await runExclusiveTraditionalAudioTransition(
       traditionalAudioTransitionLockRef.current,
       async () => {
-        if (dictation.phase === "recording" && !autoListenActive) {
+        if (dictation.phase === "recording" && !nativeRuntimeInUse) {
           await dictation.stop();
           return;
         }
-        await startManualDictationWithAudioHandoff({
-          autoListenActive,
-          deactivateAutoListen: deactivateAutoListenForManualDictation,
-          stopRealtime: realtimeVoice.stop,
+        await startDictationWithAudioHandoff({
+          stopRealtime: voiceRuntime.stop,
           interruptPlayback: props.speechPlayback.interrupt,
           startDictation: async () => (await dictation.start()) !== null,
           resumePlayback: props.speechPlayback.resumeAfterDictation,
@@ -478,14 +450,13 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       },
     );
   }, [
-    autoListenActive,
-    deactivateAutoListenForManualDictation,
     dictation.phase,
     dictation.start,
     dictation.stop,
+    nativeRuntimeInUse,
     props.speechPlayback.interrupt,
     props.speechPlayback.resumeAfterDictation,
-    realtimeVoice.stop,
+    voiceRuntime.stop,
   ]);
 
   const toggleAutoListenOperation = useCallback(async () => {
@@ -493,22 +464,22 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       traditionalAudioTransitionLockRef.current,
       async () => {
         if (autoListenActive) {
-          if (await stopAutoListenToDraft()) return;
-          await deactivateAutoListenForManualDictation();
+          if (runtimeSnapshot.mode === "thread" && runtimeSnapshot.phase === "recording") {
+            await voiceRuntime.finishThreadRecording();
+            return;
+          }
+          await voiceRuntime.stop();
           return;
         }
-        await activateAutoListenWithAudioHandoff({
-          releaseManualDictation: dictation.cancelForRealtime,
-          activateAutoListen: () => activateAutoListen(true),
-        });
+        await voiceRuntime.startThread();
       },
-    );
+    ).catch((cause) => Alert.alert("Thread voice unavailable", String(cause)));
   }, [
-    activateAutoListen,
     autoListenActive,
-    deactivateAutoListenForManualDictation,
-    dictation.cancelForRealtime,
-    stopAutoListenToDraft,
+    runtimeSnapshot,
+    voiceRuntime.finishThreadRecording,
+    voiceRuntime.startThread,
+    voiceRuntime.stop,
   ]);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
@@ -593,11 +564,12 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   }, [props.draftMessage.length]);
 
   const composerTrigger = useMemo<ComposerTrigger | null>(() => {
+    if (!nativeReviewCapabilities.richPayload) return null;
     if (composerSelection.start !== composerSelection.end) {
       return null;
     }
     return detectComposerTrigger(props.draftMessage, composerSelection.end);
-  }, [composerSelection, props.draftMessage]);
+  }, [composerSelection, nativeReviewCapabilities.richPayload, props.draftMessage]);
   const pathSearch = useComposerPathSearch({
     environmentId: props.environmentId,
     cwd: composerTrigger?.kind === "path" ? props.projectCwd : null,
@@ -756,22 +728,45 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     const threadKey = scopedThreadKey(props.environmentId, props.selectedThread.id);
     if (inFlightThreadIdsRef.current.has(threadKey)) return;
     inFlightThreadIdsRef.current.add(threadKey);
-    // Sending a prompt starts agent work: arm the lock-screen card now, while
-    // the app is foregrounded and the activity token can be registered.
-    armAgentAwarenessLiveActivityForLocalWork({
-      threadTitle: props.selectedThread.title,
-      projectTitle: props.environmentLabel ?? "T3 Code",
-    });
     try {
-      const review = await submitAutoListenReview(draftMessage);
-      if (!review.handled) await onSendMessage();
+      if (nativeReviewIdentity !== null && props.draftAttachments.length > 0) {
+        Alert.alert(
+          "Attachments are unavailable in voice review",
+          "Remove the attachment before submitting this plain-text voice transcript.",
+        );
+        return;
+      }
+      const disposition = await voiceRuntime.submitThreadTranscript({
+        environmentId: props.environmentId,
+        threadId: props.selectedThread.id,
+        transcript: draftMessage,
+        review: nativeReviewIdentity,
+      });
+      if (disposition === "native-owned") {
+        Alert.alert(
+          "Thread voice owns this turn",
+          "Stop the active voice session before sending this existing draft.",
+        );
+        return;
+      }
+      // Sending a prompt starts agent work: arm the lock-screen card while the
+      // app is foregrounded and the activity token can be registered.
+      armAgentAwarenessLiveActivityForLocalWork({
+        threadTitle: props.selectedThread.title,
+        projectTitle: props.environmentLabel ?? "T3 Code",
+      });
+      if (disposition === "ordinary") {
+        await onSendMessage();
+      }
     } finally {
       inFlightThreadIdsRef.current.delete(threadKey);
     }
   }, [
     onSendMessage,
-    submitAutoListenReview,
+    voiceRuntime.submitThreadTranscript,
     draftMessage,
+    nativeReviewIdentity,
+    props.draftAttachments.length,
     props.environmentId,
     props.environmentLabel,
     props.selectedThread.id,
@@ -1024,11 +1019,17 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
               ref={inputRef}
               multiline
               value={props.draftMessage}
-              skills={selectedProviderStatus?.skills ?? []}
+              skills={
+                nativeReviewCapabilities.richPayload ? (selectedProviderStatus?.skills ?? []) : []
+              }
               selection={composerSelection}
               onChangeText={props.onChangeDraftMessage}
               onSelectionChange={handleSelectionChange}
-              onPasteImages={(uris) => void props.onNativePasteImages(uris)}
+              onPasteImages={
+                nativeReviewOwnsComposer
+                  ? undefined
+                  : (uris) => void props.onNativePasteImages(uris)
+              }
               placeholder={props.placeholder}
               onFocus={handleFocus}
               onBlur={handleBlur}
@@ -1082,12 +1083,14 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
               {dictation.available ? (
                 <ControlPill
                   accessibilityLabel={
-                    autoListenActive
-                      ? `Pause Auto Listen, ${autoListenState.phase}`
-                      : "Start Auto Listen"
+                    autoListenActive ? `Pause Auto Listen, ${autoListenPhase}` : "Start Auto Listen"
                   }
                   active={autoListenActive}
-                  disabled={!autoListenActive && !canStartAutoListen}
+                  disabled={
+                    !voiceRuntime.controlsAvailable ||
+                    (!autoListenActive &&
+                      (!canStartAutoListen || threadVoiceControl.blockedByAnotherTarget))
+                  }
                   icon="waveform"
                   onPress={() => void toggleAutoListenOperation()}
                 />
@@ -1136,6 +1139,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
               >
                 <ComposerToolbarButton
                   icon="plus"
+                  disabled={nativeReviewOwnsComposer}
                   onPress={() => void props.onPickDraftImages()}
                   showChevron={false}
                 />
@@ -1155,17 +1159,23 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                   <ComposerToolbarButton
                     accessibilityLabel={
                       autoListenActive
-                        ? `Pause Auto Listen, ${autoListenState.phase}`
+                        ? `Pause Auto Listen, ${autoListenPhase}`
                         : "Start Auto Listen"
                     }
                     icon="waveform"
                     active={autoListenActive}
-                    disabled={!autoListenActive && !canStartAutoListen}
+                    disabled={
+                      !voiceRuntime.controlsAvailable ||
+                      (!autoListenActive &&
+                        (!canStartAutoListen || threadVoiceControl.blockedByAnotherTarget))
+                    }
                     onPress={() => void toggleAutoListenOperation()}
                     showChevron={false}
                   />
                 ) : null}
-                {props.speechPlayback.available && !realtimeInUse ? (
+                {props.speechPlayback.available &&
+                !realtimeInUse &&
+                nativeReviewCapabilities.configuration ? (
                   <ComposerToolbarButton
                     accessibilityLabel={
                       props.speechPlayback.enabled ? "Disable spoken responses" : "Speak responses"
@@ -1178,28 +1188,34 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                     showChevron={false}
                   />
                 ) : null}
-                <ControlPillMenu
-                  actions={modelMenuActions}
-                  onPressAction={({ nativeEvent }) => handleModelMenuAction(nativeEvent.event)}
-                >
-                  <ComposerToolbarTrigger
-                    accessibilityLabel="Model"
-                    iconNode={
-                      <ProviderIcon provider={currentModelOption?.providerDriver} size={16} />
-                    }
-                    label={currentModelOption?.label ?? currentModelSelection.model}
-                  />
-                </ControlPillMenu>
-                <ControlPillMenu
-                  actions={optionsMenuActions}
-                  onPressAction={({ nativeEvent }) => handleOptionsMenuAction(nativeEvent.event)}
-                >
-                  <ComposerToolbarTrigger
-                    accessibilityLabel="Configuration"
-                    icon="slider.horizontal.3"
-                    label={configurationLabel}
-                  />
-                </ControlPillMenu>
+                {nativeReviewCapabilities.configuration ? (
+                  <>
+                    <ControlPillMenu
+                      actions={modelMenuActions}
+                      onPressAction={({ nativeEvent }) => handleModelMenuAction(nativeEvent.event)}
+                    >
+                      <ComposerToolbarTrigger
+                        accessibilityLabel="Model"
+                        iconNode={
+                          <ProviderIcon provider={currentModelOption?.providerDriver} size={16} />
+                        }
+                        label={currentModelOption?.label ?? currentModelSelection.model}
+                      />
+                    </ControlPillMenu>
+                    <ControlPillMenu
+                      actions={optionsMenuActions}
+                      onPressAction={({ nativeEvent }) =>
+                        handleOptionsMenuAction(nativeEvent.event)
+                      }
+                    >
+                      <ComposerToolbarTrigger
+                        accessibilityLabel="Configuration"
+                        icon="slider.horizontal.3"
+                        label={configurationLabel}
+                      />
+                    </ControlPillMenu>
+                  </>
+                ) : null}
                 {showStopAction ? (
                   <ComposerToolbarButton
                     icon="stop.fill"

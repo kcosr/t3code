@@ -2,15 +2,12 @@ import type { T3VoiceNativeModule, T3VoiceRuntimeState } from "@t3tools/mobile-v
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
-  activateAutoListenWithAudioHandoff,
   dictationResumeTransition,
   interruptTraditionalAudioForRealtime,
   releaseRecordingForRealtime,
   releasePlaybackForRecording,
-  releaseAutoListenForManualDictation,
   runExclusiveTraditionalAudioTransition,
   startDictationWithAudioHandoff,
-  startManualDictationWithAudioHandoff,
 } from "./traditionalAudioHandoff";
 
 const idleState = (): T3VoiceRuntimeState => ({
@@ -18,9 +15,6 @@ const idleState = (): T3VoiceRuntimeState => ({
   isForeground: false,
   activeRecordingId: null,
   activePlaybackId: null,
-  activeRealtimeSessionId: null,
-  realtimeConnectionState: null,
-  realtimeMuted: false,
   sequence: 1,
 });
 
@@ -226,93 +220,6 @@ describe("traditional audio handoff coordination", () => {
 
     expect(started).toBe(true);
     expect(order).toEqual(["realtime-stopped", "playback-interrupted", "dictation-started"]);
-  });
-
-  it("fully deactivates Auto Listen before starting one-shot dictation", async () => {
-    const order: string[] = [];
-    const started = await startManualDictationWithAudioHandoff({
-      autoListenActive: true,
-      deactivateAutoListen: async () => {
-        order.push("auto-listen-stopped");
-      },
-      stopRealtime: async () => {
-        order.push("realtime-stopped");
-      },
-      interruptPlayback: async () => {
-        order.push("playback-interrupted");
-        return true;
-      },
-      startDictation: async () => {
-        order.push("dictation-started");
-        return true;
-      },
-      resumePlayback: () => order.push("playback-resumed"),
-    });
-
-    expect(started).toBe(true);
-    expect(order).toEqual([
-      "auto-listen-stopped",
-      "realtime-stopped",
-      "playback-interrupted",
-      "dictation-started",
-    ]);
-  });
-
-  it("does not activate or deactivate inactive Auto Listen for one-shot dictation", async () => {
-    const deactivateAutoListen = vi.fn(async () => undefined);
-    await startManualDictationWithAudioHandoff({
-      autoListenActive: false,
-      deactivateAutoListen,
-      stopRealtime: async () => undefined,
-      interruptPlayback: async () => true,
-      startDictation: async () => true,
-      resumePlayback: () => undefined,
-    });
-
-    expect(deactivateAutoListen).not.toHaveBeenCalled();
-  });
-
-  it("releases one-shot dictation before activating Auto Listen", async () => {
-    const order: string[] = [];
-    const activated = await activateAutoListenWithAudioHandoff({
-      releaseManualDictation: async () => {
-        order.push("dictation-released");
-      },
-      activateAutoListen: async () => {
-        order.push("auto-listen-activated");
-        return true;
-      },
-    });
-
-    expect(activated).toBe(true);
-    expect(order).toEqual(["dictation-released", "auto-listen-activated"]);
-  });
-
-  it("drains Auto Listen media commands before verifying recorder release", async () => {
-    const order: string[] = [];
-    await releaseAutoListenForManualDictation({
-      pause: () => order.push("paused"),
-      waitForMediaCommands: async () => {
-        order.push("media-drained");
-      },
-      verifyRecordingReleased: async () => {
-        order.push("recording-released");
-      },
-    });
-
-    expect(order).toEqual(["paused", "media-drained", "recording-released"]);
-  });
-
-  it("does not claim Auto Listen release when recorder verification fails", async () => {
-    await expect(
-      releaseAutoListenForManualDictation({
-        pause: () => undefined,
-        waitForMediaCommands: async () => undefined,
-        verifyRecordingReleased: async () => {
-          throw new Error("Recorder still active");
-        },
-      }),
-    ).rejects.toThrow("Recorder still active");
   });
 
   it("resumes playback exactly once when dictation fails to start", async () => {

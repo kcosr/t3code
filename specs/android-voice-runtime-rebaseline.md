@@ -1,8 +1,10 @@
 # Android Voice Runtime Rebaseline
 
-Status: Proposed product and architecture rebaseline. Investigation is required before implementation
-resumes. This document is intentionally narrower than `native-voice-runtime-kernel.md` and should
-not yet be treated as a claim about what the current tree implements.
+Status: Accepted product and architecture contract. The implementation exists on
+`feature/android-voice-runtime-rebaseline`; repository, native, artifact, and connected-device
+verification remain release gates. This document supersedes the Android ownership, process-death
+recovery, hands-free ownership, and background-control direction in older voice milestone and
+workstream documents.
 
 ## Why this rebaseline exists
 
@@ -20,8 +22,8 @@ events: a foreground service can remain active when the Activity is backgrounded
 audio resources, sockets, and React Native runtime all disappear when their shared application
 process is terminated.
 
-Before more work lands, the implementation history and current code must be evaluated against this
-narrower requirement.
+The implementation history and current code were therefore evaluated against this narrower
+requirement before the new branch was created.
 
 ## Authoritative product requirements
 
@@ -38,8 +40,10 @@ narrower requirement.
    appropriate persistent notification.
 7. Realtime can switch to Thread mode through one serialized in-process transition.
 8. Only one mode owns microphone, playback, audio focus, and routing resources at a time.
-9. Failures are bounded, visible, and leave resources in a known state. The user can retry from the
-   UI or notification where appropriate.
+9. Failures are bounded, visible, and leave resources in a known state. The user can stop a failed
+   operation from the UI or notification and then retry explicitly.
+10. React/web parity is preserved through a platform-neutral semantic adapter and shared
+    presentation behavior, not by retaining a second React-owned Android state machine.
 
 ## Explicit non-goals
 
@@ -59,7 +63,35 @@ If the process terminates, the in-flight operation terminates. On the next appli
 runtime may clean up local temporary files and report that the prior session ended, but it does not
 claim to resume that session.
 
-## Proposed runtime shape
+## Resolved product decisions
+
+- Background continuity covers Home/app switching, screen lock, Activity recreation, React
+  detachment, and best-effort task removal while the application process and foreground service
+  remain alive. `stopWithTask=false` keeps task removal from being an explicit stop, but it is not a
+  process-survival guarantee.
+- The complete Thread cycle remains native-owned in the background: recording, endpointing,
+  transcription, ordinary thread dispatch, exact response waiting, optional speech playback, and
+  configured rearming.
+- Realtime-to-Thread uses the currently selected existing Thread, including its project, runtime
+  mode, interaction mode, and voice settings. It does not create a Thread or copy the Realtime
+  transcript into the Thread.
+- The mode switch uses ordinary Realtime close and ordinary Thread dispatch contracts. There is no
+  server-side handoff prepare/commit/rollback endpoint.
+- Realtime notification controls are mute/unmute, switch to the prepared Thread target when one is
+  available, and stop. Thread controls are finish utterance while recording, submit the current
+  transcript while reviewing, and stop. MediaSession transport actions map to the same commands.
+- Realtime control polling and Thread dispatch/outcome polling tolerate bounded transient network
+  failures. Exhausted retries produce a sanitized failed snapshot and release live resources;
+  retrying the product operation is explicit.
+- Automatic endpointing and optional rearming are part of the Thread end state. Review versus
+  auto-submit, response playback, endpoint windows, and timeouts are explicit settings.
+- Realtime exposes native route selection. One-shot dictation and speech controls may retain their
+  existing bounded APIs, but they share the same exclusive media-ownership gate.
+- A completed recording is deleted after its bounded transcription attempt, including failure or
+  cancellation. A bounded startup sweep removes abandoned cache files; recordings are not retained
+  as resumable work.
+
+## Runtime shape
 
 ```text
 React commands --------------------+
@@ -90,7 +122,8 @@ A representative top-level state is:
 Idle
 Realtime(Starting | Connected | Stopping)
 SwitchingToThread(ClosingRealtime | StartingRecorder)
-Thread(Recording | Finalizing | Uploading | Waiting | Playing | Stopping)
+Thread(Starting | Recording | Finalizing | Transcribing | Reviewing |
+       Submitting | Waiting | Playing | Rearming | Stopping)
 Failed
 ```
 
@@ -113,15 +146,19 @@ same `switchRealtimeToThread` entry point.
 8. Start Thread recording using the selected Thread target and context.
 9. Enter `Thread.Recording` and publish the new state.
 
-If peer shutdown times out, force local resource release and either continue when safe or fail the
-transition. If Thread recording cannot start, end in `Idle` or `Failed`, release all media resources,
-and allow an explicit retry. The runtime does not roll back into Realtime and does not persist a
-handoff transaction for later recovery.
+If peer shutdown times out, release locally controllable resources and fail the transition while
+retaining ownership until the peer actually exits. If Thread recording cannot start, end in `Idle`
+or `Failed`, release all media resources, and allow an explicit retry. The runtime does not roll
+back into Realtime and does not persist a handoff transaction for later recovery.
 
-The investigation must determine what conversational context the server needs for this switch. A
-server request that records the transition may still be necessary, but it should not turn the local
-mode switch into a process-death-recoverable distributed transaction unless the backend contract
-truly requires that guarantee.
+A bounded shutdown deadline may publish `Failed` before a blocking platform peer has fully exited.
+That state releases audio focus, routing, wake lock, and ordinary controls, but retains the native
+owner slot, foreground service, and Stop-only notification until the terminal worker reports exact
+quiescence. Stop cannot publish `Idle`, and a new mode cannot start, while that drain is pending.
+
+The server sees an ordinary Realtime close followed by ordinary Thread work. Conversation history
+remains in its original durable Realtime conversation; no transition record or copied context is
+needed for the mode switch.
 
 ## Android lifecycle contract
 
@@ -131,9 +168,11 @@ truly requires that guarantee.
 - React detachment, navigation, or Activity recreation does not stop the session.
 - React attachment reads a complete current snapshot before consuming subsequent events.
 - The foreground notification exposes only controls valid for the current state.
+- A failed operation retains a Stop-only foreground notification until native ownership has
+  quiesced; failure never implies that media ownership was already released.
 - The service stops itself after returning to `Idle` and completing bounded cleanup.
-- `onTaskRemoved` and device-specific swipe-away behavior must be tested and assigned an explicit
-  policy. Force-stop and process termination remain non-recoverable.
+- The service declares `stopWithTask=false`; task removal is tested as best-effort continuity while
+  the process remains alive. Force-stop and process termination remain non-recoverable.
 - A sticky service restart must not pretend that an old socket, WebRTC peer, or recorder survived.
   Unless a concrete non-session task requires restart, non-sticky behavior is preferable.
 
@@ -150,86 +189,86 @@ Persistence should not model a live peer, live recorder, in-flight callback, act
 partially completed local mode switch. On fresh process startup, the native runtime starts in
 `Idle`.
 
-## Native interface direction
+## Native interface
 
-The exact API should be derived from current callers, but the end state should resemble:
+The platform-neutral semantic interface exposes:
 
-- `getSnapshot()`
-- `startRealtime(target)`
-- `startThread(target)`
-- `switchRealtimeToThread(threadTarget)`
-- `stop()`
-- `setRealtimeMuted(muted)`
-- Thread completion/cancellation controls required by the existing UX
-- one state/event subscription
+- `getSnapshot()` and `subscribe(listener)`, where subscription delivers one complete current
+  snapshot before subsequent publications;
+- `startRealtime(target)`;
+- `startThread({ target, settings })`;
+- `switchRealtimeToThread({ target, settings })`;
+- `stop()`;
+- `setRealtimeMuted(muted)`;
+- `setRealtimeAudioRoute(routeId)`;
+- `updateRealtimeContext({ focus, threadSwitch })`;
+- Realtime confirmation and client-action completion controls;
+- `finishThreadRecording()`;
+- `updateThreadReviewTranscript({ generation, reviewId }, transcript)`; and
+- `submitThreadTranscript({ generation, reviewId }, transcript)`.
 
-Commands should be typed and idempotent for duplicate delivery within the live process. The bridge
-does not need durable command replay after process termination. Obsolete bridge methods should be
-deleted rather than retained as aliases.
+The generation plus per-cycle review ID fences delayed edits and Submit actions even when automatic
+rearming keeps the same top-level generation. Initial Realtime and Thread starts share one React
+admission gate and one serialized Android command queue, including permission checks, traditional
+media interruption, credential issuance, and native admission. A losing concurrent start does not
+interrupt media or mint a child credential.
 
-## Investigation required before choosing a base branch
+Commands are typed and serialized within the live process. The bridge does not need durable command
+replay after process termination. Obsolete bridge methods are deleted rather than retained as
+aliases.
 
-`main` is not a usable implementation baseline because it contains no voice feature. Do not start
-from `main` under the assumption that foreground voice can be validated there.
+## History and baseline decision
 
-The history investigation must identify:
+The history investigation selected `f83577b035592feec1b772ded9f0e73f3625422d`
+(`fix(voice): distinguish diagnostic copy failures`) as the implementation base. At that revision,
+the application had the working React-owned foreground Realtime and Thread/Auto Listen flows plus
+the hardened recorder, endpoint detector, PCM player, WebRTC peer, audio focus/routes, bounded media
+server APIs, and foreground-service host needed as reusable primitives.
 
-1. The last commit where foreground Realtime voice worked.
-2. The last commit where foreground Thread recording/interaction worked.
-3. Whether both modes worked together at one revision.
-4. The commit immediately before native-kernel migration began changing ownership.
-5. Which Realtime offer/ICE, recording, playback, authentication, and server-contract fixes landed
-   later and must be preserved.
-6. Which current native components are independently reusable without importing the durable kernel.
-7. Whether any backend endpoint currently requires durable authority, handoff prepare/commit, or
-   consumer-election semantics, and whether that requirement is real product behavior or migration
-   scaffolding.
-8. Which tests describe current user-visible behavior versus the stronger superseded architecture.
+The later topology is intentionally donor-only:
 
-The investigation should produce a small branch/commit topology, a reusable-component inventory,
-and a recommendation between two options:
+```text
+f83577b03  working foreground Realtime + Thread behavior and native media primitives
+    |
+    +-- feature/voice-kernel-m1             durable-kernel migration
+            +-- debug/realtime-trace        temporary offer/ICE instrumentation
+            +-- feature/voice-kernel-convergence
+                                             revision-19 durable convergence
+```
 
-- branch from the last known-good foreground voice revision and port selected native components;
-- retain the current native media/service work but replace its orchestration wholesale with the
-  lean state machine.
+The kernel branches contain useful fixes and tests, particularly around WebRTC shutdown, bounded
+network lanes, notification/MediaSession rendering, callback fencing, and privacy-safe diagnostics.
+Their journals, elections, recovery workflows, handoff transactions, and process-death authority
+model are not implementation ancestry for this runtime.
 
-The decision must be based on dependency boundaries and working behavior, not on preserving the
-largest amount of already-written code.
+No production backend contract requires a durable Realtime-to-Thread handoff. Native Thread mode
+does require two small server seams: a bounded, scoped native child session and an exact
+thread-message outcome query. Both support ordinary live-process work and do not introduce recovery
+authority.
 
-## Likely reusable work
+## Implemented lineage and server seams
 
-The current convergence branch should be treated as a donor and reference. Candidates for reuse,
-subject to code inspection and focused tests, include:
+The rebaseline reuses the proven recorder, PCM player, audio-focus/routes, WebRTC peer, bounded
+network lanes, foreground notification/MediaSession host, strict bridge validation, and privacy-safe
+diagnostic ring from the selected baseline and inspected donor work. Durable recovery workflows,
+handoff journals, authority migration transactions, persisted retry timers, generic compensation,
+and consumer election were not imported.
 
-- recorder, player, PCM, audio-focus, and audio-route implementations;
-- WebRTC peer creation, offer/answer, ICE, mute, and shutdown fixes;
-- bounded network execution that prevents speech playback from blocking control work;
-- foreground notification, MediaSession, permission, and service-host rendering;
-- React UI and server integration from the last working foreground implementation;
-- strict native bridge input validation;
-- privacy-safe Realtime tracing through the first successful device connection;
-- resource-construction and teardown tests.
+Native background work uses two general server seams:
 
-Work that should not be imported merely because it exists includes durable recovery workflows,
-handoff journals, authority migration transactions, persisted retry timers, generic effect
-compensation, consumer election, and abstractions whose only purpose is process-death recovery.
+- `POST /api/voice/native-session` issues a bearer child with exactly `voice:use`,
+  `orchestration:read`, and `orchestration:operate`. Its lifetime is the lesser of 12 hours and
+  the parent session's remaining lifetime. A child cannot issue another child, and the response is
+  non-cacheable.
+- `GET /api/orchestration/threads/:threadId/messages/:messageId/turn` validates the exact
+  dispatched user message and thread. It reports `pending`, `running`, `approval-required`,
+  `user-input-required`, `completed`, `interrupted`, `failed`, or `ambiguous`, with the
+  correlated turn ID and at most 32,000 characters of settled assistant text.
 
-## Questions the investigation must resolve
-
-- Does "background" include swiping the task away, or only Home/app switching/screen lock?
-- Must Thread recording, server waiting, and response playback all continue in the background?
-- Does Realtime-to-Thread switching create a new Thread, select an existing Thread, or carry
-  context from the Realtime conversation?
-- Is a server-side handoff endpoint required, or can the service stop Realtime and issue a normal
-  Thread start?
-- Which notification actions are required in each mode?
-- What should happen on temporary network loss while the process remains alive?
-- Is automatic Thread endpointing/rearming required in the first end state?
-- Which voice cues and route-selection controls are required?
-- What local recording retention is necessary if upload fails while the process remains alive?
-
-These are product choices. They should be answered before architecture is inferred from legacy
-code or historical milestone documents.
+Thread dispatch retries preserve the same command and message identifiers. Outcome polling never
+redispatches an accepted turn. Native code uses its child bearer to request one-use transcription
+and speech tickets while React is detached; traditional one-shot React dictation and playback
+continue to request their own media tickets.
 
 ## Acceptance criteria
 
@@ -254,20 +293,17 @@ The lean runtime is complete when device tests prove:
 Repository-required typecheck, lint, native compilation, unit tests, instrumented-source
 compilation, APK inspection, signing verification, and in-place installation remain release gates.
 
-## Proposed work sequence
+## Release verification
 
-1. Freeze and preserve the current convergence work; do not merge it as the product end state.
-2. Complete the git-history and reusable-component investigation above.
-3. Review this rebaseline and answer the unresolved product questions.
-4. Select the exact voice-capable base revision and create a clean implementation branch.
-5. Restore or retain the working foreground UX and server integration.
-6. Implement the small native foreground-service state machine and React attachment contract.
-7. Integrate Realtime, then Thread, using reusable low-level components.
-8. Implement the sequential Realtime-to-Thread transition.
-9. Delete superseded orchestration and compatibility shapes rather than carrying both designs.
-10. Run focused tests, repository gates, APK verification, and the connected-device matrix.
-11. Remove temporary tracing, rebuild, reinstall, and revalidate.
+Delivery requires:
 
-Implementation should not resume merely by simplifying names or splitting the existing durable
-kernel into more files. The first deliverable is evidence identifying the correct voice-capable
-baseline and the minimum native ownership boundary required by these product requirements.
+1. Run focused TypeScript/server and Android unit tests, native compilation, `vp check`,
+   `vp run typecheck`, `vp run lint:mobile`, and `vp test`.
+2. Commit and push the complete implementation before producing release artifacts.
+3. Build the server and preview Android client from the same committed SHA.
+4. Inspect the APK package, signature, archive contents, and checksum before installation.
+5. Install in place and exercise Realtime, Thread, background/return, React remount, notification,
+   MediaSession, permission/focus loss, and Realtime-to-Thread paths on the connected device.
+6. Use temporary privacy-safe milestone tracing for the first Realtime device pass, then delete only
+   that temporary milestone layer, rerun affected gates, rebuild, reinstall, and revalidate. The
+   bounded generic diagnostic ring remains for troubleshooting.

@@ -30,13 +30,37 @@ internal interface T3VoiceWebRtcResultCallback<T> {
   fun onFailure(code: String, message: String, cause: Throwable? = null)
 }
 
+internal interface T3VoiceRealtimeMedia {
+  /** Lightweight exact cancellation; never closes or disposes JNI peer resources. */
+  fun cancelStartup(sessionId: String)
+
+  fun prepare(
+    sessionId: String,
+    diagnosticGeneration: Long,
+    callback: T3VoiceWebRtcResultCallback<String>,
+  )
+
+  fun applyAnswer(
+    sessionId: String,
+    answerSdp: String,
+    callback: T3VoiceWebRtcResultCallback<Unit>,
+  )
+
+  fun stop(sessionId: String): Boolean
+
+  fun setMuted(sessionId: String, muted: Boolean)
+
+  fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>>
+}
+
 internal class T3VoiceWebRtcSession(
   context: Context,
   private val onStateChanged: (String, String, Boolean) -> Unit,
   private val onRouteChanged: (String, T3VoiceAudioRouteChange) -> Unit,
   private val onError: (String, String, String, Boolean) -> Unit,
   private val onTerminated: (String, String, String, Boolean, Long) -> Unit,
-) {
+  sharedAudioRouter: T3VoiceAudioRouter? = null,
+) : T3VoiceRealtimeMedia {
   private data class ActiveSession(
     val sessionId: String,
     val diagnosticGeneration: Long,
@@ -75,7 +99,7 @@ internal class T3VoiceWebRtcSession(
   private val lock = Any()
   private val scheduler = Executors.newSingleThreadScheduledExecutor()
   private val audioRouter =
-    T3VoiceAudioRouter(
+    sharedAudioRouter ?: T3VoiceAudioRouter(
       applicationContext,
       ::handleAudioFocusActions,
       ::handleAudioRouteChanged,
@@ -83,6 +107,7 @@ internal class T3VoiceWebRtcSession(
   private val terminalLatch = T3VoiceRealtimeTerminalLatch()
   private val audioOwners = T3VoiceRealtimeAudioOwnerPolicy()
   private val connectionTimeouts = T3VoiceRealtimeConnectionTimeoutPolicy()
+  private val prepareFence = T3VoiceRealtimePrepareFence()
   private var active: ActiveSession? = null
   private val usedSessionIds = T3VoiceSessionIdTombstones(SESSION_ID_TOMBSTONE_CAPACITY)
 
@@ -164,18 +189,25 @@ internal class T3VoiceWebRtcSession(
     }
   }
 
-  fun prepare(
+  override fun prepare(
     sessionId: String,
     diagnosticGeneration: Long,
     callback: T3VoiceWebRtcResultCallback<String>,
   ) {
     require(sessionId.isNotBlank()) { "nativeSessionId must be a non-empty string." }
-    val audioOwner = synchronized(lock) {
+    val (attempt, audioOwner) = synchronized(lock) {
       check(active == null) { "A Realtime voice session is already active." }
       check(usedSessionIds.add(sessionId)) { "Realtime native session IDs cannot be reused." }
-      audioOwners.issue(sessionId)
+      val admitted = prepareFence.begin(sessionId) ?: return
+      admitted to audioOwners.issue(sessionId)
     }
-    val prepared = createPeerResources(sessionId, audioOwner)
+    val prepared =
+      try {
+        createPeerResources(sessionId, audioOwner)
+      } catch (cause: Throwable) {
+        prepareFence.abandon(attempt)
+        throw cause
+      }
     T3VoiceDiagnostics.record(
       diagnosticGeneration,
       T3VoiceDiagnosticCategory.LIFECYCLE,
@@ -189,6 +221,7 @@ internal class T3VoiceWebRtcSession(
     val session =
       try {
         synchronized(lock) {
+          if (!prepareFence.claimInstall(attempt)) return@synchronized null
           check(active == null) { "A Realtime voice session started concurrently." }
           ActiveSession(
             sessionId = sessionId,
@@ -216,6 +249,7 @@ internal class T3VoiceWebRtcSession(
           }
         }
       } catch (cause: Throwable) {
+        prepareFence.abandon(attempt)
         val installed = installedSession
         if (installed == null) {
           releasePreparedPeer(prepared)
@@ -224,11 +258,18 @@ internal class T3VoiceWebRtcSession(
             if (active === installed) active = null
           }
           releaseSession(installed)
+          terminalLatch.claim(installed.sessionId)
         }
         throw cause
       }
+    if (session == null) {
+      releasePreparedPeer(prepared)
+      return
+    }
+    if (releaseCancelledPreparation(attempt, session)) return
     try {
       val routerStart = audioRouter.start()
+      if (releaseCancelledPreparation(attempt, session)) return
       check(routerStart.transition.state != T3VoiceAudioFocusState.TERMINATED) {
         "Android denied Realtime audio focus."
       }
@@ -241,8 +282,11 @@ internal class T3VoiceWebRtcSession(
         active?.takeIf { it === session }?.audioRouterGeneration = routerStart.ownerGeneration
       }
       onStateChanged(sessionId, STATE_PREPARING, false)
+      if (releaseCancelledPreparation(attempt, session)) return
       peerConnection.createOffer(OfferObserver(sessionId), offerConstraints())
+      if (releaseCancelledPreparation(attempt, session)) return
     } catch (cause: Throwable) {
+      prepareFence.abandon(attempt)
       fail(
         sessionId,
         ERROR_PREPARE_FAILED,
@@ -250,10 +294,54 @@ internal class T3VoiceWebRtcSession(
         cause,
         false,
       )
+      return
+    }
+    val retained =
+      synchronized(lock) {
+        val live = prepareFence.complete(attempt)
+        if (!live && active === session) active = null
+        live
+      }
+    if (!retained) {
+      releaseSession(session)
+      terminalLatch.claim(sessionId)
+      audioRouter.stop()
+      return
     }
   }
 
-  fun applyAnswer(
+  private fun releaseCancelledPreparation(
+    attempt: T3VoiceRealtimePrepareFence.Attempt,
+    session: ActiveSession,
+  ): Boolean {
+    val cancelled =
+      synchronized(lock) {
+        if (prepareFence.isLive(attempt)) return@synchronized false
+        prepareFence.abandon(attempt)
+        if (active === session) active = null
+        true
+      }
+    if (!cancelled) return false
+    releaseSession(session)
+    terminalLatch.claim(session.sessionId)
+    audioRouter.stop()
+    return true
+  }
+
+  override fun cancelStartup(sessionId: String) {
+    require(sessionId.isNotBlank()) { "nativeSessionId must be a non-empty string." }
+    synchronized(lock) {
+      val current = active
+      if (current != null) {
+        check(current.sessionId == sessionId) {
+          "Realtime session $sessionId does not own the active peer."
+        }
+      }
+      prepareFence.cancelStartup(sessionId)
+    }
+  }
+
+  override fun applyAnswer(
     sessionId: String,
     answerSdp: String,
     callback: T3VoiceWebRtcResultCallback<Unit>,
@@ -325,7 +413,7 @@ internal class T3VoiceWebRtcSession(
     }
   }
 
-  fun setMuted(sessionId: String, muted: Boolean) {
+  override fun setMuted(sessionId: String, muted: Boolean) {
     val update =
       synchronized(lock) {
         val session = requireActive(sessionId)
@@ -338,7 +426,7 @@ internal class T3VoiceWebRtcSession(
 
   fun routes(): List<Map<String, Any>> = audioRouter.routes().map(T3VoiceAudioRoute::toResultBody)
 
-  fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>> {
+  override fun selectRoute(sessionId: String, routeId: String): List<Map<String, Any>> {
     val routerGeneration =
       synchronized(lock) {
         checkNotNull(requireActive(sessionId).audioRouterGeneration) {
@@ -349,16 +437,23 @@ internal class T3VoiceWebRtcSession(
     return routes()
   }
 
-  fun stop(sessionId: String): Boolean {
-    val session =
+  override fun stop(sessionId: String): Boolean {
+    val (session, cancelledPreparation) =
       synchronized(lock) {
-        val current = active ?: return false
+        val cancelled =
+          prepareFence.cancelPending(sessionId) ||
+            prepareFence.retireCancelledBeforeBegin(sessionId)
+        val current = active ?: return@synchronized null to cancelled
         check(current.sessionId == sessionId) {
           "Realtime session $sessionId does not own the active peer."
         }
         active = null
-        current
+        current to cancelled
       }
+    if (session == null) {
+      if (cancelledPreparation) audioRouter.stop()
+      return cancelledPreparation
+    }
     T3VoiceDiagnostics.record(
       session.diagnosticGeneration,
       T3VoiceDiagnosticCategory.LIFECYCLE,
@@ -400,7 +495,11 @@ internal class T3VoiceWebRtcSession(
   }
 
   fun release() {
-    val session = synchronized(lock) { active?.also { active = null } }
+    val session =
+      synchronized(lock) {
+        prepareFence.cancelPending()
+        active?.also { active = null }
+      }
     if (session != null) {
       session.offerCallback?.onFailure(
         ERROR_SESSION_STOPPED,
@@ -507,7 +606,7 @@ internal class T3VoiceWebRtcSession(
     onStateChanged(sessionId, normalized, stateUpdate.first)
   }
 
-  private fun handleAudioFocusActions(actions: List<T3VoiceAudioFocusAction>) {
+  internal fun handleAudioFocusActions(actions: List<T3VoiceAudioFocusAction>) {
     val session = synchronized(lock) { active } ?: return
     for (action in actions) {
       if (synchronized(lock) { active !== session }) return
@@ -571,7 +670,7 @@ internal class T3VoiceWebRtcSession(
     }
   }
 
-  private fun handleAudioRouteChanged(change: T3VoiceAudioRouteChange) {
+  internal fun handleAudioRouteChanged(change: T3VoiceAudioRouteChange) {
     val sessionId = synchronized(lock) { active?.sessionId } ?: return
     onRouteChanged(sessionId, change)
   }

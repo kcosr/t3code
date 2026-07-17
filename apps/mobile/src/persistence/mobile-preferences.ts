@@ -43,12 +43,6 @@ export interface Preferences {
   readonly voiceTranscriptionTimeoutMs?: number;
   readonly voiceSubmissionTimeoutMs?: number;
   readonly voiceResponseTimeoutMs?: number;
-  readonly voiceMode?: "off" | "realtime" | "thread";
-  readonly voiceThreadTarget?: {
-    readonly environmentId: string;
-    readonly threadId: string;
-    readonly generation: number;
-  };
   readonly baseFontSize?: number;
   readonly terminalFontSize?: number | null;
   readonly markdownFontSize?: number;
@@ -109,12 +103,6 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     voiceTranscriptionTimeoutMs?: number;
     voiceSubmissionTimeoutMs?: number;
     voiceResponseTimeoutMs?: number;
-    voiceMode?: "off" | "realtime" | "thread";
-    voiceThreadTarget?: {
-      readonly environmentId: string;
-      readonly threadId: string;
-      readonly generation: number;
-    };
     baseFontSize?: number;
     terminalFontSize?: number | null;
     markdownFontSize?: number;
@@ -190,26 +178,6 @@ function sanitizePreferences(parsed: Preferences): Preferences {
       VOICE_RESPONSE_TIMEOUT_MIN_MS,
       VOICE_RESPONSE_TIMEOUT_MAX_MS,
     );
-  }
-  if (
-    parsed.voiceMode === "off" ||
-    parsed.voiceMode === "realtime" ||
-    parsed.voiceMode === "thread"
-  ) {
-    preferences.voiceMode = parsed.voiceMode;
-  }
-  const voiceThreadTarget = parsed.voiceThreadTarget;
-  if (
-    typeof voiceThreadTarget === "object" &&
-    voiceThreadTarget !== null &&
-    typeof voiceThreadTarget.environmentId === "string" &&
-    voiceThreadTarget.environmentId.length > 0 &&
-    typeof voiceThreadTarget.threadId === "string" &&
-    voiceThreadTarget.threadId.length > 0 &&
-    Number.isSafeInteger(voiceThreadTarget.generation) &&
-    voiceThreadTarget.generation > 0
-  ) {
-    preferences.voiceThreadTarget = voiceThreadTarget;
   }
   if (typeof parsed.baseFontSize === "number") preferences.baseFontSize = parsed.baseFontSize;
   if (typeof parsed.terminalFontSize === "number" || parsed.terminalFontSize === null) {

@@ -65,6 +65,29 @@ const jsonResponse = (value: unknown): Response =>
   });
 
 describe("makeVoiceHttpClient", () => {
+  it.effect("mints the native runtime credential with the prepared connection auth", () =>
+    Effect.gen(function* () {
+      let received: { readonly url: string; readonly init?: RequestInit } | undefined;
+      const client = makeVoiceHttpClient({
+        prepared: preparedConnection({ _tag: "Bearer", token: "mobile-token" }),
+        fetch: async (resource, init) => {
+          received = { url: String(resource), ...(init === undefined ? {} : { init }) };
+          return jsonResponse({
+            accessToken: "native-runtime-token",
+            expiresAt: "2026-07-17T08:00:00.000Z",
+          });
+        },
+      });
+
+      const credential = yield* client.createNativeSession();
+
+      expect(credential.accessToken).toBe("native-runtime-token");
+      expect(received?.url).toBe("https://environment.example.test/api/voice/native-session");
+      expect(received?.init?.method).toBe("POST");
+      expect(new Headers(received?.init?.headers).get("authorization")).toBe("Bearer mobile-token");
+    }),
+  );
+
   it.effect("uses credentialed cookies for local typed control requests", () =>
     Effect.gen(function* () {
       const requests: Array<{

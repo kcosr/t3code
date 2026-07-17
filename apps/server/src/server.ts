@@ -82,7 +82,10 @@ import * as CloudCliState from "./cloud/CliState.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
-import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
+import {
+  OrchestrationLayerLive,
+  ThreadTurnOutcomeQueryConfiguredLive,
+} from "./orchestration/runtimeLayer.ts";
 import { ClientCommandDispatcherLive } from "./orchestration/Layers/ClientCommandDispatcher.ts";
 import {
   clearPersistedServerRuntimeState,
@@ -355,6 +358,7 @@ const RouteFeatureDependenciesLive = Layer.mergeAll(
   ClientCommandDispatcherLive,
   HistoryRuntimeLive,
   CompleteVoiceRuntimeLive,
+  ThreadTurnOutcomeQueryConfiguredLive,
 );
 
 const makeRoutesLayerBase = Layer.mergeAll(

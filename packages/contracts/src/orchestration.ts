@@ -483,6 +483,37 @@ export const OrchestrationThreadDetailSnapshot = Schema.Struct({
 });
 export type OrchestrationThreadDetailSnapshot = typeof OrchestrationThreadDetailSnapshot.Type;
 
+export const OrchestrationMessageTurnState = Schema.Literals([
+  "pending",
+  "running",
+  "approval-required",
+  "user-input-required",
+  "completed",
+  "interrupted",
+  "failed",
+  "ambiguous",
+]);
+export type OrchestrationMessageTurnState = typeof OrchestrationMessageTurnState.Type;
+
+export const ORCHESTRATION_MESSAGE_TURN_ASSISTANT_MAX_CHARS = 32_000;
+
+export const OrchestrationMessageTurnAssistant = Schema.Struct({
+  messageId: MessageId,
+  text: Schema.String.check(Schema.isMaxLength(ORCHESTRATION_MESSAGE_TURN_ASSISTANT_MAX_CHARS)),
+  truncated: Schema.Boolean,
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type OrchestrationMessageTurnAssistant = typeof OrchestrationMessageTurnAssistant.Type;
+
+export const OrchestrationMessageTurnResult = Schema.Struct({
+  messageId: MessageId,
+  state: OrchestrationMessageTurnState,
+  turnId: Schema.NullOr(TurnId),
+  assistantMessage: Schema.NullOr(OrchestrationMessageTurnAssistant),
+});
+export type OrchestrationMessageTurnResult = typeof OrchestrationMessageTurnResult.Type;
+
 export const ProjectCreateCommand = Schema.Struct({
   type: Schema.Literal("project.create"),
   commandId: CommandId,
