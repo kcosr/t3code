@@ -1,6 +1,6 @@
 # Voice Next Steps
 
-Status: Active working draft.
+Status: Cleanup cycle complete; retain as the working draft for subsequent voice changes.
 
 This plan tracks cleanup of the implemented voice system described by
 [voice.md](../docs/architecture/voice.md). It is not an architecture contract and does not authorize
@@ -29,18 +29,25 @@ Do not reopen the full device matrix merely to repeat it. Revalidate a focused p
 changes that path, or expand testing when a failure supplies concrete evidence that the checkpoint
 was insufficient.
 
+The cleanup deployment at `dd2bde9b0` passed static checks, full typecheck, native lint, focused
+voice tests, the native JVM suite, and the full 4,960-test repository suite. The server and preview
+APK were built from that revision, both server health endpoints passed, and the verified APK was
+installed in place on the Pixel 9. Post-install process and error-log checks passed; the securely
+locked device prevented an additional UI-driven voice call, so the earlier accepted functional
+checkpoint remains the device evidence for this cycle.
+
 ## Workstreams
 
-| Workstream                        | Status      | Scope                                                                                                                                                 |
-| --------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Documentation consolidation       | Complete    | Established one as-built document, this active plan, and one non-authoritative roadmap; removed competing voice authority documents.                  |
-| Realtime presentation cleanup     | Complete    | Removed dead global phase state, retained one Realtime-bar classifier, removed redundant mode guards, and stabilized empty transcript data.           |
-| Realtime admission cleanup        | Complete    | Reserved Resume selection under the shared start transition and consolidated duplicated Realtime start/switch preparation, types, and native parsing. |
-| Native transition cleanup         | Complete    | Removed duplicated pending target data, obsolete transient publications, and the one-value Thread-to-Realtime phase hierarchy.                        |
-| Native mechanical deduplication   | Complete    | Reused starting/stopping state construction and enum bridge naming where the result is smaller and clearer.                                           |
-| Diagnostics cleanup               | Complete    | Confirmed temporary milestone tracing is absent while retaining the bounded Android diagnostic ring and privacy-safe server logs.                     |
-| Dead-code and naming sweep        | Complete    | Removed obsolete exports and stale `MasterVoice` ownership names without compatibility aliases or dual contracts.                                     |
-| Final verification and deployment | In progress | Required static, type, focused voice, and native JVM checks pass; full repository tests, exact-revision builds, deployment, and focused smoke remain. |
+| Workstream                        | Status   | Scope                                                                                                                                                 |
+| --------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Documentation consolidation       | Complete | Established one as-built document, this active plan, and one non-authoritative roadmap; removed competing voice authority documents.                  |
+| Realtime presentation cleanup     | Complete | Removed dead global phase state, retained one Realtime-bar classifier, removed redundant mode guards, and stabilized empty transcript data.           |
+| Realtime admission cleanup        | Complete | Reserved Resume selection under the shared start transition and consolidated duplicated Realtime start/switch preparation, types, and native parsing. |
+| Native transition cleanup         | Complete | Removed duplicated pending target data, obsolete transient publications, and the one-value Thread-to-Realtime phase hierarchy.                        |
+| Native mechanical deduplication   | Complete | Reused starting/stopping state construction and enum bridge naming where the result is smaller and clearer.                                           |
+| Diagnostics cleanup               | Complete | Confirmed temporary milestone tracing is absent while retaining the bounded Android diagnostic ring and privacy-safe server logs.                     |
+| Dead-code and naming sweep        | Complete | Removed obsolete exports and stale `MasterVoice` ownership names without compatibility aliases or dual contracts.                                     |
+| Final verification and deployment | Complete | All required gates and exact-revision builds passed; server health and the verified in-place Pixel 9 install passed.                                  |
 
 ## Detailed scope and definition of done
 
