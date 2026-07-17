@@ -97,6 +97,8 @@ export type VoiceRealtimePhase = "starting" | "connected" | "stopping";
 
 export type VoiceSwitchToThreadPhase = "closing-realtime" | "starting-recorder";
 
+export type VoiceSwitchToRealtimePhase = "stopping-thread";
+
 export type VoiceThreadPhase =
   | "starting"
   | "recording"
@@ -144,6 +146,12 @@ export type VoiceRuntimeSnapshot = VoiceRuntimeSnapshotIdentity &
         readonly settings: VoiceThreadSettings;
       }
     | {
+        readonly mode: "switching-to-realtime";
+        readonly phase: VoiceSwitchToRealtimePhase;
+        readonly source: VoiceThreadTarget;
+        readonly target: VoiceRealtimeTarget;
+      }
+    | {
         readonly mode: "thread";
         readonly phase: VoiceThreadPhase;
         readonly target: VoiceThreadTarget;
@@ -155,7 +163,7 @@ export type VoiceRuntimeSnapshot = VoiceRuntimeSnapshotIdentity &
     | {
         readonly mode: "failed";
         readonly environmentId: EnvironmentId;
-        readonly operation: "realtime" | "thread" | "switching-to-thread";
+        readonly operation: "realtime" | "thread" | "switching-to-thread" | "switching-to-realtime";
         readonly failure: VoiceRuntimeFailure;
       }
   );
@@ -181,6 +189,7 @@ export interface VoiceRuntimeAdapter {
   readonly startRealtime: (target: VoiceRealtimeTarget) => Promise<void>;
   readonly startThread: (input: VoiceThreadStartInput) => Promise<void>;
   readonly switchRealtimeToThread: (input: VoiceThreadStartInput) => Promise<void>;
+  readonly switchThreadToRealtime: (target: VoiceRealtimeTarget) => Promise<void>;
   readonly stop: () => Promise<void>;
   readonly setRealtimeMuted: (muted: boolean) => Promise<void>;
   readonly setRealtimeAudioRoute: (routeId: string) => Promise<void>;

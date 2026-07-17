@@ -312,6 +312,7 @@ private fun T3VoiceControllerSnapshot.androidPlaybackState(): Int =
         T3VoiceThreadStage.STOPPING -> PlaybackState.STATE_STOPPED
       }
     is T3VoiceControllerState.SwitchingToThread -> PlaybackState.STATE_BUFFERING
+    is T3VoiceControllerState.SwitchingToRealtime -> PlaybackState.STATE_BUFFERING
     T3VoiceControllerState.Idle,
     is T3VoiceControllerState.Failed,
     -> PlaybackState.STATE_STOPPED
@@ -321,6 +322,7 @@ private fun T3VoiceControllerSnapshot.androidControlsTitle(): String =
   when (state) {
     is T3VoiceControllerState.Realtime -> "T3 Realtime voice"
     is T3VoiceControllerState.SwitchingToThread -> "Switching to Thread voice"
+    is T3VoiceControllerState.SwitchingToRealtime -> "T3 Thread voice"
     is T3VoiceControllerState.Thread -> "T3 Thread voice"
     T3VoiceControllerState.Idle -> "T3 voice"
     is T3VoiceControllerState.Failed -> "T3 voice stopped"
@@ -340,6 +342,7 @@ private fun T3VoiceControllerSnapshot.androidControlsStatusText(): String =
         T3VoiceRealtimeStage.STOPPING -> "Stopping…"
       }
     is T3VoiceControllerState.SwitchingToThread -> "Preparing Thread recording…"
+    is T3VoiceControllerState.SwitchingToRealtime -> "Stopping before Realtime…"
     is T3VoiceControllerState.Thread ->
       when (state.stage) {
         T3VoiceThreadStage.STARTING -> "Starting recorder…"

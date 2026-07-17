@@ -84,8 +84,9 @@ const targetsThread = (
   snapshot: VoiceRuntimeSnapshot,
   target: ThreadVoiceComposerTarget,
 ): boolean =>
-  (snapshot.mode === "thread" || snapshot.mode === "switching-to-thread") &&
-  sameThreadTarget(snapshot.target, target);
+  ((snapshot.mode === "thread" || snapshot.mode === "switching-to-thread") &&
+    sameThreadTarget(snapshot.target, target)) ||
+  (snapshot.mode === "switching-to-realtime" && sameThreadTarget(snapshot.source, target));
 
 export function threadVoiceControlState(
   snapshot: VoiceRuntimeSnapshot,
@@ -99,7 +100,11 @@ export function threadVoiceControlState(
       accessibilityLabel: "Start Auto Listen",
     };
   }
-  if (snapshot.mode !== "thread" && snapshot.mode !== "switching-to-thread") {
+  if (
+    snapshot.mode !== "thread" &&
+    snapshot.mode !== "switching-to-thread" &&
+    snapshot.mode !== "switching-to-realtime"
+  ) {
     return {
       active: false,
       blockedByAnotherTarget: false,

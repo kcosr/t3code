@@ -21,6 +21,7 @@ import {
   continueVoiceConversationSelection,
   masterVoiceEnvironmentId,
   prepareVoiceRuntimeAttachment,
+  realtimeVoiceBarPhase,
   reconcileVoiceAudioRoutePickerState,
   newVoiceConversationSelection,
   newVoiceConversationTitle,
@@ -415,6 +416,47 @@ describe("master voice state", () => {
     };
     expect(voiceRuntimeSnapshotEnvironmentId(realtime)).toBe(environmentId);
     expect(voiceRuntimePresentationPhase(realtime)).toBe("active");
+    const switchingToRealtime: VoiceRuntimeSnapshot = {
+      mode: "switching-to-realtime",
+      phase: "stopping-thread",
+      generation: 3,
+      sequence: 9,
+      source: {
+        environmentId,
+        projectId: focus.projectId,
+        threadId: focus.threadId,
+        modelSelection: focus.modelSelection,
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+      },
+      target: realtime.target,
+    };
+    expect(voiceRuntimeSnapshotEnvironmentId(switchingToRealtime)).toBe(environmentId);
+    expect(voiceRuntimePresentationPhase(switchingToRealtime)).toBe("starting");
+    expect(realtimeVoiceBarPhase(switchingToRealtime)).toBe("starting");
+    expect(
+      realtimeVoiceBarPhase({
+        mode: "thread",
+        phase: "recording",
+        generation: 3,
+        sequence: 10,
+        target: switchingToRealtime.source,
+        settings: threadVoiceStartForFocus(focus, voicePreferences(), true)!.settings,
+        transcript: null,
+        reviewId: null,
+        attention: null,
+      }),
+    ).toBe("idle");
+    expect(
+      realtimeVoiceBarPhase({
+        mode: "failed",
+        environmentId,
+        operation: "thread",
+        failure: { code: "thread-failed", message: "Thread failed", retryable: true },
+        generation: 3,
+        sequence: 11,
+      }),
+    ).toBe("idle");
     expect(
       voiceRuntimePresentationPhase({
         mode: "failed",

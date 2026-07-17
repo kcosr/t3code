@@ -29,6 +29,13 @@ internal fun T3VoiceControllerSnapshot.toBridgeBody(): Map<String, Any?> {
           "target" to state.threadStart.target.toBridgeBody(),
           "settings" to state.threadStart.settings.toBridgeBody(),
         )
+      is T3VoiceControllerState.SwitchingToRealtime ->
+        mapOf(
+          "mode" to "switching-to-realtime",
+          "phase" to state.stage.bridgeName(),
+          "source" to state.threadStart.target.toBridgeBody(),
+          "target" to state.realtimeTarget.toBridgeBody(),
+        )
       is T3VoiceControllerState.Thread ->
         mapOf(
           "mode" to "thread",
@@ -144,6 +151,9 @@ private fun T3VoiceRealtimeClientAction.toBridgeBody(): Map<String, Any> =
 private fun T3VoiceRealtimeStage.bridgeName(): String = name.lowercase()
 
 private fun T3VoiceSwitchStage.bridgeName(): String = name.lowercase().replace('_', '-')
+
+private fun T3VoiceSwitchToRealtimeStage.bridgeName(): String =
+  name.lowercase().replace('_', '-')
 
 private fun T3VoiceThreadStage.bridgeName(): String =
   when (this) {

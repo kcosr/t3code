@@ -25,6 +25,14 @@ internal object T3VoiceRuntimeBridgeInput {
     return T3VoiceRuntimeCommand.SwitchRealtimeToThread(start.target, start.settings)
   }
 
+  fun switchThreadToRealtime(input: Map<String, Any?>): T3VoiceRuntimeCommand.SwitchThreadToRealtime {
+    input.requireExactBridgeKeys("switchThreadToRealtime", setOf("target", "session"))
+    return T3VoiceRuntimeCommand.SwitchThreadToRealtime(
+      target = realtimeTarget(input.requireBridgeObject("target")),
+      session = nativeSession(input.requireBridgeObject("session")),
+    )
+  }
+
   fun realtimeContext(input: Map<String, Any?>): T3VoiceRealtimeContext {
     input.requireExactBridgeKeys("Realtime context", setOf("focus", "threadSwitch"))
     return T3VoiceRealtimeContext(

@@ -339,6 +339,10 @@ internal enum class T3VoiceSwitchStage {
   STARTING_RECORDER,
 }
 
+internal enum class T3VoiceSwitchToRealtimeStage {
+  STOPPING_THREAD,
+}
+
 internal enum class T3VoiceThreadStage {
   STARTING,
   RECORDING,
@@ -361,6 +365,7 @@ internal enum class T3VoiceOperation {
   REALTIME,
   THREAD,
   SWITCHING_TO_THREAD,
+  SWITCHING_TO_REALTIME,
 }
 
 internal data class T3VoiceFailure(
@@ -391,6 +396,12 @@ internal sealed interface T3VoiceControllerState {
     val stage: T3VoiceSwitchStage,
     val realtimeTarget: T3VoiceRealtimeTarget,
     val threadStart: T3VoiceThreadStart,
+  ) : T3VoiceControllerState
+
+  data class SwitchingToRealtime(
+    val stage: T3VoiceSwitchToRealtimeStage,
+    val threadStart: T3VoiceThreadStart,
+    val realtimeTarget: T3VoiceRealtimeTarget,
   ) : T3VoiceControllerState
 
   data class Thread(
@@ -434,6 +445,11 @@ internal sealed interface T3VoiceRuntimeCommand {
   data class SwitchRealtimeToThread(
     val target: T3VoiceThreadTarget,
     val settings: T3VoiceThreadSettings,
+  ) : T3VoiceRuntimeCommand
+
+  data class SwitchThreadToRealtime(
+    val target: T3VoiceRealtimeTarget,
+    val session: T3VoiceNativeSessionConfig,
   ) : T3VoiceRuntimeCommand
 
   data class SetRealtimeMuted(

@@ -41,6 +41,8 @@ export interface ActiveMasterVoiceAttachment {
 
 export type MasterVoicePhase = "idle" | "starting" | "active" | "stopping" | "error";
 
+export type RealtimeVoiceBarPhase = MasterVoicePhase;
+
 export interface VoiceAudioRoutePickerState {
   readonly selectingRouteId: VoiceAudioRoute["id"] | null;
   readonly error: string | null;
@@ -277,6 +279,7 @@ export function voiceRuntimeSnapshotEnvironmentId(
   switch (snapshot.mode) {
     case "realtime":
     case "switching-to-thread":
+    case "switching-to-realtime":
     case "thread":
       return snapshot.target.environmentId;
     case "failed":
@@ -301,12 +304,33 @@ export function voiceRuntimePresentationPhase(snapshot: VoiceRuntimeSnapshot): M
       return "error";
     case "switching-to-thread":
       return "starting";
+    case "switching-to-realtime":
+      return "starting";
     case "realtime":
       if (snapshot.phase === "starting") return "starting";
       if (snapshot.phase === "stopping") return "stopping";
       return "active";
     case "thread":
       if (snapshot.phase === "starting" || snapshot.phase === "rearming") return "starting";
+      if (snapshot.phase === "stopping") return "stopping";
+      return "active";
+  }
+}
+
+/** Presentation ownership for the dedicated Realtime call bar. */
+export function realtimeVoiceBarPhase(snapshot: VoiceRuntimeSnapshot): RealtimeVoiceBarPhase {
+  switch (snapshot.mode) {
+    case "idle":
+    case "thread":
+      return "idle";
+    case "failed":
+      return snapshot.operation === "thread" ? "idle" : "error";
+    case "switching-to-thread":
+      return "stopping";
+    case "switching-to-realtime":
+      return "starting";
+    case "realtime":
+      if (snapshot.phase === "starting") return "starting";
       if (snapshot.phase === "stopping") return "stopping";
       return "active";
   }

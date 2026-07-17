@@ -1,8 +1,9 @@
-import type {
-  ActiveMasterVoiceAttachment,
-  VoiceAudioRoute,
-  VoiceAudioRoutePickerState,
-  VoiceRuntimeSnapshot,
+import {
+  realtimeVoiceBarPhase,
+  type ActiveMasterVoiceAttachment,
+  type VoiceAudioRoute,
+  type VoiceAudioRoutePickerState,
+  type VoiceRuntimeSnapshot,
 } from "@t3tools/client-runtime/voice";
 import { SymbolView } from "expo-symbols";
 import { ActivityIndicator, FlatList, Modal, Pressable, View } from "react-native";
@@ -13,7 +14,7 @@ import { ControlPill } from "../../components/ControlPill";
 import { platformSymbolName } from "../../components/platformSymbolName";
 import { useThemeColor } from "../../lib/useThemeColor";
 
-export interface MasterVoiceTranscriptTurn {
+export interface RealtimeVoiceTranscriptTurn {
   readonly role: "user" | "assistant";
   readonly text: string;
 }
@@ -35,7 +36,7 @@ function VoiceSheetHeader(props: {
 
 export function VoiceTranscriptModal(props: {
   readonly visible: boolean;
-  readonly turns: ReadonlyArray<MasterVoiceTranscriptTurn>;
+  readonly turns: ReadonlyArray<RealtimeVoiceTranscriptTurn>;
   readonly onClose: () => void;
 }) {
   const insets = useSafeAreaInsets();
@@ -178,61 +179,34 @@ export function VoiceAudioRoutePicker(props: {
   );
 }
 
-function phaseLabel(snapshot: VoiceRuntimeSnapshot): string {
-  switch (snapshot.mode) {
-    case "idle":
-      return "Voice";
-    case "failed":
-      return "Voice session failed";
-    case "switching-to-thread":
-      return "Switching to Thread voice";
-    case "realtime":
-      if (snapshot.phase === "starting") return "Connecting";
-      if (snapshot.phase === "stopping") return "Ending voice session";
-      return "Voice active";
-    case "thread":
-      switch (snapshot.phase) {
-        case "starting":
-        case "rearming":
-          return "Starting Thread voice";
-        case "recording":
-          return "Listening";
-        case "finalizing":
-        case "transcribing":
-          return "Transcribing";
-        case "reviewing":
-          return "Review voice message";
-        case "submitting":
-          return "Sending voice message";
-        case "waiting":
-          return "Waiting for response";
-        case "playing":
-          return "Playing response";
-        case "stopping":
-          return "Ending Thread voice";
-      }
-  }
+function realtimePhaseLabel(snapshot: VoiceRuntimeSnapshot): string {
+  if (snapshot.mode === "failed") return "Realtime voice failed";
+  if (snapshot.mode === "switching-to-thread") return "Ending Realtime voice";
+  if (snapshot.mode === "switching-to-realtime") return "Connecting Realtime voice";
+  if (snapshot.mode !== "realtime") return "Realtime voice";
+  if (snapshot.phase === "starting") return "Connecting Realtime voice";
+  if (snapshot.phase === "stopping") return "Ending Realtime voice";
+  return "Realtime voice active";
 }
 
-export function MasterVoiceCallBar(props: {
+export function RealtimeVoiceCallBar(props: {
   readonly historyAvailable: boolean;
   readonly callAvailable: boolean;
   readonly snapshot: VoiceRuntimeSnapshot;
   readonly controlsAvailable: boolean;
   readonly attachment: ActiveMasterVoiceAttachment | null;
-  readonly transcript: ReadonlyArray<MasterVoiceTranscriptTurn>;
+  readonly transcript: ReadonlyArray<RealtimeVoiceTranscriptTurn>;
   readonly onMute: () => void;
   readonly onRoute: () => void;
   readonly onTranscript: () => void;
   readonly onResume: () => void;
   readonly resumePending: boolean;
   readonly onHistory: () => void;
-  readonly onFinishThreadRecording: () => void;
   readonly onStop: () => void;
 }) {
   const insets = useSafeAreaInsets();
   const iconColor = useThemeColor("--color-icon");
-  if (props.snapshot.mode === "idle") {
+  if (realtimeVoiceBarPhase(props.snapshot) === "idle") {
     if (!props.historyAvailable && !props.callAvailable) return null;
     return (
       <View
@@ -286,7 +260,7 @@ export function MasterVoiceCallBar(props: {
         onPress={props.onTranscript}
       >
         <Text className="text-sm font-t3-bold text-foreground" numberOfLines={1}>
-          {phaseLabel(props.snapshot)}
+          {realtimePhaseLabel(props.snapshot)}
           {props.attachment?.focus === null || props.attachment === null
             ? ""
             : ` · ${props.attachment.focus.threadTitle}`}
@@ -311,14 +285,6 @@ export function MasterVoiceCallBar(props: {
             onPress={props.onRoute}
           />
         </>
-      ) : null}
-      {props.snapshot.mode === "thread" && props.snapshot.phase === "recording" ? (
-        <ControlPill
-          icon="checkmark"
-          accessibilityLabel="Finish Thread voice recording"
-          disabled={!props.controlsAvailable}
-          onPress={props.onFinishThreadRecording}
-        />
       ) : null}
       <ControlPill
         icon={props.snapshot.mode === "failed" ? "xmark" : "stop.fill"}

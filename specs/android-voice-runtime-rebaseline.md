@@ -14,6 +14,8 @@ stronger requirement than the product needs.
 The product needs Realtime and non-Realtime Thread voice interactions that continue while the user
 moves the app between foreground and background. It also needs an explicit Realtime-to-Thread mode
 switch initiated from either React UI or an Android notification action.
+The React UI also lets the user resume a Realtime conversation while Thread voice is active; that
+is the inverse native mode transition rather than a stop followed by a React-coordinated restart.
 
 It does not need to resurrect an active voice session after Android terminates the application
 process. Ordinary Activity foreground/background transitions and process termination are different
@@ -38,10 +40,12 @@ requirement before the new branch was created.
 6. An active native voice operation runs in an Android microphone foreground service with an
    appropriate persistent notification.
 7. Realtime can switch to Thread mode through one serialized in-process transition.
-8. Only one mode owns microphone, playback, audio focus, and routing resources at a time.
-9. Failures are bounded, visible, and leave resources in a known state. The user can stop a failed
-   operation from the UI or notification and then retry explicitly.
-10. React/web parity is preserved through a platform-neutral semantic adapter and shared
+8. Thread can switch to Realtime through one serialized in-process transition when the user resumes
+   Realtime from the app.
+9. Only one mode owns microphone, playback, audio focus, and routing resources at a time.
+10. Failures are bounded, visible, and leave resources in a known state. The user can stop a failed
+    operation from the UI or notification and then retry explicitly.
+11. React/web parity is preserved through a platform-neutral semantic adapter and shared
     presentation behavior, not by retaining a second React-owned Android state machine.
 
 ## Explicit non-goals
@@ -86,6 +90,10 @@ claim to resume that session.
   auto-submit, response playback, endpoint windows, and timeouts are explicit settings.
 - Realtime exposes native route selection. One-shot dictation and speech controls may retain their
   existing bounded APIs, but they share the same exclusive media-ownership gate.
+- The persistent bottom call bar is exclusively the Realtime surface. While Thread voice owns the
+  runtime, that bar shows the resumable Realtime conversation rather than Thread phase, transcript,
+  finish, or stop controls. The Thread composer waveform owns Auto Listen state and controls; the
+  adjacent microphone remains one-shot dictation into the draft without submission.
 - A completed recording is deleted after its bounded transcription attempt, including failure or
   cancellation. A bounded startup sweep removes abandoned cache files; recordings are not retained
   as resumable work.
@@ -121,6 +129,7 @@ A representative top-level state is:
 Idle
 Realtime(Starting | Connected | Stopping)
 SwitchingToThread(ClosingRealtime | StartingRecorder)
+SwitchingToRealtime(StoppingThread)
 Thread(Starting | Recording | Finalizing | Transcribing | Reviewing |
        Submitting | Waiting | Playing | Rearming | Stopping)
 Failed
@@ -157,6 +166,28 @@ quiescence. Stop cannot publish `Idle`, and a new mode cannot start, while that 
 The server sees an ordinary Realtime close followed by ordinary Thread work. Conversation history
 remains in its original durable Realtime conversation; no transition record or copied context is
 needed for the mode switch.
+
+## Thread-to-Realtime mode switch
+
+Pressing Realtime Resume while Thread voice is active invokes the native
+`switchThreadToRealtime` entry point with the selected durable Realtime conversation and a fresh
+bounded native child credential.
+
+1. React performs permission and credential preparation, then admits one typed command to the
+   foreground service. React is not responsible for the transition after admission.
+2. Android enters `SwitchingToRealtime.StoppingThread` and keeps the foreground service alive.
+3. The Thread recorder, request, wait, or playback owner is stopped through its ordinary native
+   stop path.
+4. Android waits for the exact Thread release callback. Realtime cannot acquire the microphone,
+   playback, focus, or route owner before that callback.
+5. Android advances the process-local generation and starts Realtime with the already admitted
+   target and credential.
+6. Duplicate commands are coalesced. Stop during the transition cancels the pending Realtime start
+   and reaches `Idle` after Thread release.
+
+The Android notification continues to describe Thread voice while Thread resources are stopping,
+then changes to Realtime when Realtime starts. Activity backgrounding or React detachment after
+native admission does not interrupt the transition.
 
 ## Agent-initiated terminal Realtime actions
 
@@ -294,6 +325,7 @@ The platform-neutral semantic interface exposes:
 - `startRealtime(target)`;
 - `startThread({ target, settings })`;
 - `switchRealtimeToThread({ target, settings })`;
+- `switchThreadToRealtime(target)`;
 - `stop()`;
 - `setRealtimeMuted(muted)`;
 - `setRealtimeAudioRoute(routeId)`;
@@ -378,22 +410,26 @@ The lean runtime is complete when device tests prove:
 5. Notification and React commands cannot create overlapping microphone owners.
 6. Realtime-to-Thread switching closes the peer before starting the recorder.
 7. Duplicate switch taps do not start duplicate recordings.
-8. Slow or failed peer shutdown reaches a bounded, resource-safe outcome.
-9. Permission denial, audio-focus loss, route loss, network failure, and user cancellation release
-   resources and produce an understandable state.
-10. Thread recording/upload/waiting/playback behavior matches the last known-good foreground UX.
-11. No live operation is claimed after deliberate process termination and relaunch.
-12. Temporary tracing is removed after the traced device pass, followed by a clean rebuild and
+8. Realtime Resume while Thread voice is active waits for exact Thread quiescence, then starts one
+   Realtime session even if React detaches after admission.
+9. The bottom call bar renders only Realtime state; Thread Auto Listen remains controlled by the
+   composer waveform, and composer microphone dictation remains one-shot draft capture.
+10. Slow or failed peer shutdown reaches a bounded, resource-safe outcome.
+11. Permission denial, audio-focus loss, route loss, network failure, and user cancellation release
+    resources and produce an understandable state.
+12. Thread recording/upload/waiting/playback behavior matches the last known-good foreground UX.
+13. No live operation is claimed after deliberate process termination and relaunch.
+14. Temporary tracing is removed after the traced device pass, followed by a clean rebuild and
     affected-device revalidation.
-13. Agent stop speech remains audible through its final sentence, then Realtime reaches `Idle`
+15. Agent stop speech remains audible through its final sentence, then Realtime reaches `Idle`
     without another provider response.
-14. Agent switch speech remains audible through its final sentence, then exactly one prepared
+16. Agent switch speech remains audible through its final sentence, then exactly one prepared
     Thread recording starts after the Realtime owner quiesces.
-15. Terminal action admission fences microphone input immediately; speech or noise during the
+17. Terminal action admission fences microphone input immediately; speech or noise during the
     playout drain is not sent as a new Realtime turn.
-16. Silent, actively playing, already closed, duplicated, and five-second-timeout drain paths all
+18. Silent, actively playing, already closed, duplicated, and five-second-timeout drain paths all
     reach their bounded native outcome.
-17. Agent stop and switch work while React is detached and the Activity is backgrounded, and a
+19. Agent stop and switch work while React is detached and the Activity is backgrounded, and a
     later React remount observes the resulting native snapshot.
 
 Repository-required typecheck, lint, native compilation, unit tests, instrumented-source
@@ -410,7 +446,8 @@ Delivery requires:
 4. Inspect the APK package, signature, archive contents, and checksum before installation.
 5. Install in place and exercise Realtime, Thread, background/return, React remount, notification,
    MediaSession, permission/focus loss, user-initiated and agent-initiated stop, and user-initiated
-   and agent-initiated Realtime-to-Thread mode switches on the connected device.
+   and agent-initiated Realtime-to-Thread mode switches, plus user-initiated Thread-to-Realtime
+   switching, on the connected device.
 6. Use temporary privacy-safe milestone tracing for the first Realtime device pass, then delete only
    that temporary milestone layer, rerun affected gates, rebuild, reinstall, and revalidate. The
    bounded generic diagnostic ring remains for troubleshooting.

@@ -157,7 +157,7 @@ class T3VoiceModule : Module() {
       )
 
       Constants(
-        "nativeRevision" to 10,
+        "nativeRevision" to 11,
       )
 
       OnCreate {
@@ -223,6 +223,14 @@ class T3VoiceModule : Module() {
         dispatchRuntime(
           promise,
           T3VoiceRuntimeBridgeInput.switchRealtimeToThread(input.toHashMap()),
+        )
+      }
+
+      AsyncFunction("switchThreadToRealtimeAsync") {
+        input: ReadableMap, promise: Promise ->
+        dispatchRuntime(
+          promise,
+          T3VoiceRuntimeBridgeInput.switchThreadToRealtime(input.toHashMap()),
         )
       }
 

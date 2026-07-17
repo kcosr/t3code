@@ -25,6 +25,7 @@ export type {
   T3VoiceSetRealtimeMutedInput,
   T3VoiceStartRealtimeInput,
   T3VoiceStartThreadInput,
+  T3VoiceSwitchThreadToRealtimeInput,
   T3VoiceSubmitThreadTranscriptInput,
   T3VoiceUpdateThreadReviewTranscriptInput,
   T3VoiceRuntimeErrorEvent,

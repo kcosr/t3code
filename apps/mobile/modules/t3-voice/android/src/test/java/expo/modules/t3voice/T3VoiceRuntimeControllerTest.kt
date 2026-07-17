@@ -169,6 +169,114 @@ class T3VoiceRuntimeControllerTest {
   }
 
   @Test
+  fun threadToRealtimeSwitchWaitsForExactThreadQuiescenceBeforeStartingRealtime() {
+    val driver = FakeDriver()
+    val controller = T3VoiceRuntimeController(driver)
+    controller.dispatch(T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session))
+    controller.activateInitialStart(1)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
+
+    assertEquals(
+      T3VoiceCommandOutcome.APPLIED,
+      controller.dispatch(
+        T3VoiceRuntimeCommand.SwitchThreadToRealtime(realtimeTarget, session),
+      ).outcome,
+    )
+    val switching = controller.snapshot().state as T3VoiceControllerState.SwitchingToRealtime
+    assertEquals(T3VoiceSwitchToRealtimeStage.STOPPING_THREAD, switching.stage)
+    assertEquals(listOf("start-thread:1:thread-a", "stop-thread:1"), driver.actions)
+    assertEquals(
+      T3VoiceCommandOutcome.DUPLICATE,
+      controller.dispatch(
+        T3VoiceRuntimeCommand.SwitchThreadToRealtime(realtimeTarget, session),
+      ).outcome,
+    )
+
+    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadStopped))
+    val starting = controller.snapshot().state as T3VoiceControllerState.Realtime
+    assertEquals(T3VoiceRealtimeStage.STARTING, starting.stage)
+    assertEquals(2, controller.snapshot().generation)
+    assertEquals("start-realtime:2:environment-a", driver.actions.last())
+    assertTrue(controller.onCallback(2, T3VoiceRuntimeCallback.RealtimeConnected))
+    assertEquals(
+      T3VoiceRealtimeStage.CONNECTED,
+      (controller.snapshot().state as T3VoiceControllerState.Realtime).stage,
+    )
+  }
+
+  @Test
+  fun threadToRealtimeSwitchBeforeThreadActivationNeverStartsTheRecorder() {
+    val driver = FakeDriver()
+    val controller = T3VoiceRuntimeController(driver)
+    controller.dispatch(T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session))
+
+    assertEquals(
+      T3VoiceCommandOutcome.APPLIED,
+      controller.dispatch(
+        T3VoiceRuntimeCommand.SwitchThreadToRealtime(realtimeTarget, session),
+      ).outcome,
+    )
+
+    assertFalse(controller.activateInitialStart(1))
+    assertEquals(listOf("start-realtime:2:environment-a"), driver.actions)
+    assertEquals(2, controller.snapshot().generation)
+  }
+
+  @Test
+  fun stoppingAThreadToRealtimeSwitchCancelsThePendingRealtimeStart() {
+    val driver = FakeDriver()
+    val controller = T3VoiceRuntimeController(driver)
+    controller.dispatch(T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session))
+    controller.activateInitialStart(1)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
+    controller.dispatch(T3VoiceRuntimeCommand.SwitchThreadToRealtime(realtimeTarget, session))
+
+    assertEquals(T3VoiceCommandOutcome.APPLIED, controller.dispatch(T3VoiceRuntimeCommand.Stop).outcome)
+    assertThreadStage(controller, T3VoiceThreadStage.STOPPING)
+    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadStopped))
+    assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
+    assertFalse(driver.actions.any { it.startsWith("start-realtime") })
+  }
+
+  @Test
+  fun realtimeResumeCanReplaceAnAlreadyStoppingThread() {
+    val driver = FakeDriver()
+    val controller = T3VoiceRuntimeController(driver)
+    controller.dispatch(T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session))
+    controller.activateInitialStart(1)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
+    controller.dispatch(T3VoiceRuntimeCommand.Stop)
+
+    assertEquals(
+      T3VoiceCommandOutcome.APPLIED,
+      controller.dispatch(
+        T3VoiceRuntimeCommand.SwitchThreadToRealtime(realtimeTarget, session),
+      ).outcome,
+    )
+    assertTrue(controller.snapshot().state is T3VoiceControllerState.SwitchingToRealtime)
+    assertEquals(1, driver.actions.count { it == "stop-thread:1" })
+
+    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadStopped))
+    assertEquals("start-realtime:2:environment-a", driver.actions.last())
+  }
+
+  @Test
+  fun threadToRealtimeStartFailureReportsTheTransitionAndReleasesTheNewGeneration() {
+    val driver = FakeDriver(failAction = "start-realtime:2:environment-a")
+    val controller = T3VoiceRuntimeController(driver)
+    controller.dispatch(T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session))
+    controller.activateInitialStart(1)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
+    controller.dispatch(T3VoiceRuntimeCommand.SwitchThreadToRealtime(realtimeTarget, session))
+
+    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadStopped))
+    val failed = controller.snapshot().state as T3VoiceControllerState.Failed
+    assertEquals(T3VoiceOperation.SWITCHING_TO_REALTIME, failed.operation)
+    assertEquals("native-operation-failed", failed.failure.code)
+    assertEquals("release-all:2", driver.actions.last())
+  }
+
+  @Test
   fun realtimeRouteSelectionIsValidatedAndIdempotent() {
     val driver = FakeDriver()
     val controller = T3VoiceRuntimeController(driver)

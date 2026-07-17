@@ -222,6 +222,18 @@ export const makeAndroidVoiceRuntimeAdapter = (
       assertEnvironment(input.environmentId, threadInput.target.environmentId);
       return commands.enqueue(() => input.native.switchRealtimeToThreadAsync(threadInput));
     },
+    switchThreadToRealtime: async (target: VoiceRealtimeTarget) => {
+      assertEnvironment(input.environmentId, target.environmentId);
+      assertRealtimeContext(input.environmentId, target);
+      return commands.enqueue(async () => {
+        const prepared = requirePreparedConnection(target.environmentId);
+        await ensureMicrophonePermission(input.native);
+        await requestNotificationPermission().catch(() => "denied" as const);
+        await requestOptionalBluetoothPermission(input.native);
+        const session = await issueNativeSession(prepared);
+        await input.native.switchThreadToRealtimeAsync({ target, session });
+      });
+    },
     stop: () => commands.enqueue(() => stopAndAwaitRelease(input.native)),
     setRealtimeMuted: (muted: boolean) =>
       commands.enqueue(() => input.native.setRealtimeMutedAsync({ muted })),

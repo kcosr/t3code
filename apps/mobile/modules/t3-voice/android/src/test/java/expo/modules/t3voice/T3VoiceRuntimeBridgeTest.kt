@@ -84,6 +84,43 @@ class T3VoiceRuntimeBridgeTest {
   }
 
   @Test
+  fun threadToRealtimeSwitchSnapshotRetainsBothTargetsWithoutCredentials() {
+    val threadStart = T3VoiceThreadStart(threadTarget(), settings())
+    val realtimeTarget =
+      T3VoiceRealtimeTarget(
+        environmentId = "environment-a",
+        conversation =
+          T3VoiceConversationSelection.New(
+            retention = T3VoiceConversationRetention.DURABLE,
+            title = "Voice",
+          ),
+        focus = T3VoiceRealtimeFocus("project-a", "thread-a"),
+        threadSwitch = threadStart,
+      )
+    val body =
+      T3VoiceControllerSnapshot(
+        state =
+          T3VoiceControllerState.SwitchingToRealtime(
+            stage = T3VoiceSwitchToRealtimeStage.STOPPING_THREAD,
+            threadStart = threadStart,
+            realtimeTarget = realtimeTarget,
+          ),
+        generation = 4,
+        sequence = 12,
+      ).toBridgeBody()
+
+    assertEquals("switching-to-realtime", body["mode"])
+    assertEquals("stopping-thread", body["phase"])
+    @Suppress("UNCHECKED_CAST")
+    val source = body["source"] as Map<String, Any?>
+    assertEquals("thread-a", source["threadId"])
+    @Suppress("UNCHECKED_CAST")
+    val target = body["target"] as Map<String, Any?>
+    assertEquals("environment-a", target["environmentId"])
+    assertFalse(body.toString().contains("accessToken"))
+  }
+
+  @Test
   fun failedSnapshotPreservesItsEnvironmentIdentity() {
     val body =
       T3VoiceControllerSnapshot(

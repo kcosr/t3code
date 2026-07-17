@@ -72,6 +72,27 @@ class T3VoiceRuntimeBridgeInputTest {
   }
 
   @Test
+  fun parsesTheExactThreadToRealtimeSwitchShape() {
+    val command =
+      T3VoiceRuntimeBridgeInput.switchThreadToRealtime(
+        mapOf(
+          "target" to
+            mapOf(
+              "environmentId" to "environment-a",
+              "conversation" to mapOf("type" to "new", "retention" to "durable"),
+              "focus" to focus,
+              "threadSwitch" to threadStart,
+            ),
+          "session" to session,
+        ),
+      )
+
+    assertEquals("environment-a", command.target.environmentId)
+    assertEquals("thread-a", command.target.focus?.threadId)
+    assertFalse(command.session.toString().contains("secret-token"))
+  }
+
+  @Test
   fun rejectsUnknownFieldsAtEveryBridgeBoundary() {
     val input =
       mapOf<String, Any?>(

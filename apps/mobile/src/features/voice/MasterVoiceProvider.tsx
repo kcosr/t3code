@@ -71,10 +71,10 @@ import {
 import { makeAndroidVoiceRuntimeAdapter } from "./androidVoiceRuntimeAdapter";
 import { ExclusiveTransition } from "./exclusiveTransition";
 import {
-  MasterVoiceCallBar,
+  RealtimeVoiceCallBar,
   VoiceAudioRoutePicker,
   VoiceTranscriptModal,
-  type MasterVoiceTranscriptTurn,
+  type RealtimeVoiceTranscriptTurn,
 } from "./MasterVoiceOverlays";
 import { VoiceConversationBrowser, type VoiceConversationClient } from "./VoiceConversationBrowser";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
@@ -456,7 +456,9 @@ export function MasterVoiceProvider(props: {
           controllerEnvironmentIdRef.current,
         ) ||
         voiceStartTransitionRef.current.active ||
-        (snapshotRef.current.mode !== "idle" && snapshotRef.current.mode !== "failed")
+        (snapshotRef.current.mode !== "idle" &&
+          snapshotRef.current.mode !== "failed" &&
+          snapshotRef.current.mode !== "thread")
       ) {
         return;
       }
@@ -475,14 +477,19 @@ export function MasterVoiceProvider(props: {
             releaseTraditionalAudio();
             return;
           }
-          if (snapshotRef.current.mode === "failed") await runtime.adapter.stop();
+          const current = snapshotRef.current;
+          if (current.mode === "failed") await runtime.adapter.stop();
           if (!runtimeStillMatchesTarget()) {
             releaseTraditionalAudio();
             return;
           }
           lastRealtimeTargetRef.current = target;
           handledFailureSequenceRef.current = null;
-          await runtime.adapter.startRealtime(target);
+          if (current.mode === "thread") {
+            await runtime.adapter.switchThreadToRealtime(target);
+          } else {
+            await runtime.adapter.startRealtime(target);
+          }
         } catch (cause) {
           releaseTraditionalAudio?.();
           Alert.alert("Voice conversation failed", errorMessage(cause));
@@ -693,7 +700,9 @@ export function MasterVoiceProvider(props: {
       conversationConnection?.environmentId !== runtime.environmentId ||
       resumeInFlightRef.current ||
       voiceStartTransitionRef.current.active ||
-      snapshotRef.current.mode !== "idle"
+      (snapshotRef.current.mode !== "idle" &&
+        snapshotRef.current.mode !== "thread" &&
+        snapshotRef.current.mode !== "failed")
     ) {
       return;
     }
@@ -910,7 +919,7 @@ export function MasterVoiceProvider(props: {
     if (environmentId === null || snapshot.mode === "failed" || snapshot.mode === "idle")
       return null;
     const focus =
-      snapshot.mode === "realtime"
+      snapshot.mode === "realtime" || snapshot.mode === "switching-to-realtime"
         ? snapshot.target.focus
         : { projectId: snapshot.target.projectId, threadId: snapshot.target.threadId };
     if (focus === null) return { environmentId, focus: null };
@@ -919,7 +928,9 @@ export function MasterVoiceProvider(props: {
     );
     if (shell === undefined) return { environmentId, focus: null };
     const threadTarget =
-      snapshot.mode === "realtime" ? snapshot.target.threadSwitch?.target : snapshot.target;
+      snapshot.mode === "realtime" || snapshot.mode === "switching-to-realtime"
+        ? snapshot.target.threadSwitch?.target
+        : snapshot.target;
     return {
       environmentId,
       focus: {
@@ -938,11 +949,8 @@ export function MasterVoiceProvider(props: {
     };
   }, [snapshot, threadShells]);
 
-  const transcript = useMemo<ReadonlyArray<MasterVoiceTranscriptTurn>>(() => {
+  const transcript = useMemo<ReadonlyArray<RealtimeVoiceTranscriptTurn>>(() => {
     if (snapshot.mode === "realtime") return snapshot.transcript;
-    if (snapshot.mode === "thread" && snapshot.transcript !== null) {
-      return [{ role: "user", text: snapshot.transcript }];
-    }
     return [];
   }, [snapshot]);
   const phase = voiceRuntimePresentationPhase(snapshot);
@@ -986,7 +994,7 @@ export function MasterVoiceProvider(props: {
     <MasterVoiceContext.Provider value={contextValue}>
       <View className="flex-1">
         {props.children}
-        <MasterVoiceCallBar
+        <RealtimeVoiceCallBar
           historyAvailable={conversationClient !== null}
           callAvailable={
             native !== null &&
@@ -1003,12 +1011,13 @@ export function MasterVoiceProvider(props: {
           onResume={resume}
           resumePending={resumePending}
           onHistory={() => {
-            if (snapshot.mode === "idle") setBrowserVisible(true);
-          }}
-          onFinishThreadRecording={() => {
-            void finishThreadRecording().catch((cause) =>
-              Alert.alert("Could not finish voice recording", errorMessage(cause)),
-            );
+            if (
+              snapshot.mode === "idle" ||
+              snapshot.mode === "thread" ||
+              (snapshot.mode === "failed" && snapshot.operation === "thread")
+            ) {
+              setBrowserVisible(true);
+            }
           }}
           onStop={() => {
             void stop().catch((cause) => Alert.alert("Could not stop voice", errorMessage(cause)));

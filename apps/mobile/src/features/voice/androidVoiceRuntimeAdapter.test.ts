@@ -129,6 +129,7 @@ const makeHarness = (getSnapshot = async () => idleSnapshot(0)) => {
     startRealtimeAsync: vi.fn(async () => undefined),
     startThreadAsync: vi.fn(async () => undefined),
     switchRealtimeToThreadAsync: vi.fn(async () => undefined),
+    switchThreadToRealtimeAsync: vi.fn(async () => undefined),
     stopRuntimeAsync: vi.fn(async () => undefined),
     setRealtimeMutedAsync: vi.fn(async () => undefined),
     setRealtimeAudioRouteAsync: vi.fn(async () => undefined),
@@ -175,7 +176,7 @@ const makeHarness = (getSnapshot = async () => idleSnapshot(0)) => {
 };
 
 describe("makeAndroidVoiceRuntimeAdapter", () => {
-  it("mints a child credential only for initial starts and passes it directly to native", async () => {
+  it("mints child credentials for starts and passes them directly to native", async () => {
     const realtimeHarness = makeHarness();
     const threadHarness = makeHarness();
 
@@ -205,6 +206,23 @@ describe("makeAndroidVoiceRuntimeAdapter", () => {
       },
     });
     expect(realtimeHarness.native.switchRealtimeToThreadAsync).toHaveBeenCalledWith(threadInput);
+  });
+
+  it("mints a fresh child credential for a native Thread-to-Realtime transition", async () => {
+    const harness = makeHarness(async () => activeThreadSnapshot);
+
+    await harness.adapter.switchThreadToRealtime(realtimeTarget);
+
+    expect(harness.createNativeSession).toHaveBeenCalledOnce();
+    expect(harness.requestNotificationPermission).toHaveBeenCalledOnce();
+    expect(harness.native.switchThreadToRealtimeAsync).toHaveBeenCalledWith({
+      target: realtimeTarget,
+      session: {
+        baseUrl: "https://environment.example.test/",
+        accessToken: "native-child-token",
+        expiresAt: "2026-07-17T08:00:00.000Z",
+      },
+    });
   });
 
   it("serializes concurrent cross-mode starts and mints only for the Idle winner", async () => {

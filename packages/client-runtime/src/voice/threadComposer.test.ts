@@ -146,6 +146,29 @@ describe("Thread voice composer state", () => {
       accessibilityLabel: "Stop Thread voice",
     });
 
+    const switchingToRealtime: VoiceRuntimeSnapshot = {
+      mode: "switching-to-realtime",
+      phase: "stopping-thread",
+      generation: thread.generation,
+      sequence: thread.sequence + 1,
+      source: thread.target,
+      target: {
+        environmentId,
+        conversation: { type: "new", retention: "durable", title: "Voice" },
+        focus: { projectId: thread.target.projectId, threadId: thread.target.threadId },
+        threadSwitch: null,
+      },
+    };
+    expect(threadVoiceControlState(switchingToRealtime, target)).toMatchObject({
+      active: true,
+      command: "stop",
+      accessibilityLabel: "Stop Thread voice",
+    });
+    expect(threadVoiceControlState(switchingToRealtime, otherTarget)).toMatchObject({
+      active: false,
+      blockedByAnotherTarget: true,
+    });
+
     const failed: VoiceRuntimeSnapshot = {
       mode: "failed",
       generation: thread.generation,

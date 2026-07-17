@@ -27,6 +27,7 @@ internal object T3VoiceNotificationActions {
       is T3VoiceControllerState.Failed -> listOf(stop())
       is T3VoiceControllerState.Realtime -> realtimeActions(state)
       is T3VoiceControllerState.SwitchingToThread -> listOf(stop())
+      is T3VoiceControllerState.SwitchingToRealtime -> listOf(stop())
       is T3VoiceControllerState.Thread -> threadActions(state, snapshot.generation)
     }
 

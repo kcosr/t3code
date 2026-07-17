@@ -327,7 +327,9 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const composerDraftsReady = useComposerDraftsReady();
   const runtimeSnapshot = voiceRuntime.snapshot;
   const realtimeInUse =
-    runtimeSnapshot.mode === "realtime" || runtimeSnapshot.mode === "switching-to-thread";
+    runtimeSnapshot.mode === "realtime" ||
+    runtimeSnapshot.mode === "switching-to-thread" ||
+    runtimeSnapshot.mode === "switching-to-realtime";
   const nativeRuntimeInUse = runtimeSnapshot.mode !== "idle" && runtimeSnapshot.mode !== "failed";
   const threadVoiceControl = threadVoiceControlState(runtimeSnapshot, {
     environmentId: props.environmentId,

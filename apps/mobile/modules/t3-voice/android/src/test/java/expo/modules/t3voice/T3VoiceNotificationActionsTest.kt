@@ -142,6 +142,29 @@ class T3VoiceNotificationActionsTest {
   }
 
   @Test
+  fun threadToRealtimeNotificationTracksTheNativeOwnerAcrossQuiescence() {
+    val controller = T3VoiceRuntimeController(NotificationFakeDriver())
+    controller.dispatch(T3VoiceRuntimeCommand.StartThread(threadTarget, settings, session))
+    controller.activateInitialStart(1)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
+    controller.dispatch(T3VoiceRuntimeCommand.SwitchThreadToRealtime(realtimeTarget, session))
+
+    val stoppingThread =
+      controller.snapshot().androidControlsPresentation()
+        as T3VoiceAndroidControlsPresentation.Active
+    assertEquals("T3 Thread voice", stoppingThread.title)
+    assertEquals("Stopping before Realtime…", stoppingThread.statusText)
+    assertEquals(listOf(T3VoiceNotificationActionId.STOP), stoppingThread.actions)
+
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadStopped)
+    val startingRealtime =
+      controller.snapshot().androidControlsPresentation()
+        as T3VoiceAndroidControlsPresentation.Active
+    assertEquals("T3 Realtime voice", startingRealtime.title)
+    assertEquals("Connecting…", startingRealtime.statusText)
+  }
+
+  @Test
   fun blankReviewEditHidesNotificationAndMediaSubmit() {
     val controller = T3VoiceRuntimeController(NotificationFakeDriver())
     controller.dispatch(T3VoiceRuntimeCommand.StartThread(threadTarget, settings, session))
