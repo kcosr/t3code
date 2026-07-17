@@ -81,25 +81,34 @@ const principal = (
   ]),
 ) => ({ sessionId, scopes });
 
-const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
-  provider: VoiceProviderAdapter,
-  toolExecutor: VoiceToolExecutor["Service"] = VoiceToolExecutor.of({
-    invoke: () => Effect.die("unused"),
-    decide: () => Effect.die("unused"),
-    expire: () => Effect.sync(() => undefined),
-    discardSession: () => Effect.void,
-  }),
-  voiceSettings: {
+interface MakeLayerOptions {
+  readonly toolExecutor?: VoiceToolExecutor["Service"];
+  readonly voiceSettings?: {
     readonly enabled: boolean;
     readonly maxConcurrentSessions: number;
-  } = {
+  };
+  readonly projection?: Partial<ProjectionSnapshotQuery["Service"]>;
+  readonly appendContext?: VoiceConversationService["Service"]["appendContext"];
+  readonly markCallStarted?: VoiceConversationService["Service"]["markCallStarted"];
+}
+
+const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
+  provider: VoiceProviderAdapter,
+  options: MakeLayerOptions = {},
+) {
+  const toolExecutor =
+    options.toolExecutor ??
+    VoiceToolExecutor.of({
+      invoke: () => Effect.die("unused"),
+      decide: () => Effect.die("unused"),
+      expire: () => Effect.sync(() => undefined),
+      discardSession: () => Effect.void,
+    });
+  const voiceSettings = options.voiceSettings ?? {
     enabled: true,
     maxConcurrentSessions: 16,
-  },
-  projection: Partial<ProjectionSnapshotQuery["Service"]> = {},
-  appendContextOverride?: VoiceConversationService["Service"]["appendContext"],
-  markCallStartedOverride?: VoiceConversationService["Service"]["markCallStarted"],
-) {
+  };
+  const projection = options.projection ?? {};
   const appended = yield* Ref.make<Array<VoiceConversationJournalEntry>>([]);
   const conversationEpoch = yield* Ref.make(1);
   const callStarts = yield* Ref.make(0);
@@ -140,7 +149,7 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
       ),
     updateTitle: () => Effect.die("unused"),
     markCallStarted:
-      markCallStartedOverride ??
+      options.markCallStarted ??
       ((_conversationId, expectedEpoch) =>
         Effect.gen(function* () {
           const activeEpoch = yield* Ref.get(conversationEpoch);
@@ -174,7 +183,7 @@ const makeLayer = Effect.fn("test.makeVoiceSessionLayer")(function* (
         Effect.map((entries) => entries.filter((entry) => entry.epoch === expectedEpoch)),
       ),
     appendContext:
-      appendContextOverride ??
+      options.appendContext ??
       ((entry) => append(undefined, entry.expectedEpoch, entry.kind, entry.payload)),
     appendContextIdempotent: (entry) =>
       append(entry.entryId, entry.expectedEpoch, entry.kind, entry.payload),
@@ -426,6 +435,30 @@ const makeBlockedTerminationProvider = Effect.fn("test.makeBlockedTerminationPro
   };
 });
 
+const makeBlockedCallStart = Effect.fn("test.makeBlockedCallStart")(function* (
+  blockedCallIndex: number,
+) {
+  const started = yield* Deferred.make<void>();
+  const interrupted = yield* Deferred.make<void>();
+  const callCount = yield* Ref.make(0);
+  const markCallStarted: VoiceConversationService["Service"]["markCallStarted"] = () =>
+    Ref.getAndUpdate(callCount, (count) => count + 1).pipe(
+      Effect.flatMap((count) =>
+        count === blockedCallIndex
+          ? Deferred.succeed(started, undefined).pipe(
+              Effect.andThen(Effect.never),
+              Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
+            )
+          : Effect.succeed({
+              ...summary,
+              lastCallAt: "2026-07-10T12:00:01.000Z",
+              updatedAt: "2026-07-10T12:00:01.000Z",
+            }),
+      ),
+    );
+  return { interrupted, markCallStarted, started };
+});
+
 it.effect("releases a conversation before slow provider termination completes", () =>
   Effect.gen(function* () {
     const fixture = yield* makeBlockedTerminationProvider("slow-close-provider");
@@ -458,36 +491,74 @@ it.effect("releases a conversation before slow provider termination completes", 
       yield* Deferred.await(fixture.terminationCompleted);
       yield* sessions.close(owner, restarted.state.sessionId, restarted.state.leaseGeneration);
       expect(yield* Ref.get(fixture.terminations)).toBe(1);
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(fixture.releaseTermination, undefined)),
+      Effect.provide(test.layer),
+    );
+  }),
+);
+
+it.effect("bounds provider termination without abandoning session cleanup", () =>
+  Effect.gen(function* () {
+    const terminationStarted = yield* Deferred.make<void>();
+    const terminationInterrupted = yield* Deferred.make<void>();
+    const provider: VoiceProviderAdapter = {
+      id: "never-closing-provider",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Effect.succeed({
+            answer: {
+              sessionId: request.sessionId,
+              leaseGeneration: request.leaseGeneration,
+              sdp: "answer",
+            },
+            events: Stream.empty,
+            updateContext: () => Effect.void,
+            submitToolOutput: () => Effect.void,
+            terminate: Deferred.succeed(terminationStarted, undefined).pipe(
+              Effect.andThen(Effect.never),
+              Effect.onInterrupt(() => Deferred.succeed(terminationInterrupted, undefined)),
+            ),
+          }),
+      },
+    };
+    const test = yield* makeLayer(provider);
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("never-closing-owner");
+      const created = yield* sessions.create(
+        principal(owner),
+        input(false, "never-closing-idempotency"),
+      );
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+
+      const closed = yield* sessions.close(
+        owner,
+        created.state.sessionId,
+        created.state.leaseGeneration,
+      );
+      expect(closed.state.phase).toBe("ended");
+      yield* Deferred.await(terminationStarted);
+      yield* TestClock.adjust("11 seconds");
+      yield* Deferred.await(terminationInterrupted);
     }).pipe(Effect.provide(test.layer));
   }),
 );
 
 it.effect("releases an acquired lease when create is interrupted before publication", () =>
   Effect.gen(function* () {
-    const firstCallStarted = yield* Deferred.make<void>();
-    const firstCallInterrupted = yield* Deferred.make<void>();
-    const callCount = yield* Ref.make(0);
-    const markCallStarted: VoiceConversationService["Service"]["markCallStarted"] = () =>
-      Ref.getAndUpdate(callCount, (count) => count + 1).pipe(
-        Effect.flatMap((count) =>
-          count === 0
-            ? Deferred.succeed(firstCallStarted, undefined).pipe(
-                Effect.andThen(Effect.never),
-                Effect.onInterrupt(() => Deferred.succeed(firstCallInterrupted, undefined)),
-              )
-            : Effect.succeed({
-                ...summary,
-                lastCallAt: "2026-07-10T12:00:01.000Z",
-                updatedAt: "2026-07-10T12:00:01.000Z",
-              }),
-        ),
-      );
+    const blockedCall = yield* makeBlockedCallStart(0);
     const provider: VoiceProviderAdapter = {
       id: "interrupted-create-provider",
       capabilities: new Set(["agent.realtime"]),
       realtime: { negotiate: () => Effect.die("unused") },
     };
-    const test = yield* makeLayer(provider, undefined, undefined, {}, undefined, markCallStarted);
+    const test = yield* makeLayer(provider, { markCallStarted: blockedCall.markCallStarted });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const owner = AuthSessionId.make("interrupted-create-owner");
@@ -495,9 +566,9 @@ it.effect("releases an acquired lease when create is interrupted before publicat
       const creating = yield* sessions
         .create(principal(owner), createInput)
         .pipe(Effect.forkScoped);
-      yield* Deferred.await(firstCallStarted);
+      yield* Deferred.await(blockedCall.started);
       yield* Fiber.interrupt(creating);
-      yield* Deferred.await(firstCallInterrupted);
+      yield* Deferred.await(blockedCall.interrupted);
 
       const restarted = yield* sessions.create(principal(owner), createInput);
       expect(restarted.state.phase).toBe("signaling");
@@ -508,37 +579,16 @@ it.effect("releases an acquired lease when create is interrupted before publicat
 
 it.effect("terminalizes the displaced session before an interrupted takeover publishes", () =>
   Effect.gen(function* () {
-    const takeoverPublishStarted = yield* Deferred.make<void>();
-    const takeoverPublishInterrupted = yield* Deferred.make<void>();
-    const callCount = yield* Ref.make(0);
-    const markCallStarted: VoiceConversationService["Service"]["markCallStarted"] = () =>
-      Ref.getAndUpdate(callCount, (count) => count + 1).pipe(
-        Effect.flatMap((count) =>
-          count === 1
-            ? Deferred.succeed(takeoverPublishStarted, undefined).pipe(
-                Effect.andThen(Effect.never),
-                Effect.onInterrupt(() => Deferred.succeed(takeoverPublishInterrupted, undefined)),
-              )
-            : Effect.succeed({
-                ...summary,
-                lastCallAt: "2026-07-10T12:00:01.000Z",
-                updatedAt: "2026-07-10T12:00:01.000Z",
-              }),
-        ),
-      );
+    const blockedCall = yield* makeBlockedCallStart(1);
     const provider: VoiceProviderAdapter = {
       id: "interrupted-takeover-provider",
       capabilities: new Set(["agent.realtime"]),
       realtime: { negotiate: () => Effect.die("unused") },
     };
-    const test = yield* makeLayer(
-      provider,
-      undefined,
-      { enabled: true, maxConcurrentSessions: 1 },
-      {},
-      undefined,
-      markCallStarted,
-    );
+    const test = yield* makeLayer(provider, {
+      markCallStarted: blockedCall.markCallStarted,
+      voiceSettings: { enabled: true, maxConcurrentSessions: 1 },
+    });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const firstOwner = AuthSessionId.make("interrupted-takeover-first-owner");
@@ -551,11 +601,11 @@ it.effect("terminalizes the displaced session before an interrupted takeover pub
       const takeover = yield* sessions
         .create(principal(takeoverOwner), input(true, "interrupted-takeover-second"))
         .pipe(Effect.forkScoped);
-      yield* Deferred.await(takeoverPublishStarted);
+      yield* Deferred.await(blockedCall.started);
 
       expect((yield* sessions.get(firstOwner, first.state.sessionId)).phase).toBe("ended");
       yield* Fiber.interrupt(takeover);
-      yield* Deferred.await(takeoverPublishInterrupted);
+      yield* Deferred.await(blockedCall.interrupted);
 
       const recovered = yield* sessions.create(
         principal(recoveryOwner),
@@ -605,13 +655,15 @@ it.effect("validates, acknowledges, and journals realtime focus changes in order
           ),
       },
     };
-    const test = yield* makeLayer(provider, undefined, undefined, {
-      getProjectShellById: (id) =>
-        Effect.succeed(id === projectId ? Option.some(project) : Option.none()),
-      getThreadShellById: (id) =>
-        Effect.succeed(
-          id === initialThreadId || id === nextThreadId ? Option.some(thread(id)) : Option.none(),
-        ),
+    const test = yield* makeLayer(provider, {
+      projection: {
+        getProjectShellById: (id) =>
+          Effect.succeed(id === projectId ? Option.some(project) : Option.none()),
+        getThreadShellById: (id) =>
+          Effect.succeed(
+            id === initialThreadId || id === nextThreadId ? Option.some(thread(id)) : Option.none(),
+          ),
+      },
     });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
@@ -708,11 +760,13 @@ it.effect("does not let a blocked focus acknowledgement delay hang-up", () =>
           }),
       },
     };
-    const test = yield* makeLayer(provider, undefined, undefined, {
-      getProjectShellById: (id) =>
-        Effect.succeed(id === projectId ? Option.some(project) : Option.none()),
-      getThreadShellById: (id) =>
-        Effect.succeed(id === nextThreadId ? Option.some(thread) : Option.none()),
+    const test = yield* makeLayer(provider, {
+      projection: {
+        getProjectShellById: (id) =>
+          Effect.succeed(id === projectId ? Option.some(project) : Option.none()),
+        getThreadShellById: (id) =>
+          Effect.succeed(id === nextThreadId ? Option.some(thread) : Option.none()),
+      },
     });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
@@ -779,17 +833,14 @@ it.effect("completes focus journal failure cleanup outside the cancelled update"
           }),
       },
     };
-    const test = yield* makeLayer(
-      provider,
-      undefined,
-      undefined,
-      {
+    const test = yield* makeLayer(provider, {
+      projection: {
         getProjectShellById: (id) =>
           Effect.succeed(id === projectId ? Option.some(project) : Option.none()),
         getThreadShellById: (id) =>
           Effect.succeed(id === threadId ? Option.some(thread) : Option.none()),
       },
-      () =>
+      appendContext: () =>
         Effect.fail(
           new VoiceError({
             reason: "provider-unavailable",
@@ -798,7 +849,7 @@ it.effect("completes focus journal failure cleanup outside the cancelled update"
             retryable: true,
           }),
         ),
-    );
+    });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const owner = AuthSessionId.make("focus-journal-failure-owner");
@@ -849,16 +900,18 @@ it.effect("rejects a session focus whose thread belongs to another project", () 
       capabilities: new Set(["agent.realtime"]),
       realtime: { negotiate: () => Effect.die("unused") },
     };
-    const test = yield* makeLayer(provider, undefined, undefined, {
-      getProjectShellById: () =>
-        Effect.succeed(Option.some({ id: projectId } as OrchestrationProjectShell)),
-      getThreadShellById: () =>
-        Effect.succeed(
-          Option.some({
-            id: threadId,
-            projectId: otherProjectId,
-          } as OrchestrationThreadShell),
-        ),
+    const test = yield* makeLayer(provider, {
+      projection: {
+        getProjectShellById: () =>
+          Effect.succeed(Option.some({ id: projectId } as OrchestrationProjectShell)),
+        getThreadShellById: () =>
+          Effect.succeed(
+            Option.some({
+              id: threadId,
+              projectId: otherProjectId,
+            } as OrchestrationThreadShell),
+          ),
+      },
     });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
@@ -1109,7 +1162,7 @@ it.effect("takeover terminates a provider that negotiates while displaced cleanu
           Effect.andThen(Deferred.await(cleanupRelease)),
         ),
     });
-    const test = yield* makeLayer(provider, executor);
+    const test = yield* makeLayer(provider, { toolExecutor: executor });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const firstOwner = AuthSessionId.make("cleanup-race-phone");
@@ -1149,7 +1202,10 @@ it.effect("takeover terminates a provider that negotiates while displaced cleanu
       yield* Deferred.succeed(cleanupRelease, undefined);
       const replacement = yield* Fiber.join(replacing);
       expect(replacement.state.leaseGeneration).toBe(2);
-    }).pipe(Effect.provide(test.layer));
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(cleanupRelease, undefined)),
+      Effect.provide(test.layer),
+    );
   }),
 );
 
@@ -1171,7 +1227,7 @@ it.effect("rejects an old-owner heartbeat while displaced cleanup is still runni
           Effect.andThen(Deferred.await(cleanupRelease)),
         ),
     });
-    const test = yield* makeLayer(provider, executor);
+    const test = yield* makeLayer(provider, { toolExecutor: executor });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const oldOwner = AuthSessionId.make("heartbeat-race-old");
@@ -1520,7 +1576,7 @@ it.effect("publishes confirmations and submits decided tool output to the provid
       expire: () => Effect.sync(() => undefined),
       discardSession: () => Effect.void,
     });
-    const test = yield* makeLayer(provider, executor);
+    const test = yield* makeLayer(provider, { toolExecutor: executor });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const owner = AuthSessionId.make("phone-tools");
@@ -1612,7 +1668,7 @@ it.effect("continues handling provider events while a history search is blocked"
       expire: () => Effect.sync(() => undefined),
       discardSession: () => Effect.void,
     });
-    const test = yield* makeLayer(provider, executor);
+    const test = yield* makeLayer(provider, { toolExecutor: executor });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const owner = AuthSessionId.make("phone-history-tool");
@@ -1638,7 +1694,7 @@ it.effect("continues handling provider events while a history search is blocked"
 it.effect("withholds activate-thread output until the owning client acknowledges navigation", () =>
   Effect.gen(function* () {
     const fixture = yield* makeActivateThreadFixture("success");
-    const test = yield* makeLayer(fixture.provider, fixture.executor);
+    const test = yield* makeLayer(fixture.provider, { toolExecutor: fixture.executor });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const owner = AuthSessionId.make("activate-owner");
@@ -1727,7 +1783,7 @@ it.effect("withholds activate-thread output until the owning client acknowledges
 it.effect("submits a failed activate-thread result when client navigation fails", () =>
   Effect.gen(function* () {
     const fixture = yield* makeActivateThreadFixture("client-failure");
-    const test = yield* makeLayer(fixture.provider, fixture.executor);
+    const test = yield* makeLayer(fixture.provider, { toolExecutor: fixture.executor });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const owner = AuthSessionId.make("activate-failure-owner");
@@ -1756,7 +1812,7 @@ it.effect("submits a failed activate-thread result when client navigation fails"
 it.effect("times out activate-thread and rejects a late acknowledgement", () =>
   Effect.gen(function* () {
     const fixture = yield* makeActivateThreadFixture("timeout");
-    const test = yield* makeLayer(fixture.provider, fixture.executor);
+    const test = yield* makeLayer(fixture.provider, { toolExecutor: fixture.executor });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const owner = AuthSessionId.make("activate-timeout-owner");
@@ -1789,7 +1845,7 @@ it.effect("times out activate-thread and rejects a late acknowledgement", () =>
 it.effect("cancels a pending activate-thread result when the session closes", () =>
   Effect.gen(function* () {
     const fixture = yield* makeActivateThreadFixture("close");
-    const test = yield* makeLayer(fixture.provider, fixture.executor);
+    const test = yield* makeLayer(fixture.provider, { toolExecutor: fixture.executor });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const owner = AuthSessionId.make("activate-close-owner");
@@ -1864,7 +1920,7 @@ it.effect("interrupts a blocked thread-turn wait and fences its output when the 
       expire: () => Effect.sync(() => undefined),
       discardSession: () => Effect.void,
     });
-    const test = yield* makeLayer(provider, executor);
+    const test = yield* makeLayer(provider, { toolExecutor: executor });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const owner = AuthSessionId.make("phone-terminated-wait-tool");
@@ -1895,9 +1951,8 @@ const unusedProvider: VoiceProviderAdapter = {
 
 it.effect("rejects session creation when voice is disabled", () =>
   Effect.gen(function* () {
-    const test = yield* makeLayer(unusedProvider, undefined, {
-      enabled: false,
-      maxConcurrentSessions: 1,
+    const test = yield* makeLayer(unusedProvider, {
+      voiceSettings: { enabled: false, maxConcurrentSessions: 1 },
     });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
@@ -1911,9 +1966,8 @@ it.effect("rejects session creation when voice is disabled", () =>
 
 it.effect("atomically enforces the concurrent session limit", () =>
   Effect.gen(function* () {
-    const test = yield* makeLayer(unusedProvider, undefined, {
-      enabled: true,
-      maxConcurrentSessions: 1,
+    const test = yield* makeLayer(unusedProvider, {
+      voiceSettings: { enabled: true, maxConcurrentSessions: 1 },
     });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
@@ -2142,10 +2196,9 @@ it.effect("interrupts a blocked approval without delaying conversation clear", (
     const decisionInterrupted = yield* Deferred.make<void>();
     const outputs = yield* Ref.make(0);
     const terminations = yield* Ref.make(0);
-    const test = yield* makeLayer(
-      immediateResetProvider(outputs, terminations),
-      blockedDecisionExecutor(decisionStarted, decisionInterrupted),
-    );
+    const test = yield* makeLayer(immediateResetProvider(outputs, terminations), {
+      toolExecutor: blockedDecisionExecutor(decisionStarted, decisionInterrupted),
+    });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const owner = AuthSessionId.make("blocked-clear-owner");
@@ -2184,10 +2237,9 @@ it.effect("interrupts a blocked approval without delaying conversation deletion"
     const decisionInterrupted = yield* Deferred.make<void>();
     const outputs = yield* Ref.make(0);
     const terminations = yield* Ref.make(0);
-    const test = yield* makeLayer(
-      immediateResetProvider(outputs, terminations),
-      blockedDecisionExecutor(decisionStarted, decisionInterrupted),
-    );
+    const test = yield* makeLayer(immediateResetProvider(outputs, terminations), {
+      toolExecutor: blockedDecisionExecutor(decisionStarted, decisionInterrupted),
+    });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const owner = AuthSessionId.make("blocked-delete-owner");
@@ -2224,10 +2276,9 @@ it.effect("fences approval while clearing an active conversation", () =>
     const terminationStarted = yield* Deferred.make<void>();
     const releaseTermination = yield* Deferred.make<void>();
     const decisions = yield* Ref.make(0);
-    const test = yield* makeLayer(
-      resetRaceProvider(terminationStarted, releaseTermination),
-      resetRaceExecutor(decisions),
-    );
+    const test = yield* makeLayer(resetRaceProvider(terminationStarted, releaseTermination), {
+      toolExecutor: resetRaceExecutor(decisions),
+    });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const owner = AuthSessionId.make("clear-race-owner");
@@ -2265,10 +2316,9 @@ it.effect("fences approval while deleting an active conversation", () =>
     const terminationStarted = yield* Deferred.make<void>();
     const releaseTermination = yield* Deferred.make<void>();
     const decisions = yield* Ref.make(0);
-    const test = yield* makeLayer(
-      resetRaceProvider(terminationStarted, releaseTermination),
-      resetRaceExecutor(decisions),
-    );
+    const test = yield* makeLayer(resetRaceProvider(terminationStarted, releaseTermination), {
+      toolExecutor: resetRaceExecutor(decisions),
+    });
     yield* Effect.gen(function* () {
       const sessions = yield* VoiceSessionService;
       const owner = AuthSessionId.make("delete-race-owner");
