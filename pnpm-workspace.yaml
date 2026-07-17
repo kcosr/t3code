@@ -101,6 +101,9 @@ packageExtensions:
     peerDependenciesMeta:
       vitest:
         optional: true
+  expo-quick-actions@*:
+    dependencies:
+      "@expo/config-plugins": 56.0.9
   vite-plus@*:
     dependencies:
       vite: "catalog:"

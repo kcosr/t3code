@@ -66,7 +66,7 @@ overrides:
   vite: npm:@voidzero-dev/vite-plus-core@0.2.2
   yaml: ^2.9.0
 
-packageExtensionsChecksum: sha256-CUzzeefpj3gNFrCKNBhV9FOaniNbrLdKyIhWQyXuaiE=
+packageExtensionsChecksum: sha256-KWCdjEz9HSR/gI79ntjLYJAu7xbtOM9ddocMWzDyqQY=
 
 patchedDependencies:
   '@effect/vitest@4.0.0-beta.78': 42b87cc47e70d74e62496e7a8261b3fd298ecad4464d209348ab04b96f853a5f
@@ -16936,6 +16936,7 @@ snapshots:
 
   expo-quick-actions@6.0.2(expo@56.0.12)(typescript@6.0.3):
     dependencies:
+      '@expo/config-plugins': 56.0.9(typescript@6.0.3)
       '@expo/image-utils': 0.8.14(typescript@6.0.3)
       expo: 56.0.12(8895228379997a2a064f9644cda56ed0)
       schema-utils: 4.3.3
