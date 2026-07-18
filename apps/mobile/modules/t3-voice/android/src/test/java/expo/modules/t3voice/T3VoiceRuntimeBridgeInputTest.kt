@@ -272,6 +272,29 @@ class T3VoiceRuntimeBridgeInputTest {
   }
 
   @Test
+  fun parsesGenerationFencedPlayResponsesShape() {
+    val update =
+      T3VoiceRuntimeBridgeInput.updateThreadPlayResponses(
+        mapOf(
+          "expectedGeneration" to 7.0,
+          "playResponses" to false,
+        ),
+      )
+    assertEquals(7L, update.expectedGeneration)
+    assertFalse(update.playResponses)
+
+    assertThrows(IllegalStateException::class.java) {
+      T3VoiceRuntimeBridgeInput.updateThreadPlayResponses(
+        mapOf(
+          "expectedGeneration" to 7.0,
+          "playResponses" to false,
+          "legacyGeneration" to 6.0,
+        ),
+      )
+    }
+  }
+
+  @Test
   fun endpointSettingsRejectUtterancesLongerThanThirtyMinutes() {
     assertThrows(IllegalArgumentException::class.java) {
       T3VoiceThreadEndpointDetection(

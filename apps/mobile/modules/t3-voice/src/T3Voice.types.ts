@@ -257,7 +257,15 @@ export type T3VoiceDiagnosticCode =
   | "cue-failed"
   | "cue-timed-out"
   | "media-button-received"
-  | "media-action-dispatched";
+  | "media-action-dispatched"
+  | "playback-interrupt-requested"
+  | "playback-interrupt-completed"
+  | "playback-completion-stale"
+  | "thread-rearm-scheduled"
+  | "thread-rearm-admitted"
+  | "thread-rearm-rejected"
+  | "audio-claim-acquired"
+  | "audio-claim-rejected";
 
 export interface T3VoiceDiagnosticEntry {
   readonly elapsedRealtimeMillis: number;
@@ -359,6 +367,7 @@ export interface T3VoiceNativeModule {
   readonly skipThreadPlaybackAsync: () => Promise<void>;
   /** Updates playResponses on the active Thread cycle (mid-session toggle). */
   readonly updateThreadPlayResponsesAsync: (input: {
+    readonly expectedGeneration: number;
     readonly playResponses: boolean;
   }) => Promise<void>;
   readonly updateThreadReviewTranscriptAsync: (

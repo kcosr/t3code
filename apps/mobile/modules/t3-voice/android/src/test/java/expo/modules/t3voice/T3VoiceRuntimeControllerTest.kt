@@ -1421,7 +1421,12 @@ class T3VoiceRuntimeControllerTest {
     assertEquals(
       T3VoiceCommandOutcome.APPLIED,
       controller
-        .dispatch(T3VoiceRuntimeCommand.UpdateThreadPlayResponses(playResponses = false))
+        .dispatch(
+          T3VoiceRuntimeCommand.UpdateThreadPlayResponses(
+            expectedGeneration = 1,
+            playResponses = false,
+          ),
+        )
         .outcome,
     )
     val state = controller.snapshot().state as T3VoiceControllerState.Thread
@@ -1447,11 +1452,40 @@ class T3VoiceRuntimeControllerTest {
     assertEquals(
       T3VoiceCommandOutcome.APPLIED,
       controller
-        .dispatch(T3VoiceRuntimeCommand.UpdateThreadPlayResponses(playResponses = false))
+        .dispatch(
+          T3VoiceRuntimeCommand.UpdateThreadPlayResponses(
+            expectedGeneration = 1,
+            playResponses = false,
+          ),
+        )
         .outcome,
     )
     assertEquals("cancel-thread-playback:1", driver.actions.last())
     assertThreadStage(controller, T3VoiceThreadStage.PLAYING)
+  }
+
+  @Test
+  fun updateThreadPlayResponsesRejectsStaleGeneration() {
+    val driver = FakeDriver()
+    val controller = T3VoiceRuntimeController(driver)
+    controller.dispatch(
+      T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session),
+    )
+    controller.activateInitialStart(1)
+
+    assertEquals(
+      T3VoiceCommandRejection.STALE_GENERATION,
+      controller
+        .dispatch(
+          T3VoiceRuntimeCommand.UpdateThreadPlayResponses(
+            expectedGeneration = 2,
+            playResponses = false,
+          ),
+        )
+        .rejection,
+    )
+    val state = controller.snapshot().state as T3VoiceControllerState.Thread
+    assertTrue(state.settings.playResponses)
   }
 
   @Test

@@ -62,6 +62,7 @@ internal class T3VoicePcmPlayer(
   private val onChunkConsumed: (String, Int) -> Unit,
   private val onFinished: (String) -> Unit,
   private val onError: (String, Throwable) -> Unit,
+  private val onPreferredOutputRejected: () -> Unit = {},
   private val preferredOutputDevice: () -> AudioDeviceInfo? = { null },
   private val outputFactory: T3VoicePcmOutputFactory = AndroidPcmOutputFactory,
   private val clock: T3VoicePlaybackClock = AndroidPlaybackClock,
@@ -97,12 +98,16 @@ internal class T3VoicePcmPlayer(
   fun start(playbackId: String, sampleRate: Int, channelCount: Int) {
     require(sampleRate in MIN_SAMPLE_RATE..MAX_SAMPLE_RATE) { "Unsupported PCM sample rate." }
     require(channelCount == 1 || channelCount == 2) { "PCM playback supports one or two channels." }
+    var preferredOutputRejected = false
     synchronized(lock) {
       check(active == null) { "A voice playback is already active." }
       val output = outputFactory.create(sampleRate, channelCount)
       preferredOutputDevice()?.let { device ->
         // Keep TTS usable on Android's system-selected media route if preference routing fails.
-        runCatching { output.setPreferredDevice(device) }
+        if (!runCatching { output.setPreferredDevice(device) }.getOrDefault(false)) {
+          runCatching { output.setPreferredDevice(null) }
+          preferredOutputRejected = true
+        }
       }
       val playback =
         ActivePlayback(
@@ -114,14 +119,19 @@ internal class T3VoicePcmPlayer(
       active = playback
       armInactivityTimeoutLocked(playback)
     }
+    if (preferredOutputRejected) runCatching(onPreferredOutputRejected)
   }
 
-  fun setPreferredOutputDevice(device: AudioDeviceInfo?): Boolean =
-    synchronized(lock) {
-      active?.output?.let { output ->
-        runCatching { output.setPreferredDevice(device) }.getOrDefault(false)
-      } ?: true
-    }
+  fun setPreferredOutputDevice(device: AudioDeviceInfo?): Boolean {
+    val applied =
+      synchronized(lock) {
+        active?.output?.let { output ->
+          runCatching { output.setPreferredDevice(device) }.getOrDefault(false)
+        } ?: true
+      }
+    if (!applied) runCatching(onPreferredOutputRejected)
+    return applied
+  }
 
   fun enqueue(playbackId: String, chunkIndex: Int, pcmBase64: String) {
     require(pcmBase64.length <= limits.maximumEncodedChunkBytes) { "PCM chunk is too large." }

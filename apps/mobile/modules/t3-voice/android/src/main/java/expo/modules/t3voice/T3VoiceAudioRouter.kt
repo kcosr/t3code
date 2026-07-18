@@ -53,6 +53,8 @@ internal class T3VoiceAudioRouter(
   private var deviceCallbackRegistered = false
   private var active = false
   private var activeRole: T3VoiceAudioRole? = null
+  /** True only after this owner has changed Android's process-wide audio mode or route. */
+  private var audioRoleEstablished = false
   private var generation = 0L
   private var activeGeneration: Long? = null
   private var focusChangeListener: AudioManager.OnAudioFocusChangeListener? = null
@@ -99,13 +101,12 @@ internal class T3VoiceAudioRouter(
     active = true
     activeRole = role
     focusState = T3VoiceAudioFocusState.ACTIVE
-    if (role == T3VoiceAudioRole.COMMUNICATION) {
-      audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-    } else {
-      runCatching(::clearSelectedRoute)
-      audioManager.mode = AudioManager.MODE_NORMAL
-    }
-    if (requestFocus(role)) {
+    if (
+      T3VoiceAudioRoleAdmissionPolicy.admit(
+        requestFocus = { requestFocus(role) },
+        establishAudioRole = { establishAudioRole(role) },
+      )
+    ) {
       recordDiagnostic(T3VoiceDiagnosticCategory.FOCUS, T3VoiceDiagnosticCode.REQUEST_GRANTED)
       if (role == T3VoiceAudioRole.COMMUNICATION) {
         applyPreferredRoute(ownerGeneration)
@@ -132,9 +133,10 @@ internal class T3VoiceAudioRouter(
     activeGeneration = null
     focusState = T3VoiceAudioFocusState.TERMINATED
     activeRoute = null
-    runCatching(::clearSelectedRoute)
+    if (audioRoleEstablished) runCatching(::clearSelectedRoute)
     runCatching(::abandonFocus)
-    runCatching { audioManager.mode = AudioManager.MODE_NORMAL }
+    if (audioRoleEstablished) runCatching { audioManager.mode = AudioManager.MODE_NORMAL }
+    audioRoleEstablished = false
     publishPreference()
   }
 
@@ -173,6 +175,15 @@ internal class T3VoiceAudioRouter(
 
   @Synchronized
   fun preferredPlaybackDevice(): AudioDeviceInfo? = resolvePlaybackRoute().second
+
+  @Synchronized
+  fun reportPlaybackRouteFallback() {
+    if (!active || activeRole != T3VoiceAudioRole.PLAYBACK) return
+    if (activeRoute == T3VoiceAudioRouteKind.SYSTEM) return
+    activeRoute = T3VoiceAudioRouteKind.SYSTEM
+    recordDiagnostic(T3VoiceDiagnosticCategory.ROUTE, T3VoiceDiagnosticCode.ROUTE_FALLBACK)
+    publishPreference()
+  }
 
   @Synchronized
   fun shutdown() {
@@ -312,6 +323,20 @@ internal class T3VoiceAudioRouter(
     focusChangeListener = null
   }
 
+  /**
+   * Establish process-wide audio state only after Android grants focus. In particular, a denied
+   * capture retry must not switch an ongoing phone call into or out of communication mode.
+   */
+  private fun establishAudioRole(role: T3VoiceAudioRole) {
+    audioRoleEstablished = true
+    if (role == T3VoiceAudioRole.COMMUNICATION) {
+      audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+    } else {
+      runCatching(::clearSelectedRoute)
+      audioManager.mode = AudioManager.MODE_NORMAL
+    }
+  }
+
   @Synchronized
   private fun onAudioFocusChanged(ownerGeneration: Long, change: Int) {
     if (!active || activeGeneration != ownerGeneration) return
@@ -352,9 +377,10 @@ internal class T3VoiceAudioRouter(
     activeRole = null
     activeGeneration = null
     activeRoute = null
-    runCatching(::clearSelectedRoute)
+    if (audioRoleEstablished) runCatching(::clearSelectedRoute)
     runCatching(::abandonFocus)
-    runCatching { audioManager.mode = AudioManager.MODE_NORMAL }
+    if (audioRoleEstablished) runCatching { audioManager.mode = AudioManager.MODE_NORMAL }
+    audioRoleEstablished = false
     publishPreference()
   }
 

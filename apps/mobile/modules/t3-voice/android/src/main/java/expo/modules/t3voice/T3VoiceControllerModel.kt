@@ -504,8 +504,13 @@ internal sealed interface T3VoiceRuntimeCommand {
 
   /** Updates playResponses on the active Thread cycle (mid-session toggle). */
   data class UpdateThreadPlayResponses(
+    val expectedGeneration: Long,
     val playResponses: Boolean,
-  ) : T3VoiceRuntimeCommand
+  ) : T3VoiceRuntimeCommand {
+    init {
+      require(expectedGeneration > 0) { "expectedGeneration must be positive." }
+    }
+  }
 
   data class UpdateThreadReviewTranscript(
     val expectedGeneration: Long,

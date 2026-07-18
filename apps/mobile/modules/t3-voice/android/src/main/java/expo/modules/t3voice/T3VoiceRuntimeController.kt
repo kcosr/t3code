@@ -193,7 +193,7 @@ internal class T3VoiceRuntimeController(
         T3VoiceRuntimeCommand.FinishThreadUtterance -> finishThreadUtterance()
         T3VoiceRuntimeCommand.SkipThreadPlayback -> skipThreadPlayback()
         is T3VoiceRuntimeCommand.UpdateThreadPlayResponses ->
-          updateThreadPlayResponses(command.playResponses)
+          updateThreadPlayResponses(command.expectedGeneration, command.playResponses)
         is T3VoiceRuntimeCommand.UpdateThreadReviewTranscript ->
           updateThreadReviewTranscript(
             command.expectedGeneration,
@@ -498,7 +498,13 @@ internal class T3VoiceRuntimeController(
     return applied()
   }
 
-  private fun updateThreadPlayResponses(playResponses: Boolean): T3VoiceCommandResult {
+  private fun updateThreadPlayResponses(
+    expectedGeneration: Long,
+    playResponses: Boolean,
+  ): T3VoiceCommandResult {
+    if (expectedGeneration != current.generation) {
+      return rejected(T3VoiceCommandRejection.STALE_GENERATION)
+    }
     val state = current.state as? T3VoiceControllerState.Thread
       ?: return rejected(T3VoiceCommandRejection.INVALID_STATE)
     if (state.settings.playResponses == playResponses) return duplicate()

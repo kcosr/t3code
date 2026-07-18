@@ -5,6 +5,40 @@ import org.junit.Test
 
 class T3VoiceAudioFocusPolicyTest {
   @Test
+  fun deniedFocusDoesNotEstablishProcessWideAudioState() {
+    val actions = mutableListOf<String>()
+
+    val admitted =
+      T3VoiceAudioRoleAdmissionPolicy.admit(
+        requestFocus = {
+          actions += "request-focus"
+          false
+        },
+        establishAudioRole = { actions += "establish-audio-role" },
+      )
+
+    assertEquals(false, admitted)
+    assertEquals(listOf("request-focus"), actions)
+  }
+
+  @Test
+  fun grantedFocusEstablishesProcessWideAudioStateAfterAdmission() {
+    val actions = mutableListOf<String>()
+
+    val admitted =
+      T3VoiceAudioRoleAdmissionPolicy.admit(
+        requestFocus = {
+          actions += "request-focus"
+          true
+        },
+        establishAudioRole = { actions += "establish-audio-role" },
+      )
+
+    assertEquals(true, admitted)
+    assertEquals(listOf("request-focus", "establish-audio-role"), actions)
+  }
+
+  @Test
   fun coversEveryStateAndEventCombination() {
     val expected =
       mapOf(

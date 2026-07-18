@@ -43,7 +43,7 @@ import {
 } from "./ThreadComposer";
 import { ThreadFeed } from "./ThreadFeed";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
-import { useThreadSpeech } from "../voice/useThreadSpeech";
+import { useThreadSpeechAdapter } from "../voice/useThreadSpeechAdapter";
 
 export interface ThreadDetailScreenProps {
   readonly selectedThread: OrchestrationThreadShell;
@@ -269,7 +269,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     () => latestAssistantSpeechSnapshot(selectedThreadFeed),
     [selectedThreadFeed],
   );
-  const speechPlayback = useThreadSpeech({
+  const speechPlayback = useThreadSpeechAdapter({
     environmentId: props.environmentId,
     scopeKey: selectedThreadKey,
     historyReady: contentPresentationKind === "ready",

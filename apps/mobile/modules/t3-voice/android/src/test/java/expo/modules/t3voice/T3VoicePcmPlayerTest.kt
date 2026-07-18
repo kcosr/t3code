@@ -30,6 +30,28 @@ class T3VoicePcmPlayerTest {
   }
 
   @Test
+  fun rejectedActiveRouteReportsFallback() {
+    val output = FakeOutput(playbackHeadPosition = 0, preferredDeviceAccepted = false)
+    var rejected = 0
+    val player =
+      T3VoicePcmPlayer(
+        onChunkConsumed = { _, _ -> },
+        onFinished = {},
+        onError = { _, cause -> throw AssertionError("playback must not fail", cause) },
+        onPreferredOutputRejected = { rejected += 1 },
+        outputFactory = T3VoicePcmOutputFactory { _, _ -> output },
+      )
+
+    player.start("routing", 24_000, 1)
+
+    assertFalse(player.setPreferredOutputDevice(null))
+    assertEquals(1, rejected)
+    assertEquals(1, output.preferredDeviceSetCount)
+    player.cancel("routing")
+    player.release()
+  }
+
+  @Test
   fun defaultLifetimeCoversFifteenMinutesOfStandardPcm() {
     val limits = T3VoicePcmLimits()
     val standardPcmBytes = 24_000L * 2L * 15L * 60L
@@ -472,6 +494,7 @@ class T3VoicePcmPlayerTest {
 
   private class FakeOutput(
     override val playbackHeadPosition: Long,
+    private val preferredDeviceAccepted: Boolean = true,
   ) : T3VoicePcmOutput {
     var releaseCount = 0
     val releaseFlushes = mutableListOf<Boolean>()
@@ -482,7 +505,7 @@ class T3VoicePcmPlayerTest {
 
     override fun setPreferredDevice(device: android.media.AudioDeviceInfo?): Boolean {
       preferredDeviceSetCount += 1
-      return true
+      return preferredDeviceAccepted
     }
 
     override fun start() {

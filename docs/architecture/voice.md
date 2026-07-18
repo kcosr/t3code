@@ -26,12 +26,10 @@ The mobile app exposes five related voice surfaces:
    conversation and always exposes the shared native audio-route selector. While Realtime is active,
    it also exposes transcript, mute, and stop controls. While Thread voice is active, the bar remains
    a Realtime Resume surface.
-4. Eligible assistant messages can use bounded streaming speech playback on platforms where React
-   still owns that path. **Android WIP
-   (`feature/android-native-thread-voice-authority`):** Thread Auto Listen response speech is
-   native-only; React-driven auto-speak / tap-to-hear of arbitrary messages is **accepted as
-   removed** until a future native `SpeakMessage` operation (roadmap). Do not reintroduce generic
-   PCM for that surface on Android.
+4. Android Thread Auto Listen can speak the response produced by its own native cycle. Arbitrary
+   message read-aloud and tap-to-hear are not implemented on Android. The generic React speech
+   implementation remains in source for future non-Android use, but no current web, desktop, or iOS
+   adapter exposes that feature.
 5. On Android, opt-in Background Voice Controls keep a native Ready notification and MediaSession
    available after an operation ends. The user chooses Realtime or the latest valid Active Thread as
    the default next interaction and can start it without React remaining attached.
@@ -110,7 +108,9 @@ The control API also provides:
 deltas followed by one final result. `POST /api/voice/speech` validates upstream status and PCM
 format before committing success, then returns cancellable, backpressured 24 kHz mono signed 16-bit
 PCM. Android Thread voice requests one-use tickets for these routes while React is detached;
-React-owned dictation and message playback request their own tickets.
+React-owned composer dictation requests its own transcription tickets. The server speech route and
+generic React playback implementation remain available to code, but arbitrary message read-aloud is
+not exposed by a current platform adapter.
 
 Server settings select non-Realtime providers and configure the optional OpenAI-compatible speech
 server:
@@ -227,10 +227,15 @@ React subscribes to complete snapshots and does not maintain a second Android vo
 The native bridge does not expose credentials, provider identifiers, SDP, raw provider events, or
 temporary recording paths.
 
-**Work-in-progress (feature/android-native-thread-voice-authority):** On Android, Thread Auto Listen
-response speech is moving to the semantic native runtime only (`playResponses`); React must not
-drive the generic PCM player for that preference. Headset during response playback **skips** speech
-(cancel + complete cycle)—not pause/resume. Treat as design-as-built only after device acceptance.
+On Android, Thread Auto Listen response speech is owned by the semantic native runtime only
+(`playResponses`). The Thread screen mounts a small native snapshot/settings adapter rather than
+React's assistant-message observer and generic PCM state machine. The always-mounted runtime
+provider synchronizes preference changes into an active native cycle even when that screen is
+unmounted. Headset input during response playback **skips** speech (cancel + complete cycle)—not
+pause/resume. Thread-to-Realtime handoff is a single native transition; React does not dispatch a
+competing Skip first. After permanent playback focus loss, Auto Listen reacquires capture focus
+before rearming, with bounded exponential retry backoff. A denied retry does not change Android's
+process-wide communication mode or route.
 
 ### Realtime-to-Thread
 

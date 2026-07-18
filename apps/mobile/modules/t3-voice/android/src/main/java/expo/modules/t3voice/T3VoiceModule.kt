@@ -437,12 +437,9 @@ class T3VoiceModule : Module() {
 
       AsyncFunction("updateThreadPlayResponsesAsync") {
         input: Map<String, Any?>, promise: Promise ->
-        input.requireExactBridgeKeys("play responses input", setOf("playResponses"))
-        val playResponses =
-          input["playResponses"] as? Boolean ?: error("playResponses must be a boolean.")
         dispatchRuntime(
           promise,
-          T3VoiceRuntimeCommand.UpdateThreadPlayResponses(playResponses),
+          T3VoiceRuntimeBridgeInput.updateThreadPlayResponses(input),
         )
       }
 

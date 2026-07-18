@@ -61,9 +61,7 @@ export function SettingsVoiceRouteScreen() {
   const [nativeCuePreRollMs, setNativeCuePreRollMs] = useState<number | null>(null);
   const voiceCuesEnabled = nativeVoiceCuesEnabled ?? stored.voiceCuesEnabled !== false;
   const cueStartupPreRollMs =
-    nativeCuePreRollMs ??
-    stored.voiceCueStartupPreRollMs ??
-    VOICE_CUE_STARTUP_PRE_ROLL_DEFAULT_MS;
+    nativeCuePreRollMs ?? stored.voiceCueStartupPreRollMs ?? VOICE_CUE_STARTUP_PRE_ROLL_DEFAULT_MS;
   useFocusEffect(
     useCallback(() => {
       void audioRoutePreference.refresh();

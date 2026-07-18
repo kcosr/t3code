@@ -47,6 +47,7 @@ internal class T3VoiceNativeRuntimeDriver(
       onError = { playbackId, cause ->
         synchronized(lock) { threadSession }?.onPlaybackError(playbackId, cause)
       },
+      onPreferredOutputRejected = audioRouter::reportPlaybackRouteFallback,
       preferredOutputDevice = preferredPlaybackOutput::get,
     )
   private val threadMedia = T3VoiceAndroidThreadMedia(recorder, player, audioRouter)
@@ -393,13 +394,13 @@ internal class T3VoiceNativeRuntimeDriver(
   }
 
   private fun handleAudioRoutePreferenceChanged(preference: T3VoiceAudioRoutePreference) {
+    if (this::audioRoutePreferenceState.isInitialized) {
+      audioRoutePreferenceState.value = preference
+    }
     if (sharedMediaReady) {
       val output = audioRouter.preferredPlaybackDevice()
       preferredPlaybackOutput.set(output)
       player.setPreferredOutputDevice(output)
-    }
-    if (this::audioRoutePreferenceState.isInitialized) {
-      audioRoutePreferenceState.value = preference
     }
   }
 
