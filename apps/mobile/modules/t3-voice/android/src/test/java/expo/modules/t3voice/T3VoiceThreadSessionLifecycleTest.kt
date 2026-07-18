@@ -436,6 +436,7 @@ internal class T3VoiceThreadSessionLifecycleTest {
 
   private class DeferredCueArming : T3VoiceCueArming {
     val readyRequests = AtomicInteger(0)
+    val readyRequested = CountDownLatch(1)
     private val pending = AtomicReference<((T3VoiceCueCompletion) -> Unit)?>(null)
     private val generationRef = AtomicReference(0L)
 
@@ -452,6 +453,7 @@ internal class T3VoiceThreadSessionLifecycleTest {
       readyRequests.incrementAndGet()
       generationRef.set(generation)
       pending.set(completion)
+      readyRequested.countDown()
       return true
     }
 
