@@ -22,6 +22,7 @@ internal class T3VoiceNativeRuntimeDriver(
   private var threadSession: T3VoiceThreadSession? = null
   private var shutdownStarted = false
   private val sharedMediaReleased = AtomicBoolean(false)
+  @Volatile private var sharedMediaReady = false
   private lateinit var audioRoutePreferenceState: MutableStateFlow<T3VoiceAudioRoutePreference>
   private lateinit var webRtc: T3VoiceWebRtcSession
   private val audioRouter =
@@ -50,6 +51,7 @@ internal class T3VoiceNativeRuntimeDriver(
     T3VoiceCueArmingLive(T3VoiceCueSettingsStore(applicationContext))
 
   init {
+    sharedMediaReady = true
     audioRoutePreferenceState = MutableStateFlow(audioRouter.preference())
     webRtc =
       T3VoiceWebRtcSession(
@@ -387,6 +389,9 @@ internal class T3VoiceNativeRuntimeDriver(
   }
 
   private fun handleAudioRoutePreferenceChanged(preference: T3VoiceAudioRoutePreference) {
+    if (sharedMediaReady) {
+      player.setPreferredOutputDevice(audioRouter.preferredPlaybackDevice())
+    }
     if (this::audioRoutePreferenceState.isInitialized) {
       audioRoutePreferenceState.value = preference
     }

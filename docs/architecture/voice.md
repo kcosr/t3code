@@ -346,8 +346,9 @@ the service, the readiness snapshot:
 MediaSession transport controls map to the same native commands. Recognized media-button key-up and
 repeat events are consumed without dispatch; only the initial key-down can act. In Ready, headset
 hook, play, and play/pause start, while pause and stop never start. During Thread response playback,
-headset hook, play/pause, and next map to Skip (cancel remaining TTS and complete the cycle: rearm
-when auto-rearm is on, otherwise stop and release). Explicit stop remains a full session teardown.
+every recognized headset transport key maps to Skip (cancel remaining TTS and complete the cycle:
+rearm when auto-rearm is on, otherwise stop and release). The notification's explicit Stop action
+remains a full session teardown.
 Background Voice Controls require notification permission when enabled; notification permission
 denial for an already active visible operation still reduces drawer visibility without creating a
 second control path.

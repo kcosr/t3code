@@ -11,6 +11,25 @@ import org.junit.Test
 
 class T3VoicePcmPlayerTest {
   @Test
+  fun activePlaybackAppliesRouteChanges() {
+    val output = FakeOutput(playbackHeadPosition = 0)
+    val player =
+      T3VoicePcmPlayer(
+        onChunkConsumed = { _, _ -> },
+        onFinished = {},
+        onError = { _, cause -> throw AssertionError("playback must not fail", cause) },
+        outputFactory = T3VoicePcmOutputFactory { _, _ -> output },
+      )
+
+    player.start("routing", 24_000, 1)
+
+    assertTrue(player.setPreferredOutputDevice(null))
+    assertEquals(1, output.preferredDeviceSetCount)
+    player.cancel("routing")
+    player.release()
+  }
+
+  @Test
   fun defaultLifetimeCoversFifteenMinutesOfStandardPcm() {
     val limits = T3VoicePcmLimits()
     val standardPcmBytes = 24_000L * 2L * 15L * 60L
@@ -459,8 +478,12 @@ class T3VoicePcmPlayerTest {
     var pauseCount = 0
     var resumeCount = 0
     var startCount = 0
+    var preferredDeviceSetCount = 0
 
-    override fun setPreferredDevice(device: android.media.AudioDeviceInfo): Boolean = true
+    override fun setPreferredDevice(device: android.media.AudioDeviceInfo?): Boolean {
+      preferredDeviceSetCount += 1
+      return true
+    }
 
     override fun start() {
       startCount += 1
@@ -490,7 +513,7 @@ class T3VoicePcmPlayerTest {
     var releaseCount = 0
     val releaseFlushes = mutableListOf<Boolean>()
 
-    override fun setPreferredDevice(device: android.media.AudioDeviceInfo): Boolean = true
+    override fun setPreferredDevice(device: android.media.AudioDeviceInfo?): Boolean = true
 
     override fun start() = Unit
 

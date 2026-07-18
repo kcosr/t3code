@@ -16,7 +16,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 internal interface T3VoicePcmOutput {
   val playbackHeadPosition: Long
 
-  fun setPreferredDevice(device: AudioDeviceInfo): Boolean
+  fun setPreferredDevice(device: AudioDeviceInfo?): Boolean
 
   fun start()
 
@@ -115,6 +115,13 @@ internal class T3VoicePcmPlayer(
       armInactivityTimeoutLocked(playback)
     }
   }
+
+  fun setPreferredOutputDevice(device: AudioDeviceInfo?): Boolean =
+    synchronized(lock) {
+      active?.output?.let { output ->
+        runCatching { output.setPreferredDevice(device) }.getOrDefault(false)
+      } ?: true
+    }
 
   fun enqueue(playbackId: String, chunkIndex: Int, pcmBase64: String) {
     require(pcmBase64.length <= limits.maximumEncodedChunkBytes) { "PCM chunk is too large." }
@@ -497,7 +504,7 @@ internal class T3VoicePcmPlayer(
         override val playbackHeadPosition: Long
           get() = track.playbackHeadPosition.toLong()
 
-        override fun setPreferredDevice(device: AudioDeviceInfo): Boolean =
+        override fun setPreferredDevice(device: AudioDeviceInfo?): Boolean =
           track.setPreferredDevice(device)
 
         override fun start() = track.play()
