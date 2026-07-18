@@ -87,7 +87,7 @@ internal data class T3VoiceDiagnosticEntry(
 
 internal class T3VoiceDiagnosticRing(
   private val capacity: Int = DEFAULT_CAPACITY,
-  private val clock: () -> Long = ::monotonicElapsedRealtimeMillis,
+  private val clock: () -> Long = defaultDiagnosticClock,
   initialGeneration: Long = 0,
 ) {
   private val entries = ArrayDeque<T3VoiceDiagnosticEntry>(capacity)
@@ -167,12 +167,17 @@ internal class T3VoiceDiagnosticRing(
 
 /**
  * Android's local-JVM stub throws when [SystemClock.elapsedRealtime] is called outside a device.
- * Diagnostics are best-effort and must never stop the voice state machine, so retain the Android
- * clock in production and use the JVM's monotonic clock when the platform clock is unavailable.
+ * Diagnostics are best-effort and must never stop the voice state machine. Probe once so local-JVM
+ * tests do not pay for and swallow the Android stub exception on every diagnostic event.
  */
-private fun monotonicElapsedRealtimeMillis(): Long =
-  runCatching { SystemClock.elapsedRealtime() }
-    .getOrElse { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
+private val defaultDiagnosticClock: () -> Long by lazy {
+  try {
+    SystemClock.elapsedRealtime()
+    SystemClock::elapsedRealtime
+  } catch (_: RuntimeException) {
+    { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
+  }
+}
 
 internal object T3VoiceDiagnostics {
   private val ring = T3VoiceDiagnosticRing()
