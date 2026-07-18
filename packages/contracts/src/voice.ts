@@ -634,12 +634,3 @@ export const VoicePublicErrorReason = Schema.Literals([
   "authorization-revoked",
 ]);
 export type VoicePublicErrorReason = typeof VoicePublicErrorReason.Type;
-
-export const VoicePublicError = Schema.Struct({
-  reason: VoicePublicErrorReason,
-  message: TrimmedNonEmptyString,
-  requestId: Schema.optionalKey(VoiceRequestId),
-  sessionId: Schema.optionalKey(VoiceSessionId),
-  retryable: Schema.Boolean,
-});
-export type VoicePublicError = typeof VoicePublicError.Type;

@@ -808,16 +808,8 @@ private fun JSONObject.requiredArray(name: String): JSONArray =
 private fun JSONObject.requiredObject(name: String): JSONObject =
   get(name) as? JSONObject ?: error("Expected JSON object field $name.")
 
-private fun JSONObject.remoteThreadTarget(): T3VoiceRemoteThreadTarget {
-  val parsed = T3VoiceThreadWireParser.target(T3VoiceJsonWireObject(this))
-  return T3VoiceRemoteThreadTarget(
-    projectId = parsed.projectId,
-    threadId = parsed.threadId,
-    modelSelection = parsed.modelSelection,
-    runtimeMode = parsed.runtimeMode,
-    interactionMode = parsed.interactionMode,
-  )
-}
+private fun JSONObject.remoteThreadTarget(): T3VoiceRemoteThreadTarget =
+  T3VoiceThreadWireParser.target(T3VoiceJsonWireObject(this))
 
 private class T3VoiceJsonWireObject(
   private val input: JSONObject,

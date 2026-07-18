@@ -164,14 +164,7 @@ internal object T3VoiceRuntimeBridgeInput {
         T3VoiceBridgeWireObject(input),
         additionalFields = setOf("environmentId"),
       )
-    return T3VoiceThreadTarget(
-      environmentId = input.requireBridgeIdentifier("environmentId"),
-      projectId = parsed.projectId,
-      threadId = parsed.threadId,
-      modelSelection = parsed.modelSelection,
-      runtimeMode = parsed.runtimeMode,
-      interactionMode = parsed.interactionMode,
-    )
+    return parsed.inEnvironment(input.requireBridgeIdentifier("environmentId"))
   }
 
   private fun threadSettings(input: Map<String, Any?>): T3VoiceThreadSettings {
@@ -256,14 +249,6 @@ private class T3VoiceBridgeWireObject(
     input.optionalBridgeObjectList(name)?.map(::T3VoiceBridgeWireObject)
 }
 
-internal data class T3VoiceParsedThreadTarget(
-  val projectId: String,
-  val threadId: String,
-  val modelSelection: T3VoiceModelSelection,
-  val runtimeMode: T3VoiceThreadRuntimeMode,
-  val interactionMode: T3VoiceThreadInteractionMode,
-)
-
 /** Canonical parser for Thread target fields shared by both native ingress boundaries. */
 internal object T3VoiceThreadWireParser {
   private val targetFields =
@@ -272,9 +257,9 @@ internal object T3VoiceThreadWireParser {
   fun target(
     input: T3VoiceWireObject,
     additionalFields: Set<String> = emptySet(),
-  ): T3VoiceParsedThreadTarget {
+  ): T3VoiceRemoteThreadTarget {
     input.requireExactFields("Thread target", targetFields + additionalFields)
-    return T3VoiceParsedThreadTarget(
+    return T3VoiceRemoteThreadTarget(
       projectId = input.requireIdentifier("projectId"),
       threadId = input.requireIdentifier("threadId"),
       modelSelection = modelSelection(input.requiredObject("modelSelection")),

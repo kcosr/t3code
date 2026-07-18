@@ -2,10 +2,11 @@ package expo.modules.t3voice
 
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-internal class T3VoiceRetainedNativeSessionTest {
+internal class T3VoiceRealtimeThreadTransferTest {
   private val session =
     T3VoiceNativeSessionConfig(
       baseUrl = "https://environment.example.test/",
@@ -15,26 +16,42 @@ internal class T3VoiceRetainedNativeSessionTest {
 
   @Test
   fun `normal close and failure cleanup leave no retained credential`() {
-    val retained = T3VoiceRetainedNativeSession()
+    val transfer = T3VoiceRealtimeThreadTransfer()
 
-    retained.retain(session)
-    retained.clear()
-    assertFalse(retained.hasValueForTest())
+    transfer.begin(ownerGeneration = 7, preserveForThread = true)
+    transfer.complete(ownerGeneration = 7, session = session)
+    transfer.clear()
+    assertFalse(transfer.hasValueForTest())
 
-    retained.retain(session)
-    retained.clear()
-    assertFalse(retained.hasValueForTest())
+    transfer.begin(ownerGeneration = 8, preserveForThread = true)
+    transfer.complete(ownerGeneration = 8, session = session)
+    transfer.clear()
+    assertFalse(transfer.hasValueForTest())
   }
 
   @Test
   fun `Realtime to Thread transfer is single use`() {
-    val retained = T3VoiceRetainedNativeSession()
-    retained.retain(session)
+    val transfer = T3VoiceRealtimeThreadTransfer()
+    transfer.begin(ownerGeneration = 7, preserveForThread = true)
+    transfer.complete(ownerGeneration = 7, session = session)
 
-    assertTrue(retained.hasValueForTest())
-    assertSame(session, retained.consume())
-    assertFalse(retained.hasValueForTest())
-    assertSame(null, retained.consume())
+    assertTrue(transfer.hasValueForTest())
+    assertSame(session, transfer.consume())
+    assertFalse(transfer.hasValueForTest())
+    assertSame(null, transfer.consume())
+  }
+
+  @Test
+  fun `new transfer cannot overwrite an unconsumed credential`() {
+    val transfer = T3VoiceRealtimeThreadTransfer()
+    transfer.begin(ownerGeneration = 7, preserveForThread = true)
+    transfer.complete(ownerGeneration = 7, session = session)
+    transfer.begin(ownerGeneration = 8, preserveForThread = true)
+
+    assertThrows(IllegalStateException::class.java) {
+      transfer.complete(ownerGeneration = 8, session = session)
+    }
+    assertTrue(transfer.hasValueForTest())
   }
 
   @Test

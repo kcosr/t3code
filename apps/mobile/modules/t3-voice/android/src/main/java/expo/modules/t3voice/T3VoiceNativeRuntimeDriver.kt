@@ -368,31 +368,9 @@ internal class T3VoiceNativeRuntimeDriver(
     }
 }
 
-/** Single-use credential transfer slot for the in-process Realtime-to-Thread mode switch. */
-internal class T3VoiceRetainedNativeSession {
-  private var value: T3VoiceNativeSessionConfig? = null
-
-  @Synchronized
-  fun retain(session: T3VoiceNativeSessionConfig) {
-    check(value == null) { "A native session credential is already retained." }
-    value = session
-  }
-
-  @Synchronized
-  fun consume(): T3VoiceNativeSessionConfig? = value.also { value = null }
-
-  @Synchronized
-  fun clear() {
-    value = null
-  }
-
-  @Synchronized
-  internal fun hasValueForTest(): Boolean = value != null
-}
-
 /** Correlates the one narrow credential transfer with close/cancel races. */
 internal class T3VoiceRealtimeThreadTransfer {
-  private val retained = T3VoiceRetainedNativeSession()
+  private var retainedSession: T3VoiceNativeSessionConfig? = null
   private var generation: Long? = null
   private var preserve = false
 
@@ -400,12 +378,17 @@ internal class T3VoiceRealtimeThreadTransfer {
   fun begin(ownerGeneration: Long, preserveForThread: Boolean) {
     generation = ownerGeneration
     preserve = preserveForThread
-    if (!preserveForThread) retained.clear()
+    if (!preserveForThread) retainedSession = null
   }
 
   @Synchronized
   fun complete(ownerGeneration: Long, session: T3VoiceNativeSessionConfig) {
-    if (generation == ownerGeneration && preserve) retained.retain(session) else retained.clear()
+    if (generation == ownerGeneration && preserve) {
+      check(retainedSession == null) { "A native session credential is already retained." }
+      retainedSession = session
+    } else {
+      retainedSession = null
+    }
     preserve = false
   }
 
@@ -414,19 +397,22 @@ internal class T3VoiceRealtimeThreadTransfer {
     if (generation != ownerGeneration) return
     preserve = false
     generation = null
-    retained.clear()
+    retainedSession = null
   }
 
   @Synchronized
-  fun consume(): T3VoiceNativeSessionConfig? = retained.consume().also { generation = null }
+  fun consume(): T3VoiceNativeSessionConfig? = retainedSession.also {
+    retainedSession = null
+    generation = null
+  }
 
   @Synchronized
   fun clear() {
     generation = null
     preserve = false
-    retained.clear()
+    retainedSession = null
   }
 
   @Synchronized
-  internal fun hasValueForTest(): Boolean = retained.hasValueForTest()
+  internal fun hasValueForTest(): Boolean = retainedSession != null
 }

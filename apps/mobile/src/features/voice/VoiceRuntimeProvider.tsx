@@ -16,6 +16,7 @@ import {
   threadTranscriptSubmissionDisposition,
   threadVoiceStartForFocus,
   threadVoiceSettings,
+  voiceRealtimeContextsEqual,
   voiceRuntimeCommandEnvironmentMatches,
   voiceRuntimeSnapshotEnvironmentId,
   voiceThreadNavigationRequest,
@@ -27,6 +28,7 @@ import {
   type VoiceHttpClient,
   type VoiceRealtimeContext,
   type VoiceRealtimeTarget,
+  type VoiceRealtimeTranscriptTurn,
   type VoiceRuntimeAdapter,
   type VoiceRuntimeSnapshot,
 } from "@t3tools/client-runtime/voice";
@@ -69,7 +71,6 @@ import {
   RealtimeVoiceCallBar,
   VoiceAudioRoutePicker,
   VoiceTranscriptModal,
-  type RealtimeVoiceTranscriptTurn,
 } from "./VoiceRuntimeOverlays";
 import { VoiceConversationBrowser, type VoiceConversationClient } from "./VoiceConversationBrowser";
 import { loadResumeSelection } from "./voiceConversationResume";
@@ -120,7 +121,7 @@ const INITIAL_SNAPSHOT: VoiceRuntimeSnapshot = {
 };
 
 const VoiceRuntimeContext = createContext<VoiceRuntimeContextValue | null>(null);
-const EMPTY_REALTIME_TRANSCRIPT: ReadonlyArray<RealtimeVoiceTranscriptTurn> = [];
+const EMPTY_REALTIME_TRANSCRIPT: ReadonlyArray<VoiceRealtimeTranscriptTurn> = [];
 
 const canStartRealtimeFrom = (snapshot: VoiceRuntimeSnapshot): boolean =>
   snapshot.mode === "idle" || snapshot.mode === "failed" || snapshot.mode === "thread";
@@ -325,15 +326,6 @@ export function VoiceRuntimeProvider(props: {
   );
   const threadStartAvailable =
     threadStart !== null && isThreadVoiceStartAvailable(snapshot, prepared !== null);
-  const realtimeContextKey = JSON.stringify(realtimeContext);
-  const nativeRealtimeContextKey =
-    snapshot.mode === "realtime"
-      ? JSON.stringify({
-          focus: snapshot.target.focus,
-          threadSettings: snapshot.target.threadSettings,
-        })
-      : null;
-
   const acknowledgeAdmittedClientAction = useCallback(
     (admittedFocus: AdmittedClientActionFocus): boolean => {
       const runtime = runtimeRef.current;
@@ -377,21 +369,14 @@ export function VoiceRuntimeProvider(props: {
       runtime === null ||
       snapshot.mode !== "realtime" ||
       runtime.environmentId !== snapshot.target.environmentId ||
-      nativeRealtimeContextKey === realtimeContextKey
+      voiceRealtimeContextsEqual(snapshot.target, realtimeContext)
     ) {
       return;
     }
     void runtime.adapter
       .updateRealtimeContext(realtimeContext)
       .catch((cause) => Alert.alert("Voice focus unavailable", errorMessage(cause)));
-  }, [
-    acknowledgeAdmittedClientAction,
-    nativeRealtimeContextKey,
-    realtimeContext,
-    realtimeContextKey,
-    snapshot,
-    visibleFocus,
-  ]);
+  }, [acknowledgeAdmittedClientAction, realtimeContext, snapshot, visibleFocus]);
 
   const interruptTraditionalAudio = useCallback(async () => {
     const releases: Array<void | (() => void)> = [];
@@ -902,7 +887,7 @@ export function VoiceRuntimeProvider(props: {
     };
   }, [snapshot, threadShells]);
 
-  const transcript = useMemo<ReadonlyArray<RealtimeVoiceTranscriptTurn>>(() => {
+  const transcript = useMemo<ReadonlyArray<VoiceRealtimeTranscriptTurn>>(() => {
     if (snapshot.mode === "realtime") return snapshot.transcript;
     return EMPTY_REALTIME_TRANSCRIPT;
   }, [snapshot]);

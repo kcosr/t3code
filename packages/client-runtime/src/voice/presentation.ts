@@ -47,6 +47,41 @@ export interface AdmittedClientActionFocus {
   readonly threadId: ThreadId;
 }
 
+/** Compares the product fields React mirrors into the native Realtime runtime. */
+export function voiceRealtimeContextsEqual(
+  left: VoiceRealtimeContext,
+  right: VoiceRealtimeContext,
+): boolean {
+  const focusEqual =
+    left.focus === right.focus ||
+    (left.focus !== null &&
+      right.focus !== null &&
+      left.focus.projectId === right.focus.projectId &&
+      left.focus.threadId === right.focus.threadId);
+  if (!focusEqual) return false;
+
+  const leftSettings = left.threadSettings;
+  const rightSettings = right.threadSettings;
+  return (
+    leftSettings === rightSettings ||
+    (leftSettings !== null &&
+      rightSettings !== null &&
+      leftSettings.submission === rightSettings.submission &&
+      leftSettings.playResponses === rightSettings.playResponses &&
+      leftSettings.autoRearm === rightSettings.autoRearm &&
+      leftSettings.endpointDetection.endSilenceMs ===
+        rightSettings.endpointDetection.endSilenceMs &&
+      leftSettings.endpointDetection.noSpeechTimeoutMs ===
+        rightSettings.endpointDetection.noSpeechTimeoutMs &&
+      leftSettings.endpointDetection.maximumUtteranceMs ===
+        rightSettings.endpointDetection.maximumUtteranceMs &&
+      leftSettings.rearmDelayMs === rightSettings.rearmDelayMs &&
+      leftSettings.transcriptionTimeoutMs === rightSettings.transcriptionTimeoutMs &&
+      leftSettings.submissionTimeoutMs === rightSettings.submissionTimeoutMs &&
+      leftSettings.responseTimeoutMs === rightSettings.responseTimeoutMs)
+  );
+}
+
 /** Portable preference fields needed to configure a native Thread voice session. */
 export interface ThreadVoiceStartPreferences {
   readonly autoListenEnabled: boolean;

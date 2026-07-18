@@ -98,10 +98,10 @@ T3 keeps three identities separate:
 - A provider call is an ephemeral OpenAI Realtime resource and is never the durable T3 identity.
 
 A new Realtime start selects either a new conversation or a previously saved durable conversation.
-Durable conversations and normalized journal entries are stored in SQLite. Final user and assistant
-transcripts, tool requests and results, context changes, call boundaries, device handoffs, and
-clear-context markers are journal data; raw audio, SDP, credentials, and provider event dumps are
-not.
+Durable conversations and normalized journal entries are stored in SQLite. Production writers
+currently record final user and assistant transcripts, tool requests and results, context changes,
+and clear-context markers. Raw audio, SDP, credentials, and provider event dumps are not journal
+data.
 
 The server compiles a bounded set of current-epoch journal entries when opening a provider call.
 Clear context advances the conversation epoch, leaving older entries visible in history but

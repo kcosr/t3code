@@ -1,5 +1,5 @@
 // @effect-diagnostics globalDate:off
-import type { VoiceRuntimeSnapshot } from "./runtime.ts";
+import type { VoiceRealtimeContext, VoiceRuntimeSnapshot } from "./runtime.ts";
 import {
   EnvironmentId,
   ProjectId,
@@ -29,6 +29,7 @@ import {
   threadVoiceStartForFocus,
   voiceThreadNavigationRequest,
   voiceRuntimeCommandEnvironmentMatches,
+  voiceRealtimeContextsEqual,
   voiceRuntimeSnapshotEnvironmentId,
   type VoiceRuntimeFocus,
   type ThreadVoiceStartPreferences,
@@ -63,6 +64,27 @@ const focus: VoiceRuntimeFocus = {
   activeThreadBusy: false,
 };
 
+const realtimeContext: VoiceRealtimeContext = {
+  focus: {
+    projectId: ProjectId.make("project-one"),
+    threadId: ThreadId.make("thread-one"),
+  },
+  threadSettings: {
+    submission: "auto-submit",
+    playResponses: true,
+    autoRearm: true,
+    endpointDetection: {
+      endSilenceMs: 2_200,
+      noSpeechTimeoutMs: 30_000,
+      maximumUtteranceMs: 120_000,
+    },
+    rearmDelayMs: 750,
+    transcriptionTimeoutMs: 600_000,
+    submissionTimeoutMs: 30_000,
+    responseTimeoutMs: 600_000,
+  },
+};
+
 const conversation = (
   id: string,
   retention: VoiceConversationSummary["retention"],
@@ -79,6 +101,92 @@ const conversation = (
 });
 
 describe("voice runtime state", () => {
+  it("compares Realtime context by product fields rather than object identity or key order", () => {
+    const reordered: VoiceRealtimeContext = {
+      threadSettings: {
+        responseTimeoutMs: 600_000,
+        submissionTimeoutMs: 30_000,
+        transcriptionTimeoutMs: 600_000,
+        rearmDelayMs: 750,
+        endpointDetection: {
+          maximumUtteranceMs: 120_000,
+          noSpeechTimeoutMs: 30_000,
+          endSilenceMs: 2_200,
+        },
+        autoRearm: true,
+        playResponses: true,
+        submission: "auto-submit",
+      },
+      focus: {
+        threadId: ThreadId.make("thread-one"),
+        projectId: ProjectId.make("project-one"),
+      },
+    };
+
+    expect(voiceRealtimeContextsEqual(realtimeContext, reordered)).toBe(true);
+    expect(
+      voiceRealtimeContextsEqual(
+        { focus: null, threadSettings: null },
+        { threadSettings: null, focus: null },
+      ),
+    ).toBe(true);
+    expect(voiceRealtimeContextsEqual(realtimeContext, { ...realtimeContext, focus: null })).toBe(
+      false,
+    );
+    expect(
+      voiceRealtimeContextsEqual(realtimeContext, { ...realtimeContext, threadSettings: null }),
+    ).toBe(false);
+  });
+
+  it("detects a difference in every Realtime context field", () => {
+    const settings = realtimeContext.threadSettings!;
+    const withSettings = (
+      replacement: Partial<VoiceRealtimeContext["threadSettings"]>,
+    ): VoiceRealtimeContext => ({
+      ...realtimeContext,
+      threadSettings: { ...settings, ...replacement },
+    });
+    const withEndpointDetection = (
+      replacement: Partial<typeof settings.endpointDetection>,
+    ): VoiceRealtimeContext =>
+      withSettings({
+        endpointDetection: { ...settings.endpointDetection, ...replacement },
+      });
+    const differences: ReadonlyArray<readonly [string, VoiceRealtimeContext]> = [
+      [
+        "focus.projectId",
+        {
+          ...realtimeContext,
+          focus: { ...realtimeContext.focus!, projectId: ProjectId.make("project-two") },
+        },
+      ],
+      [
+        "focus.threadId",
+        {
+          ...realtimeContext,
+          focus: { ...realtimeContext.focus!, threadId: ThreadId.make("thread-two") },
+        },
+      ],
+      ["submission", withSettings({ submission: "review" })],
+      ["playResponses", withSettings({ playResponses: false })],
+      ["autoRearm", withSettings({ autoRearm: false })],
+      ["endpointDetection.endSilenceMs", withEndpointDetection({ endSilenceMs: 2_201 })],
+      ["endpointDetection.noSpeechTimeoutMs", withEndpointDetection({ noSpeechTimeoutMs: null })],
+      [
+        "endpointDetection.maximumUtteranceMs",
+        withEndpointDetection({ maximumUtteranceMs: 120_001 }),
+      ],
+      ["rearmDelayMs", withSettings({ rearmDelayMs: 751 })],
+      ["transcriptionTimeoutMs", withSettings({ transcriptionTimeoutMs: 600_001 })],
+      ["submissionTimeoutMs", withSettings({ submissionTimeoutMs: 30_001 })],
+      ["responseTimeoutMs", withSettings({ responseTimeoutMs: 600_001 })],
+    ];
+
+    for (const [field, different] of differences) {
+      expect(voiceRealtimeContextsEqual(realtimeContext, different), field).toBe(false);
+    }
+  });
+
   it("keeps the active environment authoritative across route focus changes", () => {
     expect(voiceRuntimeEnvironmentId(environmentId, null)).toBe(environmentId);
     expect(voiceRuntimeEnvironmentId(null, focus)).toBe(environmentId);

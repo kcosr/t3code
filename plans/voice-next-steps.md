@@ -1,6 +1,7 @@
 # Voice Next Steps
 
-Status: Active working draft; the end-state implementation is present and focused validation remains.
+Status: Active working draft; the accepted end state and low-risk simplification batch are
+complete. Medium-risk reductions remain deferred to separately approved slices.
 
 This plan tracks cleanup of the implemented voice system described by
 [voice.md](../docs/architecture/voice.md). It is not an architecture contract and does not authorize
@@ -9,86 +10,64 @@ new product features. Longer-term ideas are isolated in
 
 ## Current objective
 
-Finish and verify the smallest end state for two related control contracts:
+Preserve the accepted voice behavior while removing measured incidental complexity. The completed
+low-risk batch corrected as-built documentation, removed duplicate/dead data shapes, replaced a
+serialization-based comparison with tested typed equality, and folded one redundant native
+credential holder into its existing transfer owner.
 
-- one native-persisted audio-route preference is shared by the bottom call bar and Voice Settings
-  and applies to one-shot dictation, Thread voice, and Realtime;
-- `switch_to_thread_voice` requires an explicit `threadId`, the server resolves the complete target,
-  and Android performs the Realtime-to-Thread ownership transition without React;
-- React only reconciles navigation after a native switch; and
-- notifications retain controls that have an unambiguous native meaning and do not infer a Thread
-  from current or last-used UI state.
+Binder lifecycle reduction, WebRTC fencing changes, executor consolidation, shared native media
+primitives, audio-route release ownership, and server registry folding are separate medium-risk
+workstreams. They are not part of the current mechanical batch.
 
 ## Accepted device checkpoint
 
-The deployed `7372e5742` baseline was accepted after user testing of the corrected control ownership
-and Thread-to-Realtime Resume behavior. Treat the foreground/background and notification validation
-checkpoint as sufficient for the current cleanup cycle.
+The server and verified preview APK were built and deployed from `0852af685`. Server health checks
+passed, and subsequent user testing accepted the explicit-ID Realtime-to-Thread handoff, shared
+audio-route controls, and the Realtime-only bottom-bar behavior.
 
-Do not reopen the full device matrix merely to repeat it. Revalidate a focused path when cleanup
-changes that path, or expand testing when a failure supplies concrete evidence that the checkpoint
-was insufficient.
+At that revision, `vp check`, `vp run typecheck`, `vp run lint:mobile`, focused voice tests, and all
+270 native JVM tests passed. The full repository run reported 5,128 passing tests and one unrelated
+ProviderRegistry timing failure; that test passed when rerun in isolation.
 
-The cleanup deployment at `dd2bde9b0` passed static checks, full typecheck, native lint, focused
-voice tests, the native JVM suite, and the full 4,960-test repository suite. The server and preview
-APK were built from that revision, both server health endpoints passed, and the verified APK was
-installed in place on the Pixel 9. Post-install process and error-log checks passed; the securely
-locked device prevented an additional UI-driven voice call, so the earlier accepted functional
-checkpoint remains the device evidence for this cycle.
+The follow-up low-risk cleanup passed `vp check`, `vp run typecheck`, `vp run lint:mobile`, all 271
+native JVM tests, and the complete `vp test` run: 654 test files and 5,131 tests passed, with only
+the repository's intentional skips. Native production source moved from 13,117 lines to 13,080
+lines while retaining 47 files; the purpose was concept removal and invariant preservation, not a
+line-count target.
+
+Do not reopen the full device matrix merely to repeat accepted behavior. Revalidate only paths
+touched by cleanup, or expand testing when a failure supplies concrete evidence that the accepted
+checkpoint was insufficient.
 
 ## Workstreams
 
-| Workstream                         | Status      | Scope                                                                                                                           |
-| ---------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| Earlier simplification cycle       | Complete    | Presentation, admission, transition-state, diagnostics, naming, and dead-code cleanup described by the accepted baseline above. |
-| Explicit-ID agent handoff          | Implemented | Require `threadId`, resolve and authorize the full target on the server, and publish one discriminated terminal action.         |
-| Native atomic handoff              | Implemented | Consume the resolved target, drain and release Realtime, start Thread voice, and let React reconcile navigation from snapshots. |
-| Global native audio preference     | Implemented | Persist one route choice and apply it across Realtime, Thread voice, and one-shot dictation with non-destructive fallback.      |
-| Shared route controls              | Implemented | Keep the convenience selector in the Realtime bar and expose the same native preference in Voice Settings.                      |
-| Notification destination semantics | Implemented | Remove inferred current/last-Thread switching; notification controls remain state-derived and unambiguous.                      |
-| Contract and regression validation | Remaining   | Run focused server, shared-runtime, Android bridge/controller, audio-routing, and UI tests for the changed contracts.           |
-| Device validation and deployment   | Remaining   | Build exact committed source, install in place, and exercise the changed handoff and routing paths on the Pixel.                |
+| Workstream                         | Status   | Scope                                                                                                                          |
+| ---------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Accepted behavior baseline         | Complete | Explicit-ID handoff, atomic native switching, global route preference, shared controls, and unambiguous notifications.         |
+| As-built documentation correction  | Complete | Journal behavior and cleanup estimates now match measured production writers and code.                                         |
+| Duplicate contract/type removal    | Complete | Removed the dead public error, duplicate transcript, and duplicate native parsed-target shapes without compatibility aliases.  |
+| Mechanical native pruning          | Complete | Folded retained credential storage into its transfer owner while preserving and extending invariant tests.                     |
+| Typed context comparison           | Complete | Replaced serialization-based comparison with tested field-wise equality covering every current context field.                  |
+| Medium-risk architecture reduction | Deferred | Binder, WebRTC fencing, executors, shared media, route-release ownership, and server registry changes require separate slices. |
+| Final validation                   | Complete | Required repository gates, the native JVM suite, and the clean full repository test suite passed.                              |
 
 ## Remaining near-term work
 
-### 1. Focused automated coverage
+No further implementation is active in this cleanup batch. Choose and scope any next slice
+independently:
 
-- Prove that a missing, unknown, unauthorized, or ineligible `threadId` cannot publish a native
-  switch action.
-- Prove that the resolved target survives terminal-action serialization and starts the exact Thread
-  while React is detached.
-- Prove that React follows a completed native switch once without becoming a second transition
-  owner or continuously forcing navigation.
-- Cover preferred-route persistence, temporary device loss, system fallback without preference
-  deletion, and preference reapplication.
-- Cover route selection from both UI surfaces and application by all three native voice paths.
+1. Decide whether to prune unused server journal kinds and other reserved/speculative contracts.
+   Do not combine this API/compiler decision with native lifecycle work.
+2. If further native reduction is desired, start with one measured medium-risk area and preserve
+   its concurrency/lifecycle tests: binder lifecycle, WebRTC fencing, executor ownership, shared
+   media primitives, or route-release ownership.
+3. Consider React provider/hydration extraction only as a separate test-first maintainability
+   slice; it is not required for the accepted Android behavior.
 
-### 2. Repository gates
-
-- Run `vp check`.
-- Run `vp run typecheck`.
-- Run `vp run lint:mobile`.
-- Run focused voice suites and `vp test`.
-- Run the complete native JVM suite.
-
-### 3. Exact-revision deployment and device smoke test
-
-- Commit before building the server or APK.
-- Build and deploy the server and preview APK from that exact revision.
-- Verify APK package, signature, archive integrity, source revision, and checksum before installation.
-- Confirm that the route button remains available when Realtime is idle and matches Voice Settings.
-- Select routes from each UI surface and exercise one-shot dictation, Thread voice, and Realtime,
-  including temporary route unavailability where practical.
-- From Realtime, invoke `switch_to_thread_voice` with a non-visible Thread ID and confirm native
-  handoff plus subsequent UI reconciliation in foreground and background cases.
-- Confirm the notification offers no guessed Thread-switch action.
-
-### 4. Closeout
-
-- Reconcile this plan with observed device behavior and any fixes.
-- Mark validation and deployment complete only after their evidence exists.
-- Keep [voice.md](../docs/architecture/voice.md) limited to implemented behavior and move any
-  unapproved feature ideas to the roadmap.
+No new server or APK deployment is required for this batch because it changes internal
+representation, type reuse, comparisons, tests, and documentation without changing the accepted
+runtime behavior. If a later slice changes runtime behavior, commit first and deploy from that
+exact revision for focused device validation.
 
 ## Exclusions
 

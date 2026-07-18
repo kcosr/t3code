@@ -2,6 +2,7 @@ import {
   realtimeVoiceBarPhase,
   type ActiveVoiceRuntimeAttachment,
   type RealtimeVoiceBarPhase,
+  type VoiceRealtimeTranscriptTurn,
   type VoiceRuntimeSnapshot,
 } from "@t3tools/client-runtime/voice";
 import { ActivityIndicator, FlatList, Modal, Pressable, View } from "react-native";
@@ -12,11 +13,6 @@ import { SymbolView } from "../../components/AppSymbol";
 import { ControlPill } from "../../components/ControlPill";
 import { useThemeColor } from "../../lib/useThemeColor";
 import type { VoiceAudioRoutePreferenceController } from "./VoiceAudioRoutePreference";
-
-export interface RealtimeVoiceTranscriptTurn {
-  readonly role: "user" | "assistant";
-  readonly text: string;
-}
 
 function VoiceSheetHeader(props: {
   readonly title: string;
@@ -35,7 +31,7 @@ function VoiceSheetHeader(props: {
 
 export function VoiceTranscriptModal(props: {
   readonly visible: boolean;
-  readonly turns: ReadonlyArray<RealtimeVoiceTranscriptTurn>;
+  readonly turns: ReadonlyArray<VoiceRealtimeTranscriptTurn>;
   readonly onClose: () => void;
 }) {
   const insets = useSafeAreaInsets();
@@ -212,7 +208,7 @@ export function RealtimeVoiceCallBar(props: {
   readonly snapshot: VoiceRuntimeSnapshot;
   readonly controlsAvailable: boolean;
   readonly attachment: ActiveVoiceRuntimeAttachment | null;
-  readonly transcript: ReadonlyArray<RealtimeVoiceTranscriptTurn>;
+  readonly transcript: ReadonlyArray<VoiceRealtimeTranscriptTurn>;
   readonly onMute: () => void;
   readonly onRoute: () => void;
   readonly routeAvailable: boolean;
