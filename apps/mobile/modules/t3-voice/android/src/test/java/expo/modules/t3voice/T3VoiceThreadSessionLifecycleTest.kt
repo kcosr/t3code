@@ -306,6 +306,47 @@ internal class T3VoiceThreadSessionLifecycleTest {
   }
 
   @Test
+  fun `Ready CANCELLED still opens the recorder when the session is live`() {
+    val media = LifecycleMedia()
+    val arming = ScriptedCueArming(T3VoiceCueOutcome.CANCELLED)
+    val voice =
+      session(
+        generation = 1,
+        media = media,
+        api = LifecycleApi(),
+        emit = {},
+        onQuiesced = {},
+        cueArming = arming,
+      )
+
+    voice.start()
+    assertTrue(media.recordingStarted.await(1, TimeUnit.SECONDS))
+    assertEquals(1, arming.readyRequests.get())
+    voice.stop(reportStopped = true)
+  }
+
+  @Test
+  fun `Ready completion after stop does not open the recorder`() {
+    val media = LifecycleMedia()
+    val arming = DeferredCueArming()
+    val voice =
+      session(
+        generation = 1,
+        media = media,
+        api = LifecycleApi(),
+        emit = {},
+        onQuiesced = {},
+        cueArming = arming,
+      )
+
+    voice.start()
+    assertEquals(1, arming.readyRequests.get())
+    voice.stop(reportStopped = true)
+    arming.complete(T3VoiceCueOutcome.DRAINED)
+    assertFalse(media.recordingStarted.await(150, TimeUnit.MILLISECONDS))
+  }
+
+  @Test
   fun `stop waits for blocked response polling without publishing response`() {
     val api = BlockingPhaseApi(block = BlockingPhase.RESPONSE)
     val submitted = CountDownLatch(1)
@@ -342,6 +383,7 @@ internal class T3VoiceThreadSessionLifecycleTest {
     api: T3VoiceThreadSessionApi,
     emit: (T3VoiceRuntimeCallback) -> Unit,
     onQuiesced: (T3VoiceRuntimeCallback?) -> Unit,
+    cueArming: T3VoiceCueArming = NoOpCueArming,
   ): T3VoiceThreadSession =
     T3VoiceThreadSession(
       generation = generation,
@@ -350,8 +392,87 @@ internal class T3VoiceThreadSessionLifecycleTest {
       media = media,
       emit = emit,
       onQuiesced = onQuiesced,
+      cueArming = cueArming,
       api = api,
     )
+
+  private class ScriptedCueArming(
+    private val readyOutcome: T3VoiceCueOutcome,
+  ) : T3VoiceCueArming {
+    val readyRequests = AtomicInteger(0)
+
+    override fun isEnabled(): Boolean = true
+
+    override fun setEnabled(enabled: Boolean): T3VoiceCueSettings = T3VoiceCueSettings(enabled)
+
+    override fun settings(): T3VoiceCueSettings = T3VoiceCueSettings(enabled = true)
+
+    override fun requestReady(
+      generation: Long,
+      completion: (T3VoiceCueCompletion) -> Unit,
+    ): Boolean {
+      readyRequests.incrementAndGet()
+      completion(
+        T3VoiceCueCompletion(
+          generation = generation,
+          cue = T3VoiceCue.READY,
+          outcome = readyOutcome,
+        ),
+      )
+      return true
+    }
+
+    override fun requestEnded(generation: Long) = Unit
+
+    override fun cancel(generation: Long) = Unit
+
+    override fun cancelAll() = Unit
+
+    override fun release() = Unit
+  }
+
+  private class DeferredCueArming : T3VoiceCueArming {
+    val readyRequests = AtomicInteger(0)
+    private val pending = AtomicReference<((T3VoiceCueCompletion) -> Unit)?>(null)
+    private val generationRef = AtomicReference(0L)
+
+    override fun isEnabled(): Boolean = true
+
+    override fun setEnabled(enabled: Boolean): T3VoiceCueSettings = T3VoiceCueSettings(enabled)
+
+    override fun settings(): T3VoiceCueSettings = T3VoiceCueSettings(enabled = true)
+
+    override fun requestReady(
+      generation: Long,
+      completion: (T3VoiceCueCompletion) -> Unit,
+    ): Boolean {
+      readyRequests.incrementAndGet()
+      generationRef.set(generation)
+      pending.set(completion)
+      return true
+    }
+
+    fun complete(outcome: T3VoiceCueOutcome) {
+      val completion = checkNotNull(pending.getAndSet(null))
+      completion(
+        T3VoiceCueCompletion(
+          generation = generationRef.get(),
+          cue = T3VoiceCue.READY,
+          outcome = outcome,
+        ),
+      )
+    }
+
+    override fun requestEnded(generation: Long) = Unit
+
+    override fun cancel(generation: Long) {
+      complete(T3VoiceCueOutcome.CANCELLED)
+    }
+
+    override fun cancelAll() = Unit
+
+    override fun release() = Unit
+  }
 
   private class LifecycleMedia(
     private val finishAsNoInput: Boolean = false,
