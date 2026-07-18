@@ -355,6 +355,69 @@ export const OpenCodeSettings = makeProviderSettingsSchema(
 );
 export type OpenCodeSettings = typeof OpenCodeSettings.Type;
 
+export const PiProjectTrust = Schema.Literals(["inherit", "approve", "deny"]);
+export type PiProjectTrust = typeof PiProjectTrust.Type;
+
+export const PiSettings = makeProviderSettingsSchema(
+  {
+    enabled: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(true)),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+    binaryPath: makeBinaryPathSetting("pi").pipe(
+      Schema.annotateKey({
+        title: "Binary path",
+        description: "Path to the stock Pi binary (`pi --mode rpc`).",
+        providerSettingsForm: { placeholder: "pi", clearWhenEmpty: "omit" },
+      }),
+    ),
+    agentDir: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Agent directory",
+        description:
+          "Optional Pi configuration directory. Exported as PI_CODING_AGENT_DIR when set. Does not rewrite HOME.",
+        providerSettingsForm: {
+          placeholder: "~/.pi/agent",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    sessionDir: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Session directory",
+        description:
+          "Optional Pi session storage directory (--session-dir / PI_CODING_AGENT_SESSION_DIR).",
+        providerSettingsForm: {
+          placeholder: "~/.pi/agent/sessions",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    projectTrust: PiProjectTrust.pipe(
+      Schema.withDecodingDefault(Effect.succeed("inherit" as const satisfies PiProjectTrust)),
+      Schema.annotateKey({
+        title: "Project trust",
+        description:
+          "Whether project-local Pi resources (extensions, prompts, skills, themes) load in noninteractive mode. Does not control bash or file-tool approvals. Values: inherit, approve, deny.",
+        providerSettingsForm: {
+          placeholder: "inherit",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    customModels: Schema.Array(Schema.String).pipe(
+      Schema.withDecodingDefault(Effect.succeed([])),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+  },
+  {
+    order: ["binaryPath", "agentDir", "sessionDir", "projectTrust"],
+  },
+);
+export type PiSettings = typeof PiSettings.Type;
+
 export const ObservabilitySettings = Schema.Struct({
   otlpTracesUrl: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   otlpMetricsUrl: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
@@ -477,6 +540,7 @@ export const ServerSettings = Schema.Struct({
     cursor: CursorSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     grok: GrokSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     opencode: OpenCodeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+    piAgent: PiSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   // New driver-agnostic instance map. Keyed by `ProviderInstanceId`; values
   // are `ProviderInstanceConfig` envelopes. The driver-specific config blob
@@ -580,6 +644,15 @@ const OpenCodeSettingsPatch = Schema.Struct({
   customModels: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 
+const PiSettingsPatch = Schema.Struct({
+  enabled: Schema.optionalKey(Schema.Boolean),
+  binaryPath: Schema.optionalKey(TrimmedString),
+  agentDir: Schema.optionalKey(TrimmedString),
+  sessionDir: Schema.optionalKey(TrimmedString),
+  projectTrust: Schema.optionalKey(PiProjectTrust),
+  customModels: Schema.optionalKey(Schema.Array(Schema.String)),
+});
+
 export const ServerSettingsPatch = Schema.Struct({
   // Server settings
   enableAssistantStreaming: Schema.optionalKey(Schema.Boolean),
@@ -643,6 +716,7 @@ export const ServerSettingsPatch = Schema.Struct({
       cursor: Schema.optionalKey(CursorSettingsPatch),
       grok: Schema.optionalKey(GrokSettingsPatch),
       opencode: Schema.optionalKey(OpenCodeSettingsPatch),
+      piAgent: Schema.optionalKey(PiSettingsPatch),
     }),
   ),
   // Whole-map replacement for the new instance config. Patching individual

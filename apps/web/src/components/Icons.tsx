@@ -685,14 +685,27 @@ export const ACPRegistryIcon: Icon = ({ className, ...props }) => (
   </svg>
 );
 
+/**
+ * Pi coding-agent mark (same geometry as stock Pi / Synara).
+ * Uses currentColor so it tracks light/dark UI chrome like other provider icons.
+ */
 export const PiAgentIcon: Icon = ({ className, ...props }) => (
-  <svg {...props} viewBox="0 0 800 800" className={cn("fill-none", className)}>
-    <rect width="800" height="800" rx="160" fill="#000" />
+  <svg
+    {...props}
+    viewBox="0 0 800 800"
+    fill="none"
+    xmlns="http://www.w3.org/2000/svg"
+    className={cn(className)}
+  >
     <path
-      fill="#fff"
+      fill="currentColor"
       fillRule="evenodd"
-      d="M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65Z"
+      clipRule="evenodd"
+      d="M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29V165.29ZM282.65 282.65V400H400V282.65H282.65Z"
     />
-    <path fill="#fff" d="M517.36 400H634.72V634.72H517.36Z" />
+    <path fill="currentColor" d="M517.36 400H634.72V634.72H517.36V400Z" />
   </svg>
 );
+
+/** Alias matching Synara/upstream naming; same glyph as PiAgentIcon. */
+export const PiIcon = PiAgentIcon;
