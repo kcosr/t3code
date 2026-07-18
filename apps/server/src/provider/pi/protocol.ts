@@ -35,7 +35,9 @@ export const PiSessionStateSchema = Schema.Struct({
   steeringMode: Schema.optional(Schema.String),
   followUpMode: Schema.optional(Schema.String),
   sessionFile: Schema.optional(Schema.String),
-  sessionId: Schema.String,
+  // Optional so `--no-session` probes (model discovery / text gen) can still
+  // pass readiness when stock Pi omits a durable session id.
+  sessionId: Schema.optional(Schema.String),
   sessionName: Schema.optional(Schema.String),
   autoCompactionEnabled: Schema.optional(Schema.Boolean),
   messageCount: Schema.optional(Schema.Number),

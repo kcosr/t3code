@@ -4,6 +4,9 @@
  * @module PiAdapterLive
  */
 
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodePath from "node:path";
+
 import {
   ApprovalRequestId,
   type CanonicalItemType,
@@ -36,7 +39,6 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
-// Path/FileSystem are required by makePiSessionRuntime (resolveSpawnCommand).
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
@@ -124,6 +126,8 @@ interface PiSessionContext {
   activeTurnId: TurnId | undefined;
   activeMessage: ActiveMessageItem | undefined;
   readonly activeTools: Map<string, ActiveToolItem>;
+  /** Open context-compaction item awaiting compaction_end. */
+  activeCompactionItemId: string | undefined;
   /** One-shot warnings for TUI-only extension UI methods. */
   readonly unsupportedExtensionMethods: Set<string>;
   extensionLimitedBridgeWarned: boolean;
@@ -254,6 +258,16 @@ function extractToolTextResult(result: unknown): string | undefined {
   return boundText(result);
 }
 
+function isPathInsideDirectory(candidatePath: string, directory: string): boolean {
+  const resolvedCandidate = NodePath.resolve(candidatePath);
+  const resolvedDir = NodePath.resolve(directory);
+  if (resolvedCandidate === resolvedDir) {
+    return true;
+  }
+  const prefix = resolvedDir.endsWith(NodePath.sep) ? resolvedDir : `${resolvedDir}${NodePath.sep}`;
+  return resolvedCandidate.startsWith(prefix);
+}
+
 function parseResumeCursor(
   raw: unknown,
   sessionDir: string | undefined,
@@ -278,7 +292,7 @@ function parseResumeCursor(
   }
   if (sessionDir) {
     const expanded = expandHomePath(sessionDir);
-    if (!raw.sessionPath.startsWith(expanded)) {
+    if (!isPathInsideDirectory(raw.sessionPath, expanded)) {
       return Effect.fail(
         new ProviderAdapterValidationError({
           provider: PROVIDER,
@@ -417,13 +431,27 @@ export function makePiAdapter(piSettings: PiSettings, options?: PiAdapterLiveOpt
         ctx.pendingUserInputs.clear();
       });
 
-    const stopContext = (ctx: PiSessionContext, reason: string, recoverable: boolean) =>
+    const clearTurnLocalState = (ctx: PiSessionContext) => {
+      ctx.activeTurnId = undefined;
+      ctx.activeMessage = undefined;
+      ctx.activeTools.clear();
+      ctx.activeCompactionItemId = undefined;
+    };
+
+    const stopContext = (
+      ctx: PiSessionContext,
+      reason: string,
+      recoverable: boolean,
+      options?: { readonly interruptEventFiber?: boolean },
+    ) =>
       Effect.gen(function* () {
         if (ctx.stopped) {
           return;
         }
         ctx.stopped = true;
         ctx.generation += 1;
+        const eventFiber = ctx.eventFiber;
+        ctx.eventFiber = undefined;
         if (ctx.activeTurnId) {
           yield* publishRuntime({
             ...(yield* buildEventBase({ threadId: ctx.threadId, turnId: ctx.activeTurnId })),
@@ -433,14 +461,11 @@ export function makePiAdapter(piSettings: PiSettings, options?: PiAdapterLiveOpt
               errorMessage: reason,
             },
           }).pipe(Effect.ignore);
-          ctx.activeTurnId = undefined;
+          clearTurnLocalState(ctx);
         }
         yield* settlePendingAsCancelled(ctx);
-        if (ctx.eventFiber) {
-          yield* Fiber.interrupt(ctx.eventFiber).pipe(Effect.ignore);
-        }
-        yield* ctx.runtime.close.pipe(Effect.ignore);
-        yield* Scope.close(ctx.scope, Exit.void).pipe(Effect.ignore);
+        // Emit session.exited and close resources before any event-fiber interrupt so a
+        // process_exit handler running ON that fiber still finishes map removal + teardown.
         yield* publishRuntime({
           ...(yield* buildEventBase({ threadId: ctx.threadId })),
           type: "session.exited",
@@ -450,6 +475,13 @@ export function makePiAdapter(piSettings: PiSettings, options?: PiAdapterLiveOpt
             exitKind: recoverable ? "error" : "graceful",
           },
         }).pipe(Effect.ignore);
+        yield* ctx.runtime.close.pipe(Effect.ignore);
+        yield* Scope.close(ctx.scope, Exit.void).pipe(Effect.ignore);
+        // Never interrupt the currently-running event drain fiber (process_exit path).
+        // The stream ends after process exit; stopSession/stopAll may interrupt from outside.
+        if (options?.interruptEventFiber !== false && eventFiber) {
+          yield* Fiber.interrupt(eventFiber).pipe(Effect.ignore);
+        }
       });
 
     const handleNativeEvent = (ctx: PiSessionContext, event: PiRuntimeNativeEvent) =>
@@ -473,6 +505,7 @@ export function makePiAdapter(piSettings: PiSettings, options?: PiAdapterLiveOpt
                 ctx,
                 typeof event.detail === "string" ? event.detail : "Pi process exited",
                 true,
+                { interruptEventFiber: false },
               );
               return next;
             }),
@@ -532,9 +565,7 @@ export function makePiAdapter(piSettings: PiSettings, options?: PiAdapterLiveOpt
                   reason === "aborted"
                     ? { state: "interrupted" as const, stopReason: "aborted" as const }
                     : classifyPiTurnFailure(message);
-                ctx.activeTurnId = undefined;
-                ctx.activeMessage = undefined;
-                ctx.activeTools.clear();
+                clearTurnLocalState(ctx);
                 ctx.session = {
                   ...ctx.session,
                   status: "ready",
@@ -710,6 +741,7 @@ export function makePiAdapter(piSettings: PiSettings, options?: PiAdapterLiveOpt
           }
           case "compaction_start": {
             const itemId = `pi-compact-${yield* randomUUIDv4}`;
+            ctx.activeCompactionItemId = itemId;
             yield* publishRuntime({
               ...(yield* buildEventBase({
                 threadId: ctx.threadId,
@@ -732,10 +764,13 @@ export function makePiAdapter(piSettings: PiSettings, options?: PiAdapterLiveOpt
             const aborted = event.aborted === true;
             const failed =
               !aborted && event.result == null && typeof event.errorMessage === "string";
+            const compactionItemId = ctx.activeCompactionItemId;
+            ctx.activeCompactionItemId = undefined;
             yield* publishRuntime({
               ...(yield* buildEventBase({
                 threadId: ctx.threadId,
                 turnId,
+                ...(compactionItemId ? { itemId: compactionItemId } : {}),
                 raw: event,
                 method: type,
               })),
@@ -771,13 +806,13 @@ export function makePiAdapter(piSettings: PiSettings, options?: PiAdapterLiveOpt
             break;
           }
           case "auto_retry_end": {
-            if (event.success === false && turnId) {
+            if (event.success === false && turnId && ctx.activeTurnId === turnId) {
               const message =
                 typeof event.finalError === "string"
                   ? event.finalError
                   : "Pi automatic retry exhausted.";
               const classification = classifyPiTurnFailure(message);
-              ctx.activeTurnId = undefined;
+              clearTurnLocalState(ctx);
               ctx.session = {
                 ...ctx.session,
                 status: "ready",
@@ -824,9 +859,7 @@ export function makePiAdapter(piSettings: PiSettings, options?: PiAdapterLiveOpt
           case "agent_end": {
             // message_update error may have already completed the turn.
             if (!turnId || ctx.activeTurnId !== turnId) break;
-            ctx.activeTurnId = undefined;
-            ctx.activeMessage = undefined;
-            ctx.activeTools.clear();
+            clearTurnLocalState(ctx);
             ctx.session = {
               ...ctx.session,
               status: "ready",
@@ -1256,6 +1289,7 @@ export function makePiAdapter(piSettings: PiSettings, options?: PiAdapterLiveOpt
           activeTurnId: undefined,
           activeMessage: undefined,
           activeTools: new Map(),
+          activeCompactionItemId: undefined,
           unsupportedExtensionMethods: new Set(),
           extensionLimitedBridgeWarned: false,
           generation: 0,
@@ -1376,16 +1410,6 @@ export function makePiAdapter(piSettings: PiSettings, options?: PiAdapterLiveOpt
             yield* ctx.runtime
               .setThinkingLevel(effectiveThinking)
               .pipe(Effect.mapError((error) => mapPiRuntimeError(error, operation, ctx.threadId)));
-            const verified = yield* ctx.runtime
-              .getState()
-              .pipe(Effect.mapError((error) => mapPiRuntimeError(error, operation, ctx.threadId)));
-            if (
-              verified.thinkingLevel &&
-              verified.thinkingLevel !== effectiveThinking &&
-              isPiThinkingLevel(verified.thinkingLevel)
-            ) {
-              // Pi may clamp further; accept the reported level.
-            }
           }
         }
 

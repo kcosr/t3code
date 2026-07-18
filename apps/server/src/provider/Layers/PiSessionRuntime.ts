@@ -579,12 +579,18 @@ export function makePiSessionRuntime(
               }),
           ),
         );
-        if (!stateResult.sessionId?.trim()) {
+        // Durable coding sessions must report a session id. Ephemeral
+        // `--no-session` probes (model discovery / utility text gen) may not.
+        if (!options.spawn.noSession && !stateResult.sessionId?.trim()) {
           return yield* new PiSessionRuntimeStateError({
             detail: "Pi get_state returned an empty session id.",
           });
         }
-        if (options.expectedSessionId && stateResult.sessionId !== options.expectedSessionId) {
+        if (
+          options.expectedSessionId &&
+          stateResult.sessionId &&
+          stateResult.sessionId !== options.expectedSessionId
+        ) {
           return yield* new PiSessionRuntimeStateError({
             detail: `Pi session id mismatch: expected '${options.expectedSessionId}', got '${stateResult.sessionId}'.`,
           });
@@ -677,12 +683,17 @@ export function makePiSessionRuntime(
       },
       start,
       getState,
+      // Prompt ack is acceptance, not turn completion (events carry the rest).
+      // Keep a generous bound so slow accept under load does not abort live work.
       prompt: (input) =>
-        command({
-          type: "prompt",
-          message: input.message,
-          ...(input.images && input.images.length > 0 ? { images: input.images } : {}),
-        }).pipe(Effect.asVoid),
+        command(
+          {
+            type: "prompt",
+            message: input.message,
+            ...(input.images && input.images.length > 0 ? { images: input.images } : {}),
+          },
+          Duration.seconds(120),
+        ).pipe(Effect.asVoid),
       abort: () => command({ type: "abort" }, Duration.seconds(5)).pipe(Effect.asVoid),
       setModel: (provider, modelId) => command({ type: "set_model", provider, modelId }),
       setThinkingLevel: (level) =>
@@ -764,14 +775,20 @@ export function makePiSessionRuntime(
         Effect.gen(function* () {
           const state = (yield* Ref.get(stateRef)) ?? (yield* getState());
           const sessionPath = state.sessionFile?.trim();
+          const sessionId = state.sessionId?.trim();
           if (!sessionPath) {
             return yield* new PiSessionRuntimeStateError({
               detail: "Pi session has no session file path for resume cursor.",
             });
           }
+          if (!sessionId) {
+            return yield* new PiSessionRuntimeStateError({
+              detail: "Pi session has no session id for resume cursor.",
+            });
+          }
           return {
             version: 1 as const,
-            sessionId: state.sessionId,
+            sessionId,
             sessionPath,
             cwd: options.spawn.cwd,
           } satisfies PiResumeCursor;
