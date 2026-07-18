@@ -8,6 +8,21 @@ import org.junit.Test
 
 class T3VoiceDiagnosticRingTest {
   @Test
+  fun processDiagnosticsRemainUsableWithoutAnAndroidRuntime() {
+    T3VoiceDiagnostics.record(
+      generation = 1,
+      category = T3VoiceDiagnosticCategory.STATE,
+      code = T3VoiceDiagnosticCode.AUDIO_CLAIM_ACQUIRED,
+    )
+
+    assertTrue(
+      T3VoiceDiagnostics.snapshot().any {
+        it["generation"] == 1L && it["code"] == "audio-claim-acquired"
+      },
+    )
+  }
+
+  @Test
   fun rotatesAtCapacityAndRetainsNewestEntries() {
     var now = 100L
     val ring = T3VoiceDiagnosticRing(capacity = 3, clock = { now++ })

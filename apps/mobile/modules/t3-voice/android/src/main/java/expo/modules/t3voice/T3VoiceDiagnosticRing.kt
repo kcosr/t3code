@@ -1,6 +1,7 @@
 package expo.modules.t3voice
 
 import android.os.SystemClock
+import java.util.concurrent.TimeUnit
 
 internal enum class T3VoiceDiagnosticCategory {
   LIFECYCLE,
@@ -86,7 +87,7 @@ internal data class T3VoiceDiagnosticEntry(
 
 internal class T3VoiceDiagnosticRing(
   private val capacity: Int = DEFAULT_CAPACITY,
-  private val clock: () -> Long = SystemClock::elapsedRealtime,
+  private val clock: () -> Long = ::monotonicElapsedRealtimeMillis,
   initialGeneration: Long = 0,
 ) {
   private val entries = ArrayDeque<T3VoiceDiagnosticEntry>(capacity)
@@ -163,6 +164,15 @@ internal class T3VoiceDiagnosticRing(
     internal const val MAX_COUNTER = 1_000_000
   }
 }
+
+/**
+ * Android's local-JVM stub throws when [SystemClock.elapsedRealtime] is called outside a device.
+ * Diagnostics are best-effort and must never stop the voice state machine, so retain the Android
+ * clock in production and use the JVM's monotonic clock when the platform clock is unavailable.
+ */
+private fun monotonicElapsedRealtimeMillis(): Long =
+  runCatching { SystemClock.elapsedRealtime() }
+    .getOrElse { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
 
 internal object T3VoiceDiagnostics {
   private val ring = T3VoiceDiagnosticRing()
