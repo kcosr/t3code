@@ -8,7 +8,6 @@ import {
   type ModelCapabilities,
   type PiSettings,
   ProviderDriverKind,
-  type ServerProvider,
   type ServerProviderModel,
 } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";

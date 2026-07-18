@@ -56,7 +56,6 @@ import {
   isValidPiSessionId,
   parsePiModelSlug,
   preferPiSessionIdFromThreadId,
-  type PiThinkingLevel,
 } from "../pi/modelSlug.ts";
 import { isPiExtensionUiRequest, isPiResumeCursor, type PiResumeCursor } from "../pi/protocol.ts";
 import { classifyPiTurnFailure } from "../pi/turnFailure.ts";

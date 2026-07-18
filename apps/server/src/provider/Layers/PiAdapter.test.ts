@@ -1,12 +1,12 @@
 // @effect-diagnostics nodeBuiltinImport:off
 /**
  * PiAdapter lifecycle tests via the `makeRuntime` seam (no real Pi binary).
- * Uses plain vitest + Effect.runPromise so the suite stays independent of
- * @effect/vitest layer helpers.
+ * Uses @effect/vitest so every test is supervised by the test runtime.
  */
 import * as NodeAssert from "node:assert/strict";
 import * as NodePath from "node:path";
 
+import { afterEach, describe, it, vi } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   PiSettings,
@@ -23,7 +23,6 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import { afterEach, describe, it, vi } from "vitest";
 
 import { ServerConfig } from "../../config.ts";
 import { ProviderAdapterSessionNotFoundError, ProviderAdapterValidationError } from "../Errors.ts";
@@ -49,7 +48,7 @@ const defaultSessionState = (spawnCwd: string): PiSessionState => ({
 });
 
 class FakePiRuntime implements PiSessionRuntimeShape {
-  private readonly eventQueue = Effect.runSync(Queue.unbounded<PiRuntimeNativeEvent>());
+  private readonly eventQueue: Queue.Queue<PiRuntimeNativeEvent>;
   private state: PiSessionState;
 
   public readonly startImpl = vi.fn(() => Promise.resolve(this.state));
@@ -90,8 +89,9 @@ class FakePiRuntime implements PiSessionRuntimeShape {
 
   readonly options: PiSessionRuntimeOptions;
 
-  constructor(options: PiSessionRuntimeOptions) {
+  constructor(options: PiSessionRuntimeOptions, eventQueue: Queue.Queue<PiRuntimeNativeEvent>) {
     this.options = options;
+    this.eventQueue = eventQueue;
     this.state = defaultSessionState(options.spawn.cwd);
     if (options.expectedSessionId) {
       this.state = { ...this.state, sessionId: options.expectedSessionId };
@@ -178,11 +178,14 @@ class FakePiRuntime implements PiSessionRuntimeShape {
 
 function makeRuntimeFactory() {
   const runtimes: Array<FakePiRuntime> = [];
-  const factory = vi.fn((options: PiSessionRuntimeOptions) => {
-    const runtime = new FakePiRuntime(options);
-    runtimes.push(runtime);
-    return Effect.succeed(runtime);
-  });
+  const factory = vi.fn((options: PiSessionRuntimeOptions) =>
+    Effect.gen(function* () {
+      const eventQueue = yield* Queue.unbounded<PiRuntimeNativeEvent>();
+      const runtime = new FakePiRuntime(options, eventQueue);
+      runtimes.push(runtime);
+      return runtime;
+    }),
+  );
 
   return {
     factory,
@@ -226,15 +229,15 @@ function collectUntil(
   });
 }
 
-async function withAdapter<A>(
+function withAdapter<A, E>(
   runtimeFactory: ReturnType<typeof makeRuntimeFactory>,
   body: (
     adapter: PiAdapterShape,
     runtimeFactory: ReturnType<typeof makeRuntimeFactory>,
-  ) => Effect.Effect<A>,
+  ) => Effect.Effect<A, E>,
   settings: Record<string, unknown> = {},
-): Promise<A> {
-  const program = Effect.scoped(
+): Effect.Effect<A> {
+  return Effect.scoped(
     Effect.gen(function* () {
       const adapter = yield* makePiAdapter(
         decodePiSettings({
@@ -247,22 +250,20 @@ async function withAdapter<A>(
       );
       return yield* body(adapter, runtimeFactory);
     }),
-  ).pipe(Effect.provide(envLayer));
-
-  return Effect.runPromise(program);
+  ).pipe(Effect.provide(envLayer), Effect.orDie);
 }
 
 describe("PiAdapterLive validation", () => {
-  it("rejects non full-access runtime modes", async () => {
+  it.live("rejects non full-access runtime modes", () => {
     const runtimeFactory = makeRuntimeFactory();
-    await withAdapter(runtimeFactory, (adapter) =>
+    return withAdapter(runtimeFactory, (adapter) =>
       Effect.gen(function* () {
         const result = yield* adapter
           .startSession({
             provider: ProviderDriverKind.make("piAgent"),
             threadId: asThreadId("thread-sandbox"),
             cwd: process.cwd(),
-            runtimeMode: "workspace-write",
+            runtimeMode: "approval-required",
           })
           .pipe(Effect.result);
 
@@ -275,9 +276,9 @@ describe("PiAdapterLive validation", () => {
     );
   });
 
-  it("requires a working directory", async () => {
+  it.live("requires a working directory", () => {
     const runtimeFactory = makeRuntimeFactory();
-    await withAdapter(runtimeFactory, (adapter) =>
+    return withAdapter(runtimeFactory, (adapter) =>
       Effect.gen(function* () {
         const result = yield* adapter
           .startSession({
@@ -301,9 +302,9 @@ describe("PiAdapterLive validation", () => {
     );
   });
 
-  it("rejects explicit approvalPolicy and sandboxMode", async () => {
+  it.live("rejects explicit approvalPolicy and sandboxMode", () => {
     const runtimeFactory = makeRuntimeFactory();
-    await withAdapter(runtimeFactory, (adapter) =>
+    return withAdapter(runtimeFactory, (adapter) =>
       Effect.gen(function* () {
         const result = yield* adapter
           .startSession({
@@ -323,9 +324,9 @@ describe("PiAdapterLive validation", () => {
     );
   });
 
-  it("rejects resume session paths outside the configured session directory", async () => {
+  it.live("rejects resume session paths outside the configured session directory", () => {
     const runtimeFactory = makeRuntimeFactory();
-    await withAdapter(runtimeFactory, (adapter) =>
+    return withAdapter(runtimeFactory, (adapter) =>
       Effect.gen(function* () {
         const result = yield* adapter
           .startSession({
@@ -357,9 +358,9 @@ describe("PiAdapterLive validation", () => {
     );
   });
 
-  it("maps missing sessions to ProviderAdapterSessionNotFoundError", async () => {
+  it.live("maps missing sessions to ProviderAdapterSessionNotFoundError", () => {
     const runtimeFactory = makeRuntimeFactory();
-    await withAdapter(runtimeFactory, (adapter) =>
+    return withAdapter(runtimeFactory, (adapter) =>
       Effect.gen(function* () {
         const result = yield* adapter
           .sendTurn({
@@ -388,9 +389,9 @@ describe("PiAdapterLive lifecycle", () => {
     vi.clearAllMocks();
   });
 
-  it("starts a session, emits lifecycle events, and exposes resume cursor", async () => {
+  it.live("starts a session, emits lifecycle events, and exposes resume cursor", () => {
     const runtimeFactory = makeRuntimeFactory();
-    await withAdapter(runtimeFactory, (adapter) =>
+    return withAdapter(runtimeFactory, (adapter) =>
       Effect.gen(function* () {
         const threadId = asThreadId("thread-start");
         const collector = yield* collectUntil(
@@ -422,9 +423,9 @@ describe("PiAdapterLive lifecycle", () => {
           "pi-session-1",
         );
 
-        const types = collector.events.map((event) => event.type);
-        NodeAssert.ok(types.includes("session.started"));
-        NodeAssert.ok(types.includes("thread.started"));
+        const types = new Set(collector.events.map((event) => event.type));
+        NodeAssert.ok(types.has("session.started"));
+        NodeAssert.ok(types.has("thread.started"));
 
         const runtime = runtimeFactory.lastRuntime;
         NodeAssert.ok(runtime);
@@ -436,9 +437,9 @@ describe("PiAdapterLive lifecycle", () => {
     );
   });
 
-  it("accepts resume cursors whose session path is inside sessionDir", async () => {
+  it.live("accepts resume cursors whose session path is inside sessionDir", () => {
     const runtimeFactory = makeRuntimeFactory();
-    await withAdapter(runtimeFactory, (adapter) =>
+    return withAdapter(runtimeFactory, (adapter) =>
       Effect.gen(function* () {
         const threadId = asThreadId("thread-resume-inside");
         const sessionPath = NodePath.join(sessionDir, "nested", "resume.jsonl");
@@ -471,9 +472,9 @@ describe("PiAdapterLive lifecycle", () => {
     );
   });
 
-  it("maps prompt + native message events through a full turn", async () => {
+  it.live("maps prompt + native message events through a full turn", () => {
     const runtimeFactory = makeRuntimeFactory();
-    await withAdapter(runtimeFactory, (adapter) =>
+    return withAdapter(runtimeFactory, (adapter) =>
       Effect.gen(function* () {
         const threadId = asThreadId("thread-turn");
 
@@ -512,12 +513,12 @@ describe("PiAdapterLive lifecycle", () => {
         yield* collector.await;
         yield* collector.interrupt;
 
-        const types = collector.events.map((event) => event.type);
-        NodeAssert.ok(types.includes("turn.started"));
-        NodeAssert.ok(types.includes("item.started"));
-        NodeAssert.ok(types.includes("content.delta"));
-        NodeAssert.ok(types.includes("item.completed"));
-        NodeAssert.ok(types.includes("turn.completed"));
+        const types = new Set(collector.events.map((event) => event.type));
+        NodeAssert.ok(types.has("turn.started"));
+        NodeAssert.ok(types.has("item.started"));
+        NodeAssert.ok(types.has("content.delta"));
+        NodeAssert.ok(types.has("item.completed"));
+        NodeAssert.ok(types.has("turn.completed"));
 
         const delta = collector.events.find((event) => event.type === "content.delta");
         NodeAssert.ok(delta);
@@ -542,9 +543,9 @@ describe("PiAdapterLive lifecycle", () => {
     );
   });
 
-  it("correlates compaction_start and compaction_end with the same itemId", async () => {
+  it.live("correlates compaction_start and compaction_end with the same itemId", () => {
     const runtimeFactory = makeRuntimeFactory();
-    await withAdapter(runtimeFactory, (adapter) =>
+    return withAdapter(runtimeFactory, (adapter) =>
       Effect.gen(function* () {
         const threadId = asThreadId("thread-compaction");
 
@@ -592,9 +593,9 @@ describe("PiAdapterLive lifecycle", () => {
     );
   });
 
-  it("tears down on process_exit without hanging (session.exited + close + drop)", async () => {
+  it.live("tears down on process_exit without hanging (session.exited + close + drop)", () => {
     const runtimeFactory = makeRuntimeFactory();
-    await withAdapter(runtimeFactory, (adapter) =>
+    return withAdapter(runtimeFactory, (adapter) =>
       Effect.gen(function* () {
         const threadId = asThreadId("thread-process-exit");
         const collector = yield* collectUntil(
@@ -634,7 +635,9 @@ describe("PiAdapterLive lifecycle", () => {
         if (exited?.type === "session.exited") {
           NodeAssert.equal(exited.payload.recoverable, true);
           NodeAssert.equal(exited.payload.exitKind, "error");
-          NodeAssert.match(exited.payload.reason, /exited unexpectedly/);
+          const reason = exited.payload.reason;
+          NodeAssert.ok(reason);
+          NodeAssert.match(reason, /exited unexpectedly/);
         }
 
         const stopResult = yield* adapter.stopSession(threadId).pipe(Effect.result);
@@ -646,9 +649,9 @@ describe("PiAdapterLive lifecycle", () => {
     );
   });
 
-  it("interrupts an active turn on process_exit before session.exited", async () => {
+  it.live("interrupts an active turn on process_exit before session.exited", () => {
     const runtimeFactory = makeRuntimeFactory();
-    await withAdapter(runtimeFactory, (adapter) =>
+    return withAdapter(runtimeFactory, (adapter) =>
       Effect.gen(function* () {
         const threadId = asThreadId("thread-exit-mid-turn");
         const collector = yield* collectUntil(
@@ -701,9 +704,9 @@ describe("PiAdapterLive lifecycle", () => {
     );
   });
 
-  it("stopSession closes the runtime and removes the session", async () => {
+  it.live("stopSession closes the runtime and removes the session", () => {
     const runtimeFactory = makeRuntimeFactory();
-    await withAdapter(runtimeFactory, (adapter) =>
+    return withAdapter(runtimeFactory, (adapter) =>
       Effect.gen(function* () {
         const threadId = asThreadId("thread-stop");
 
@@ -726,9 +729,9 @@ describe("PiAdapterLive lifecycle", () => {
     );
   });
 
-  it("applies idle model selection on sendTurn when instance matches", async () => {
+  it.live("applies idle model selection on sendTurn when instance matches", () => {
     const runtimeFactory = makeRuntimeFactory();
-    await withAdapter(runtimeFactory, (adapter) =>
+    return withAdapter(runtimeFactory, (adapter) =>
       Effect.gen(function* () {
         const threadId = asThreadId("thread-model");
 
