@@ -45,14 +45,17 @@ class T3VoiceRuntimeService : Service() {
 
     fun runtimeSnapshot(): T3VoiceControllerSnapshot = semanticController.snapshot()
 
+    val audioRoutePreferences: StateFlow<T3VoiceAudioRoutePreference>
+      get() = semanticDriver.audioRoutePreferences
+
     fun dispatchRuntime(command: T3VoiceRuntimeCommand): T3VoiceCommandResult =
       dispatchSemanticCommand(command)
 
     fun audioRoutePreference(): Map<String, Any?> =
       semanticDriver.audioRoutePreference().toResultBody()
 
-    fun setAudioRoutePreference(routeId: String): Map<String, Any?> =
-      semanticDriver.setAudioRoutePreference(routeId).toResultBody()
+    fun setAudioRoutePreference(route: String): Map<String, Any?> =
+      semanticDriver.setAudioRoutePreference(route).toResultBody()
 
     val events: SharedFlow<T3VoiceRuntimeEvent>
       get() = T3VoiceStateStore.events

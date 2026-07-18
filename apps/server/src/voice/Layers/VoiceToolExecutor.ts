@@ -28,7 +28,6 @@ import {
   VoiceToolCallId,
   VoiceToolName,
   VoiceTerminalActionRequest,
-  type VoiceTerminalAction,
   type OrchestrationProjectShell,
   type OrchestrationThreadShell,
   type VoiceConversationId,
@@ -64,11 +63,15 @@ import { VoiceError } from "../Errors.ts";
 import { VoiceConversationService } from "../Services/VoiceConversationService.ts";
 import {
   VoiceToolExecutor,
+  isTerminalVoiceTool,
+  terminalActionForVoiceTool,
+  type TerminalVoiceTool,
   type VoiceToolCallInput,
   type VoiceToolCompletedResult,
   type VoiceToolExecutionResult,
   type VoiceToolExecutorShape,
   type VoiceToolInvokeResult,
+  type VoiceToolTerminalResult,
 } from "../Services/VoiceToolExecutor.ts";
 
 const CONFIRMATION_TTL_MILLIS = 30_000;
@@ -393,11 +396,6 @@ const boundedHistoryOutput = (value: Record<string, unknown>) => {
 const deterministicId = (prefix: string, input: VoiceToolCallInput) =>
   `${prefix}:${input.conversationId}:${input.toolCallId}`;
 
-type TerminalVoiceTool = "stop_realtime_voice" | "switch_to_thread_voice";
-
-const terminalActionForTool = (tool: TerminalVoiceTool): VoiceTerminalAction =>
-  tool === "stop_realtime_voice" ? "stop-realtime" : "switch-to-thread";
-
 const terminalActionId = (input: {
   readonly sessionId: VoiceSessionId;
   readonly conversationId: VoiceConversationId;
@@ -688,7 +686,7 @@ const make = Effect.gen(function* () {
       outcome: "succeeded",
       output: jsonOutput({ status: "accepted", terminalAction }),
       terminalAction,
-    };
+    } satisfies VoiceToolTerminalResult;
   });
 
   const prepareMutation = Effect.fn("VoiceToolExecutor.prepareMutation")(function* (
@@ -1013,12 +1011,12 @@ const make = Effect.gen(function* () {
     submitOutput: boolean,
   ): VoiceToolExecutionResult => {
     if (
-      (call.toolName === "stop_realtime_voice" || call.toolName === "switch_to_thread_voice") &&
+      isTerminalVoiceTool(call.toolName) &&
       call.status === "succeeded" &&
       call.resultOutput !== null
     ) {
       const persisted = decodePersistedTerminalResult(call.resultOutput);
-      const expectedAction = terminalActionForTool(call.toolName);
+      const expectedAction = terminalActionForVoiceTool(call.toolName);
       const expectedActionId = terminalActionId({ ...call, name: call.toolName });
       if (
         Option.isSome(persisted) &&

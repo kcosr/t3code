@@ -38,6 +38,7 @@ class T3VoiceModule : Module() {
     )
   private val pendingBinderOperations = T3VoiceBinderOperationRegistry<PendingBinderOperation>()
   private var runtimeSnapshotCollection: Job? = null
+  private var audioRoutePreferenceCollection: Job? = null
   private var eventCollection: Job? = null
   private var recordingTerminationCollection: Job? = null
   private var playbackTerminationCollection: Job? = null
@@ -88,6 +89,13 @@ class T3VoiceModule : Module() {
           appContext.mainQueue.launch {
             connectedBinder.runtimeSnapshots.collectLatest { snapshot ->
               sendEvent(RUNTIME_SNAPSHOT_CHANGED_EVENT, snapshot.toBridgeBody())
+            }
+          }
+        audioRoutePreferenceCollection?.cancel()
+        audioRoutePreferenceCollection =
+          appContext.mainQueue.launch {
+            connectedBinder.audioRoutePreferences.collectLatest { preference ->
+              sendEvent(AUDIO_ROUTE_PREFERENCE_CHANGED_EVENT, preference.toResultBody())
             }
           }
         eventCollection?.cancel()
@@ -150,6 +158,7 @@ class T3VoiceModule : Module() {
       Name(MODULE_NAME)
       Events(
         RUNTIME_SNAPSHOT_CHANGED_EVENT,
+        AUDIO_ROUTE_PREFERENCE_CHANGED_EVENT,
         PLAYBACK_CHUNK_CONSUMED_EVENT,
         PLAYBACK_TERMINATED_EVENT,
         RECORDING_TERMINATED_EVENT,
@@ -157,7 +166,7 @@ class T3VoiceModule : Module() {
       )
 
       Constants(
-        "nativeRevision" to 12,
+        "nativeRevision" to 13,
       )
 
       OnCreate {
@@ -246,10 +255,10 @@ class T3VoiceModule : Module() {
 
       AsyncFunction("setAudioRoutePreferenceAsync") {
         input: Map<String, Any?>, promise: Promise ->
-        input.requireExactBridgeKeys("audio route input", setOf("routeId"))
+        input.requireExactBridgeKeys("audio route input", setOf("route"))
         withBinder(promise, "audio-route-preference-write-failed") { voice, result ->
           result.resolve(
-            voice.setAudioRoutePreference(input.requireBridgeArgumentIdentifier("routeId")),
+            voice.setAudioRoutePreference(input.requireBridgeArgumentIdentifier("route")),
           )
         }
       }
@@ -745,6 +754,8 @@ class T3VoiceModule : Module() {
   private fun cancelCollections() {
     runtimeSnapshotCollection?.cancel()
     runtimeSnapshotCollection = null
+    audioRoutePreferenceCollection?.cancel()
+    audioRoutePreferenceCollection = null
     eventCollection?.cancel()
     eventCollection = null
     recordingTerminationCollection?.cancel()
@@ -756,6 +767,7 @@ class T3VoiceModule : Module() {
   companion object {
     private const val MODULE_NAME = "T3Voice"
     private const val RUNTIME_SNAPSHOT_CHANGED_EVENT = "runtimeSnapshotChanged"
+    private const val AUDIO_ROUTE_PREFERENCE_CHANGED_EVENT = "audioRoutePreferenceChanged"
     private const val PLAYBACK_CHUNK_CONSUMED_EVENT = "playbackChunkConsumed"
     private const val PLAYBACK_TERMINATED_EVENT = "playbackTerminated"
     private const val RECORDING_TERMINATED_EVENT = "recordingTerminated"

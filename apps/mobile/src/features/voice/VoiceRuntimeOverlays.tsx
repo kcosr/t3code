@@ -90,7 +90,7 @@ export function VoiceAudioRoutePicker(props: {
   const iconColor = useThemeColor("--color-icon");
   const routes = props.controller.state?.routes ?? [];
   const loading = props.controller.loading && props.controller.state === null;
-  const selectionInFlight = props.controller.selectingRouteId !== null;
+  const selectionInFlight = props.controller.selectingRoute !== null;
   return (
     <Modal
       animationType="slide"
@@ -121,7 +121,7 @@ export function VoiceAudioRoutePicker(props: {
         ) : (
           <FlatList
             data={routes}
-            keyExtractor={(route) => route.id}
+            keyExtractor={(route) => route.kind}
             contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 24 }}
             ListHeaderComponent={
               props.controller.error || props.controller.statusMessage ? (
@@ -143,13 +143,14 @@ export function VoiceAudioRoutePicker(props: {
               </Text>
             }
             renderItem={({ item }) => {
-              const selecting = props.controller.selectingRouteId === item.id;
-              const active = props.controller.state?.activeRouteId === item.id;
+              const selecting = props.controller.selectingRoute === item.kind;
+              const preferred = props.controller.state?.preferredRoute === item.kind;
+              const active = props.controller.state?.activeRoute === item.kind;
               return (
                 <Pressable
                   accessibilityRole="radio"
                   accessibilityState={{
-                    checked: item.selected,
+                    checked: preferred,
                     disabled: selectionInFlight,
                   }}
                   accessibilityLabel={item.label}
@@ -172,7 +173,7 @@ export function VoiceAudioRoutePicker(props: {
                       accessibilityLabel={`Selecting ${item.label}`}
                       color={iconColor}
                     />
-                  ) : item.selected ? (
+                  ) : preferred ? (
                     <SymbolView
                       name="checkmark"
                       size={20}

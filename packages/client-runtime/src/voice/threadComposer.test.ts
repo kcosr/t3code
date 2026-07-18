@@ -111,7 +111,6 @@ describe("Thread voice composer state", () => {
         threadSettings: null,
       },
       muted: false,
-      audioRoutes: [],
       transcript: [],
       pendingConfirmations: [],
       pendingClientActions: [],

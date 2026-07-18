@@ -23,6 +23,7 @@ import { canStartComposerDictation } from "./dictationAdmission";
 import { ensureMicrophonePermission } from "./microphonePermission";
 import { releaseRecordingForRealtime } from "./traditionalAudioHandoff";
 import type { ResolvedVoicePreferences } from "./voicePreferences";
+import { voiceErrorMessage as errorMessage } from "./voiceError";
 
 export type ComposerDictationPhase = "idle" | "recording" | "transcribing";
 
@@ -39,9 +40,6 @@ export interface ComposerRecordingTerminationEvent {
   readonly outcome: "cancelled" | "failed";
   readonly reason: "no-speech" | "finalization-failed";
 }
-
-const errorMessage = (cause: unknown): string =>
-  cause instanceof Error ? cause.message : String(cause);
 
 export function useComposerDictation(input: {
   readonly environmentId: Parameters<typeof usePreparedConnection>[0];

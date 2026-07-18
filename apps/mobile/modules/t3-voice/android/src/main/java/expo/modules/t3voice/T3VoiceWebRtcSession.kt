@@ -66,7 +66,6 @@ private enum class T3VoiceRealtimePlayoutDrainOutcome {
 internal class T3VoiceWebRtcSession(
   context: Context,
   private val onStateChanged: (String, String, Boolean) -> Unit,
-  private val onRouteChanged: (String, T3VoiceAudioRouteChange) -> Unit,
   private val onError: (String, String, String, Boolean) -> Unit,
   private val onTerminated: (String, String, String, Boolean) -> Unit,
   sharedAudioRouter: T3VoiceAudioRouter? = null,
@@ -122,7 +121,6 @@ internal class T3VoiceWebRtcSession(
     sharedAudioRouter ?: T3VoiceAudioRouter(
       applicationContext,
       ::handleAudioFocusActions,
-      ::handleAudioRouteChanged,
     )
   private val terminalLatch = T3VoiceRealtimeTerminalLatch()
   private val audioOwners = T3VoiceRealtimeAudioOwnerPolicy()
@@ -433,8 +431,6 @@ internal class T3VoiceWebRtcSession(
     onStateChanged(sessionId, update.first, update.second)
   }
 
-  fun routes(): List<Map<String, Any>> = audioRouter.routes().map(T3VoiceAudioRoute::toResultBody)
-
   override fun fenceInputAndDrainPlayout(
     sessionId: String,
     onComplete: () -> Unit,
@@ -673,11 +669,6 @@ internal class T3VoiceWebRtcSession(
         )
       }
     }
-  }
-
-  internal fun handleAudioRouteChanged(change: T3VoiceAudioRouteChange) {
-    val sessionId = synchronized(lock) { active?.sessionId } ?: return
-    onRouteChanged(sessionId, change)
   }
 
   private fun armConnectionTimeout(session: ActiveSession) {

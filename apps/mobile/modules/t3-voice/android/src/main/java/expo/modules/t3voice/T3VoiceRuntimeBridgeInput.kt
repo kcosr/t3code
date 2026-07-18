@@ -159,60 +159,18 @@ internal object T3VoiceRuntimeBridgeInput {
   }
 
   private fun threadTarget(input: Map<String, Any?>): T3VoiceThreadTarget {
-    input.requireExactBridgeKeys(
-      "Thread target",
-      setOf(
-        "environmentId",
-        "projectId",
-        "threadId",
-        "modelSelection",
-        "runtimeMode",
-        "interactionMode",
-      ),
-    )
+    val parsed =
+      T3VoiceThreadWireParser.target(
+        T3VoiceBridgeWireObject(input),
+        additionalFields = setOf("environmentId"),
+      )
     return T3VoiceThreadTarget(
       environmentId = input.requireBridgeIdentifier("environmentId"),
-      projectId = input.requireBridgeIdentifier("projectId"),
-      threadId = input.requireBridgeIdentifier("threadId"),
-      modelSelection = modelSelection(input.requireBridgeObject("modelSelection")),
-      runtimeMode =
-        when (input.requireBridgeText("runtimeMode")) {
-          "approval-required" -> T3VoiceThreadRuntimeMode.APPROVAL_REQUIRED
-          "auto-accept-edits" -> T3VoiceThreadRuntimeMode.AUTO_ACCEPT_EDITS
-          "full-access" -> T3VoiceThreadRuntimeMode.FULL_ACCESS
-          else -> error("runtimeMode is invalid.")
-        },
-      interactionMode =
-        when (input.requireBridgeText("interactionMode")) {
-          "default" -> T3VoiceThreadInteractionMode.DEFAULT
-          "plan" -> T3VoiceThreadInteractionMode.PLAN
-          else -> error("interactionMode must be default or plan.")
-        },
-    )
-  }
-
-  private fun modelSelection(input: Map<String, Any?>): T3VoiceModelSelection {
-    input.requireAllowedBridgeKeys(
-      "Thread model selection",
-      required = setOf("instanceId", "model"),
-      allowed = setOf("instanceId", "model", "options"),
-    )
-    return T3VoiceModelSelection(
-      instanceId = input.requireBridgeIdentifier("instanceId"),
-      model = input.requireBridgeText("model"),
-      options =
-        input.optionalBridgeObjectList("options")?.map { option ->
-          option.requireExactBridgeKeys("Thread model option", setOf("id", "value"))
-          T3VoiceModelOption(
-            id = option.requireBridgeText("id"),
-            value =
-              when (val value = option["value"]) {
-                is String -> T3VoiceModelOptionValue.StringValue(value)
-                is Boolean -> T3VoiceModelOptionValue.BooleanValue(value)
-                else -> error("Thread model option value must be a string or boolean.")
-              },
-          )
-        },
+      projectId = parsed.projectId,
+      threadId = parsed.threadId,
+      modelSelection = parsed.modelSelection,
+      runtimeMode = parsed.runtimeMode,
+      interactionMode = parsed.interactionMode,
     )
   }
 
@@ -270,4 +228,127 @@ internal object T3VoiceRuntimeBridgeInput {
   private const val MAXIMUM_BASE_URL_LENGTH = 4_096
   private const val MAXIMUM_ACCESS_TOKEN_LENGTH = 16_384
   private const val MAXIMUM_EXPIRATION_LENGTH = 128
+}
+
+/** Minimal object view shared by the Expo bridge and native HTTP wire decoders. */
+internal interface T3VoiceWireObject {
+  val fieldNames: Set<String>
+
+  fun value(name: String): Any?
+
+  fun requiredObject(name: String): T3VoiceWireObject
+
+  fun optionalObjectList(name: String): List<T3VoiceWireObject>?
+}
+
+private class T3VoiceBridgeWireObject(
+  private val input: Map<String, Any?>,
+) : T3VoiceWireObject {
+  override val fieldNames: Set<String>
+    get() = input.keys
+
+  override fun value(name: String): Any? = input[name]
+
+  override fun requiredObject(name: String): T3VoiceWireObject =
+    T3VoiceBridgeWireObject(input.requireBridgeObject(name))
+
+  override fun optionalObjectList(name: String): List<T3VoiceWireObject>? =
+    input.optionalBridgeObjectList(name)?.map(::T3VoiceBridgeWireObject)
+}
+
+internal data class T3VoiceParsedThreadTarget(
+  val projectId: String,
+  val threadId: String,
+  val modelSelection: T3VoiceModelSelection,
+  val runtimeMode: T3VoiceThreadRuntimeMode,
+  val interactionMode: T3VoiceThreadInteractionMode,
+)
+
+/** Canonical parser for Thread target fields shared by both native ingress boundaries. */
+internal object T3VoiceThreadWireParser {
+  private val targetFields =
+    setOf("projectId", "threadId", "modelSelection", "runtimeMode", "interactionMode")
+
+  fun target(
+    input: T3VoiceWireObject,
+    additionalFields: Set<String> = emptySet(),
+  ): T3VoiceParsedThreadTarget {
+    input.requireExactFields("Thread target", targetFields + additionalFields)
+    return T3VoiceParsedThreadTarget(
+      projectId = input.requireIdentifier("projectId"),
+      threadId = input.requireIdentifier("threadId"),
+      modelSelection = modelSelection(input.requiredObject("modelSelection")),
+      runtimeMode = runtimeMode(input.requireText("runtimeMode")),
+      interactionMode = interactionMode(input.requireText("interactionMode")),
+    )
+  }
+
+  private fun modelSelection(input: T3VoiceWireObject): T3VoiceModelSelection {
+    input.requireAllowedFields(
+      "Thread model selection",
+      required = setOf("instanceId", "model"),
+      allowed = setOf("instanceId", "model", "options"),
+    )
+    return T3VoiceModelSelection(
+      instanceId = input.requireIdentifier("instanceId"),
+      model = input.requireText("model"),
+      options =
+        input.optionalObjectList("options")?.map { option ->
+          option.requireExactFields("Thread model option", setOf("id", "value"))
+          T3VoiceModelOption(
+            id = option.requireText("id"),
+            value =
+              when (val value = option.value("value")) {
+                is String -> T3VoiceModelOptionValue.StringValue(value)
+                is Boolean -> T3VoiceModelOptionValue.BooleanValue(value)
+                else -> error("Thread model option value must be a string or boolean.")
+              },
+          )
+        },
+    )
+  }
+
+  private fun runtimeMode(value: String): T3VoiceThreadRuntimeMode =
+    when (value) {
+      "approval-required" -> T3VoiceThreadRuntimeMode.APPROVAL_REQUIRED
+      "auto-accept-edits" -> T3VoiceThreadRuntimeMode.AUTO_ACCEPT_EDITS
+      "full-access" -> T3VoiceThreadRuntimeMode.FULL_ACCESS
+      else -> error("runtimeMode is invalid.")
+    }
+
+  private fun interactionMode(value: String): T3VoiceThreadInteractionMode =
+    when (value) {
+      "default" -> T3VoiceThreadInteractionMode.DEFAULT
+      "plan" -> T3VoiceThreadInteractionMode.PLAN
+      else -> error("interactionMode must be default or plan.")
+    }
+}
+
+private fun T3VoiceWireObject.requireExactFields(name: String, expected: Set<String>) {
+  check(fieldNames == expected) {
+    "$name fields must be exactly ${expected.sorted().joinToString()}."
+  }
+}
+
+private fun T3VoiceWireObject.requireAllowedFields(
+  name: String,
+  required: Set<String>,
+  allowed: Set<String>,
+) {
+  check(fieldNames.containsAll(required) && allowed.containsAll(fieldNames)) {
+    "$name fields are invalid."
+  }
+}
+
+private fun T3VoiceWireObject.requireIdentifier(name: String): String =
+  requireText(name, T3VoiceBridgeValidation.MAXIMUM_IDENTIFIER_LENGTH)
+
+private fun T3VoiceWireObject.requireText(
+  name: String,
+  maximumLength: Int = T3VoiceBridgeValidation.MAXIMUM_BRIDGE_TEXT_LENGTH,
+): String {
+  val text = value(name) as? String ?: error("$name must be a string.")
+  check(text.isNotBlank()) { "$name must be non-empty." }
+  check(text.length <= maximumLength) { "$name is too long." }
+  return text
 }

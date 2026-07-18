@@ -197,7 +197,6 @@ class T3VoiceRuntimeLifecyclePolicyTest {
       target = realtimeTarget,
       muted = false,
       pendingClientActions = emptyList(),
-      audioRoutes = emptyList(),
       transcript = emptyList(),
       pendingConfirmations = emptyList(),
     )

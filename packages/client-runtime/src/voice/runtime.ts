@@ -66,11 +66,11 @@ export interface VoiceThreadReviewToken {
   readonly reviewId: number;
 }
 
+export type VoiceAudioRouteKind = "system" | "speaker" | "earpiece" | "bluetooth" | "wired";
+
 export interface VoiceAudioRoute {
-  readonly id: string;
+  readonly kind: VoiceAudioRouteKind;
   readonly label: string;
-  readonly type: "system" | "speaker" | "earpiece" | "wired" | "bluetooth";
-  readonly selected: boolean;
 }
 
 export interface VoiceRealtimeTranscriptTurn {
@@ -132,7 +132,6 @@ export type VoiceRuntimeSnapshot = VoiceRuntimeSnapshotIdentity &
         readonly phase: VoiceRealtimePhase;
         readonly target: VoiceRealtimeTarget;
         readonly muted: boolean;
-        readonly audioRoutes: ReadonlyArray<VoiceAudioRoute>;
         readonly transcript: ReadonlyArray<VoiceRealtimeTranscriptTurn>;
         readonly pendingConfirmations: ReadonlyArray<VoiceRealtimeConfirmation>;
         readonly pendingClientActions: ReadonlyArray<VoiceRealtimeClientAction>;

@@ -46,6 +46,8 @@ import {
 } from "../Services/VoiceSessionService.ts";
 import {
   VoiceToolExecutor,
+  terminalActionForVoiceTool,
+  terminalVoiceToolForAction,
   type VoiceToolCompletedResult,
   type VoiceToolConfirmationResult,
   type VoiceToolTerminalResult,
@@ -91,13 +93,6 @@ const BACKGROUND_VOICE_TOOLS = new Set([
   "stop_realtime_voice",
   "switch_to_thread_voice",
 ]);
-
-const terminalActionForToolName = (name: string): VoiceTerminalAction | undefined =>
-  name === "stop_realtime_voice"
-    ? "stop-realtime"
-    : name === "switch_to_thread_voice"
-      ? "switch-to-thread"
-      : undefined;
 
 interface ClientActionResolution {
   readonly outcome: "succeeded" | "failed";
@@ -896,7 +891,7 @@ const make = Effect.gen(function* () {
         return;
       case "function-call":
         if (!(yield* isSessionLive(lease))) return;
-        const requestedTerminalAction = terminalActionForToolName(event.name);
+        const requestedTerminalAction = terminalActionForVoiceTool(event.name);
         const invocation = tools.invoke({
           authSessionId: lease.ownerAuthSessionId,
           sessionId: lease.sessionId,
@@ -927,10 +922,7 @@ const make = Effect.gen(function* () {
                     const current = yield* getLiveSession(lease);
                     if (Option.isNone(current)) return;
                     if (!current.value.input.terminalActions.includes(requestedTerminalAction)) {
-                      const tool =
-                        requestedTerminalAction === "stop-realtime"
-                          ? ("stop_realtime_voice" as const)
-                          : ("switch_to_thread_voice" as const);
+                      const tool = terminalVoiceToolForAction(requestedTerminalAction);
                       yield* submitCompletedTool(lease, providerSession, {
                         type: "completed",
                         toolCallId: VoiceToolCallId.make(event.providerFunctionCallId),

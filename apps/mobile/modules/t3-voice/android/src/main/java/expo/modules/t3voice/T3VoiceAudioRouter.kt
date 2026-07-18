@@ -10,17 +10,13 @@ import android.media.AudioManager
 import android.os.Build
 
 internal data class T3VoiceAudioRoute(
-  val id: String,
+  val kind: T3VoiceAudioRouteKind,
   val label: String,
-  val type: String,
-  val selected: Boolean,
 ) {
   fun toResultBody(): Map<String, Any> =
     mapOf(
-      "id" to id,
+      "kind" to kind.id,
       "label" to label,
-      "type" to type,
-      "selected" to selected,
     )
 }
 
@@ -32,14 +28,12 @@ internal data class T3VoiceAudioRouterStartResult(
 /** The narrow Realtime-session view of the process-owned Android audio router. */
 internal interface T3VoiceRealtimeAudioRouting {
   fun stop()
-
-  fun routes(): List<T3VoiceAudioRoute>
 }
 
 internal class T3VoiceAudioRouter(
   context: Context,
   private val onFocusActions: (List<T3VoiceAudioFocusAction>) -> Unit = {},
-  private val onRouteChanged: (T3VoiceAudioRouteChange) -> Unit = {},
+  private val onPreferenceChanged: (T3VoiceAudioRoutePreference) -> Unit = {},
 ) : T3VoiceRealtimeAudioRouting {
   private val audioManager = context.getSystemService(AudioManager::class.java)
   private val preferenceStore =
@@ -48,12 +42,30 @@ internal class T3VoiceAudioRouter(
   private var focusState = T3VoiceAudioFocusState.TERMINATED
   private var preferredRoute = preferenceStore.get()
   private var activeRoute: T3VoiceAudioRouteKind? = null
+  private var availableRoutes =
+    listOf(T3VoiceAudioRoute(T3VoiceAudioRouteKind.SYSTEM, routeLabel(T3VoiceAudioRouteKind.SYSTEM)))
+  private var lastPublishedPreference: T3VoiceAudioRoutePreference? = null
   private var deviceCallbackRegistered = false
   private var active = false
   private var generation = 0L
   private var activeGeneration: Long? = null
   private var focusChangeListener: AudioManager.OnAudioFocusChangeListener? = null
-  private var deviceCallback: AudioDeviceCallback? = null
+  private val deviceCallback =
+    object : AudioDeviceCallback() {
+      override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+        onAvailableDevicesChanged()
+      }
+
+      override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+        onAvailableDevicesChanged()
+      }
+    }
+
+  init {
+    refreshAvailableRoutes(availableOutputDevicesOrNull())
+    lastPublishedPreference = preference()
+    registerDeviceCallback()
+  }
 
   @Synchronized
   fun start(): T3VoiceAudioRouterStartResult {
@@ -71,23 +83,12 @@ internal class T3VoiceAudioRouter(
       AudioManager.OnAudioFocusChangeListener { change ->
         onAudioFocusChanged(ownerGeneration, change)
       }
-    deviceCallback =
-      object : AudioDeviceCallback() {
-        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
-          reconcileSelectedRoute(ownerGeneration)
-        }
-
-        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
-          reconcileSelectedRoute(ownerGeneration)
-        }
-      }
     active = true
     focusState = T3VoiceAudioFocusState.ACTIVE
     audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
     if (requestFocus()) {
       recordDiagnostic(T3VoiceDiagnosticCategory.FOCUS, T3VoiceDiagnosticCode.REQUEST_GRANTED)
-      registerDeviceCallback()
-      applyPreferredRoute(ownerGeneration, notify = false)
+      applyPreferredRoute(ownerGeneration)
       return T3VoiceAudioRouterStartResult(
         transition = T3VoiceAudioFocusTransition(focusState, emptyList()),
         ownerGeneration = ownerGeneration,
@@ -103,7 +104,6 @@ internal class T3VoiceAudioRouter(
   override fun stop() {
     if (!active) return
     recordDiagnostic(T3VoiceDiagnosticCategory.LIFECYCLE, T3VoiceDiagnosticCode.STOPPED)
-    unregisterDeviceCallback()
     active = false
     activeGeneration = null
     focusState = T3VoiceAudioFocusState.TERMINATED
@@ -111,46 +111,37 @@ internal class T3VoiceAudioRouter(
     runCatching(::clearSelectedRoute)
     runCatching(::abandonFocus)
     runCatching { audioManager.mode = AudioManager.MODE_NORMAL }
-  }
-
-  @Synchronized
-  override fun routes(): List<T3VoiceAudioRoute> {
-    val devicesByRoute =
-      availableOutputDevicesOrNull().orEmpty()
-        .mapNotNull { device -> routeIdForDevice(device)?.let { route -> route to device } }
-        .groupBy({ it.first }, { it.second })
-    return T3VoiceAudioRouteKind.entries.mapNotNull { route ->
-      val device = devicesByRoute[route]?.firstOrNull()
-      if (route != T3VoiceAudioRouteKind.SYSTEM && device == null) {
-        return@mapNotNull null
-      }
-      T3VoiceAudioRoute(
-        id = route.id,
-        label = if (device == null) routeLabel(route, null) else routeLabel(route, device),
-        type = route.id,
-        selected = route == preferredRoute,
-      )
-    }
+    publishPreference()
   }
 
   @Synchronized
   fun preference(): T3VoiceAudioRoutePreference =
     T3VoiceAudioRoutePreference(
-      preferredRouteId = preferredRoute.id,
-      activeRouteId = activeRoute?.id,
-      routes = routes(),
+      preferredRoute = preferredRoute,
+      activeRoute = activeRoute,
+      routes = availableRoutes,
     )
 
   @Synchronized
-  fun setPreference(routeId: String): T3VoiceAudioRoutePreference {
-    val route = requireNotNull(T3VoiceAudioRouteKind.fromId(routeId)) { "Unsupported audio route." }
-    val changed = preferredRoute != route
+  fun setPreference(routeValue: String): T3VoiceAudioRoutePreference {
+    val route = requireNotNull(T3VoiceAudioRouteKind.fromId(routeValue)) { "Unsupported audio route." }
+    if (preferredRoute == route) {
+      val ownerGeneration = activeGeneration
+      if (ownerGeneration != null && activeRoute != preferredRoute) {
+        applyPreferredRoute(ownerGeneration)
+      }
+      return preference()
+    }
     preferenceStore.set(route)
     preferredRoute = route
-    activeGeneration?.let {
-      applyPreferredRoute(it, notify = true, forceNotification = changed)
-    }
+    activeGeneration?.let(::applyPreferredRoute) ?: publishPreference()
     return preference()
+  }
+
+  @Synchronized
+  fun shutdown() {
+    stop()
+    unregisterDeviceCallback()
   }
 
   @Suppress("DEPRECATION")
@@ -225,7 +216,7 @@ internal class T3VoiceAudioRouter(
       else -> T3VoiceAudioDeviceKind.UNKNOWN
     }
 
-  private fun routeLabel(route: T3VoiceAudioRouteKind, device: AudioDeviceInfo?): String =
+  private fun routeLabel(route: T3VoiceAudioRouteKind, device: AudioDeviceInfo? = null): String =
     when (route) {
       T3VoiceAudioRouteKind.SPEAKER -> "Speaker"
       T3VoiceAudioRouteKind.EARPIECE -> "Phone"
@@ -313,17 +304,16 @@ internal class T3VoiceAudioRouter(
     if (!active) return
     active = false
     activeGeneration = null
-    unregisterDeviceCallback()
     activeRoute = null
     runCatching(::clearSelectedRoute)
     runCatching(::abandonFocus)
     runCatching { audioManager.mode = AudioManager.MODE_NORMAL }
+    publishPreference()
   }
 
   private fun registerDeviceCallback() {
     if (deviceCallbackRegistered) return
-    val callback = deviceCallback ?: return
-    val registered = runCatching { audioManager.registerAudioDeviceCallback(callback, null) }
+    val registered = runCatching { audioManager.registerAudioDeviceCallback(deviceCallback, null) }
     if (registered.isSuccess) {
       deviceCallbackRegistered = true
       recordDiagnostic(
@@ -339,11 +329,9 @@ internal class T3VoiceAudioRouter(
   }
 
   private fun unregisterDeviceCallback() {
-    val callback = deviceCallback
-    deviceCallback = null
-    if (!deviceCallbackRegistered || callback == null) return
+    if (!deviceCallbackRegistered) return
     deviceCallbackRegistered = false
-    runCatching { audioManager.unregisterAudioDeviceCallback(callback) }
+    runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
     recordDiagnostic(
       T3VoiceDiagnosticCategory.ROUTE,
       T3VoiceDiagnosticCode.DEVICE_CALLBACK_UNREGISTERED,
@@ -351,25 +339,31 @@ internal class T3VoiceAudioRouter(
   }
 
   @Synchronized
-  private fun reconcileSelectedRoute(ownerGeneration: Long) {
-    if (!active || activeGeneration != ownerGeneration) return
-    applyPreferredRoute(ownerGeneration, notify = true)
+  private fun onAvailableDevicesChanged() {
+    val ownerGeneration = activeGeneration
+    if (ownerGeneration != null) {
+      applyPreferredRoute(ownerGeneration)
+    } else {
+      refreshAvailableRoutes(availableOutputDevicesOrNull())
+      publishPreference()
+    }
   }
 
-  private fun applyPreferredRoute(
-    ownerGeneration: Long,
-    notify: Boolean,
-    forceNotification: Boolean = false,
-  ) {
+  private fun applyPreferredRoute(ownerGeneration: Long) {
     if (!active || activeGeneration != ownerGeneration) return
     val availableDevices = availableOutputDevicesOrNull()
     if (availableDevices == null) {
+      refreshAvailableRoutes(null)
+      runCatching(::clearSelectedRoute)
+      activeRoute = T3VoiceAudioRouteKind.SYSTEM
       recordDiagnostic(
         T3VoiceDiagnosticCategory.ROUTE,
         T3VoiceDiagnosticCode.ROUTE_SCAN_UNAVAILABLE,
       )
+      publishPreference()
       return
     }
+    refreshAvailableRoutes(availableDevices)
     val selectedDevice =
       if (preferredRoute == T3VoiceAudioRouteKind.SYSTEM) {
         null
@@ -407,9 +401,13 @@ internal class T3VoiceAudioRouter(
           T3VoiceDiagnosticCategory.ROUTE,
           T3VoiceDiagnosticCode.ROUTE_SCAN_UNAVAILABLE,
         )
+        publishPreference()
         return
       }
-    if (activeRoute == appliedRoute && !forceNotification) return
+    if (activeRoute == appliedRoute) {
+      publishPreference()
+      return
+    }
     activeRoute = appliedRoute
     val fallback = appliedRoute != preferredRoute
     recordDiagnostic(
@@ -417,20 +415,27 @@ internal class T3VoiceAudioRouter(
       if (fallback) T3VoiceDiagnosticCode.ROUTE_FALLBACK else T3VoiceDiagnosticCode.ROUTE_SELECTED,
       primaryCount = availableDevices.size,
     )
-    if (notify) {
-      onRouteChanged(
-        T3VoiceAudioRouteChange(
-          routeId = appliedRoute.id,
-          routeType = appliedRoute.id,
-          reason =
-            if (fallback) {
-              T3VoiceAudioRouteChangeReason.SELECTED_ROUTE_UNAVAILABLE
-            } else {
-              T3VoiceAudioRouteChangeReason.SELECTED
-            },
-        ),
-      )
-    }
+    publishPreference()
+  }
+
+  private fun refreshAvailableRoutes(devices: List<AudioDeviceInfo>?) {
+    val devicesByRoute =
+      devices.orEmpty()
+        .mapNotNull { device -> routeIdForDevice(device)?.let { route -> route to device } }
+        .groupBy({ it.first }, { it.second })
+    availableRoutes =
+      T3VoiceAudioRouteKind.entries.mapNotNull { route ->
+        val device = devicesByRoute[route]?.firstOrNull()
+        if (route != T3VoiceAudioRouteKind.SYSTEM && device == null) return@mapNotNull null
+        T3VoiceAudioRoute(route, routeLabel(route, device))
+      }
+  }
+
+  private fun publishPreference() {
+    val preference = preference()
+    if (preference == lastPublishedPreference) return
+    lastPublishedPreference = preference
+    onPreferenceChanged(preference)
   }
 
   private fun recordDiagnostic(

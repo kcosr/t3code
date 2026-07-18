@@ -1,6 +1,7 @@
 import type { PermissionResponse } from "expo";
 import type {
   VoiceAudioRoute,
+  VoiceAudioRouteKind,
   VoiceRealtimeContext,
   VoiceRealtimeTarget,
   VoiceRuntimeSnapshot,
@@ -37,12 +38,12 @@ export interface T3VoiceSetRealtimeMutedInput {
 }
 
 export interface T3VoiceSetAudioRoutePreferenceInput {
-  readonly routeId: string;
+  readonly route: VoiceAudioRouteKind;
 }
 
 export interface T3VoiceAudioRoutePreferenceState {
-  readonly preferredRouteId: string;
-  readonly activeRouteId: string | null;
+  readonly preferredRoute: VoiceAudioRouteKind;
+  readonly activeRoute: VoiceAudioRouteKind | null;
   readonly routes: ReadonlyArray<VoiceAudioRoute>;
 }
 
@@ -224,6 +225,10 @@ export interface T3VoiceNativeModule {
     (
       eventName: "runtimeSnapshotChanged",
       listener: (snapshot: VoiceRuntimeSnapshot) => void,
+    ): T3VoiceEventSubscription;
+    (
+      eventName: "audioRoutePreferenceChanged",
+      listener: (state: T3VoiceAudioRoutePreferenceState) => void,
     ): T3VoiceEventSubscription;
     (
       eventName: "playbackChunkConsumed",

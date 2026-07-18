@@ -453,7 +453,6 @@ internal class T3VoiceRealtimeSessionTest {
       active.set(false)
     }
 
-    override fun routes(): List<T3VoiceAudioRoute> = emptyList()
   }
 
   private class InstalledBlockedRealtimeMedia(

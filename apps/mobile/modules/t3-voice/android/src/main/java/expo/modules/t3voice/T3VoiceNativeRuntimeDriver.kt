@@ -2,6 +2,9 @@ package expo.modules.t3voice
 
 import android.content.Context
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * Service-owned concrete runtime. It owns one shared audio router and one instance of each native
@@ -19,12 +22,13 @@ internal class T3VoiceNativeRuntimeDriver(
   private var threadSession: T3VoiceThreadSession? = null
   private var shutdownStarted = false
   private val sharedMediaReleased = AtomicBoolean(false)
+  private lateinit var audioRoutePreferenceState: MutableStateFlow<T3VoiceAudioRoutePreference>
   private lateinit var webRtc: T3VoiceWebRtcSession
   private val audioRouter =
     T3VoiceAudioRouter(
       applicationContext,
       ::handleAudioFocusActions,
-      ::handleAudioRouteChanged,
+      ::handleAudioRoutePreferenceChanged,
     )
   private val recorder = T3VoiceRecorder(applicationContext, onTerminated = ::handleRecorderTermination)
   private val player =
@@ -43,15 +47,13 @@ internal class T3VoiceNativeRuntimeDriver(
   private val threadMedia = T3VoiceAndroidThreadMedia(recorder, player, audioRouter)
 
   init {
+    audioRoutePreferenceState = MutableStateFlow(audioRouter.preference())
     webRtc =
       T3VoiceWebRtcSession(
         context = applicationContext,
         onStateChanged = { sessionId, connectionState, _ ->
           synchronized(lock) { realtimeSession }
             ?.onWebRtcStateChanged(sessionId, connectionState)
-        },
-        onRouteChanged = { _, _ ->
-          synchronized(lock) { realtimeSession }?.onAudioRouteChanged()
         },
         onError = { sessionId, code, _, recoverable ->
           synchronized(lock) { realtimeSession }
@@ -118,8 +120,11 @@ internal class T3VoiceNativeRuntimeDriver(
 
   fun audioRoutePreference(): T3VoiceAudioRoutePreference = audioRouter.preference()
 
-  fun setAudioRoutePreference(routeId: String): T3VoiceAudioRoutePreference =
-    audioRouter.setPreference(routeId)
+  val audioRoutePreferences: StateFlow<T3VoiceAudioRoutePreference>
+    get() = audioRoutePreferenceState.asStateFlow()
+
+  fun setAudioRoutePreference(route: String): T3VoiceAudioRoutePreference =
+    audioRouter.setPreference(route)
 
   fun acquireLegacyAudio(): Boolean =
     audioRouter.start().transition.state != T3VoiceAudioFocusState.TERMINATED
@@ -314,7 +319,7 @@ internal class T3VoiceNativeRuntimeDriver(
 
   private fun releaseSharedMedia() {
     if (!sharedMediaReleased.compareAndSet(false, true)) return
-    audioRouter.stop()
+    audioRouter.shutdown()
     recorder.release()
     player.release()
     webRtc.release()
@@ -344,9 +349,10 @@ internal class T3VoiceNativeRuntimeDriver(
     }
   }
 
-  private fun handleAudioRouteChanged(change: T3VoiceAudioRouteChange) {
-    val realtime = synchronized(lock) { realtimeSession }
-    if (realtime != null) webRtc.handleAudioRouteChanged(change)
+  private fun handleAudioRoutePreferenceChanged(preference: T3VoiceAudioRoutePreference) {
+    if (this::audioRoutePreferenceState.isInitialized) {
+      audioRoutePreferenceState.value = preference
+    }
   }
 
   private fun requireRealtime(generation: Long): T3VoiceRealtimeSession =

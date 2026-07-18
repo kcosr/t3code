@@ -8,6 +8,7 @@ import type {
   VoiceConfirmationId,
   VoiceConversationId,
   VoiceSessionId,
+  VoiceTerminalAction,
   VoiceTerminalActionRequest,
   VoiceToolCallId,
   VoiceToolName,
@@ -16,6 +17,28 @@ import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 
 import type { VoiceError } from "../Errors.ts";
+
+const TERMINAL_VOICE_TOOL_BY_ACTION = {
+  "stop-realtime": "stop_realtime_voice",
+  "switch-to-thread": "switch_to_thread_voice",
+} as const satisfies Record<VoiceTerminalAction, VoiceToolName>;
+
+export type TerminalVoiceTool = (typeof TERMINAL_VOICE_TOOL_BY_ACTION)[VoiceTerminalAction];
+
+export const terminalVoiceToolForAction = (action: VoiceTerminalAction): TerminalVoiceTool =>
+  TERMINAL_VOICE_TOOL_BY_ACTION[action];
+
+export function terminalActionForVoiceTool(tool: TerminalVoiceTool): VoiceTerminalAction;
+export function terminalActionForVoiceTool(tool: string): VoiceTerminalAction | undefined;
+export function terminalActionForVoiceTool(tool: string): VoiceTerminalAction | undefined {
+  for (const action of Object.keys(TERMINAL_VOICE_TOOL_BY_ACTION) as VoiceTerminalAction[]) {
+    if (TERMINAL_VOICE_TOOL_BY_ACTION[action] === tool) return action;
+  }
+  return undefined;
+}
+
+export const isTerminalVoiceTool = (tool: string): tool is TerminalVoiceTool =>
+  terminalActionForVoiceTool(tool) !== undefined;
 
 export interface VoiceToolCallInput {
   readonly authSessionId: AuthSessionId;
@@ -52,7 +75,7 @@ export interface VoiceToolTerminalResult {
   readonly type: "terminal-completed";
   readonly toolCallId: VoiceToolCallId;
   readonly providerFunctionCallId: string;
-  readonly tool: "stop_realtime_voice" | "switch_to_thread_voice";
+  readonly tool: TerminalVoiceTool;
   readonly outcome: "succeeded";
   readonly output: string;
   readonly terminalAction: VoiceTerminalActionRequest;

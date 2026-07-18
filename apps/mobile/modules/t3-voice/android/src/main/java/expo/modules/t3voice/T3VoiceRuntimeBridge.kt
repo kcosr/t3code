@@ -15,7 +15,6 @@ internal fun T3VoiceControllerSnapshot.toBridgeBody(): Map<String, Any?> {
           "phase" to state.stage.bridgeName(),
           "target" to state.target.toBridgeBody(),
           "muted" to state.muted,
-          "audioRoutes" to state.audioRoutes.map(T3VoiceAudioRoute::toResultBody),
           "transcript" to state.transcript.map(T3VoiceRealtimeTranscriptTurn::toBridgeBody),
           "pendingConfirmations" to
             state.pendingConfirmations.map(T3VoiceRealtimeConfirmation::toBridgeBody),

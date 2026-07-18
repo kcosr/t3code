@@ -1,7 +1,7 @@
 import { NativeHeaderToolbar, NativeStackScreenOptions } from "../../native/StackHeader";
 import { StackActions, useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Platform, useColorScheme, View } from "react-native";
+import { ActivityIndicator, Platform, Pressable, useColorScheme, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Svg, { Defs, LinearGradient, Rect, Stop } from "react-native-svg";
 import {
@@ -17,6 +17,7 @@ import { AppText as Text, AppTextInput as TextInput } from "../../components/App
 import { EmptyState } from "../../components/EmptyState";
 import { LoadingScreen } from "../../components/LoadingScreen";
 import { resolveFileSelectionNavigationAction } from "../../lib/adaptive-navigation";
+import { cn } from "../../lib/cn";
 import { copyTextWithHaptic } from "../../lib/copyTextWithHaptic";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { useThemeColor } from "../../lib/useThemeColor";
@@ -460,6 +461,7 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
   useAdaptiveWorkspacePaneRole("inspector");
   const navigation = useNavigation();
   const { fileInspector, panes, toggleAuxiliaryPane } = useAdaptiveWorkspaceLayout();
+  const isAndroid = Platform.OS === "android";
   const iconColor = useThemeColor("--color-icon");
   const params = props.route.params;
   const relativePath = normalizeRoutePath(params.path);
@@ -504,6 +506,21 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
       : null,
   );
   const fileData = fileQuery.data as ProjectReadFileResult | null;
+
+  const handleReturnToThread = useCallback(() => {
+    if (navigation.canGoBack()) {
+      navigation.goBack();
+      return;
+    }
+    if (environmentId !== null && threadId !== null) {
+      navigation.dispatch(
+        StackActions.replace("Thread", {
+          environmentId: String(environmentId),
+          threadId: String(threadId),
+        }),
+      );
+    }
+  }, [environmentId, navigation, threadId]);
 
   const handleSelectFile = useCallback(
     (path: string) => {
@@ -561,96 +578,180 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
 
   const parentDir = relativePath.split("/").slice(0, -1).join("/");
   const headerSubtitle = [projectName, parentDir].filter(Boolean).join(" · ");
+  const showModeSelector = canPreview && !isImageFile;
 
   return (
     <ReviewHighlighterProvider>
       <View className="flex-1 bg-sheet">
         <NativeStackScreenOptions
-          options={{
-            // Static header config lives in Stack.tsx (SOLID_HEADER_OPTIONS: solid
-            // sheet-colored header — this route's content scrolls internally, so
-            // there is nothing for glass to sample). Only dynamic values here.
-            headerTintColor: iconColor,
-            headerTitle: basename(relativePath),
-            title: basename(relativePath),
-            unstable_headerSubtitle:
-              Platform.OS === "ios" && headerSubtitle.length > 0 ? headerSubtitle : undefined,
-          }}
+          options={
+            isAndroid
+              ? // Android draws its own in-flow header (AndroidScreenHeader below).
+                { headerShown: false }
+              : {
+                  // Static header config lives in Stack.tsx (SOLID_HEADER_OPTIONS: solid
+                  // sheet-colored header — this route's content scrolls internally, so
+                  // there is nothing for glass to sample). Only dynamic values here.
+                  headerTintColor: iconColor,
+                  headerTitle: basename(relativePath),
+                  title: basename(relativePath),
+                  unstable_headerSubtitle: headerSubtitle.length > 0 ? headerSubtitle : undefined,
+                }
+          }
         />
-        <WorkspaceSidebarToolbar>
-          {fileInspector.supported ? (
-            <NativeHeaderToolbar.Button
-              accessibilityLabel="Return to chat"
-              icon="chevron.left"
-              onPress={() => {
-                navigation.dispatch(
-                  StackActions.replace("Thread", {
-                    environmentId: String(environmentId),
-                    threadId: String(threadId),
-                  }),
-                );
-              }}
-            />
-          ) : null}
-        </WorkspaceSidebarToolbar>
-        <NativeHeaderToolbar placement="right">
-          {fileInspector.supported ? (
-            <NativeHeaderToolbar.Button
-              accessibilityLabel={
-                panes.auxiliaryPaneVisible ? "Hide file navigator" : "Show file navigator"
-              }
-              icon="sidebar.right"
-              onPress={toggleAuxiliaryPane}
-              separateBackground
-            />
-          ) : null}
-          <NativeHeaderToolbar.Menu accessibilityLabel="File actions" icon="ellipsis">
-            {canPreview && !isImageFile ? (
-              <NativeHeaderToolbar.Menu inline>
+        {isAndroid ? (
+          <AndroidScreenHeader
+            title={basename(relativePath)}
+            subtitle={headerSubtitle.length > 0 ? headerSubtitle : null}
+            onBack={handleReturnToThread}
+            actions={[
+              {
+                accessibilityLabel: "Copy path",
+                icon: "doc.on.doc",
+                onPress: () => copyTextWithHaptic(relativePath),
+              },
+              ...(resolvedActiveMode === "preview" && (isBrowserFile || isImageFile)
+                ? [
+                    {
+                      accessibilityLabel: "Refresh preview",
+                      icon: "arrow.clockwise" as const,
+                      onPress: () => {
+                        setPreviewRevision((current) => current + 1);
+                      },
+                    },
+                  ]
+                : []),
+            ]}
+            trailing={
+              showModeSelector ? (
+                <View className="flex-row items-center rounded-full bg-subtle p-0.5">
+                  <Pressable
+                    accessibilityLabel="Show rendered preview"
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: resolvedActiveMode === "preview" }}
+                    hitSlop={4}
+                    onPress={() => setModeOverride({ path: relativePath, mode: "preview" })}
+                    className={cn(
+                      "rounded-full px-3 py-1.5",
+                      resolvedActiveMode === "preview" && "bg-card",
+                    )}
+                  >
+                    <Text
+                      className={cn(
+                        "text-[13px] font-t3-medium",
+                        resolvedActiveMode === "preview"
+                          ? "text-foreground"
+                          : "text-foreground-muted",
+                      )}
+                    >
+                      Preview
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    accessibilityLabel="Show file source"
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: resolvedActiveMode === "source" }}
+                    hitSlop={4}
+                    onPress={() => setModeOverride({ path: relativePath, mode: "source" })}
+                    className={cn(
+                      "rounded-full px-3 py-1.5",
+                      resolvedActiveMode === "source" && "bg-card",
+                    )}
+                  >
+                    <Text
+                      className={cn(
+                        "text-[13px] font-t3-medium",
+                        resolvedActiveMode === "source"
+                          ? "text-foreground"
+                          : "text-foreground-muted",
+                      )}
+                    >
+                      Source
+                    </Text>
+                  </Pressable>
+                </View>
+              ) : null
+            }
+          />
+        ) : null}
+        {!isAndroid ? (
+          <>
+            <WorkspaceSidebarToolbar>
+              {fileInspector.supported ? (
+                <NativeHeaderToolbar.Button
+                  accessibilityLabel="Return to chat"
+                  icon="chevron.left"
+                  onPress={() => {
+                    navigation.dispatch(
+                      StackActions.replace("Thread", {
+                        environmentId: String(environmentId),
+                        threadId: String(threadId),
+                      }),
+                    );
+                  }}
+                />
+              ) : null}
+            </WorkspaceSidebarToolbar>
+            <NativeHeaderToolbar placement="right">
+              {fileInspector.supported ? (
+                <NativeHeaderToolbar.Button
+                  accessibilityLabel={
+                    panes.auxiliaryPaneVisible ? "Hide file navigator" : "Show file navigator"
+                  }
+                  icon="sidebar.right"
+                  onPress={toggleAuxiliaryPane}
+                  separateBackground
+                />
+              ) : null}
+              <NativeHeaderToolbar.Menu accessibilityLabel="File actions" icon="ellipsis">
+                {showModeSelector ? (
+                  <NativeHeaderToolbar.Menu inline>
+                    <NativeHeaderToolbar.MenuAction
+                      icon="eye"
+                      isOn={resolvedActiveMode === "preview"}
+                      onPress={() => setModeOverride({ path: relativePath, mode: "preview" })}
+                    >
+                      Preview
+                    </NativeHeaderToolbar.MenuAction>
+                    <NativeHeaderToolbar.MenuAction
+                      icon="doc.text"
+                      isOn={resolvedActiveMode === "source"}
+                      onPress={() => setModeOverride({ path: relativePath, mode: "source" })}
+                    >
+                      Source
+                    </NativeHeaderToolbar.MenuAction>
+                  </NativeHeaderToolbar.Menu>
+                ) : null}
                 <NativeHeaderToolbar.MenuAction
-                  icon="eye"
-                  isOn={resolvedActiveMode === "preview"}
-                  onPress={() => setModeOverride({ path: relativePath, mode: "preview" })}
+                  icon="doc.on.doc"
+                  onPress={() => copyTextWithHaptic(relativePath)}
                 >
-                  Preview
+                  Copy path
                 </NativeHeaderToolbar.MenuAction>
-                <NativeHeaderToolbar.MenuAction
-                  icon="doc.text"
-                  isOn={resolvedActiveMode === "source"}
-                  onPress={() => setModeOverride({ path: relativePath, mode: "source" })}
-                >
-                  Source
-                </NativeHeaderToolbar.MenuAction>
+                {isBrowserFile && typeof assetPreviewUri === "string" ? (
+                  <NativeHeaderToolbar.MenuAction
+                    icon="safari"
+                    onPress={() => {
+                      void tryOpenExternalUrl(assetPreviewUri, "file-preview");
+                    }}
+                  >
+                    Open in Safari
+                  </NativeHeaderToolbar.MenuAction>
+                ) : null}
+                {resolvedActiveMode === "preview" && (isBrowserFile || isImageFile) ? (
+                  <NativeHeaderToolbar.MenuAction
+                    icon="arrow.clockwise"
+                    onPress={() => {
+                      setPreviewRevision((current) => current + 1);
+                    }}
+                  >
+                    Refresh
+                  </NativeHeaderToolbar.MenuAction>
+                ) : null}
               </NativeHeaderToolbar.Menu>
-            ) : null}
-            <NativeHeaderToolbar.MenuAction
-              icon="doc.on.doc"
-              onPress={() => copyTextWithHaptic(relativePath)}
-            >
-              Copy path
-            </NativeHeaderToolbar.MenuAction>
-            {isBrowserFile && typeof assetPreviewUri === "string" ? (
-              <NativeHeaderToolbar.MenuAction
-                icon="safari"
-                onPress={() => {
-                  void tryOpenExternalUrl(assetPreviewUri, "file-preview");
-                }}
-              >
-                Open in Safari
-              </NativeHeaderToolbar.MenuAction>
-            ) : null}
-            {resolvedActiveMode === "preview" && (isBrowserFile || isImageFile) ? (
-              <NativeHeaderToolbar.MenuAction
-                icon="arrow.clockwise"
-                onPress={() => {
-                  setPreviewRevision((current) => current + 1);
-                }}
-              >
-                Refresh
-              </NativeHeaderToolbar.MenuAction>
-            ) : null}
-          </NativeHeaderToolbar.Menu>
-        </NativeHeaderToolbar>
+            </NativeHeaderToolbar>
+          </>
+        ) : null}
         <FileContent
           activeMode={resolvedActiveMode}
           previewUri={previewUri}

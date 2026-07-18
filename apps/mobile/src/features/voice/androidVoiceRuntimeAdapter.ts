@@ -25,6 +25,7 @@ import * as Effect from "effect/Effect";
 
 import { AndroidVoiceCommandQueue } from "./androidVoiceCommandQueue";
 import { requestAndroidVoiceNotificationPermission } from "./androidVoiceNotificationPermission";
+import { requestOptionalBluetoothPermission } from "./requestOptionalBluetoothPermission";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
 import { ensureMicrophonePermission } from "./microphonePermission";
 
@@ -39,18 +40,6 @@ export interface AndroidVoiceRuntimeAdapterInput {
   readonly makeClient?: AndroidVoiceRuntimeClientFactory;
   readonly requestNotificationPermission?: () => Promise<"granted" | "denied">;
 }
-
-const requestOptionalBluetoothPermission = async (native: T3VoiceNativeModule): Promise<void> => {
-  try {
-    const current = await native.getBluetoothPermissionAsync();
-    if (current.granted || current.canAskAgain === false) return;
-    // Bluetooth denial degrades route discovery but does not block microphone
-    // work or the system-selected non-Bluetooth route.
-    await native.requestBluetoothPermissionAsync();
-  } catch {
-    // Permission-manager failure has the same degraded-route behavior as denial.
-  }
-};
 
 const assertEnvironment = (
   runtimeEnvironmentId: EnvironmentId,

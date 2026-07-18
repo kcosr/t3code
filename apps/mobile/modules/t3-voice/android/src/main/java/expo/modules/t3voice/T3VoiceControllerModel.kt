@@ -401,7 +401,6 @@ internal sealed interface T3VoiceControllerState {
     val target: T3VoiceRealtimeTarget,
     val muted: Boolean,
     val pendingClientActions: List<T3VoiceRealtimeClientAction>,
-    val audioRoutes: List<T3VoiceAudioRoute>,
     val transcript: List<T3VoiceRealtimeTranscriptTurn>,
     val pendingConfirmations: List<T3VoiceRealtimeConfirmation>,
   ) : T3VoiceControllerState
@@ -549,10 +548,6 @@ internal sealed interface T3VoiceRuntimeCallback {
 
   data class RealtimeTerminalActionReceived(
     val action: T3VoiceRealtimeTerminalAction,
-  ) : T3VoiceRuntimeCallback
-
-  data class RealtimeAudioRoutesChanged(
-    val routes: List<T3VoiceAudioRoute>,
   ) : T3VoiceRuntimeCallback
 
   data class RealtimeTranscriptChanged(

@@ -5,6 +5,8 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Test
+import org.json.JSONArray
+import org.json.JSONObject
 
 internal class T3VoiceNativeVoiceApiPolicyTest {
   @Test
@@ -99,6 +101,76 @@ internal class T3VoiceNativeVoiceApiPolicyTest {
     assertFalse(withoutFocus.containsKey("threadId"))
     assertEquals(listOf("stop-realtime"), withoutFocus["terminalActions"])
   }
+
+  @Test
+  fun `Terminal switch event requires and decodes the exact canonical Thread target`() {
+    val event =
+      terminalSwitchEvent(canonicalTarget())
+        .realtimeEvent(expectedSessionId = "session-a", expectedLeaseGeneration = 7)
+    val action =
+      (event as T3VoiceApiRealtimeEvent.TerminalAction).action
+        as T3VoiceRealtimeTerminalAction.SwitchToThread
+
+    assertEquals("terminal-a", action.actionId)
+    assertEquals("project-a", action.target.projectId)
+    assertEquals("thread-a", action.target.threadId)
+    assertEquals("codex_personal", action.target.modelSelection.instanceId)
+    assertEquals("gpt-5.4", action.target.modelSelection.model)
+    assertEquals(
+      listOf(
+        T3VoiceModelOption(
+          "reasoningEffort",
+          T3VoiceModelOptionValue.StringValue("high"),
+        ),
+        T3VoiceModelOption("fastMode", T3VoiceModelOptionValue.BooleanValue(true)),
+      ),
+      action.target.modelSelection.options,
+    )
+    assertEquals(T3VoiceThreadRuntimeMode.FULL_ACCESS, action.target.runtimeMode)
+    assertEquals(T3VoiceThreadInteractionMode.PLAN, action.target.interactionMode)
+
+    assertThrows(RuntimeException::class.java) {
+      terminalSwitchEvent().realtimeEvent("session-a", 7)
+    }
+    assertThrows(RuntimeException::class.java) {
+      terminalSwitchEvent(canonicalTarget().apply { remove("runtimeMode") })
+        .realtimeEvent("session-a", 7)
+    }
+    assertThrows(RuntimeException::class.java) {
+      terminalSwitchEvent(canonicalTarget().put("legacyThreadId", "thread-old"))
+        .realtimeEvent("session-a", 7)
+    }
+  }
+
+  private fun terminalSwitchEvent(target: JSONObject? = null): JSONObject =
+    JSONObject()
+      .put("sessionId", "session-a")
+      .put("leaseGeneration", 7)
+      .put("sequence", 11)
+      .put("occurredAt", "2026-07-17T12:00:00.000Z")
+      .put("type", "terminal-action")
+      .put("actionId", "terminal-a")
+      .put("action", "switch-to-thread")
+      .also { event -> target?.let { event.put("target", it) } }
+
+  private fun canonicalTarget(): JSONObject =
+    JSONObject()
+      .put("projectId", "project-a")
+      .put("threadId", "thread-a")
+      .put(
+        "modelSelection",
+        JSONObject()
+          .put("instanceId", "codex_personal")
+          .put("model", "gpt-5.4")
+          .put(
+            "options",
+            JSONArray()
+              .put(JSONObject().put("id", "reasoningEffort").put("value", "high"))
+              .put(JSONObject().put("id", "fastMode").put("value", true)),
+          ),
+      )
+      .put("runtimeMode", "full-access")
+      .put("interactionMode", "plan")
 
   private companion object {
     val THREAD_SETTINGS =

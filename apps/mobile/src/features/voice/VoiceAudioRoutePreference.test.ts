@@ -20,20 +20,16 @@ describe("presentVoiceAudioRoutePreference", () => {
     expect(
       presentVoiceAudioRoutePreference(
         {
-          preferredRouteId: "bluetooth",
-          activeRouteId: "speaker",
+          preferredRoute: "bluetooth",
+          activeRoute: "speaker",
           routes: [
             {
-              id: "speaker",
+              kind: "speaker",
               label: "Speaker",
-              type: "speaker",
-              selected: false,
             },
             {
-              id: "bluetooth",
+              kind: "bluetooth",
               label: "Bluetooth",
-              type: "bluetooth",
-              selected: true,
             },
           ],
         },
@@ -49,14 +45,12 @@ describe("presentVoiceAudioRoutePreference", () => {
     expect(
       presentVoiceAudioRoutePreference(
         {
-          preferredRouteId: "bluetooth",
-          activeRouteId: "speaker",
+          preferredRoute: "bluetooth",
+          activeRoute: "speaker",
           routes: [
             {
-              id: "speaker",
+              kind: "speaker",
               label: "Speaker",
-              type: "speaker",
-              selected: false,
             },
           ],
         },

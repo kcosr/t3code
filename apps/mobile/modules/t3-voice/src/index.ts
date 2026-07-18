@@ -33,6 +33,8 @@ export type {
   T3VoiceRuntimeState,
 } from "./T3Voice.types";
 
+export type { VoiceAudioRoute, VoiceAudioRouteKind } from "@t3tools/client-runtime/voice";
+
 const NATIVE_MODULE_NAME = "T3Voice";
 
 let resolvedModule: T3VoiceNativeModule | null | undefined;

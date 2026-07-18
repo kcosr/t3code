@@ -76,6 +76,7 @@ import { loadResumeSelection } from "./voiceConversationResume";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
 import { useVoiceCapabilityAvailability } from "./useVoiceCapabilityAvailability";
 import { resolveVoicePreferences } from "./voicePreferences";
+import { voiceErrorMessage as errorMessage } from "./voiceError";
 
 interface NativeRuntimeConnection {
   readonly environmentId: EnvironmentId;
@@ -120,9 +121,6 @@ const INITIAL_SNAPSHOT: VoiceRuntimeSnapshot = {
 
 const VoiceRuntimeContext = createContext<VoiceRuntimeContextValue | null>(null);
 const EMPTY_REALTIME_TRANSCRIPT: ReadonlyArray<RealtimeVoiceTranscriptTurn> = [];
-
-const errorMessage = (cause: unknown): string =>
-  cause instanceof Error ? cause.message : String(cause);
 
 const canStartRealtimeFrom = (snapshot: VoiceRuntimeSnapshot): boolean =>
   snapshot.mode === "idle" || snapshot.mode === "failed" || snapshot.mode === "thread";

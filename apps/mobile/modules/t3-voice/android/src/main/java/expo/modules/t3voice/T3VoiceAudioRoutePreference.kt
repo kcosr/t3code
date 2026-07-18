@@ -30,25 +30,31 @@ internal class T3VoiceSharedPreferencesAudioRouteStorage(context: Context) :
 internal class T3VoiceAudioRoutePreferenceStore(
   private val storage: T3VoiceAudioRoutePreferenceStorage,
 ) {
+  private var cached: T3VoiceAudioRouteKind? = null
+
   @Synchronized
   fun get(): T3VoiceAudioRouteKind =
-    storage.read()?.let(T3VoiceAudioRouteKind::fromId) ?: T3VoiceAudioRouteKind.SYSTEM
+    cached
+      ?: (storage.read()?.let(T3VoiceAudioRouteKind::fromId) ?: T3VoiceAudioRouteKind.SYSTEM)
+        .also { cached = it }
 
   @Synchronized
   fun set(route: T3VoiceAudioRouteKind) {
+    if (route == get()) return
     storage.write(route.id)
+    cached = route
   }
 }
 
 internal data class T3VoiceAudioRoutePreference(
-  val preferredRouteId: String,
-  val activeRouteId: String?,
+  val preferredRoute: T3VoiceAudioRouteKind,
+  val activeRoute: T3VoiceAudioRouteKind?,
   val routes: List<T3VoiceAudioRoute>,
 ) {
   fun toResultBody(): Map<String, Any?> =
     mapOf(
-      "preferredRouteId" to preferredRouteId,
-      "activeRouteId" to activeRouteId,
+      "preferredRoute" to preferredRoute.id,
+      "activeRoute" to activeRoute?.id,
       "routes" to routes.map(T3VoiceAudioRoute::toResultBody),
     )
 }

@@ -25,6 +25,7 @@ import {
   type ThreadSpeechPlannerState,
 } from "./threadSpeechPlanner";
 import { useVoiceCapabilityAvailability } from "./useVoiceCapabilityAvailability";
+import { voiceErrorMessage as errorMessage } from "./voiceError";
 
 const bytesToBase64 = (bytes: Uint8Array): string => {
   let binary = "";
@@ -34,9 +35,6 @@ const bytesToBase64 = (bytes: Uint8Array): string => {
   }
   return globalThis.btoa(binary);
 };
-
-const errorMessage = (cause: unknown): string =>
-  cause instanceof Error ? cause.message : String(cause);
 
 const MAX_UNCONSUMED_CHUNKS = 4;
 

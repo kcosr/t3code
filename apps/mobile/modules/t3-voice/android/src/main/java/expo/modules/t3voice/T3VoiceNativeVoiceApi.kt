@@ -809,48 +809,33 @@ private fun JSONObject.requiredObject(name: String): JSONObject =
   get(name) as? JSONObject ?: error("Expected JSON object field $name.")
 
 private fun JSONObject.remoteThreadTarget(): T3VoiceRemoteThreadTarget {
-  val selection = requiredObject("modelSelection")
-  val options =
-    if (selection.has("options") && !selection.isNull("options")) {
-      val values = selection.requiredArray("options")
-      List(values.length()) { index ->
-        val option = values.requiredObject(index)
-        T3VoiceModelOption(
-          id = option.requiredString("id"),
-          value =
-            when (val value = option.get("value")) {
-              is String -> T3VoiceModelOptionValue.StringValue(value)
-              is Boolean -> T3VoiceModelOptionValue.BooleanValue(value)
-              else -> error("Thread model option value must be a string or boolean.")
-            },
-        )
-      }
-    } else {
-      null
-    }
+  val parsed = T3VoiceThreadWireParser.target(T3VoiceJsonWireObject(this))
   return T3VoiceRemoteThreadTarget(
-    projectId = requiredString("projectId"),
-    threadId = requiredString("threadId"),
-    modelSelection =
-      T3VoiceModelSelection(
-        instanceId = selection.requiredString("instanceId"),
-        model = selection.requiredString("model"),
-        options = options,
-      ),
-    runtimeMode =
-      when (requiredString("runtimeMode")) {
-        "approval-required" -> T3VoiceThreadRuntimeMode.APPROVAL_REQUIRED
-        "auto-accept-edits" -> T3VoiceThreadRuntimeMode.AUTO_ACCEPT_EDITS
-        "full-access" -> T3VoiceThreadRuntimeMode.FULL_ACCESS
-        else -> error("Thread runtime mode was unsupported.")
-      },
-    interactionMode =
-      when (requiredString("interactionMode")) {
-        "default" -> T3VoiceThreadInteractionMode.DEFAULT
-        "plan" -> T3VoiceThreadInteractionMode.PLAN
-        else -> error("Thread interaction mode was unsupported.")
-      },
+    projectId = parsed.projectId,
+    threadId = parsed.threadId,
+    modelSelection = parsed.modelSelection,
+    runtimeMode = parsed.runtimeMode,
+    interactionMode = parsed.interactionMode,
   )
+}
+
+private class T3VoiceJsonWireObject(
+  private val input: JSONObject,
+) : T3VoiceWireObject {
+  override val fieldNames: Set<String>
+    get() = input.keys().asSequence().toSet()
+
+  override fun value(name: String): Any? =
+    if (!input.has(name) || input.isNull(name)) null else input.get(name)
+
+  override fun requiredObject(name: String): T3VoiceWireObject =
+    T3VoiceJsonWireObject(input.requiredObject(name))
+
+  override fun optionalObjectList(name: String): List<T3VoiceWireObject>? {
+    if (!input.has(name)) return null
+    val values = input.requiredArray(name)
+    return List(values.length()) { index -> T3VoiceJsonWireObject(values.requiredObject(index)) }
+  }
 }
 
 private fun JSONObject.nullableObject(name: String): JSONObject? =

@@ -302,7 +302,6 @@ internal class T3VoiceRealtimeSession(
     val expected = synchronized(lock) { serverSession?.state?.sessionId } ?: return
     if (sessionId != expected || terminal.get()) return
     if (connectionState == "connected" && connected.compareAndSet(false, true)) {
-      emitRoutes()
       emitIfLive(T3VoiceRuntimeCallback.RealtimeConnected)
     }
   }
@@ -326,8 +325,6 @@ internal class T3VoiceRealtimeSession(
       "The Realtime media connection ended.",
     )
   }
-
-  fun onAudioRouteChanged() = emitRoutes()
 
   private fun offer(server: T3VoiceApiRealtimeSession, offerSdp: String) {
     if (terminal.get()) return
@@ -611,12 +608,6 @@ internal class T3VoiceRealtimeSession(
   private fun requireLivePhase(phase: String) {
     if (phase == "ended" || phase == "error") {
       throw T3VoiceNativeApiException("realtime-session-ended", retryable = true)
-    }
-  }
-
-  private fun emitRoutes() {
-    if (!terminal.get()) {
-      emit(T3VoiceRuntimeCallback.RealtimeAudioRoutesChanged(audioRouter.routes()))
     }
   }
 

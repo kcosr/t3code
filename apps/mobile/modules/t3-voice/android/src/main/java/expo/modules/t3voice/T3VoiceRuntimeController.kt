@@ -216,8 +216,6 @@ internal class T3VoiceRuntimeController(
           realtimeClientActionResolved(callback.actionId)
         is T3VoiceRuntimeCallback.RealtimeTerminalActionReceived ->
           realtimeTerminalActionReceived(callback.action)
-        is T3VoiceRuntimeCallback.RealtimeAudioRoutesChanged ->
-          realtimeAudioRoutesChanged(callback.routes)
         is T3VoiceRuntimeCallback.RealtimeTranscriptChanged ->
           realtimeTranscriptChanged(callback.transcript)
         is T3VoiceRuntimeCallback.RealtimeConfirmationReceived ->
@@ -797,13 +795,6 @@ internal class T3VoiceRuntimeController(
     return true
   }
 
-  private fun realtimeAudioRoutesChanged(routes: List<T3VoiceAudioRoute>): Boolean {
-    val state = current.state as? T3VoiceControllerState.Realtime ?: return false
-    if (state.stage == T3VoiceRealtimeStage.STOPPING || state.audioRoutes == routes) return false
-    update(state.copy(audioRoutes = routes))
-    return true
-  }
-
   private fun realtimeTranscriptChanged(
     transcript: List<T3VoiceRealtimeTranscriptTurn>,
   ): Boolean {
@@ -1012,7 +1003,6 @@ internal class T3VoiceRuntimeController(
       target = target,
       muted = false,
       pendingClientActions = emptyList(),
-      audioRoutes = emptyList(),
       transcript = emptyList(),
       pendingConfirmations = emptyList(),
     )

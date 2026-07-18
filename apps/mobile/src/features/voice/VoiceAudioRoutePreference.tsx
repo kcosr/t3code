@@ -1,21 +1,29 @@
-import type { VoiceAudioRoute } from "@t3tools/client-runtime/voice";
+import type { VoiceAudioRoute, VoiceAudioRouteKind } from "@t3tools/client-runtime/voice";
 import type {
   T3VoiceAudioRoutePreferenceState,
   T3VoiceNativeModule,
 } from "@t3tools/mobile-voice-native";
-import { createContext, use, useCallback, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  createContext,
+  use,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
-const errorMessage = (cause: unknown): string =>
-  cause instanceof Error ? cause.message : String(cause);
+import { requestOptionalBluetoothPermission } from "./requestOptionalBluetoothPermission";
+import { voiceErrorMessage as errorMessage } from "./voiceError";
 
-const routeKindLabel = (routeId: string): string =>
-  ({
-    system: "System default",
-    speaker: "Speaker",
-    earpiece: "Phone",
-    bluetooth: "Bluetooth",
-    wired: "Wired headset",
-  })[routeId] ?? "Preferred device";
+const ROUTE_KIND_LABEL: Readonly<Record<VoiceAudioRouteKind, string>> = {
+  system: "System default",
+  speaker: "Speaker",
+  earpiece: "Phone",
+  bluetooth: "Bluetooth",
+  wired: "Wired headset",
+};
 
 export interface VoiceAudioRoutePreferencePresentation {
   readonly valueLabel: string;
@@ -43,21 +51,21 @@ export function presentVoiceAudioRoutePreference(
     };
   }
 
-  const preferred = state.routes.find((route) => route.id === state.preferredRouteId);
+  const preferred = state.routes.find((route) => route.kind === state.preferredRoute);
   const active =
-    state.activeRouteId === null
+    state.activeRoute === null
       ? null
-      : state.routes.find((route) => route.id === state.activeRouteId);
+      : state.routes.find((route) => route.kind === state.activeRoute);
   if (preferred === undefined) {
     return {
-      valueLabel: `${routeKindLabel(state.preferredRouteId)} (unavailable)`,
+      valueLabel: `${ROUTE_KIND_LABEL[state.preferredRoute]} (unavailable)`,
       statusMessage:
         active === undefined || active === null
           ? "Your preferred audio route is unavailable. Android will use the system default."
           : `Your preferred audio route is unavailable. Android is using ${active.label}.`,
     };
   }
-  if (active !== null && active !== undefined && active.id !== preferred.id) {
+  if (active !== null && active !== undefined && active.kind !== preferred.kind) {
     return {
       valueLabel: preferred.label,
       statusMessage: `Android is currently using ${active.label}.`,
@@ -70,7 +78,7 @@ export interface VoiceAudioRoutePreferenceController {
   readonly nativeAvailable: boolean;
   readonly visible: boolean;
   readonly loading: boolean;
-  readonly selectingRouteId: VoiceAudioRoute["id"] | null;
+  readonly selectingRoute: VoiceAudioRouteKind | null;
   readonly state: T3VoiceAudioRoutePreferenceState | null;
   readonly error: string | null;
   readonly valueLabel: string;
@@ -86,7 +94,7 @@ export function useVoiceAudioRoutePreferenceController(
 ): VoiceAudioRoutePreferenceController {
   const [visible, setVisible] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [selectingRouteId, setSelectingRouteId] = useState<VoiceAudioRoute["id"] | null>(null);
+  const [selectingRoute, setSelectingRoute] = useState<VoiceAudioRouteKind | null>(null);
   const [state, setState] = useState<T3VoiceAudioRoutePreferenceState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const requestSequenceRef = useRef(0);
@@ -115,22 +123,42 @@ export function useVoiceAudioRoutePreferenceController(
 
   const open = useCallback(() => {
     setVisible(true);
-    void refresh();
-  }, [refresh]);
+    if (native === null) {
+      void refresh();
+      return;
+    }
+    void requestOptionalBluetoothPermission(native).then(refresh);
+  }, [native, refresh]);
 
   const close = useCallback(() => {
     setVisible(false);
-    setSelectingRouteId(null);
+    setSelectingRoute(null);
   }, []);
+
+  useEffect(() => {
+    if (native === null) return;
+    const subscription = native.addListener("audioRoutePreferenceChanged", (next) => {
+      requestSequenceRef.current += 1;
+      setState(next);
+      setError(null);
+      setLoading(false);
+    });
+    void refresh();
+    return () => {
+      requestSequenceRef.current += 1;
+      subscription.remove();
+    };
+  }, [native, refresh]);
 
   const select = useCallback(
     (route: VoiceAudioRoute) => {
-      if (native === null || selectingRouteId !== null) return;
-      setSelectingRouteId(route.id);
+      if (native === null || selectingRoute !== null || route.kind === state?.preferredRoute)
+        return;
+      setSelectingRoute(route.kind);
       setError(null);
       const requestSequence = ++requestSequenceRef.current;
       void native
-        .setAudioRoutePreferenceAsync({ routeId: route.id })
+        .setAudioRoutePreferenceAsync({ route: route.kind })
         .then((next) => {
           if (requestSequence !== requestSequenceRef.current) return;
           setState(next);
@@ -140,10 +168,10 @@ export function useVoiceAudioRoutePreferenceController(
           setError(errorMessage(cause));
         })
         .finally(() => {
-          setSelectingRouteId((current) => (current === route.id ? null : current));
+          setSelectingRoute((current) => (current === route.kind ? null : current));
         });
     },
-    [native, selectingRouteId],
+    [native, selectingRoute, state?.preferredRoute],
   );
 
   const { valueLabel, statusMessage } = presentVoiceAudioRoutePreference(state, {
@@ -157,7 +185,7 @@ export function useVoiceAudioRoutePreferenceController(
       nativeAvailable: native !== null,
       visible,
       loading,
-      selectingRouteId,
+      selectingRoute,
       state,
       error,
       valueLabel,
@@ -175,7 +203,7 @@ export function useVoiceAudioRoutePreferenceController(
       open,
       refresh,
       select,
-      selectingRouteId,
+      selectingRoute,
       state,
       statusMessage,
       valueLabel,

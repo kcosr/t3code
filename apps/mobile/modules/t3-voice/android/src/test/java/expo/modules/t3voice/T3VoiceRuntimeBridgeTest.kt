@@ -39,7 +39,6 @@ class T3VoiceRuntimeBridgeTest {
             target = target,
             muted = false,
             pendingClientActions = emptyList(),
-            audioRoutes = emptyList(),
             transcript = emptyList(),
             pendingConfirmations = emptyList(),
           ),
