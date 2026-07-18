@@ -194,9 +194,8 @@ internal class T3VoiceCuePlayer(
           }
         }
       if (!stillCurrent) {
-        if (!cue.terminalClaimed.get()) {
-          worker.execute { runCatching { output.release(true) } }
-        }
+        // settle() owns release of any published output (including replace/cancel). Do not
+        // release here — that races settle's synchronized(cue) release path.
         return
       }
       synchronized(lock) {
