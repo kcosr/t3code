@@ -399,6 +399,7 @@ it.effect("allows interrupting an opened speech body stream", () =>
 
 it.effect("reports readiness from health/ready with configuration gates", () =>
   Effect.gen(function* () {
+    __testing.clearHealthCache();
     const requests: Array<string> = [];
     const httpClient = HttpClient.make((request) =>
       Effect.sync(() => {
@@ -421,6 +422,16 @@ it.effect("reports readiness from health/ready with configuration gates", () =>
     expect(ready).toBe("ready");
     expect(requests).toEqual(["http://speech.test:6624/health/ready"]);
 
+    // Cached: second call must not re-hit the network within the TTL.
+    const readyAgain = yield* __testing.checkOpenAiSpeechServerHealth.pipe(
+      Effect.provideService(HttpClient.HttpClient, httpClient),
+      Effect.provideService(VoiceCredentialStore, credentialStore(Option.some("speech-token"))),
+      Effect.provideService(ServerSettingsService, settingsService(baseSettings())),
+    );
+    expect(readyAgain).toBe("ready");
+    expect(requests).toHaveLength(1);
+
+    __testing.clearHealthCache();
     const missingConfig = yield* __testing.checkOpenAiSpeechServerHealth.pipe(
       Effect.provideService(
         HttpClient.HttpClient,
@@ -431,6 +442,7 @@ it.effect("reports readiness from health/ready with configuration gates", () =>
     );
     expect(missingConfig).toBe("not-configured");
 
+    __testing.clearHealthCache();
     const unhealthyClient = HttpClient.make((request) =>
       Effect.succeed(HttpClientResponse.fromWeb(request, new Response(null, { status: 503 }))),
     );

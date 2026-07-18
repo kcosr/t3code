@@ -1,4 +1,5 @@
 import type { VoiceSpeechPreset } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -226,6 +227,20 @@ const make = Effect.gen(function* () {
 
 export type OpenAiSpeechServerReadiness = "ready" | "not-configured" | "unavailable";
 
+/** Capabilities polls often; avoid a full connectTimeout round-trip on every call. */
+const HEALTH_CHECK_CACHE_TTL_MS = 5_000;
+/** Hard ceiling for the capabilities health probe (also min'd with connectTimeoutSeconds). */
+const CAPABILITIES_HEALTH_TIMEOUT_SECONDS = 5;
+
+type HealthCacheEntry = {
+  readonly expiresAtMs: number;
+  readonly baseUrl: string;
+  readonly tokenConfigured: boolean;
+  readonly state: OpenAiSpeechServerReadiness;
+};
+
+let healthCache: HealthCacheEntry | undefined;
+
 export const checkOpenAiSpeechServerHealth: Effect.Effect<
   OpenAiSpeechServerReadiness,
   never,
@@ -240,6 +255,7 @@ export const checkOpenAiSpeechServerHealth: Effect.Effect<
   }
   const config = settingsResult.success.voice.openaiSpeechServer;
   if (config.baseUrl.trim().length === 0) {
+    healthCache = undefined;
     return "not-configured" as const;
   }
   const tokenResult = yield* credentials.get(PROVIDER_ID).pipe(Effect.result);
@@ -247,24 +263,44 @@ export const checkOpenAiSpeechServerHealth: Effect.Effect<
     return "unavailable" as const;
   }
   if (Option.isNone(tokenResult.success)) {
+    healthCache = undefined;
     return "not-configured" as const;
   }
   const baseUrlResult = yield* requireBaseUrl(config.baseUrl).pipe(Effect.result);
   if (baseUrlResult._tag === "Failure") {
+    healthCache = undefined;
     return "not-configured" as const;
   }
   const baseUrl = baseUrlResult.success;
+  const nowMs = yield* Clock.currentTimeMillis;
+  if (
+    healthCache !== undefined &&
+    healthCache.expiresAtMs > nowMs &&
+    healthCache.baseUrl === baseUrl &&
+    healthCache.tokenConfigured
+  ) {
+    return healthCache.state;
+  }
+  const healthTimeoutSeconds = Math.min(
+    config.connectTimeoutSeconds,
+    CAPABILITIES_HEALTH_TIMEOUT_SECONDS,
+  );
   const responseResult = yield* client
     .execute(HttpClientRequest.get(`${baseUrl}/health/ready`))
-    .pipe(Effect.timeout(`${config.connectTimeoutSeconds} seconds`), Effect.result);
-  if (responseResult._tag === "Failure") {
-    return "unavailable" as const;
-  }
-  const response = responseResult.success;
-  if (response.status < 200 || response.status >= 300) {
-    return "unavailable" as const;
-  }
-  return "ready" as const;
+    .pipe(Effect.timeout(`${healthTimeoutSeconds} seconds`), Effect.result);
+  const state: OpenAiSpeechServerReadiness =
+    responseResult._tag === "Failure" ||
+    responseResult.success.status < 200 ||
+    responseResult.success.status >= 300
+      ? "unavailable"
+      : "ready";
+  healthCache = {
+    expiresAtMs: nowMs + HEALTH_CHECK_CACHE_TTL_MS,
+    baseUrl,
+    tokenConfigured: true,
+    state,
+  };
+  return state;
 });
 
 export const OpenAiSpeechServerVoiceProviderLive = Layer.effect(
@@ -275,6 +311,11 @@ export const OpenAiSpeechServerVoiceProviderLive = Layer.effect(
 export const __testing = {
   make,
   checkOpenAiSpeechServerHealth,
+  clearHealthCache: () => {
+    healthCache = undefined;
+  },
+  HEALTH_CHECK_CACHE_TTL_MS,
+  CAPABILITIES_HEALTH_TIMEOUT_SECONDS,
   PROVIDER_ID,
   UPSTREAM_MODEL,
 };

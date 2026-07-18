@@ -22,6 +22,7 @@ import {
 } from "effect/unstable/http";
 
 import { VoiceError } from "../../Errors.ts";
+import { VOICE_SPEECH_FIRST_BYTE_TIMEOUT_SECONDS } from "../../Services/VoiceMediaPolicy.ts";
 import { VoiceCredentialStore } from "../../Services/VoiceCredentialStore.ts";
 import { logVoiceDiagnostic } from "../../Services/VoiceObservability.ts";
 import type {
@@ -831,7 +832,10 @@ const make = Effect.gen(function* () {
           }),
           Effect.mapError(providerError("openai.synthesize.request")),
         );
+        // Bound connect+headers before the media route commits 200 / holds a permit.
+        // Matches the pre-prepare first-byte budget and speech-server connect timeout.
         const response = yield* client.execute(request).pipe(
+          Effect.timeout(`${VOICE_SPEECH_FIRST_BYTE_TIMEOUT_SECONDS} seconds`),
           Effect.tapError((cause) => logHttpFailure("openai.synthesize", cause)),
           Effect.mapError(mapOpenAiCompatibleHttpFailure("openai.synthesize")),
         );
