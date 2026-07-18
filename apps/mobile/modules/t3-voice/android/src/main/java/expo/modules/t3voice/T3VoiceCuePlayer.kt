@@ -70,8 +70,11 @@ internal class T3VoiceCuePlayer(
   private val coldStartCheckMs: Long = COLD_START_CHECK_MS,
   private val drainPollMs: Long = DRAIN_POLL_MS,
   private val timeoutMs: Long = TIMEOUT_MS,
-  private val recordDiagnostic: (Long, T3VoiceDiagnosticCategory, T3VoiceDiagnosticCode) -> Unit =
-    { generation, category, code -> T3VoiceDiagnostics.record(generation, category, code) },
+  private val recordDiagnostic:
+    (Long, T3VoiceDiagnosticCategory, T3VoiceDiagnosticCode, Int, Int) -> Unit =
+    { generation, category, code, primaryCount, secondaryCount ->
+      T3VoiceDiagnostics.record(generation, category, code, primaryCount, secondaryCount)
+    },
 ) {
   private data class ActiveCue(
     val generation: Long,
@@ -113,7 +116,11 @@ internal class T3VoiceCuePlayer(
         ActiveCue(
           generation,
           cue,
-          T3VoiceCuePcm.synthesize(sampleRate, cue),
+          T3VoiceCuePcm.withStartupPreRoll(
+            sampleRate,
+            T3VoiceCuePcm.synthesize(sampleRate, cue),
+            STARTUP_PRE_ROLL_MS,
+          ),
           clock.elapsedRealtime() + timeoutMs,
           completion,
         )
@@ -128,6 +135,8 @@ internal class T3VoiceCuePlayer(
       } else {
         T3VoiceDiagnosticCode.CUE_ENDED_STARTED
       },
+      0,
+      0,
     )
     replaced?.let { settle(it, T3VoiceCueOutcome.CANCELLED, flush = true) }
     worker.execute { startAttempt(next) }
@@ -171,33 +180,14 @@ internal class T3VoiceCuePlayer(
       cue.output = output
     }
     try {
-      // Serialize write/play with settle()'s release on the same per-cue monitor so AudioTrack
-      // is never written and released from two worker threads concurrently.
-      val stillCurrent =
-        synchronized(cue) {
-          if (!isCurrent(cue) || cue.output !== output) {
-            false
-          } else {
-            var offset = 0
-            while (offset < cue.pcm.size) {
-              if (!isCurrent(cue) || cue.output !== output) return@synchronized false
-              val written = output.write(cue.pcm, offset, cue.pcm.size - offset)
-              check(written > 0) { "Cue output stopped accepting PCM." }
-              offset += written
-            }
-            if (!isCurrent(cue) || cue.output !== output) {
-              false
-            } else {
-              output.play()
-              true
-            }
-          }
-        }
-      if (!stillCurrent) {
-        // settle() owns release of any published output (including replace/cancel). Do not
-        // release here — that races settle's synchronized(cue) release path.
-        return
+      output.play()
+      var offset = 0
+      while (offset < cue.pcm.size && isCurrent(cue)) {
+        val written = output.write(cue.pcm, offset, cue.pcm.size - offset)
+        check(written > 0) { "Cue output stopped accepting PCM." }
+        offset += written
       }
+      if (!isCurrent(cue)) return
       synchronized(lock) {
         if (active !== cue || cue.output !== output || cue.terminalClaimed.get()) return
         cue.attemptTasks += scheduler.schedule(coldStartCheckMs) { checkColdStart(cue, output) }
@@ -255,6 +245,16 @@ internal class T3VoiceCuePlayer(
 
   private fun settle(cue: ActiveCue, outcome: T3VoiceCueOutcome, flush: Boolean) {
     if (!cue.terminalClaimed.compareAndSet(false, true)) return
+    val output = synchronized(lock) {
+      if (active === cue) active = null
+      cue.attemptTasks.forEach(T3VoiceCueTask::cancel)
+      cue.attemptTasks.clear()
+      cue.timeoutTask?.cancel()
+      cue.timeoutTask = null
+      cue.output.also { cue.output = null }
+    }
+    val finalPlaybackHeadPosition =
+      output?.let { runCatching { it.playbackHeadPosition }.getOrDefault(0L) } ?: 0L
     recordDiagnostic(
       cue.generation,
       T3VoiceDiagnosticCategory.TERMINAL,
@@ -264,26 +264,16 @@ internal class T3VoiceCuePlayer(
         T3VoiceCueOutcome.FAILED -> T3VoiceDiagnosticCode.CUE_FAILED
         T3VoiceCueOutcome.TIMED_OUT -> T3VoiceDiagnosticCode.CUE_TIMED_OUT
       },
+      finalPlaybackHeadPosition.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt(),
+      cue.attempt,
     )
-    val output = synchronized(lock) {
-      if (active === cue) active = null
-      cue.attemptTasks.forEach(T3VoiceCueTask::cancel)
-      cue.attemptTasks.clear()
-      cue.timeoutTask?.cancel()
-      cue.timeoutTask = null
-      cue.output.also { cue.output = null }
+    // Completion must never wait for a platform AudioTrack call. The single worker releases this
+    // output before any replacement can start, while the session's settle guard keeps capture out
+    // of the drained cue tail.
+    runCatching {
+      cue.completion(T3VoiceCueCompletion(cue.generation, cue.cue, outcome))
     }
-    val complete = {
-      if (output != null) {
-        // Release under the same per-cue monitor used by the write loop.
-        synchronized(cue) { runCatching { output.release(flush) } }
-      }
-      runCatching {
-        cue.completion(T3VoiceCueCompletion(cue.generation, cue.cue, outcome))
-      }
-      Unit
-    }
-    if (output != null) worker.execute(complete) else complete()
+    if (output != null) worker.execute { runCatching { output.release(flush) } }
   }
 
   private fun isCurrent(cue: ActiveCue): Boolean =
@@ -297,6 +287,7 @@ internal class T3VoiceCuePlayer(
 
   private companion object {
     const val SAMPLE_RATE = 48_000
+    const val STARTUP_PRE_ROLL_MS = 512
     const val COLD_START_CHECK_MS = 220L
     const val DRAIN_POLL_MS = 10L
     const val TIMEOUT_MS = 2_500L
@@ -309,14 +300,11 @@ internal object T3VoiceCuePcm {
 
   fun synthesize(sampleRate: Int, cue: T3VoiceCue): ByteArray {
     require(sampleRate > 0)
-    val toneSegments = when (cue) {
+    val segments = when (cue) {
       T3VoiceCue.READY ->
         listOf(Segment(523.25, 95, 0.14f), Segment(0.0, 55, 0f), Segment(659.25, 140, 0.16f))
       T3VoiceCue.ENDED -> listOf(Segment(659.25, 140, 0.16f))
     }
-    // Short cold-start pre-roll so the first audible samples land after AudioTrack bring-up
-    // without adding ~800ms of dead time before every capture arm.
-    val segments = listOf(Segment(0.0, 120, 0f)) + toneSegments
     val sampleCount = segments.sumOf { sampleRate * it.durationMs / 1_000 }
     val pcm = ByteArray(sampleCount * Short.SIZE_BYTES)
     var sampleOffset = 0
@@ -343,10 +331,27 @@ internal object T3VoiceCuePcm {
     }
     return pcm
   }
+
+  fun withStartupPreRoll(sampleRate: Int, pcm: ByteArray, durationMs: Int): ByteArray {
+    require(sampleRate > 0)
+    require(durationMs >= 0)
+    if (durationMs == 0) return pcm
+    val silenceBytes = sampleRate * durationMs / 1_000 * Short.SIZE_BYTES
+    return ByteArray(silenceBytes + pcm.size).also { output ->
+      pcm.copyInto(output, destinationOffset = silenceBytes)
+    }
+  }
 }
 
 private object AndroidCueOutputFactory : T3VoiceCueOutputFactory {
   override fun create(sampleRate: Int, byteCount: Int): T3VoiceCueOutput {
+    val minimumBufferSize =
+      AudioTrack.getMinBufferSize(
+        sampleRate,
+        AudioFormat.CHANNEL_OUT_MONO,
+        AudioFormat.ENCODING_PCM_16BIT,
+      )
+    check(minimumBufferSize > 0) { "Cue AudioTrack buffer sizing failed." }
     val track =
       AudioTrack.Builder()
         .setAudioAttributes(
@@ -362,16 +367,19 @@ private object AndroidCueOutputFactory : T3VoiceCueOutputFactory {
             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
             .build(),
         )
-        .setTransferMode(AudioTrack.MODE_STATIC)
-        .setBufferSizeInBytes(byteCount)
+        .setTransferMode(AudioTrack.MODE_STREAM)
+        .setBufferSizeInBytes(maxOf(minimumBufferSize, byteCount))
         .build()
-    check(track.state == AudioTrack.STATE_INITIALIZED) { "Cue AudioTrack initialization failed." }
+    if (track.state != AudioTrack.STATE_INITIALIZED) {
+      track.release()
+      error("Cue AudioTrack initialization failed.")
+    }
     return object : T3VoiceCueOutput {
       override val playbackHeadPosition: Long
         get() = track.playbackHeadPosition.toLong() and 0xffff_ffffL
 
       override fun write(pcm: ByteArray, offset: Int, length: Int): Int =
-        track.write(pcm, offset, length, AudioTrack.WRITE_BLOCKING)
+        track.write(pcm, offset, length, AudioTrack.WRITE_NON_BLOCKING)
 
       override fun play() = track.play()
 
@@ -389,7 +397,7 @@ private object AndroidCueClock : T3VoiceCueClock {
 }
 
 private object AndroidCueWorker : T3VoiceCueWorker {
-  private val executor: ExecutorService = Executors.newCachedThreadPool()
+  private val executor: ExecutorService = Executors.newSingleThreadExecutor()
 
   override fun execute(action: () -> Unit) {
     executor.execute(action)

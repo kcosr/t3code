@@ -21,8 +21,14 @@ internal interface T3VoiceCueArming {
     completion: (T3VoiceCueCompletion) -> Unit,
   ): Boolean
 
-  /** Fire-and-forget Ended cue when enabled; no-op when disabled. */
-  fun requestEnded(generation: Long)
+  /**
+   * Request Ended cue. Invokes [completion] with the terminal outcome so route teardown can remain
+   * fenced until playback drains (or fails open at the player's bounded timeout).
+   */
+  fun requestEnded(
+    generation: Long,
+    completion: (T3VoiceCueCompletion) -> Unit,
+  ): Boolean
 
   fun cancel(generation: Long)
 
@@ -78,9 +84,31 @@ internal class T3VoiceCueArmingLive(
     return accepted
   }
 
-  override fun requestEnded(generation: Long) {
-    if (!isEnabled()) return
-    coordinator.requestEnded(generation) { /* fire-and-forget */ }
+  override fun requestEnded(
+    generation: Long,
+    completion: (T3VoiceCueCompletion) -> Unit,
+  ): Boolean {
+    if (!isEnabled()) {
+      completion(
+        T3VoiceCueCompletion(
+          generation = generation,
+          cue = T3VoiceCue.ENDED,
+          outcome = T3VoiceCueOutcome.DRAINED,
+        ),
+      )
+      return true
+    }
+    val accepted = coordinator.requestEnded(generation, completion)
+    if (!accepted) {
+      completion(
+        T3VoiceCueCompletion(
+          generation = generation,
+          cue = T3VoiceCue.ENDED,
+          outcome = T3VoiceCueOutcome.FAILED,
+        ),
+      )
+    }
+    return accepted
   }
 
   override fun cancel(generation: Long) {
@@ -118,7 +146,19 @@ internal object NoOpCueArming : T3VoiceCueArming {
     return true
   }
 
-  override fun requestEnded(generation: Long) = Unit
+  override fun requestEnded(
+    generation: Long,
+    completion: (T3VoiceCueCompletion) -> Unit,
+  ): Boolean {
+    completion(
+      T3VoiceCueCompletion(
+        generation = generation,
+        cue = T3VoiceCue.ENDED,
+        outcome = T3VoiceCueOutcome.DRAINED,
+      ),
+    )
+    return true
+  }
 
   override fun cancel(generation: Long) = Unit
 

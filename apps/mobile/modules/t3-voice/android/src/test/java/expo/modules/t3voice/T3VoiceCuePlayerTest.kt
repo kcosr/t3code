@@ -7,18 +7,31 @@ import org.junit.Test
 
 class T3VoiceCuePlayerTest {
   @Test
-  fun `synthesizes assistant ready and ended shapes with cold-start preroll`() {
+  fun `synthesizes assistant ready and ended shapes without preroll`() {
     val ready = T3VoiceCuePcm.synthesize(48_000, T3VoiceCue.READY)
     val ended = T3VoiceCuePcm.synthesize(48_000, T3VoiceCue.ENDED)
-    val preroll = 48_000 * 120 / 1_000
 
-    assertEquals(48_000 * (120 + 95 + 55 + 140) / 1_000 * 2, ready.size)
-    assertEquals(48_000 * (120 + 140) / 1_000 * 2, ended.size)
+    assertEquals(48_000 * (95 + 55 + 140) / 1_000 * 2, ready.size)
+    assertEquals(48_000 * 140 / 1_000 * 2, ended.size)
     assertEquals(0, sample(ready, 0))
-    assertEquals(0, sample(ready, preroll + 48_000 * 95 / 1_000))
-    assertEquals(0, sample(ready, preroll + 48_000 * 120 / 1_000))
-    assertTrue(sample(ready, preroll + 48_000 * 30 / 1_000) != 0)
-    assertTrue(sample(ended, preroll + 48_000 * 30 / 1_000) != 0)
+    assertEquals(0, sample(ready, 48_000 * 95 / 1_000))
+    assertEquals(0, sample(ready, 48_000 * 120 / 1_000))
+    assertTrue(sample(ready, 48_000 * 30 / 1_000) != 0)
+    assertTrue(sample(ended, 48_000 * 30 / 1_000) != 0)
+  }
+
+  @Test
+  fun `prepends 512 milliseconds of startup silence without changing cue samples`() {
+    val cue = T3VoiceCuePcm.synthesize(48_000, T3VoiceCue.ENDED)
+    val withPreRoll = T3VoiceCuePcm.withStartupPreRoll(48_000, cue, 512)
+    val silenceSamples = 48_000 * 512 / 1_000
+
+    assertEquals((silenceSamples * 2) + cue.size, withPreRoll.size)
+    assertEquals(0, sample(withPreRoll, silenceSamples - 1))
+    assertEquals(
+      sample(cue, 48_000 * 30 / 1_000),
+      sample(withPreRoll, silenceSamples + 48_000 * 30 / 1_000),
+    )
   }
 
   @Test
@@ -33,14 +46,19 @@ class T3VoiceCuePlayerTest {
       completions += it
     })
     fixture.worker.runAll()
+    assertEquals(listOf("play", "write"), output.operations.take(2))
     output.head = output.written / 2L
     fixture.scheduler.runNext(DRAIN_DELAY)
+    // Completion is fail-open and cannot be held behind a platform release call.
+    assertEquals(listOf(T3VoiceCueOutcome.DRAINED), completions.map { it.outcome })
+    assertEquals(emptyList<Boolean>(), output.releaseFlushes)
     fixture.scheduler.runAllIncludingCancelled()
     fixture.worker.runAll()
 
-    assertEquals(listOf(T3VoiceCueOutcome.DRAINED), completions.map { it.outcome })
     assertEquals(listOf(false), output.releaseFlushes)
-    assertEquals(listOf(true), releasedBeforeCompletion)
+    assertEquals(listOf(false), releasedBeforeCompletion)
+    assertEquals(output.head.toInt(), fixture.diagnostics.last().primaryCount)
+    assertEquals(0, fixture.diagnostics.last().secondaryCount)
   }
 
   @Test
@@ -61,24 +79,30 @@ class T3VoiceCuePlayerTest {
     assertEquals(2, fixture.createdOutputs)
     assertEquals(listOf(true), first.releaseFlushes)
     assertEquals(listOf(T3VoiceCueOutcome.DRAINED), completions.map { it.outcome })
+    assertEquals(replay.head.toInt(), fixture.diagnostics.last().primaryCount)
+    assertEquals(1, fixture.diagnostics.last().secondaryCount)
   }
 
   @Test
   fun `second zero-head attempt fails open at its bounded timeout`() {
     val clock = FakeClock()
-    val fixture = Fixture(clock, ArrayDeque(listOf(FakeOutput(), FakeOutput())))
+    val replay = FakeOutput()
+    val fixture = Fixture(clock, ArrayDeque(listOf(FakeOutput(), replay)))
     val completions = mutableListOf<T3VoiceCueCompletion>()
 
     fixture.player.play(T3VoiceCue.READY, 3, completions::add)
     fixture.worker.runAll()
     fixture.scheduler.runNext(COLD_START_DELAY)
     fixture.worker.runAll()
+    replay.head = 123
     clock.now = TIMEOUT
     fixture.scheduler.runNext(TIMEOUT)
     fixture.worker.runAll()
 
     assertEquals(listOf(T3VoiceCueOutcome.TIMED_OUT), completions.map { it.outcome })
     assertEquals(2, fixture.createdOutputs)
+    assertEquals(123, fixture.diagnostics.last().primaryCount)
+    assertEquals(1, fixture.diagnostics.last().secondaryCount)
   }
 
   @Test
@@ -94,6 +118,21 @@ class T3VoiceCuePlayerTest {
     assertEquals(1, completions.size)
     assertEquals(7L, completions.single().generation)
     assertEquals(T3VoiceCueOutcome.CANCELLED, completions.single().outcome)
+  }
+
+  @Test
+  fun `replacement releases the prior stream before starting the next one`() {
+    val operations = mutableListOf<String>()
+    val first = FakeOutput(label = "first", operations = operations)
+    val second = FakeOutput(label = "second", operations = operations)
+    val fixture = Fixture(outputs = ArrayDeque(listOf(first, second)))
+
+    fixture.player.play(T3VoiceCue.READY, 20) {}
+    fixture.worker.runAll()
+    fixture.player.play(T3VoiceCue.ENDED, 20) {}
+    fixture.worker.runAll()
+
+    assertTrue(operations.indexOf("first:release") < operations.indexOf("second:play"))
   }
 
   @Test
@@ -155,6 +194,7 @@ class T3VoiceCuePlayerTest {
   ) {
     val scheduler = FakeScheduler()
     val worker = FakeWorker()
+    val diagnostics = mutableListOf<T3VoiceDiagnosticEntry>()
     var createdOutputs = 0
     val player =
       T3VoiceCuePlayer(
@@ -168,11 +208,25 @@ class T3VoiceCuePlayerTest {
         coldStartCheckMs = COLD_START_DELAY,
         drainPollMs = DRAIN_DELAY,
         timeoutMs = TIMEOUT,
-        recordDiagnostic = { _, _, _ -> },
+        recordDiagnostic = { generation, category, code, primaryCount, secondaryCount ->
+          diagnostics +=
+            T3VoiceDiagnosticEntry(
+              elapsedRealtimeMillis = 0,
+              generation = generation,
+              category = category,
+              code = code,
+              primaryCount = primaryCount,
+              secondaryCount = secondaryCount,
+            )
+        },
       )
   }
 
-  private class FakeOutput(private val writeResult: Int? = null) : T3VoiceCueOutput {
+  private class FakeOutput(
+    private val writeResult: Int? = null,
+    private val label: String? = null,
+    val operations: MutableList<String> = mutableListOf(),
+  ) : T3VoiceCueOutput {
     var head = 0L
     var written = 0
     var playCount = 0
@@ -182,18 +236,23 @@ class T3VoiceCuePlayerTest {
       get() = head
 
     override fun write(pcm: ByteArray, offset: Int, length: Int): Int {
+      operations += operation("write")
       val result = writeResult ?: length
       if (result > 0) written += result
       return result
     }
 
     override fun play() {
+      operations += operation("play")
       playCount += 1
     }
 
     override fun release(flush: Boolean) {
+      operations += operation("release")
       releaseFlushes += flush
     }
+
+    private fun operation(value: String): String = label?.let { "$it:$value" } ?: value
   }
 
   private class FakeClock(var now: Long = 0) : T3VoiceCueClock {
