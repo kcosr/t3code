@@ -111,6 +111,11 @@ class T3VoiceRuntimeService : Service() {
     fun setAudioRoutePreference(route: String): Map<String, Any?> =
       semanticDriver.setAudioRoutePreference(route).toResultBody()
 
+    fun voiceCuesEnabled(): Boolean = semanticDriver.voiceCuesEnabled()
+
+    fun setVoiceCuesEnabled(enabled: Boolean): Map<String, Any?> =
+      semanticDriver.setVoiceCuesEnabled(enabled)
+
     val events: SharedFlow<T3VoiceRuntimeEvent>
       get() = T3VoiceStateStore.events
 

@@ -33,6 +33,12 @@ internal enum class T3VoiceDiagnosticCode {
   REALTIME_DRAIN_TIMED_OUT,
   ENDPOINT_SAMPLE,
   ENDPOINT_TERMINATED,
+  CUE_READY_STARTED,
+  CUE_ENDED_STARTED,
+  CUE_DRAINED,
+  CUE_CANCELLED,
+  CUE_FAILED,
+  CUE_TIMED_OUT,
 }
 
 internal data class T3VoiceDiagnosticEntry(

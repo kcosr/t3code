@@ -3,7 +3,7 @@ import { useFocusEffect } from "@react-navigation/native";
 import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import { AsyncResult } from "effect/unstable/reactivity";
 import * as Clipboard from "expo-clipboard";
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { Alert, Platform, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -51,10 +51,28 @@ export function SettingsVoiceRouteScreen() {
   const backgroundControlsEnabled = voiceRuntime.backgroundControlsEnabled;
   const backgroundMode = stored.voiceBackgroundDefaultMode ?? "realtime";
   const rememberedThread = stored.voiceBackgroundThreadTarget;
+  // Native SharedPreferences is the runtime source of truth for cue gating.
+  const [nativeVoiceCuesEnabled, setNativeVoiceCuesEnabled] = useState<boolean | null>(null);
+  const voiceCuesEnabled = nativeVoiceCuesEnabled ?? stored.voiceCuesEnabled !== false;
   useFocusEffect(
     useCallback(() => {
       void audioRoutePreference.refresh();
-    }, [audioRoutePreference.refresh]),
+      if (Platform.OS !== "android") return;
+      const native = getT3VoiceNativeModule();
+      if (native === null) return;
+      void native
+        .getVoiceCuesEnabledAsync()
+        .then((result) => {
+          setNativeVoiceCuesEnabled(result.enabled);
+          // Reconcile React blob when native truth differs (e.g. after reinstall / drift).
+          if ((stored.voiceCuesEnabled !== false) !== result.enabled) {
+            savePreferences({ voiceCuesEnabled: result.enabled });
+          }
+        })
+        .catch(() => {
+          // Keep blob fallback when binder is unavailable.
+        });
+    }, [audioRoutePreference.refresh, savePreferences, stored.voiceCuesEnabled]),
   );
   const copyDiagnostics = async () => {
     const native = getT3VoiceNativeModule();
@@ -123,6 +141,36 @@ export function SettingsVoiceRouteScreen() {
             label="Voice audio device"
             value={audioRoutePreference.valueLabel}
             onPress={audioRoutePreference.open}
+          />
+          <SettingsSwitchRow
+            disabled={!ready || Platform.OS !== "android"}
+            icon="bell"
+            label="Voice cues"
+            value={voiceCuesEnabled}
+            onValueChange={(value) => {
+              const native = getT3VoiceNativeModule();
+              if (native === null) {
+                // Web/desktop or missing native module: React blob only.
+                setNativeVoiceCuesEnabled(value);
+                savePreferences({ voiceCuesEnabled: value });
+                return;
+              }
+              // Native SharedPreferences is the runtime source of truth for FG gating.
+              void native
+                .setVoiceCuesEnabledAsync({ enabled: value })
+                .then(() => {
+                  setNativeVoiceCuesEnabled(value);
+                  savePreferences({ voiceCuesEnabled: value });
+                })
+                .catch((cause) =>
+                  Alert.alert(
+                    "Voice cues unavailable",
+                    cause instanceof Error
+                      ? cause.message
+                      : "Could not update the native voice cues preference.",
+                  ),
+                );
+            }}
           />
         </SettingsSection>
 

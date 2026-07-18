@@ -8,6 +8,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -348,6 +349,42 @@ internal class T3VoiceRealtimeSessionTest {
   }
 
   @Test
+  fun `clean Realtime close fences capture and drains Ended before route teardown`() {
+    val media = TestRealtimeMedia()
+    val routing = TestAudioRouting()
+    val arming = DeferredEndedCueArming()
+    val quiesced = CountDownLatch(1)
+    val session =
+      session(
+        generation = 1,
+        api = TestRealtimeApi("session-ended-cue"),
+        media = media,
+        routing = routing,
+        cueArming = arming,
+        onQuiesced = { quiesced.countDown() },
+      )
+    session.start()
+    assertTrue(media.prepareCompleted.await(1, TimeUnit.SECONDS))
+    routing.startForTest()
+    session.onWebRtcStateChanged("session-ended-cue", "connected")
+    assertTrue(media.inputReadyEnabled.await(1, TimeUnit.SECONDS))
+
+    session.closeAfterPlayoutDrain()
+    assertTrue(media.drainEntered.await(1, TimeUnit.SECONDS))
+    media.completeDrain()
+
+    assertTrue(arming.endedRequested.await(1, TimeUnit.SECONDS))
+    assertTrue(media.inputReadyStates.contains(false))
+    assertTrue(routing.active.get())
+    assertEquals(1L, media.stopEntered.count)
+    arming.completeEnded()
+
+    assertTrue(media.stopEntered.await(1, TimeUnit.SECONDS))
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+    assertFalse(routing.active.get())
+  }
+
+  @Test
   fun `duplicate terminal events are admitted only once while Realtime is starting`() {
     val action =
       T3VoiceRealtimeTerminalAction.StopRealtime("terminal-a")
@@ -424,6 +461,7 @@ internal class T3VoiceRealtimeSessionTest {
     onQuiesced: (T3VoiceRealtimeTerminalResult) -> Unit,
     startupExecutor: ExecutorService = Executors.newSingleThreadExecutor(),
     terminalOutcomeDeadlineMs: Long = 1_000,
+    cueArming: T3VoiceCueArming = NoOpCueArming,
   ) =
     T3VoiceRealtimeSession(
       generation = generation,
@@ -434,6 +472,7 @@ internal class T3VoiceRealtimeSessionTest {
       emit = emit,
       onQuiesced = onQuiesced,
       api = api,
+      cueArming = cueArming,
       startupExecutor = startupExecutor,
       terminalOutcomeDeadlineMs = terminalOutcomeDeadlineMs,
     )
@@ -504,6 +543,7 @@ internal class T3VoiceRealtimeSessionTest {
     }
 
     override fun setMuted(sessionId: String, muted: Boolean) = Unit
+    override fun setInputReady(sessionId: String, ready: Boolean) = Unit
 
   }
 
@@ -522,6 +562,8 @@ internal class T3VoiceRealtimeSessionTest {
     val prepareCount = AtomicInteger(0)
     val cancelledBeforeInstall = AtomicInteger(0)
     val overlapDetected = AtomicBoolean(false)
+    val inputReadyEnabled = CountDownLatch(1)
+    val inputReadyStates = CopyOnWriteArrayList<Boolean>()
     private val lock = Any()
     private val cancelled = mutableSetOf<String>()
     private var activeSession: String? = null
@@ -589,9 +631,59 @@ internal class T3VoiceRealtimeSessionTest {
     }
 
     override fun setMuted(sessionId: String, muted: Boolean) = Unit
+    override fun setInputReady(sessionId: String, ready: Boolean) {
+      inputReadyStates += ready
+      if (ready) inputReadyEnabled.countDown()
+    }
 
 
     fun activeSessionId(): String? = synchronized(lock) { activeSession }
+  }
+
+  private class DeferredEndedCueArming : T3VoiceCueArming {
+    val endedRequested = CountDownLatch(1)
+    private val endedCompletion = AtomicReference<((T3VoiceCueCompletion) -> Unit)?>(null)
+    private val endedGeneration = AtomicReference(0L)
+
+    override fun isEnabled(): Boolean = true
+
+    override fun setEnabled(enabled: Boolean): T3VoiceCueSettings = T3VoiceCueSettings(enabled)
+
+    override fun settings(): T3VoiceCueSettings = T3VoiceCueSettings(enabled = true)
+
+    override fun requestReady(
+      generation: Long,
+      completion: (T3VoiceCueCompletion) -> Unit,
+    ): Boolean {
+      completion(T3VoiceCueCompletion(generation, T3VoiceCue.READY, T3VoiceCueOutcome.DRAINED))
+      return true
+    }
+
+    override fun requestEnded(
+      generation: Long,
+      completion: (T3VoiceCueCompletion) -> Unit,
+    ): Boolean {
+      endedGeneration.set(generation)
+      endedCompletion.set(completion)
+      endedRequested.countDown()
+      return true
+    }
+
+    fun completeEnded() {
+      checkNotNull(endedCompletion.getAndSet(null))(
+        T3VoiceCueCompletion(
+          endedGeneration.get(),
+          T3VoiceCue.ENDED,
+          T3VoiceCueOutcome.DRAINED,
+        ),
+      )
+    }
+
+    override fun cancel(generation: Long) = Unit
+
+    override fun cancelAll() = Unit
+
+    override fun release() = Unit
   }
 
   private class ImmediateOfferRealtimeMedia : T3VoiceRealtimeMedia {
@@ -621,6 +713,7 @@ internal class T3VoiceRealtimeSessionTest {
     }
 
     override fun setMuted(sessionId: String, muted: Boolean) = Unit
+    override fun setInputReady(sessionId: String, ready: Boolean) = Unit
 
   }
 

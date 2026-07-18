@@ -26,11 +26,23 @@ class T3VoiceCapturePolicyTest {
 
   @Test
   fun focusGainRestoresCaptureForAnUnmutedUser() {
-    val suspended =
-      T3VoiceCapturePolicy.setFocusSuspended(T3VoiceCaptureState(), suspended = true)
+    val armed = T3VoiceCapturePolicy.setInputReady(T3VoiceCaptureState(), ready = true)
+    val suspended = T3VoiceCapturePolicy.setFocusSuspended(armed, suspended = true)
     val restored = T3VoiceCapturePolicy.setFocusSuspended(suspended, suspended = false)
 
     assertFalse(restored.effectiveMuted)
+  }
+
+  @Test
+  fun captureStaysMutedUntilInputReadyEvenWhenUnmuted() {
+    val unmuted = T3VoiceCapturePolicy.setUserMuted(T3VoiceCaptureState(), muted = false)
+
+    assertTrue(unmuted.effectiveMuted)
+    assertFalse(unmuted.recordingEnabled)
+
+    val ready = T3VoiceCapturePolicy.setInputReady(unmuted, ready = true)
+    assertFalse(ready.effectiveMuted)
+    assertTrue(ready.recordingEnabled)
   }
 
   @Test

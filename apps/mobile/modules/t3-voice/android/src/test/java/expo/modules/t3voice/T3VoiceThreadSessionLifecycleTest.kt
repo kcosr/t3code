@@ -306,6 +306,82 @@ internal class T3VoiceThreadSessionLifecycleTest {
   }
 
   @Test
+  fun `Ready CANCELLED still opens the recorder when the session is live`() {
+    val media = LifecycleMedia()
+    val arming = ScriptedCueArming(T3VoiceCueOutcome.CANCELLED)
+    val voice =
+      session(
+        generation = 1,
+        media = media,
+        api = LifecycleApi(),
+        emit = {},
+        onQuiesced = {},
+        cueArming = arming,
+      )
+
+    voice.start()
+    assertTrue(media.recordingStarted.await(1, TimeUnit.SECONDS))
+    assertEquals(1, arming.readyRequests.get())
+    voice.stop(reportStopped = true)
+  }
+
+  @Test
+  fun `Ready completion after stop does not open the recorder`() {
+    val media = LifecycleMedia()
+    val arming = DeferredCueArming()
+    val quiesced = CountDownLatch(1)
+    val voice =
+      session(
+        generation = 1,
+        media = media,
+        api = LifecycleApi(),
+        emit = {},
+        onQuiesced = { quiesced.countDown() },
+        cueArming = arming,
+      )
+
+    voice.start()
+    assertTrue(arming.readyRequested.await(1, TimeUnit.SECONDS))
+    assertEquals(1, arming.readyRequests.get())
+    // stop() cancels the pending Ready (CANCELLED completion); session is inactive so openRecorder is skipped.
+    voice.stop(reportStopped = true)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+    assertFalse(media.recordingStarted.await(150, TimeUnit.MILLISECONDS))
+  }
+
+  @Test
+  fun `Ready and Ended cues remain bracketed by the selected audio route`() {
+    val media = LifecycleMedia()
+    val quiesced = CountDownLatch(1)
+    val arming =
+      InspectingCueArming(
+        onReady = { assertTrue(media.audioAcquired.get()) },
+        onEnded = {
+          assertTrue(media.audioAcquired.get())
+          assertFalse(media.hasActiveRecording())
+        },
+      )
+    val voice =
+      session(
+        generation = 1,
+        media = media,
+        api = LifecycleApi(),
+        emit = {},
+        onQuiesced = { quiesced.countDown() },
+        cueArming = arming,
+      )
+
+    voice.start()
+    assertTrue(media.recordingStarted.await(1, TimeUnit.SECONDS))
+    voice.stop(reportStopped = true)
+
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+    assertEquals(1, arming.readyRequests.get())
+    assertEquals(1, arming.endedRequests.get())
+    assertFalse(media.audioAcquired.get())
+  }
+
+  @Test
   fun `stop waits for blocked response polling without publishing response`() {
     val api = BlockingPhaseApi(block = BlockingPhase.RESPONSE)
     val submitted = CountDownLatch(1)
@@ -342,6 +418,7 @@ internal class T3VoiceThreadSessionLifecycleTest {
     api: T3VoiceThreadSessionApi,
     emit: (T3VoiceRuntimeCallback) -> Unit,
     onQuiesced: (T3VoiceRuntimeCallback?) -> Unit,
+    cueArming: T3VoiceCueArming = NoOpCueArming,
   ): T3VoiceThreadSession =
     T3VoiceThreadSession(
       generation = generation,
@@ -350,8 +427,141 @@ internal class T3VoiceThreadSessionLifecycleTest {
       media = media,
       emit = emit,
       onQuiesced = onQuiesced,
+      cueArming = cueArming,
       api = api,
     )
+
+  private class ScriptedCueArming(
+    private val readyOutcome: T3VoiceCueOutcome,
+  ) : T3VoiceCueArming {
+    val readyRequests = AtomicInteger(0)
+
+    override fun isEnabled(): Boolean = true
+
+    override fun setEnabled(enabled: Boolean): T3VoiceCueSettings = T3VoiceCueSettings(enabled)
+
+    override fun settings(): T3VoiceCueSettings = T3VoiceCueSettings(enabled = true)
+
+    override fun requestReady(
+      generation: Long,
+      completion: (T3VoiceCueCompletion) -> Unit,
+    ): Boolean {
+      readyRequests.incrementAndGet()
+      completion(
+        T3VoiceCueCompletion(
+          generation = generation,
+          cue = T3VoiceCue.READY,
+          outcome = readyOutcome,
+        ),
+      )
+      return true
+    }
+
+    override fun requestEnded(
+      generation: Long,
+      completion: (T3VoiceCueCompletion) -> Unit,
+    ): Boolean {
+      completion(T3VoiceCueCompletion(generation, T3VoiceCue.ENDED, T3VoiceCueOutcome.DRAINED))
+      return true
+    }
+
+    override fun cancel(generation: Long) = Unit
+
+    override fun cancelAll() = Unit
+
+    override fun release() = Unit
+  }
+
+  private class DeferredCueArming : T3VoiceCueArming {
+    val readyRequests = AtomicInteger(0)
+    val readyRequested = CountDownLatch(1)
+    private val pending = AtomicReference<((T3VoiceCueCompletion) -> Unit)?>(null)
+    private val generationRef = AtomicReference(0L)
+
+    override fun isEnabled(): Boolean = true
+
+    override fun setEnabled(enabled: Boolean): T3VoiceCueSettings = T3VoiceCueSettings(enabled)
+
+    override fun settings(): T3VoiceCueSettings = T3VoiceCueSettings(enabled = true)
+
+    override fun requestReady(
+      generation: Long,
+      completion: (T3VoiceCueCompletion) -> Unit,
+    ): Boolean {
+      readyRequests.incrementAndGet()
+      generationRef.set(generation)
+      pending.set(completion)
+      readyRequested.countDown()
+      return true
+    }
+
+    fun complete(outcome: T3VoiceCueOutcome) {
+      val completion = checkNotNull(pending.getAndSet(null))
+      completion(
+        T3VoiceCueCompletion(
+          generation = generationRef.get(),
+          cue = T3VoiceCue.READY,
+          outcome = outcome,
+        ),
+      )
+    }
+
+    override fun requestEnded(
+      generation: Long,
+      completion: (T3VoiceCueCompletion) -> Unit,
+    ): Boolean {
+      completion(T3VoiceCueCompletion(generation, T3VoiceCue.ENDED, T3VoiceCueOutcome.DRAINED))
+      return true
+    }
+
+    override fun cancel(generation: Long) {
+      complete(T3VoiceCueOutcome.CANCELLED)
+    }
+
+    override fun cancelAll() = Unit
+
+    override fun release() = Unit
+  }
+
+  private class InspectingCueArming(
+    private val onReady: () -> Unit,
+    private val onEnded: () -> Unit,
+  ) : T3VoiceCueArming {
+    val readyRequests = AtomicInteger(0)
+    val endedRequests = AtomicInteger(0)
+
+    override fun isEnabled(): Boolean = true
+
+    override fun setEnabled(enabled: Boolean): T3VoiceCueSettings = T3VoiceCueSettings(enabled)
+
+    override fun settings(): T3VoiceCueSettings = T3VoiceCueSettings(enabled = true)
+
+    override fun requestReady(
+      generation: Long,
+      completion: (T3VoiceCueCompletion) -> Unit,
+    ): Boolean {
+      readyRequests.incrementAndGet()
+      onReady()
+      completion(T3VoiceCueCompletion(generation, T3VoiceCue.READY, T3VoiceCueOutcome.DRAINED))
+      return true
+    }
+
+    override fun requestEnded(
+      generation: Long,
+      completion: (T3VoiceCueCompletion) -> Unit,
+    ): Boolean {
+      endedRequests.incrementAndGet()
+      onEnded()
+      completion(T3VoiceCueCompletion(generation, T3VoiceCue.ENDED, T3VoiceCueOutcome.DRAINED))
+      return true
+    }
+
+    override fun cancel(generation: Long) = Unit
+
+    override fun cancelAll() = Unit
+
+    override fun release() = Unit
+  }
 
   private class LifecycleMedia(
     private val finishAsNoInput: Boolean = false,
@@ -363,18 +573,25 @@ internal class T3VoiceThreadSessionLifecycleTest {
     val deletedRecordings = CopyOnWriteArrayList<T3VoiceRecordingResult>()
     val finalPlaybackChunkIndex = AtomicInteger(-1)
     val finishedRecording = AtomicReference<T3VoiceRecordingResult?>()
+    val audioAcquired = java.util.concurrent.atomic.AtomicBoolean(false)
     private val recordingStartCount = AtomicInteger(0)
     private val activeRecording = AtomicReference<String?>()
     private val activePlayback = AtomicReference<String?>()
 
-    override fun acquireAudio(): Boolean = true
+    override fun acquireAudio(): Boolean {
+      audioAcquired.set(true)
+      return true
+    }
 
-    override fun releaseAudio() = Unit
+    override fun releaseAudio() {
+      audioAcquired.set(false)
+    }
 
     override fun startRecording(
       recordingId: String,
       endpointConfig: T3VoiceEndpointDetectionConfig,
     ) {
+      check(audioAcquired.get())
       check(activeRecording.compareAndSet(null, recordingId))
       when (recordingStartCount.incrementAndGet()) {
         1 -> recordingStarted.countDown()
@@ -427,6 +644,8 @@ internal class T3VoiceThreadSessionLifecycleTest {
     override fun resumePlayback(playbackId: String) = Unit
 
     fun completePlayback(): String = checkNotNull(activePlayback.getAndSet(null))
+
+    fun hasActiveRecording(): Boolean = activeRecording.get() != null
   }
 
   private class LifecycleApi : ThreadApiAdapter() {

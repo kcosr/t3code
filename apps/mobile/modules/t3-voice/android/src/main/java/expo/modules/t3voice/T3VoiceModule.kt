@@ -186,7 +186,7 @@ class T3VoiceModule : Module() {
       )
 
       Constants(
-        "nativeRevision" to 15,
+        "nativeRevision" to 16,
       )
 
       OnCreate {
@@ -330,6 +330,21 @@ class T3VoiceModule : Module() {
           result.resolve(
             voice.setAudioRoutePreference(input.requireBridgeArgumentIdentifier("route")),
           )
+        }
+      }
+
+      AsyncFunction("getVoiceCuesEnabledAsync") { promise: Promise ->
+        withBinder(promise, "voice-cues-preference-read-failed") { voice, result ->
+          result.resolve(mapOf("enabled" to voice.voiceCuesEnabled()))
+        }
+      }
+
+      AsyncFunction("setVoiceCuesEnabledAsync") {
+        input: Map<String, Any?>, promise: Promise ->
+        input.requireExactBridgeKeys("voice cues input", setOf("enabled"))
+        val enabled = input["enabled"] as? Boolean ?: error("enabled must be a boolean.")
+        withBinder(promise, "voice-cues-preference-write-failed") { voice, result ->
+          result.resolve(voice.setVoiceCuesEnabled(enabled))
         }
       }
 

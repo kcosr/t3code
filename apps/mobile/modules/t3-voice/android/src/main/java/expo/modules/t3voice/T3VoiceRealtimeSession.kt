@@ -25,6 +25,7 @@ internal class T3VoiceRealtimeSession(
   private val audioRouter: T3VoiceRealtimeAudioRouting,
   private val emit: (T3VoiceRuntimeCallback) -> Unit,
   private val onQuiesced: (T3VoiceRealtimeTerminalResult) -> Unit,
+  private val cueArming: T3VoiceCueArming = NoOpCueArming,
   private val api: T3VoiceRealtimeSessionApi = T3VoiceNativeVoiceApi(sessionConfig),
   private val nowEpochMillis: () -> Long = T3VoiceTime::nowEpochMillis,
   private val scheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor(),
@@ -86,6 +87,8 @@ internal class T3VoiceRealtimeSession(
   private var terminalCallback: T3VoiceRuntimeCallback? = null
   private var terminalDeadlineFuture: ScheduledFuture<*>? = null
   private var terminalActionId: String? = null
+  /** True when closing as Realtime→Thread handoff (no Ended cue). */
+  private val closeForHandoff = AtomicBoolean(false)
 
   init {
     require(terminalOutcomeDeadlineMs > 0) { "terminalOutcomeDeadlineMs must be positive." }
@@ -137,7 +140,8 @@ internal class T3VoiceRealtimeSession(
     }
   }
 
-  fun close() {
+  fun close(forHandoff: Boolean = false) {
+    if (forHandoff) closeForHandoff.set(true)
     if (terminal.compareAndSet(false, true)) {
       synchronized(lock) {
         terminalCallback = T3VoiceRuntimeCallback.RealtimeClosed
@@ -146,7 +150,8 @@ internal class T3VoiceRealtimeSession(
     beginTerminalCleanup()
   }
 
-  fun closeAfterPlayoutDrain() {
+  fun closeAfterPlayoutDrain(forHandoff: Boolean = false) {
+    if (forHandoff) closeForHandoff.set(true)
     if (!terminal.compareAndSet(false, true)) return
     val server =
       synchronized(lock) {
@@ -303,6 +308,38 @@ internal class T3VoiceRealtimeSession(
     if (sessionId != expected || terminal.get()) return
     if (connectionState == "connected" && connected.compareAndSet(false, true)) {
       emitIfLive(T3VoiceRuntimeCallback.RealtimeConnected)
+      armRealtimeCapture(sessionId)
+    }
+  }
+
+  private fun armRealtimeCapture(sessionId: String) {
+    if (terminal.get()) return
+    val settleMs =
+      if (cueArming.isEnabled()) T3VoiceCueTiming.READY_TO_CAPTURE_SETTLE_MS else 0L
+    cueArming.requestReady(generation) { _ ->
+      // Teardown already sets terminal before cancel; any remaining completion (including
+      // mid-flight disable → CANCELLED) must fail-open so the mic is never stranded.
+      if (terminal.get()) return@requestReady
+      scheduleRealtimeCapture(sessionId, settleMs)
+    }
+    // close() marks terminal before cancelling this generation. If it won immediately before the
+    // request above, fence the newly admitted Ready cue here as well.
+    if (terminal.get()) cueArming.cancel(generation)
+  }
+
+  private fun scheduleRealtimeCapture(sessionId: String, settleMs: Long) {
+    val arm = {
+      if (!terminal.get()) {
+        runCatching { webRtc.setInputReady(sessionId, ready = true) }
+      }
+    }
+    if (settleMs == 0L) {
+      arm()
+      return
+    }
+    if (runCatching { scheduler.schedule(arm, settleMs, TimeUnit.MILLISECONDS) }.isFailure) {
+      // Fail open if the settle scheduler is unavailable while the session is still live.
+      arm()
     }
   }
 
@@ -637,22 +674,37 @@ internal class T3VoiceRealtimeSession(
    */
   private fun beginTerminalCleanup() {
     if (!cleanupStarted.compareAndSet(false, true)) return
-    val server = synchronized(lock) { serverSession }
+    val (server, callback) = synchronized(lock) { serverSession to terminalCallback }
+    val wasConnected = connected.get()
+    val playEnded =
+      wasConnected &&
+        callback is T3VoiceRuntimeCallback.RealtimeClosed &&
+        !closeForHandoff.get() &&
+        runCatching { cueArming.isEnabled() }.getOrDefault(false)
+    // Cancel any pending Ready and fence capture before the bounded Ended cue. Keep the peer and
+    // communication router alive until the cue drains; either teardown would kill its output.
+    cueArming.cancel(generation)
+    runCatching { server?.let { webRtc.setInputReady(it.state.sessionId, ready = false) } }
     // Fence startup before abandoning process-global audio focus. cancelStartup is lock-only;
     // potentially blocking JNI peer disposal remains isolated on the terminal worker.
     runCatching { server?.let { webRtc.cancelStartup(it.state.sessionId) } }
-    audioRouter.stop()
+    if (!playEnded) audioRouter.stop()
     cancelLiveWork()
+    val terminalDeadlineWithCueMs =
+      terminalOutcomeDeadlineMs + if (playEnded) ENDED_TERMINAL_DEADLINE_ALLOWANCE_MS else 0L
     terminalDeadlineFuture =
       terminalDeadlineScheduler.schedule(
         ::publishBoundedTerminalFailure,
-        terminalOutcomeDeadlineMs,
+        terminalDeadlineWithCueMs,
         TimeUnit.MILLISECONDS,
       )
     shutdownLiveExecutors()
     terminalExecutor.execute {
       startupQuiescence.awaitUninterruptibly()
       val publishedServer = synchronized(lock) { serverSession }
+      if (playEnded && publishedServer != null) {
+        T3VoiceCueTiming.awaitEnded(cueArming, generation)
+      }
       runCatching { publishedServer?.let { webRtc.stop(it.state.sessionId) } }
       audioRouter.stop()
       awaitLiveExecutors()
@@ -794,5 +846,6 @@ internal class T3VoiceRealtimeSession(
     const val MAXIMUM_PUBLIC_TRANSCRIPT_TURNS = 100
     const val MAXIMUM_TRANSCRIPT_TURN_CHARS = 65_536
     const val DEFAULT_TERMINAL_OUTCOME_DEADLINE_MS = 5_000L
+    const val ENDED_TERMINAL_DEADLINE_ALLOWANCE_MS = 4_000L
   }
 }

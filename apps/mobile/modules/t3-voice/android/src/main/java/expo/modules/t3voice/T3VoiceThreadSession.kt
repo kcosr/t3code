@@ -19,6 +19,7 @@ internal class T3VoiceThreadSession(
   private val media: T3VoiceThreadMedia,
   private val emit: (T3VoiceRuntimeCallback) -> Unit,
   private val onQuiesced: (T3VoiceRuntimeCallback?) -> Unit,
+  private val cueArming: T3VoiceCueArming = NoOpCueArming,
   private val api: T3VoiceThreadSessionApi = T3VoiceNativeVoiceApi(config),
   private val nowIso: () -> String = T3VoiceTime::nowIso,
   private val scheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor(),
@@ -500,39 +501,21 @@ internal class T3VoiceThreadSession(
           noInputRecordingId = null
           mediaOwner = MediaOwner.STARTING_RECORDING
         }
+        // Establish MODE_IN_COMMUNICATION, focus, and the selected route before Ready. Without a
+        // live communication output Android can accept the cue PCM while advancing zero frames.
         check(media.acquireAudio()) {
           "Android denied recording audio focus."
         }
-        media.startRecording(
-          id,
-          T3VoiceEndpointDetectionConfig(
-            endSilenceMs = start.settings.endpointDetection.endSilenceMs,
-            noSpeechTimeoutMs = start.settings.endpointDetection.noSpeechTimeoutMs,
-            maximumUtteranceMs = start.settings.endpointDetection.maximumUtteranceMs,
-          ),
-        )
-        val retained =
-          synchronized(lock) {
-            if (
-              active.get() &&
-                recordingId == id &&
-                mediaOwner == MediaOwner.STARTING_RECORDING
-            ) {
-              completedRecording.delete()
-              submittedMessageId = null
-              assistantText = null
-              mediaOwner = MediaOwner.RECORDING
-              true
-            } else {
-              false
-            }
-          }
-        if (!retained) {
-          runCatching { media.cancelRecording(id) }
-          media.releaseAudio()
-          return@execute
+        val settleMs =
+          if (cueArming.isEnabled()) T3VoiceCueTiming.READY_TO_CAPTURE_SETTLE_MS else 0L
+        // Keep STARTING until Ready completes (or cues fail open), then leave a short route settle
+        // guard so the cue tail cannot enter the microphone capture.
+        cueArming.requestReady(generation) { _ ->
+          scheduleOpenRecorder(id, settleMs)
         }
-        emitIfActive(T3VoiceRuntimeCallback.ThreadRecordingStarted)
+        // terminate() sets active=false before cancelling this generation. If it won that race
+        // just before requestReady(), cancel the newly admitted cue here as the matching fence.
+        if (!active.get()) cueArming.cancel(generation)
       } catch (cause: Throwable) {
         synchronized(lock) {
           if (recordingId == id) recordingId = null
@@ -542,6 +525,75 @@ internal class T3VoiceThreadSession(
         media.releaseAudio()
         failCycle(cause, "recording-start-failed", "Voice recording could not start.")
       }
+    }
+  }
+
+  private fun scheduleOpenRecorder(id: String, settleMs: Long) {
+    val open = {
+      runCatching {
+        controlExecutor.execute {
+          if (!active.get()) return@execute
+          openRecorder(id)
+        }
+      }
+    }
+    if (settleMs == 0L) {
+      open()
+      return
+    }
+    if (runCatching { scheduler.schedule(open, settleMs, TimeUnit.MILLISECONDS) }.isFailure) {
+      // Fail open if the settle scheduler is unavailable while the session is still live.
+      open()
+    }
+  }
+
+  private fun openRecorder(id: String) {
+    if (!active.get()) return
+    try {
+      synchronized(lock) {
+        check(active.get()) { "Thread voice session stopped." }
+        check(recordingId == id && mediaOwner == MediaOwner.STARTING_RECORDING) {
+          "Thread recording arming ownership changed."
+        }
+      }
+      media.startRecording(
+        id,
+        T3VoiceEndpointDetectionConfig(
+          endSilenceMs = start.settings.endpointDetection.endSilenceMs,
+          noSpeechTimeoutMs = start.settings.endpointDetection.noSpeechTimeoutMs,
+          maximumUtteranceMs = start.settings.endpointDetection.maximumUtteranceMs,
+        ),
+      )
+      val retained =
+        synchronized(lock) {
+          if (
+            active.get() &&
+              recordingId == id &&
+              mediaOwner == MediaOwner.STARTING_RECORDING
+          ) {
+            completedRecording.delete()
+            submittedMessageId = null
+            assistantText = null
+            mediaOwner = MediaOwner.RECORDING
+            true
+          } else {
+            false
+          }
+        }
+      if (!retained) {
+        runCatching { media.cancelRecording(id) }
+        media.releaseAudio()
+        return
+      }
+      emitIfActive(T3VoiceRuntimeCallback.ThreadRecordingStarted)
+    } catch (cause: Throwable) {
+      synchronized(lock) {
+        if (recordingId == id) recordingId = null
+        mediaOwner = MediaOwner.NONE
+      }
+      runCatching { media.cancelRecording(id) }
+      media.releaseAudio()
+      failCycle(cause, "recording-start-failed", "Voice recording could not start.")
     }
   }
 
@@ -629,7 +681,12 @@ internal class T3VoiceThreadSession(
       check(terminalOutcome == null) { "Thread session already has a terminal outcome." }
       terminalOutcome = outcome
     }
-    beginCleanup()
+    cueArming.cancel(generation)
+    beginCleanup(
+      playEnded =
+        outcome is TerminalOutcome.Stopped &&
+          runCatching { cueArming.isEnabled() }.getOrDefault(false),
+    )
   }
 
   /**
@@ -638,18 +695,27 @@ internal class T3VoiceThreadSession(
    * notification/MediaSession callback may wait for them. The terminal callback remains deferred
    * until both serial media executors terminate and the cleanup executor runs a second sweep.
    */
-  private fun beginCleanup() {
+  private fun beginCleanup(playEnded: Boolean) {
     val calls = currentCalls.getAndSet(null)
     scheduler.shutdownNow()
     cleanupExecutor.execute {
       runCatching { calls?.cancelAll() }
-      cancelOwnedMedia()
+      // Stop capture/playback first, then keep (or reacquire) the selected communication route
+      // through the bounded Ended drain. This mirrors the Ready fence in the opposite direction.
+      cancelOwnedMedia(releaseAudio = !playEnded)
+      if (playEnded) {
+        val routeAcquired = runCatching { media.acquireAudio() }.getOrDefault(false)
+        if (routeAcquired) {
+          T3VoiceCueTiming.awaitEnded(cueArming, generation)
+        }
+        runCatching { media.releaseAudio() }
+      }
     }
     controlExecutor.shutdownNow()
     speechExecutor.shutdownNow()
   }
 
-  private fun cancelOwnedMedia() {
+  private fun cancelOwnedMedia(releaseAudio: Boolean = true) {
     val rearm: ScheduledFuture<*>?
     val sink: T3VoicePcmStreamSink?
     val activeRecording: String?
@@ -667,7 +733,7 @@ internal class T3VoiceThreadSession(
     if (activeRecording != null) runCatching { media.cancelRecording(activeRecording) }
     completedRecording.delete()
     if (activePlayback != null) runCatching { media.cancelPlayback(activePlayback) }
-    runCatching { media.releaseAudio() }
+    if (releaseAudio) runCatching { media.releaseAudio() }
   }
 
   private fun mediaExecutorTerminated() {
