@@ -15,7 +15,7 @@ logic are platform-neutral, but there is no web, desktop, or iOS voice-runtime a
 
 ## Product surfaces
 
-The mobile app exposes four related voice surfaces:
+The mobile app exposes five related voice surfaces:
 
 1. The microphone beside the Thread composer performs one bounded dictation. Its transcript remains
    in the draft and is not submitted automatically.
@@ -27,6 +27,9 @@ The mobile app exposes four related voice surfaces:
    it also exposes transcript, mute, and stop controls. While Thread voice is active, the bar remains
    a Realtime Resume surface.
 4. Eligible assistant messages can use bounded streaming speech playback.
+5. On Android, opt-in Background Voice Controls keep a native Ready notification and MediaSession
+   available after an operation ends. The user chooses Realtime or the latest valid Active Thread as
+   the default next interaction and can start it without React remaining attached.
 
 Starting Realtime while Thread voice is active performs one native Thread-to-Realtime transition.
 Starting Thread voice while Realtime is active performs one native Realtime-to-Thread transition.
@@ -37,12 +40,12 @@ time.
 
 ```text
 React Native UI
-  composer controls / Realtime call bar
+  composer controls / Realtime call bar / readiness settings
              |
-             | platform-neutral semantic commands and snapshots
+             | semantic commands, prepared readiness, and snapshots
              v
 Android microphone foreground service
-  serialized native controller
+  serialized native controller + process-local Ready envelope
   notification + MediaSession
   WebRTC / recorder / PCM player / audio focus and routes
              |
@@ -238,16 +241,47 @@ force-stop, reboot, application update, or native crash ends the live operation.
 starts in `Idle`; sockets, peers, recorders, callbacks, timers, and mode switches are never restored
 from persistence.
 
-The notification is derived from the current controller snapshot:
+Android also has a separate opt-in readiness posture around that operation controller. While React
+is attached, it resolves the configured default into one complete start command and issues a bounded
+native child credential. Realtime readiness always contains a concrete durable conversation
+continuation: React selects the latest durable conversation or creates one before configuring
+native, so repeated background starts continue the same prepared conversation. Active Thread
+readiness contains the complete current Thread target and settings; if the remembered Thread can no
+longer be resolved, native reports it unavailable and never falls back to Realtime.
 
-- Realtime exposes mute or unmute and stop. It does not guess a Thread destination from visible,
-  current, or last-used UI state.
+The readiness postures are `Disabled`, `Ready`, `Unavailable`, and `NeedsRefresh`. Configuration is
+an atomic full replacement fenced by a monotonic readiness generation. A Ready service owns no
+recorder, WebRTC peer, playback stream, audio focus, or wake lock. It retains only the foreground
+notification and paused MediaSession needed for background controls. Start dispatches the cached
+command directly through the same controller admission path used by React. Active operation state
+always takes presentation precedence; stop or normal completion returns to Ready when it remains
+enabled.
+
+Prepared commands and child credentials exist only in the application process and are accepted only
+before the credential's parsed expiry. Expiry or a bounded Realtime lease conflict changes readiness
+to `NeedsRefresh`; later media-button presses do not retry or guess. Process death removes Ready just
+as it removes live operations. The durable enabled/default/latest-Thread preferences cause
+reprovisioning only after the app is attached again. Native persists no target or credential; its
+only readiness persistence is a generation marker allowing an explicit notification Disable to be
+reconciled durably into the saved enabled setting on the next React attach.
+
+The combined notification is derived from the active controller snapshot or, when no operation owns
+the service, the readiness snapshot:
+
+- Ready exposes Start and Disable. Unavailable and Needs Refresh expose Disable and require the app
+  to resolve a new target or credential before Start returns.
+- Realtime exposes mute or unmute and stop. When React has explicitly provisioned a complete latest
+  Thread target, it also exposes a fenced Thread switch; it never resolves a destination inside the
+  background service.
 - Thread exposes finish utterance while recording, submit while reviewing, and stop.
 - Transitions expose stop.
 - A failed owner retains a Stop-only foreground notification until native release is known.
 
-MediaSession transport controls map to the same native commands. Notification permission denial
-reduces drawer visibility but does not create a second control path.
+MediaSession transport controls map to the same native commands. Recognized media-button key-up and
+repeat events are consumed without dispatch; only the initial key-down can act. In Ready, headset
+hook, play, and play/pause start, while pause and stop never start. Background Voice Controls require
+notification permission when enabled; notification permission denial for an already active visible
+operation still reduces drawer visibility without creating a second control path.
 
 Android owns and persists one global preferred audio route. The always-visible selector in the
 Realtime call bar and the selector in Voice Settings read and write that same native preference.
@@ -261,7 +295,8 @@ Voice media, conversation, session, event, and confirmation operations require `
 Credential administration requires `voice:manage`. Voice tools recheck the scope required by their
 underlying orchestration or history operation.
 
-After a visible Android start, the authenticated client can request a bounded native child bearer
+After a visible Android start or readiness provisioning, the authenticated client can request a
+bounded native child bearer
 with exactly `voice:use`, `orchestration:read`, and `orchestration:operate`. Its lifetime is the
 lesser of twelve hours and the parent session's remaining lifetime. It cannot mint another child.
 Parent revocation invalidates child-owned sessions and media tickets.
