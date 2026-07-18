@@ -255,7 +255,9 @@ export type T3VoiceDiagnosticCode =
   | "cue-drained"
   | "cue-cancelled"
   | "cue-failed"
-  | "cue-timed-out";
+  | "cue-timed-out"
+  | "media-button-received"
+  | "media-action-dispatched";
 
 export interface T3VoiceDiagnosticEntry {
   readonly elapsedRealtimeMillis: number;
