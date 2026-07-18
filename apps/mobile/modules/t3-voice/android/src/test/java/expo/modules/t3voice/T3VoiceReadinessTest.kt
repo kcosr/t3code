@@ -46,6 +46,26 @@ class T3VoiceReadinessTest {
     )
 
   @Test
+  fun expiryAlarmConvertsWallClockRemainingTimeToElapsedRealtime() {
+    assertEquals(
+      8_500L,
+      T3VoiceReadinessExpiryAlarmPolicy.triggerAtElapsedRealtime(
+        expiresAtEpochMillis = 12_000,
+        nowEpochMillis = 10_000,
+        nowElapsedRealtimeMillis = 6_500,
+      ),
+    )
+    assertEquals(
+      6_500L,
+      T3VoiceReadinessExpiryAlarmPolicy.triggerAtElapsedRealtime(
+        expiresAtEpochMillis = 9_000,
+        nowEpochMillis = 10_000,
+        nowElapsedRealtimeMillis = 6_500,
+      ),
+    )
+  }
+
+  @Test
   fun readyStartsTheExactPreparedCommandRepeatedly() {
     val owner = T3VoiceReadinessOwner { T3VoiceTime.parseIsoEpochMillis("2026-07-17T21:00:00Z", "now") }
     val configured = configuration(1)
@@ -74,6 +94,59 @@ class T3VoiceReadinessTest {
     val owner = T3VoiceReadinessOwner { expiration }
     assertTrue(owner.configure(configuration(1)) is T3VoiceReadinessSnapshot.NeedsRefresh)
     assertSame(T3VoiceReadinessStartDecision.Unavailable, owner.start(1))
+  }
+
+  @Test
+  fun readyExpiresOnFirstLateStartAndThenRefusesStart() {
+    val expiration = T3VoiceTime.parseIsoEpochMillis(session.expiresAt, "expiration")
+    var now = expiration - 1
+    val owner = T3VoiceReadinessOwner { now }
+    assertTrue(owner.configure(configuration(1)) is T3VoiceReadinessSnapshot.Ready)
+
+    now = expiration
+    val first = owner.start(1) as T3VoiceReadinessStartDecision.Expired
+    assertEquals(
+      T3VoiceReadinessSnapshot.NeedsRefresh(
+        generation = 1,
+        mode = T3VoiceReadinessMode.REALTIME,
+        label = "Realtime",
+        expiresAt = session.expiresAt,
+      ),
+      first.snapshot,
+    )
+    assertEquals(first.snapshot, owner.snapshot())
+    assertSame(T3VoiceReadinessStartDecision.Unavailable, owner.start(1))
+  }
+
+  @Test
+  fun expiryCoordinatorFencesGenerationAndRearmsAnEarlyWallClockDelivery() {
+    val expiration = T3VoiceTime.parseIsoEpochMillis(session.expiresAt, "expiration")
+    var now = expiration - 1
+    val owner = T3VoiceReadinessOwner { now }
+    val configured = configuration(1)
+    owner.configure(configured)
+    val alarm = FakeReadinessExpiryAlarm()
+    val expired = mutableListOf<T3VoiceReadinessSnapshot.NeedsRefresh>()
+    val coordinator = T3VoiceReadinessExpiryCoordinator(owner, alarm, expired::add)
+
+    coordinator.replace(configured)
+    assertEquals(listOf(1L to expiration), alarm.replacements)
+    coordinator.onAlarm(2)
+    assertEquals(listOf(1L to expiration), alarm.replacements)
+    assertTrue(expired.isEmpty())
+
+    coordinator.onAlarm(1)
+    assertEquals(listOf(1L to expiration, 1L to expiration), alarm.replacements)
+    assertTrue(owner.snapshot() is T3VoiceReadinessSnapshot.Ready)
+
+    now = expiration
+    coordinator.onAlarm(1)
+    assertEquals(listOf(owner.snapshot()), expired)
+    assertTrue(owner.snapshot() is T3VoiceReadinessSnapshot.NeedsRefresh)
+    coordinator.replace(configured)
+    assertEquals(1, alarm.cancelCount)
+    coordinator.cancel()
+    assertEquals(2, alarm.cancelCount)
   }
 
   @Test
@@ -146,4 +219,20 @@ class T3VoiceReadinessTest {
       preparedStart = T3VoicePreparedStart.Realtime(target, session),
       preparedThreadSwitch = threadStart,
     )
+
+  private class FakeReadinessExpiryAlarm : T3VoiceReadinessExpiryAlarm {
+    val replacements = mutableListOf<Pair<Long, Long>>()
+    var cancelCount = 0
+
+    override fun replace(
+      generation: Long,
+      expiresAtEpochMillis: Long,
+    ) {
+      replacements += generation to expiresAtEpochMillis
+    }
+
+    override fun cancel() {
+      cancelCount += 1
+    }
+  }
 }

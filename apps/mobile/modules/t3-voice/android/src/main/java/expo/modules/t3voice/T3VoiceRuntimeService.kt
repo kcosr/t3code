@@ -68,10 +68,9 @@ class T3VoiceRuntimeService : Service() {
             snapshot
           }
         } catch (cause: Throwable) {
-          readinessExpiry?.let(mainHandler::removeCallbacks)
-          readinessExpiry = null
+          readinessExpiryCoordinator.cancel()
           publishReadinessLocked(previous.snapshot)
-          previous.configuration?.let(::scheduleReadinessExpiryLocked)
+          previous.configuration?.let(readinessExpiryCoordinator::replace)
           runCatching { reconcileSemanticControlsLocked(semanticController.snapshot()) }
           stopRuntimeForegroundLocked()
           throw cause
@@ -231,10 +230,10 @@ class T3VoiceRuntimeService : Service() {
   private lateinit var semanticWakeLock: PowerManager.WakeLock
   private val readinessOwner = T3VoiceReadinessOwner()
   private var readinessLaunch: T3VoiceReadinessLaunch? = null
+  private lateinit var readinessExpiryCoordinator: T3VoiceReadinessExpiryCoordinator
   private lateinit var readinessDisableMarker: T3VoiceReadinessDisableMarker
   private val mutableReadinessSnapshots =
     MutableStateFlow<T3VoiceReadinessSnapshot>(T3VoiceReadinessSnapshot.Disabled(0))
-  private var readinessExpiry: Runnable? = null
   private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
   private var semanticSnapshotCollection: Job? = null
   private var foregroundServiceTypes = 0
@@ -242,6 +241,14 @@ class T3VoiceRuntimeService : Service() {
   override fun onCreate() {
     super.onCreate()
     readinessDisableMarker = T3VoiceReadinessDisableMarker(applicationContext)
+    readinessExpiryCoordinator =
+      T3VoiceReadinessExpiryCoordinator(
+        readinessOwner,
+        T3VoiceAndroidReadinessExpiryAlarm(applicationContext),
+      ) { snapshot ->
+        publishReadinessLocked(snapshot)
+        reconcileSemanticControlsLocked(semanticController.snapshot())
+      }
     semanticDriver =
       T3VoiceNativeRuntimeDriver(
         applicationContext,
@@ -402,6 +409,12 @@ class T3VoiceRuntimeService : Service() {
             stopSelf(startId)
           }
         }
+        ACTION_READINESS_EXPIRY -> {
+          readinessExpiryCoordinator.onAlarm(
+            intent.getLongExtra(EXTRA_READINESS_GENERATION, INVALID_GENERATION),
+          )
+          if (canStopServiceLocked()) stopSelf(startId)
+        }
         else -> if (canStopServiceLocked()) stopSelf(startId)
       }
     }
@@ -412,8 +425,7 @@ class T3VoiceRuntimeService : Service() {
     semanticSnapshotCollection?.cancel()
     semanticSnapshotCollection = null
     serviceScope.cancel()
-    readinessExpiry?.let(mainHandler::removeCallbacks)
-    readinessExpiry = null
+    if (this::readinessExpiryCoordinator.isInitialized) readinessExpiryCoordinator.cancel()
     if (this::semanticWakeLock.isInitialized && semanticWakeLock.isHeld) semanticWakeLock.release()
     if (this::androidControls.isInitialized) androidControls.release()
     synchronized(operationLock) {
@@ -592,10 +604,10 @@ class T3VoiceRuntimeService : Service() {
     generation: Long,
     persistMarker: Boolean = false,
   ): T3VoiceReadinessSnapshot.Disabled {
-    readinessExpiry?.let(mainHandler::removeCallbacks)
-    readinessExpiry = null
+    readinessOwner.validateNextGeneration(generation)
     if (persistMarker) readinessDisableMarker.mark(generation)
     val disabled = readinessOwner.disable(generation)
+    readinessExpiryCoordinator.cancel()
     publishReadinessLocked(disabled)
     reconcileSemanticControlsLocked(semanticController.snapshot())
     return disabled
@@ -606,24 +618,7 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun scheduleReadinessExpiryLocked(configuration: T3VoiceReadinessConfiguration) {
-    readinessExpiry?.let(mainHandler::removeCallbacks)
-    readinessExpiry = null
-    val session = configuration.preparedStart?.session ?: return
-    val expiration =
-      T3VoiceTime.parseIsoEpochMillis(session.expiresAt, "native session expiration")
-    val delay = (expiration - T3VoiceTime.nowEpochMillis()).coerceAtLeast(0)
-    val task =
-      Runnable {
-        synchronized(operationLock) {
-          val decision = readinessOwner.start(configuration.generation)
-          if (decision is T3VoiceReadinessStartDecision.Expired) {
-            publishReadinessLocked(decision.snapshot)
-            reconcileSemanticControlsLocked(semanticController.snapshot())
-          }
-        }
-      }
-    readinessExpiry = task
-    mainHandler.postDelayed(task, delay)
+    readinessExpiryCoordinator.replace(configuration)
   }
 
   private fun dispatchSemanticCommand(command: T3VoiceRuntimeCommand): T3VoiceCommandResult {
@@ -1016,6 +1011,9 @@ class T3VoiceRuntimeService : Service() {
     private const val ACTION_START_SEMANTIC_RUNTIME =
       "expo.modules.t3voice.action.START_SEMANTIC_RUNTIME"
     private const val ACTION_START_READINESS = "expo.modules.t3voice.action.START_READINESS"
+    internal const val ACTION_READINESS_EXPIRY =
+      "expo.modules.t3voice.action.READINESS_EXPIRY"
+    internal const val EXTRA_READINESS_GENERATION = "readinessGeneration"
     private const val INVALID_GENERATION = -1L
     private const val SEMANTIC_WAKE_LOCK_TAG = "t3tools:voice-runtime"
     private val SEMANTIC_FOREGROUND_SERVICE_TYPES =

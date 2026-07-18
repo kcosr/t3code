@@ -131,9 +131,13 @@ internal class T3VoiceReadinessOwner(
   }
 
   fun disable(generation: Long): T3VoiceReadinessSnapshot.Disabled {
-    require(generation > current.generation) { "Readiness generation is stale." }
+    validateNextGeneration(generation)
     configuration = null
     return T3VoiceReadinessSnapshot.Disabled(generation).also { current = it }
+  }
+
+  fun validateNextGeneration(generation: Long) {
+    require(generation > current.generation) { "Readiness generation is stale." }
   }
 
   fun start(generation: Long): T3VoiceReadinessStartDecision {
