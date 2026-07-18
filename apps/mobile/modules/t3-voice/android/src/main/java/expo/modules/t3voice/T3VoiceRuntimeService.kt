@@ -21,7 +21,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
@@ -44,6 +46,36 @@ class T3VoiceRuntimeService : Service() {
       get() = semanticController.snapshots
 
     fun runtimeSnapshot(): T3VoiceControllerSnapshot = semanticController.snapshot()
+
+    val readinessSnapshots: StateFlow<T3VoiceReadinessSnapshot>
+      get() = mutableReadinessSnapshots.asStateFlow()
+
+    fun readinessSnapshot(): T3VoiceReadinessSnapshot = readinessOwner.snapshot()
+
+    fun configureReadiness(
+      configuration: T3VoiceReadinessConfiguration,
+    ): T3VoiceReadinessSnapshot =
+      synchronized(operationLock) {
+        val snapshot = readinessOwner.configure(configuration)
+        publishReadinessLocked(snapshot)
+        startForReadiness(this@T3VoiceRuntimeService)
+        ensureRuntimeForeground(SEMANTIC_FOREGROUND_SERVICE_TYPES)
+        scheduleReadinessExpiryLocked(configuration)
+        reconcileSemanticControlsLocked(semanticController.snapshot())
+        snapshot
+      }
+
+    fun disableReadiness(generation: Long): T3VoiceReadinessSnapshot =
+      synchronized(operationLock) {
+        disableReadinessLocked(generation)
+      }
+
+    fun pendingReadinessDisableGeneration(): Long? =
+      readinessDisableMarker.pendingGeneration()
+
+    fun acknowledgeReadinessDisable(generation: Long) {
+      readinessDisableMarker.acknowledge(generation)
+    }
 
     val audioRoutePreferences: StateFlow<T3VoiceAudioRoutePreference>
       get() = semanticDriver.audioRoutePreferences
@@ -184,12 +216,18 @@ class T3VoiceRuntimeService : Service() {
   private lateinit var semanticController: T3VoiceRuntimeController
   private lateinit var androidControls: T3VoiceAndroidControls
   private lateinit var semanticWakeLock: PowerManager.WakeLock
+  private val readinessOwner = T3VoiceReadinessOwner()
+  private lateinit var readinessDisableMarker: T3VoiceReadinessDisableMarker
+  private val mutableReadinessSnapshots =
+    MutableStateFlow<T3VoiceReadinessSnapshot>(T3VoiceReadinessSnapshot.Disabled(0))
+  private var readinessExpiry: Runnable? = null
   private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
   private var semanticSnapshotCollection: Job? = null
   private var foregroundServiceTypes = 0
   private val mainHandler = Handler(Looper.getMainLooper())
   override fun onCreate() {
     super.onCreate()
+    readinessDisableMarker = T3VoiceReadinessDisableMarker(applicationContext)
     semanticDriver =
       T3VoiceNativeRuntimeDriver(
         applicationContext,
@@ -206,8 +244,10 @@ class T3VoiceRuntimeService : Service() {
         .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, SEMANTIC_WAKE_LOCK_TAG)
         .apply { setReferenceCounted(false) }
     androidControls =
-      T3VoiceAndroidControls(applicationContext) { command ->
-        dispatchSemanticCommand(command)
+      T3VoiceAndroidControls(applicationContext) { action, owner, generation ->
+        synchronized(operationLock) {
+          dispatchAndroidControlLocked(action, owner, generation)
+        }
       }
     semanticSnapshotCollection =
       serviceScope.launch {
@@ -318,10 +358,12 @@ class T3VoiceRuntimeService : Service() {
             startId = startId,
           )
         ACTION_SEMANTIC_CONTROL ->
-          dispatchSemanticControlLocked(
+          dispatchAndroidControlLocked(
             generation = intent.getLongExtra(EXTRA_SEMANTIC_GENERATION, INVALID_GENERATION),
-            actionName = intent.getStringExtra(EXTRA_SEMANTIC_ACTION),
-            startId = startId,
+            action = intent.getStringExtra(EXTRA_SEMANTIC_ACTION)
+              ?.let { runCatching { T3VoiceAndroidControlAction.valueOf(it) }.getOrNull() },
+            owner = intent.getStringExtra(EXTRA_CONTROL_OWNER)
+              ?.let { runCatching { T3VoiceAndroidControlOwner.valueOf(it) }.getOrNull() },
           )
         ACTION_START_RECORDING ->
           reconcileStartCommand(
@@ -337,7 +379,14 @@ class T3VoiceRuntimeService : Service() {
             foregroundServiceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
             startId = startId,
           )
-        else -> if (isCompletelyIdle()) stopSelf(startId)
+        ACTION_START_READINESS -> {
+          if (readinessOwner.snapshot().retainsService()) {
+            ensureRuntimeForeground(SEMANTIC_FOREGROUND_SERVICE_TYPES)
+          } else if (isCompletelyIdle()) {
+            stopSelf(startId)
+          }
+        }
+        else -> if (isCompletelyIdle() && !readinessOwner.snapshot().retainsService()) stopSelf(startId)
       }
     }
     return START_NOT_STICKY
@@ -347,6 +396,8 @@ class T3VoiceRuntimeService : Service() {
     semanticSnapshotCollection?.cancel()
     semanticSnapshotCollection = null
     serviceScope.cancel()
+    readinessExpiry?.let(mainHandler::removeCallbacks)
+    readinessExpiry = null
     if (this::semanticWakeLock.isInitialized && semanticWakeLock.isHeld) semanticWakeLock.release()
     if (this::androidControls.isInitialized) androidControls.release()
     synchronized(operationLock) {
@@ -452,28 +503,102 @@ class T3VoiceRuntimeService : Service() {
     }
   }
 
-  private fun dispatchSemanticControlLocked(
+  private fun dispatchAndroidControlLocked(
     generation: Long,
-    actionName: String?,
-    startId: Int,
+    action: T3VoiceAndroidControlAction?,
+    owner: T3VoiceAndroidControlOwner?,
   ) {
-    val snapshot = semanticController.snapshot()
-    val actionId =
-      actionName?.let {
-        runCatching { T3VoiceNotificationActionId.valueOf(it) }.getOrNull()
+    if (action == null || owner == null) return
+    dispatchAndroidControlLocked(action, owner, generation)
+  }
+
+  private fun dispatchAndroidControlLocked(
+    action: T3VoiceAndroidControlAction,
+    owner: T3VoiceAndroidControlOwner,
+    generation: Long,
+  ) {
+    when (owner) {
+      T3VoiceAndroidControlOwner.READINESS -> {
+        if (generation != readinessOwner.snapshot().generation) return
+        when (action) {
+          T3VoiceAndroidControlAction.START -> startPreparedReadinessLocked(generation)
+          T3VoiceAndroidControlAction.DISABLE ->
+            disableReadinessLocked(generation + 1, persistMarker = true)
+          else -> Unit
+        }
       }
-    val command =
-      if (generation == snapshot.generation && actionId != null) {
-        T3VoiceNotificationActions.forSnapshot(snapshot).firstOrNull { it.id == actionId }?.command
-      } else {
-        null
+      T3VoiceAndroidControlOwner.OPERATION -> {
+        val snapshot = semanticController.snapshot()
+        if (generation != snapshot.generation) return
+        val command =
+          when (action) {
+            T3VoiceAndroidControlAction.SWITCH_TO_THREAD ->
+              readinessOwner.preparedThreadStart()?.let {
+                T3VoiceRuntimeCommand.SwitchRealtimeToThread(it.target, it.settings)
+              }
+            else ->
+              action.toNotificationActionId()?.let { id ->
+                T3VoiceNotificationActions.forSnapshot(snapshot)
+                  .firstOrNull { it.id == id }
+                  ?.command
+              }
+          } ?: return
+        semanticController.dispatch(command)
+        reconcileSemanticControlsLocked(semanticController.snapshot())
       }
-    if (command == null) {
-      if (isCompletelyIdle()) stopSelf(startId)
-      return
     }
-    semanticController.dispatch(command)
+  }
+
+  private fun startPreparedReadinessLocked(generation: Long) {
+    if (!isCompletelyIdle() || hasActiveLegacyMediaOwnerLocked()) return
+    when (val decision = readinessOwner.start(generation)) {
+      is T3VoiceReadinessStartDecision.Start -> dispatchSemanticCommand(decision.command)
+      is T3VoiceReadinessStartDecision.Expired -> {
+        publishReadinessLocked(decision.snapshot)
+        reconcileSemanticControlsLocked(semanticController.snapshot())
+      }
+      T3VoiceReadinessStartDecision.IgnoreStale,
+      T3VoiceReadinessStartDecision.Unavailable,
+      -> Unit
+    }
+  }
+
+  private fun disableReadinessLocked(
+    generation: Long,
+    persistMarker: Boolean = false,
+  ): T3VoiceReadinessSnapshot.Disabled {
+    readinessExpiry?.let(mainHandler::removeCallbacks)
+    readinessExpiry = null
+    if (persistMarker) readinessDisableMarker.mark(generation)
+    val disabled = readinessOwner.disable(generation)
+    publishReadinessLocked(disabled)
     reconcileSemanticControlsLocked(semanticController.snapshot())
+    return disabled
+  }
+
+  private fun publishReadinessLocked(snapshot: T3VoiceReadinessSnapshot) {
+    mutableReadinessSnapshots.value = snapshot
+  }
+
+  private fun scheduleReadinessExpiryLocked(configuration: T3VoiceReadinessConfiguration) {
+    readinessExpiry?.let(mainHandler::removeCallbacks)
+    readinessExpiry = null
+    val session = configuration.preparedStart?.session ?: return
+    val expiration =
+      T3VoiceTime.parseIsoEpochMillis(session.expiresAt, "native session expiration")
+    val delay = (expiration - T3VoiceTime.nowEpochMillis()).coerceAtLeast(0)
+    val task =
+      Runnable {
+        synchronized(operationLock) {
+          val decision = readinessOwner.start(configuration.generation)
+          if (decision is T3VoiceReadinessStartDecision.Expired) {
+            publishReadinessLocked(decision.snapshot)
+            reconcileSemanticControlsLocked(semanticController.snapshot())
+          }
+        }
+      }
+    readinessExpiry = task
+    mainHandler.postDelayed(task, delay)
   }
 
   private fun dispatchSemanticCommand(command: T3VoiceRuntimeCommand): T3VoiceCommandResult {
@@ -646,7 +771,12 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun stopRuntimeForegroundLocked() {
-    if (isCompletelyIdle() && T3VoiceStateStore.state.value.isForeground) {
+    if (
+      T3VoiceForegroundRetentionPolicy.shouldRelease(
+        isCompletelyIdle(),
+        readinessOwner.snapshot(),
+      ) && T3VoiceStateStore.state.value.isForeground
+    ) {
       foregroundReleaseCoordinator.releaseWhileLocked()
     }
   }
@@ -703,7 +833,20 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun reconcileSemanticControlsLocked(snapshot: T3VoiceControllerSnapshot) {
-    val render = androidControls.render(snapshot, NOTIFICATION_CHANNEL_ID)
+    if (
+      snapshot.state is T3VoiceControllerState.Failed &&
+        snapshot.state.operation == T3VoiceOperation.REALTIME &&
+        snapshot.state.failure.code in READINESS_REFRESH_FAILURE_CODES
+    ) {
+      readinessOwner.markNeedsRefresh()?.let(::publishReadinessLocked)
+    }
+    val render =
+      androidControls.render(
+        snapshot,
+        readinessOwner.snapshot(),
+        readinessOwner.preparedThreadStart() != null,
+        NOTIFICATION_CHANNEL_ID,
+      )
     reconcileSemanticWakeLock(snapshot.state)
     if (render.changed && T3VoiceStateStore.state.value.isForeground) {
       render.notification?.let { notification ->
@@ -716,13 +859,22 @@ class T3VoiceRuntimeService : Service() {
   private fun currentNotification(): Notification {
     val snapshot =
       if (this::semanticController.isInitialized) {
-        semanticController.snapshot().takeIf { it.state.needsForeground() }
+        semanticController.snapshot().takeIf {
+          it.state.needsForeground() || readinessOwner.snapshot().retainsService()
+        }
       } else {
         null
       }
     return if (snapshot != null && this::androidControls.isInitialized) {
-      checkNotNull(androidControls.render(snapshot, NOTIFICATION_CHANNEL_ID).notification) {
-        "Active semantic voice state did not produce a foreground notification."
+      checkNotNull(
+        androidControls.render(
+          snapshot,
+          readinessOwner.snapshot(),
+          readinessOwner.preparedThreadStart() != null,
+          NOTIFICATION_CHANNEL_ID,
+        ).notification,
+      ) {
+        "Retained voice state did not produce a foreground notification."
       }
     } else {
       buildNotification()
@@ -810,13 +962,17 @@ class T3VoiceRuntimeService : Service() {
       "expo.modules.t3voice.action.SEMANTIC_CONTROL"
     internal const val EXTRA_SEMANTIC_ACTION = "semanticAction"
     internal const val EXTRA_SEMANTIC_GENERATION = "semanticGeneration"
+    internal const val EXTRA_CONTROL_OWNER = "controlOwner"
     private const val ACTION_START_SEMANTIC_RUNTIME =
       "expo.modules.t3voice.action.START_SEMANTIC_RUNTIME"
+    private const val ACTION_START_READINESS = "expo.modules.t3voice.action.START_READINESS"
     private const val INVALID_GENERATION = -1L
     private const val SEMANTIC_WAKE_LOCK_TAG = "t3tools:voice-runtime"
     private val SEMANTIC_FOREGROUND_SERVICE_TYPES =
       ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
         ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+    private val READINESS_REFRESH_FAILURE_CODES =
+      setOf("takeover-required", "voice_conversation_not_found")
 
     fun startForRecording(context: Context, recordingId: String) {
       start(context, ACTION_START_RECORDING, recordingId)
@@ -831,6 +987,14 @@ class T3VoiceRuntimeService : Service() {
         Intent(context, T3VoiceRuntimeService::class.java).apply {
           action = ACTION_START_SEMANTIC_RUNTIME
           putExtra(EXTRA_SEMANTIC_GENERATION, generation)
+        }
+      start(context, intent)
+    }
+
+    fun startForReadiness(context: Context) {
+      val intent =
+        Intent(context, T3VoiceRuntimeService::class.java).apply {
+          action = ACTION_START_READINESS
         }
       start(context, intent)
     }
@@ -857,3 +1021,16 @@ class T3VoiceRuntimeService : Service() {
     }
   }
 }
+
+private fun T3VoiceAndroidControlAction.toNotificationActionId(): T3VoiceNotificationActionId? =
+  when (this) {
+    T3VoiceAndroidControlAction.MUTE -> T3VoiceNotificationActionId.MUTE
+    T3VoiceAndroidControlAction.UNMUTE -> T3VoiceNotificationActionId.UNMUTE
+    T3VoiceAndroidControlAction.FINISH_UTTERANCE -> T3VoiceNotificationActionId.FINISH_UTTERANCE
+    T3VoiceAndroidControlAction.SUBMIT_TRANSCRIPT -> T3VoiceNotificationActionId.SUBMIT_TRANSCRIPT
+    T3VoiceAndroidControlAction.STOP -> T3VoiceNotificationActionId.STOP
+    T3VoiceAndroidControlAction.START,
+    T3VoiceAndroidControlAction.DISABLE,
+    T3VoiceAndroidControlAction.SWITCH_TO_THREAD,
+    -> null
+  }

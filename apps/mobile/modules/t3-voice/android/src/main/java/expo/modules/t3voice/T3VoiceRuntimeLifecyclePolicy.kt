@@ -8,6 +8,13 @@ internal object T3VoiceRuntimeLifecyclePolicy {
     state !is T3VoiceControllerState.Idle && state !is T3VoiceControllerState.Failed
 }
 
+internal object T3VoiceForegroundRetentionPolicy {
+  fun shouldRelease(
+    operationIdle: Boolean,
+    readiness: T3VoiceReadinessSnapshot,
+  ): Boolean = operationIdle && !readiness.retainsService()
+}
+
 internal object T3VoiceRuntimeAdmissionPolicy {
   fun canStartSemantic(hasLegacyMediaOwner: Boolean): Boolean = !hasLegacyMediaOwner
 

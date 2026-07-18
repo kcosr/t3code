@@ -8,6 +8,61 @@ import org.junit.Test
 
 class T3VoiceRuntimeBridgeInputTest {
   @Test
+  fun parsesCompleteReadinessAndIndependentThreadSwitchTargets() {
+    val realtimeTarget =
+      mapOf(
+        "environmentId" to "environment-a",
+        "conversation" to
+          mapOf(
+            "type" to "continue",
+            "conversationId" to "conversation-a",
+            "takeover" to false,
+          ),
+        "focus" to focus,
+        "threadSettings" to threadStart.getValue("settings"),
+      )
+    val configuration =
+      T3VoiceRuntimeBridgeInput.configureReadiness(
+        mapOf(
+          "generation" to 8.0,
+          "mode" to "realtime",
+          "label" to "Realtime",
+          "start" to
+            mapOf(
+              "type" to "realtime",
+              "input" to realtimeTarget,
+              "session" to session,
+            ),
+          "threadSwitch" to threadStart,
+        ),
+      )
+
+    assertEquals(8L, configuration.generation)
+    assertTrue(configuration.preparedStart is T3VoicePreparedStart.Realtime)
+    assertEquals("thread-a", configuration.preparedThreadSwitch?.target?.threadId)
+    assertFalse(configuration.preparedStart.toString().contains("secret-token"))
+  }
+
+  @Test
+  fun unavailableThreadReadinessIsExplicitAndCannotContainLegacyFallbackFields() {
+    val input =
+      mapOf<String, Any?>(
+        "generation" to 9.0,
+        "mode" to "thread",
+        "label" to "Archived thread",
+        "start" to null,
+        "threadSwitch" to null,
+      )
+    val configuration = T3VoiceRuntimeBridgeInput.configureReadiness(input)
+    assertEquals(T3VoiceReadinessMode.THREAD, configuration.mode)
+    assertEquals(null, configuration.preparedStart)
+
+    assertThrows(IllegalStateException::class.java) {
+      T3VoiceRuntimeBridgeInput.configureReadiness(input + ("fallbackMode" to "realtime"))
+    }
+  }
+
+  @Test
   fun parsesTheExactRealtimeStartShapeWithoutExposingCredentials() {
     val command =
       T3VoiceRuntimeBridgeInput.startRealtime(

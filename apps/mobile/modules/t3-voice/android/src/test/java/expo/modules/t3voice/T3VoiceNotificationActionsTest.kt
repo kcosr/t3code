@@ -149,7 +149,7 @@ class T3VoiceNotificationActionsTest {
         as T3VoiceAndroidControlsPresentation.Active
     assertEquals("T3 Thread voice", stoppingThread.title)
     assertEquals("Stopping before Realtime…", stoppingThread.statusText)
-    assertEquals(listOf(T3VoiceNotificationActionId.STOP), stoppingThread.actions)
+    assertEquals(listOf(T3VoiceAndroidControlAction.STOP), stoppingThread.actions)
 
     controller.onCallback(1, T3VoiceRuntimeCallback.ThreadStopped)
     val startingRealtime =
@@ -277,27 +277,51 @@ class T3VoiceNotificationActionsTest {
 
   @Test
   fun notificationPendingIntentIdentityIsStableForTheSameActionAndGeneration() {
-    val first = T3VoiceNotificationActionId.MUTE.pendingIntentIdentity(generation = 42)
-    val second = T3VoiceNotificationActionId.MUTE.pendingIntentIdentity(generation = 42)
+    val first =
+      T3VoiceAndroidControlAction.MUTE.pendingIntentIdentity(
+        T3VoiceAndroidControlOwner.OPERATION,
+        generation = 42,
+      )
+    val second =
+      T3VoiceAndroidControlAction.MUTE.pendingIntentIdentity(
+        T3VoiceAndroidControlOwner.OPERATION,
+        generation = 42,
+      )
 
     assertEquals(first, second)
-    assertEquals("t3voice-runtime://semantic-control/42/MUTE", first.dataUri)
+    assertEquals("t3voice-runtime://semantic-control/OPERATION/42/MUTE", first.dataUri)
   }
 
   @Test
   fun notificationPendingIntentIdentityFencesGenerationsAndActions() {
     val muteGenerationOne =
-      T3VoiceNotificationActionId.MUTE.pendingIntentIdentity(generation = 1)
+      T3VoiceAndroidControlAction.MUTE.pendingIntentIdentity(
+        T3VoiceAndroidControlOwner.OPERATION,
+        generation = 1,
+      )
     val muteGenerationTwo =
-      T3VoiceNotificationActionId.MUTE.pendingIntentIdentity(generation = 2)
+      T3VoiceAndroidControlAction.MUTE.pendingIntentIdentity(
+        T3VoiceAndroidControlOwner.OPERATION,
+        generation = 2,
+      )
     val stopGenerationOne =
-      T3VoiceNotificationActionId.STOP.pendingIntentIdentity(generation = 1)
+      T3VoiceAndroidControlAction.STOP.pendingIntentIdentity(
+        T3VoiceAndroidControlOwner.OPERATION,
+        generation = 1,
+      )
 
     assertEquals(muteGenerationOne.requestCode, muteGenerationTwo.requestCode)
     assertNotEquals(muteGenerationOne.dataUri, muteGenerationTwo.dataUri)
     assertNotEquals(muteGenerationOne.dataUri, stopGenerationOne.dataUri)
     assertNotEquals(muteGenerationOne, muteGenerationTwo)
     assertNotEquals(muteGenerationOne, stopGenerationOne)
+    assertNotEquals(
+      muteGenerationOne,
+      T3VoiceAndroidControlAction.MUTE.pendingIntentIdentity(
+        T3VoiceAndroidControlOwner.READINESS,
+        generation = 1,
+      ),
+    )
   }
 }
 

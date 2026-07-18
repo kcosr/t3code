@@ -33,6 +33,44 @@ export interface T3VoiceStartThreadInput {
   readonly session: T3VoiceNativeSessionConfiguration;
 }
 
+export type T3VoiceReadinessMode = "realtime" | "thread";
+
+export type T3VoiceReadinessSnapshot =
+  | { readonly posture: "disabled"; readonly generation: number }
+  | {
+      readonly posture: "ready" | "needs-refresh";
+      readonly generation: number;
+      readonly mode: T3VoiceReadinessMode;
+      readonly label: string;
+      readonly expiresAt: string;
+    }
+  | {
+      readonly posture: "unavailable";
+      readonly generation: number;
+      readonly mode: T3VoiceReadinessMode;
+      readonly label: string;
+    };
+
+export type T3VoicePreparedReadinessStart =
+  | {
+      readonly type: "realtime";
+      readonly input: VoiceRealtimeTarget;
+      readonly session: T3VoiceNativeSessionConfiguration;
+    }
+  | {
+      readonly type: "thread";
+      readonly input: VoiceThreadStartInput;
+      readonly session: T3VoiceNativeSessionConfiguration;
+    };
+
+export interface T3VoiceConfigureReadinessInput {
+  readonly generation: number;
+  readonly mode: T3VoiceReadinessMode;
+  readonly label: string;
+  readonly start: T3VoicePreparedReadinessStart | null;
+  readonly threadSwitch: VoiceThreadStartInput | null;
+}
+
 export interface T3VoiceSetRealtimeMutedInput {
   readonly muted: boolean;
 }
@@ -227,6 +265,10 @@ export interface T3VoiceNativeModule {
       listener: (snapshot: VoiceRuntimeSnapshot) => void,
     ): T3VoiceEventSubscription;
     (
+      eventName: "readinessSnapshotChanged",
+      listener: (snapshot: T3VoiceReadinessSnapshot) => void,
+    ): T3VoiceEventSubscription;
+    (
       eventName: "audioRoutePreferenceChanged",
       listener: (state: T3VoiceAudioRoutePreferenceState) => void,
     ): T3VoiceEventSubscription;
@@ -248,6 +290,17 @@ export interface T3VoiceNativeModule {
     ): T3VoiceEventSubscription;
   };
   readonly getRuntimeSnapshotAsync: () => Promise<VoiceRuntimeSnapshot>;
+  readonly getReadinessSnapshotAsync: () => Promise<T3VoiceReadinessSnapshot>;
+  readonly configureReadinessAsync: (
+    input: T3VoiceConfigureReadinessInput,
+  ) => Promise<T3VoiceReadinessSnapshot>;
+  readonly disableReadinessAsync: (input: {
+    readonly generation: number;
+  }) => Promise<T3VoiceReadinessSnapshot>;
+  readonly getPendingReadinessDisableAsync: () => Promise<number | null>;
+  readonly acknowledgeReadinessDisableAsync: (input: {
+    readonly generation: number;
+  }) => Promise<void>;
   readonly startRealtimeAsync: (input: T3VoiceRealtimeAdmissionInput) => Promise<void>;
   readonly startThreadAsync: (input: T3VoiceStartThreadInput) => Promise<void>;
   readonly switchRealtimeToThreadAsync: (input: VoiceThreadStartInput) => Promise<void>;

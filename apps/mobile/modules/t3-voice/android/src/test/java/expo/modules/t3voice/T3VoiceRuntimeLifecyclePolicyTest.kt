@@ -182,6 +182,31 @@ class T3VoiceRuntimeLifecyclePolicyTest {
     )
   }
 
+  @Test
+  fun readyRetainsForegroundOnlyAfterTheOperationIsExactlyIdle() {
+    val ready =
+      T3VoiceReadinessSnapshot.Ready(
+        generation = 4,
+        mode = T3VoiceReadinessMode.REALTIME,
+        label = "Realtime",
+        expiresAt = "2099-01-01T00:00:00Z",
+      )
+    assertFalse(T3VoiceForegroundRetentionPolicy.shouldRelease(operationIdle = true, ready))
+    assertFalse(T3VoiceForegroundRetentionPolicy.shouldRelease(operationIdle = false, ready))
+    assertTrue(
+      T3VoiceForegroundRetentionPolicy.shouldRelease(
+        operationIdle = true,
+        T3VoiceReadinessSnapshot.Disabled(5),
+      ),
+    )
+    assertFalse(
+      T3VoiceForegroundRetentionPolicy.shouldRelease(
+        operationIdle = false,
+        T3VoiceReadinessSnapshot.Disabled(5),
+      ),
+    )
+  }
+
   private fun threadState(stage: T3VoiceThreadStage) =
     T3VoiceControllerState.Thread(
       stage = stage,
