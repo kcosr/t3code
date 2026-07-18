@@ -19,6 +19,7 @@ internal class T3VoiceThreadSession(
   private val media: T3VoiceThreadMedia,
   private val emit: (T3VoiceRuntimeCallback) -> Unit,
   private val onQuiesced: (T3VoiceRuntimeCallback?) -> Unit,
+  private val cueArming: T3VoiceCueArming = NoOpCueArming,
   private val api: T3VoiceThreadSessionApi = T3VoiceNativeVoiceApi(config),
   private val nowIso: () -> String = T3VoiceTime::nowIso,
   private val scheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor(),
@@ -491,57 +492,69 @@ internal class T3VoiceThreadSession(
   private fun startRecording() {
     controlExecutor.execute {
       if (!active.get()) return@execute
-      val id = UUID.randomUUID().toString()
-      try {
+      // Keep STARTING until Ready completes (or cues disabled / fail-open).
+      cueArming.requestReady(generation) { completion ->
+        controlExecutor.execute {
+          if (!active.get()) return@execute
+          if (completion.outcome == T3VoiceCueOutcome.CANCELLED) return@execute
+          openRecorder()
+        }
+      }
+    }
+  }
+
+  private fun openRecorder() {
+    if (!active.get()) return
+    val id = UUID.randomUUID().toString()
+    try {
+      synchronized(lock) {
+        check(active.get()) { "Thread voice session stopped." }
+        check(mediaOwner == MediaOwner.NONE) { "Thread media is already active." }
+        recordingId = id
+        noInputRecordingId = null
+        mediaOwner = MediaOwner.STARTING_RECORDING
+      }
+      check(media.acquireAudio()) {
+        "Android denied recording audio focus."
+      }
+      media.startRecording(
+        id,
+        T3VoiceEndpointDetectionConfig(
+          endSilenceMs = start.settings.endpointDetection.endSilenceMs,
+          noSpeechTimeoutMs = start.settings.endpointDetection.noSpeechTimeoutMs,
+          maximumUtteranceMs = start.settings.endpointDetection.maximumUtteranceMs,
+        ),
+      )
+      val retained =
         synchronized(lock) {
-          check(active.get()) { "Thread voice session stopped." }
-          check(mediaOwner == MediaOwner.NONE) { "Thread media is already active." }
-          recordingId = id
-          noInputRecordingId = null
-          mediaOwner = MediaOwner.STARTING_RECORDING
-        }
-        check(media.acquireAudio()) {
-          "Android denied recording audio focus."
-        }
-        media.startRecording(
-          id,
-          T3VoiceEndpointDetectionConfig(
-            endSilenceMs = start.settings.endpointDetection.endSilenceMs,
-            noSpeechTimeoutMs = start.settings.endpointDetection.noSpeechTimeoutMs,
-            maximumUtteranceMs = start.settings.endpointDetection.maximumUtteranceMs,
-          ),
-        )
-        val retained =
-          synchronized(lock) {
-            if (
-              active.get() &&
-                recordingId == id &&
-                mediaOwner == MediaOwner.STARTING_RECORDING
-            ) {
-              completedRecording.delete()
-              submittedMessageId = null
-              assistantText = null
-              mediaOwner = MediaOwner.RECORDING
-              true
-            } else {
-              false
-            }
+          if (
+            active.get() &&
+              recordingId == id &&
+              mediaOwner == MediaOwner.STARTING_RECORDING
+          ) {
+            completedRecording.delete()
+            submittedMessageId = null
+            assistantText = null
+            mediaOwner = MediaOwner.RECORDING
+            true
+          } else {
+            false
           }
-        if (!retained) {
-          runCatching { media.cancelRecording(id) }
-          media.releaseAudio()
-          return@execute
         }
-        emitIfActive(T3VoiceRuntimeCallback.ThreadRecordingStarted)
-      } catch (cause: Throwable) {
-        synchronized(lock) {
-          if (recordingId == id) recordingId = null
-          mediaOwner = MediaOwner.NONE
-        }
+      if (!retained) {
         runCatching { media.cancelRecording(id) }
         media.releaseAudio()
-        failCycle(cause, "recording-start-failed", "Voice recording could not start.")
+        return
       }
+      emitIfActive(T3VoiceRuntimeCallback.ThreadRecordingStarted)
+    } catch (cause: Throwable) {
+      synchronized(lock) {
+        if (recordingId == id) recordingId = null
+        mediaOwner = MediaOwner.NONE
+      }
+      runCatching { media.cancelRecording(id) }
+      media.releaseAudio()
+      failCycle(cause, "recording-start-failed", "Voice recording could not start.")
     }
   }
 
@@ -628,6 +641,10 @@ internal class T3VoiceThreadSession(
     synchronized(lock) {
       check(terminalOutcome == null) { "Thread session already has a terminal outcome." }
       terminalOutcome = outcome
+    }
+    cueArming.cancel(generation)
+    if (outcome is TerminalOutcome.Stopped) {
+      cueArming.requestEnded(generation)
     }
     beginCleanup()
   }

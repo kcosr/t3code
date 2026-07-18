@@ -249,7 +249,13 @@ export type T3VoiceDiagnosticCode =
   | "failed"
   | "realtime-drain-timed-out"
   | "endpoint-sample"
-  | "endpoint-terminated";
+  | "endpoint-terminated"
+  | "cue-ready-started"
+  | "cue-ended-started"
+  | "cue-drained"
+  | "cue-cancelled"
+  | "cue-failed"
+  | "cue-timed-out";
 
 export interface T3VoiceDiagnosticEntry {
   readonly elapsedRealtimeMillis: number;
@@ -325,6 +331,10 @@ export interface T3VoiceNativeModule {
   readonly switchThreadToRealtimeAsync: (input: T3VoiceRealtimeAdmissionInput) => Promise<void>;
   readonly stopRuntimeAsync: () => Promise<void>;
   readonly setRealtimeMutedAsync: (input: T3VoiceSetRealtimeMutedInput) => Promise<void>;
+  readonly getVoiceCuesEnabledAsync: () => Promise<{ readonly enabled: boolean }>;
+  readonly setVoiceCuesEnabledAsync: (input: {
+    readonly enabled: boolean;
+  }) => Promise<{ readonly enabled: boolean; readonly generation: number }>;
   readonly getAudioRoutePreferenceAsync: () => Promise<T3VoiceAudioRoutePreferenceState>;
   readonly setAudioRoutePreferenceAsync: (
     input: T3VoiceSetAudioRoutePreferenceInput,

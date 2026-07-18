@@ -124,6 +124,20 @@ export function SettingsVoiceRouteScreen() {
             value={audioRoutePreference.valueLabel}
             onPress={audioRoutePreference.open}
           />
+          <SettingsSwitchRow
+            disabled={!ready || Platform.OS !== "android"}
+            icon="bell"
+            label="Voice cues"
+            value={stored.voiceCuesEnabled !== false}
+            onValueChange={(value) => {
+              savePreferences({ voiceCuesEnabled: value });
+              const native = getT3VoiceNativeModule();
+              if (native === null) return;
+              void native.setVoiceCuesEnabledAsync({ enabled: value }).catch(() => {
+                // Native store is best-effort for detached FG ownership; React blob remains.
+              });
+            }}
+          />
         </SettingsSection>
 
         {Platform.OS === "android" ? (

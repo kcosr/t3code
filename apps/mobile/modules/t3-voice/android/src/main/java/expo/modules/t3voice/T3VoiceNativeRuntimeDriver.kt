@@ -45,6 +45,8 @@ internal class T3VoiceNativeRuntimeDriver(
       },
     )
   private val threadMedia = T3VoiceAndroidThreadMedia(recorder, player, audioRouter)
+  private val cueArming: T3VoiceCueArming =
+    T3VoiceCueArmingLive(T3VoiceCueSettingsStore(applicationContext))
 
   init {
     audioRoutePreferenceState = MutableStateFlow(audioRouter.preference())
@@ -65,6 +67,16 @@ internal class T3VoiceNativeRuntimeDriver(
         },
         sharedAudioRouter = audioRouter,
       )
+  }
+
+  fun voiceCuesEnabled(): Boolean = cueArming.isEnabled()
+
+  fun setVoiceCuesEnabled(enabled: Boolean): Map<String, Any?> {
+    val next = cueArming.setEnabled(enabled)
+    return mapOf(
+      "enabled" to next.enabled,
+      "generation" to next.generation,
+    )
   }
 
   override fun startRealtime(
@@ -88,6 +100,7 @@ internal class T3VoiceNativeRuntimeDriver(
           audioRouter = audioRouter,
           emit = { event -> handleRealtimeCallback(generation, event) },
           onQuiesced = { result -> handleRealtimeQuiesced(created, generation, result) },
+          cueArming = cueArming,
         )
       realtimeSession = created
     }
@@ -247,6 +260,7 @@ internal class T3VoiceNativeRuntimeDriver(
           media = threadMedia,
           emit = { event -> handleThreadCallback(generation, event) },
           onQuiesced = { event -> handleThreadQuiesced(created, generation, event) },
+          cueArming = cueArming,
         )
       threadSession = created
     }
@@ -319,6 +333,7 @@ internal class T3VoiceNativeRuntimeDriver(
 
   private fun releaseSharedMedia() {
     if (!sharedMediaReleased.compareAndSet(false, true)) return
+    cueArming.release()
     audioRouter.shutdown()
     recorder.release()
     player.release()

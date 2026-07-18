@@ -55,6 +55,9 @@ internal interface T3VoiceRealtimeMedia {
   )
 
   fun setMuted(sessionId: String, muted: Boolean)
+
+  /** Arm microphone after Ready cue (or immediately when cues disabled). */
+  fun setInputReady(sessionId: String, ready: Boolean)
 }
 
 private enum class T3VoiceRealtimePlayoutDrainOutcome {
@@ -256,6 +259,8 @@ internal class T3VoiceWebRtcSession(
             active = session
             audioOwners.activate(audioOwner)
             installedSession = session
+            // Gate mic until Ready arming sets inputReady (default false).
+            applyCaptureState(session)
             terminalLatch.activate(sessionId)
             session.offerTimeout =
               scheduler.schedule(
@@ -425,6 +430,17 @@ internal class T3VoiceWebRtcSession(
       synchronized(lock) {
         val session = requireActive(sessionId)
         session.captureState = T3VoiceCapturePolicy.setUserMuted(session.captureState, muted)
+        applyCaptureState(session)
+        connectionStateFor(session) to effectiveMuted(session)
+      }
+    onStateChanged(sessionId, update.first, update.second)
+  }
+
+  override fun setInputReady(sessionId: String, ready: Boolean) {
+    val update =
+      synchronized(lock) {
+        val session = requireActive(sessionId)
+        session.captureState = T3VoiceCapturePolicy.setInputReady(session.captureState, ready)
         applyCaptureState(session)
         connectionStateFor(session) to effectiveMuted(session)
       }

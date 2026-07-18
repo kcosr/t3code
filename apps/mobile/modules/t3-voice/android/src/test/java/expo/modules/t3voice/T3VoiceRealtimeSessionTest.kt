@@ -504,6 +504,7 @@ internal class T3VoiceRealtimeSessionTest {
     }
 
     override fun setMuted(sessionId: String, muted: Boolean) = Unit
+    override fun setInputReady(sessionId: String, ready: Boolean) = Unit
 
   }
 
@@ -589,6 +590,7 @@ internal class T3VoiceRealtimeSessionTest {
     }
 
     override fun setMuted(sessionId: String, muted: Boolean) = Unit
+    override fun setInputReady(sessionId: String, ready: Boolean) = Unit
 
 
     fun activeSessionId(): String? = synchronized(lock) { activeSession }
@@ -621,6 +623,7 @@ internal class T3VoiceRealtimeSessionTest {
     }
 
     override fun setMuted(sessionId: String, muted: Boolean) = Unit
+    override fun setInputReady(sessionId: String, ready: Boolean) = Unit
 
   }
 

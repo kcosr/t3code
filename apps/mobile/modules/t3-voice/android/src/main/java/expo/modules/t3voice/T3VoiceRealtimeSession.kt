@@ -25,6 +25,7 @@ internal class T3VoiceRealtimeSession(
   private val audioRouter: T3VoiceRealtimeAudioRouting,
   private val emit: (T3VoiceRuntimeCallback) -> Unit,
   private val onQuiesced: (T3VoiceRealtimeTerminalResult) -> Unit,
+  private val cueArming: T3VoiceCueArming = NoOpCueArming,
   private val api: T3VoiceRealtimeSessionApi = T3VoiceNativeVoiceApi(sessionConfig),
   private val nowEpochMillis: () -> Long = T3VoiceTime::nowEpochMillis,
   private val scheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor(),
@@ -303,6 +304,17 @@ internal class T3VoiceRealtimeSession(
     if (sessionId != expected || terminal.get()) return
     if (connectionState == "connected" && connected.compareAndSet(false, true)) {
       emitIfLive(T3VoiceRuntimeCallback.RealtimeConnected)
+      armRealtimeCapture(sessionId)
+    }
+  }
+
+  private fun armRealtimeCapture(sessionId: String) {
+    if (terminal.get()) return
+    cueArming.requestReady(generation) { completion ->
+      if (terminal.get()) return@requestReady
+      if (completion.outcome == T3VoiceCueOutcome.CANCELLED) return@requestReady
+      // Fail-open for DRAINED / FAILED / TIMED_OUT so a beep never strands the call.
+      runCatching { webRtc.setInputReady(sessionId, ready = true) }
     }
   }
 
@@ -638,6 +650,12 @@ internal class T3VoiceRealtimeSession(
   private fun beginTerminalCleanup() {
     if (!cleanupStarted.compareAndSet(false, true)) return
     val server = synchronized(lock) { serverSession }
+    val wasConnected = connected.get()
+    // Cancel any pending Ready; play Ended only after a clean connected session.
+    cueArming.cancel(generation)
+    if (wasConnected && terminalCallback is T3VoiceRuntimeCallback.RealtimeClosed) {
+      cueArming.requestEnded(generation)
+    }
     // Fence startup before abandoning process-global audio focus. cancelStartup is lock-only;
     // potentially blocking JNI peer disposal remains isolated on the terminal worker.
     runCatching { server?.let { webRtc.cancelStartup(it.state.sessionId) } }
