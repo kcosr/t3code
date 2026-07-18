@@ -65,6 +65,10 @@ internal class T3VoiceThreadSession(
   private var pcmSink: T3VoicePcmStreamSink? = null
   private var playbackFocusSuspended = false
   private var inFlightMediaCallbacks = 0
+  /** Set when Skip arrives before [playbackId] is assigned (WAITING→PLAYING handoff). */
+  private var skipPending = false
+  /** Playback id that has been asked to skip; cleared at the next recording cycle. */
+  private var skipRequestedPlaybackId: String? = null
 
   fun start() = startRecording()
 
@@ -305,7 +309,30 @@ internal class T3VoiceThreadSession(
         if (focusSuspended == null) {
           sink.cancel()
           runCatching { media.cancelPlayback(id) }
-          media.releaseAudio()
+          // Interrupt or stop may already own release; only release if we still claim the id.
+          if (claimPlaybackOwnership(id)) {
+            media.releaseAudio()
+          }
+          return@execute
+        }
+        // Consume Skip that arrived during WAITING→PLAYING / STARTING_PLAYBACK.
+        val skipAfterEstablish =
+          synchronized(lock) {
+            if (skipPending || skipRequestedPlaybackId == id) {
+              skipPending = false
+              skipRequestedPlaybackId = id
+              true
+            } else {
+              false
+            }
+          }
+        if (skipAfterEstablish) {
+          sink.cancel()
+          runCatching { media.cancelPlayback(id) }
+          if (claimPlaybackOwnership(id)) {
+            media.releaseAudio()
+            emitIfActive(T3VoiceRuntimeCallback.ThreadPlaybackFinished)
+          }
           return@execute
         }
         if (focusSuspended) media.pausePlayback(id)
@@ -322,19 +349,68 @@ internal class T3VoiceThreadSession(
       } catch (cause: Throwable) {
         sink.cancel()
         runCatching { media.cancelPlayback(id) }
-        synchronized(lock) {
-          if (playbackId == id) {
-            playbackId = null
-            pcmSink = null
-            playbackFocusSuspended = false
-            mediaOwner = MediaOwner.NONE
+        // Intentional skip must not surface as a terminal playback failure.
+        val skipped = synchronized(lock) { skipRequestedPlaybackId == id }
+        if (claimPlaybackOwnership(id)) {
+          media.releaseAudio()
+          if (skipped) {
+            emitIfActive(T3VoiceRuntimeCallback.ThreadPlaybackFinished)
+          } else {
+            fail(cause, "playback-failed", "Assistant response playback failed.")
           }
         }
-        media.releaseAudio()
-        fail(cause, "playback-failed", "Assistant response playback failed.")
       }
     }
   }
+
+  /**
+   * Cancels the current response playback without tearing down the Thread session.
+   * Completes via [T3VoiceRuntimeCallback.ThreadPlaybackFinished] so the controller can rearm
+   * or stop according to autoRearm. Idempotent for double headset presses.
+   */
+  fun interruptPlayback() {
+    val id =
+      synchronized(lock) {
+        if (!active.get()) return
+        val current = playbackId
+        if (current == null) {
+          skipPending = true
+          return
+        }
+        if (
+          mediaOwner != MediaOwner.PLAYBACK &&
+            mediaOwner != MediaOwner.STARTING_PLAYBACK
+        ) {
+          return
+        }
+        if (skipRequestedPlaybackId == current) return
+        skipRequestedPlaybackId = current
+        inFlightMediaCallbacks += 1
+        current
+      }
+    try {
+      synchronized(lock) { pcmSink }?.cancel()
+      // Player cancel deliberately fires no onFinished callback — we synthesize completion.
+      runCatching { media.cancelPlayback(id) }
+      if (claimPlaybackOwnership(id)) {
+        media.releaseAudio()
+        emitIfActive(T3VoiceRuntimeCallback.ThreadPlaybackFinished)
+      }
+    } finally {
+      mediaCallbackFinished()
+    }
+  }
+
+  /** Sole gate that nulls playback ownership so exactly one path emits finish/fail. */
+  private fun claimPlaybackOwnership(id: String): Boolean =
+    synchronized(lock) {
+      if (playbackId != id) return false
+      playbackId = null
+      pcmSink = null
+      playbackFocusSuspended = false
+      mediaOwner = MediaOwner.NONE
+      true
+    }
 
   fun scheduleRearm(delayMs: Long) {
     if (!active.get()) return
@@ -412,8 +488,27 @@ internal class T3VoiceThreadSession(
   }
 
   fun onPlaybackError(id: String, cause: Throwable): Boolean {
-    val owned = synchronized(lock) { playbackId == id }
-    if (!owned) return false
+    val skipped =
+      synchronized(lock) {
+        if (playbackId != id) return false
+        skipRequestedPlaybackId == id
+      }
+    if (skipped) {
+      // Same single-emit gate as interrupt/finish; fence terminal quiescence like onPlaybackFinished.
+      synchronized(lock) {
+        if (playbackId != id) return true
+        inFlightMediaCallbacks += 1
+      }
+      try {
+        if (claimPlaybackOwnership(id)) {
+          media.releaseAudio()
+          emitIfActive(T3VoiceRuntimeCallback.ThreadPlaybackFinished)
+        }
+      } finally {
+        mediaCallbackFinished()
+      }
+      return true
+    }
     fail(cause, "pcm-playback-failed", "Assistant response playback failed.")
     return true
   }
@@ -497,6 +592,9 @@ internal class T3VoiceThreadSession(
         synchronized(lock) {
           check(active.get()) { "Thread voice session stopped." }
           check(mediaOwner == MediaOwner.NONE) { "Thread media is already active." }
+          // Never let a prior cycle's Skip latch affect the next rearm cycle.
+          skipPending = false
+          skipRequestedPlaybackId = null
           recordingId = id
           noInputRecordingId = null
           mediaOwner = MediaOwner.STARTING_RECORDING
