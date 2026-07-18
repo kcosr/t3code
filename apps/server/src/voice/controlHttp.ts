@@ -7,6 +7,8 @@ import {
   EnvironmentVoiceOperationError,
   EnvironmentHttpApi,
   type VoiceCapabilityDescriptor,
+  type VoiceCapabilityState,
+  type VoiceNonRealtimeProviderId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -25,6 +27,7 @@ import {
 } from "../auth/http.ts";
 import { isSessionCredentialInternalError } from "../auth/SessionStore.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
+import { checkOpenAiSpeechServerHealth } from "./Providers/OpenAiSpeechServer/OpenAiSpeechServerVoiceProvider.ts";
 import { VoiceCredentialStore } from "./Services/VoiceCredentialStore.ts";
 import { VoiceConversationService } from "./Services/VoiceConversationService.ts";
 import { VoiceMediaTicketRegistry } from "./Services/VoiceMediaTicketRegistry.ts";
@@ -334,21 +337,54 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
           const settings = (yield* settingsService.getSettings.pipe(
             Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)),
           )).voice;
-          const credential = yield* credentials.status.pipe(
-            Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)),
-          );
-          const state = !settings.enabled
-            ? "disabled"
-            : credential.configured
-              ? "ready"
-              : "not-configured";
+          if (!settings.enabled) {
+            const disabled = "disabled" as const;
+            return {
+              version: 1 as const,
+              capabilities: [
+                descriptor("transcription.request", disabled, settings),
+                descriptor("speech.streaming", disabled, settings),
+                descriptor("transcription.realtime", disabled, settings),
+                descriptor("agent.realtime", disabled, settings),
+              ],
+              conversationRetention: ["ephemeral", "durable"] as const,
+            };
+          }
+
+          const openAiCredential = yield* credentials
+            .status("openai")
+            .pipe(Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)));
+          const openAiState: VoiceCapabilityState = openAiCredential.configured
+            ? "ready"
+            : "not-configured";
+
+          const resolveNonRealtimeState = (
+            selected: VoiceNonRealtimeProviderId,
+            speechServerState: VoiceCapabilityState,
+          ): VoiceCapabilityState => (selected === "openai" ? openAiState : speechServerState);
+
+          const speechServerSelected =
+            settings.providers.transcription === "openai-speech-server" ||
+            settings.providers.speech === "openai-speech-server";
+          const speechServerState: VoiceCapabilityState = speechServerSelected
+            ? yield* checkOpenAiSpeechServerHealth
+            : "not-configured";
+
           return {
             version: 1 as const,
             capabilities: [
-              descriptor("transcription.request", state, settings),
-              descriptor("speech.streaming", state, settings),
-              descriptor("transcription.realtime", state, settings),
-              descriptor("agent.realtime", state, settings),
+              descriptor(
+                "transcription.request",
+                resolveNonRealtimeState(settings.providers.transcription, speechServerState),
+                settings,
+              ),
+              descriptor(
+                "speech.streaming",
+                resolveNonRealtimeState(settings.providers.speech, speechServerState),
+                settings,
+              ),
+              descriptor("transcription.realtime", openAiState, settings),
+              descriptor("agent.realtime", openAiState, settings),
             ],
             conversationRetention: ["ephemeral", "durable"] as const,
           };
@@ -382,7 +418,7 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
         Effect.fn("environment.voice.credentialStatus")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthVoiceManageScope);
-          return yield* credentials.status.pipe(
+          return yield* credentials.listStatus.pipe(
             Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)),
           );
         }),
@@ -393,7 +429,7 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthVoiceManageScope);
           return yield* credentials
-            .setOpenAiApiKey(args.payload.apiKey)
+            .set(args.payload.providerId, args.payload.token)
             .pipe(Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)));
         }),
       )
@@ -402,10 +438,9 @@ export const voiceControlHttpApiLayer = HttpApiBuilder.group(
         Effect.fn("environment.voice.clearCredential")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthVoiceManageScope);
-          yield* credentials.clearOpenAiApiKey.pipe(
-            Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)),
-          );
-          return { configured: false, updatedAt: null };
+          return yield* credentials
+            .clear(args.params.providerId)
+            .pipe(Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)));
         }),
       );
   }),

@@ -48,23 +48,25 @@ Android microphone foreground service
              |
              | authenticated T3 control and media APIs
              v
-T3 environment server ---------------------- OpenAI
-  voice sessions and durable conversations     transcription / speech
-  signaling and sideband tool execution        Realtime WebRTC + sideband
-  media tickets and native child sessions
-  orchestration and history services
+T3 environment server ---- VoiceProviderRegistry ---- OpenAI
+  voice sessions / media                              transcription / speech / Realtime
+  signaling and tools
+  media tickets                                       OpenAI-compatible speech server
+                                                      transcription / speech only
 ```
 
 There are two media paths:
 
 - Bounded transcription and speech use authenticated T3 HTTP endpoints. The server validates media,
-  applies byte, duration, concurrency, and timeout limits, and calls OpenAI.
+  applies byte, duration, concurrency, and timeout limits, and routes each capability through
+  `VoiceProviderRegistry` to the selected provider (`openai` or `openai-speech-server`).
 - Realtime audio flows directly between Android and OpenAI over WebRTC. The T3 server authenticates
   session creation, proxies SDP negotiation, attaches a provider sideband connection, executes the
-  allowlisted T3 tools, and publishes normalized session events.
+  allowlisted T3 tools, and publishes normalized session events. Realtime always uses OpenAI.
 
-OpenAI is the only configured production voice provider. Its API key remains in the server secret
-store. Clients receive neither the provider credential nor raw provider control events.
+Provider API keys and speech-server tokens remain in the server secret store, keyed by provider id.
+Clients receive neither provider credentials nor raw provider control events. Android and web clients
+do not learn which non-Realtime provider is selected.
 
 ## Server capabilities and APIs
 
@@ -73,7 +75,18 @@ store. Clients receive neither the provider credential nor raw provider control 
 - `transcription.request` — implemented bounded MP4 transcription;
 - `speech.streaming` — implemented PCM speech streaming;
 - `agent.realtime` — implemented Realtime voice agent; and
-- `transcription.realtime` — part of the contract but currently reported unavailable.
+- `transcription.realtime` — part of the contract but currently reported unavailable when Realtime
+  is otherwise ready.
+
+Readiness is derived per capability from the selected provider:
+
+- voice globally disabled → `disabled`;
+- missing provider configuration or credential → `not-configured`;
+- selected speech-server health check fails or times out → `unavailable`;
+- configured and healthy → `ready`.
+
+`transcription.request` and `speech.streaming` may select different providers. `agent.realtime`
+always uses OpenAI.
 
 The control API also provides:
 
@@ -82,12 +95,39 @@ The control API also provides:
 - voice-conversation create, list, read, rename, transcript, clear-context, and delete;
 - one-use media tickets;
 - bounded Android native child sessions; and
-- credential status, set, and clear operations.
+- provider-keyed credential status, set, and clear operations
+  (`GET/PUT /api/voice/credentials`, `DELETE /api/voice/credentials/:providerId`).
 
 `POST /api/voice/transcriptions` accepts one validated `audio/mp4` upload and streams transcript
-deltas followed by one final result. `POST /api/voice/speech` returns cancellable, backpressured
-24 kHz mono signed 16-bit PCM. Android Thread voice requests one-use tickets for these routes while
-React is detached; React-owned dictation and message playback request their own tickets.
+deltas followed by one final result. `POST /api/voice/speech` validates upstream status and PCM
+format before committing success, then returns cancellable, backpressured 24 kHz mono signed 16-bit
+PCM. Android Thread voice requests one-use tickets for these routes while React is detached;
+React-owned dictation and message playback request their own tickets.
+
+Server settings select non-Realtime providers and configure the optional OpenAI-compatible speech
+server:
+
+```json
+{
+  "voice": {
+    "providers": {
+      "transcription": "openai",
+      "speech": "openai"
+    },
+    "openaiSpeechServer": {
+      "baseUrl": "http://192.168.50.72:6624",
+      "connectTimeoutSeconds": 15,
+      "speechPresets": {
+        "default": { "voice": "default", "speed": 1 },
+        "warm": { "voice": "af_sky", "speed": 1 }
+      }
+    }
+  }
+}
+```
+
+Selection is observed on each new media request. Changing settings does not require a process
+restart and does not alter an already in-flight request.
 
 ## Conversations, sessions, and calls
 

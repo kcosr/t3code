@@ -58,8 +58,10 @@ import {
   VoiceConfirmationResult,
   VoiceClientActionAckInput,
   VoiceClientActionAckResult,
+  VoiceCredentialProviderId,
   VoiceCredentialSetInput,
   VoiceCredentialStatus,
+  VoiceCredentialsStatus,
   VoiceConversationClearContextResult,
   VoiceConversationClearContextInput,
   VoiceConversationCreateInput,
@@ -866,7 +868,7 @@ export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
   .add(
     HttpApiEndpoint.get("credentialStatus", "/api/voice/credentials", {
       headers: OptionalBearerHeaders,
-      success: VoiceCredentialStatus,
+      success: VoiceCredentialsStatus,
       error: EnvironmentScopedOperationErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )
@@ -879,8 +881,9 @@ export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
-    HttpApiEndpoint.delete("clearCredential", "/api/voice/credentials", {
+    HttpApiEndpoint.delete("clearCredential", "/api/voice/credentials/:providerId", {
       headers: OptionalBearerHeaders,
+      params: Schema.Struct({ providerId: VoiceCredentialProviderId }),
       success: VoiceCredentialStatus,
       error: EnvironmentScopedOperationErrors,
     }).middleware(EnvironmentAuthenticatedAuth),

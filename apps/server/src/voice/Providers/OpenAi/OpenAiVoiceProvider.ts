@@ -1,4 +1,4 @@
-import type { VoiceTerminalAction, VoiceTranscriptionStreamEvent } from "@t3tools/contracts";
+import type { VoiceTerminalAction } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -13,7 +13,6 @@ import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
-import * as Sse from "effect/unstable/encoding/Sse";
 import {
   HttpBody,
   HttpClient,
@@ -32,6 +31,13 @@ import type {
   Transcriber,
   VoiceProviderAdapter,
 } from "../../Services/VoiceProvider.ts";
+import {
+  logOpenAiCompatibleHttpFailure,
+  mapOpenAiCompatibleHttpFailure,
+  mapTranscriptionSseToVoiceEvents,
+  requireCompatiblePcmResponse,
+  requireOkHttpResponse,
+} from "../openaiCompatible/http.ts";
 import {
   OpenAiRealtimeSocket,
   OpenAiRealtimeSocketLive,
@@ -67,20 +73,6 @@ export class OpenAiVoiceProvider extends Context.Service<
   OpenAiVoiceProvider,
   VoiceProviderAdapter
 >()("t3/voice/Providers/OpenAi/OpenAiVoiceProvider") {}
-
-const OpenAiTranscriptionEvent = Schema.Union([
-  Schema.Struct({
-    type: Schema.Literal("transcript.text.delta"),
-    delta: Schema.String,
-  }),
-  Schema.Struct({
-    type: Schema.Literal("transcript.text.done"),
-    text: Schema.String,
-  }),
-]);
-const decodeOpenAiTranscriptionEvent = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(OpenAiTranscriptionEvent),
-);
 
 const REALTIME_TOOLS = [
   {
@@ -369,13 +361,7 @@ const providerError = (operation: string) => (cause: unknown) =>
   });
 
 const logHttpFailure = (operation: string, cause: unknown) =>
-  Effect.logWarning("OpenAI voice HTTP request failed", {
-    operation,
-    failureType: HttpClientError.isHttpClientError(cause) ? cause.reason._tag : "unknown",
-    ...(HttpClientError.isHttpClientError(cause) && cause.response !== undefined
-      ? { status: cause.response.status }
-      : {}),
-  });
+  logOpenAiCompatibleHttpFailure(operation, cause);
 
 const isTransientNegotiationFailure = (cause: unknown): boolean =>
   Cause.isTimeoutError(cause) ||
@@ -764,7 +750,7 @@ const parseReplayServerEvent = (
 };
 
 const requireApiKey = (credentials: VoiceCredentialStore["Service"]) =>
-  credentials.getOpenAiApiKey.pipe(
+  credentials.get("openai").pipe(
     Effect.flatMap(
       Option.match({
         onNone: () =>
@@ -806,76 +792,55 @@ const make = Effect.gen(function* () {
             HttpClientRequest.setHeader("accept", "text/event-stream"),
             HttpClientRequest.setBody(HttpBody.formData(data)),
           );
-          const response = client
-            .execute(request)
-            .pipe(Effect.flatMap(HttpClientResponse.filterStatusOk));
-          return HttpClientResponse.stream(response).pipe(
-            Stream.decodeText,
-            Stream.pipeThroughChannel(Sse.decode()),
-            Stream.filter(({ data }) => data !== "[DONE]"),
-            Stream.mapEffect(({ data }) => decodeOpenAiTranscriptionEvent(data)),
-            Stream.map(
-              (data): VoiceTranscriptionStreamEvent =>
-                data.type === "transcript.text.delta"
-                  ? {
-                      type: "delta",
-                      requestId: input.requestId,
-                      text: data.delta,
-                    }
-                  : {
-                      type: "final",
-                      result: {
-                        requestId: input.requestId,
-                        text: data.text,
-                        ...(input.language === undefined ? {} : { language: input.language }),
-                      },
-                    },
-            ),
-            Stream.filter(
-              (event) =>
-                event.type === "final" || (event.type === "delta" && event.text.length > 0),
-            ),
-            Stream.mapError(providerError("openai.transcribe")),
+          const response = yield* client.execute(request).pipe(
+            Effect.tapError((cause) => logHttpFailure("openai.transcribe", cause)),
+            Effect.mapError(mapOpenAiCompatibleHttpFailure("openai.transcribe")),
+          );
+          yield* requireOkHttpResponse(response, "openai.transcribe");
+          return mapTranscriptionSseToVoiceEvents(
+            response,
+            input.requestId,
+            input.language,
+            "openai.transcribe",
           );
         }),
       ),
   };
 
   const speechSynthesizer: SpeechSynthesizer = {
-    synthesize: (input) =>
-      Stream.unwrap(
-        Effect.gen(function* () {
-          const apiKey = yield* requireApiKey(credentials);
-          const voice = VOICE_PRESETS[input.preset];
-          if (voice === undefined) {
-            return yield* new VoiceError({
-              reason: "unsupported-media",
-              operation: "openai.synthesize",
-              detail: `Unknown server voice preset: ${input.preset}`,
-              retryable: false,
-            });
-          }
-          const request = yield* HttpClientRequest.post(
-            `${OPENAI_API_ORIGIN}/v1/audio/speech`,
-          ).pipe(
-            HttpClientRequest.bearerToken(apiKey),
-            HttpClientRequest.setHeader("accept", "audio/pcm"),
-            HttpClientRequest.bodyJson({
-              model: SPEECH_MODEL,
-              voice,
-              input: input.text,
-              response_format: "pcm",
-            }),
-            Effect.mapError(providerError("openai.synthesize.request")),
-          );
-          return HttpClientResponse.stream(
-            client.execute(request).pipe(Effect.flatMap(HttpClientResponse.filterStatusOk)),
-          ).pipe(
-            Stream.tapError((cause) => logHttpFailure("openai.synthesize", cause)),
-            Stream.mapError(providerError("openai.synthesize")),
-          );
-        }),
-      ),
+    prepare: (input) =>
+      Effect.gen(function* () {
+        const apiKey = yield* requireApiKey(credentials);
+        const voice = VOICE_PRESETS[input.preset];
+        if (voice === undefined) {
+          return yield* new VoiceError({
+            reason: "unsupported-media",
+            operation: "openai.synthesize",
+            detail: `Unknown server voice preset: ${input.preset}`,
+            retryable: false,
+          });
+        }
+        const request = yield* HttpClientRequest.post(`${OPENAI_API_ORIGIN}/v1/audio/speech`).pipe(
+          HttpClientRequest.bearerToken(apiKey),
+          HttpClientRequest.setHeader("accept", "audio/pcm"),
+          HttpClientRequest.bodyJson({
+            model: SPEECH_MODEL,
+            voice,
+            input: input.text,
+            response_format: "pcm",
+          }),
+          Effect.mapError(providerError("openai.synthesize.request")),
+        );
+        const response = yield* client.execute(request).pipe(
+          Effect.tapError((cause) => logHttpFailure("openai.synthesize", cause)),
+          Effect.mapError(mapOpenAiCompatibleHttpFailure("openai.synthesize")),
+        );
+        yield* requireCompatiblePcmResponse(response, "openai.synthesize");
+        return response.stream.pipe(
+          Stream.tapError((cause) => logHttpFailure("openai.synthesize", cause)),
+          Stream.mapError(mapOpenAiCompatibleHttpFailure("openai.synthesize")),
+        );
+      }),
   };
 
   const realtime: RealtimeVoiceProvider = {

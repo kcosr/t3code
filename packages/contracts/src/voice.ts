@@ -67,14 +67,24 @@ export const VoiceCapabilities = Schema.Struct({
 });
 export type VoiceCapabilities = typeof VoiceCapabilities.Type;
 
+export const VoiceCredentialProviderId = Schema.Literals(["openai", "openai-speech-server"]);
+export type VoiceCredentialProviderId = typeof VoiceCredentialProviderId.Type;
+
 export const VoiceCredentialStatus = Schema.Struct({
+  providerId: VoiceCredentialProviderId,
   configured: Schema.Boolean,
   updatedAt: Schema.NullOr(IsoDateTime),
 });
 export type VoiceCredentialStatus = typeof VoiceCredentialStatus.Type;
 
+export const VoiceCredentialsStatus = Schema.Struct({
+  credentials: Schema.Array(VoiceCredentialStatus),
+});
+export type VoiceCredentialsStatus = typeof VoiceCredentialsStatus.Type;
+
 export const VoiceCredentialSetInput = Schema.Struct({
-  apiKey: TrimmedNonEmptyString,
+  providerId: VoiceCredentialProviderId,
+  token: TrimmedNonEmptyString,
 });
 export type VoiceCredentialSetInput = typeof VoiceCredentialSetInput.Type;
 

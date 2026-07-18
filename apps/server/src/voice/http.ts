@@ -14,6 +14,7 @@ import * as Multipart from "effect/unstable/http/Multipart";
 
 import { authenticateRawRouteWithScope } from "../auth/http.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
+import { VoiceError } from "./Errors.ts";
 import { VoiceMediaTicketRegistry } from "./Services/VoiceMediaTicketRegistry.ts";
 import { inspectVoiceMp4 } from "./Services/VoiceMp4Inspector.ts";
 import { observeVoiceMediaStream } from "./Services/VoiceObservability.ts";
@@ -115,6 +116,23 @@ const voiceMediaPolicyErrorResponse = (error: VoiceMediaPolicyError) =>
       { status: error.reason === "quota-exceeded" ? 429 : 400 },
     ),
   );
+
+const voiceErrorResponse = (error: VoiceError) => {
+  const status =
+    error.reason === "quota-exceeded"
+      ? 429
+      : error.reason === "payload-too-large" || error.reason === "unsupported-media"
+        ? 400
+        : error.reason === "not-configured" || error.reason === "disabled"
+          ? 503
+          : 503;
+  return Effect.succeed(
+    HttpServerResponse.jsonUnsafe(
+      { code: error.reason, message: error.detail, retryable: error.retryable },
+      { status },
+    ),
+  );
+};
 
 const authenticateVoiceMedia = (operation: "transcription-upload" | "speech-stream") =>
   Effect.gen(function* () {
@@ -256,8 +274,11 @@ const transcriptionRoute = HttpRouter.add(
       }).pipe(Effect.onError(() => permit.release));
     });
   }).pipe(
-    Effect.catchTag("VoiceMediaRequestError", voiceMediaRequestErrorResponse),
-    Effect.catchTag("VoiceMediaPolicyError", voiceMediaPolicyErrorResponse),
+    Effect.catchTags({
+      VoiceMediaRequestError: voiceMediaRequestErrorResponse,
+      VoiceMediaPolicyError: voiceMediaPolicyErrorResponse,
+      VoiceError: voiceErrorResponse,
+    }),
   ),
 );
 
@@ -307,8 +328,9 @@ const speechRoute = HttpRouter.add(
       return yield* invalidRequest("Selected voice provider has no speech synthesizer");
     }
     const permit = yield* mediaRequestLimiter.acquire(settings.maxConcurrentMediaRequests);
-    return yield* Effect.sync(() => {
-      const providerStream = synthesizer.synthesize({
+    return yield* Effect.gen(function* () {
+      // Validate upstream status and PCM headers before committing the T3 response.
+      const providerStream = yield* synthesizer.prepare({
         requestId: input.requestId,
         playbackId: input.playbackId,
         segmentIndex: input.segmentIndex,
@@ -340,8 +362,11 @@ const speechRoute = HttpRouter.add(
       });
     }).pipe(Effect.onError(() => permit.release));
   }).pipe(
-    Effect.catchTag("VoiceMediaRequestError", voiceMediaRequestErrorResponse),
-    Effect.catchTag("VoiceMediaPolicyError", voiceMediaPolicyErrorResponse),
+    Effect.catchTags({
+      VoiceMediaRequestError: voiceMediaRequestErrorResponse,
+      VoiceMediaPolicyError: voiceMediaPolicyErrorResponse,
+      VoiceError: voiceErrorResponse,
+    }),
   ),
 );
 

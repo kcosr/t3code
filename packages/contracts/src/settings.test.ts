@@ -99,6 +99,48 @@ describe("ServerSettings.voice", () => {
       maxConcurrentMediaRequests: 4,
       maxConcurrentSessions: 1,
       contextTokenBudget: 16_000,
+      providers: {
+        transcription: "openai",
+        speech: "openai",
+      },
+      openaiSpeechServer: {
+        baseUrl: "",
+        connectTimeoutSeconds: 15,
+        speechPresets: {
+          default: { voice: "default", speed: 1 },
+          warm: { voice: "af_sky", speed: 1 },
+        },
+      },
+    });
+  });
+
+  it("accepts independent non-Realtime provider selection and speech-server config", () => {
+    const decoded = decodeServerSettings({
+      voice: {
+        providers: {
+          transcription: "openai-speech-server",
+          speech: "openai",
+        },
+        openaiSpeechServer: {
+          baseUrl: "http://192.168.50.72:6624",
+          connectTimeoutSeconds: 20,
+          speechPresets: {
+            warm: { voice: "af_bella", speed: 1.1 },
+          },
+        },
+      },
+    });
+    expect(decoded.voice.providers).toEqual({
+      transcription: "openai-speech-server",
+      speech: "openai",
+    });
+    expect(decoded.voice.openaiSpeechServer).toEqual({
+      baseUrl: "http://192.168.50.72:6624",
+      connectTimeoutSeconds: 20,
+      speechPresets: {
+        default: { voice: "default", speed: 1 },
+        warm: { voice: "af_bella", speed: 1.1 },
+      },
     });
   });
 
@@ -121,6 +163,16 @@ describe("ServerSettings.voice", () => {
     expect(() =>
       Schema.decodeUnknownSync(ServerSettings)({
         voice: { maxSpeechOutputBytes: 64 * 1024 * 1024 + 1 },
+      }),
+    ).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(ServerSettings)({
+        voice: { providers: { transcription: "pi" } },
+      }),
+    ).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(ServerSettings)({
+        voice: { openaiSpeechServer: { connectTimeoutSeconds: 0 } },
       }),
     ).toThrow();
   });
