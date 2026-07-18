@@ -329,20 +329,22 @@ internal class T3VoiceThreadSessionLifecycleTest {
   fun `Ready completion after stop does not open the recorder`() {
     val media = LifecycleMedia()
     val arming = DeferredCueArming()
+    val quiesced = CountDownLatch(1)
     val voice =
       session(
         generation = 1,
         media = media,
         api = LifecycleApi(),
         emit = {},
-        onQuiesced = {},
+        onQuiesced = { quiesced.countDown() },
         cueArming = arming,
       )
 
     voice.start()
     assertEquals(1, arming.readyRequests.get())
+    // stop() cancels the pending Ready (CANCELLED completion); session is inactive so openRecorder is skipped.
     voice.stop(reportStopped = true)
-    arming.complete(T3VoiceCueOutcome.DRAINED)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
     assertFalse(media.recordingStarted.await(150, TimeUnit.MILLISECONDS))
   }
 
