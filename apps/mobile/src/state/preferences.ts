@@ -114,7 +114,18 @@ export function createMobilePreferencesState(runtime: Atom.AtomRuntime<MobilePre
     )
     .pipe(Atom.keepAlive, Atom.withLabel("mobile:preferences:update"));
 
-  return { preferencesAtom, updatePreferencesAtom } as const;
+  const acceptPersistedPreferencesAtom = runtime
+    .fn((patch: Partial<Preferences>, get) =>
+      Effect.sync(() => {
+        get.set(confirmedPreferencesAtom, {
+          ...get(confirmedPreferencesAtom),
+          ...patch,
+        });
+      }),
+    )
+    .pipe(Atom.keepAlive, Atom.withLabel("mobile:preferences:accept-persisted"));
+
+  return { acceptPersistedPreferencesAtom, preferencesAtom, updatePreferencesAtom } as const;
 }
 
 const mobilePreferencesRuntime = Atom.runtime(Runtime.runtimeContextLayer);
@@ -122,3 +133,5 @@ export const mobilePreferencesState = createMobilePreferencesState(mobilePrefere
 
 export const mobilePreferencesAtom = mobilePreferencesState.preferencesAtom;
 export const updateMobilePreferencesAtom = mobilePreferencesState.updatePreferencesAtom;
+export const acceptPersistedMobilePreferencesAtom =
+  mobilePreferencesState.acceptPersistedPreferencesAtom;

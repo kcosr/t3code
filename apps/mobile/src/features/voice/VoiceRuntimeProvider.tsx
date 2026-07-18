@@ -33,7 +33,7 @@ import {
   type VoiceRuntimeSnapshot,
 } from "@t3tools/client-runtime/voice";
 import {
-  type EnvironmentId,
+  EnvironmentId,
   type ThreadId,
   type VoiceConversationId,
   type VoiceConversationSelection,
@@ -58,8 +58,11 @@ import { Alert, AppState, View } from "react-native";
 
 import { useThreadShells } from "../../state/entities";
 import { scopedThreadKey } from "../../lib/scopedEntities";
-import { mobilePreferencesAtom } from "../../state/preferences";
-import { updateMobilePreferencesAtom } from "../../state/preferences";
+import {
+  acceptPersistedMobilePreferencesAtom,
+  mobilePreferencesAtom,
+  updateMobilePreferencesAtom,
+} from "../../state/preferences";
 import { savePreferencesPatch } from "../../persistence/imperative";
 import { usePreparedConnection } from "../../state/session";
 import {
@@ -68,8 +71,12 @@ import {
 } from "../../state/use-composer-drafts";
 import { makeAndroidVoiceRuntimeAdapter } from "./androidVoiceRuntimeAdapter";
 import {
-  disableAndroidVoiceReadiness,
-  provisionAndroidVoiceReadiness,
+  acceptEnabledAndroidVoiceReadiness,
+  androidVoiceReadinessIdentity,
+  AndroidVoiceReadinessCoordinator,
+  AndroidVoiceReadinessDependencyUnavailable,
+  persistAndroidVoiceReadinessSetting,
+  reconcileAndroidVoiceReadinessDisable,
   type AndroidVoiceReadinessTarget,
 } from "./androidVoiceReadiness";
 import { ExclusiveTransition } from "./exclusiveTransition";
@@ -99,6 +106,11 @@ interface VoiceConversationConnection {
   readonly client: VoiceHttpClient;
 }
 
+interface ReadinessClientConnection {
+  readonly prepared: PreparedConnection;
+  readonly client: VoiceHttpClient;
+}
+
 interface VoiceRuntimeContextValue {
   readonly snapshot: VoiceRuntimeSnapshot;
   readonly controlsAvailable: boolean;
@@ -123,6 +135,9 @@ interface VoiceRuntimeContextValue {
     interrupt: () => void | (() => void) | Promise<void | (() => void)>,
   ) => () => void;
   readonly readinessSnapshot: T3VoiceReadinessSnapshot;
+  readonly backgroundControlsEnabled: boolean;
+  readonly readinessPending: boolean;
+  readonly rememberedThreadStatus: "available" | "disconnected" | "unavailable" | "none";
   readonly setBackgroundControlsEnabled: (enabled: boolean) => Promise<void>;
 }
 
@@ -152,12 +167,18 @@ export function VoiceRuntimeProvider(props: {
   const audioRoutePreference = useVoiceAudioRoutePreferenceController(native);
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
+  const acceptPersistedPreferences = useAtomSet(acceptPersistedMobilePreferencesAtom);
   const threadShells = useThreadShells();
   const [snapshot, setSnapshot] = useState<VoiceRuntimeSnapshot>(INITIAL_SNAPSHOT);
   const [readinessSnapshot, setReadinessSnapshot] = useState<T3VoiceReadinessSnapshot>(
     INITIAL_READINESS_SNAPSHOT,
   );
   const [readinessReconciled, setReadinessReconciled] = useState(false);
+  const [backgroundControlsOverride, setBackgroundControlsOverride] = useState<boolean | null>(
+    null,
+  );
+  const [readinessPending, setReadinessPending] = useState(false);
+  const [readinessDisableReconciling, setReadinessDisableReconciling] = useState(false);
   const [applicationState, setApplicationState] = useState(AppState.currentState);
   const [runtimeEnvironmentId, setRuntimeEnvironmentId] = useState<EnvironmentId | null>(null);
   const [conversationConnection, setConversationConnection] =
@@ -184,6 +205,9 @@ export function VoiceRuntimeProvider(props: {
     new Set<() => void | (() => void) | Promise<void | (() => void)>>(),
   );
   const readinessGenerationRef = useRef(0);
+  const readinessPendingCountRef = useRef(0);
+  const readinessReadyIdentityRef = useRef<string | null>(null);
+  const pendingDisableReconciliationRef = useRef<Promise<void> | null>(null);
 
   const storedPreferences = Option.getOrNull(AsyncResult.value(preferencesResult));
   const preferencesReady = AsyncResult.isSuccess(preferencesResult);
@@ -192,33 +216,13 @@ export function VoiceRuntimeProvider(props: {
     [storedPreferences],
   );
   const playThreadResponses = storedPreferences?.threadSpeechEnabled === true;
+  const backgroundControlsEnabled =
+    backgroundControlsOverride ?? storedPreferences?.voiceBackgroundControlsEnabled === true;
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", setApplicationState);
     return () => subscription.remove();
   }, []);
-
-  useEffect(() => {
-    const focus = props.focus;
-    if (focus === null) return;
-    const current = storedPreferences?.voiceBackgroundThreadTarget;
-    if (
-      current?.environmentId === String(focus.environmentId) &&
-      current.projectId === String(focus.projectId) &&
-      current.threadId === String(focus.threadId) &&
-      current.title === focus.threadTitle
-    ) {
-      return;
-    }
-    savePreferences({
-      voiceBackgroundThreadTarget: {
-        environmentId: String(focus.environmentId),
-        projectId: String(focus.projectId),
-        threadId: String(focus.threadId),
-        title: focus.threadTitle,
-      },
-    });
-  }, [props.focus, savePreferences, storedPreferences?.voiceBackgroundThreadTarget]);
 
   const composerDraftsReady = useComposerDraftsReady();
 
@@ -266,6 +270,11 @@ export function VoiceRuntimeProvider(props: {
   const conversationClient: VoiceHttpClient | null = browserConnection?.client ?? null;
 
   const rememberedThread = storedPreferences?.voiceBackgroundThreadTarget;
+  const rememberedEnvironmentId =
+    rememberedThread === null || rememberedThread === undefined
+      ? null
+      : EnvironmentId.make(rememberedThread.environmentId);
+  const rememberedPrepared = Option.getOrNull(usePreparedConnection(rememberedEnvironmentId));
   const rememberedThreadShell =
     rememberedThread === null || rememberedThread === undefined
       ? null
@@ -276,31 +285,6 @@ export function VoiceRuntimeProvider(props: {
             String(thread.id) === rememberedThread.threadId &&
             thread.archivedAt === null,
         ) ?? null);
-  const rememberedThreadStart = useMemo(
-    () =>
-      rememberedThreadShell === null
-        ? null
-        : threadVoiceStartForFocus(
-            {
-              environmentId: rememberedThreadShell.environmentId,
-              projectId: rememberedThreadShell.projectId,
-              threadId: rememberedThreadShell.id,
-              threadTitle: rememberedThreadShell.title,
-              modelSelection: rememberedThreadShell.modelSelection,
-              runtimeMode: rememberedThreadShell.runtimeMode,
-              interactionMode: rememberedThreadShell.interactionMode ?? "default",
-              interactionRequired:
-                rememberedThreadShell.hasPendingApprovals === true ||
-                rememberedThreadShell.hasPendingUserInput === true,
-              activeThreadBusy:
-                rememberedThreadShell.session?.status === "starting" ||
-                rememberedThreadShell.session?.status === "running",
-            },
-            voicePreferences,
-            playThreadResponses,
-          ),
-    [playThreadResponses, rememberedThreadShell, voicePreferences],
-  );
 
   useEffect(
     () => () => {
@@ -399,6 +383,74 @@ export function VoiceRuntimeProvider(props: {
         : null,
     [canSwitchRealtimeToThread, playThreadResponses, visibleFocus, voicePreferences],
   );
+  useEffect(() => {
+    const focus = props.focus;
+    if (focus === null || threadStart === null) return;
+    const current = storedPreferences?.voiceBackgroundThreadTarget;
+    if (
+      current?.environmentId === String(focus.environmentId) &&
+      current.projectId === String(focus.projectId) &&
+      current.threadId === String(focus.threadId) &&
+      current.title === focus.threadTitle
+    ) {
+      return;
+    }
+    savePreferences({
+      voiceBackgroundThreadTarget: {
+        environmentId: String(focus.environmentId),
+        projectId: String(focus.projectId),
+        threadId: String(focus.threadId),
+        title: focus.threadTitle,
+      },
+    });
+  }, [props.focus, savePreferences, storedPreferences?.voiceBackgroundThreadTarget, threadStart]);
+  const rememberedDraftKey =
+    rememberedThreadShell === null
+      ? null
+      : scopedThreadKey(rememberedThreadShell.environmentId, rememberedThreadShell.id);
+  const rememberedDraftEmpty = useComposerDraftContentEmpty(rememberedDraftKey);
+  const rememberedThreadStart = useMemo(() => {
+    if (rememberedThreadShell === null) return null;
+    const interactionRequired =
+      rememberedThreadShell.hasPendingApprovals === true ||
+      rememberedThreadShell.hasPendingUserInput === true;
+    const activeThreadBusy =
+      rememberedThreadShell.session?.status === "starting" ||
+      rememberedThreadShell.session?.status === "running";
+    if (
+      !canStartThreadVoiceFromComposer({
+        preferencesReady,
+        composerDraftsReady,
+        composerContentEmpty: rememberedDraftEmpty,
+        interactionRequired,
+        activeThreadBusy,
+      })
+    ) {
+      return null;
+    }
+    return threadVoiceStartForFocus(
+      {
+        environmentId: rememberedThreadShell.environmentId,
+        projectId: rememberedThreadShell.projectId,
+        threadId: rememberedThreadShell.id,
+        threadTitle: rememberedThreadShell.title,
+        modelSelection: rememberedThreadShell.modelSelection,
+        runtimeMode: rememberedThreadShell.runtimeMode,
+        interactionMode: rememberedThreadShell.interactionMode ?? "default",
+        interactionRequired,
+        activeThreadBusy,
+      },
+      voicePreferences,
+      playThreadResponses,
+    );
+  }, [
+    composerDraftsReady,
+    playThreadResponses,
+    preferencesReady,
+    rememberedDraftEmpty,
+    rememberedThreadShell,
+    voicePreferences,
+  ]);
   const realtimeContext = useMemo<VoiceRealtimeContext>(
     () => ({
       focus:
@@ -411,111 +463,242 @@ export function VoiceRuntimeProvider(props: {
     }),
     [playThreadResponses, preferencesReady, visibleFocus, voicePreferences],
   );
+  const backgroundMode = storedPreferences?.voiceBackgroundDefaultMode ?? "realtime";
+  const readinessPrepared = backgroundMode === "thread" ? rememberedPrepared : prepared;
+  const [readinessClientConnection, setReadinessClientConnection] =
+    useState<ReadinessClientConnection | null>(null);
+  useEffect(() => {
+    let disposed = false;
+    setReadinessClientConnection(null);
+    if (readinessPrepared === null) return;
+    void makeMobileVoiceClient(readinessPrepared)
+      .then((client) => {
+        if (!disposed) setReadinessClientConnection({ prepared: readinessPrepared, client });
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+    };
+  }, [readinessPrepared]);
+  const readinessClient =
+    readinessClientConnection?.prepared === readinessPrepared
+      ? readinessClientConnection.client
+      : null;
+  const rememberedThreadStatus: VoiceRuntimeContextValue["rememberedThreadStatus"] =
+    rememberedThread === null || rememberedThread === undefined
+      ? "none"
+      : rememberedPrepared === null ||
+          (readinessPrepared === rememberedPrepared && readinessClient === null)
+        ? "disconnected"
+        : rememberedThreadStart === null
+          ? "unavailable"
+          : "available";
   const readinessTarget = useMemo<AndroidVoiceReadinessTarget | null>(() => {
-    if (controllerEnvironmentId === null) return null;
-    const mode = storedPreferences?.voiceBackgroundDefaultMode ?? "realtime";
-    if (mode === "thread") {
+    if (backgroundMode === "thread") {
       return {
         mode: "thread",
         label: rememberedThread?.title ?? "Active Thread",
-        target: rememberedThreadStart,
+        target:
+          rememberedThreadStatus === "available" && readinessClient !== null
+            ? rememberedThreadStart
+            : null,
       };
     }
+    if (controllerEnvironmentId === null) return null;
     return {
       mode: "realtime",
       label: "Realtime",
-      target: {
-        environmentId: controllerEnvironmentId,
-        ...realtimeContext,
-      },
+      target: { environmentId: controllerEnvironmentId, ...realtimeContext },
     };
   }, [
+    backgroundMode,
     controllerEnvironmentId,
+    readinessClient,
     realtimeContext,
     rememberedThread?.title,
     rememberedThreadStart,
-    storedPreferences?.voiceBackgroundDefaultMode,
+    rememberedThreadStatus,
   ]);
-
-  const provisionReadiness = useCallback(
-    async (signal: AbortSignal) => {
-      if (
-        native === null ||
-        prepared === null ||
-        conversationClient === null ||
-        readinessTarget === null
-      ) {
-        throw new Error("Open a connected environment to prepare background voice controls");
-      }
-      const next = await provisionAndroidVoiceReadiness({
-        native,
-        prepared,
-        client: conversationClient,
-        target: readinessTarget,
-        threadSwitch: rememberedThreadStart,
-        signal,
-      });
-      readinessGenerationRef.current = next.generation;
-      setReadinessSnapshot(next);
-      return next;
-    },
-    [conversationClient, native, prepared, readinessTarget, rememberedThreadStart],
+  const preparedThreadSwitch =
+    backgroundMode === "realtime" &&
+    rememberedThreadStart?.target.environmentId === controllerEnvironmentId
+      ? rememberedThreadStart
+      : null;
+  const readinessRequest = useMemo(
+    () =>
+      readinessTarget === null
+        ? null
+        : {
+            identity: androidVoiceReadinessIdentity(readinessTarget, preparedThreadSwitch),
+            prepared: readinessPrepared,
+            client: readinessClient,
+            target: readinessTarget,
+            threadSwitch: preparedThreadSwitch,
+          },
+    [preparedThreadSwitch, readinessClient, readinessPrepared, readinessTarget],
   );
+  const acceptReadinessSnapshot = useCallback((next: T3VoiceReadinessSnapshot) => {
+    if (next.generation < readinessGenerationRef.current) return;
+    readinessGenerationRef.current = next.generation;
+    setReadinessSnapshot(next);
+  }, []);
+  const readinessCoordinator = useMemo(
+    () =>
+      native === null
+        ? null
+        : new AndroidVoiceReadinessCoordinator(native, acceptReadinessSnapshot),
+    [acceptReadinessSnapshot, native],
+  );
+  useEffect(() => () => readinessCoordinator?.dispose(), [readinessCoordinator]);
+  const trackReadiness = useCallback(async <A,>(work: () => Promise<A>): Promise<A> => {
+    readinessPendingCountRef.current += 1;
+    setReadinessPending(true);
+    try {
+      return await work();
+    } finally {
+      readinessPendingCountRef.current -= 1;
+      if (readinessPendingCountRef.current === 0) setReadinessPending(false);
+    }
+  }, []);
+  const provisionReadiness = useCallback(async () => {
+    if (readinessCoordinator === null) {
+      throw new AndroidVoiceReadinessDependencyUnavailable(
+        "Open a connected environment to prepare background voice controls",
+      );
+    }
+    if (readinessRequest === null) {
+      await trackReadiness(() => readinessCoordinator.disable());
+      throw new AndroidVoiceReadinessDependencyUnavailable(
+        "Open a connected environment to prepare background voice controls",
+      );
+    }
+    return trackReadiness(async () => {
+      const result = await readinessCoordinator.request(readinessRequest);
+      if (result?.posture === "ready")
+        readinessReadyIdentityRef.current = readinessRequest.identity;
+      return result;
+    });
+  }, [readinessCoordinator, readinessRequest, trackReadiness]);
 
   const setBackgroundControlsEnabled = useCallback(
     async (enabled: boolean) => {
-      if (native === null) throw new Error("This build has no native voice runtime");
-      if (!enabled) {
-        const disabled = await disableAndroidVoiceReadiness(native);
-        readinessGenerationRef.current = disabled.generation;
-        setReadinessSnapshot(disabled);
-        savePreferences({ voiceBackgroundControlsEnabled: false });
-        return;
+      if (native === null || readinessCoordinator === null) {
+        throw new Error("This build has no native voice runtime");
       }
-      const microphone = await native.requestMicrophonePermissionAsync();
-      if (!microphone.granted) {
-        throw new Error("Background voice controls need microphone access");
-      }
-      const controller = new AbortController();
-      const readySnapshot = await provisionReadiness(controller.signal);
-      if (readySnapshot.posture !== "ready") {
-        throw new Error(
-          readySnapshot.posture === "unavailable"
-            ? "The selected Active Thread is unavailable"
-            : "Voice controls need to be refreshed",
+      await pendingDisableReconciliationRef.current;
+      await trackReadiness(async () => {
+        if (!enabled) {
+          await readinessCoordinator.disable();
+          readinessReadyIdentityRef.current = null;
+          await persistAndroidVoiceReadinessSetting(
+            false,
+            async (value) => {
+              await savePreferencesPatch({ voiceBackgroundControlsEnabled: value });
+            },
+            async () => {
+              if (readinessRequest === null) return;
+              const restored = await readinessCoordinator.request(readinessRequest);
+              if (restored?.posture === "ready") {
+                readinessReadyIdentityRef.current = readinessRequest.identity;
+              }
+            },
+          );
+          setBackgroundControlsOverride(false);
+          acceptPersistedPreferences({ voiceBackgroundControlsEnabled: false });
+          return;
+        }
+        const microphone = await native.requestMicrophonePermissionAsync();
+        if (!microphone.granted) {
+          throw new Error("Background voice controls need microphone access");
+        }
+        if (readinessRequest === null) {
+          throw new AndroidVoiceReadinessDependencyUnavailable(
+            "Open a connected environment to prepare background voice controls",
+          );
+        }
+        let readySnapshot: T3VoiceReadinessSnapshot | null;
+        try {
+          readySnapshot = await readinessCoordinator.request(readinessRequest);
+        } catch (cause) {
+          await readinessCoordinator.disable();
+          throw cause;
+        }
+        readySnapshot = await acceptEnabledAndroidVoiceReadiness(
+          readySnapshot,
+          readinessRequest.target.mode,
+          () => readinessCoordinator.disable(),
         );
-      }
-      savePreferences({ voiceBackgroundControlsEnabled: true });
+        readinessReadyIdentityRef.current = readinessRequest.identity;
+        await persistAndroidVoiceReadinessSetting(
+          true,
+          async (value) => {
+            await savePreferencesPatch({ voiceBackgroundControlsEnabled: value });
+          },
+          async () => {
+            await readinessCoordinator.disable();
+            readinessReadyIdentityRef.current = null;
+          },
+        );
+        setBackgroundControlsOverride(true);
+        acceptPersistedPreferences({ voiceBackgroundControlsEnabled: true });
+      });
     },
-    [native, provisionReadiness, savePreferences],
+    [acceptPersistedPreferences, native, readinessCoordinator, readinessRequest, trackReadiness],
   );
+
+  const reconcilePendingReadinessDisable = useCallback((): Promise<void> => {
+    if (native === null || readinessCoordinator === null) return Promise.resolve();
+    const existing = pendingDisableReconciliationRef.current;
+    if (existing !== null) return existing;
+    const task = (async () => {
+      setReadinessDisableReconciling(true);
+      await reconcileAndroidVoiceReadinessDisable(
+        native,
+        async () => {
+          await savePreferencesPatch({ voiceBackgroundControlsEnabled: false });
+        },
+        () => {
+          readinessCoordinator.cancelDesired();
+          readinessReadyIdentityRef.current = null;
+          setBackgroundControlsOverride(false);
+          acceptPersistedPreferences({ voiceBackgroundControlsEnabled: false });
+        },
+        () => undefined,
+      );
+    })();
+    pendingDisableReconciliationRef.current = task;
+    void task.then(
+      () => {
+        if (pendingDisableReconciliationRef.current === task) {
+          pendingDisableReconciliationRef.current = null;
+        }
+        setReadinessDisableReconciling(false);
+      },
+      () => {
+        if (pendingDisableReconciliationRef.current === task) {
+          pendingDisableReconciliationRef.current = null;
+        }
+        setReadinessDisableReconciling(false);
+      },
+    );
+    return task;
+  }, [acceptPersistedPreferences, native, readinessCoordinator]);
 
   useEffect(() => {
     if (native === null) return;
     setReadinessReconciled(false);
     let disposed = false;
     const accept = (next: T3VoiceReadinessSnapshot) => {
-      if (disposed || next.generation < readinessGenerationRef.current) return;
-      readinessGenerationRef.current = next.generation;
-      setReadinessSnapshot(next);
-      if (
-        next.posture === "disabled" &&
-        next.generation > 0 &&
-        storedPreferences?.voiceBackgroundControlsEnabled === true
-      ) {
-        savePreferences({ voiceBackgroundControlsEnabled: false });
+      if (disposed) return;
+      acceptReadinessSnapshot(next);
+      if (next.posture === "disabled") {
+        void reconcilePendingReadinessDisable().catch(() => undefined);
       }
     };
     const subscription = native.addListener("readinessSnapshotChanged", accept);
     void (async () => {
-      const pendingDisable = await native.getPendingReadinessDisableAsync();
+      await reconcilePendingReadinessDisable();
       if (disposed) return;
-      if (pendingDisable !== null) {
-        await savePreferencesPatch({ voiceBackgroundControlsEnabled: false });
-        if (disposed) return;
-        savePreferences({ voiceBackgroundControlsEnabled: false });
-        await native.acknowledgeReadinessDisableAsync({ generation: pendingDisable });
-      }
       accept(await native.getReadinessSnapshotAsync());
       if (!disposed) setReadinessReconciled(true);
     })().catch(() => undefined);
@@ -523,28 +706,35 @@ export function VoiceRuntimeProvider(props: {
       disposed = true;
       subscription.remove();
     };
-  }, [native, savePreferences, storedPreferences?.voiceBackgroundControlsEnabled]);
+  }, [acceptReadinessSnapshot, native, reconcilePendingReadinessDisable]);
 
   useEffect(() => {
     if (
-      storedPreferences?.voiceBackgroundControlsEnabled !== true ||
+      !backgroundControlsEnabled ||
       !readinessReconciled ||
+      readinessDisableReconciling ||
       applicationState !== "active"
     ) {
       return;
     }
-    const controller = new AbortController();
-    void provisionReadiness(controller.signal).catch((cause) => {
-      if (!controller.signal.aborted) {
+    if (
+      readinessSnapshot.posture === "ready" &&
+      readinessReadyIdentityRef.current === readinessRequest?.identity
+    ) {
+      return;
+    }
+    void provisionReadiness().catch((cause) => {
+      if (!(cause instanceof AndroidVoiceReadinessDependencyUnavailable)) {
         Alert.alert("Background voice controls unavailable", errorMessage(cause));
       }
     });
-    return () => controller.abort();
   }, [
     applicationState,
+    backgroundControlsEnabled,
     provisionReadiness,
+    readinessDisableReconciling,
     readinessReconciled,
-    storedPreferences?.voiceBackgroundControlsEnabled,
+    readinessSnapshot.posture,
   ]);
   const threadStartAvailable =
     threadStart !== null && isThreadVoiceStartAvailable(snapshot, prepared !== null);
@@ -1126,13 +1316,20 @@ export function VoiceRuntimeProvider(props: {
       stop,
       registerTraditionalAudioInterruption,
       readinessSnapshot,
+      backgroundControlsEnabled,
+      readinessPending: readinessPending || readinessDisableReconciling,
+      rememberedThreadStatus,
       setBackgroundControlsEnabled,
     }),
     [
       finishThreadRecording,
       controlsAvailable,
       registerTraditionalAudioInterruption,
+      backgroundControlsEnabled,
       readinessSnapshot,
+      readinessDisableReconciling,
+      readinessPending,
+      rememberedThreadStatus,
       setBackgroundControlsEnabled,
       snapshot,
       startThread,

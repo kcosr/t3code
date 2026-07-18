@@ -10,6 +10,10 @@ import * as MobileDatabase from "./mobile-database";
 import * as MobileSecureStorage from "./mobile-secure-storage";
 import { MobileStorageDecodeError, MobileStorageEncodeError } from "./mobile-storage";
 import {
+  sanitizeVoiceBackgroundThreadTarget,
+  type VoiceBackgroundThreadTarget,
+} from "./voiceBackgroundPreferences";
+import {
   clampVoicePreference,
   VOICE_END_SILENCE_MAX_MS,
   VOICE_END_SILENCE_MIN_MS,
@@ -44,12 +48,7 @@ export interface Preferences {
   readonly voiceResponseTimeoutMs?: number;
   readonly voiceBackgroundControlsEnabled?: boolean;
   readonly voiceBackgroundDefaultMode?: "realtime" | "thread";
-  readonly voiceBackgroundThreadTarget?: {
-    readonly environmentId: string;
-    readonly projectId: string;
-    readonly threadId: string;
-    readonly title: string;
-  } | null;
+  readonly voiceBackgroundThreadTarget?: VoiceBackgroundThreadTarget | null;
   readonly baseFontSize?: number;
   readonly terminalFontSize?: number | null;
   readonly markdownFontSize?: number;
@@ -202,19 +201,8 @@ function sanitizePreferences(parsed: Preferences): Preferences {
   if (parsed.voiceBackgroundThreadTarget === null) {
     preferences.voiceBackgroundThreadTarget = null;
   } else {
-    const target = parsed.voiceBackgroundThreadTarget;
-    if (
-      typeof target === "object" &&
-      target !== null &&
-      typeof target.environmentId === "string" &&
-      target.environmentId.length > 0 &&
-      typeof target.projectId === "string" &&
-      target.projectId.length > 0 &&
-      typeof target.threadId === "string" &&
-      target.threadId.length > 0 &&
-      typeof target.title === "string" &&
-      target.title.length > 0
-    ) {
+    const target = sanitizeVoiceBackgroundThreadTarget(parsed.voiceBackgroundThreadTarget);
+    if (target !== null) {
       preferences.voiceBackgroundThreadTarget = target;
     }
   }

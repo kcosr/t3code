@@ -62,6 +62,38 @@ function makePreferencesState(
 }
 
 describe("mobile preferences state", () => {
+  it.effect("accepts an already persisted patch without writing it again", () =>
+    Effect.gen(function* () {
+      const savePatch = vi.fn((patch: Partial<Preferences>) => Effect.succeed(patch));
+      const state = makePreferencesState({
+        load: Effect.succeed({ voiceBackgroundControlsEnabled: false }),
+        savePatch,
+      });
+      const registry = AtomRegistry.make();
+      const unmountPreferences = registry.mount(state.preferencesAtom);
+      const unmountAccept = registry.mount(state.acceptPersistedPreferencesAtom);
+      yield* AtomRegistry.getResult(registry, state.preferencesAtom, { suspendOnWaiting: true });
+
+      registry.set(state.acceptPersistedPreferencesAtom, {
+        voiceBackgroundControlsEnabled: true,
+      });
+
+      yield* Effect.promise(() =>
+        vi.waitFor(() => {
+          expect(Option.getOrThrow(AsyncResult.value(registry.get(state.preferencesAtom)))).toEqual(
+            {
+              voiceBackgroundControlsEnabled: true,
+            },
+          );
+        }),
+      );
+      expect(savePatch).not.toHaveBeenCalled();
+      unmountAccept();
+      unmountPreferences();
+      registry.dispose();
+    }),
+  );
+
   it.effect("shares one preference load across consumers", () =>
     Effect.gen(function* () {
       const load = vi.fn(() => Promise.resolve<Preferences>({ baseFontSize: 17 }));

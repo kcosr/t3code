@@ -48,7 +48,7 @@ export function SettingsVoiceRouteScreen() {
   const noSpeechEnabled = voice.noSpeechTimeoutMs !== null;
   const audioRoutePreference = useVoiceAudioRoutePreference();
   const voiceRuntime = useVoiceRuntime();
-  const backgroundControlsEnabled = stored.voiceBackgroundControlsEnabled === true;
+  const backgroundControlsEnabled = voiceRuntime.backgroundControlsEnabled;
   const backgroundMode = stored.voiceBackgroundDefaultMode ?? "realtime";
   const rememberedThread = stored.voiceBackgroundThreadTarget;
   useFocusEffect(
@@ -129,7 +129,7 @@ export function SettingsVoiceRouteScreen() {
         {Platform.OS === "android" ? (
           <SettingsSection title="Background controls">
             <SettingsSwitchRow
-              disabled={!ready}
+              disabled={!ready || voiceRuntime.readinessPending}
               icon="headphones"
               label="Background voice controls"
               value={backgroundControlsEnabled}
@@ -147,7 +147,7 @@ export function SettingsVoiceRouteScreen() {
               }}
             />
             <SettingsRow
-              disabled={!ready || !backgroundControlsEnabled}
+              disabled={!ready || !backgroundControlsEnabled || voiceRuntime.readinessPending}
               icon="waveform.circle"
               label="Default voice interaction"
               value={backgroundMode === "realtime" ? "Realtime" : "Active Thread"}
@@ -178,16 +178,34 @@ export function SettingsVoiceRouteScreen() {
             />
             <SettingsRow
               disabled
+              icon="text.bubble"
+              label="Remembered Thread"
+              value={
+                rememberedThread === null || rememberedThread === undefined
+                  ? "None"
+                  : voiceRuntime.rememberedThreadStatus === "available"
+                    ? rememberedThread.title
+                    : voiceRuntime.rememberedThreadStatus === "disconnected"
+                      ? `${rememberedThread.title} · Disconnected`
+                      : `${rememberedThread.title} · Unavailable`
+              }
+            />
+            <SettingsRow
+              disabled
               icon="info.circle"
               label="Background status"
               value={
-                voiceRuntime.readinessSnapshot.posture === "ready"
-                  ? `Ready · ${voiceRuntime.readinessSnapshot.label}`
-                  : voiceRuntime.readinessSnapshot.posture === "needs-refresh"
-                    ? "Open T3 to refresh"
-                    : voiceRuntime.readinessSnapshot.posture === "unavailable"
-                      ? "Active Thread unavailable"
-                      : "Disabled"
+                voiceRuntime.readinessPending
+                  ? "Preparing…"
+                  : voiceRuntime.readinessSnapshot.posture === "ready"
+                    ? `Ready · ${voiceRuntime.readinessSnapshot.label}`
+                    : voiceRuntime.readinessSnapshot.posture === "needs-refresh"
+                      ? "Open T3 to refresh"
+                      : voiceRuntime.readinessSnapshot.posture === "unavailable"
+                        ? voiceRuntime.readinessSnapshot.mode === "thread"
+                          ? "Active Thread unavailable"
+                          : "Realtime unavailable"
+                        : "Disabled"
               }
             />
           </SettingsSection>
