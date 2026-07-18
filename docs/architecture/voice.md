@@ -326,7 +326,8 @@ the service, the readiness snapshot:
 - Realtime exposes mute or unmute and stop. When React has explicitly provisioned a complete latest
   Thread target, it also exposes a fenced Thread switch; it never resolves a destination inside the
   background service.
-- Thread exposes finish utterance while recording, submit while reviewing, and stop.
+- Thread exposes finish utterance while recording, submit while reviewing, skip while playing a
+  response, and stop.
 - Transitions expose stop.
 - A failed owner retains a Stop-only foreground notification only while native release remains
   unresolved. Exact cleanup returns the operation controller to Idle, so enabled readiness becomes
@@ -334,9 +335,12 @@ the service, the readiness snapshot:
 
 MediaSession transport controls map to the same native commands. Recognized media-button key-up and
 repeat events are consumed without dispatch; only the initial key-down can act. In Ready, headset
-hook, play, and play/pause start, while pause and stop never start. Background Voice Controls require
-notification permission when enabled; notification permission denial for an already active visible
-operation still reduces drawer visibility without creating a second control path.
+hook, play, and play/pause start, while pause and stop never start. During Thread response playback,
+headset hook, play/pause, and next map to Skip (cancel remaining TTS and complete the cycle: rearm
+when auto-rearm is on, otherwise stop and release). Explicit stop remains a full session teardown.
+Background Voice Controls require notification permission when enabled; notification permission
+denial for an already active visible operation still reduces drawer visibility without creating a
+second control path.
 
 Android owns and persists one global preferred audio route. The always-visible selector in the
 Realtime call bar and the selector in Voice Settings read and write that same native preference.

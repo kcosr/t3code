@@ -190,6 +190,10 @@ internal class T3VoiceNativeRuntimeDriver(
     requireThread(generation).startPlayback()
   }
 
+  override fun cancelThreadPlayback(generation: Long) {
+    requireThread(generation).interruptPlayback()
+  }
+
   override fun scheduleThreadRearm(generation: Long, delayMs: Long) {
     requireThread(generation).scheduleRearm(delayMs)
   }
