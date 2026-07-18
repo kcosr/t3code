@@ -1,6 +1,7 @@
 package expo.modules.t3voice
 
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.util.Base64
@@ -14,6 +15,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 internal interface T3VoicePcmOutput {
   val playbackHeadPosition: Long
+
+  fun setPreferredDevice(device: AudioDeviceInfo): Boolean
 
   fun start()
 
@@ -59,6 +62,7 @@ internal class T3VoicePcmPlayer(
   private val onChunkConsumed: (String, Int) -> Unit,
   private val onFinished: (String) -> Unit,
   private val onError: (String, Throwable) -> Unit,
+  private val preferredOutputDevice: () -> AudioDeviceInfo? = { null },
   private val outputFactory: T3VoicePcmOutputFactory = AndroidPcmOutputFactory,
   private val clock: T3VoicePlaybackClock = AndroidPlaybackClock,
   private val decodePcm: (String) -> ByteArray = ::decodeStrictPcm,
@@ -95,10 +99,15 @@ internal class T3VoicePcmPlayer(
     require(channelCount == 1 || channelCount == 2) { "PCM playback supports one or two channels." }
     synchronized(lock) {
       check(active == null) { "A voice playback is already active." }
+      val output = outputFactory.create(sampleRate, channelCount)
+      preferredOutputDevice()?.let { device ->
+        // Keep TTS usable on Android's system-selected media route if preference routing fails.
+        runCatching { output.setPreferredDevice(device) }
+      }
       val playback =
         ActivePlayback(
           playbackId = playbackId,
-          output = outputFactory.create(sampleRate, channelCount),
+          output = output,
           bytesPerFrame = channelCount * Short.SIZE_BYTES,
           sampleRate = sampleRate,
         )
@@ -467,7 +476,7 @@ internal class T3VoicePcmPlayer(
           .build()
       val attributes =
         AudioAttributes.Builder()
-          .setUsage(AudioAttributes.USAGE_ASSISTANT)
+          .setUsage(AudioAttributes.USAGE_MEDIA)
           .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
           .build()
       val track =
@@ -487,6 +496,9 @@ internal class T3VoicePcmPlayer(
       return object : T3VoicePcmOutput {
         override val playbackHeadPosition: Long
           get() = track.playbackHeadPosition.toLong()
+
+        override fun setPreferredDevice(device: AudioDeviceInfo): Boolean =
+          track.setPreferredDevice(device)
 
         override fun start() = track.play()
 

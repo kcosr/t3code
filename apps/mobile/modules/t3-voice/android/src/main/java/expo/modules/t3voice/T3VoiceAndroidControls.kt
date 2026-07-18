@@ -90,8 +90,10 @@ internal fun transportActionsFor(actions: List<T3VoiceAndroidControlAction>): Lo
         T3VoiceAndroidControlAction.SWITCH_TO_THREAD -> PlaybackState.ACTION_SKIP_TO_NEXT
         T3VoiceAndroidControlAction.SKIP ->
           PlaybackState.ACTION_SKIP_TO_NEXT or
+            PlaybackState.ACTION_PLAY or
             PlaybackState.ACTION_PAUSE or
-            PlaybackState.ACTION_PLAY_PAUSE
+            PlaybackState.ACTION_PLAY_PAUSE or
+            PlaybackState.ACTION_STOP
         T3VoiceAndroidControlAction.STOP -> PlaybackState.ACTION_STOP
         T3VoiceAndroidControlAction.DISABLE -> 0L
       }
@@ -128,6 +130,7 @@ internal class T3VoiceAndroidControls(
         object : MediaSession.Callback() {
           override fun onPlay() {
             dispatchFirst(
+              T3VoiceAndroidControlAction.SKIP,
               T3VoiceAndroidControlAction.START,
               T3VoiceAndroidControlAction.UNMUTE,
               T3VoiceAndroidControlAction.SUBMIT_TRANSCRIPT,
@@ -144,7 +147,10 @@ internal class T3VoiceAndroidControls(
           }
 
           override fun onStop() {
-            dispatchFirst(T3VoiceAndroidControlAction.STOP)
+            dispatchFirst(
+              T3VoiceAndroidControlAction.SKIP,
+              T3VoiceAndroidControlAction.STOP,
+            )
           }
 
           override fun onSkipToNext() {
@@ -175,6 +181,15 @@ internal class T3VoiceAndroidControls(
                 repeatCount = event.repeatCount,
                 available = activeActions(),
               )
+            val presentation =
+              currentPresentation as? T3VoiceAndroidControlsPresentation.Active
+            T3VoiceDiagnostics.record(
+              generation = presentation?.generation ?: 0,
+              category = T3VoiceDiagnosticCategory.STATE,
+              code = T3VoiceDiagnosticCode.MEDIA_BUTTON_RECEIVED,
+              primaryCount = event.keyCode,
+              secondaryCount = decision.action?.ordinal?.plus(1) ?: 0,
+            )
             decision.action?.let { dispatchFirst(it) }
             return decision.consume || super.onMediaButtonEvent(mediaButtonIntent)
           }
@@ -288,7 +303,15 @@ internal class T3VoiceAndroidControls(
   private fun dispatchFirst(vararg ids: T3VoiceAndroidControlAction) {
     val presentation = currentPresentation as? T3VoiceAndroidControlsPresentation.Active ?: return
     ids.firstOrNull(presentation.actions::contains)
-      ?.let { dispatch(it, presentation.owner, presentation.generation) }
+      ?.let {
+        T3VoiceDiagnostics.record(
+          generation = presentation.generation,
+          category = T3VoiceDiagnosticCategory.STATE,
+          code = T3VoiceDiagnosticCode.MEDIA_ACTION_DISPATCHED,
+          primaryCount = it.ordinal + 1,
+        )
+        dispatch(it, presentation.owner, presentation.generation)
+      }
   }
 
   private fun parseActionId(value: String): T3VoiceAndroidControlAction? =

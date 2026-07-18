@@ -88,8 +88,12 @@ class T3VoiceMediaButtonPolicyTest {
       decide(KeyEvent.KEYCODE_MEDIA_PAUSE, available).action,
     )
     assertEquals(
-      T3VoiceAndroidControlAction.STOP,
+      T3VoiceAndroidControlAction.SKIP,
       decide(KeyEvent.KEYCODE_MEDIA_STOP, available).action,
+    )
+    assertEquals(
+      T3VoiceAndroidControlAction.SKIP,
+      decide(KeyEvent.KEYCODE_MEDIA_PLAY, available).action,
     )
   }
 

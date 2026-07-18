@@ -39,6 +39,8 @@ internal enum class T3VoiceDiagnosticCode {
   CUE_CANCELLED,
   CUE_FAILED,
   CUE_TIMED_OUT,
+  MEDIA_BUTTON_RECEIVED,
+  MEDIA_ACTION_DISPATCHED,
 }
 
 internal data class T3VoiceDiagnosticEntry(

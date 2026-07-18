@@ -290,7 +290,7 @@ internal class T3VoiceThreadSession(
           playbackFocusSuspended = false
           mediaOwner = MediaOwner.STARTING_PLAYBACK
         }
-        check(media.acquireAudio()) {
+        check(media.acquirePlaybackAudio()) {
           "Android denied playback audio focus."
         }
         media.startPlayback(id, SPEECH_SAMPLE_RATE, SPEECH_CHANNEL_COUNT)
@@ -483,7 +483,7 @@ internal class T3VoiceThreadSession(
   private fun playEndedAfterCaptureThenReleaseAudio() {
     if (cueArming.isEnabled()) {
       // Recording already held the route; re-acquire is idempotent if still active.
-      val routeHeld = runCatching { media.acquireAudio() }.getOrDefault(false)
+      val routeHeld = runCatching { media.acquireCaptureAudio() }.getOrDefault(false)
       if (routeHeld) {
         T3VoiceCueTiming.awaitEnded(cueArming, generation)
       }
@@ -629,7 +629,7 @@ internal class T3VoiceThreadSession(
         }
         // Establish MODE_IN_COMMUNICATION, focus, and the selected route before Ready. Without a
         // live communication output Android can accept the cue PCM while advancing zero frames.
-        check(media.acquireAudio()) {
+        check(media.acquireCaptureAudio()) {
           "Android denied recording audio focus."
         }
         val settleMs =
@@ -830,7 +830,7 @@ internal class T3VoiceThreadSession(
       // through the bounded Ended drain. This mirrors the Ready fence in the opposite direction.
       cancelOwnedMedia(releaseAudio = !playEnded)
       if (playEnded) {
-        val routeAcquired = runCatching { media.acquireAudio() }.getOrDefault(false)
+        val routeAcquired = runCatching { media.acquireCaptureAudio() }.getOrDefault(false)
         if (routeAcquired) {
           T3VoiceCueTiming.awaitEnded(cueArming, generation)
         }

@@ -43,6 +43,7 @@ internal class T3VoiceNativeRuntimeDriver(
       onError = { playbackId, cause ->
         synchronized(lock) { threadSession }?.onPlaybackError(playbackId, cause)
       },
+      preferredOutputDevice = audioRouter::preferredPlaybackDevice,
     )
   private val threadMedia = T3VoiceAndroidThreadMedia(recorder, player, audioRouter)
   private val cueArming: T3VoiceCueArming =
@@ -157,7 +158,7 @@ internal class T3VoiceNativeRuntimeDriver(
     audioRouter.setPreference(route)
 
   fun acquireLegacyAudio(): Boolean =
-    audioRouter.start().transition.state != T3VoiceAudioFocusState.TERMINATED
+    audioRouter.startCommunication().transition.state != T3VoiceAudioFocusState.TERMINATED
 
   fun releaseLegacyAudio() = audioRouter.stop()
 

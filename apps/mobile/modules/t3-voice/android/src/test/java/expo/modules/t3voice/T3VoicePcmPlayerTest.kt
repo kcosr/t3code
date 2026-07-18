@@ -460,6 +460,8 @@ class T3VoicePcmPlayerTest {
     var resumeCount = 0
     var startCount = 0
 
+    override fun setPreferredDevice(device: android.media.AudioDeviceInfo): Boolean = true
+
     override fun start() {
       startCount += 1
     }
@@ -487,6 +489,8 @@ class T3VoicePcmPlayerTest {
     val writeExited = CountDownLatch(1)
     var releaseCount = 0
     val releaseFlushes = mutableListOf<Boolean>()
+
+    override fun setPreferredDevice(device: android.media.AudioDeviceInfo): Boolean = true
 
     override fun start() = Unit
 

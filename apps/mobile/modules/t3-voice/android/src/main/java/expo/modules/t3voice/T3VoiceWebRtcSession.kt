@@ -290,7 +290,7 @@ internal class T3VoiceWebRtcSession(
     }
     if (releaseCancelledPreparation(attempt, session)) return
     try {
-      val routerStart = audioRouter.start()
+      val routerStart = audioRouter.startCommunication()
       if (releaseCancelledPreparation(attempt, session)) return
       check(routerStart.transition.state != T3VoiceAudioFocusState.TERMINATED) {
         "Android denied Realtime audio focus."

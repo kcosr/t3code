@@ -971,7 +971,9 @@ internal class T3VoiceThreadSessionTest {
     private var activePlayback: String? = null
     private var audioOwner: String? = null
 
-    override fun acquireAudio(): Boolean = true
+    override fun acquireCaptureAudio(): Boolean = true
+
+    override fun acquirePlaybackAudio(): Boolean = true
 
     override fun releaseAudio() {
       val release = releaseCount.incrementAndGet()
@@ -1112,7 +1114,9 @@ internal class T3VoiceThreadSessionTest {
       @Synchronized get() =
         baseCompletedRecording.copy(recordingId = checkNotNull(finalizingRecordingId))
 
-    override fun acquireAudio(): Boolean = true
+    override fun acquireCaptureAudio(): Boolean = true
+
+    override fun acquirePlaybackAudio(): Boolean = true
 
     override fun releaseAudio() = Unit
 
@@ -1185,7 +1189,10 @@ internal class T3VoiceThreadSessionTest {
     private val lock = Any()
     private var activePlayback: String? = null
 
-    override fun acquireAudio(): Boolean = true
+    override fun acquireCaptureAudio(): Boolean =
+      error("Playback-only test media must not acquire communication audio")
+
+    override fun acquirePlaybackAudio(): Boolean = true
 
     override fun releaseAudio() = Unit
 
@@ -1312,7 +1319,9 @@ internal class T3VoiceThreadSessionTest {
     private val lock = Any()
     private var activeRecording: String? = null
 
-    override fun acquireAudio(): Boolean = true
+    override fun acquireCaptureAudio(): Boolean = true
+
+    override fun acquirePlaybackAudio(): Boolean = true
 
     override fun releaseAudio() = Unit
 
@@ -1383,7 +1392,9 @@ internal class T3VoiceThreadSessionTest {
     val resumeCount = AtomicInteger(0)
     private val activeRecording = AtomicReference<String?>()
 
-    override fun acquireAudio(): Boolean = true
+    override fun acquireCaptureAudio(): Boolean = true
+
+    override fun acquirePlaybackAudio(): Boolean = true
 
     override fun releaseAudio() = Unit
 
