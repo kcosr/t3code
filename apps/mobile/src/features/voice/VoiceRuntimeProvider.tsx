@@ -1,4 +1,4 @@
-import { useAtomValue } from "@effect/atom-react";
+import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { useNavigation } from "@react-navigation/native";
 import type { PreparedConnection } from "@t3tools/client-runtime/connection";
 import {
@@ -38,7 +38,10 @@ import {
   type VoiceConversationId,
   type VoiceConversationSelection,
 } from "@t3tools/contracts";
-import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
+import {
+  getT3VoiceNativeModule,
+  type T3VoiceReadinessSnapshot,
+} from "@t3tools/mobile-voice-native";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
 import {
@@ -51,17 +54,24 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Alert, View } from "react-native";
+import { Alert, AppState, View } from "react-native";
 
 import { useThreadShells } from "../../state/entities";
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { mobilePreferencesAtom } from "../../state/preferences";
+import { updateMobilePreferencesAtom } from "../../state/preferences";
+import { savePreferencesPatch } from "../../persistence/imperative";
 import { usePreparedConnection } from "../../state/session";
 import {
   useComposerDraftContentEmpty,
   useComposerDraftsReady,
 } from "../../state/use-composer-drafts";
 import { makeAndroidVoiceRuntimeAdapter } from "./androidVoiceRuntimeAdapter";
+import {
+  disableAndroidVoiceReadiness,
+  provisionAndroidVoiceReadiness,
+  type AndroidVoiceReadinessTarget,
+} from "./androidVoiceReadiness";
 import { ExclusiveTransition } from "./exclusiveTransition";
 import {
   VoiceAudioRoutePreferenceProvider,
@@ -72,7 +82,7 @@ import {
   VoiceAudioRoutePicker,
   VoiceTranscriptModal,
 } from "./VoiceRuntimeOverlays";
-import { VoiceConversationBrowser, type VoiceConversationClient } from "./VoiceConversationBrowser";
+import { VoiceConversationBrowser } from "./VoiceConversationBrowser";
 import { loadResumeSelection } from "./voiceConversationResume";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
 import { useVoiceCapabilityAvailability } from "./useVoiceCapabilityAvailability";
@@ -112,12 +122,18 @@ interface VoiceRuntimeContextValue {
   readonly registerTraditionalAudioInterruption: (
     interrupt: () => void | (() => void) | Promise<void | (() => void)>,
   ) => () => void;
+  readonly readinessSnapshot: T3VoiceReadinessSnapshot;
+  readonly setBackgroundControlsEnabled: (enabled: boolean) => Promise<void>;
 }
 
 const INITIAL_SNAPSHOT: VoiceRuntimeSnapshot = {
   mode: "idle",
   generation: 0,
   sequence: -1,
+};
+const INITIAL_READINESS_SNAPSHOT: T3VoiceReadinessSnapshot = {
+  posture: "disabled",
+  generation: 0,
 };
 
 const VoiceRuntimeContext = createContext<VoiceRuntimeContextValue | null>(null);
@@ -135,8 +151,14 @@ export function VoiceRuntimeProvider(props: {
   const native = getT3VoiceNativeModule();
   const audioRoutePreference = useVoiceAudioRoutePreferenceController(native);
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
+  const savePreferences = useAtomSet(updateMobilePreferencesAtom);
   const threadShells = useThreadShells();
   const [snapshot, setSnapshot] = useState<VoiceRuntimeSnapshot>(INITIAL_SNAPSHOT);
+  const [readinessSnapshot, setReadinessSnapshot] = useState<T3VoiceReadinessSnapshot>(
+    INITIAL_READINESS_SNAPSHOT,
+  );
+  const [readinessReconciled, setReadinessReconciled] = useState(false);
+  const [applicationState, setApplicationState] = useState(AppState.currentState);
   const [runtimeEnvironmentId, setRuntimeEnvironmentId] = useState<EnvironmentId | null>(null);
   const [conversationConnection, setConversationConnection] =
     useState<VoiceConversationConnection | null>(null);
@@ -161,6 +183,7 @@ export function VoiceRuntimeProvider(props: {
   const traditionalAudioInterruptionsRef = useRef(
     new Set<() => void | (() => void) | Promise<void | (() => void)>>(),
   );
+  const readinessGenerationRef = useRef(0);
 
   const storedPreferences = Option.getOrNull(AsyncResult.value(preferencesResult));
   const preferencesReady = AsyncResult.isSuccess(preferencesResult);
@@ -169,6 +192,33 @@ export function VoiceRuntimeProvider(props: {
     [storedPreferences],
   );
   const playThreadResponses = storedPreferences?.threadSpeechEnabled === true;
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", setApplicationState);
+    return () => subscription.remove();
+  }, []);
+
+  useEffect(() => {
+    const focus = props.focus;
+    if (focus === null) return;
+    const current = storedPreferences?.voiceBackgroundThreadTarget;
+    if (
+      current?.environmentId === String(focus.environmentId) &&
+      current.projectId === String(focus.projectId) &&
+      current.threadId === String(focus.threadId) &&
+      current.title === focus.threadTitle
+    ) {
+      return;
+    }
+    savePreferences({
+      voiceBackgroundThreadTarget: {
+        environmentId: String(focus.environmentId),
+        projectId: String(focus.projectId),
+        threadId: String(focus.threadId),
+        title: focus.threadTitle,
+      },
+    });
+  }, [props.focus, savePreferences, storedPreferences?.voiceBackgroundThreadTarget]);
 
   const composerDraftsReady = useComposerDraftsReady();
 
@@ -213,7 +263,44 @@ export function VoiceRuntimeProvider(props: {
     conversationConnection?.environmentId === controllerEnvironmentId
       ? conversationConnection
       : null;
-  const conversationClient: VoiceConversationClient | null = browserConnection?.client ?? null;
+  const conversationClient: VoiceHttpClient | null = browserConnection?.client ?? null;
+
+  const rememberedThread = storedPreferences?.voiceBackgroundThreadTarget;
+  const rememberedThreadShell =
+    rememberedThread === null || rememberedThread === undefined
+      ? null
+      : (threadShells.find(
+          (thread) =>
+            String(thread.environmentId) === rememberedThread.environmentId &&
+            String(thread.projectId) === rememberedThread.projectId &&
+            String(thread.id) === rememberedThread.threadId &&
+            thread.archivedAt === null,
+        ) ?? null);
+  const rememberedThreadStart = useMemo(
+    () =>
+      rememberedThreadShell === null
+        ? null
+        : threadVoiceStartForFocus(
+            {
+              environmentId: rememberedThreadShell.environmentId,
+              projectId: rememberedThreadShell.projectId,
+              threadId: rememberedThreadShell.id,
+              threadTitle: rememberedThreadShell.title,
+              modelSelection: rememberedThreadShell.modelSelection,
+              runtimeMode: rememberedThreadShell.runtimeMode,
+              interactionMode: rememberedThreadShell.interactionMode ?? "default",
+              interactionRequired:
+                rememberedThreadShell.hasPendingApprovals === true ||
+                rememberedThreadShell.hasPendingUserInput === true,
+              activeThreadBusy:
+                rememberedThreadShell.session?.status === "starting" ||
+                rememberedThreadShell.session?.status === "running",
+            },
+            voicePreferences,
+            playThreadResponses,
+          ),
+    [playThreadResponses, rememberedThreadShell, voicePreferences],
+  );
 
   useEffect(
     () => () => {
@@ -324,6 +411,141 @@ export function VoiceRuntimeProvider(props: {
     }),
     [playThreadResponses, preferencesReady, visibleFocus, voicePreferences],
   );
+  const readinessTarget = useMemo<AndroidVoiceReadinessTarget | null>(() => {
+    if (controllerEnvironmentId === null) return null;
+    const mode = storedPreferences?.voiceBackgroundDefaultMode ?? "realtime";
+    if (mode === "thread") {
+      return {
+        mode: "thread",
+        label: rememberedThread?.title ?? "Active Thread",
+        target: rememberedThreadStart,
+      };
+    }
+    return {
+      mode: "realtime",
+      label: "Realtime",
+      target: {
+        environmentId: controllerEnvironmentId,
+        ...realtimeContext,
+      },
+    };
+  }, [
+    controllerEnvironmentId,
+    realtimeContext,
+    rememberedThread?.title,
+    rememberedThreadStart,
+    storedPreferences?.voiceBackgroundDefaultMode,
+  ]);
+
+  const provisionReadiness = useCallback(
+    async (signal: AbortSignal) => {
+      if (
+        native === null ||
+        prepared === null ||
+        conversationClient === null ||
+        readinessTarget === null
+      ) {
+        throw new Error("Open a connected environment to prepare background voice controls");
+      }
+      const next = await provisionAndroidVoiceReadiness({
+        native,
+        prepared,
+        client: conversationClient,
+        target: readinessTarget,
+        threadSwitch: rememberedThreadStart,
+        signal,
+      });
+      readinessGenerationRef.current = next.generation;
+      setReadinessSnapshot(next);
+      return next;
+    },
+    [conversationClient, native, prepared, readinessTarget, rememberedThreadStart],
+  );
+
+  const setBackgroundControlsEnabled = useCallback(
+    async (enabled: boolean) => {
+      if (native === null) throw new Error("This build has no native voice runtime");
+      if (!enabled) {
+        const disabled = await disableAndroidVoiceReadiness(native);
+        readinessGenerationRef.current = disabled.generation;
+        setReadinessSnapshot(disabled);
+        savePreferences({ voiceBackgroundControlsEnabled: false });
+        return;
+      }
+      const microphone = await native.requestMicrophonePermissionAsync();
+      if (!microphone.granted) {
+        throw new Error("Background voice controls need microphone access");
+      }
+      const controller = new AbortController();
+      const readySnapshot = await provisionReadiness(controller.signal);
+      if (readySnapshot.posture !== "ready") {
+        throw new Error(
+          readySnapshot.posture === "unavailable"
+            ? "The selected Active Thread is unavailable"
+            : "Voice controls need to be refreshed",
+        );
+      }
+      savePreferences({ voiceBackgroundControlsEnabled: true });
+    },
+    [native, provisionReadiness, savePreferences],
+  );
+
+  useEffect(() => {
+    if (native === null) return;
+    setReadinessReconciled(false);
+    let disposed = false;
+    const accept = (next: T3VoiceReadinessSnapshot) => {
+      if (disposed || next.generation < readinessGenerationRef.current) return;
+      readinessGenerationRef.current = next.generation;
+      setReadinessSnapshot(next);
+      if (
+        next.posture === "disabled" &&
+        next.generation > 0 &&
+        storedPreferences?.voiceBackgroundControlsEnabled === true
+      ) {
+        savePreferences({ voiceBackgroundControlsEnabled: false });
+      }
+    };
+    const subscription = native.addListener("readinessSnapshotChanged", accept);
+    void (async () => {
+      const pendingDisable = await native.getPendingReadinessDisableAsync();
+      if (disposed) return;
+      if (pendingDisable !== null) {
+        await savePreferencesPatch({ voiceBackgroundControlsEnabled: false });
+        if (disposed) return;
+        savePreferences({ voiceBackgroundControlsEnabled: false });
+        await native.acknowledgeReadinessDisableAsync({ generation: pendingDisable });
+      }
+      accept(await native.getReadinessSnapshotAsync());
+      if (!disposed) setReadinessReconciled(true);
+    })().catch(() => undefined);
+    return () => {
+      disposed = true;
+      subscription.remove();
+    };
+  }, [native, savePreferences, storedPreferences?.voiceBackgroundControlsEnabled]);
+
+  useEffect(() => {
+    if (
+      storedPreferences?.voiceBackgroundControlsEnabled !== true ||
+      !readinessReconciled ||
+      applicationState !== "active"
+    ) {
+      return;
+    }
+    const controller = new AbortController();
+    void provisionReadiness(controller.signal).catch((cause) => {
+      if (!controller.signal.aborted) {
+        Alert.alert("Background voice controls unavailable", errorMessage(cause));
+      }
+    });
+    return () => controller.abort();
+  }, [
+    applicationState,
+    provisionReadiness,
+    readinessReconciled,
+    storedPreferences?.voiceBackgroundControlsEnabled,
+  ]);
   const threadStartAvailable =
     threadStart !== null && isThreadVoiceStartAvailable(snapshot, prepared !== null);
   const acknowledgeAdmittedClientAction = useCallback(
@@ -903,11 +1125,15 @@ export function VoiceRuntimeProvider(props: {
       submitThreadTranscript,
       stop,
       registerTraditionalAudioInterruption,
+      readinessSnapshot,
+      setBackgroundControlsEnabled,
     }),
     [
       finishThreadRecording,
       controlsAvailable,
       registerTraditionalAudioInterruption,
+      readinessSnapshot,
+      setBackgroundControlsEnabled,
       snapshot,
       startThread,
       stop,
