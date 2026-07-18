@@ -341,6 +341,7 @@ internal class T3VoiceThreadSessionLifecycleTest {
       )
 
     voice.start()
+    assertTrue(arming.readyRequested.await(1, TimeUnit.SECONDS))
     assertEquals(1, arming.readyRequests.get())
     // stop() cancels the pending Ready (CANCELLED completion); session is inactive so openRecorder is skipped.
     voice.stop(reportStopped = true)
