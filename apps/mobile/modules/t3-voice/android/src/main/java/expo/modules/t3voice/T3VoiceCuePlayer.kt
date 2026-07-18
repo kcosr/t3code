@@ -287,7 +287,7 @@ internal class T3VoiceCuePlayer(
 
   private companion object {
     const val SAMPLE_RATE = 48_000
-    const val STARTUP_PRE_ROLL_MS = 512
+    const val STARTUP_PRE_ROLL_MS = 768
     const val COLD_START_CHECK_MS = 220L
     const val DRAIN_POLL_MS = 10L
     const val TIMEOUT_MS = 2_500L
