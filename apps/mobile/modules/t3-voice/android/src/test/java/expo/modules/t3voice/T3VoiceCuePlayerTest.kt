@@ -10,10 +10,10 @@ class T3VoiceCuePlayerTest {
   fun `synthesizes assistant ready and ended shapes with cold-start preroll`() {
     val ready = T3VoiceCuePcm.synthesize(48_000, T3VoiceCue.READY)
     val ended = T3VoiceCuePcm.synthesize(48_000, T3VoiceCue.ENDED)
-    val preroll = 48_000 * 512 / 1_000
+    val preroll = 48_000 * 120 / 1_000
 
-    assertEquals(48_000 * (512 + 95 + 55 + 140) / 1_000 * 2, ready.size)
-    assertEquals(48_000 * (512 + 140) / 1_000 * 2, ended.size)
+    assertEquals(48_000 * (120 + 95 + 55 + 140) / 1_000 * 2, ready.size)
+    assertEquals(48_000 * (120 + 140) / 1_000 * 2, ended.size)
     assertEquals(0, sample(ready, 0))
     assertEquals(0, sample(ready, preroll + 48_000 * 95 / 1_000))
     assertEquals(0, sample(ready, preroll + 48_000 * 120 / 1_000))

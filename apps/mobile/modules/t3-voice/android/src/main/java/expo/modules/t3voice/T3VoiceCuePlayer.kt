@@ -171,14 +171,34 @@ internal class T3VoiceCuePlayer(
       cue.output = output
     }
     try {
-      var offset = 0
-      while (offset < cue.pcm.size && isCurrent(cue)) {
-        val written = output.write(cue.pcm, offset, cue.pcm.size - offset)
-        check(written > 0) { "Cue output stopped accepting PCM." }
-        offset += written
+      // Serialize write/play with settle()'s release on the same per-cue monitor so AudioTrack
+      // is never written and released from two worker threads concurrently.
+      val stillCurrent =
+        synchronized(cue) {
+          if (!isCurrent(cue) || cue.output !== output) {
+            false
+          } else {
+            var offset = 0
+            while (offset < cue.pcm.size) {
+              if (!isCurrent(cue) || cue.output !== output) return@synchronized false
+              val written = output.write(cue.pcm, offset, cue.pcm.size - offset)
+              check(written > 0) { "Cue output stopped accepting PCM." }
+              offset += written
+            }
+            if (!isCurrent(cue) || cue.output !== output) {
+              false
+            } else {
+              output.play()
+              true
+            }
+          }
+        }
+      if (!stillCurrent) {
+        if (!cue.terminalClaimed.get()) {
+          worker.execute { runCatching { output.release(true) } }
+        }
+        return
       }
-      if (!isCurrent(cue)) return
-      output.play()
       synchronized(lock) {
         if (active !== cue || cue.output !== output || cue.terminalClaimed.get()) return
         cue.attemptTasks += scheduler.schedule(coldStartCheckMs) { checkColdStart(cue, output) }
@@ -255,8 +275,13 @@ internal class T3VoiceCuePlayer(
       cue.output.also { cue.output = null }
     }
     val complete = {
-      if (output != null) runCatching { output.release(flush) }
-      cue.completion(T3VoiceCueCompletion(cue.generation, cue.cue, outcome))
+      if (output != null) {
+        // Release under the same per-cue monitor used by the write loop.
+        synchronized(cue) { runCatching { output.release(flush) } }
+      }
+      runCatching {
+        cue.completion(T3VoiceCueCompletion(cue.generation, cue.cue, outcome))
+      }
     }
     if (output != null) worker.execute(complete) else complete()
   }
@@ -289,8 +314,9 @@ internal object T3VoiceCuePcm {
         listOf(Segment(523.25, 95, 0.14f), Segment(0.0, 55, 0f), Segment(659.25, 140, 0.16f))
       T3VoiceCue.ENDED -> listOf(Segment(659.25, 140, 0.16f))
     }
-    // Cold-start pre-roll so the first audible samples land after AudioTrack bring-up.
-    val segments = listOf(Segment(0.0, 512, 0f)) + toneSegments
+    // Short cold-start pre-roll so the first audible samples land after AudioTrack bring-up
+    // without adding ~800ms of dead time before every capture arm.
+    val segments = listOf(Segment(0.0, 120, 0f)) + toneSegments
     val sampleCount = segments.sumOf { sampleRate * it.durationMs / 1_000 }
     val pcm = ByteArray(sampleCount * Short.SIZE_BYTES)
     var sampleOffset = 0

@@ -113,7 +113,12 @@ internal class T3VoiceNativeRuntimeDriver(
   ) {
     val session = requireRealtime(generation)
     realtimeThreadTransfer.begin(generation, policy.preservesSessionForThread)
-    if (policy.drainsPlayout) session.closeAfterPlayoutDrain() else session.close()
+    val handoff = policy.preservesSessionForThread
+    if (policy.drainsPlayout) {
+      session.closeAfterPlayoutDrain(forHandoff = handoff)
+    } else {
+      session.close(forHandoff = handoff)
+    }
   }
 
   override fun cancelRealtimeToThreadSwitch(generation: Long) {

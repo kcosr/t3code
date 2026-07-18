@@ -130,12 +130,24 @@ export function SettingsVoiceRouteScreen() {
             label="Voice cues"
             value={stored.voiceCuesEnabled !== false}
             onValueChange={(value) => {
-              savePreferences({ voiceCuesEnabled: value });
               const native = getT3VoiceNativeModule();
-              if (native === null) return;
-              void native.setVoiceCuesEnabledAsync({ enabled: value }).catch(() => {
-                // Native store is best-effort for detached FG ownership; React blob remains.
-              });
+              if (native === null) {
+                // Web/desktop or missing native module: React blob only.
+                savePreferences({ voiceCuesEnabled: value });
+                return;
+              }
+              // Native SharedPreferences is the runtime source of truth for FG gating.
+              void native
+                .setVoiceCuesEnabledAsync({ enabled: value })
+                .then(() => savePreferences({ voiceCuesEnabled: value }))
+                .catch((cause) =>
+                  Alert.alert(
+                    "Voice cues unavailable",
+                    cause instanceof Error
+                      ? cause.message
+                      : "Could not update the native voice cues preference.",
+                  ),
+                );
             }}
           />
         </SettingsSection>

@@ -87,6 +87,8 @@ internal class T3VoiceRealtimeSession(
   private var terminalCallback: T3VoiceRuntimeCallback? = null
   private var terminalDeadlineFuture: ScheduledFuture<*>? = null
   private var terminalActionId: String? = null
+  /** True when closing as Realtime→Thread handoff (no Ended cue). */
+  private val closeForHandoff = AtomicBoolean(false)
 
   init {
     require(terminalOutcomeDeadlineMs > 0) { "terminalOutcomeDeadlineMs must be positive." }
@@ -138,7 +140,8 @@ internal class T3VoiceRealtimeSession(
     }
   }
 
-  fun close() {
+  fun close(forHandoff: Boolean = false) {
+    if (forHandoff) closeForHandoff.set(true)
     if (terminal.compareAndSet(false, true)) {
       synchronized(lock) {
         terminalCallback = T3VoiceRuntimeCallback.RealtimeClosed
@@ -147,7 +150,8 @@ internal class T3VoiceRealtimeSession(
     beginTerminalCleanup()
   }
 
-  fun closeAfterPlayoutDrain() {
+  fun closeAfterPlayoutDrain(forHandoff: Boolean = false) {
+    if (forHandoff) closeForHandoff.set(true)
     if (!terminal.compareAndSet(false, true)) return
     val server =
       synchronized(lock) {
@@ -310,10 +314,10 @@ internal class T3VoiceRealtimeSession(
 
   private fun armRealtimeCapture(sessionId: String) {
     if (terminal.get()) return
-    cueArming.requestReady(generation) { completion ->
+    cueArming.requestReady(generation) { _ ->
+      // Teardown already sets terminal before cancel; any remaining completion (including
+      // mid-flight disable → CANCELLED) must fail-open so the mic is never stranded.
       if (terminal.get()) return@requestReady
-      if (completion.outcome == T3VoiceCueOutcome.CANCELLED) return@requestReady
-      // Fail-open for DRAINED / FAILED / TIMED_OUT so a beep never strands the call.
       runCatching { webRtc.setInputReady(sessionId, ready = true) }
     }
   }
@@ -651,9 +655,13 @@ internal class T3VoiceRealtimeSession(
     if (!cleanupStarted.compareAndSet(false, true)) return
     val server = synchronized(lock) { serverSession }
     val wasConnected = connected.get()
-    // Cancel any pending Ready; play Ended only after a clean connected session.
+    // Cancel any pending Ready; play Ended only on genuine clean stops (not mode handoffs).
     cueArming.cancel(generation)
-    if (wasConnected && terminalCallback is T3VoiceRuntimeCallback.RealtimeClosed) {
+    if (
+      wasConnected &&
+        terminalCallback is T3VoiceRuntimeCallback.RealtimeClosed &&
+        !closeForHandoff.get()
+    ) {
       cueArming.requestEnded(generation)
     }
     // Fence startup before abandoning process-global audio focus. cancelStartup is lock-only;

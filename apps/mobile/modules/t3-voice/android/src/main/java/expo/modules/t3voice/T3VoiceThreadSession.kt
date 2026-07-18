@@ -493,11 +493,14 @@ internal class T3VoiceThreadSession(
     controlExecutor.execute {
       if (!active.get()) return@execute
       // Keep STARTING until Ready completes (or cues disabled / fail-open).
-      cueArming.requestReady(generation) { completion ->
-        controlExecutor.execute {
-          if (!active.get()) return@execute
-          if (completion.outcome == T3VoiceCueOutcome.CANCELLED) return@execute
-          openRecorder()
+      // Do not special-case CANCELLED: active=false already covers teardown, and mid-flight
+      // disable must still open the recorder (fail-open).
+      cueArming.requestReady(generation) { _ ->
+        runCatching {
+          controlExecutor.execute {
+            if (!active.get()) return@execute
+            openRecorder()
+          }
         }
       }
     }
