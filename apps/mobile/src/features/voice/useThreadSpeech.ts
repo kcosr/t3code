@@ -5,6 +5,7 @@ import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Platform } from "react-native";
 
 import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import { uuidv4 } from "../../lib/uuid";
@@ -25,7 +26,16 @@ import {
   type ThreadSpeechPlannerState,
 } from "./threadSpeechPlanner";
 import { useVoiceCapabilityAvailability } from "./useVoiceCapabilityAvailability";
+import { useVoiceRuntime } from "./VoiceRuntimeProvider";
 import { voiceErrorMessage as errorMessage } from "./voiceError";
+
+/**
+ * On Android, the semantic native Thread runtime owns Auto Listen response TTS
+ * (`playResponses`). React must not drive the generic PCM player for the same
+ * preference. This flag selects preference UI + native skip only.
+ */
+const nativeOwnsThreadResponseSpeech = (native: ReturnType<typeof getT3VoiceNativeModule>) =>
+  Platform.OS === "android" && native !== null;
 
 const bytesToBase64 = (bytes: Uint8Array): string => {
   let binary = "";
@@ -53,6 +63,8 @@ export function useThreadSpeech(input: {
 }) {
   const prepared = Option.getOrNull(usePreparedConnection(input.environmentId));
   const native = getT3VoiceNativeModule();
+  const nativeAuthority = nativeOwnsThreadResponseSpeech(native);
+  const voiceRuntime = useVoiceRuntime();
   const capabilityAvailable = useVoiceCapabilityAvailability(prepared, "speech.streaming");
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
@@ -183,6 +195,8 @@ export function useThreadSpeech(input: {
 
   const executeAction = useCallback(
     async (action: ThreadSpeechAction, generation: number) => {
+      // Android semantic runtime owns response speech; do not start generic PCM.
+      if (nativeAuthority) return;
       if (native === null || prepared === null) return;
       if (operationGenerationRef.current !== generation) throw new Error("Playback was cancelled");
       switch (action.type) {
@@ -321,12 +335,12 @@ export function useThreadSpeech(input: {
         }
       }
     },
-    [emitLifecycle, handlePlaybackTerminated, native, prepared],
+    [emitLifecycle, handlePlaybackTerminated, native, nativeAuthority, prepared],
   );
 
   const enqueueActions = useCallback(
     (actions: ReadonlyArray<ThreadSpeechAction>) => {
-      if (actions.length === 0) return;
+      if (nativeAuthority || actions.length === 0) return;
       const generation = operationGenerationRef.current;
       const startedAction = actions.find((action) => action.type === "start");
       actionChainRef.current = actionChainRef.current
@@ -363,10 +377,11 @@ export function useThreadSpeech(input: {
           await cancellation;
         });
     },
-    [emitTerminalLifecycle, executeAction, native],
+    [emitTerminalLifecycle, executeAction, native, nativeAuthority],
   );
 
   useEffect(() => {
+    if (nativeAuthority) return;
     const result = updateThreadSpeech(
       plannerRef.current,
       input.latestAssistant,
@@ -375,7 +390,14 @@ export function useThreadSpeech(input: {
     );
     plannerRef.current = result.state;
     enqueueActions(result.actions);
-  }, [enqueueActions, input.latestAssistant]);
+  }, [enqueueActions, input.latestAssistant, nativeAuthority]);
+
+  // Native Thread `playing` drives the speaker UI on Android authority path.
+  useEffect(() => {
+    if (!nativeAuthority) return;
+    const snapshot = voiceRuntime.snapshot;
+    setPlaying(snapshot.mode === "thread" && snapshot.phase === "playing");
+  }, [nativeAuthority, voiceRuntime.snapshot]);
 
   useEffect(() => {
     ++operationGenerationRef.current;
@@ -383,7 +405,7 @@ export function useThreadSpeech(input: {
     playbackRef.current = null;
     for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
     actionChainRef.current =
-      native !== null && playback !== null
+      !nativeAuthority && native !== null && playback !== null
         ? native.cancelPlaybackAsync({ playbackId: playback.playbackId }).catch(() => undefined)
         : Promise.resolve();
     plannerRef.current = {
@@ -391,11 +413,11 @@ export function useThreadSpeech(input: {
       baselineMessageId: input.latestAssistant?.id ?? null,
       active: null,
     };
-    setPlaying(false);
-  }, [input.scopeKey, native, prepared]);
+    if (!nativeAuthority) setPlaying(false);
+  }, [input.scopeKey, native, nativeAuthority, prepared]);
 
   useEffect(() => {
-    if (native === null) return;
+    if (native === null || nativeAuthority) return;
     const terminatedSubscription = native.addListener("playbackTerminated", (event) => {
       void handlePlaybackTerminated(event).catch(() => undefined);
     });
@@ -437,7 +459,7 @@ export function useThreadSpeech(input: {
       errorSubscription.remove();
       for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
     };
-  }, [handlePlaybackTerminated, native]);
+  }, [handlePlaybackTerminated, native, nativeAuthority]);
 
   const disableImmediately = useCallback(
     (persist: boolean) => {
@@ -452,12 +474,17 @@ export function useThreadSpeech(input: {
       ).state;
       for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
       setEnabled(false);
-      setPlaying(false);
+      if (!nativeAuthority) setPlaying(false);
       setError(null);
       if (persist) savePreferences({ threadSpeechEnabled: false });
 
       const cancellation = (async () => {
         if (native === null) return;
+        if (nativeAuthority) {
+          // Skip any in-flight native response speech; preference already maps to playResponses.
+          await native.skipThreadPlaybackAsync().catch(() => undefined);
+          return;
+        }
         const playbackId =
           playback?.playbackId ??
           pendingStart?.playbackId ??
@@ -475,7 +502,7 @@ export function useThreadSpeech(input: {
       });
       return cancellation;
     },
-    [native, savePreferences],
+    [native, nativeAuthority, savePreferences],
   );
 
   useEffect(() => {
@@ -501,8 +528,8 @@ export function useThreadSpeech(input: {
     lastObservedPreferenceRef.current = preferencesResult.value.threadSpeechEnabled === true;
     plannerRef.current = restored.state;
     setEnabled(restored.state.enabled);
-    enqueueActions(restored.actions);
-  }, [enqueueActions, input.historyReady, preferencesResult]);
+    if (!nativeAuthority) enqueueActions(restored.actions);
+  }, [enqueueActions, input.historyReady, nativeAuthority, preferencesResult]);
 
   useEffect(() => {
     if (!preferenceHydratedRef.current || !AsyncResult.isSuccess(preferencesResult)) return;
@@ -519,11 +546,11 @@ export function useThreadSpeech(input: {
     plannerRef.current = result.state;
     setEnabled(requestedEnabled);
     setError(null);
-    enqueueActions(result.actions);
-  }, [disableImmediately, enqueueActions, preferencesResult]);
+    if (!nativeAuthority) enqueueActions(result.actions);
+  }, [disableImmediately, enqueueActions, nativeAuthority, preferencesResult]);
 
   const toggle = useCallback(() => {
-    if (!capabilityAvailable) return;
+    if (!nativeAuthority && !capabilityAvailable) return;
     if (!preferenceHydratedRef.current) {
       toggledBeforePreferenceHydrationRef.current = true;
       earlyToggleNeedsBaselineRef.current ||= !input.historyReady;
@@ -542,29 +569,32 @@ export function useThreadSpeech(input: {
     setEnabled(result.enabled);
     savePreferences({ threadSpeechEnabled: result.enabled });
     setError(null);
-    enqueueActions(result.actions);
+    // Preference drives native playResponses; do not start React PCM on Android.
+    if (!nativeAuthority) enqueueActions(result.actions);
   }, [
     capabilityAvailable,
     disableImmediately,
     enqueueActions,
     input.historyReady,
+    nativeAuthority,
     savePreferences,
   ]);
 
   const resumeAfterDictation = useCallback(() => {
     if (!suspendedForDictationRef.current) return;
     suspendedForDictationRef.current = false;
-    if (suspendedForRealtimeRef.current) return;
+    if (suspendedForRealtimeRef.current || nativeAuthority) return;
     const result = updateThreadSpeech(plannerRef.current, latestRef.current, uuidv4);
     plannerRef.current = result.state;
     enqueueActions(result.actions);
-  }, [enqueueActions]);
+  }, [enqueueActions, nativeAuthority]);
 
   const resumeAfterRealtime = useCallback(() => {
     if (!suspendedForRealtimeRef.current) return;
     suspendedForRealtimeRef.current = false;
+    if (nativeAuthority) return;
     plannerRef.current = interruptThreadSpeech(plannerRef.current, latestRef.current);
-  }, []);
+  }, [nativeAuthority]);
 
   const interruptPlayback = useCallback(
     async (reason: "dictation" | "realtime") => {
@@ -576,10 +606,15 @@ export function useThreadSpeech(input: {
       playbackRef.current = null;
       plannerRef.current = interruptThreadSpeech(plannerRef.current, latestRef.current);
       for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
-      setPlaying(false);
+      if (!nativeAuthority) setPlaying(false);
       setError(null);
       const cancellation = (async () => {
         if (native === null) return;
+        if (nativeAuthority) {
+          // Handoff: skip native Thread response speech so Realtime/dictation can take audio.
+          await native.skipThreadPlaybackAsync().catch(() => undefined);
+          return;
+        }
         const playbackId =
           playback?.playbackId ??
           pendingStart?.playbackId ??
@@ -606,7 +641,7 @@ export function useThreadSpeech(input: {
         return false;
       }
     },
-    [native, resumeAfterDictation, resumeAfterRealtime],
+    [native, nativeAuthority, resumeAfterDictation, resumeAfterRealtime],
   );
 
   const interrupt = useCallback(() => interruptPlayback("dictation"), [interruptPlayback]);
@@ -622,8 +657,8 @@ export function useThreadSpeech(input: {
     setEnabled(true);
     savePreferences({ threadSpeechEnabled: true });
     setError(null);
-    enqueueActions(result.actions);
-  }, [enqueueActions, savePreferences]);
+    if (!nativeAuthority) enqueueActions(result.actions);
+  }, [enqueueActions, nativeAuthority, savePreferences]);
 
   useEffect(
     () => () => {
@@ -633,15 +668,20 @@ export function useThreadSpeech(input: {
       playbackRef.current = null;
       for (const waiter of consumptionWaitersRef.current.splice(0)) waiter.resolve();
       actionChainRef.current =
-        native !== null && playback !== null
+        !nativeAuthority && native !== null && playback !== null
           ? native.cancelPlaybackAsync({ playbackId: playback.playbackId }).catch(() => undefined)
           : Promise.resolve();
     },
-    [native],
+    [native, nativeAuthority],
   );
 
   return {
-    available: native !== null && prepared !== null && capabilityAvailable,
+    // On Android, response speech UI is available whenever native is present even if
+    // speech.streaming capability probing is for the React synthesize path.
+    available:
+      native !== null &&
+      prepared !== null &&
+      (nativeAuthority || capabilityAvailable),
     enabled,
     playing,
     error,

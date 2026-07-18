@@ -411,6 +411,10 @@ class T3VoiceModule : Module() {
         dispatchRuntime(promise, T3VoiceRuntimeCommand.FinishThreadUtterance)
       }
 
+      AsyncFunction("skipThreadPlaybackAsync") { promise: Promise ->
+        dispatchRuntime(promise, T3VoiceRuntimeCommand.SkipThreadPlayback)
+      }
+
       AsyncFunction("updateThreadReviewTranscriptAsync") {
         input: Map<String, Any?>, promise: Promise ->
         dispatchRuntime(
