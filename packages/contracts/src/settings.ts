@@ -361,6 +361,51 @@ export const ObservabilitySettings = Schema.Struct({
 });
 export type ObservabilitySettings = typeof ObservabilitySettings.Type;
 
+export const VoiceNonRealtimeProviderId = Schema.Literals(["openai", "openai-speech-server"]);
+export type VoiceNonRealtimeProviderId = typeof VoiceNonRealtimeProviderId.Type;
+
+export const VoiceProviderSelections = Schema.Struct({
+  transcription: VoiceNonRealtimeProviderId.pipe(
+    Schema.withDecodingDefault(Effect.succeed("openai" as const)),
+  ),
+  speech: VoiceNonRealtimeProviderId.pipe(
+    Schema.withDecodingDefault(Effect.succeed("openai" as const)),
+  ),
+});
+export type VoiceProviderSelections = typeof VoiceProviderSelections.Type;
+
+export const VoiceSpeechPresetConfig = Schema.Struct({
+  voice: TrimmedNonEmptyString,
+  speed: Schema.Number.check(Schema.isBetween({ minimum: 0.25, maximum: 4 })),
+});
+export type VoiceSpeechPresetConfig = typeof VoiceSpeechPresetConfig.Type;
+
+const DEFAULT_SPEECH_PRESET_DEFAULT: VoiceSpeechPresetConfig = { voice: "default", speed: 1 };
+const DEFAULT_SPEECH_PRESET_WARM: VoiceSpeechPresetConfig = { voice: "af_sky", speed: 1 };
+
+export const OpenAiSpeechServerSettings = Schema.Struct({
+  baseUrl: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
+  connectTimeoutSeconds: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 120 })).pipe(
+    Schema.withDecodingDefault(Effect.succeed(15)),
+  ),
+  speechPresets: Schema.Struct({
+    default: VoiceSpeechPresetConfig.pipe(
+      Schema.withDecodingDefault(Effect.succeed(DEFAULT_SPEECH_PRESET_DEFAULT)),
+    ),
+    warm: VoiceSpeechPresetConfig.pipe(
+      Schema.withDecodingDefault(Effect.succeed(DEFAULT_SPEECH_PRESET_WARM)),
+    ),
+  }).pipe(
+    Schema.withDecodingDefault(
+      Effect.succeed({
+        default: DEFAULT_SPEECH_PRESET_DEFAULT,
+        warm: DEFAULT_SPEECH_PRESET_WARM,
+      }),
+    ),
+  ),
+});
+export type OpenAiSpeechServerSettings = typeof OpenAiSpeechServerSettings.Type;
+
 export const VoiceSettings = Schema.Struct({
   enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   maxUploadBytes: Schema.Int.check(
@@ -386,6 +431,10 @@ export const VoiceSettings = Schema.Struct({
   ),
   contextTokenBudget: Schema.Int.check(Schema.isBetween({ minimum: 1024, maximum: 100_000 })).pipe(
     Schema.withDecodingDefault(Effect.succeed(16_000)),
+  ),
+  providers: VoiceProviderSelections.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+  openaiSpeechServer: OpenAiSpeechServerSettings.pipe(
+    Schema.withDecodingDefault(Effect.succeed({})),
   ),
 });
 export type VoiceSettings = typeof VoiceSettings.Type;
@@ -557,6 +606,34 @@ export const ServerSettingsPatch = Schema.Struct({
       maxConcurrentMediaRequests: Schema.optionalKey(Schema.Int),
       maxConcurrentSessions: Schema.optionalKey(Schema.Int),
       contextTokenBudget: Schema.optionalKey(Schema.Int),
+      providers: Schema.optionalKey(
+        Schema.Struct({
+          transcription: Schema.optionalKey(VoiceNonRealtimeProviderId),
+          speech: Schema.optionalKey(VoiceNonRealtimeProviderId),
+        }),
+      ),
+      openaiSpeechServer: Schema.optionalKey(
+        Schema.Struct({
+          baseUrl: Schema.optionalKey(TrimmedString),
+          connectTimeoutSeconds: Schema.optionalKey(Schema.Int),
+          speechPresets: Schema.optionalKey(
+            Schema.Struct({
+              default: Schema.optionalKey(
+                Schema.Struct({
+                  voice: Schema.optionalKey(TrimmedNonEmptyString),
+                  speed: Schema.optionalKey(Schema.Number),
+                }),
+              ),
+              warm: Schema.optionalKey(
+                Schema.Struct({
+                  voice: Schema.optionalKey(TrimmedNonEmptyString),
+                  speed: Schema.optionalKey(Schema.Number),
+                }),
+              ),
+            }),
+          ),
+        }),
+      ),
     }),
   ),
   providers: Schema.optionalKey(

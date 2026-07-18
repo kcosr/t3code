@@ -209,10 +209,21 @@ it("distinguishes normal and abnormal Realtime sideband closes", () => {
 
 const credentialStore = (key: Option.Option<string>) =>
   VoiceCredentialStore.of({
-    status: Effect.succeed({ configured: Option.isSome(key), updatedAt: null }),
-    getOpenAiApiKey: Effect.succeed(key),
-    setOpenAiApiKey: () => Effect.die("unused"),
-    clearOpenAiApiKey: Effect.die("unused"),
+    listStatus: Effect.succeed({
+      credentials: [
+        { providerId: "openai", configured: Option.isSome(key), updatedAt: null },
+        { providerId: "openai-speech-server", configured: false, updatedAt: null },
+      ],
+    }),
+    status: (providerId) =>
+      Effect.succeed({
+        providerId,
+        configured: providerId === "openai" && Option.isSome(key),
+        updatedAt: null,
+      }),
+    get: (providerId) => Effect.succeed(providerId === "openai" ? key : Option.none()),
+    set: () => Effect.die("unused"),
+    clear: () => Effect.die("unused"),
   });
 
 const realtimeSocket = (
@@ -316,16 +327,15 @@ it.effect("streams PCM speech bytes and maps the server-owned voice preset", () 
       Effect.provideService(VoiceCredentialStore, credentialStore(Option.some("sk-test"))),
       Effect.provideService(OpenAiRealtimeSocket, realtimeSocket()),
     );
-    const bytes = yield* provider
-      .speechSynthesizer!.synthesize({
-        requestId: "voice-request-2" as never,
-        playbackId: "voice-playback-1",
-        segmentIndex: 0,
-        finalSegment: true,
-        text: "Hello world",
-        preset: "default",
-      })
-      .pipe(Stream.runCollect);
+    const body = yield* provider.speechSynthesizer!.prepare({
+      requestId: "voice-request-2" as never,
+      playbackId: "voice-playback-1",
+      segmentIndex: 0,
+      finalSegment: true,
+      text: "Hello world",
+      preset: "default",
+    });
+    const bytes = yield* body.pipe(Stream.runCollect);
 
     expect(Array.from(bytes).flatMap((chunk) => Array.from(chunk))).toEqual([1, 2, 3, 4]);
     const decodedRequestBody = yield* Schema.decodeUnknownEffect(Schema.UnknownFromJsonString)(
@@ -351,7 +361,7 @@ it.effect("fails before HTTP when the server credential is absent", () =>
       Effect.provideService(OpenAiRealtimeSocket, realtimeSocket()),
     );
     const error = yield* provider
-      .speechSynthesizer!.synthesize({
+      .speechSynthesizer!.prepare({
         requestId: "voice-request-3" as never,
         playbackId: "voice-playback-2",
         segmentIndex: 0,
@@ -359,7 +369,7 @@ it.effect("fails before HTTP when the server credential is absent", () =>
         text: "Hello",
         preset: "default",
       })
-      .pipe(Stream.runDrain, Effect.flip);
+      .pipe(Effect.flip);
 
     expect(error.reason).toBe("not-configured");
   }),

@@ -20,13 +20,26 @@ export class VoiceProviderRegistry extends Context.Service<
 export const makeVoiceProviderRegistry = (
   providers: ReadonlyArray<VoiceProviderAdapter>,
   selections: ReadonlyMap<VoiceCapability, string>,
+): VoiceProviderRegistryShape =>
+  makeDynamicVoiceProviderRegistry(providers, (capability) =>
+    Effect.succeed(selections.get(capability)),
+  );
+
+/**
+ * Resolves the selected provider for each new request via `resolveSelection`.
+ * Callers that have already resolved a provider for an in-flight request keep
+ * using that adapter; subsequent requests observe updated settings.
+ */
+export const makeDynamicVoiceProviderRegistry = (
+  providers: ReadonlyArray<VoiceProviderAdapter>,
+  resolveSelection: (capability: VoiceCapability) => Effect.Effect<string | undefined, VoiceError>,
 ): VoiceProviderRegistryShape => {
   const providersById = new Map(providers.map((provider) => [provider.id, provider]));
 
   return {
     resolve: (capability) =>
       Effect.gen(function* () {
-        const selectedId = selections.get(capability);
+        const selectedId = yield* resolveSelection(capability);
         const provider = selectedId === undefined ? undefined : providersById.get(selectedId);
         if (provider === undefined || !provider.capabilities.has(capability)) {
           return yield* new VoiceError({

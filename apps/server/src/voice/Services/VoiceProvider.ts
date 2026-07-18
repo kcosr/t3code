@@ -35,8 +35,15 @@ export interface SpeechSynthesisRequest {
   readonly preset: string;
 }
 
+/**
+ * Opens the upstream speech response and validates status/format before
+ * returning a pull-based PCM body stream. Callers must not commit a successful
+ * T3 speech response until `prepare` succeeds.
+ */
 export interface SpeechSynthesizer {
-  readonly synthesize: (request: SpeechSynthesisRequest) => Stream.Stream<Uint8Array, VoiceError>;
+  readonly prepare: (
+    request: SpeechSynthesisRequest,
+  ) => Effect.Effect<Stream.Stream<Uint8Array, VoiceError>, VoiceError>;
 }
 
 export interface RealtimeNegotiationRequest {

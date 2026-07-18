@@ -6,6 +6,9 @@ import {
   VoiceConversationTranscriptEntry,
   VoiceConversationTranscriptQuery,
   VoiceConversationUpdateInput,
+  VoiceCredentialSetInput,
+  VoiceCredentialStatus,
+  VoiceCredentialsStatus,
   VoiceMediaTicketRequest,
   VoiceSpeechRequest,
   VoiceSessionCreateInput,
@@ -83,6 +86,46 @@ describe("voice contracts", () => {
       decodeUnknownSync(VoiceConversationSelection)({
         type: "continue",
         conversationId: "voice-conversation-1",
+      }),
+    ).toThrow();
+  });
+
+  it("uses provider-keyed credential status without secret values", () => {
+    const status = decodeUnknownSync(VoiceCredentialStatus)({
+      providerId: "openai-speech-server",
+      configured: true,
+      updatedAt: "2026-07-17T00:00:00.000Z",
+    });
+    expect(status).toEqual({
+      providerId: "openai-speech-server",
+      configured: true,
+      updatedAt: "2026-07-17T00:00:00.000Z",
+    });
+    expect(status).not.toHaveProperty("token");
+    expect(status).not.toHaveProperty("apiKey");
+
+    const list = decodeUnknownSync(VoiceCredentialsStatus)({
+      credentials: [
+        { providerId: "openai", configured: false, updatedAt: null },
+        {
+          providerId: "openai-speech-server",
+          configured: true,
+          updatedAt: "2026-07-17T00:00:00.000Z",
+        },
+      ],
+    });
+    expect(list.credentials).toHaveLength(2);
+
+    expect(
+      decodeUnknownSync(VoiceCredentialSetInput)({
+        providerId: "openai",
+        token: "sk-test",
+      }),
+    ).toEqual({ providerId: "openai", token: "sk-test" });
+    expect(() =>
+      decodeUnknownSync(VoiceCredentialSetInput)({
+        providerId: "openai",
+        apiKey: "sk-test",
       }),
     ).toThrow();
   });

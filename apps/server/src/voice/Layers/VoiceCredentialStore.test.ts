@@ -15,19 +15,46 @@ const layer = VoiceCredentialStoreLive.pipe(
   Layer.provide(NodeServices.layer),
 );
 
-it.effect("stores OpenAI credentials without returning them in status", () =>
+it.effect("stores provider-keyed credentials without returning secrets", () =>
   Effect.gen(function* () {
     const credentials = yield* VoiceCredentialStore;
-    expect((yield* credentials.status).configured).toBe(false);
+    expect((yield* credentials.status("openai")).configured).toBe(false);
+    expect((yield* credentials.status("openai-speech-server")).configured).toBe(false);
 
-    const status = yield* credentials.setOpenAiApiKey("sk-test-secret");
-    const key = yield* credentials.getOpenAiApiKey;
+    const openAiStatus = yield* credentials.set("openai", "sk-test-secret");
+    const speechStatus = yield* credentials.set("openai-speech-server", "speech-token");
+    const openAiKey = yield* credentials.get("openai");
+    const speechKey = yield* credentials.get("openai-speech-server");
+    const listed = yield* credentials.listStatus;
 
-    expect(status.configured).toBe(true);
-    expect(status).not.toHaveProperty("apiKey");
-    expect(Option.getOrNull(key)).toBe("sk-test-secret");
+    expect(openAiStatus).toEqual({
+      providerId: "openai",
+      configured: true,
+      updatedAt: openAiStatus.updatedAt,
+    });
+    expect(speechStatus).toEqual({
+      providerId: "openai-speech-server",
+      configured: true,
+      updatedAt: speechStatus.updatedAt,
+    });
+    expect(openAiStatus).not.toHaveProperty("token");
+    expect(speechStatus).not.toHaveProperty("token");
+    expect(Option.getOrNull(openAiKey)).toBe("sk-test-secret");
+    expect(Option.getOrNull(speechKey)).toBe("speech-token");
+    expect(listed.credentials).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ providerId: "openai", configured: true }),
+        expect.objectContaining({ providerId: "openai-speech-server", configured: true }),
+      ]),
+    );
 
-    yield* credentials.clearOpenAiApiKey;
-    expect((yield* credentials.status).configured).toBe(false);
+    const cleared = yield* credentials.clear("openai-speech-server");
+    expect(cleared).toEqual({
+      providerId: "openai-speech-server",
+      configured: false,
+      updatedAt: null,
+    });
+    expect((yield* credentials.status("openai")).configured).toBe(true);
+    expect((yield* credentials.status("openai-speech-server")).configured).toBe(false);
   }).pipe(Effect.provide(layer)),
 );
