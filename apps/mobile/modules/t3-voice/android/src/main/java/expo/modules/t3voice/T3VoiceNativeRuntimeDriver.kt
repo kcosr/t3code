@@ -1,7 +1,9 @@
 package expo.modules.t3voice
 
 import android.content.Context
+import android.media.AudioDeviceInfo
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -22,6 +24,7 @@ internal class T3VoiceNativeRuntimeDriver(
   private var threadSession: T3VoiceThreadSession? = null
   private var shutdownStarted = false
   private val sharedMediaReleased = AtomicBoolean(false)
+  private val preferredPlaybackOutput = AtomicReference<AudioDeviceInfo?>(null)
   @Volatile private var sharedMediaReady = false
   private lateinit var audioRoutePreferenceState: MutableStateFlow<T3VoiceAudioRoutePreference>
   private lateinit var webRtc: T3VoiceWebRtcSession
@@ -44,13 +47,14 @@ internal class T3VoiceNativeRuntimeDriver(
       onError = { playbackId, cause ->
         synchronized(lock) { threadSession }?.onPlaybackError(playbackId, cause)
       },
-      preferredOutputDevice = audioRouter::preferredPlaybackDevice,
+      preferredOutputDevice = preferredPlaybackOutput::get,
     )
   private val threadMedia = T3VoiceAndroidThreadMedia(recorder, player, audioRouter)
   private val cueArming: T3VoiceCueArming =
     T3VoiceCueArmingLive(T3VoiceCueSettingsStore(applicationContext))
 
   init {
+    preferredPlaybackOutput.set(audioRouter.preferredPlaybackDevice())
     sharedMediaReady = true
     audioRoutePreferenceState = MutableStateFlow(audioRouter.preference())
     webRtc =
@@ -389,8 +393,10 @@ internal class T3VoiceNativeRuntimeDriver(
   }
 
   private fun handleAudioRoutePreferenceChanged(preference: T3VoiceAudioRoutePreference) {
+    val output = audioRouter.preferredPlaybackDevice()
+    preferredPlaybackOutput.set(output)
     if (sharedMediaReady) {
-      player.setPreferredOutputDevice(audioRouter.preferredPlaybackDevice())
+      player.setPreferredOutputDevice(output)
     }
     if (this::audioRoutePreferenceState.isInitialized) {
       audioRoutePreferenceState.value = preference
