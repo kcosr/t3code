@@ -97,10 +97,11 @@ internal class T3VoicePcmPlayer(
   fun start(playbackId: String, sampleRate: Int, channelCount: Int) {
     require(sampleRate in MIN_SAMPLE_RATE..MAX_SAMPLE_RATE) { "Unsupported PCM sample rate." }
     require(channelCount == 1 || channelCount == 2) { "PCM playback supports one or two channels." }
+    val preferredDevice = preferredOutputDevice()
     synchronized(lock) {
       check(active == null) { "A voice playback is already active." }
       val output = outputFactory.create(sampleRate, channelCount)
-      preferredOutputDevice()?.let { device ->
+      preferredDevice?.let { device ->
         // Keep TTS usable on Android's system-selected media route if preference routing fails.
         runCatching { output.setPreferredDevice(device) }
       }
