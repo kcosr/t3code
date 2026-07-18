@@ -98,19 +98,12 @@ import { makeMobileVoiceClient } from "./mobileVoiceClient";
 import { useVoiceCapabilityAvailability } from "./useVoiceCapabilityAvailability";
 import { resolveVoicePreferences } from "./voicePreferences";
 import { voiceErrorMessage as errorMessage } from "./voiceError";
+import { RuntimeTerminalFailurePresentationRegistry } from "./runtimeTerminalFailurePresentations";
 
 interface NativeRuntimeConnection {
   readonly environmentId: EnvironmentId;
   readonly adapter: AndroidVoiceRuntimeAdapter;
 }
-
-interface RuntimeFailurePresentation {
-  completed: boolean;
-  acknowledgement: (() => Promise<void>) | null;
-  acknowledgementInFlight: boolean;
-}
-
-const MAXIMUM_RETAINED_FAILURE_PRESENTATIONS = 64;
 
 interface VoiceConversationConnection {
   readonly environmentId: EnvironmentId;
@@ -207,7 +200,7 @@ export function VoiceRuntimeProvider(props: {
   const voiceStartTransitionRef = useRef(new ExclusiveTransition());
   const threadReviewHydrationTracker = useMemo(() => new ThreadReviewHydrationTracker(), []);
   const resumeAbortRef = useRef<AbortController | null>(null);
-  const failurePresentationsRef = useRef(new Map<number, RuntimeFailurePresentation>());
+  const failurePresentationsRef = useRef(new RuntimeTerminalFailurePresentationRegistry());
   const handledClientActionsRef = useRef(new Set<string>());
   const admittedClientActionFocusRef = useRef<AdmittedClientActionFocus | null>(null);
   const promptedConfirmationsRef = useRef(new Set<string>());
@@ -884,49 +877,10 @@ export function VoiceRuntimeProvider(props: {
   );
 
   const presentRuntimeFailure = useCallback(
-    (failed: T3VoiceTerminalRuntimeFailureEvent, acknowledge?: () => Promise<void>) => {
-      const existing = failurePresentationsRef.current.get(failed.failureId);
-      if (existing !== undefined) {
-        if (acknowledge !== undefined) {
-          if (existing.completed) {
-            if (!existing.acknowledgementInFlight) {
-              existing.acknowledgementInFlight = true;
-              void acknowledge()
-                .catch(() => undefined)
-                .finally(() => {
-                  existing.acknowledgementInFlight = false;
-                });
-            }
-          } else if (existing.acknowledgement === null) existing.acknowledgement = acknowledge;
-        }
-        return;
-      }
-      const presentation: RuntimeFailurePresentation = {
-        completed: false,
-        acknowledgement: acknowledge ?? null,
-        acknowledgementInFlight: false,
-      };
-      failurePresentationsRef.current.set(failed.failureId, presentation);
-      const complete = () => {
-        if (presentation.completed) return;
-        presentation.completed = true;
-        const acknowledgeFailure = presentation.acknowledgement;
-        presentation.acknowledgement = null;
-        if (acknowledgeFailure !== null) {
-          presentation.acknowledgementInFlight = true;
-          void acknowledgeFailure()
-            .catch(() => undefined)
-            .finally(() => {
-              presentation.acknowledgementInFlight = false;
-            });
-        }
-        if (failurePresentationsRef.current.size <= MAXIMUM_RETAINED_FAILURE_PRESENTATIONS) return;
-        for (const [failureId, retained] of failurePresentationsRef.current) {
-          if (!retained.completed || failureId === failed.failureId) continue;
-          failurePresentationsRef.current.delete(failureId);
-          if (failurePresentationsRef.current.size <= MAXIMUM_RETAINED_FAILURE_PRESENTATIONS) break;
-        }
-      };
+    (failed: T3VoiceTerminalRuntimeFailureEvent, acknowledge: () => Promise<void>) => {
+      const presentation = failurePresentationsRef.current.register(failed.failureId, acknowledge);
+      if (!presentation.shouldPresent) return;
+      const complete = presentation.complete;
       const target = lastRealtimeTargetRef.current;
       if (
         failed.operation === "realtime" &&
