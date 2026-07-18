@@ -415,6 +415,17 @@ class T3VoiceModule : Module() {
         dispatchRuntime(promise, T3VoiceRuntimeCommand.SkipThreadPlayback)
       }
 
+      AsyncFunction("updateThreadPlayResponsesAsync") {
+        input: Map<String, Any?>, promise: Promise ->
+        input.requireExactBridgeKeys("play responses input", setOf("playResponses"))
+        val playResponses =
+          input["playResponses"] as? Boolean ?: error("playResponses must be a boolean.")
+        dispatchRuntime(
+          promise,
+          T3VoiceRuntimeCommand.UpdateThreadPlayResponses(playResponses),
+        )
+      }
+
       AsyncFunction("updateThreadReviewTranscriptAsync") {
         input: Map<String, Any?>, promise: Promise ->
         dispatchRuntime(

@@ -349,6 +349,10 @@ export interface T3VoiceNativeModule {
   readonly finishThreadRecordingAsync: () => Promise<void>;
   /** Cancels Thread response TTS and completes the cycle (rearm or stop). Not pause. */
   readonly skipThreadPlaybackAsync: () => Promise<void>;
+  /** Updates playResponses on the active Thread cycle (mid-session toggle). */
+  readonly updateThreadPlayResponsesAsync: (input: {
+    readonly playResponses: boolean;
+  }) => Promise<void>;
   readonly updateThreadReviewTranscriptAsync: (
     input: T3VoiceUpdateThreadReviewTranscriptInput,
   ) => Promise<void>;

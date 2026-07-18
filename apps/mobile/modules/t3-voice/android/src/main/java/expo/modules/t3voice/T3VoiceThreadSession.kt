@@ -377,12 +377,14 @@ internal class T3VoiceThreadSession(
           skipPending = true
           return
         }
-        if (
-          mediaOwner != MediaOwner.PLAYBACK &&
-            mediaOwner != MediaOwner.STARTING_PLAYBACK
-        ) {
+        // While STARTING_PLAYBACK, only latch — startPlayback owns acquire/release/emit after
+        // establish so we do not releaseAudio before acquireAudio races.
+        if (mediaOwner == MediaOwner.STARTING_PLAYBACK) {
+          skipRequestedPlaybackId = current
+          skipPending = true
           return
         }
+        if (mediaOwner != MediaOwner.PLAYBACK) return
         if (skipRequestedPlaybackId == current) return
         skipRequestedPlaybackId = current
         inFlightMediaCallbacks += 1

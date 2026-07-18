@@ -219,11 +219,13 @@ that admitted their work, so late callbacks from an earlier owner cannot mutate 
 
 React, notification intents, and MediaSession callbacks dispatch the same typed controller commands.
 React subscribes to complete snapshots and does not maintain a second Android voice state machine.
-On Android, Thread Auto Listen response speech is owned by the semantic native runtime
-(`playResponses`); React must not drive the generic PCM player for the same preference. Headset
-actions during response playback **skip** speech (cancel + complete cycle)—not pause/resume.
 The native bridge does not expose credentials, provider identifiers, SDP, raw provider events, or
 temporary recording paths.
+
+**Work-in-progress (feature/android-native-thread-voice-authority):** On Android, Thread Auto Listen
+response speech is moving to the semantic native runtime only (`playResponses`); React must not
+drive the generic PCM player for that preference. Headset during response playback **skips** speech
+(cancel + complete cycle)—not pause/resume. Treat as design-as-built only after device acceptance.
 
 ### Realtime-to-Thread
 

@@ -133,7 +133,9 @@ internal class T3VoiceAndroidControls(
           }
 
           override fun onPause() {
+            // While PLAYING, transport pause must skip speech (not pause/resume product).
             dispatchFirst(
+              T3VoiceAndroidControlAction.SKIP,
               T3VoiceAndroidControlAction.MUTE,
               T3VoiceAndroidControlAction.FINISH_UTTERANCE,
             )

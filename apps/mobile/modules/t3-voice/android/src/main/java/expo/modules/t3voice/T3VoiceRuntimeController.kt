@@ -192,6 +192,8 @@ internal class T3VoiceRuntimeController(
           )
         T3VoiceRuntimeCommand.FinishThreadUtterance -> finishThreadUtterance()
         T3VoiceRuntimeCommand.SkipThreadPlayback -> skipThreadPlayback()
+        is T3VoiceRuntimeCommand.UpdateThreadPlayResponses ->
+          updateThreadPlayResponses(command.playResponses)
         is T3VoiceRuntimeCommand.UpdateThreadReviewTranscript ->
           updateThreadReviewTranscript(
             command.expectedGeneration,
@@ -493,6 +495,20 @@ internal class T3VoiceRuntimeController(
     // Tolerate the race where natural finish lands microseconds before skip.
     if (state.stage != T3VoiceThreadStage.PLAYING) return duplicate()
     runDriver(T3VoiceOperation.THREAD) { driver.cancelThreadPlayback(current.generation) }
+    return applied()
+  }
+
+  private fun updateThreadPlayResponses(playResponses: Boolean): T3VoiceCommandResult {
+    val state = current.state as? T3VoiceControllerState.Thread
+      ?: return rejected(T3VoiceCommandRejection.INVALID_STATE)
+    if (state.settings.playResponses == playResponses) return duplicate()
+    val next = state.copy(settings = state.settings.copy(playResponses = playResponses))
+    update(next)
+    // Disabling while audible: skip current speech (complete cycle). Waiting just updates
+    // settings so the next response is not played.
+    if (!playResponses && state.stage == T3VoiceThreadStage.PLAYING) {
+      runDriver(T3VoiceOperation.THREAD) { driver.cancelThreadPlayback(current.generation) }
+    }
     return applied()
   }
 

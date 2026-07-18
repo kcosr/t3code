@@ -1404,6 +1404,57 @@ class T3VoiceRuntimeControllerTest {
   }
 
   @Test
+  fun updateThreadPlayResponsesDisableWhileWaitingPreventsPlayback() {
+    val driver = FakeDriver()
+    val controller = T3VoiceRuntimeController(driver)
+    controller.dispatch(
+      T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session),
+    )
+    controller.activateInitialStart(1)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadEndpointDetected)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingFinalized)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadTranscriptReady("spoken request"))
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadSubmitted)
+    assertThreadStage(controller, T3VoiceThreadStage.WAITING)
+
+    assertEquals(
+      T3VoiceCommandOutcome.APPLIED,
+      controller
+        .dispatch(T3VoiceRuntimeCommand.UpdateThreadPlayResponses(playResponses = false))
+        .outcome,
+    )
+    val state = controller.snapshot().state as T3VoiceControllerState.Thread
+    assertFalse(state.settings.playResponses)
+
+    assertTrue(
+      controller.onCallback(1, T3VoiceRuntimeCallback.ThreadResponseReady(hasPlayback = true)),
+    )
+    assertThreadStage(controller, T3VoiceThreadStage.REARMING)
+    assertFalse(driver.actions.any { it.startsWith("play-thread") })
+  }
+
+  @Test
+  fun updateThreadPlayResponsesDisableWhilePlayingSkips() {
+    val driver = FakeDriver()
+    val controller = T3VoiceRuntimeController(driver)
+    controller.dispatch(
+      T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session),
+    )
+    controller.activateInitialStart(1)
+    advanceThreadToPlaying(controller)
+
+    assertEquals(
+      T3VoiceCommandOutcome.APPLIED,
+      controller
+        .dispatch(T3VoiceRuntimeCommand.UpdateThreadPlayResponses(playResponses = false))
+        .outcome,
+    )
+    assertEquals("cancel-thread-playback:1", driver.actions.last())
+    assertThreadStage(controller, T3VoiceThreadStage.PLAYING)
+  }
+
+  @Test
   fun skipThreadPlaybackWithAutoRearmCancelsThenRearmsOnFinish() {
     val driver = FakeDriver()
     val controller = T3VoiceRuntimeController(driver)

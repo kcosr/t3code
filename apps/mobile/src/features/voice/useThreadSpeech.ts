@@ -396,8 +396,15 @@ export function useThreadSpeech(input: {
   useEffect(() => {
     if (!nativeAuthority) return;
     const snapshot = voiceRuntime.snapshot;
-    setPlaying(snapshot.mode === "thread" && snapshot.phase === "playing");
-  }, [nativeAuthority, voiceRuntime.snapshot]);
+    // Prefer matching this screen's thread when the snapshot carries a target.
+    const playingThisThread =
+      snapshot.mode === "thread" &&
+      snapshot.phase === "playing" &&
+      (input.scopeKey.length === 0 ||
+        snapshot.target.threadId === input.scopeKey ||
+        input.scopeKey.endsWith(snapshot.target.threadId));
+    setPlaying(playingThisThread);
+  }, [input.scopeKey, nativeAuthority, voiceRuntime.snapshot]);
 
   useEffect(() => {
     ++operationGenerationRef.current;
@@ -481,8 +488,10 @@ export function useThreadSpeech(input: {
       const cancellation = (async () => {
         if (native === null) return;
         if (nativeAuthority) {
-          // Skip any in-flight native response speech; preference already maps to playResponses.
-          await native.skipThreadPlaybackAsync().catch(() => undefined);
+          // Mid-cycle settings: stop pending/current speech and persist for rearm cycles.
+          await native
+            .updateThreadPlayResponsesAsync({ playResponses: false })
+            .catch(() => undefined);
           return;
         }
         const playbackId =
@@ -546,8 +555,14 @@ export function useThreadSpeech(input: {
     plannerRef.current = result.state;
     setEnabled(requestedEnabled);
     setError(null);
-    if (!nativeAuthority) enqueueActions(result.actions);
-  }, [disableImmediately, enqueueActions, nativeAuthority, preferencesResult]);
+    if (nativeAuthority) {
+      void native
+        ?.updateThreadPlayResponsesAsync({ playResponses: true })
+        .catch(() => undefined);
+    } else {
+      enqueueActions(result.actions);
+    }
+  }, [disableImmediately, enqueueActions, native, nativeAuthority, preferencesResult]);
 
   const toggle = useCallback(() => {
     if (!nativeAuthority && !capabilityAvailable) return;
@@ -569,13 +584,19 @@ export function useThreadSpeech(input: {
     setEnabled(result.enabled);
     savePreferences({ threadSpeechEnabled: result.enabled });
     setError(null);
-    // Preference drives native playResponses; do not start React PCM on Android.
-    if (!nativeAuthority) enqueueActions(result.actions);
+    if (nativeAuthority) {
+      void native
+        ?.updateThreadPlayResponsesAsync({ playResponses: true })
+        .catch(() => undefined);
+    } else {
+      enqueueActions(result.actions);
+    }
   }, [
     capabilityAvailable,
     disableImmediately,
     enqueueActions,
     input.historyReady,
+    native,
     nativeAuthority,
     savePreferences,
   ]);
@@ -657,8 +678,14 @@ export function useThreadSpeech(input: {
     setEnabled(true);
     savePreferences({ threadSpeechEnabled: true });
     setError(null);
-    if (!nativeAuthority) enqueueActions(result.actions);
-  }, [enqueueActions, nativeAuthority, savePreferences]);
+    if (nativeAuthority) {
+      void native
+        ?.updateThreadPlayResponsesAsync({ playResponses: true })
+        .catch(() => undefined);
+    } else {
+      enqueueActions(result.actions);
+    }
+  }, [enqueueActions, native, nativeAuthority, savePreferences]);
 
   useEffect(
     () => () => {
