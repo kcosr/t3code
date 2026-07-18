@@ -1094,6 +1094,7 @@ private fun T3VoiceAndroidControlAction.toNotificationActionId(): T3VoiceNotific
     T3VoiceAndroidControlAction.UNMUTE -> T3VoiceNotificationActionId.UNMUTE
     T3VoiceAndroidControlAction.FINISH_UTTERANCE -> T3VoiceNotificationActionId.FINISH_UTTERANCE
     T3VoiceAndroidControlAction.SUBMIT_TRANSCRIPT -> T3VoiceNotificationActionId.SUBMIT_TRANSCRIPT
+    T3VoiceAndroidControlAction.SKIP -> T3VoiceNotificationActionId.SKIP
     T3VoiceAndroidControlAction.STOP -> T3VoiceNotificationActionId.STOP
     T3VoiceAndroidControlAction.START,
     T3VoiceAndroidControlAction.DISABLE,
