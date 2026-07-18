@@ -125,7 +125,8 @@ internal class T3VoiceThreadSession(
               deleteRecording(finish)
               return@execute
             }
-            media.releaseAudio()
+            // Capture done with speech: play Ended before upload/submit (hands-free cycle).
+            playEndedAfterCaptureThenReleaseAudio()
             emitIfActive(T3VoiceRuntimeCallback.ThreadRecordingFinalized)
           }
         }
@@ -446,23 +447,48 @@ internal class T3VoiceThreadSession(
       inFlightMediaCallbacks += 1
     }
     try {
-      media.releaseAudio()
       when (termination) {
-        is T3VoiceRecordingTermination.Completed ->
+        is T3VoiceRecordingTermination.Completed -> {
+          // Auto-endpoint with usable speech: single Ended beep before cycle continues.
+          playEndedAfterCaptureThenReleaseAudio()
           emitIfActive(T3VoiceRuntimeCallback.ThreadEndpointDetected)
-        is T3VoiceRecordingTermination.Cancelled ->
+        }
+        is T3VoiceRecordingTermination.Cancelled -> {
+          media.releaseAudio()
           emitIfActive(T3VoiceRuntimeCallback.ThreadNoSpeechDetected)
-        is T3VoiceRecordingTermination.Failed ->
+        }
+        is T3VoiceRecordingTermination.Failed -> {
+          media.releaseAudio()
           failCycle(
             IllegalStateException("Recorder finalization failed."),
             "recording-finalization-failed",
             "Voice recording could not be finalized.",
           )
+        }
       }
     } finally {
       mediaCallbackFinished()
     }
     return true
+  }
+
+  /**
+   * After capture ownership is cleared, optionally play the Ended (done) cue on the
+   * communication route, then release audio so upload/submit can proceed.
+   *
+   * Uses [T3VoiceCueTiming.awaitEnded] (existing capture→Ended settle + pre-roll). No separate
+   * product delay control: cue lead silence and rearm guard already cover timing knobs.
+   * Fail-open if cues are off or the player rejects so the Thread cycle never stalls.
+   */
+  private fun playEndedAfterCaptureThenReleaseAudio() {
+    if (cueArming.isEnabled()) {
+      // Recording already held the route; re-acquire is idempotent if still active.
+      val routeHeld = runCatching { media.acquireAudio() }.getOrDefault(false)
+      if (routeHeld) {
+        T3VoiceCueTiming.awaitEnded(cueArming, generation)
+      }
+    }
+    media.releaseAudio()
   }
 
   fun onPlaybackChunkConsumed(id: String, chunkIndex: Int): Boolean {
