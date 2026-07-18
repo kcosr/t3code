@@ -229,32 +229,58 @@ class T3VoiceRuntimeLifecyclePolicyTest {
   }
 
   @Test
-  fun readinessRefreshesForCredentialAndTargetFailuresInEitherMode() {
-    listOf(T3VoiceOperation.REALTIME, T3VoiceOperation.THREAD).forEach { operation ->
-      listOf(
-        "native-session-expired",
-        "takeover-required",
-        "voice_conversation_not_found",
-      ).forEach { code ->
-        assertTrue(
-          T3VoiceReadinessFailurePolicy.shouldRefresh(
-            T3VoiceControllerState.Failed(
-              environmentId = "environment-a",
-              operation = operation,
-              failure = T3VoiceFailure(code, "Refresh required.", recoverable = true),
-            ),
+  fun readinessFailureDispositionIsOperationAwareAndProvenanceFenced() {
+    val ready =
+      T3VoiceReadinessSnapshot.Ready(
+        generation = 4,
+        mode = T3VoiceReadinessMode.THREAD,
+        label = "Thread",
+        expiresAt = "2099-01-01T00:00:00Z",
+      )
+    val launch = T3VoiceReadinessLaunch(operationGeneration = 7, readinessGeneration = 4)
+    val missingThread =
+      T3VoiceControllerSnapshot(
+        state =
+          T3VoiceControllerState.Failed(
+            environmentId = "environment-a",
+            operation = T3VoiceOperation.THREAD,
+            failure = T3VoiceFailure("thread_not_found", "Thread is gone.", recoverable = false),
           ),
-        )
-      }
-    }
-    assertFalse(
-      T3VoiceReadinessFailurePolicy.shouldRefresh(
-        T3VoiceControllerState.Failed(
-          environmentId = "environment-a",
-          operation = T3VoiceOperation.THREAD,
-          failure = T3VoiceFailure("network-failed", "Retry later.", recoverable = true),
-        ),
+        generation = 7,
+        sequence = 9,
+      )
+
+    assertEquals(
+      T3VoiceReadinessFailureDisposition.UNAVAILABLE,
+      T3VoiceReadinessFailurePolicy.disposition(missingThread, ready, launch),
+    )
+    assertEquals(
+      T3VoiceReadinessFailureDisposition.NONE,
+      T3VoiceReadinessFailurePolicy.disposition(missingThread, ready, launch = null),
+    )
+    assertEquals(
+      T3VoiceReadinessFailureDisposition.NONE,
+      T3VoiceReadinessFailurePolicy.disposition(
+        missingThread,
+        ready.copy(generation = 5),
+        launch,
       ),
+    )
+    val expiredThread =
+      missingThread.copy(
+        state =
+          (missingThread.state as T3VoiceControllerState.Failed).copy(
+            failure =
+              T3VoiceFailure(
+                "native-session-expired",
+                "Credential expired.",
+                recoverable = true,
+              ),
+          ),
+      )
+    assertEquals(
+      T3VoiceReadinessFailureDisposition.NEEDS_REFRESH,
+      T3VoiceReadinessFailurePolicy.disposition(expiredThread, ready, launch),
     )
   }
 

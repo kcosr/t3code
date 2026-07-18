@@ -15,16 +15,52 @@ internal object T3VoiceServiceOwnershipPolicy {
   ): Boolean = operationIdle && !readiness.retainsService()
 }
 
-internal object T3VoiceReadinessFailurePolicy {
-  private val refreshCodes =
-    setOf(
-      "native-session-expired",
-      "takeover-required",
-      "voice_conversation_not_found",
-    )
+internal data class T3VoiceReadinessLaunch(
+  val operationGeneration: Long,
+  val readinessGeneration: Long,
+)
 
-  fun shouldRefresh(state: T3VoiceControllerState): Boolean =
-    state is T3VoiceControllerState.Failed && state.failure.code in refreshCodes
+internal enum class T3VoiceReadinessFailureDisposition {
+  NONE,
+  NEEDS_REFRESH,
+  UNAVAILABLE,
+}
+
+internal object T3VoiceReadinessFailurePolicy {
+  fun disposition(
+    snapshot: T3VoiceControllerSnapshot,
+    readiness: T3VoiceReadinessSnapshot,
+    launch: T3VoiceReadinessLaunch?,
+  ): T3VoiceReadinessFailureDisposition {
+    val failed = snapshot.state as? T3VoiceControllerState.Failed
+      ?: return T3VoiceReadinessFailureDisposition.NONE
+    if (
+      launch == null ||
+      launch.operationGeneration != snapshot.generation ||
+      launch.readinessGeneration != readiness.generation
+    ) {
+      return T3VoiceReadinessFailureDisposition.NONE
+    }
+    return when (failed.operation) {
+      T3VoiceOperation.REALTIME ->
+        when (failed.failure.code) {
+          "native-session-expired",
+          "takeover-required",
+          "voice_conversation_not_found",
+          -> T3VoiceReadinessFailureDisposition.NEEDS_REFRESH
+          else -> T3VoiceReadinessFailureDisposition.NONE
+        }
+      T3VoiceOperation.THREAD ->
+        when (failed.failure.code) {
+          "native-session-expired" -> T3VoiceReadinessFailureDisposition.NEEDS_REFRESH
+          "thread_not_found" -> T3VoiceReadinessFailureDisposition.UNAVAILABLE
+          else -> T3VoiceReadinessFailureDisposition.NONE
+        }
+      T3VoiceOperation.SWITCHING_TO_THREAD,
+      T3VoiceOperation.SWITCHING_TO_REALTIME,
+      -> T3VoiceReadinessFailureDisposition.NONE
+    }
+  }
 }
 
 internal object T3VoiceRuntimeAdmissionPolicy {

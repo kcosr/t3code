@@ -176,6 +176,16 @@ internal class T3VoiceReadinessOwner(
     ).also { current = it }
   }
 
+  fun markUnavailable(): T3VoiceReadinessSnapshot.Unavailable? {
+    val configured = configuration ?: return null
+    if (current is T3VoiceReadinessSnapshot.Unavailable) return null
+    return T3VoiceReadinessSnapshot.Unavailable(
+      configured.generation,
+      configured.mode,
+      configured.label,
+    ).also { current = it }
+  }
+
   private fun snapshotFor(
     configuration: T3VoiceReadinessConfiguration,
   ): T3VoiceReadinessSnapshot {

@@ -230,6 +230,7 @@ class T3VoiceRuntimeService : Service() {
   private lateinit var androidControls: T3VoiceAndroidControls
   private lateinit var semanticWakeLock: PowerManager.WakeLock
   private val readinessOwner = T3VoiceReadinessOwner()
+  private var readinessLaunch: T3VoiceReadinessLaunch? = null
   private lateinit var readinessDisableMarker: T3VoiceReadinessDisableMarker
   private val mutableReadinessSnapshots =
     MutableStateFlow<T3VoiceReadinessSnapshot>(T3VoiceReadinessSnapshot.Disabled(0))
@@ -567,7 +568,16 @@ class T3VoiceRuntimeService : Service() {
   private fun startPreparedReadinessLocked(generation: Long) {
     if (!isCompletelyIdle() || hasActiveLegacyMediaOwnerLocked()) return
     when (val decision = readinessOwner.start(generation)) {
-      is T3VoiceReadinessStartDecision.Start -> dispatchSemanticCommand(decision.command)
+      is T3VoiceReadinessStartDecision.Start -> {
+        val result = dispatchSemanticCommand(decision.command)
+        if (result.outcome == T3VoiceCommandOutcome.APPLIED) {
+          readinessLaunch =
+            T3VoiceReadinessLaunch(
+              operationGeneration = result.snapshot.generation,
+              readinessGeneration = generation,
+            )
+        }
+      }
       is T3VoiceReadinessStartDecision.Expired -> {
         publishReadinessLocked(decision.snapshot)
         reconcileSemanticControlsLocked(semanticController.snapshot())
@@ -858,8 +868,27 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun reconcileSemanticControlsLocked(snapshot: T3VoiceControllerSnapshot) {
-    if (T3VoiceReadinessFailurePolicy.shouldRefresh(snapshot.state)) {
-      readinessOwner.markNeedsRefresh()?.let(::publishReadinessLocked)
+    when (
+      T3VoiceReadinessFailurePolicy.disposition(
+        snapshot,
+        readinessOwner.snapshot(),
+        readinessLaunch,
+      )
+    ) {
+      T3VoiceReadinessFailureDisposition.NEEDS_REFRESH ->
+        readinessOwner.markNeedsRefresh()?.let(::publishReadinessLocked)
+      T3VoiceReadinessFailureDisposition.UNAVAILABLE ->
+        readinessOwner.markUnavailable()?.let(::publishReadinessLocked)
+      T3VoiceReadinessFailureDisposition.NONE -> Unit
+    }
+    readinessLaunch?.let { launch ->
+      if (
+        snapshot.generation != launch.operationGeneration ||
+        snapshot.state is T3VoiceControllerState.Idle ||
+        snapshot.state is T3VoiceControllerState.Failed
+      ) {
+        readinessLaunch = null
+      }
     }
     val render =
       androidControls.render(
