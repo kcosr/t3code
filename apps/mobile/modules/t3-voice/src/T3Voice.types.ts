@@ -4,6 +4,7 @@ import type {
   VoiceAudioRouteKind,
   VoiceRealtimeContext,
   VoiceRealtimeTarget,
+  VoiceRuntimeFailure,
   VoiceRuntimeSnapshot,
   VoiceThreadStartInput,
 } from "@t3tools/client-runtime/voice";
@@ -210,6 +211,15 @@ export interface T3VoiceRuntimeErrorEvent {
   readonly recoverable: boolean;
 }
 
+export interface T3VoiceTerminalRuntimeFailureEvent {
+  readonly failureId: number;
+  readonly generation: number;
+  readonly sequence: number;
+  readonly environmentId: string;
+  readonly operation: "realtime" | "thread" | "switching-to-thread" | "switching-to-realtime";
+  readonly failure: VoiceRuntimeFailure;
+}
+
 export type T3VoiceDiagnosticCategory =
   | "lifecycle"
   | "state"
@@ -285,11 +295,19 @@ export interface T3VoiceNativeModule {
       listener: (event: T3VoiceRecordingTerminatedEvent) => void,
     ): T3VoiceEventSubscription;
     (
+      eventName: "runtimeTerminalFailure",
+      listener: (event: T3VoiceTerminalRuntimeFailureEvent) => void,
+    ): T3VoiceEventSubscription;
+    (
       eventName: "runtimeError",
       listener: (event: T3VoiceRuntimeErrorEvent) => void,
     ): T3VoiceEventSubscription;
   };
   readonly getRuntimeSnapshotAsync: () => Promise<VoiceRuntimeSnapshot>;
+  readonly getPendingTerminalRuntimeFailureAsync: () => Promise<T3VoiceTerminalRuntimeFailureEvent | null>;
+  readonly acknowledgeTerminalRuntimeFailureAsync: (input: {
+    readonly failureId: number;
+  }) => Promise<void>;
   readonly getReadinessSnapshotAsync: () => Promise<T3VoiceReadinessSnapshot>;
   readonly configureReadinessAsync: (
     input: T3VoiceConfigureReadinessInput,

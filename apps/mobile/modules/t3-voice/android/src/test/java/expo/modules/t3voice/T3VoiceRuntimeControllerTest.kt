@@ -442,7 +442,8 @@ class T3VoiceRuntimeControllerTest {
   @Test
   fun missingThreadSettingsClosesRealtimeThenPublishesRecoverableSwitchFailure() {
     val driver = FakeDriver()
-    val controller = T3VoiceRuntimeController(driver)
+    val terminalFailures = mutableListOf<T3VoiceControllerSnapshot>()
+    val controller = T3VoiceRuntimeController(driver, terminalFailures::add)
     controller.dispatch(
       T3VoiceRuntimeCommand.StartRealtime(realtimeTarget.copy(threadSettings = null), session),
     )
@@ -467,6 +468,7 @@ class T3VoiceRuntimeControllerTest {
     assertEquals(T3VoiceOperation.SWITCHING_TO_THREAD, failed.operation)
     assertEquals("thread-settings-unavailable", failed.failure.code)
     assertTrue(failed.failure.recoverable)
+    assertEquals(controller.snapshot(), terminalFailures.single())
     assertFalse(driver.actions.any { it.startsWith("start-thread") })
   }
 
@@ -604,7 +606,8 @@ class T3VoiceRuntimeControllerTest {
 
   @Test
   fun `Stop intent reaches Idle when an already quiesced Thread failure arrives`() {
-    val controller = T3VoiceRuntimeController(FakeDriver())
+    val terminalFailures = mutableListOf<T3VoiceControllerSnapshot>()
+    val controller = T3VoiceRuntimeController(FakeDriver(), terminalFailures::add)
     controller.dispatch(
       T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session),
     )
@@ -621,6 +624,10 @@ class T3VoiceRuntimeControllerTest {
       ),
     )
     assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
+    assertEquals(1, terminalFailures.size)
+    val terminal = terminalFailures.single()
+    assertEquals(1, terminal.generation)
+    assertEquals("recording-failed", (terminal.state as T3VoiceControllerState.Failed).failure.code)
   }
 
   @Test
@@ -1091,7 +1098,8 @@ class T3VoiceRuntimeControllerTest {
   @Test
   fun recoverableThreadCycleFailureRearmsAndClearsItsStatusOnRestart() {
     val driver = FakeDriver()
-    val controller = T3VoiceRuntimeController(driver)
+    val terminalFailures = mutableListOf<T3VoiceControllerSnapshot>()
+    val controller = T3VoiceRuntimeController(driver, terminalFailures::add)
     controller.dispatch(
       T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session),
     )
@@ -1113,6 +1121,7 @@ class T3VoiceRuntimeControllerTest {
     val recording = controller.snapshot().state as T3VoiceControllerState.Thread
     assertEquals(T3VoiceThreadStage.RECORDING, recording.stage)
     assertNull(recording.cycleFailure)
+    assertTrue(terminalFailures.isEmpty())
   }
 
   @Test

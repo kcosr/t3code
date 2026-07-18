@@ -47,6 +47,16 @@ class T3VoiceRuntimeService : Service() {
 
     fun runtimeSnapshot(): T3VoiceControllerSnapshot = semanticController.snapshot()
 
+    val terminalRuntimeFailures: StateFlow<T3VoiceTerminalRuntimeFailure?>
+      get() = T3VoiceTerminalRuntimeFailureStore.head
+
+    fun terminalRuntimeFailure(): T3VoiceTerminalRuntimeFailure? =
+      T3VoiceTerminalRuntimeFailureStore.head.value
+
+    fun acknowledgeTerminalRuntimeFailure(failureId: Long) {
+      T3VoiceTerminalRuntimeFailureStore.acknowledge(failureId)
+    }
+
     val readinessSnapshots: StateFlow<T3VoiceReadinessSnapshot>
       get() = mutableReadinessSnapshots.asStateFlow()
 
@@ -259,7 +269,8 @@ class T3VoiceRuntimeService : Service() {
         },
         onUnownedAudioFocusActions = ::handleLegacyAudioFocusActions,
       )
-    semanticController = T3VoiceRuntimeController(semanticDriver)
+    semanticController =
+      T3VoiceRuntimeController(semanticDriver, T3VoiceTerminalRuntimeFailureStore::publish)
     semanticWakeLock =
       getSystemService(PowerManager::class.java)
         .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, SEMANTIC_WAKE_LOCK_TAG)

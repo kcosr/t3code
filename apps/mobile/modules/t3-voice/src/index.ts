@@ -33,6 +33,7 @@ export type {
   T3VoiceSubmitThreadTranscriptInput,
   T3VoiceUpdateThreadReviewTranscriptInput,
   T3VoiceRuntimeErrorEvent,
+  T3VoiceTerminalRuntimeFailureEvent,
   T3VoiceRuntimePhase,
   T3VoiceRuntimeState,
 } from "./T3Voice.types";

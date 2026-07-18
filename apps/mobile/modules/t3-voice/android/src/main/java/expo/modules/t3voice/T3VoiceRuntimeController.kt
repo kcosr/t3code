@@ -99,6 +99,7 @@ internal enum class T3VoiceRealtimeClosePolicy {
  */
 internal class T3VoiceRuntimeController(
   private val driver: T3VoiceRuntimeDriver,
+  private val terminalFailureSink: (T3VoiceControllerSnapshot) -> Unit = {},
 ) {
   private sealed interface PendingInitialStart {
     val generation: Long
@@ -653,7 +654,7 @@ internal class T3VoiceRuntimeController(
         if (state.stage != T3VoiceRealtimeStage.STOPPING) return false
         val failure = terminalCloseFailure.also { terminalCloseFailure = null }
         if (failure != null && stopRequestedGeneration != current.generation) {
-          update(
+          publishTerminalFailure(
             T3VoiceControllerState.Failed(
               environmentId = state.target.environmentId,
               operation = T3VoiceOperation.SWITCHING_TO_THREAD,
@@ -1135,14 +1136,28 @@ internal class T3VoiceRuntimeController(
     val driverReleasePending = driverRelease.getOrElse { true }
     failedReleasePending = releasePending || driverReleasePending
     failedReleaseUncertain = !releasePending && driverRelease.isFailure
+    val failedState = T3VoiceControllerState.Failed(failedEnvironmentId, operation, failure)
     if (stopAlreadyRequested && !failedReleasePending) {
+      emitTerminalFailure(failedState)
       stopRequestedGeneration = null
       failedStopRequested = false
       update(T3VoiceControllerState.Idle)
       return
     }
     failedStopRequested = failedReleasePending && stopAlreadyRequested
-    update(T3VoiceControllerState.Failed(failedEnvironmentId, operation, failure))
+    publishTerminalFailure(failedState)
+  }
+
+  private fun publishTerminalFailure(state: T3VoiceControllerState.Failed) {
+    val snapshot = current.copy(state = state, sequence = current.sequence + 1)
+    runCatching { terminalFailureSink(snapshot) }
+    publish(snapshot)
+  }
+
+  private fun emitTerminalFailure(state: T3VoiceControllerState.Failed) {
+    runCatching {
+      terminalFailureSink(current.copy(state = state, sequence = current.sequence + 1))
+    }
   }
 
   private fun applied() = T3VoiceCommandResult(T3VoiceCommandOutcome.APPLIED, current)

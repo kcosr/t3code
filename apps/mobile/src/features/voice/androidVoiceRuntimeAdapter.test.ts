@@ -17,6 +17,7 @@ import {
   VoiceConfirmationId,
 } from "@t3tools/contracts";
 import type { T3VoiceNativeModule } from "@t3tools/mobile-voice-native";
+import type { T3VoiceTerminalRuntimeFailureEvent } from "@t3tools/mobile-voice-native";
 import * as Effect from "effect/Effect";
 import { describe, expect, it, vi } from "vite-plus/test";
 
@@ -113,16 +114,25 @@ const activeThreadSnapshot: VoiceRuntimeSnapshot = {
 const makeHarness = (getSnapshot = async () => idleSnapshot(0)) => {
   let currentPrepared: PreparedConnection | null = prepared;
   let snapshotListener: ((snapshot: VoiceRuntimeSnapshot) => void) | null = null;
+  let terminalFailureListener: ((failure: T3VoiceTerminalRuntimeFailureEvent) => void) | null =
+    null;
   const remove = vi.fn();
   const native = {
     getRuntimeSnapshotAsync: vi.fn(getSnapshot),
+    getPendingTerminalRuntimeFailureAsync: vi.fn(async () => null),
+    acknowledgeTerminalRuntimeFailureAsync: vi.fn(async () => undefined),
     getMicrophonePermissionAsync: vi.fn(async () => ({ granted: true })),
     requestMicrophonePermissionAsync: vi.fn(async () => ({ granted: true })),
     getBluetoothPermissionAsync: vi.fn(async () => ({ granted: true })),
     requestBluetoothPermissionAsync: vi.fn(async () => ({ granted: true })),
-    addListener: vi.fn((eventName: string, listener: (snapshot: VoiceRuntimeSnapshot) => void) => {
-      expect(eventName).toBe("runtimeSnapshotChanged");
-      snapshotListener = listener;
+    addListener: vi.fn((eventName: string, listener: (event: never) => void) => {
+      if (eventName === "runtimeSnapshotChanged") {
+        snapshotListener = listener as (snapshot: VoiceRuntimeSnapshot) => void;
+      } else if (eventName === "runtimeTerminalFailure") {
+        terminalFailureListener = listener as (failure: T3VoiceTerminalRuntimeFailureEvent) => void;
+      } else {
+        throw new Error(`Unexpected event ${eventName}`);
+      }
       return { remove };
     }),
     startRealtimeAsync: vi.fn(async () => undefined),
@@ -169,10 +179,15 @@ const makeHarness = (getSnapshot = async () => idleSnapshot(0)) => {
     if (snapshotListener === null) throw new Error("Snapshot listener is not attached");
     snapshotListener(snapshot);
   };
+  const emitTerminalFailure = (failure: T3VoiceTerminalRuntimeFailureEvent) => {
+    if (terminalFailureListener === null) throw new Error("Failure listener is not attached");
+    terminalFailureListener(failure);
+  };
   return {
     adapter,
     createNativeSession,
     emit,
+    emitTerminalFailure,
     makeClient,
     native,
     remove,
@@ -184,6 +199,36 @@ const makeHarness = (getSnapshot = async () => idleSnapshot(0)) => {
 };
 
 describe("makeAndroidVoiceRuntimeAdapter", () => {
+  it("delivers one terminal failure when hydration and the native event race", async () => {
+    const harness = makeHarness();
+    const failure: T3VoiceTerminalRuntimeFailureEvent = {
+      failureId: 9,
+      generation: 3,
+      sequence: 14,
+      environmentId: String(ENVIRONMENT_ID),
+      operation: "thread",
+      failure: { code: "submission-failed", message: "Submission failed.", retryable: true },
+    };
+    let resolvePending!: (value: T3VoiceTerminalRuntimeFailureEvent | null) => void;
+    vi.mocked(harness.native.getPendingTerminalRuntimeFailureAsync).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolvePending = resolve;
+        }),
+    );
+    const listener = vi.fn();
+
+    const attaching = harness.adapter.subscribeTerminalFailures(listener);
+    harness.emitTerminalFailure(failure);
+    resolvePending(failure);
+    const detach = await attaching;
+
+    expect(listener).toHaveBeenCalledOnce();
+    expect(listener).toHaveBeenCalledWith(failure);
+    detach();
+    expect(harness.remove).toHaveBeenCalledOnce();
+  });
+
   it("mints child credentials for starts and passes them directly to native", async () => {
     const realtimeHarness = makeHarness();
     const threadHarness = makeHarness();

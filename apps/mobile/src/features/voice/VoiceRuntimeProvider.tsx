@@ -29,7 +29,6 @@ import {
   type VoiceRealtimeContext,
   type VoiceRealtimeTarget,
   type VoiceRealtimeTranscriptTurn,
-  type VoiceRuntimeAdapter,
   type VoiceRuntimeSnapshot,
 } from "@t3tools/client-runtime/voice";
 import {
@@ -41,6 +40,7 @@ import {
 import {
   getT3VoiceNativeModule,
   type T3VoiceReadinessSnapshot,
+  type T3VoiceTerminalRuntimeFailureEvent,
 } from "@t3tools/mobile-voice-native";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
@@ -69,7 +69,10 @@ import {
   useComposerDraftContentEmpty,
   useComposerDraftsReady,
 } from "../../state/use-composer-drafts";
-import { makeAndroidVoiceRuntimeAdapter } from "./androidVoiceRuntimeAdapter";
+import {
+  makeAndroidVoiceRuntimeAdapter,
+  type AndroidVoiceRuntimeAdapter,
+} from "./androidVoiceRuntimeAdapter";
 import {
   acceptEnabledAndroidVoiceReadiness,
   androidVoiceReadinessIdentity,
@@ -98,8 +101,16 @@ import { voiceErrorMessage as errorMessage } from "./voiceError";
 
 interface NativeRuntimeConnection {
   readonly environmentId: EnvironmentId;
-  readonly adapter: VoiceRuntimeAdapter;
+  readonly adapter: AndroidVoiceRuntimeAdapter;
 }
+
+interface RuntimeFailurePresentation {
+  completed: boolean;
+  acknowledgement: (() => Promise<void>) | null;
+  acknowledgementInFlight: boolean;
+}
+
+const MAXIMUM_RETAINED_FAILURE_PRESENTATIONS = 64;
 
 interface VoiceConversationConnection {
   readonly environmentId: EnvironmentId;
@@ -196,7 +207,7 @@ export function VoiceRuntimeProvider(props: {
   const voiceStartTransitionRef = useRef(new ExclusiveTransition());
   const threadReviewHydrationTracker = useMemo(() => new ThreadReviewHydrationTracker(), []);
   const resumeAbortRef = useRef<AbortController | null>(null);
-  const handledFailureSequenceRef = useRef<number | null>(null);
+  const failurePresentationsRef = useRef(new Map<number, RuntimeFailurePresentation>());
   const handledClientActionsRef = useRef(new Set<string>());
   const admittedClientActionFocusRef = useRef<AdmittedClientActionFocus | null>(null);
   const promptedConfirmationsRef = useRef(new Set<string>());
@@ -841,7 +852,6 @@ export function VoiceRuntimeProvider(props: {
         }
         await runtime.adapter.startRealtime(target, { signal });
         lastRealtimeTargetRef.current = target;
-        handledFailureSequenceRef.current = null;
       } catch (cause) {
         releaseTraditionalAudio?.();
         throw cause;
@@ -873,55 +883,75 @@ export function VoiceRuntimeProvider(props: {
     [performRealtimeStart],
   );
 
-  useEffect(() => {
-    if (snapshot.mode !== "failed" || handledFailureSequenceRef.current === snapshot.sequence) {
-      return;
-    }
-    handledFailureSequenceRef.current = snapshot.sequence;
-    const target = lastRealtimeTargetRef.current;
-    if (
-      snapshot.operation === "realtime" &&
-      snapshot.failure.code === "takeover-required" &&
-      target?.conversation.type === "continue" &&
-      !target.conversation.takeover
-    ) {
-      const takeoverConversation: VoiceConversationSelection = {
-        ...target.conversation,
-        takeover: true,
+  const presentRuntimeFailure = useCallback(
+    (failed: T3VoiceTerminalRuntimeFailureEvent, acknowledge?: () => Promise<void>) => {
+      const existing = failurePresentationsRef.current.get(failed.failureId);
+      if (existing !== undefined) {
+        if (acknowledge !== undefined) {
+          if (existing.completed) {
+            if (!existing.acknowledgementInFlight) {
+              existing.acknowledgementInFlight = true;
+              void acknowledge()
+                .catch(() => undefined)
+                .finally(() => {
+                  existing.acknowledgementInFlight = false;
+                });
+            }
+          } else if (existing.acknowledgement === null) existing.acknowledgement = acknowledge;
+        }
+        return;
+      }
+      const presentation: RuntimeFailurePresentation = {
+        completed: false,
+        acknowledgement: acknowledge ?? null,
+        acknowledgementInFlight: false,
       };
-      const takeoverTarget: VoiceRealtimeTarget = {
-        ...target,
-        conversation: takeoverConversation,
+      failurePresentationsRef.current.set(failed.failureId, presentation);
+      const complete = () => {
+        if (presentation.completed) return;
+        presentation.completed = true;
+        const acknowledgeFailure = presentation.acknowledgement;
+        presentation.acknowledgement = null;
+        if (acknowledgeFailure !== null) {
+          presentation.acknowledgementInFlight = true;
+          void acknowledgeFailure()
+            .catch(() => undefined)
+            .finally(() => {
+              presentation.acknowledgementInFlight = false;
+            });
+        }
+        if (failurePresentationsRef.current.size <= MAXIMUM_RETAINED_FAILURE_PRESENTATIONS) return;
+        for (const [failureId, retained] of failurePresentationsRef.current) {
+          if (!retained.completed || failureId === failed.failureId) continue;
+          failurePresentationsRef.current.delete(failureId);
+          if (failurePresentationsRef.current.size <= MAXIMUM_RETAINED_FAILURE_PRESENTATIONS) break;
+        }
       };
-      const expectedEnvironmentId = target.environmentId;
-      Alert.alert(
-        "Take over active voice session?",
-        "An existing voice session is already active for this conversation. Taking over stops it and starts a new session here.",
-        [
-          {
-            text: "Cancel",
-            style: "cancel",
-            onPress: () => {
-              const runtime = runtimeRef.current;
-              if (
-                runtime === null ||
-                !voiceRuntimeCommandEnvironmentMatches(
-                  expectedEnvironmentId,
-                  runtime.environmentId,
-                  controllerEnvironmentIdRef.current,
-                )
-              ) {
-                return;
-              }
-              void runtime.adapter
-                .stop()
-                .catch((cause) => Alert.alert("Could not stop voice", errorMessage(cause)));
-            },
-          },
-          {
-            text: "Take Over",
-            onPress: () => {
-              void (async () => {
+      const target = lastRealtimeTargetRef.current;
+      if (
+        failed.operation === "realtime" &&
+        failed.failure.code === "takeover-required" &&
+        target?.conversation.type === "continue" &&
+        !target.conversation.takeover
+      ) {
+        const takeoverConversation: VoiceConversationSelection = {
+          ...target.conversation,
+          takeover: true,
+        };
+        const takeoverTarget: VoiceRealtimeTarget = {
+          ...target,
+          conversation: takeoverConversation,
+        };
+        const expectedEnvironmentId = target.environmentId;
+        Alert.alert(
+          "Take over active voice session?",
+          "An existing voice session is already active for this conversation. Taking over stops it and starts a new session here.",
+          [
+            {
+              text: "Cancel",
+              style: "cancel",
+              onPress: () => {
+                complete();
                 const runtime = runtimeRef.current;
                 if (
                   runtime === null ||
@@ -933,32 +963,90 @@ export function VoiceRuntimeProvider(props: {
                 ) {
                   return;
                 }
-                await runtime.adapter.stop();
-                await startRealtime(takeoverTarget);
-              })().catch((cause) => Alert.alert("Voice takeover failed", errorMessage(cause)));
+                void runtime.adapter
+                  .stop()
+                  .catch((cause) => Alert.alert("Could not stop voice", errorMessage(cause)));
+              },
             },
-          },
-        ],
+            {
+              text: "Take Over",
+              onPress: () => {
+                complete();
+                void (async () => {
+                  const runtime = runtimeRef.current;
+                  if (
+                    runtime === null ||
+                    !voiceRuntimeCommandEnvironmentMatches(
+                      expectedEnvironmentId,
+                      runtime.environmentId,
+                      controllerEnvironmentIdRef.current,
+                    )
+                  ) {
+                    return;
+                  }
+                  await runtime.adapter.stop();
+                  await startRealtime(takeoverTarget);
+                })().catch((cause) => Alert.alert("Voice takeover failed", errorMessage(cause)));
+              },
+            },
+          ],
+          { cancelable: false },
+        );
+        return;
+      }
+      if (
+        failed.operation === "realtime" &&
+        failed.failure.code === "voice_conversation_not_found"
+      ) {
+        void runtimeRef.current?.adapter
+          .stop()
+          .catch((cause) => Alert.alert("Could not stop voice", errorMessage(cause)));
+        Alert.alert(
+          "Conversation no longer available",
+          "It may have been deleted on another device. The conversation list has been refreshed.",
+          [{ text: "OK", onPress: complete }],
+          { cancelable: false },
+        );
+        setBrowserVisible(true);
+        return;
+      }
+      Alert.alert(
+        "Voice session failed",
+        failed.failure.message,
+        [{ text: "OK", onPress: complete }],
         { cancelable: false },
       );
-      return;
-    }
-    if (
-      snapshot.operation === "realtime" &&
-      snapshot.failure.code === "voice_conversation_not_found"
-    ) {
-      void runtimeRef.current?.adapter
-        .stop()
-        .catch((cause) => Alert.alert("Could not stop voice", errorMessage(cause)));
-      Alert.alert(
-        "Conversation no longer available",
-        "It may have been deleted on another device. The conversation list has been refreshed.",
-      );
-      setBrowserVisible(true);
-      return;
-    }
-    Alert.alert("Voice session failed", snapshot.failure.message);
-  }, [snapshot, startRealtime]);
+    },
+    [startRealtime],
+  );
+
+  useEffect(() => {
+    if (applicationState !== "active" || subscribedEnvironmentId === null) return;
+    const runtime = runtimeRef.current;
+    if (runtime === null || runtime.environmentId !== subscribedEnvironmentId) return;
+    let disposed = false;
+    let detach: (() => void) | null = null;
+
+    void runtime.adapter
+      .subscribeTerminalFailures((failure: T3VoiceTerminalRuntimeFailureEvent) => {
+        if (disposed) return;
+        presentRuntimeFailure(failure, () =>
+          runtime.adapter.acknowledgeTerminalFailure(failure.failureId),
+        );
+      })
+      .then((release) => {
+        if (disposed) release();
+        else detach = release;
+      })
+      .catch((cause) => {
+        if (!disposed) Alert.alert("Voice failure reporting unavailable", errorMessage(cause));
+      });
+
+    return () => {
+      disposed = true;
+      detach?.();
+    };
+  }, [applicationState, presentRuntimeFailure, subscribedEnvironmentId]);
 
   useEffect(() => {
     const request = voiceThreadNavigationRequest(snapshot);
