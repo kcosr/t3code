@@ -49,6 +49,7 @@ internal object T3VoiceMediaButtonPolicy {
       KeyEvent.KEYCODE_MEDIA_PAUSE ->
         firstAvailable(
           available,
+          T3VoiceAndroidControlAction.SKIP,
           T3VoiceAndroidControlAction.MUTE,
           T3VoiceAndroidControlAction.FINISH_UTTERANCE,
         )

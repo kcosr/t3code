@@ -273,6 +273,12 @@ class T3VoiceNotificationActionsTest {
     assertTrue(
       (transportActionsFor(presentation.actions) and PlaybackState.ACTION_SKIP_TO_NEXT) != 0L,
     )
+    assertTrue(
+      (transportActionsFor(presentation.actions) and PlaybackState.ACTION_PAUSE) != 0L,
+    )
+    assertTrue(
+      (transportActionsFor(presentation.actions) and PlaybackState.ACTION_PLAY_PAUSE) != 0L,
+    )
   }
 
   @Test

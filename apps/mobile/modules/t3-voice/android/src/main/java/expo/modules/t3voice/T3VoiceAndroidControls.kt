@@ -87,9 +87,11 @@ internal fun transportActionsFor(actions: List<T3VoiceAndroidControlAction>): Lo
         T3VoiceAndroidControlAction.MUTE,
         T3VoiceAndroidControlAction.FINISH_UTTERANCE,
         -> PlaybackState.ACTION_PAUSE
-        T3VoiceAndroidControlAction.SWITCH_TO_THREAD,
-        T3VoiceAndroidControlAction.SKIP,
-        -> PlaybackState.ACTION_SKIP_TO_NEXT
+        T3VoiceAndroidControlAction.SWITCH_TO_THREAD -> PlaybackState.ACTION_SKIP_TO_NEXT
+        T3VoiceAndroidControlAction.SKIP ->
+          PlaybackState.ACTION_SKIP_TO_NEXT or
+            PlaybackState.ACTION_PAUSE or
+            PlaybackState.ACTION_PLAY_PAUSE
         T3VoiceAndroidControlAction.STOP -> PlaybackState.ACTION_STOP
         T3VoiceAndroidControlAction.DISABLE -> 0L
       }
