@@ -55,7 +55,8 @@ class T3VoiceReadinessTest {
     val second = owner.start(1) as T3VoiceReadinessStartDecision.Start
     assertEquals(first.command, second.command)
     assertEquals(T3VoiceRuntimeCommand.StartRealtime(target, session), first.command)
-    assertSame(threadStart, owner.preparedThreadStart())
+    assertSame(threadStart, owner.preparedThreadStartFor("environment-a"))
+    assertNull(owner.preparedThreadStartFor("environment-b"))
   }
 
   @Test
@@ -90,7 +91,7 @@ class T3VoiceReadinessTest {
       )
     assertTrue(snapshot is T3VoiceReadinessSnapshot.Unavailable)
     assertSame(T3VoiceReadinessStartDecision.Unavailable, owner.start(1))
-    assertNull(owner.preparedThreadStart())
+    assertNull(owner.preparedThreadStartFor("environment-a"))
   }
 
   @Test
@@ -98,8 +99,43 @@ class T3VoiceReadinessTest {
     val owner = T3VoiceReadinessOwner { 0 }
     owner.configure(configuration(1))
     assertEquals(T3VoiceReadinessSnapshot.Disabled(2), owner.disable(2))
-    assertNull(owner.preparedThreadStart())
+    assertNull(owner.preparedThreadStartFor("environment-a"))
     assertSame(T3VoiceReadinessStartDecision.Unavailable, owner.start(2))
+  }
+
+  @Test
+  fun malformedReplacementDoesNotMutateTheCurrentReadyConfiguration() {
+    val owner = T3VoiceReadinessOwner { 0 }
+    val original = configuration(1)
+    val ready = owner.configure(original)
+    val malformed =
+      configuration(2).copy(
+        preparedStart =
+          T3VoicePreparedStart.Realtime(
+            target,
+            T3VoiceNativeSessionConfig("https://example.test", "secret", "not-an-instant"),
+          ),
+      )
+
+    assertThrows(IllegalArgumentException::class.java) { owner.configure(malformed) }
+    assertEquals(ready, owner.snapshot())
+    assertEquals(original, owner.checkpoint().configuration)
+  }
+
+  @Test
+  fun failedPromotionRollsBackTheFullReadyConfiguration() {
+    val owner = T3VoiceReadinessOwner { 0 }
+    val original = configuration(1)
+    val ready = owner.configure(original)
+
+    assertThrows(IllegalStateException::class.java) {
+      owner.configureTransaction(configuration(2)) {
+        throw IllegalStateException("foreground promotion failed")
+      }
+    }
+
+    assertEquals(ready, owner.snapshot())
+    assertEquals(original, owner.checkpoint().configuration)
   }
 
   private fun configuration(generation: Long) =

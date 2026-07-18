@@ -86,6 +86,11 @@ internal sealed interface T3VoiceReadinessStartDecision {
     T3VoiceReadinessStartDecision
 }
 
+internal data class T3VoiceReadinessCheckpoint(
+  val configuration: T3VoiceReadinessConfiguration?,
+  val snapshot: T3VoiceReadinessSnapshot,
+)
+
 /** Process-local owner for the idle Ready envelope. It never persists credentials or targets. */
 internal class T3VoiceReadinessOwner(
   private val nowEpochMillis: () -> Long = T3VoiceTime::nowEpochMillis,
@@ -95,11 +100,34 @@ internal class T3VoiceReadinessOwner(
 
   fun snapshot(): T3VoiceReadinessSnapshot = current
 
+  fun checkpoint(): T3VoiceReadinessCheckpoint =
+    T3VoiceReadinessCheckpoint(configuration, current)
+
+  fun restore(checkpoint: T3VoiceReadinessCheckpoint) {
+    configuration = checkpoint.configuration
+    current = checkpoint.snapshot
+  }
+
   fun configure(next: T3VoiceReadinessConfiguration): T3VoiceReadinessSnapshot {
     require(next.generation > current.generation) { "Readiness generation is stale." }
+    val nextSnapshot = snapshotFor(next)
     configuration = next
-    current = snapshotFor(next)
+    current = nextSnapshot
     return current
+  }
+
+  fun <A> configureTransaction(
+    next: T3VoiceReadinessConfiguration,
+    activate: (T3VoiceReadinessSnapshot) -> A,
+  ): A {
+    val previous = checkpoint()
+    val nextSnapshot = configure(next)
+    return try {
+      activate(nextSnapshot)
+    } catch (cause: Throwable) {
+      restore(previous)
+      throw cause
+    }
   }
 
   fun disable(generation: Long): T3VoiceReadinessSnapshot.Disabled {
@@ -130,9 +158,11 @@ internal class T3VoiceReadinessOwner(
     return T3VoiceReadinessStartDecision.Start(prepared.command())
   }
 
-  fun preparedThreadStart(): T3VoiceThreadStart? =
-    configuration?.preparedThreadSwitch
-      ?: (configuration?.preparedStart as? T3VoicePreparedStart.Thread)?.start
+  fun preparedThreadStartFor(environmentId: String): T3VoiceThreadStart? =
+    (
+      configuration?.preparedThreadSwitch
+        ?: (configuration?.preparedStart as? T3VoicePreparedStart.Thread)?.start
+    )?.takeIf { it.target.environmentId == environmentId }
 
   fun markNeedsRefresh(): T3VoiceReadinessSnapshot.NeedsRefresh? {
     val configured = configuration ?: return null

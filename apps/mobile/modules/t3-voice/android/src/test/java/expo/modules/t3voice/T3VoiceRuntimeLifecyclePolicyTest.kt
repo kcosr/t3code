@@ -135,7 +135,7 @@ class T3VoiceRuntimeLifecyclePolicyTest {
       T3VoiceSemanticStartIntentPolicy.decide(
         requestedGeneration = 1,
         snapshot = newer,
-        serviceCompletelyIdle = false,
+        serviceCanStop = false,
       ),
     )
     assertEquals(
@@ -143,7 +143,7 @@ class T3VoiceRuntimeLifecyclePolicyTest {
       T3VoiceSemanticStartIntentPolicy.decide(
         requestedGeneration = 2,
         snapshot = newer,
-        serviceCompletelyIdle = false,
+        serviceCanStop = false,
       ),
     )
   }
@@ -157,7 +157,7 @@ class T3VoiceRuntimeLifecyclePolicyTest {
       T3VoiceSemanticStartIntentPolicy.decide(
         requestedGeneration = 1,
         snapshot = idle,
-        serviceCompletelyIdle = true,
+        serviceCanStop = true,
       ),
     )
     assertEquals(
@@ -165,7 +165,7 @@ class T3VoiceRuntimeLifecyclePolicyTest {
       T3VoiceSemanticStartIntentPolicy.decide(
         requestedGeneration = 1,
         snapshot = idle,
-        serviceCompletelyIdle = false,
+        serviceCanStop = false,
       ),
     )
   }
@@ -183,7 +183,7 @@ class T3VoiceRuntimeLifecyclePolicyTest {
   }
 
   @Test
-  fun readyRetainsForegroundOnlyAfterTheOperationIsExactlyIdle() {
+  fun readyRetainsTheServiceAfterTheOperationIsExactlyIdle() {
     val ready =
       T3VoiceReadinessSnapshot.Ready(
         generation = 4,
@@ -191,18 +191,69 @@ class T3VoiceRuntimeLifecyclePolicyTest {
         label = "Realtime",
         expiresAt = "2099-01-01T00:00:00Z",
       )
-    assertFalse(T3VoiceForegroundRetentionPolicy.shouldRelease(operationIdle = true, ready))
-    assertFalse(T3VoiceForegroundRetentionPolicy.shouldRelease(operationIdle = false, ready))
+    assertFalse(T3VoiceServiceOwnershipPolicy.canStop(operationIdle = true, ready))
+    assertFalse(T3VoiceServiceOwnershipPolicy.canStop(operationIdle = false, ready))
     assertTrue(
-      T3VoiceForegroundRetentionPolicy.shouldRelease(
+      T3VoiceServiceOwnershipPolicy.canStop(
         operationIdle = true,
         T3VoiceReadinessSnapshot.Disabled(5),
       ),
     )
     assertFalse(
-      T3VoiceForegroundRetentionPolicy.shouldRelease(
+      T3VoiceServiceOwnershipPolicy.canStop(
         operationIdle = false,
         T3VoiceReadinessSnapshot.Disabled(5),
+      ),
+    )
+  }
+
+  @Test
+  fun staleStartCannotStopAnOperationIdleServiceOwnedByReadiness() {
+    val ready =
+      T3VoiceReadinessSnapshot.Ready(
+        generation = 4,
+        mode = T3VoiceReadinessMode.REALTIME,
+        label = "Realtime",
+        expiresAt = "2099-01-01T00:00:00Z",
+      )
+    val idle = T3VoiceControllerSnapshot(T3VoiceControllerState.Idle, 2, 5)
+
+    assertEquals(
+      T3VoiceSemanticStartIntentDecision.IGNORE_STALE,
+      T3VoiceSemanticStartIntentPolicy.decide(
+        requestedGeneration = 1,
+        snapshot = idle,
+        serviceCanStop = T3VoiceServiceOwnershipPolicy.canStop(true, ready),
+      ),
+    )
+  }
+
+  @Test
+  fun readinessRefreshesForCredentialAndTargetFailuresInEitherMode() {
+    listOf(T3VoiceOperation.REALTIME, T3VoiceOperation.THREAD).forEach { operation ->
+      listOf(
+        "native-session-expired",
+        "takeover-required",
+        "voice_conversation_not_found",
+      ).forEach { code ->
+        assertTrue(
+          T3VoiceReadinessFailurePolicy.shouldRefresh(
+            T3VoiceControllerState.Failed(
+              environmentId = "environment-a",
+              operation = operation,
+              failure = T3VoiceFailure(code, "Refresh required.", recoverable = true),
+            ),
+          ),
+        )
+      }
+    }
+    assertFalse(
+      T3VoiceReadinessFailurePolicy.shouldRefresh(
+        T3VoiceControllerState.Failed(
+          environmentId = "environment-a",
+          operation = T3VoiceOperation.THREAD,
+          failure = T3VoiceFailure("network-failed", "Retry later.", recoverable = true),
+        ),
       ),
     )
   }

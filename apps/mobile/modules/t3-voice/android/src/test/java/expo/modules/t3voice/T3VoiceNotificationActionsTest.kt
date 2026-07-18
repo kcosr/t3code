@@ -1,5 +1,6 @@
 package expo.modules.t3voice
 
+import android.media.session.PlaybackState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
@@ -55,6 +56,18 @@ class T3VoiceNotificationActionsTest {
       accessToken = "test-token",
       expiresAt = "2099-01-01T00:00:00Z",
     )
+
+  @Test
+  fun readyDisableIsCustomOnlyAndDoesNotAdvertiseTransportStop() {
+    val actions =
+      transportActionsFor(
+        listOf(T3VoiceAndroidControlAction.START, T3VoiceAndroidControlAction.DISABLE),
+      )
+
+    assertTrue(actions and PlaybackState.ACTION_PLAY != 0L)
+    assertTrue(actions and PlaybackState.ACTION_PLAY_PAUSE != 0L)
+    assertEquals(0L, actions and PlaybackState.ACTION_STOP)
+  }
 
   @Test
   fun realtimeNotificationCommandsUseTheControllerCommandPath() {

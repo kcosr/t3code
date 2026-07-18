@@ -8,11 +8,23 @@ internal object T3VoiceRuntimeLifecyclePolicy {
     state !is T3VoiceControllerState.Idle && state !is T3VoiceControllerState.Failed
 }
 
-internal object T3VoiceForegroundRetentionPolicy {
-  fun shouldRelease(
+internal object T3VoiceServiceOwnershipPolicy {
+  fun canStop(
     operationIdle: Boolean,
     readiness: T3VoiceReadinessSnapshot,
   ): Boolean = operationIdle && !readiness.retainsService()
+}
+
+internal object T3VoiceReadinessFailurePolicy {
+  private val refreshCodes =
+    setOf(
+      "native-session-expired",
+      "takeover-required",
+      "voice_conversation_not_found",
+    )
+
+  fun shouldRefresh(state: T3VoiceControllerState): Boolean =
+    state is T3VoiceControllerState.Failed && state.failure.code in refreshCodes
 }
 
 internal object T3VoiceRuntimeAdmissionPolicy {
@@ -32,7 +44,7 @@ internal object T3VoiceSemanticStartIntentPolicy {
   fun decide(
     requestedGeneration: Long,
     snapshot: T3VoiceControllerSnapshot,
-    serviceCompletelyIdle: Boolean,
+    serviceCanStop: Boolean,
   ): T3VoiceSemanticStartIntentDecision {
     val matchingStart =
       requestedGeneration == snapshot.generation &&
@@ -43,7 +55,7 @@ internal object T3VoiceSemanticStartIntentPolicy {
         }
     return when {
       matchingStart -> T3VoiceSemanticStartIntentDecision.ACTIVATE
-      serviceCompletelyIdle -> T3VoiceSemanticStartIntentDecision.STOP_IDLE_SERVICE
+      serviceCanStop -> T3VoiceSemanticStartIntentDecision.STOP_IDLE_SERVICE
       else -> T3VoiceSemanticStartIntentDecision.IGNORE_STALE
     }
   }

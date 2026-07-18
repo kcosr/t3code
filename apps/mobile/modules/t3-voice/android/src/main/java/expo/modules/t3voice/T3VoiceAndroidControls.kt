@@ -75,6 +75,29 @@ internal fun T3VoiceAndroidControlAction.pendingIntentIdentity(
     dataUri = "$SEMANTIC_CONTROL_URI_PREFIX/${owner.name}/$generation/$name",
   )
 
+internal fun transportActionsFor(actions: List<T3VoiceAndroidControlAction>): Long =
+  actions.fold(0L) { mask, id ->
+    mask or
+      when (id) {
+        T3VoiceAndroidControlAction.START,
+        T3VoiceAndroidControlAction.UNMUTE,
+        T3VoiceAndroidControlAction.SUBMIT_TRANSCRIPT,
+        -> PlaybackState.ACTION_PLAY
+        T3VoiceAndroidControlAction.MUTE,
+        T3VoiceAndroidControlAction.FINISH_UTTERANCE,
+        -> PlaybackState.ACTION_PAUSE
+        T3VoiceAndroidControlAction.SWITCH_TO_THREAD -> PlaybackState.ACTION_SKIP_TO_NEXT
+        T3VoiceAndroidControlAction.STOP -> PlaybackState.ACTION_STOP
+        T3VoiceAndroidControlAction.DISABLE -> 0L
+      }
+  }.let { mask ->
+    if (T3VoiceAndroidControlAction.START in actions) {
+      mask or PlaybackState.ACTION_PLAY_PAUSE
+    } else {
+      mask
+    }
+  }
+
 /** Renders notification and MediaSession controls from the controller's current state. */
 internal class T3VoiceAndroidControls(
   private val context: Context,
@@ -174,14 +197,7 @@ internal class T3VoiceAndroidControls(
   }
 
   private fun renderMediaSession(presentation: T3VoiceAndroidControlsPresentation.Active) {
-    val transportActions =
-      presentation.actions.fold(0L) { mask, id -> mask or id.transportAction() }.let { mask ->
-        if (T3VoiceAndroidControlAction.START in presentation.actions) {
-          mask or PlaybackState.ACTION_PLAY_PAUSE
-        } else {
-          mask
-        }
-      }
+    val transportActions = transportActionsFor(presentation.actions)
     mediaSession.setPlaybackState(
       PlaybackState.Builder()
         .setState(presentation.playbackState, 0, 1f)
@@ -289,21 +305,6 @@ internal class T3VoiceAndroidControls(
     )
   }
 
-  private fun T3VoiceAndroidControlAction.transportAction(): Long =
-    when (this) {
-      T3VoiceAndroidControlAction.START,
-      T3VoiceAndroidControlAction.UNMUTE,
-      T3VoiceAndroidControlAction.SUBMIT_TRANSCRIPT,
-      -> PlaybackState.ACTION_PLAY
-      T3VoiceAndroidControlAction.MUTE,
-      T3VoiceAndroidControlAction.FINISH_UTTERANCE,
-      -> PlaybackState.ACTION_PAUSE
-      T3VoiceAndroidControlAction.SWITCH_TO_THREAD -> PlaybackState.ACTION_SKIP_TO_NEXT
-      T3VoiceAndroidControlAction.STOP,
-      T3VoiceAndroidControlAction.DISABLE,
-      -> PlaybackState.ACTION_STOP
-    }
-
   private fun T3VoiceAndroidControlAction.customActionName(): String =
     MEDIA_CUSTOM_ACTION_PREFIX + name
 
@@ -402,7 +403,7 @@ private fun T3VoiceReadinessSnapshot.androidControlsPresentation():
         generation = generation,
         playbackState = PlaybackState.STATE_PAUSED,
         actions = listOf(T3VoiceAndroidControlAction.DISABLE),
-        title = "Voice ready — $label",
+        title = "Voice unavailable — $label",
         statusText = "Active Thread unavailable",
       )
     is T3VoiceReadinessSnapshot.NeedsRefresh ->
