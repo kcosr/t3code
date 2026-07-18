@@ -116,6 +116,11 @@ class T3VoiceRuntimeService : Service() {
     fun setVoiceCuesEnabled(enabled: Boolean): Map<String, Any?> =
       semanticDriver.setVoiceCuesEnabled(enabled)
 
+    fun voiceCueStartupPreRollMs(): Int = semanticDriver.voiceCueStartupPreRollMs()
+
+    fun setVoiceCueStartupPreRollMs(startupPreRollMs: Int): Map<String, Any?> =
+      semanticDriver.setVoiceCueStartupPreRollMs(startupPreRollMs)
+
     val events: SharedFlow<T3VoiceRuntimeEvent>
       get() = T3VoiceStateStore.events
 

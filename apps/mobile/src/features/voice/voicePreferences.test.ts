@@ -42,7 +42,7 @@ describe("resolveVoicePreferences", () => {
       endSilenceMs: 500,
       noSpeechTimeoutMs: null,
       maximumUtteranceMs: 30 * 60_000,
-      postPlaybackGuardMs: 3_000,
+      postPlaybackGuardMs: 2_000,
       transcriptionTimeoutMs: VOICE_TRANSCRIPTION_TIMEOUT_DEFAULT_MS,
       submissionTimeoutMs: VOICE_SUBMISSION_TIMEOUT_DEFAULT_MS,
       responseTimeoutMs: 60_000,

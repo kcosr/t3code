@@ -18,8 +18,13 @@ import {
   VOICE_NO_SPEECH_DEFAULT_MS,
   VOICE_NO_SPEECH_MAX_MS,
   VOICE_NO_SPEECH_MIN_MS,
+  VOICE_CUE_STARTUP_PRE_ROLL_DEFAULT_MS,
+  VOICE_CUE_STARTUP_PRE_ROLL_MAX_MS,
+  VOICE_CUE_STARTUP_PRE_ROLL_MIN_MS,
+  VOICE_CUE_STARTUP_PRE_ROLL_STEP_MS,
   VOICE_REARM_GUARD_MAX_MS,
   VOICE_REARM_GUARD_MIN_MS,
+  VOICE_REARM_GUARD_STEP_MS,
   VOICE_RESPONSE_TIMEOUT_MAX_MS,
   VOICE_RESPONSE_TIMEOUT_MIN_MS,
   VOICE_SUBMISSION_TIMEOUT_MAX_MS,
@@ -53,7 +58,12 @@ export function SettingsVoiceRouteScreen() {
   const rememberedThread = stored.voiceBackgroundThreadTarget;
   // Native SharedPreferences is the runtime source of truth for cue gating.
   const [nativeVoiceCuesEnabled, setNativeVoiceCuesEnabled] = useState<boolean | null>(null);
+  const [nativeCuePreRollMs, setNativeCuePreRollMs] = useState<number | null>(null);
   const voiceCuesEnabled = nativeVoiceCuesEnabled ?? stored.voiceCuesEnabled !== false;
+  const cueStartupPreRollMs =
+    nativeCuePreRollMs ??
+    stored.voiceCueStartupPreRollMs ??
+    VOICE_CUE_STARTUP_PRE_ROLL_DEFAULT_MS;
   useFocusEffect(
     useCallback(() => {
       void audioRoutePreference.refresh();
@@ -72,7 +82,26 @@ export function SettingsVoiceRouteScreen() {
         .catch(() => {
           // Keep blob fallback when binder is unavailable.
         });
-    }, [audioRoutePreference.refresh, savePreferences, stored.voiceCuesEnabled]),
+      void native
+        .getVoiceCueStartupPreRollMsAsync()
+        .then((result) => {
+          setNativeCuePreRollMs(result.startupPreRollMs);
+          if (
+            stored.voiceCueStartupPreRollMs !== undefined &&
+            stored.voiceCueStartupPreRollMs !== result.startupPreRollMs
+          ) {
+            savePreferences({ voiceCueStartupPreRollMs: result.startupPreRollMs });
+          }
+        })
+        .catch(() => {
+          // Keep blob fallback when binder is unavailable.
+        });
+    }, [
+      audioRoutePreference.refresh,
+      savePreferences,
+      stored.voiceCueStartupPreRollMs,
+      stored.voiceCuesEnabled,
+    ]),
   );
   const copyDiagnostics = async () => {
     const native = getT3VoiceNativeModule();
@@ -168,6 +197,38 @@ export function SettingsVoiceRouteScreen() {
                     cause instanceof Error
                       ? cause.message
                       : "Could not update the native voice cues preference.",
+                  ),
+                );
+            }}
+          />
+          <SettingsStepperRow
+            disabled={!ready || Platform.OS !== "android"}
+            icon="waveform.path"
+            label="Cue lead silence"
+            max={VOICE_CUE_STARTUP_PRE_ROLL_MAX_MS}
+            min={VOICE_CUE_STARTUP_PRE_ROLL_MIN_MS}
+            step={VOICE_CUE_STARTUP_PRE_ROLL_STEP_MS}
+            value={cueStartupPreRollMs}
+            valueLabel={seconds(cueStartupPreRollMs)}
+            onChange={(value) => {
+              const native = getT3VoiceNativeModule();
+              if (native === null) {
+                setNativeCuePreRollMs(value);
+                savePreferences({ voiceCueStartupPreRollMs: value });
+                return;
+              }
+              void native
+                .setVoiceCueStartupPreRollMsAsync({ startupPreRollMs: value })
+                .then((result) => {
+                  setNativeCuePreRollMs(result.startupPreRollMs);
+                  savePreferences({ voiceCueStartupPreRollMs: result.startupPreRollMs });
+                })
+                .catch((cause) =>
+                  Alert.alert(
+                    "Cue lead silence unavailable",
+                    cause instanceof Error
+                      ? cause.message
+                      : "Could not update the native cue lead silence preference.",
                   ),
                 );
             }}
@@ -337,7 +398,7 @@ export function SettingsVoiceRouteScreen() {
             label="Playback guard"
             max={VOICE_REARM_GUARD_MAX_MS}
             min={VOICE_REARM_GUARD_MIN_MS}
-            step={250}
+            step={VOICE_REARM_GUARD_STEP_MS}
             value={voice.postPlaybackGuardMs}
             valueLabel={seconds(voice.postPlaybackGuardMs)}
             onChange={(value) => savePreferences({ voicePostPlaybackGuardMs: value })}

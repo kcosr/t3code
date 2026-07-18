@@ -39,17 +39,28 @@ internal interface T3VoiceCueArming {
 
 internal class T3VoiceCueArmingLive(
   private val settingsStore: T3VoiceCueSettingsStore,
-  private val coordinator: T3VoiceCueCoordinator = T3VoiceCueCoordinator(),
+  private val coordinator: T3VoiceCueCoordinator =
+    T3VoiceCueCoordinator(
+      player =
+        T3VoiceCuePlayer(
+          startupPreRollMs = {
+            settingsStore.read().startupPreRollMs
+          },
+        ),
+    ),
 ) : T3VoiceCueArming {
   override fun isEnabled(): Boolean = settingsStore.read().enabled
 
   override fun setEnabled(enabled: Boolean): T3VoiceCueSettings {
-    val next = settingsStore.write(enabled)
+    val next = settingsStore.writeEnabled(enabled)
     if (!next.enabled) {
       coordinator.stop()
     }
     return next
   }
+
+  fun setStartupPreRollMs(startupPreRollMs: Int): T3VoiceCueSettings =
+    settingsStore.writeStartupPreRollMs(startupPreRollMs)
 
   override fun settings(): T3VoiceCueSettings = settingsStore.read()
 

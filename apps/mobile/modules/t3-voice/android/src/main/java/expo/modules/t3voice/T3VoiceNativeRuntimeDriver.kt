@@ -79,6 +79,18 @@ internal class T3VoiceNativeRuntimeDriver(
     )
   }
 
+  fun voiceCueStartupPreRollMs(): Int = cueArming.settings().startupPreRollMs
+
+  fun setVoiceCueStartupPreRollMs(startupPreRollMs: Int): Map<String, Any?> {
+    val live = cueArming as? T3VoiceCueArmingLive
+    val next =
+      live?.setStartupPreRollMs(startupPreRollMs) ?: cueArming.settings()
+    return mapOf(
+      "startupPreRollMs" to next.startupPreRollMs,
+      "generation" to next.generation,
+    )
+  }
+
   override fun startRealtime(
     generation: Long,
     target: T3VoiceRealtimeTarget,

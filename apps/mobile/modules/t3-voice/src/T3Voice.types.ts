@@ -335,6 +335,12 @@ export interface T3VoiceNativeModule {
   readonly setVoiceCuesEnabledAsync: (input: {
     readonly enabled: boolean;
   }) => Promise<{ readonly enabled: boolean; readonly generation: number }>;
+  readonly getVoiceCueStartupPreRollMsAsync: () => Promise<{
+    readonly startupPreRollMs: number;
+  }>;
+  readonly setVoiceCueStartupPreRollMsAsync: (input: {
+    readonly startupPreRollMs: number;
+  }) => Promise<{ readonly startupPreRollMs: number; readonly generation: number }>;
   readonly getAudioRoutePreferenceAsync: () => Promise<T3VoiceAudioRoutePreferenceState>;
   readonly setAudioRoutePreferenceAsync: (
     input: T3VoiceSetAudioRoutePreferenceInput,

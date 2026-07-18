@@ -21,6 +21,8 @@ import {
   VOICE_MAXIMUM_UTTERANCE_MIN_MS,
   VOICE_NO_SPEECH_MAX_MS,
   VOICE_NO_SPEECH_MIN_MS,
+  VOICE_CUE_STARTUP_PRE_ROLL_MAX_MS,
+  VOICE_CUE_STARTUP_PRE_ROLL_MIN_MS,
   VOICE_REARM_GUARD_MAX_MS,
   VOICE_REARM_GUARD_MIN_MS,
   VOICE_RESPONSE_TIMEOUT_MAX_MS,
@@ -44,6 +46,8 @@ export interface Preferences {
   readonly voiceNoSpeechTimeoutMs?: number | null;
   readonly voiceMaximumUtteranceMs?: number;
   readonly voicePostPlaybackGuardMs?: number;
+  /** Leading silence before Ready/Ended cue tones (ms). Native runtime reads this. */
+  readonly voiceCueStartupPreRollMs?: number;
   readonly voiceTranscriptionTimeoutMs?: number;
   readonly voiceSubmissionTimeoutMs?: number;
   readonly voiceResponseTimeoutMs?: number;
@@ -107,6 +111,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     voiceNoSpeechTimeoutMs?: number | null;
     voiceMaximumUtteranceMs?: number;
     voicePostPlaybackGuardMs?: number;
+    voiceCueStartupPreRollMs?: number;
     voiceTranscriptionTimeoutMs?: number;
     voiceSubmissionTimeoutMs?: number;
     voiceResponseTimeoutMs?: number;
@@ -171,6 +176,13 @@ function sanitizePreferences(parsed: Preferences): Preferences {
       parsed.voicePostPlaybackGuardMs!,
       VOICE_REARM_GUARD_MIN_MS,
       VOICE_REARM_GUARD_MAX_MS,
+    );
+  }
+  if (Number.isFinite(parsed.voiceCueStartupPreRollMs)) {
+    preferences.voiceCueStartupPreRollMs = clampVoicePreference(
+      parsed.voiceCueStartupPreRollMs!,
+      VOICE_CUE_STARTUP_PRE_ROLL_MIN_MS,
+      VOICE_CUE_STARTUP_PRE_ROLL_MAX_MS,
     );
   }
   if (Number.isFinite(parsed.voiceTranscriptionTimeoutMs)) {
