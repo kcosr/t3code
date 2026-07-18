@@ -474,7 +474,7 @@ private fun T3VoiceControllerSnapshot.androidControlsStatusText(): String =
     is T3VoiceControllerState.SwitchingToThread -> "Preparing Thread recording…"
     is T3VoiceControllerState.SwitchingToRealtime -> "Stopping before Realtime…"
     is T3VoiceControllerState.Thread ->
-      when (state.stage) {
+      state.cycleFailure?.message ?: when (state.stage) {
         T3VoiceThreadStage.STARTING -> "Starting recorder…"
         T3VoiceThreadStage.RECORDING -> "Listening"
         T3VoiceThreadStage.FINALIZING -> "Finishing recording…"

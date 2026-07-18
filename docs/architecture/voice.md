@@ -228,6 +228,19 @@ create another turn.
 Recordings are deleted after their bounded transcription attempt. Startup performs a bounded cleanup
 of abandoned cache files; files are not treated as resumable session state.
 
+The endpoint detector is the single authority for usable Thread speech. Automatic endpointing and a
+manual Finish both settle through the same terminal recorder arbitration, including one final
+amplitude observation and the configured minimum-speech requirement. A manual or automatic cycle
+with no usable speech deletes the recording without requesting a media ticket or transcription.
+A defensively blank native transcription result is handled as the same no-input outcome rather than
+as a transcription failure.
+
+No-input and recoverable failures before Thread message dispatch are cycle outcomes, not sticky
+runtime failures. Continuous Thread voice rearms after its configured delay; one-shot Thread voice
+stops to Idle. The privacy-safe failure reason remains visible during the rearm or stop transition
+and clears when the next recording starts. Submission and later failures remain terminal because a
+message may already have been dispatched; they never auto-rearm or submit another turn.
+
 ## Android lifecycle and controls
 
 A visible user action supplies microphone permission and starts the microphone foreground service.
@@ -275,7 +288,9 @@ the service, the readiness snapshot:
   background service.
 - Thread exposes finish utterance while recording, submit while reviewing, and stop.
 - Transitions expose stop.
-- A failed owner retains a Stop-only foreground notification until native release is known.
+- A failed owner retains a Stop-only foreground notification only while native release remains
+  unresolved. Exact cleanup returns the operation controller to Idle, so enabled readiness becomes
+  actionable again without requiring a separate acknowledgement.
 
 MediaSession transport controls map to the same native commands. Recognized media-button key-up and
 repeat events are consumed without dispatch; only the initial key-down can act. In Ready, headset

@@ -328,6 +328,92 @@ internal class T3VoiceThreadSessionTest {
   }
 
   @Test
+  fun `manual finish joins automatic no input already in progress exactly once`() {
+    val media = ConcurrentFinalizationMedia(finishAsNoInput = true)
+    val api = CompletedResponseApi()
+    val recordingStarted = CountDownLatch(1)
+    val noInput = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val voice =
+      session(
+        generation = 1,
+        media = media,
+        api = api,
+        emit = { callback ->
+          callbacks += callback
+          when (callback) {
+            T3VoiceRuntimeCallback.ThreadRecordingStarted -> recordingStarted.countDown()
+            T3VoiceRuntimeCallback.ThreadNoSpeechDetected -> noInput.countDown()
+            else -> Unit
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    voice.start()
+    assertTrue(recordingStarted.await(1, TimeUnit.SECONDS))
+    voice.finishRecording()
+    assertTrue(media.finishEntered.await(1, TimeUnit.SECONDS))
+    val recordingId = media.finalizingRecordingId()
+
+    assertTrue(
+      voice.onRecorderTerminated(
+        T3VoiceRecordingTermination.Cancelled(recordingId, "no-speech"),
+      ),
+    )
+    media.allowFinishToReturn.countDown()
+
+    assertTrue(noInput.await(1, TimeUnit.SECONDS))
+    assertEquals(1, callbacks.count { it == T3VoiceRuntimeCallback.ThreadNoSpeechDetected })
+    assertTrue(callbacks.none { it == T3VoiceRuntimeCallback.ThreadRecordingFinalized })
+    assertEquals(1L, api.ticketCreated.count)
+
+    voice.stop(reportStopped = false)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `manual finish after automatic no input is an exact no op`() {
+    val media = GenerationAwareMedia()
+    val api = CompletedResponseApi()
+    val noInput = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val voice =
+      session(
+        generation = 1,
+        media = media,
+        api = api,
+        emit = { callback ->
+          callbacks += callback
+          if (callback == T3VoiceRuntimeCallback.ThreadNoSpeechDetected) noInput.countDown()
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    voice.start()
+    assertTrue(media.firstRecordingStarted.await(1, TimeUnit.SECONDS))
+    val recordingId = media.cancelActiveRecordingForEndpoint()
+    assertTrue(
+      voice.onRecorderTerminated(
+        T3VoiceRecordingTermination.Cancelled(recordingId, "no-speech"),
+      ),
+    )
+    assertTrue(noInput.await(1, TimeUnit.SECONDS))
+
+    voice.finishRecording()
+    voice.rearmRecording()
+    assertTrue(media.secondRecordingStarted.await(1, TimeUnit.SECONDS))
+    assertEquals(1, callbacks.count { it == T3VoiceRuntimeCallback.ThreadNoSpeechDetected })
+    assertTrue(callbacks.none { it == T3VoiceRuntimeCallback.ThreadRecordingFinalized })
+    assertEquals(1L, api.ticketCreated.count)
+
+    voice.stop(reportStopped = false)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
   fun `permanent focus loss cancels a blocked recording start before it can publish`() {
     val media = DelayedFirstRecordingMedia()
     val quiesced = CountDownLatch(1)
@@ -649,6 +735,11 @@ internal class T3VoiceThreadSessionTest {
         completedRecording(recordingId)
       }
 
+    fun cancelActiveRecordingForEndpoint(): String =
+      synchronized(lock) {
+        checkNotNull(activeRecording).also { activeRecording = null }
+      }
+
     fun completeActivePlayback(): String =
       synchronized(lock) {
         checkNotNull(activePlayback).also { activePlayback = null }
@@ -682,7 +773,9 @@ internal class T3VoiceThreadSessionTest {
     }
   }
 
-  private class ConcurrentFinalizationMedia : T3VoiceThreadMedia {
+  private class ConcurrentFinalizationMedia(
+    private val finishAsNoInput: Boolean = false,
+  ) : T3VoiceThreadMedia {
     val finishEntered = CountDownLatch(1)
     val allowFinishToReturn = CountDownLatch(1)
     private val baseCompletedRecording =
@@ -713,7 +806,7 @@ internal class T3VoiceThreadSessionTest {
       activeRecordingId = recordingId
     }
 
-    override fun finishRecording(recordingId: String): T3VoiceRecordingResult {
+    override fun finishRecording(recordingId: String): T3VoiceThreadRecordingFinish {
       synchronized(this) {
         check(activeRecordingId == recordingId)
         activeRecordingId = null
@@ -721,8 +814,11 @@ internal class T3VoiceThreadSessionTest {
       }
       finishEntered.countDown()
       awaitIgnoringInterrupt(allowFinishToReturn)
-      return completedRecording
+      return if (finishAsNoInput) T3VoiceRecordingNoInput(recordingId) else completedRecording
     }
+
+    @Synchronized
+    fun finalizingRecordingId(): String = checkNotNull(finalizingRecordingId)
 
     @Synchronized
     override fun cancelRecording(recordingId: String) {

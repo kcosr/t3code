@@ -67,8 +67,147 @@ internal class T3VoiceThreadSessionLifecycleTest {
     )
     assertEquals(listOf("edited review transcript"), api.submittedTranscripts)
     assertEquals(api.dispatchedMessageId.get(), api.requestedResponseMessageId.get())
-    assertEquals(listOf(checkNotNull(media.finishedRecording.get())), media.deletedRecordings)
+    assertEquals(1, media.deletedRecordings.size)
+    assertEquals(checkNotNull(media.finishedRecording.get()), media.deletedRecordings.single())
     assertEquals(0, media.finalPlaybackChunkIndex.get())
+  }
+
+  @Test
+  fun `manual no input skips transcription and remains an ordinary cycle outcome`() {
+    val media = LifecycleMedia(finishAsNoInput = true)
+    val api = LifecycleApi()
+    val noInput = CountDownLatch(1)
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val quiesced = CountDownLatch(1)
+    lateinit var voice: T3VoiceThreadSession
+    voice =
+      session(
+        generation = 1,
+        media = media,
+        api = api,
+        emit = { callback ->
+          callbacks += callback
+          if (callback == T3VoiceRuntimeCallback.ThreadRecordingFinalized) {
+            voice.uploadAndTranscribe()
+          }
+          if (callback == T3VoiceRuntimeCallback.ThreadNoSpeechDetected) noInput.countDown()
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    voice.start()
+    assertTrue(media.recordingStarted.await(1, TimeUnit.SECONDS))
+    voice.finishRecording()
+
+    assertTrue(noInput.await(1, TimeUnit.SECONDS))
+    assertTrue(callbacks.none { it == T3VoiceRuntimeCallback.ThreadRecordingFinalized })
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.Failed })
+    assertTrue(api.ticketOperations.isEmpty())
+    assertTrue(media.deletedRecordings.isEmpty())
+
+    voice.stop(reportStopped = false)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `blank defensive transcription becomes no input and deletes media once`() {
+    val media = LifecycleMedia()
+    val api = BlankTranscriptionApi()
+    val noInput = CountDownLatch(1)
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val quiesced = CountDownLatch(1)
+    lateinit var voice: T3VoiceThreadSession
+    voice =
+      session(
+        generation = 1,
+        media = media,
+        api = api,
+        emit = { callback ->
+          callbacks += callback
+          if (callback == T3VoiceRuntimeCallback.ThreadRecordingFinalized) {
+            voice.uploadAndTranscribe()
+          }
+          if (callback == T3VoiceRuntimeCallback.ThreadNoSpeechDetected) noInput.countDown()
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    voice.start()
+    assertTrue(media.recordingStarted.await(1, TimeUnit.SECONDS))
+    voice.finishRecording()
+
+    assertTrue(noInput.await(1, TimeUnit.SECONDS))
+    assertTrue(media.recordingDeleted.await(1, TimeUnit.SECONDS))
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.ThreadTranscriptReady })
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.Failed })
+    assertEquals(1, media.deletedRecordings.size)
+    assertEquals(checkNotNull(media.finishedRecording.get()), media.deletedRecordings.single())
+
+    voice.stop(reportStopped = false)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+    assertEquals(1, media.deletedRecordings.size)
+  }
+
+  @Test
+  fun `recoverable transcription failure reports a cycle failure without terminating the session`() {
+    val media = LifecycleMedia()
+    val cycleFailed = CountDownLatch(1)
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val quiesced = CountDownLatch(1)
+    lateinit var voice: T3VoiceThreadSession
+    voice =
+      session(
+        generation = 1,
+        media = media,
+        api = FailingTranscriptionApi(),
+        emit = { callback ->
+          callbacks += callback
+          if (callback == T3VoiceRuntimeCallback.ThreadRecordingFinalized) {
+            voice.uploadAndTranscribe()
+          }
+          if (callback is T3VoiceRuntimeCallback.ThreadCycleFailed) cycleFailed.countDown()
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    voice.start()
+    assertTrue(media.recordingStarted.await(1, TimeUnit.SECONDS))
+    voice.finishRecording()
+
+    assertTrue(cycleFailed.await(1, TimeUnit.SECONDS))
+    assertEquals(1L, quiesced.count)
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.Failed })
+    voice.rearmRecording()
+    assertTrue(media.secondRecordingStarted.await(1, TimeUnit.SECONDS))
+
+    voice.stop(reportStopped = false)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `ambiguous submission failure remains terminal and never becomes a cycle failure`() {
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val quiesced = CountDownLatch(1)
+    val terminal = AtomicReference<T3VoiceRuntimeCallback?>()
+    val voice =
+      session(
+        generation = 1,
+        media = LifecycleMedia(),
+        api = AmbiguousSubmissionApi(),
+        emit = callbacks::add,
+        onQuiesced = { callback ->
+          terminal.set(callback)
+          quiesced.countDown()
+        },
+      )
+
+    voice.submitTranscript("dispatch once")
+
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+    val failed = terminal.get() as T3VoiceRuntimeCallback.Failed
+    assertEquals("submission-ambiguous", failed.failure.code)
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.ThreadCycleFailed })
+    assertTrue(callbacks.none { it == T3VoiceRuntimeCallback.ThreadSubmitted })
   }
 
   @Test
@@ -214,12 +353,17 @@ internal class T3VoiceThreadSessionLifecycleTest {
       api = api,
     )
 
-  private class LifecycleMedia : T3VoiceThreadMedia {
+  private class LifecycleMedia(
+    private val finishAsNoInput: Boolean = false,
+  ) : T3VoiceThreadMedia {
     val recordingStarted = CountDownLatch(1)
+    val secondRecordingStarted = CountDownLatch(1)
+    val recordingDeleted = CountDownLatch(1)
     val playbackPrepared = CountDownLatch(1)
     val deletedRecordings = CopyOnWriteArrayList<T3VoiceRecordingResult>()
     val finalPlaybackChunkIndex = AtomicInteger(-1)
     val finishedRecording = AtomicReference<T3VoiceRecordingResult?>()
+    private val recordingStartCount = AtomicInteger(0)
     private val activeRecording = AtomicReference<String?>()
     private val activePlayback = AtomicReference<String?>()
 
@@ -232,11 +376,15 @@ internal class T3VoiceThreadSessionLifecycleTest {
       endpointConfig: T3VoiceEndpointDetectionConfig,
     ) {
       check(activeRecording.compareAndSet(null, recordingId))
-      recordingStarted.countDown()
+      when (recordingStartCount.incrementAndGet()) {
+        1 -> recordingStarted.countDown()
+        2 -> secondRecordingStarted.countDown()
+      }
     }
 
-    override fun finishRecording(recordingId: String): T3VoiceRecordingResult {
+    override fun finishRecording(recordingId: String): T3VoiceThreadRecordingFinish {
       check(activeRecording.compareAndSet(recordingId, null))
+      if (finishAsNoInput) return T3VoiceRecordingNoInput(recordingId)
       return T3VoiceRecordingResult(
         recordingId = recordingId,
         uri = "file:///$recordingId.m4a",
@@ -251,6 +399,7 @@ internal class T3VoiceThreadSessionLifecycleTest {
 
     override fun deleteRecording(recording: T3VoiceRecordingResult) {
       deletedRecordings += recording
+      recordingDeleted.countDown()
     }
 
     override fun startPlayback(playbackId: String, sampleRate: Int, channelCount: Int) {
@@ -341,6 +490,47 @@ internal class T3VoiceThreadSessionLifecycleTest {
       onPcm.onChunk(byteArrayOf(1, 2))
       return 2
     }
+  }
+
+  private class BlankTranscriptionApi : ThreadApiAdapter() {
+    override fun createMediaTicket(
+      calls: T3VoiceHttpCallRegistry,
+      operation: T3VoiceMediaOperation,
+      requestId: String,
+    ) = T3VoiceMediaTicket("blank-ticket", "2099-01-01T00:00:00Z")
+
+    override fun transcribe(
+      calls: T3VoiceHttpCallRegistry,
+      recording: T3VoiceRecordingResult,
+      requestId: String,
+      ticket: T3VoiceMediaTicket,
+    ): String = "   "
+  }
+
+  private class FailingTranscriptionApi : ThreadApiAdapter() {
+    override fun createMediaTicket(
+      calls: T3VoiceHttpCallRegistry,
+      operation: T3VoiceMediaOperation,
+      requestId: String,
+    ) = T3VoiceMediaTicket("failing-ticket", "2099-01-01T00:00:00Z")
+
+    override fun transcribe(
+      calls: T3VoiceHttpCallRegistry,
+      recording: T3VoiceRecordingResult,
+      requestId: String,
+      ticket: T3VoiceMediaTicket,
+    ): String = throw T3VoiceNativeApiException("transcription-timeout", retryable = true)
+  }
+
+  private class AmbiguousSubmissionApi : ThreadApiAdapter() {
+    override fun dispatchThreadTurn(
+      calls: T3VoiceHttpCallRegistry,
+      target: T3VoiceThreadTarget,
+      transcript: String,
+      commandId: String,
+      messageId: String,
+      createdAt: String,
+    ): Long = throw T3VoiceNativeApiException("submission-ambiguous", retryable = false)
   }
 
   private data class DispatchAttempt(

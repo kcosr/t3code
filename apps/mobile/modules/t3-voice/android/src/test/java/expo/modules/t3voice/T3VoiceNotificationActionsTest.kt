@@ -232,6 +232,34 @@ class T3VoiceNotificationActionsTest {
   }
 
   @Test
+  fun recoverableCycleFailureShowsItsSafeStatusOnlyUntilRearmStarts() {
+    val controller = T3VoiceRuntimeController(NotificationFakeDriver())
+    controller.dispatch(
+      T3VoiceRuntimeCommand.StartThread(threadTarget, settings.copy(autoRearm = true), session),
+    )
+    controller.activateInitialStart(1)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
+    controller.onCallback(
+      1,
+      T3VoiceRuntimeCallback.ThreadCycleFailed(
+        T3VoiceFailure("transcription-timeout", "Voice transcription failed.", true),
+      ),
+    )
+
+    val failedCycle =
+      controller.snapshot().androidControlsPresentation()
+        as T3VoiceAndroidControlsPresentation.Active
+    assertEquals("Voice transcription failed.", failedCycle.statusText)
+    assertEquals(listOf(T3VoiceAndroidControlAction.STOP), failedCycle.actions)
+
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRearmReady)
+    val restarting =
+      controller.snapshot().androidControlsPresentation()
+        as T3VoiceAndroidControlsPresentation.Active
+    assertEquals("Starting recorder…", restarting.statusText)
+  }
+
+  @Test
   fun controlsPresentationSkipsNonVisualReviewUpdatesAndNoOpCommands() {
     val controller = T3VoiceRuntimeController(NotificationFakeDriver())
     controller.dispatch(T3VoiceRuntimeCommand.StartThread(threadTarget, settings, session))

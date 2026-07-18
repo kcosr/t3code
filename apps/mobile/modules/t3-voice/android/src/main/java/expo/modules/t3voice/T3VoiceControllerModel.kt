@@ -423,6 +423,7 @@ internal sealed interface T3VoiceControllerState {
     val transcript: String?,
     val attention: T3VoiceThreadAttention?,
     val reviewId: Long? = null,
+    val cycleFailure: T3VoiceFailure? = null,
   ) : T3VoiceControllerState
 
   data class Failed(
@@ -571,6 +572,10 @@ internal sealed interface T3VoiceRuntimeCallback {
   data object ThreadEndpointDetected : T3VoiceRuntimeCallback
 
   data object ThreadNoSpeechDetected : T3VoiceRuntimeCallback
+
+  data class ThreadCycleFailed(
+    val failure: T3VoiceFailure,
+  ) : T3VoiceRuntimeCallback
 
   data object ThreadRecordingFinalized : T3VoiceRuntimeCallback
 

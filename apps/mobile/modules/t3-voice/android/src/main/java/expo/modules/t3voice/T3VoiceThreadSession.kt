@@ -56,6 +56,7 @@ internal class T3VoiceThreadSession(
   private var scheduledRearm: ScheduledFuture<*>? = null
   private var mediaOwner = MediaOwner.NONE
   private var recordingId: String? = null
+  private var noInputRecordingId: String? = null
   private val completedRecording = T3VoiceCompletedRecordingSlot(::deleteRecording)
   private var submittedMessageId: String? = null
   private var assistantText: String? = null
@@ -77,34 +78,59 @@ internal class T3VoiceThreadSession(
         return@execute
       }
       try {
-        val id = synchronized(lock) { checkNotNull(recordingId) }
-        val result = media.finishRecording(id)
-        val retained =
-          synchronized(lock) {
-            recordingId = null
-            mediaOwner = MediaOwner.NONE
-            if (active.get()) {
-              val existing = completedRecording.current()
-              if (existing == null) {
-                completedRecording.store(result)
-              } else {
-                check(existing == result) {
-                  "Recorder finalization returned a different completed recording."
+        val id = synchronized(lock) { recordingId } ?: return@execute
+        when (val finish = media.finishRecording(id)) {
+          is T3VoiceRecordingNoInput -> {
+            val publish =
+              synchronized(lock) {
+                if (noInputRecordingId == id) {
+                  false
+                } else {
+                  recordingId = null
+                  mediaOwner = MediaOwner.NONE
+                  noInputRecordingId = id
+                  active.get()
                 }
               }
-              true
-            } else {
-              false
+            if (publish) {
+              media.releaseAudio()
+              emitIfActive(T3VoiceRuntimeCallback.ThreadNoSpeechDetected)
             }
           }
-        if (!retained) {
-          deleteRecording(result)
-          return@execute
+          is T3VoiceRecordingResult -> {
+            val retained =
+              synchronized(lock) {
+                recordingId = null
+                mediaOwner = MediaOwner.NONE
+                if (active.get()) {
+                  val existing = completedRecording.current()
+                  if (existing == null) {
+                    completedRecording.store(finish)
+                  } else {
+                    check(existing == finish) {
+                      "Recorder finalization returned a different completed recording."
+                    }
+                  }
+                  true
+                } else {
+                  false
+                }
+              }
+            if (!retained) {
+              deleteRecording(finish)
+              return@execute
+            }
+            media.releaseAudio()
+            emitIfActive(T3VoiceRuntimeCallback.ThreadRecordingFinalized)
+          }
+        }
+      } catch (cause: Throwable) {
+        synchronized(lock) {
+          recordingId = null
+          mediaOwner = MediaOwner.NONE
         }
         media.releaseAudio()
-        emitIfActive(T3VoiceRuntimeCallback.ThreadRecordingFinalized)
-      } catch (cause: Throwable) {
-        fail(cause, "recording-finalization-failed", "Voice recording could not be finalized.")
+        failCycle(cause, "recording-finalization-failed", "Voice recording could not be finalized.")
       }
     }
   }
@@ -125,9 +151,13 @@ internal class T3VoiceThreadSession(
             val ticket = api.createMediaTicket(calls, T3VoiceMediaOperation.TRANSCRIPTION, requestId)
             api.transcribe(calls, recording, requestId, ticket)
           }
-        emitIfActive(T3VoiceRuntimeCallback.ThreadTranscriptReady(transcript))
+        if (transcript.isBlank()) {
+          emitIfActive(T3VoiceRuntimeCallback.ThreadNoSpeechDetected)
+        } else {
+          emitIfActive(T3VoiceRuntimeCallback.ThreadTranscriptReady(transcript))
+        }
       } catch (cause: Throwable) {
-        fail(cause, "transcription-failed", "Voice transcription failed.")
+        failCycle(cause, "transcription-failed", "Voice transcription failed.")
       } finally {
         completedRecording.delete(recording)
       }
@@ -331,6 +361,8 @@ internal class T3VoiceThreadSession(
       mediaOwner = MediaOwner.NONE
       if (termination is T3VoiceRecordingTermination.Completed) {
         completedRecording.store(termination.recording)
+      } else if (termination is T3VoiceRecordingTermination.Cancelled) {
+        noInputRecordingId = termination.recordingId
       }
       inFlightMediaCallbacks += 1
     }
@@ -342,7 +374,7 @@ internal class T3VoiceThreadSession(
         is T3VoiceRecordingTermination.Cancelled ->
           emitIfActive(T3VoiceRuntimeCallback.ThreadNoSpeechDetected)
         is T3VoiceRecordingTermination.Failed ->
-          fail(
+          failCycle(
             IllegalStateException("Recorder finalization failed."),
             "recording-finalization-failed",
             "Voice recording could not be finalized.",
@@ -465,6 +497,7 @@ internal class T3VoiceThreadSession(
           check(active.get()) { "Thread voice session stopped." }
           check(mediaOwner == MediaOwner.NONE) { "Thread media is already active." }
           recordingId = id
+          noInputRecordingId = null
           mediaOwner = MediaOwner.STARTING_RECORDING
         }
         check(media.acquireAudio()) {
@@ -501,8 +534,13 @@ internal class T3VoiceThreadSession(
         }
         emitIfActive(T3VoiceRuntimeCallback.ThreadRecordingStarted)
       } catch (cause: Throwable) {
+        synchronized(lock) {
+          if (recordingId == id) recordingId = null
+          mediaOwner = MediaOwner.NONE
+        }
+        runCatching { media.cancelRecording(id) }
         media.releaseAudio()
-        fail(cause, "recording-start-failed", "Voice recording could not start.")
+        failCycle(cause, "recording-start-failed", "Voice recording could not start.")
       }
     }
   }
@@ -564,15 +602,24 @@ internal class T3VoiceThreadSession(
     TimeUnit.NANOSECONDS.toMillis((deadlineNanos - System.nanoTime()).coerceAtLeast(0))
 
   private fun fail(cause: Throwable, fallbackCode: String, message: String) {
+    terminate(TerminalOutcome.Failed(failure(cause, fallbackCode, message)))
+  }
+
+  private fun failCycle(cause: Throwable, fallbackCode: String, message: String) {
+    val failure = failure(cause, fallbackCode, message)
+    if (failure.recoverable) {
+      emitIfActive(T3VoiceRuntimeCallback.ThreadCycleFailed(failure))
+    } else {
+      terminate(TerminalOutcome.Failed(failure))
+    }
+  }
+
+  private fun failure(cause: Throwable, fallbackCode: String, message: String): T3VoiceFailure {
     val apiFailure = cause as? T3VoiceNativeApiException
-    terminate(
-      TerminalOutcome.Failed(
-        T3VoiceFailure(
-          code = safeFailureCode(apiFailure?.code, fallbackCode),
-          message = message,
-          recoverable = apiFailure?.retryable ?: true,
-        ),
-      ),
+    return T3VoiceFailure(
+      code = safeFailureCode(apiFailure?.code, fallbackCode),
+      message = message,
+      recoverable = apiFailure?.retryable ?: true,
     )
   }
 

@@ -199,6 +199,53 @@ class T3VoiceEndpointDetectorTest {
   }
 
   @Test
+  fun manualFinishRejectsUnconfirmedAndBelowMinimumSpeech() {
+    val detector =
+      T3VoiceEndpointDetector(
+        T3VoiceEndpointDetectionConfig(
+          speechOnsetMs = 100L,
+          minimumSpeechMs = 250L,
+          noSpeechTimeoutMs = 30_000L,
+        ),
+      )
+
+    assertNull(detector.observe(0L, 8_000))
+    assertEquals(T3VoiceEndpointDetector.Outcome.NO_SPEECH, detector.finishManually(100L, 8_000))
+    assertEquals(T3VoiceEndpointDetector.Outcome.NO_SPEECH, detector.finishManually(150L, 0))
+  }
+
+  @Test
+  fun manualFinishUsesItsFinalObservationToReachMinimumSpeech() {
+    val detector =
+      T3VoiceEndpointDetector(
+        T3VoiceEndpointDetectionConfig(
+          speechOnsetMs = 100L,
+          minimumSpeechMs = 250L,
+          noSpeechTimeoutMs = 30_000L,
+        ),
+      )
+
+    assertNull(detector.observe(0L, 8_000))
+    assertNull(detector.observe(100L, 8_000))
+    assertEquals(
+      T3VoiceEndpointDetector.Outcome.SPEECH_ENDED,
+      detector.finishManually(250L, 8_000),
+    )
+  }
+
+  @Test
+  fun manualFinishJoinsTheAutomaticTerminalDecision() {
+    val detector =
+      T3VoiceEndpointDetector(
+        T3VoiceEndpointDetectionConfig(noSpeechTimeoutMs = 1_000L),
+      )
+
+    assertNull(detector.observe(0L, 0))
+    assertEquals(T3VoiceEndpointDetector.Outcome.NO_SPEECH, detector.observe(1_000L, 0))
+    assertEquals(T3VoiceEndpointDetector.Outcome.NO_SPEECH, detector.finishManually(1_000L, 0))
+  }
+
+  @Test
   fun rejectsInvalidConfigAndNonMonotonicSamples() {
     assertThrows(IllegalArgumentException::class.java) {
       T3VoiceEndpointDetectionConfig(endSilenceMs = 100L)

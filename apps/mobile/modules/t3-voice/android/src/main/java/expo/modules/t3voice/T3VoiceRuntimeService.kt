@@ -863,6 +863,7 @@ class T3VoiceRuntimeService : Service() {
   }
 
   private fun reconcileSemanticControlsLocked(snapshot: T3VoiceControllerSnapshot) {
+    if (snapshot != semanticController.snapshot()) return
     when (
       T3VoiceReadinessFailurePolicy.disposition(
         snapshot,
@@ -884,6 +885,10 @@ class T3VoiceRuntimeService : Service() {
       ) {
         readinessLaunch = null
       }
+    }
+    if (semanticController.settleQuiescedFailure(snapshot.generation)) {
+      reconcileSemanticControlsLocked(semanticController.snapshot())
+      return
     }
     val render =
       androidControls.render(
