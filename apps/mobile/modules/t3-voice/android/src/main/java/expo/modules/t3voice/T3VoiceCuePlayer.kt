@@ -281,6 +281,7 @@ internal class T3VoiceCuePlayer(
       runCatching {
         cue.completion(T3VoiceCueCompletion(cue.generation, cue.cue, outcome))
       }
+      Unit
     }
     if (output != null) worker.execute(complete) else complete()
   }
