@@ -4,6 +4,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -441,7 +442,8 @@ class T3VoiceRuntimeControllerTest {
   @Test
   fun missingThreadSettingsClosesRealtimeThenPublishesRecoverableSwitchFailure() {
     val driver = FakeDriver()
-    val controller = T3VoiceRuntimeController(driver)
+    val terminalFailures = mutableListOf<T3VoiceControllerSnapshot>()
+    val controller = T3VoiceRuntimeController(driver, terminalFailures::add)
     controller.dispatch(
       T3VoiceRuntimeCommand.StartRealtime(realtimeTarget.copy(threadSettings = null), session),
     )
@@ -466,6 +468,7 @@ class T3VoiceRuntimeControllerTest {
     assertEquals(T3VoiceOperation.SWITCHING_TO_THREAD, failed.operation)
     assertEquals("thread-settings-unavailable", failed.failure.code)
     assertTrue(failed.failure.recoverable)
+    assertEquals(controller.snapshot(), terminalFailures.single())
     assertFalse(driver.actions.any { it.startsWith("start-thread") })
   }
 
@@ -603,7 +606,8 @@ class T3VoiceRuntimeControllerTest {
 
   @Test
   fun `Stop intent reaches Idle when an already quiesced Thread failure arrives`() {
-    val controller = T3VoiceRuntimeController(FakeDriver())
+    val terminalFailures = mutableListOf<T3VoiceControllerSnapshot>()
+    val controller = T3VoiceRuntimeController(FakeDriver(), terminalFailures::add)
     controller.dispatch(
       T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session),
     )
@@ -620,6 +624,10 @@ class T3VoiceRuntimeControllerTest {
       ),
     )
     assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
+    assertEquals(1, terminalFailures.size)
+    val terminal = terminalFailures.single()
+    assertEquals(1, terminal.generation)
+    assertEquals("recording-failed", (terminal.state as T3VoiceControllerState.Failed).failure.code)
   }
 
   @Test
@@ -665,7 +673,7 @@ class T3VoiceRuntimeControllerTest {
   }
 
   @Test
-  fun switchCloseBeforeBoundedFailureDoesNotMasqueradeAsUserStop() {
+  fun switchCloseFailureReturnsToIdleOnExactNativeQuiescence() {
     val controller = T3VoiceRuntimeController(FakeDriver())
     controller.dispatch(T3VoiceRuntimeCommand.StartRealtime(realtimeTarget, session))
     controller.activateInitialStart(1)
@@ -682,7 +690,7 @@ class T3VoiceRuntimeControllerTest {
       ),
     )
     assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.NativeReleaseQuiesced))
-    assertTrue(controller.snapshot().state is T3VoiceControllerState.Failed)
+    assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
   }
 
   @Test
@@ -1053,7 +1061,7 @@ class T3VoiceRuntimeControllerTest {
   }
 
   @Test
-  fun noSpeechWithoutAutoRearmFailsAndReleasesThreadOwnership() {
+  fun noSpeechWithoutAutoRearmStopsAndReturnsToIdle() {
     val settings = continuousSettings.copy(autoRearm = false)
     val driver = FakeDriver()
     val controller = T3VoiceRuntimeController(driver)
@@ -1063,10 +1071,99 @@ class T3VoiceRuntimeControllerTest {
 
     assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadNoSpeechDetected))
 
-    val failed = controller.snapshot().state as T3VoiceControllerState.Failed
-    assertEquals("no-speech", failed.failure.code)
-    assertEquals("release-all:1", driver.actions.last())
+    assertThreadStage(controller, T3VoiceThreadStage.STOPPING)
+    assertEquals("stop-thread:1", driver.actions.last())
     assertFalse(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadNoSpeechDetected))
+    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadStopped))
+    assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
+  }
+
+  @Test
+  fun blankTranscriptionNoSpeechStopsFromUploadingWithoutSubmission() {
+    val settings = continuousSettings.copy(autoRearm = false)
+    val driver = FakeDriver()
+    val controller = T3VoiceRuntimeController(driver)
+    controller.dispatch(T3VoiceRuntimeCommand.StartThread(threadTarget, settings, session))
+    controller.activateInitialStart(1)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
+    controller.dispatch(T3VoiceRuntimeCommand.FinishThreadUtterance)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingFinalized)
+
+    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadNoSpeechDetected))
+    assertThreadStage(controller, T3VoiceThreadStage.STOPPING)
+    assertFalse(driver.actions.any { it.startsWith("submit-thread") })
+    assertEquals("stop-thread:1", driver.actions.last())
+  }
+
+  @Test
+  fun recoverableThreadCycleFailureRearmsAndClearsItsStatusOnRestart() {
+    val driver = FakeDriver()
+    val terminalFailures = mutableListOf<T3VoiceControllerSnapshot>()
+    val controller = T3VoiceRuntimeController(driver, terminalFailures::add)
+    controller.dispatch(
+      T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session),
+    )
+    controller.activateInitialStart(1)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
+    val failure = T3VoiceFailure("transcription-timeout", "Voice transcription failed.", true)
+
+    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadCycleFailed(failure)))
+    val rearming = controller.snapshot().state as T3VoiceControllerState.Thread
+    assertEquals(T3VoiceThreadStage.REARMING, rearming.stage)
+    assertEquals(failure, rearming.cycleFailure)
+    assertEquals("rearm-thread:1:750", driver.actions.last())
+
+    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRearmReady))
+    val starting = controller.snapshot().state as T3VoiceControllerState.Thread
+    assertEquals(T3VoiceThreadStage.STARTING, starting.stage)
+    assertNull(starting.cycleFailure)
+    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted))
+    val recording = controller.snapshot().state as T3VoiceControllerState.Thread
+    assertEquals(T3VoiceThreadStage.RECORDING, recording.stage)
+    assertNull(recording.cycleFailure)
+    assertTrue(terminalFailures.isEmpty())
+  }
+
+  @Test
+  fun submissionFailureIsTerminalAndNeverRearmsTheThreadCycle() {
+    val driver = FakeDriver()
+    val controller = T3VoiceRuntimeController(driver)
+    controller.dispatch(
+      T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session),
+    )
+    controller.activateInitialStart(1)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
+    controller.dispatch(T3VoiceRuntimeCommand.FinishThreadUtterance)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingFinalized)
+    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadTranscriptReady("dispatch once"))
+
+    assertTrue(
+      controller.onCallback(
+        1,
+        T3VoiceRuntimeCallback.Failed(
+          T3VoiceFailure("submission-ambiguous", "The Thread message could not be submitted.", true),
+        ),
+      ),
+    )
+    assertTrue(controller.snapshot().state is T3VoiceControllerState.Failed)
+    assertFalse(driver.actions.any { it.startsWith("rearm-thread") })
+    assertEquals("release-all:1", driver.actions.last())
+  }
+
+  @Test
+  fun alreadyQuiescedFailureCanSettleWithoutAStopCommand() {
+    val controller = T3VoiceRuntimeController(FakeDriver())
+    controller.dispatch(T3VoiceRuntimeCommand.StartRealtime(realtimeTarget, session))
+    controller.activateInitialStart(1)
+    controller.onCallback(
+      1,
+      T3VoiceRuntimeCallback.Failed(T3VoiceFailure("peer-failed", "Realtime stopped.", true)),
+    )
+
+    assertTrue(controller.snapshot().state is T3VoiceControllerState.Failed)
+    assertTrue(controller.settleQuiescedFailure(1))
+    assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
+    assertFalse(controller.settleQuiescedFailure(1))
   }
 
   @Test

@@ -99,6 +99,7 @@ internal enum class T3VoiceRealtimeClosePolicy {
  */
 internal class T3VoiceRuntimeController(
   private val driver: T3VoiceRuntimeDriver,
+  private val terminalFailureSink: (T3VoiceControllerSnapshot) -> Unit = {},
 ) {
   private sealed interface PendingInitialStart {
     val generation: Long
@@ -225,6 +226,7 @@ internal class T3VoiceRuntimeController(
         T3VoiceRuntimeCallback.ThreadRecordingStarted -> threadRecordingStarted()
         T3VoiceRuntimeCallback.ThreadEndpointDetected -> threadEndpointDetected()
         T3VoiceRuntimeCallback.ThreadNoSpeechDetected -> threadNoSpeechDetected()
+        is T3VoiceRuntimeCallback.ThreadCycleFailed -> threadCycleFailed(callback.failure)
         T3VoiceRuntimeCallback.ThreadRecordingFinalized -> threadRecordingFinalized()
         is T3VoiceRuntimeCallback.ThreadTranscriptReady ->
           threadTranscriptReady(callback.transcript)
@@ -652,7 +654,7 @@ internal class T3VoiceRuntimeController(
         if (state.stage != T3VoiceRealtimeStage.STOPPING) return false
         val failure = terminalCloseFailure.also { terminalCloseFailure = null }
         if (failure != null && stopRequestedGeneration != current.generation) {
-          update(
+          publishTerminalFailure(
             T3VoiceControllerState.Failed(
               environmentId = state.target.environmentId,
               operation = T3VoiceOperation.SWITCHING_TO_THREAD,
@@ -682,13 +684,23 @@ internal class T3VoiceRuntimeController(
     if (!failedReleasePending) return false
     failedReleasePending = false
     failedReleaseUncertain = false
-    if (failedStopRequested) {
+    failedStopRequested = false
+    stopRequestedGeneration = null
+    update(T3VoiceControllerState.Idle)
+    return true
+  }
+
+  fun settleQuiescedFailure(generation: Long): Boolean =
+    synchronized(lock) {
+      if (generation != current.generation || current.state !is T3VoiceControllerState.Failed) {
+        return@synchronized false
+      }
+      if (failedReleasePending || failedReleaseUncertain) return@synchronized false
       failedStopRequested = false
       stopRequestedGeneration = null
       update(T3VoiceControllerState.Idle)
+      true
     }
-    return true
-  }
 
   private fun threadRecordingStarted(): Boolean {
     return when (val state = current.state) {
@@ -852,20 +864,47 @@ internal class T3VoiceRuntimeController(
 
   private fun threadNoSpeechDetected(): Boolean {
     val state = current.state as? T3VoiceControllerState.Thread ?: return false
-    if (state.stage != T3VoiceThreadStage.RECORDING) return false
-    if (!state.settings.autoRearm) {
-      fail(
-        T3VoiceOperation.THREAD,
-        T3VoiceFailure(
-          code = "no-speech",
-          message = "No speech was detected.",
-          recoverable = true,
-        ),
-      )
+    if (
+      state.stage != T3VoiceThreadStage.RECORDING &&
+      state.stage != T3VoiceThreadStage.FINALIZING &&
+      state.stage != T3VoiceThreadStage.UPLOADING
+    ) return false
+    settleThreadCycle(state, cycleFailure = null)
+    return true
+  }
+
+  private fun threadCycleFailed(failure: T3VoiceFailure): Boolean {
+    val state = current.state as? T3VoiceControllerState.Thread ?: return false
+    val safeStage =
+      state.stage == T3VoiceThreadStage.STARTING ||
+        state.stage == T3VoiceThreadStage.RECORDING ||
+        state.stage == T3VoiceThreadStage.FINALIZING ||
+        state.stage == T3VoiceThreadStage.UPLOADING
+    if (!safeStage || !failure.recoverable) {
+      fail(T3VoiceOperation.THREAD, failure)
       return true
     }
-    scheduleThreadRearm(state)
+    settleThreadCycle(state, cycleFailure = failure)
     return true
+  }
+
+  private fun settleThreadCycle(
+    state: T3VoiceControllerState.Thread,
+    cycleFailure: T3VoiceFailure?,
+  ) {
+    val settled =
+      state.copy(
+        transcript = null,
+        attention = null,
+        reviewId = null,
+        cycleFailure = cycleFailure,
+      )
+    if (state.settings.autoRearm) {
+      scheduleThreadRearm(settled)
+    } else {
+      update(settled.copy(stage = T3VoiceThreadStage.STOPPING))
+      runDriver(T3VoiceOperation.THREAD) { driver.stopThread(current.generation) }
+    }
   }
 
   private fun threadRecordingFinalized(): Boolean {
@@ -943,6 +982,7 @@ internal class T3VoiceRuntimeController(
         transcript = null,
         attention = null,
         reviewId = null,
+        cycleFailure = null,
       ),
     )
     runDriver(T3VoiceOperation.THREAD) {
@@ -1017,6 +1057,7 @@ internal class T3VoiceRuntimeController(
       settings = start.settings,
       transcript = null,
       attention = null,
+      cycleFailure = null,
     )
 
   private fun fail(failure: T3VoiceFailure, releasePending: Boolean): Boolean {
@@ -1095,14 +1136,28 @@ internal class T3VoiceRuntimeController(
     val driverReleasePending = driverRelease.getOrElse { true }
     failedReleasePending = releasePending || driverReleasePending
     failedReleaseUncertain = !releasePending && driverRelease.isFailure
+    val failedState = T3VoiceControllerState.Failed(failedEnvironmentId, operation, failure)
     if (stopAlreadyRequested && !failedReleasePending) {
+      emitTerminalFailure(failedState)
       stopRequestedGeneration = null
       failedStopRequested = false
       update(T3VoiceControllerState.Idle)
       return
     }
     failedStopRequested = failedReleasePending && stopAlreadyRequested
-    update(T3VoiceControllerState.Failed(failedEnvironmentId, operation, failure))
+    publishTerminalFailure(failedState)
+  }
+
+  private fun publishTerminalFailure(state: T3VoiceControllerState.Failed) {
+    val snapshot = current.copy(state = state, sequence = current.sequence + 1)
+    runCatching { terminalFailureSink(snapshot) }
+    publish(snapshot)
+  }
+
+  private fun emitTerminalFailure(state: T3VoiceControllerState.Failed) {
+    runCatching {
+      terminalFailureSink(current.copy(state = state, sequence = current.sequence + 1))
+    }
   }
 
   private fun applied() = T3VoiceCommandResult(T3VoiceCommandOutcome.APPLIED, current)

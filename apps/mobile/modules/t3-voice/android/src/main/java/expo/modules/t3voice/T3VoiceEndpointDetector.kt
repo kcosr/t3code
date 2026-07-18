@@ -60,6 +60,7 @@ internal class T3VoiceEndpointDetector(
   }
 
   private var terminal = false
+  private var terminalOutcome: Outcome? = null
   private var lastElapsedMs: Long? = null
   private var noiseFloorDbfs = INITIAL_NOISE_FLOOR_DBFS
   private var onsetCandidateAtMs: Long? = null
@@ -89,7 +90,7 @@ internal class T3VoiceEndpointDetector(
     val forcedOutcome =
       when {
         elapsedMs >= config.maximumUtteranceMs ->
-          if (speechConfirmed) Outcome.MAXIMUM_UTTERANCE else Outcome.NO_SPEECH
+          if (hasUsableSpeech()) Outcome.MAXIMUM_UTTERANCE else Outcome.NO_SPEECH
         !speechConfirmed && config.noSpeechTimeoutMs?.let { elapsedMs >= it } == true ->
           Outcome.NO_SPEECH
         else -> null
@@ -140,6 +141,28 @@ internal class T3VoiceEndpointDetector(
     )
     terminal = true
   }
+
+  fun finishManually(elapsedMs: Long, peakAmplitude: Int): Outcome {
+    terminalOutcome?.let { return it }
+    val observed = observe(elapsedMs, peakAmplitude)
+    val outcome =
+      if (hasUsableSpeech()) {
+        observed?.takeUnless { it == Outcome.NO_SPEECH } ?: Outcome.SPEECH_ENDED
+      } else {
+        Outcome.NO_SPEECH
+      }
+    if (!terminal) {
+      val levelDbfs = amplitudeToDbfs(peakAmplitude)
+      val releaseThresholdDbfs =
+        max(noiseFloorDbfs + config.onsetMarginDb, config.onsetFloorDbfs) -
+          config.releaseHysteresisDb
+      emitDiagnostic(elapsedMs, levelDbfs, releaseThresholdDbfs, terminal = true)
+    }
+    return finish(outcome)
+  }
+
+  private fun hasUsableSpeech(): Boolean =
+    speechConfirmed && accumulatedSpeechMs >= config.minimumSpeechMs
 
   private fun observeBeforeSpeech(
     elapsedMs: Long,
@@ -222,6 +245,7 @@ internal class T3VoiceEndpointDetector(
 
   private fun finish(outcome: Outcome): Outcome {
     terminal = true
+    terminalOutcome = outcome
     return outcome
   }
 

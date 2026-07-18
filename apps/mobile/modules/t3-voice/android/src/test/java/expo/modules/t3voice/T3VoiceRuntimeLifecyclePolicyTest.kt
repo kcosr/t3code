@@ -135,7 +135,7 @@ class T3VoiceRuntimeLifecyclePolicyTest {
       T3VoiceSemanticStartIntentPolicy.decide(
         requestedGeneration = 1,
         snapshot = newer,
-        serviceCompletelyIdle = false,
+        serviceCanStop = false,
       ),
     )
     assertEquals(
@@ -143,7 +143,7 @@ class T3VoiceRuntimeLifecyclePolicyTest {
       T3VoiceSemanticStartIntentPolicy.decide(
         requestedGeneration = 2,
         snapshot = newer,
-        serviceCompletelyIdle = false,
+        serviceCanStop = false,
       ),
     )
   }
@@ -157,7 +157,7 @@ class T3VoiceRuntimeLifecyclePolicyTest {
       T3VoiceSemanticStartIntentPolicy.decide(
         requestedGeneration = 1,
         snapshot = idle,
-        serviceCompletelyIdle = true,
+        serviceCanStop = true,
       ),
     )
     assertEquals(
@@ -165,7 +165,7 @@ class T3VoiceRuntimeLifecyclePolicyTest {
       T3VoiceSemanticStartIntentPolicy.decide(
         requestedGeneration = 1,
         snapshot = idle,
-        serviceCompletelyIdle = false,
+        serviceCanStop = false,
       ),
     )
   }
@@ -179,6 +179,108 @@ class T3VoiceRuntimeLifecyclePolicyTest {
     assertEquals(
       T3VoiceSemanticStartFailureDecision.RETAIN_FOREGROUND_FAILURE,
       T3VoiceSemanticStartFailurePolicy.decide(foregroundAcquired = true),
+    )
+  }
+
+  @Test
+  fun readyRetainsTheServiceAfterTheOperationIsExactlyIdle() {
+    val ready =
+      T3VoiceReadinessSnapshot.Ready(
+        generation = 4,
+        mode = T3VoiceReadinessMode.REALTIME,
+        label = "Realtime",
+        expiresAt = "2099-01-01T00:00:00Z",
+      )
+    assertFalse(T3VoiceServiceOwnershipPolicy.canStop(operationIdle = true, ready))
+    assertFalse(T3VoiceServiceOwnershipPolicy.canStop(operationIdle = false, ready))
+    assertTrue(
+      T3VoiceServiceOwnershipPolicy.canStop(
+        operationIdle = true,
+        T3VoiceReadinessSnapshot.Disabled(5),
+      ),
+    )
+    assertFalse(
+      T3VoiceServiceOwnershipPolicy.canStop(
+        operationIdle = false,
+        T3VoiceReadinessSnapshot.Disabled(5),
+      ),
+    )
+  }
+
+  @Test
+  fun staleStartCannotStopAnOperationIdleServiceOwnedByReadiness() {
+    val ready =
+      T3VoiceReadinessSnapshot.Ready(
+        generation = 4,
+        mode = T3VoiceReadinessMode.REALTIME,
+        label = "Realtime",
+        expiresAt = "2099-01-01T00:00:00Z",
+      )
+    val idle = T3VoiceControllerSnapshot(T3VoiceControllerState.Idle, 2, 5)
+
+    assertEquals(
+      T3VoiceSemanticStartIntentDecision.IGNORE_STALE,
+      T3VoiceSemanticStartIntentPolicy.decide(
+        requestedGeneration = 1,
+        snapshot = idle,
+        serviceCanStop = T3VoiceServiceOwnershipPolicy.canStop(true, ready),
+      ),
+    )
+  }
+
+  @Test
+  fun readinessFailureDispositionIsOperationAwareAndProvenanceFenced() {
+    val ready =
+      T3VoiceReadinessSnapshot.Ready(
+        generation = 4,
+        mode = T3VoiceReadinessMode.THREAD,
+        label = "Thread",
+        expiresAt = "2099-01-01T00:00:00Z",
+      )
+    val launch = T3VoiceReadinessLaunch(operationGeneration = 7, readinessGeneration = 4)
+    val missingThread =
+      T3VoiceControllerSnapshot(
+        state =
+          T3VoiceControllerState.Failed(
+            environmentId = "environment-a",
+            operation = T3VoiceOperation.THREAD,
+            failure = T3VoiceFailure("thread_not_found", "Thread is gone.", recoverable = false),
+          ),
+        generation = 7,
+        sequence = 9,
+      )
+
+    assertEquals(
+      T3VoiceReadinessFailureDisposition.UNAVAILABLE,
+      T3VoiceReadinessFailurePolicy.disposition(missingThread, ready, launch),
+    )
+    assertEquals(
+      T3VoiceReadinessFailureDisposition.NONE,
+      T3VoiceReadinessFailurePolicy.disposition(missingThread, ready, launch = null),
+    )
+    assertEquals(
+      T3VoiceReadinessFailureDisposition.NONE,
+      T3VoiceReadinessFailurePolicy.disposition(
+        missingThread,
+        ready.copy(generation = 5),
+        launch,
+      ),
+    )
+    val expiredThread =
+      missingThread.copy(
+        state =
+          (missingThread.state as T3VoiceControllerState.Failed).copy(
+            failure =
+              T3VoiceFailure(
+                "native-session-expired",
+                "Credential expired.",
+                recoverable = true,
+              ),
+          ),
+      )
+    assertEquals(
+      T3VoiceReadinessFailureDisposition.NEEDS_REFRESH,
+      T3VoiceReadinessFailurePolicy.disposition(expiredThread, ready, launch),
     )
   }
 

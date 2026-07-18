@@ -10,14 +10,32 @@ import android.media.session.PlaybackState
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
+
+internal enum class T3VoiceAndroidControlOwner {
+  OPERATION,
+  READINESS,
+}
+
+internal enum class T3VoiceAndroidControlAction {
+  START,
+  DISABLE,
+  MUTE,
+  UNMUTE,
+  FINISH_UTTERANCE,
+  SUBMIT_TRANSCRIPT,
+  SWITCH_TO_THREAD,
+  STOP,
+}
 
 internal sealed interface T3VoiceAndroidControlsPresentation {
   data object Inactive : T3VoiceAndroidControlsPresentation
 
   data class Active(
+    val owner: T3VoiceAndroidControlOwner,
     val generation: Long,
     val playbackState: Int,
-    val actions: List<T3VoiceNotificationActionId>,
+    val actions: List<T3VoiceAndroidControlAction>,
     val title: String,
     val statusText: String,
   ) : T3VoiceAndroidControlsPresentation
@@ -26,8 +44,12 @@ internal sealed interface T3VoiceAndroidControlsPresentation {
 internal class T3VoiceAndroidControlsPresentationCache {
   private var current: T3VoiceAndroidControlsPresentation? = null
 
-  fun accept(snapshot: T3VoiceControllerSnapshot): T3VoiceAndroidControlsPresentation? {
-    val next = snapshot.androidControlsPresentation()
+  fun accept(
+    snapshot: T3VoiceControllerSnapshot,
+    readiness: T3VoiceReadinessSnapshot = T3VoiceReadinessSnapshot.Disabled(0),
+    preparedThreadAvailable: Boolean = false,
+  ): T3VoiceAndroidControlsPresentation? {
+    val next = snapshot.androidControlsPresentation(readiness, preparedThreadAvailable)
     if (next == current) return null
     current = next
     return next
@@ -44,20 +66,50 @@ internal data class T3VoiceNotificationPendingIntentIdentity(
   val dataUri: String,
 )
 
-internal fun T3VoiceNotificationActionId.pendingIntentIdentity(
+internal fun T3VoiceAndroidControlAction.pendingIntentIdentity(
+  owner: T3VoiceAndroidControlOwner,
   generation: Long,
 ): T3VoiceNotificationPendingIntentIdentity =
   T3VoiceNotificationPendingIntentIdentity(
     requestCode = ACTION_REQUEST_CODE_BASE + ordinal,
-    dataUri = "$SEMANTIC_CONTROL_URI_PREFIX/$generation/$name",
+    dataUri = "$SEMANTIC_CONTROL_URI_PREFIX/${owner.name}/$generation/$name",
   )
+
+internal fun transportActionsFor(actions: List<T3VoiceAndroidControlAction>): Long =
+  actions.fold(0L) { mask, id ->
+    mask or
+      when (id) {
+        T3VoiceAndroidControlAction.START,
+        T3VoiceAndroidControlAction.UNMUTE,
+        T3VoiceAndroidControlAction.SUBMIT_TRANSCRIPT,
+        -> PlaybackState.ACTION_PLAY
+        T3VoiceAndroidControlAction.MUTE,
+        T3VoiceAndroidControlAction.FINISH_UTTERANCE,
+        -> PlaybackState.ACTION_PAUSE
+        T3VoiceAndroidControlAction.SWITCH_TO_THREAD -> PlaybackState.ACTION_SKIP_TO_NEXT
+        T3VoiceAndroidControlAction.STOP -> PlaybackState.ACTION_STOP
+        T3VoiceAndroidControlAction.DISABLE -> 0L
+      }
+  }.let { mask ->
+    if (T3VoiceAndroidControlAction.START in actions) {
+      mask or PlaybackState.ACTION_PLAY_PAUSE
+    } else {
+      mask
+    }
+  }
 
 /** Renders notification and MediaSession controls from the controller's current state. */
 internal class T3VoiceAndroidControls(
   private val context: Context,
-  private val dispatch: (T3VoiceRuntimeCommand) -> Unit,
+  private val dispatch: (
+    action: T3VoiceAndroidControlAction,
+    owner: T3VoiceAndroidControlOwner,
+    generation: Long,
+  ) -> Unit,
 ) {
   @Volatile private var snapshot = idleSnapshot()
+  @Volatile private var currentPresentation: T3VoiceAndroidControlsPresentation =
+    T3VoiceAndroidControlsPresentation.Inactive
   private val presentationCache = T3VoiceAndroidControlsPresentationCache()
   private var notification: Notification? = null
 
@@ -71,25 +123,49 @@ internal class T3VoiceAndroidControls(
         object : MediaSession.Callback() {
           override fun onPlay() {
             dispatchFirst(
-              T3VoiceNotificationActionId.UNMUTE,
-              T3VoiceNotificationActionId.SUBMIT_TRANSCRIPT,
+              T3VoiceAndroidControlAction.START,
+              T3VoiceAndroidControlAction.UNMUTE,
+              T3VoiceAndroidControlAction.SUBMIT_TRANSCRIPT,
             )
           }
 
           override fun onPause() {
             dispatchFirst(
-              T3VoiceNotificationActionId.MUTE,
-              T3VoiceNotificationActionId.FINISH_UTTERANCE,
+              T3VoiceAndroidControlAction.MUTE,
+              T3VoiceAndroidControlAction.FINISH_UTTERANCE,
             )
           }
 
           override fun onStop() {
-            dispatchFirst(T3VoiceNotificationActionId.STOP)
+            dispatchFirst(T3VoiceAndroidControlAction.STOP)
+          }
+
+          override fun onSkipToNext() {
+            dispatchFirst(T3VoiceAndroidControlAction.SWITCH_TO_THREAD)
           }
 
           override fun onCustomAction(action: String, extras: Bundle?) {
             val id = action.removePrefix(MEDIA_CUSTOM_ACTION_PREFIX).let(::parseActionId) ?: return
             dispatchFirst(id)
+          }
+
+          override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
+            val event =
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                mediaButtonIntent.getParcelableExtra(Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
+              } else {
+                @Suppress("DEPRECATION")
+                mediaButtonIntent.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
+              } ?: return super.onMediaButtonEvent(mediaButtonIntent)
+            val decision =
+              T3VoiceMediaButtonPolicy.decide(
+                keyCode = event.keyCode,
+                keyAction = event.action,
+                repeatCount = event.repeatCount,
+                available = activeActions(),
+              )
+            decision.action?.let { dispatchFirst(it) }
+            return decision.consume || super.onMediaButtonEvent(mediaButtonIntent)
           }
         },
       )
@@ -97,12 +173,15 @@ internal class T3VoiceAndroidControls(
 
   fun render(
     snapshot: T3VoiceControllerSnapshot,
+    readiness: T3VoiceReadinessSnapshot,
+    preparedThreadAvailable: Boolean,
     channelId: String,
   ): T3VoiceAndroidControlsRender {
     this.snapshot = snapshot
     val presentation =
-      presentationCache.accept(snapshot)
+      presentationCache.accept(snapshot, readiness, preparedThreadAvailable)
         ?: return T3VoiceAndroidControlsRender(changed = false, notification)
+    currentPresentation = presentation
     notification =
       when (presentation) {
         T3VoiceAndroidControlsPresentation.Inactive -> {
@@ -118,10 +197,11 @@ internal class T3VoiceAndroidControls(
   }
 
   private fun renderMediaSession(presentation: T3VoiceAndroidControlsPresentation.Active) {
+    val transportActions = transportActionsFor(presentation.actions)
     mediaSession.setPlaybackState(
       PlaybackState.Builder()
         .setState(presentation.playbackState, 0, 1f)
-        .setActions(presentation.actions.fold(0L) { mask, id -> mask or id.transportAction() })
+        .setActions(transportActions)
         .also { builder ->
           presentation.actions.forEach { id ->
             builder.addCustomAction(id.customActionName(), id.label(), id.icon())
@@ -174,7 +254,7 @@ internal class T3VoiceAndroidControls(
       builder.addAction(
         id.icon(),
         id.label(),
-        id.pendingIntent(context, presentation.generation),
+        id.pendingIntent(context, presentation.owner, presentation.generation),
       )
     }
     val compact = presentation.actions.indices.take(MAXIMUM_COMPACT_ACTIONS).toList().toIntArray()
@@ -191,26 +271,31 @@ internal class T3VoiceAndroidControls(
     mediaSession.release()
   }
 
-  private fun dispatchFirst(vararg ids: T3VoiceNotificationActionId) {
-    val available = T3VoiceNotificationActions.forSnapshot(snapshot)
-    ids.firstNotNullOfOrNull { id -> available.firstOrNull { it.id == id } }
-      ?.let { dispatch(it.command) }
+  private fun activeActions(): List<T3VoiceAndroidControlAction> =
+    (currentPresentation as? T3VoiceAndroidControlsPresentation.Active)?.actions.orEmpty()
+
+  private fun dispatchFirst(vararg ids: T3VoiceAndroidControlAction) {
+    val presentation = currentPresentation as? T3VoiceAndroidControlsPresentation.Active ?: return
+    ids.firstOrNull(presentation.actions::contains)
+      ?.let { dispatch(it, presentation.owner, presentation.generation) }
   }
 
-  private fun parseActionId(value: String): T3VoiceNotificationActionId? =
-    runCatching { T3VoiceNotificationActionId.valueOf(value) }.getOrNull()
+  private fun parseActionId(value: String): T3VoiceAndroidControlAction? =
+    runCatching { T3VoiceAndroidControlAction.valueOf(value) }.getOrNull()
 
-  private fun T3VoiceNotificationActionId.pendingIntent(
+  private fun T3VoiceAndroidControlAction.pendingIntent(
     context: Context,
+    owner: T3VoiceAndroidControlOwner,
     generation: Long,
   ): PendingIntent {
-    val identity = pendingIntentIdentity(generation)
+    val identity = pendingIntentIdentity(owner, generation)
     val intent =
       Intent(context, T3VoiceRuntimeService::class.java).apply {
         action = T3VoiceRuntimeService.ACTION_SEMANTIC_CONTROL
         data = Uri.parse(identity.dataUri)
         putExtra(T3VoiceRuntimeService.EXTRA_SEMANTIC_ACTION, name)
         putExtra(T3VoiceRuntimeService.EXTRA_SEMANTIC_GENERATION, generation)
+        putExtra(T3VoiceRuntimeService.EXTRA_CONTROL_OWNER, owner.name)
       }
     return PendingIntent.getService(
       context,
@@ -220,38 +305,34 @@ internal class T3VoiceAndroidControls(
     )
   }
 
-  private fun T3VoiceNotificationActionId.transportAction(): Long =
-    when (this) {
-      T3VoiceNotificationActionId.UNMUTE,
-      T3VoiceNotificationActionId.SUBMIT_TRANSCRIPT,
-      -> PlaybackState.ACTION_PLAY
-      T3VoiceNotificationActionId.MUTE,
-      T3VoiceNotificationActionId.FINISH_UTTERANCE,
-      -> PlaybackState.ACTION_PAUSE
-      T3VoiceNotificationActionId.STOP -> PlaybackState.ACTION_STOP
-    }
-
-  private fun T3VoiceNotificationActionId.customActionName(): String =
+  private fun T3VoiceAndroidControlAction.customActionName(): String =
     MEDIA_CUSTOM_ACTION_PREFIX + name
 
-  private fun T3VoiceNotificationActionId.label(): String =
+  private fun T3VoiceAndroidControlAction.label(): String =
     when (this) {
-      T3VoiceNotificationActionId.MUTE -> "Mute"
-      T3VoiceNotificationActionId.UNMUTE -> "Unmute"
-      T3VoiceNotificationActionId.FINISH_UTTERANCE -> "Finish"
-      T3VoiceNotificationActionId.SUBMIT_TRANSCRIPT -> "Submit"
-      T3VoiceNotificationActionId.STOP -> "Stop"
+      T3VoiceAndroidControlAction.START -> "Start"
+      T3VoiceAndroidControlAction.DISABLE -> "Disable"
+      T3VoiceAndroidControlAction.MUTE -> "Mute"
+      T3VoiceAndroidControlAction.UNMUTE -> "Unmute"
+      T3VoiceAndroidControlAction.FINISH_UTTERANCE -> "Finish"
+      T3VoiceAndroidControlAction.SUBMIT_TRANSCRIPT -> "Submit"
+      T3VoiceAndroidControlAction.SWITCH_TO_THREAD -> "Thread"
+      T3VoiceAndroidControlAction.STOP -> "Stop"
     }
 
-  private fun T3VoiceNotificationActionId.icon(): Int =
+  private fun T3VoiceAndroidControlAction.icon(): Int =
     when (this) {
-      T3VoiceNotificationActionId.UNMUTE,
-      T3VoiceNotificationActionId.SUBMIT_TRANSCRIPT,
+      T3VoiceAndroidControlAction.START,
+      T3VoiceAndroidControlAction.UNMUTE,
+      T3VoiceAndroidControlAction.SUBMIT_TRANSCRIPT,
       -> android.R.drawable.ic_media_play
-      T3VoiceNotificationActionId.MUTE,
-      T3VoiceNotificationActionId.FINISH_UTTERANCE,
+      T3VoiceAndroidControlAction.MUTE,
+      T3VoiceAndroidControlAction.FINISH_UTTERANCE,
       -> android.R.drawable.ic_media_pause
-      T3VoiceNotificationActionId.STOP -> android.R.drawable.ic_menu_close_clear_cancel
+      T3VoiceAndroidControlAction.SWITCH_TO_THREAD -> android.R.drawable.ic_media_next
+      T3VoiceAndroidControlAction.STOP,
+      T3VoiceAndroidControlAction.DISABLE,
+      -> android.R.drawable.ic_menu_close_clear_cancel
     }
 
   private companion object {
@@ -268,17 +349,73 @@ internal class T3VoiceAndroidControls(
 private const val ACTION_REQUEST_CODE_BASE = 3150
 private const val SEMANTIC_CONTROL_URI_PREFIX = "t3voice-runtime://semantic-control"
 
-internal fun T3VoiceControllerSnapshot.androidControlsPresentation():
+internal fun T3VoiceControllerSnapshot.androidControlsPresentation(
+  readiness: T3VoiceReadinessSnapshot = T3VoiceReadinessSnapshot.Disabled(0),
+  preparedThreadAvailable: Boolean = false,
+):
   T3VoiceAndroidControlsPresentation {
-  if (!state.needsForeground()) return T3VoiceAndroidControlsPresentation.Inactive
+  if (!state.needsForeground()) return readiness.androidControlsPresentation()
   return T3VoiceAndroidControlsPresentation.Active(
+    owner = T3VoiceAndroidControlOwner.OPERATION,
     generation = generation,
     playbackState = androidPlaybackState(),
-    actions = T3VoiceNotificationActions.forSnapshot(this).map(T3VoiceNotificationAction::id),
+    actions =
+      buildList {
+        addAll(T3VoiceNotificationActions.forSnapshot(this@androidControlsPresentation).map { it.id.toAndroidAction() })
+        if (
+          preparedThreadAvailable &&
+            state is T3VoiceControllerState.Realtime &&
+            state.stage == T3VoiceRealtimeStage.CONNECTED
+        ) {
+          add(indexOf(T3VoiceAndroidControlAction.STOP).coerceAtLeast(0), T3VoiceAndroidControlAction.SWITCH_TO_THREAD)
+        }
+      },
     title = androidControlsTitle(),
     statusText = androidControlsStatusText(),
   )
 }
+
+private fun T3VoiceNotificationActionId.toAndroidAction(): T3VoiceAndroidControlAction =
+  when (this) {
+    T3VoiceNotificationActionId.MUTE -> T3VoiceAndroidControlAction.MUTE
+    T3VoiceNotificationActionId.UNMUTE -> T3VoiceAndroidControlAction.UNMUTE
+    T3VoiceNotificationActionId.FINISH_UTTERANCE -> T3VoiceAndroidControlAction.FINISH_UTTERANCE
+    T3VoiceNotificationActionId.SUBMIT_TRANSCRIPT -> T3VoiceAndroidControlAction.SUBMIT_TRANSCRIPT
+    T3VoiceNotificationActionId.STOP -> T3VoiceAndroidControlAction.STOP
+  }
+
+private fun T3VoiceReadinessSnapshot.androidControlsPresentation():
+  T3VoiceAndroidControlsPresentation =
+  when (this) {
+    is T3VoiceReadinessSnapshot.Disabled -> T3VoiceAndroidControlsPresentation.Inactive
+    is T3VoiceReadinessSnapshot.Ready ->
+      T3VoiceAndroidControlsPresentation.Active(
+        owner = T3VoiceAndroidControlOwner.READINESS,
+        generation = generation,
+        playbackState = PlaybackState.STATE_PAUSED,
+        actions = listOf(T3VoiceAndroidControlAction.START, T3VoiceAndroidControlAction.DISABLE),
+        title = "Voice ready — $label",
+        statusText = "Press Start to begin",
+      )
+    is T3VoiceReadinessSnapshot.Unavailable ->
+      T3VoiceAndroidControlsPresentation.Active(
+        owner = T3VoiceAndroidControlOwner.READINESS,
+        generation = generation,
+        playbackState = PlaybackState.STATE_PAUSED,
+        actions = listOf(T3VoiceAndroidControlAction.DISABLE),
+        title = "Voice unavailable — $label",
+        statusText = "Active Thread unavailable",
+      )
+    is T3VoiceReadinessSnapshot.NeedsRefresh ->
+      T3VoiceAndroidControlsPresentation.Active(
+        owner = T3VoiceAndroidControlOwner.READINESS,
+        generation = generation,
+        playbackState = PlaybackState.STATE_PAUSED,
+        actions = listOf(T3VoiceAndroidControlAction.DISABLE),
+        title = "Voice controls need refresh",
+        statusText = "Open T3 to refresh voice controls",
+      )
+  }
 
 private fun T3VoiceControllerSnapshot.androidPlaybackState(): Int =
   when (val state = state) {
@@ -337,7 +474,7 @@ private fun T3VoiceControllerSnapshot.androidControlsStatusText(): String =
     is T3VoiceControllerState.SwitchingToThread -> "Preparing Thread recording…"
     is T3VoiceControllerState.SwitchingToRealtime -> "Stopping before Realtime…"
     is T3VoiceControllerState.Thread ->
-      when (state.stage) {
+      state.cycleFailure?.message ?: when (state.stage) {
         T3VoiceThreadStage.STARTING -> "Starting recorder…"
         T3VoiceThreadStage.RECORDING -> "Listening"
         T3VoiceThreadStage.FINALIZING -> "Finishing recording…"

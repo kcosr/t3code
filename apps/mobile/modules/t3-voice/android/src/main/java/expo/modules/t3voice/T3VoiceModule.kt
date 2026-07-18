@@ -38,6 +38,8 @@ class T3VoiceModule : Module() {
     )
   private val pendingBinderOperations = T3VoiceBinderOperationRegistry<PendingBinderOperation>()
   private var runtimeSnapshotCollection: Job? = null
+  private var terminalRuntimeFailureCollection: Job? = null
+  private var readinessSnapshotCollection: Job? = null
   private var audioRoutePreferenceCollection: Job? = null
   private var eventCollection: Job? = null
   private var recordingTerminationCollection: Job? = null
@@ -89,6 +91,22 @@ class T3VoiceModule : Module() {
           appContext.mainQueue.launch {
             connectedBinder.runtimeSnapshots.collectLatest { snapshot ->
               sendEvent(RUNTIME_SNAPSHOT_CHANGED_EVENT, snapshot.toBridgeBody())
+            }
+          }
+        terminalRuntimeFailureCollection?.cancel()
+        terminalRuntimeFailureCollection =
+          appContext.mainQueue.launch {
+            connectedBinder.terminalRuntimeFailures.collectLatest { failure ->
+              if (failure != null) {
+                sendEvent(TERMINAL_RUNTIME_FAILURE_EVENT, failure.toBridgeBody())
+              }
+            }
+          }
+        readinessSnapshotCollection?.cancel()
+        readinessSnapshotCollection =
+          appContext.mainQueue.launch {
+            connectedBinder.readinessSnapshots.collectLatest { snapshot ->
+              sendEvent(READINESS_SNAPSHOT_CHANGED_EVENT, snapshot.toBridgeBody())
             }
           }
         audioRoutePreferenceCollection?.cancel()
@@ -158,6 +176,8 @@ class T3VoiceModule : Module() {
       Name(MODULE_NAME)
       Events(
         RUNTIME_SNAPSHOT_CHANGED_EVENT,
+        TERMINAL_RUNTIME_FAILURE_EVENT,
+        READINESS_SNAPSHOT_CHANGED_EVENT,
         AUDIO_ROUTE_PREFERENCE_CHANGED_EVENT,
         PLAYBACK_CHUNK_CONSUMED_EVENT,
         PLAYBACK_TERMINATED_EVENT,
@@ -166,7 +186,7 @@ class T3VoiceModule : Module() {
       )
 
       Constants(
-        "nativeRevision" to 13,
+        "nativeRevision" to 15,
       )
 
       OnCreate {
@@ -210,6 +230,56 @@ class T3VoiceModule : Module() {
       AsyncFunction("getRuntimeSnapshotAsync") { promise: Promise ->
         withBinder(promise, "voice-runtime-snapshot-failed") { voice, result ->
           result.resolve(voice.runtimeSnapshot().toBridgeBody())
+        }
+      }
+
+      AsyncFunction("getPendingTerminalRuntimeFailureAsync") { promise: Promise ->
+        withBinder(promise, "voice-runtime-failure-read-failed") { voice, result ->
+          result.resolve(voice.terminalRuntimeFailure()?.toBridgeBody())
+        }
+      }
+
+      AsyncFunction("acknowledgeTerminalRuntimeFailureAsync") {
+        input: Map<String, Any?>, promise: Promise ->
+        input.requireExactBridgeKeys("terminal runtime failure acknowledgement", setOf("failureId"))
+        withBinder(promise, "voice-runtime-failure-acknowledgement-failed") { voice, result ->
+          voice.acknowledgeTerminalRuntimeFailure(input.requireBridgeLong("failureId"))
+          result.resolve()
+        }
+      }
+
+      AsyncFunction("getReadinessSnapshotAsync") { promise: Promise ->
+        withBinder(promise, "voice-readiness-snapshot-failed") { voice, result ->
+          result.resolve(voice.readinessSnapshot().toBridgeBody())
+        }
+      }
+
+      AsyncFunction("configureReadinessAsync") { input: ReadableMap, promise: Promise ->
+        val configuration = T3VoiceRuntimeBridgeInput.configureReadiness(input.toHashMap())
+        withBinder(promise, "voice-readiness-configuration-failed") { voice, result ->
+          result.resolve(voice.configureReadiness(configuration).toBridgeBody())
+        }
+      }
+
+      AsyncFunction("disableReadinessAsync") { input: Map<String, Any?>, promise: Promise ->
+        input.requireExactBridgeKeys("readiness disable", setOf("generation"))
+        withBinder(promise, "voice-readiness-disable-failed") { voice, result ->
+          result.resolve(voice.disableReadiness(input.requireBridgeLong("generation")).toBridgeBody())
+        }
+      }
+
+      AsyncFunction("getPendingReadinessDisableAsync") { promise: Promise ->
+        withBinder(promise, "voice-readiness-disable-read-failed") { voice, result ->
+          result.resolve(voice.pendingReadinessDisableGeneration()?.toDouble())
+        }
+      }
+
+      AsyncFunction("acknowledgeReadinessDisableAsync") {
+        input: Map<String, Any?>, promise: Promise ->
+        input.requireExactBridgeKeys("readiness disable acknowledgement", setOf("generation"))
+        withBinder(promise, "voice-readiness-disable-acknowledgement-failed") { voice, result ->
+          voice.acknowledgeReadinessDisable(input.requireBridgeLong("generation"))
+          result.resolve()
         }
       }
 
@@ -754,6 +824,10 @@ class T3VoiceModule : Module() {
   private fun cancelCollections() {
     runtimeSnapshotCollection?.cancel()
     runtimeSnapshotCollection = null
+    terminalRuntimeFailureCollection?.cancel()
+    terminalRuntimeFailureCollection = null
+    readinessSnapshotCollection?.cancel()
+    readinessSnapshotCollection = null
     audioRoutePreferenceCollection?.cancel()
     audioRoutePreferenceCollection = null
     eventCollection?.cancel()
@@ -767,6 +841,8 @@ class T3VoiceModule : Module() {
   companion object {
     private const val MODULE_NAME = "T3Voice"
     private const val RUNTIME_SNAPSHOT_CHANGED_EVENT = "runtimeSnapshotChanged"
+    private const val TERMINAL_RUNTIME_FAILURE_EVENT = "runtimeTerminalFailure"
+    private const val READINESS_SNAPSHOT_CHANGED_EVENT = "readinessSnapshotChanged"
     private const val AUDIO_ROUTE_PREFERENCE_CHANGED_EVENT = "audioRoutePreferenceChanged"
     private const val PLAYBACK_CHUNK_CONSUMED_EVENT = "playbackChunkConsumed"
     private const val PLAYBACK_TERMINATED_EVENT = "playbackTerminated"

@@ -10,6 +10,10 @@ import * as MobileDatabase from "./mobile-database";
 import * as MobileSecureStorage from "./mobile-secure-storage";
 import { MobileStorageDecodeError, MobileStorageEncodeError } from "./mobile-storage";
 import {
+  sanitizeVoiceBackgroundThreadTarget,
+  type VoiceBackgroundThreadTarget,
+} from "./voiceBackgroundPreferences";
+import {
   clampVoicePreference,
   VOICE_END_SILENCE_MAX_MS,
   VOICE_END_SILENCE_MIN_MS,
@@ -42,6 +46,9 @@ export interface Preferences {
   readonly voiceTranscriptionTimeoutMs?: number;
   readonly voiceSubmissionTimeoutMs?: number;
   readonly voiceResponseTimeoutMs?: number;
+  readonly voiceBackgroundControlsEnabled?: boolean;
+  readonly voiceBackgroundDefaultMode?: "realtime" | "thread";
+  readonly voiceBackgroundThreadTarget?: VoiceBackgroundThreadTarget | null;
   readonly baseFontSize?: number;
   readonly terminalFontSize?: number | null;
   readonly markdownFontSize?: number;
@@ -101,6 +108,14 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     voiceTranscriptionTimeoutMs?: number;
     voiceSubmissionTimeoutMs?: number;
     voiceResponseTimeoutMs?: number;
+    voiceBackgroundControlsEnabled?: boolean;
+    voiceBackgroundDefaultMode?: "realtime" | "thread";
+    voiceBackgroundThreadTarget?: {
+      readonly environmentId: string;
+      readonly projectId: string;
+      readonly threadId: string;
+      readonly title: string;
+    } | null;
     baseFontSize?: number;
     terminalFontSize?: number | null;
     markdownFontSize?: number;
@@ -173,6 +188,23 @@ function sanitizePreferences(parsed: Preferences): Preferences {
       VOICE_RESPONSE_TIMEOUT_MIN_MS,
       VOICE_RESPONSE_TIMEOUT_MAX_MS,
     );
+  }
+  if (typeof parsed.voiceBackgroundControlsEnabled === "boolean") {
+    preferences.voiceBackgroundControlsEnabled = parsed.voiceBackgroundControlsEnabled;
+  }
+  if (
+    parsed.voiceBackgroundDefaultMode === "realtime" ||
+    parsed.voiceBackgroundDefaultMode === "thread"
+  ) {
+    preferences.voiceBackgroundDefaultMode = parsed.voiceBackgroundDefaultMode;
+  }
+  if (parsed.voiceBackgroundThreadTarget === null) {
+    preferences.voiceBackgroundThreadTarget = null;
+  } else {
+    const target = sanitizeVoiceBackgroundThreadTarget(parsed.voiceBackgroundThreadTarget);
+    if (target !== null) {
+      preferences.voiceBackgroundThreadTarget = target;
+    }
   }
   if (typeof parsed.baseFontSize === "number") preferences.baseFontSize = parsed.baseFontSize;
   if (typeof parsed.terminalFontSize === "number" || parsed.terminalFontSize === null) {

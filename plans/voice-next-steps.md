@@ -1,7 +1,7 @@
 # Voice Next Steps
 
-Status: Active working draft; the accepted end state and low-risk simplification batch are
-complete. Medium-risk reductions remain deferred to separately approved slices.
+Status: Active working draft; the accepted foreground baseline and low-risk simplification batch
+are complete. Android native readiness is implemented and awaiting integration/device acceptance.
 
 This plan tracks cleanup of the implemented voice system described by
 [voice.md](../docs/architecture/voice.md). It is not an architecture contract and does not authorize
@@ -41,20 +41,34 @@ checkpoint was insufficient.
 
 ## Workstreams
 
-| Workstream                         | Status   | Scope                                                                                                                          |
-| ---------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| Accepted behavior baseline         | Complete | Explicit-ID handoff, atomic native switching, global route preference, shared controls, and unambiguous notifications.         |
-| As-built documentation correction  | Complete | Journal behavior and cleanup estimates now match measured production writers and code.                                         |
-| Duplicate contract/type removal    | Complete | Removed the dead public error, duplicate transcript, and duplicate native parsed-target shapes without compatibility aliases.  |
-| Mechanical native pruning          | Complete | Folded retained credential storage into its transfer owner while preserving and extending invariant tests.                     |
-| Typed context comparison           | Complete | Replaced serialization-based comparison with tested field-wise equality covering every current context field.                  |
-| Medium-risk architecture reduction | Deferred | Binder, WebRTC fencing, executors, shared media, route-release ownership, and server registry changes require separate slices. |
-| Final validation                   | Complete | Required repository gates, the native JVM suite, and the clean full repository test suite passed.                              |
+| Workstream                         | Status      | Scope                                                                                                                              |
+| ---------------------------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Accepted behavior baseline         | Complete    | Explicit-ID handoff, atomic native switching, global route preference, shared controls, and unambiguous notifications.             |
+| As-built documentation correction  | Complete    | Journal behavior and cleanup estimates now match measured production writers and code.                                             |
+| Duplicate contract/type removal    | Complete    | Removed the dead public error, duplicate transcript, and duplicate native parsed-target shapes without compatibility aliases.      |
+| Mechanical native pruning          | Complete    | Folded retained credential storage into its transfer owner while preserving and extending invariant tests.                         |
+| Typed context comparison           | Complete    | Replaced serialization-based comparison with tested field-wise equality covering every current context field.                      |
+| Android native readiness           | Implemented | Added opt-in process-local Ready controls, prepared starts, expiry fencing, race-safe no-input settlement, and non-sticky cleanup. |
+| Medium-risk architecture reduction | Deferred    | Binder, WebRTC fencing, executors, shared media, route-release ownership, and server registry changes require separate slices.     |
+| Final validation                   | Complete    | Required repository gates, the native JVM suite, and the clean full repository test suite passed.                                  |
 
 ## Remaining near-term work
 
-No further implementation is active in this cleanup batch. Choose and scope any next slice
-independently:
+The Android readiness implementation is intentionally separate from the completed cleanup batch.
+Its remaining steps are:
+
+1. Integrate the Android readiness commits and run focused device acceptance from the exact merged
+   revision: enable/disable, both defaults, background/lock starts, headset controls, expiry, and
+   return-to-Ready after operation stop.
+2. Confirm notification Disable remains saved after the application process is later recreated and
+   that force-stop/process death is presented as loss of Ready rather than recovery.
+3. After device acceptance, mark the readiness workstream Complete and record the tested revision.
+
+Focused acceptance should also cover immediately finishing a silent Thread recording (no upload or
+failure icon), finishing after speech (normal transcription), continuous recovery after a safe
+transcription failure, and return to the Ready controls after a terminal owner has fully released.
+
+Then choose and scope any cleanup slice independently:
 
 1. Decide whether to prune unused server journal kinds and other reserved/speculative contracts.
    Do not combine this API/compiler decision with native lifecycle work.
@@ -79,7 +93,6 @@ This work does not include:
 - Realtime transcription;
 - automatic summarization or transparent provider-call replacement;
 - Android process-death recovery or durable mode-switch transactions;
-- notification-initiated Thread voice based on a remembered current or last-used Thread;
 - always-on or wake-word capture;
 - a React-owned Android fallback state machine; or
 - compatibility aliases for removed voice contracts.

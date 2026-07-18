@@ -2,6 +2,46 @@ package expo.modules.t3voice
 
 /** Strict conversion from the Expo/JavaScript bridge shape into native runtime commands. */
 internal object T3VoiceRuntimeBridgeInput {
+  fun configureReadiness(input: Map<String, Any?>): T3VoiceReadinessConfiguration {
+    input.requireExactBridgeKeys(
+      "readiness configuration",
+      setOf("generation", "mode", "label", "start", "threadSwitch"),
+    )
+    val mode =
+      when (input.requireBridgeText("mode")) {
+        "realtime" -> T3VoiceReadinessMode.REALTIME
+        "thread" -> T3VoiceReadinessMode.THREAD
+        else -> error("readiness mode must be realtime or thread.")
+      }
+    val start = input.optionalBridgeObject("start")?.let(::preparedStart)
+    return T3VoiceReadinessConfiguration(
+      generation = input.requireBridgeLong("generation"),
+      mode = mode,
+      label = input.requireBridgeText("label", MAXIMUM_READINESS_LABEL_LENGTH),
+      preparedStart = start,
+      preparedThreadSwitch = input.optionalBridgeObject("threadSwitch")?.let(::threadStart),
+    )
+  }
+
+  private fun preparedStart(input: Map<String, Any?>): T3VoicePreparedStart {
+    input.requireExactBridgeKeys("prepared readiness start", setOf("type", "input", "session"))
+    val session = nativeSession(input.requireBridgeObject("session"))
+    val prepared = input.requireBridgeObject("input")
+    return when (input.requireBridgeText("type")) {
+      "realtime" ->
+        T3VoicePreparedStart.Realtime(
+          target = realtimeTarget(prepared),
+          session = session,
+        )
+      "thread" ->
+        T3VoicePreparedStart.Thread(
+          start = threadStart(prepared),
+          session = session,
+        )
+      else -> error("prepared readiness start type must be realtime or thread.")
+    }
+  }
+
   fun startRealtime(input: Map<String, Any?>): T3VoiceRuntimeCommand.StartRealtime {
     val admission = realtimeAdmission(input, "startRealtime")
     return T3VoiceRuntimeCommand.StartRealtime(
@@ -221,6 +261,7 @@ internal object T3VoiceRuntimeBridgeInput {
   private const val MAXIMUM_BASE_URL_LENGTH = 4_096
   private const val MAXIMUM_ACCESS_TOKEN_LENGTH = 16_384
   private const val MAXIMUM_EXPIRATION_LENGTH = 128
+  private const val MAXIMUM_READINESS_LABEL_LENGTH = 256
 }
 
 /** Minimal object view shared by the Expo bridge and native HTTP wire decoders. */

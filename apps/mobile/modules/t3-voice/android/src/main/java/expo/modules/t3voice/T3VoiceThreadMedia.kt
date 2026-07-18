@@ -11,7 +11,7 @@ internal interface T3VoiceThreadMedia {
 
   fun startRecording(recordingId: String, endpointConfig: T3VoiceEndpointDetectionConfig)
 
-  fun finishRecording(recordingId: String): T3VoiceRecordingResult
+  fun finishRecording(recordingId: String): T3VoiceThreadRecordingFinish
 
   fun cancelRecording(recordingId: String)
 
@@ -31,6 +31,8 @@ internal interface T3VoiceThreadMedia {
   fun resumePlayback(playbackId: String)
 }
 
+internal sealed interface T3VoiceThreadRecordingFinish
+
 internal class T3VoiceAndroidThreadMedia(
   private val recorder: T3VoiceRecorder,
   private val player: T3VoicePcmPlayer,
@@ -46,8 +48,8 @@ internal class T3VoiceAndroidThreadMedia(
     endpointConfig: T3VoiceEndpointDetectionConfig,
   ) = recorder.start(recordingId, endpointConfig)
 
-  override fun finishRecording(recordingId: String): T3VoiceRecordingResult =
-    recorder.stop(recordingId)
+  override fun finishRecording(recordingId: String): T3VoiceThreadRecordingFinish =
+    recorder.finishThread(recordingId)
 
   override fun cancelRecording(recordingId: String) = recorder.cancel(recordingId)
 

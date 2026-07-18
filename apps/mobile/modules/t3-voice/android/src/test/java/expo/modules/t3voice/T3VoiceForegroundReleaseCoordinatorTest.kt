@@ -16,7 +16,7 @@ class T3VoiceForegroundReleaseCoordinatorTest {
     val claimCompleted = CountDownLatch(1)
     val coordinator =
       T3VoiceForegroundReleaseCoordinator(
-        isIdle = idle::get,
+        canRelease = idle::get,
         releaseForeground = foregroundReleased::countDown,
       )
 
@@ -45,7 +45,7 @@ class T3VoiceForegroundReleaseCoordinatorTest {
   fun foregroundReleaseRejectsAnActiveOwner() {
     val coordinator =
       T3VoiceForegroundReleaseCoordinator(
-        isIdle = { false },
+        canRelease = { false },
         releaseForeground = { throw AssertionError("must not release") },
       )
 

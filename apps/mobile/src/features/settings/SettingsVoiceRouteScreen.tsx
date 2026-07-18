@@ -4,7 +4,7 @@ import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import { AsyncResult } from "effect/unstable/reactivity";
 import * as Clipboard from "expo-clipboard";
 import { useCallback } from "react";
-import { Alert, ScrollView, View } from "react-native";
+import { Alert, Platform, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
@@ -29,6 +29,7 @@ import {
 } from "../voice/voicePreferences";
 import { formatVoiceDiagnostics } from "../voice/voiceDiagnostics";
 import { useVoiceAudioRoutePreference } from "../voice/VoiceAudioRoutePreference";
+import { useVoiceRuntime } from "../voice/VoiceRuntimeProvider";
 import { SettingsRow } from "./components/SettingsRow";
 import { SettingsSection } from "./components/SettingsSection";
 import { SettingsStepperRow } from "./components/SettingsStepperRow";
@@ -46,6 +47,10 @@ export function SettingsVoiceRouteScreen() {
   const voice = resolveVoicePreferences(stored);
   const noSpeechEnabled = voice.noSpeechTimeoutMs !== null;
   const audioRoutePreference = useVoiceAudioRoutePreference();
+  const voiceRuntime = useVoiceRuntime();
+  const backgroundControlsEnabled = voiceRuntime.backgroundControlsEnabled;
+  const backgroundMode = stored.voiceBackgroundDefaultMode ?? "realtime";
+  const rememberedThread = stored.voiceBackgroundThreadTarget;
   useFocusEffect(
     useCallback(() => {
       void audioRoutePreference.refresh();
@@ -120,6 +125,91 @@ export function SettingsVoiceRouteScreen() {
             onPress={audioRoutePreference.open}
           />
         </SettingsSection>
+
+        {Platform.OS === "android" ? (
+          <SettingsSection title="Background controls">
+            <SettingsSwitchRow
+              disabled={!ready || voiceRuntime.readinessPending}
+              icon="headphones"
+              label="Background voice controls"
+              value={backgroundControlsEnabled}
+              onValueChange={(enabled) => {
+                void voiceRuntime
+                  .setBackgroundControlsEnabled(enabled)
+                  .catch((cause) =>
+                    Alert.alert(
+                      "Background voice controls unavailable",
+                      cause instanceof Error
+                        ? cause.message
+                        : "Voice controls could not be changed.",
+                    ),
+                  );
+              }}
+            />
+            <SettingsRow
+              disabled={!ready || !backgroundControlsEnabled || voiceRuntime.readinessPending}
+              icon="waveform.circle"
+              label="Default voice interaction"
+              value={backgroundMode === "realtime" ? "Realtime" : "Active Thread"}
+              onPress={() =>
+                Alert.alert(
+                  "Default voice interaction",
+                  rememberedThread === null || rememberedThread === undefined
+                    ? "Open a Thread before selecting Active Thread."
+                    : `Current Active Thread: ${rememberedThread.title}`,
+                  [
+                    {
+                      text: "Realtime",
+                      onPress: () => savePreferences({ voiceBackgroundDefaultMode: "realtime" }),
+                    },
+                    ...(rememberedThread === null || rememberedThread === undefined
+                      ? []
+                      : [
+                          {
+                            text: "Active Thread",
+                            onPress: () =>
+                              savePreferences({ voiceBackgroundDefaultMode: "thread" as const }),
+                          },
+                        ]),
+                    { text: "Cancel", style: "cancel" as const },
+                  ],
+                )
+              }
+            />
+            <SettingsRow
+              disabled
+              icon="text.bubble"
+              label="Remembered Thread"
+              value={
+                rememberedThread === null || rememberedThread === undefined
+                  ? "None"
+                  : voiceRuntime.rememberedThreadStatus === "available"
+                    ? rememberedThread.title
+                    : voiceRuntime.rememberedThreadStatus === "disconnected"
+                      ? `${rememberedThread.title} · Disconnected`
+                      : `${rememberedThread.title} · Unavailable`
+              }
+            />
+            <SettingsRow
+              disabled
+              icon="info.circle"
+              label="Background status"
+              value={
+                voiceRuntime.readinessPending
+                  ? "Preparing…"
+                  : voiceRuntime.readinessSnapshot.posture === "ready"
+                    ? `Ready · ${voiceRuntime.readinessSnapshot.label}`
+                    : voiceRuntime.readinessSnapshot.posture === "needs-refresh"
+                      ? "Open T3 to refresh"
+                      : voiceRuntime.readinessSnapshot.posture === "unavailable"
+                        ? voiceRuntime.readinessSnapshot.mode === "thread"
+                          ? "Active Thread unavailable"
+                          : "Realtime unavailable"
+                        : "Disabled"
+              }
+            />
+          </SettingsSection>
+        ) : null}
 
         <SettingsSection title="Listening">
           <SettingsStepperRow

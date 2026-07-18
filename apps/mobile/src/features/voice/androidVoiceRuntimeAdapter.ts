@@ -20,6 +20,7 @@ import type {
 import type {
   T3VoiceNativeModule,
   T3VoiceNativeSessionConfiguration,
+  T3VoiceTerminalRuntimeFailureEvent,
 } from "@t3tools/mobile-voice-native";
 import * as Effect from "effect/Effect";
 
@@ -39,6 +40,13 @@ export interface AndroidVoiceRuntimeAdapterInput {
   readonly getPrepared: () => PreparedConnection | null;
   readonly makeClient?: AndroidVoiceRuntimeClientFactory;
   readonly requestNotificationPermission?: () => Promise<"granted" | "denied">;
+}
+
+export interface AndroidVoiceRuntimeAdapter extends VoiceRuntimeAdapter {
+  readonly subscribeTerminalFailures: (
+    listener: (failure: T3VoiceTerminalRuntimeFailureEvent) => void,
+  ) => Promise<() => void>;
+  readonly acknowledgeTerminalFailure: (failureId: number) => Promise<void>;
 }
 
 const assertEnvironment = (
@@ -104,6 +112,46 @@ const attachSnapshotListener = async (
   };
 };
 
+const attachTerminalFailureListener = async (
+  native: T3VoiceNativeModule,
+  listener: (failure: T3VoiceTerminalRuntimeFailureEvent) => void,
+): Promise<() => void> => {
+  let buffered: T3VoiceTerminalRuntimeFailureEvent | null = null;
+  let attached = true;
+  let hydrating = true;
+  const delivered = new Set<number>();
+
+  const publish = (failure: T3VoiceTerminalRuntimeFailureEvent | null) => {
+    if (failure === null || delivered.has(failure.failureId)) return;
+    delivered.add(failure.failureId);
+    listener(failure);
+  };
+  const subscription = native.addListener("runtimeTerminalFailure", (failure) => {
+    if (!attached) return;
+    if (hydrating) {
+      buffered = failure;
+      return;
+    }
+    publish(failure);
+  });
+
+  try {
+    publish(await native.getPendingTerminalRuntimeFailureAsync());
+    publish(buffered);
+    hydrating = false;
+  } catch (cause) {
+    attached = false;
+    subscription.remove();
+    throw cause;
+  }
+
+  return () => {
+    if (!attached) return;
+    attached = false;
+    subscription.remove();
+  };
+};
+
 const STOP_COMPLETION_TIMEOUT_MS = 15_000;
 
 const stopAndAwaitRelease = async (native: T3VoiceNativeModule): Promise<void> => {
@@ -141,7 +189,7 @@ const stopAndAwaitRelease = async (native: T3VoiceNativeModule): Promise<void> =
 
 export const makeAndroidVoiceRuntimeAdapter = (
   input: AndroidVoiceRuntimeAdapterInput,
-): VoiceRuntimeAdapter => {
+): AndroidVoiceRuntimeAdapter => {
   const commands = new AndroidVoiceCommandQueue();
   const makeClient = input.makeClient ?? makeMobileVoiceClient;
   const requestNotificationPermission =
@@ -197,6 +245,9 @@ export const makeAndroidVoiceRuntimeAdapter = (
   return {
     getSnapshot: async () => input.native.getRuntimeSnapshotAsync(),
     subscribe: (listener) => attachSnapshotListener(input.native, listener),
+    subscribeTerminalFailures: (listener) => attachTerminalFailureListener(input.native, listener),
+    acknowledgeTerminalFailure: (failureId) =>
+      input.native.acknowledgeTerminalRuntimeFailureAsync({ failureId }),
     startRealtime: async (target: VoiceRealtimeTarget, options?: VoiceRuntimeAdmissionOptions) => {
       assertEnvironment(input.environmentId, target.environmentId);
       return commands.enqueue(async () => {

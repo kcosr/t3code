@@ -4,6 +4,7 @@ import type {
   VoiceAudioRouteKind,
   VoiceRealtimeContext,
   VoiceRealtimeTarget,
+  VoiceRuntimeFailure,
   VoiceRuntimeSnapshot,
   VoiceThreadStartInput,
 } from "@t3tools/client-runtime/voice";
@@ -31,6 +32,44 @@ export interface T3VoiceRealtimeAdmissionInput {
 export interface T3VoiceStartThreadInput {
   readonly input: VoiceThreadStartInput;
   readonly session: T3VoiceNativeSessionConfiguration;
+}
+
+export type T3VoiceReadinessMode = "realtime" | "thread";
+
+export type T3VoiceReadinessSnapshot =
+  | { readonly posture: "disabled"; readonly generation: number }
+  | {
+      readonly posture: "ready" | "needs-refresh";
+      readonly generation: number;
+      readonly mode: T3VoiceReadinessMode;
+      readonly label: string;
+      readonly expiresAt: string;
+    }
+  | {
+      readonly posture: "unavailable";
+      readonly generation: number;
+      readonly mode: T3VoiceReadinessMode;
+      readonly label: string;
+    };
+
+export type T3VoicePreparedReadinessStart =
+  | {
+      readonly type: "realtime";
+      readonly input: VoiceRealtimeTarget;
+      readonly session: T3VoiceNativeSessionConfiguration;
+    }
+  | {
+      readonly type: "thread";
+      readonly input: VoiceThreadStartInput;
+      readonly session: T3VoiceNativeSessionConfiguration;
+    };
+
+export interface T3VoiceConfigureReadinessInput {
+  readonly generation: number;
+  readonly mode: T3VoiceReadinessMode;
+  readonly label: string;
+  readonly start: T3VoicePreparedReadinessStart | null;
+  readonly threadSwitch: VoiceThreadStartInput | null;
 }
 
 export interface T3VoiceSetRealtimeMutedInput {
@@ -172,6 +211,15 @@ export interface T3VoiceRuntimeErrorEvent {
   readonly recoverable: boolean;
 }
 
+export interface T3VoiceTerminalRuntimeFailureEvent {
+  readonly failureId: number;
+  readonly generation: number;
+  readonly sequence: number;
+  readonly environmentId: string;
+  readonly operation: "realtime" | "thread" | "switching-to-thread" | "switching-to-realtime";
+  readonly failure: VoiceRuntimeFailure;
+}
+
 export type T3VoiceDiagnosticCategory =
   | "lifecycle"
   | "state"
@@ -227,6 +275,10 @@ export interface T3VoiceNativeModule {
       listener: (snapshot: VoiceRuntimeSnapshot) => void,
     ): T3VoiceEventSubscription;
     (
+      eventName: "readinessSnapshotChanged",
+      listener: (snapshot: T3VoiceReadinessSnapshot) => void,
+    ): T3VoiceEventSubscription;
+    (
       eventName: "audioRoutePreferenceChanged",
       listener: (state: T3VoiceAudioRoutePreferenceState) => void,
     ): T3VoiceEventSubscription;
@@ -243,11 +295,30 @@ export interface T3VoiceNativeModule {
       listener: (event: T3VoiceRecordingTerminatedEvent) => void,
     ): T3VoiceEventSubscription;
     (
+      eventName: "runtimeTerminalFailure",
+      listener: (event: T3VoiceTerminalRuntimeFailureEvent) => void,
+    ): T3VoiceEventSubscription;
+    (
       eventName: "runtimeError",
       listener: (event: T3VoiceRuntimeErrorEvent) => void,
     ): T3VoiceEventSubscription;
   };
   readonly getRuntimeSnapshotAsync: () => Promise<VoiceRuntimeSnapshot>;
+  readonly getPendingTerminalRuntimeFailureAsync: () => Promise<T3VoiceTerminalRuntimeFailureEvent | null>;
+  readonly acknowledgeTerminalRuntimeFailureAsync: (input: {
+    readonly failureId: number;
+  }) => Promise<void>;
+  readonly getReadinessSnapshotAsync: () => Promise<T3VoiceReadinessSnapshot>;
+  readonly configureReadinessAsync: (
+    input: T3VoiceConfigureReadinessInput,
+  ) => Promise<T3VoiceReadinessSnapshot>;
+  readonly disableReadinessAsync: (input: {
+    readonly generation: number;
+  }) => Promise<T3VoiceReadinessSnapshot>;
+  readonly getPendingReadinessDisableAsync: () => Promise<number | null>;
+  readonly acknowledgeReadinessDisableAsync: (input: {
+    readonly generation: number;
+  }) => Promise<void>;
   readonly startRealtimeAsync: (input: T3VoiceRealtimeAdmissionInput) => Promise<void>;
   readonly startThreadAsync: (input: T3VoiceStartThreadInput) => Promise<void>;
   readonly switchRealtimeToThreadAsync: (input: VoiceThreadStartInput) => Promise<void>;

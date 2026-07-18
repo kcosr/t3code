@@ -85,7 +85,7 @@ internal data class T3VoiceRecordingResult(
   val uri: String,
   val durationMs: Long,
   val byteLength: Long,
-) {
+) : T3VoiceThreadRecordingFinish {
   fun toResultBody(): Map<String, Any> =
     mapOf(
       "recordingId" to recordingId,
@@ -109,6 +109,10 @@ internal sealed interface T3VoiceRecordingTermination {
   data class Failed(val recordingId: String) : T3VoiceRecordingTermination
 }
 
+internal data class T3VoiceRecordingNoInput(
+  val recordingId: String,
+) : T3VoiceThreadRecordingFinish
+
 internal class T3VoiceRecorder(
   private val context: Context,
   private val terminalLock: Any = Any(),
@@ -125,6 +129,7 @@ internal class T3VoiceRecorder(
 
   private var active: ActiveRecording? = null
   private val completed = mutableMapOf<String, T3VoiceRecordingResult>()
+  private val noInputTerminations = linkedSetOf<String>()
   private val recordingCache = T3VoiceRecordingCache(context.cacheDir)
   private val terminalPolicy = T3VoiceRecordingTerminalPolicy()
   private val terminalCoordinator = T3VoiceRecordingTerminalCoordinator(terminalLock)
@@ -203,6 +208,32 @@ internal class T3VoiceRecorder(
       finalizeCompleted(recording)
     }
 
+  fun finishThread(recordingId: String): T3VoiceThreadRecordingFinish =
+    terminalCoordinator.serialized {
+      val recording =
+        synchronized(this) {
+          completed[recordingId]?.let { return@serialized it }
+          if (noInputTerminations.remove(recordingId)) {
+            return@serialized T3VoiceRecordingNoInput(recordingId)
+          }
+          val current = requireActive(recordingId)
+          check(terminalPolicy.claim(current.terminalOwner)) { "The recording already terminated." }
+          active = null
+          current
+        }
+      val elapsed = SystemClock.elapsedRealtime() - recording.startedAtMs
+      val amplitude = runCatching { recording.recorder.maxAmplitude }.getOrDefault(0)
+      when (recording.endpointDetector.finishManually(elapsed, amplitude)) {
+        T3VoiceEndpointDetector.Outcome.NO_SPEECH -> {
+          stopAndDelete(recording)
+          T3VoiceRecordingNoInput(recording.recordingId)
+        }
+        T3VoiceEndpointDetector.Outcome.SPEECH_ENDED,
+        T3VoiceEndpointDetector.Outcome.MAXIMUM_UTTERANCE,
+        -> finalizeCompleted(recording)
+      }
+    }
+
   fun cancel(recordingId: String) {
     terminalCoordinator.serialized {
       val recording =
@@ -247,6 +278,7 @@ internal class T3VoiceRecorder(
       recording.recorder.release()
       recording.file.delete()
     }
+    noInputTerminations.clear()
     endpointThread.quitSafely()
   }
 
@@ -336,6 +368,12 @@ internal class T3VoiceRecorder(
 
   private fun cancelAutomatically(recording: ActiveRecording) {
     stopAndDelete(recording)
+    synchronized(this) {
+      noInputTerminations += recording.recordingId
+      while (noInputTerminations.size > MAXIMUM_NO_INPUT_TERMINATIONS) {
+        noInputTerminations.remove(noInputTerminations.first())
+      }
+    }
     onTerminated(T3VoiceRecordingTermination.Cancelled(recording.recordingId, "no-speech"))
   }
 
@@ -384,6 +422,7 @@ internal class T3VoiceRecorder(
   companion object {
     private const val RECORDING_SAMPLE_RATE = 24_000
     private const val RECORDING_BIT_RATE = 64_000
+    private const val MAXIMUM_NO_INPUT_TERMINATIONS = 16
     private const val MAXIMUM_RECORDING_DURATION_MS = 30 * 60 * 1_000
     private const val MAXIMUM_RECORDING_BYTES = 32L * 1_024L * 1_024L
     private const val ENDPOINT_POLL_INTERVAL_MS = 50L

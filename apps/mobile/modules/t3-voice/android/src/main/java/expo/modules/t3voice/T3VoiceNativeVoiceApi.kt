@@ -185,7 +185,7 @@ internal class T3VoiceNativeVoiceApi(
           }
           check(finalText == null) { "Voice transcription returned duplicate final events." }
           finalText =
-            result.requiredTrimmedString("text").also { text ->
+            result.requiredString("text").trim().also { text ->
               require(
                 text.length <= T3VoiceRuntimeBounds.MAXIMUM_THREAD_TRANSCRIPT_CHARS &&
                   text.toByteArray(Charsets.UTF_8).size <= MAXIMUM_TRANSCRIPT_BYTES
