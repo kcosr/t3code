@@ -26,7 +26,12 @@ The mobile app exposes five related voice surfaces:
    conversation and always exposes the shared native audio-route selector. While Realtime is active,
    it also exposes transcript, mute, and stop controls. While Thread voice is active, the bar remains
    a Realtime Resume surface.
-4. Eligible assistant messages can use bounded streaming speech playback.
+4. Eligible assistant messages can use bounded streaming speech playback on platforms where React
+   still owns that path. **Android WIP
+   (`feature/android-native-thread-voice-authority`):** Thread Auto Listen response speech is
+   native-only; React-driven auto-speak / tap-to-hear of arbitrary messages is **accepted as
+   removed** until a future native `SpeakMessage` operation (roadmap). Do not reintroduce generic
+   PCM for that surface on Android.
 5. On Android, opt-in Background Voice Controls keep a native Ready notification and MediaSession
    available after an operation ends. The user chooses Realtime or the latest valid Active Thread as
    the default next interaction and can start it without React remaining attached.
