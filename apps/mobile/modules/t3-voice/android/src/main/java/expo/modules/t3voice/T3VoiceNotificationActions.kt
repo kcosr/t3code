@@ -5,7 +5,6 @@ internal enum class T3VoiceNotificationActionId {
   UNMUTE,
   FINISH_UTTERANCE,
   SUBMIT_TRANSCRIPT,
-  SKIP,
   STOP,
 }
 
@@ -84,22 +83,16 @@ internal object T3VoiceNotificationActions {
           }
           add(stop())
         }
-      T3VoiceThreadStage.PLAYING -> listOf(skip(), stop())
       T3VoiceThreadStage.STARTING,
       T3VoiceThreadStage.FINALIZING,
       T3VoiceThreadStage.UPLOADING,
       T3VoiceThreadStage.SUBMITTING,
       T3VoiceThreadStage.WAITING,
+      T3VoiceThreadStage.PLAYING,
       T3VoiceThreadStage.REARMING,
       -> listOf(stop())
       T3VoiceThreadStage.STOPPING -> emptyList()
     }
-
-  private fun skip() =
-    T3VoiceNotificationAction(
-      id = T3VoiceNotificationActionId.SKIP,
-      command = T3VoiceRuntimeCommand.SkipThreadPlayback,
-    )
 
   private fun stop() =
     T3VoiceNotificationAction(

@@ -65,9 +65,6 @@ internal interface T3VoiceRuntimeDriver {
 
   fun startThreadPlayback(generation: Long)
 
-  /** Cancels active Thread TTS without tearing down the session; session emits playback finished. */
-  fun cancelThreadPlayback(generation: Long)
-
   fun scheduleThreadRearm(generation: Long, delayMs: Long)
 
   fun stopThread(generation: Long)
@@ -191,7 +188,6 @@ internal class T3VoiceRuntimeController(
             command.message,
           )
         T3VoiceRuntimeCommand.FinishThreadUtterance -> finishThreadUtterance()
-        T3VoiceRuntimeCommand.SkipThreadPlayback -> skipThreadPlayback()
         is T3VoiceRuntimeCommand.UpdateThreadReviewTranscript ->
           updateThreadReviewTranscript(
             command.expectedGeneration,
@@ -480,19 +476,6 @@ internal class T3VoiceRuntimeController(
 
     update(state.copy(stage = T3VoiceThreadStage.FINALIZING))
     runDriver(T3VoiceOperation.THREAD) { driver.finishThreadRecording(current.generation) }
-    return applied()
-  }
-
-  /**
-   * Asks the session to cancel TTS. Stage stays [T3VoiceThreadStage.PLAYING] until the session
-   * reports [T3VoiceRuntimeCallback.ThreadPlaybackFinished], which reuses [completeThreadCycle].
-   */
-  private fun skipThreadPlayback(): T3VoiceCommandResult {
-    val state = current.state as? T3VoiceControllerState.Thread
-      ?: return rejected(T3VoiceCommandRejection.INVALID_STATE)
-    // Tolerate the race where natural finish lands microseconds before skip.
-    if (state.stage != T3VoiceThreadStage.PLAYING) return duplicate()
-    runDriver(T3VoiceOperation.THREAD) { driver.cancelThreadPlayback(current.generation) }
     return applied()
   }
 

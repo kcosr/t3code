@@ -32,7 +32,6 @@ internal object T3VoiceMediaButtonPolicy {
       ->
         firstAvailable(
           available,
-          T3VoiceAndroidControlAction.SKIP,
           T3VoiceAndroidControlAction.START,
           T3VoiceAndroidControlAction.MUTE,
           T3VoiceAndroidControlAction.UNMUTE,
@@ -55,11 +54,7 @@ internal object T3VoiceMediaButtonPolicy {
       KeyEvent.KEYCODE_MEDIA_STOP ->
         firstAvailable(available, T3VoiceAndroidControlAction.STOP)
       KeyEvent.KEYCODE_MEDIA_NEXT ->
-        firstAvailable(
-          available,
-          T3VoiceAndroidControlAction.SKIP,
-          T3VoiceAndroidControlAction.SWITCH_TO_THREAD,
-        )
+        firstAvailable(available, T3VoiceAndroidControlAction.SWITCH_TO_THREAD)
       else -> null
     }
 

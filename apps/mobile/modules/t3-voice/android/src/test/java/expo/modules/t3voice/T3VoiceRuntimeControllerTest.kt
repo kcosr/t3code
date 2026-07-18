@@ -1404,128 +1404,6 @@ class T3VoiceRuntimeControllerTest {
   }
 
   @Test
-  fun skipThreadPlaybackWithAutoRearmCancelsThenRearmsOnFinish() {
-    val driver = FakeDriver()
-    val controller = T3VoiceRuntimeController(driver)
-    controller.dispatch(
-      T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session),
-    )
-    controller.activateInitialStart(1)
-    advanceThreadToPlaying(controller)
-
-    assertEquals(
-      T3VoiceCommandOutcome.APPLIED,
-      controller.dispatch(T3VoiceRuntimeCommand.SkipThreadPlayback).outcome,
-    )
-    assertThreadStage(controller, T3VoiceThreadStage.PLAYING)
-    assertEquals("cancel-thread-playback:1", driver.actions.last())
-    assertFalse(driver.actions.any { it.startsWith("rearm-thread") })
-    assertFalse(driver.actions.any { it.startsWith("stop-thread") })
-
-    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadPlaybackFinished))
-    assertThreadStage(controller, T3VoiceThreadStage.REARMING)
-    assertEquals("rearm-thread:1:750", driver.actions.last())
-  }
-
-  @Test
-  fun skipThreadPlaybackWithoutAutoRearmStopsOnFinish() {
-    val settings = continuousSettings.copy(autoRearm = false)
-    val driver = FakeDriver()
-    val controller = T3VoiceRuntimeController(driver)
-    controller.dispatch(T3VoiceRuntimeCommand.StartThread(threadTarget, settings, session))
-    controller.activateInitialStart(1)
-    advanceThreadToPlaying(controller)
-
-    assertEquals(
-      T3VoiceCommandOutcome.APPLIED,
-      controller.dispatch(T3VoiceRuntimeCommand.SkipThreadPlayback).outcome,
-    )
-    assertThreadStage(controller, T3VoiceThreadStage.PLAYING)
-    assertEquals("cancel-thread-playback:1", driver.actions.last())
-
-    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadPlaybackFinished))
-    assertThreadStage(controller, T3VoiceThreadStage.STOPPING)
-    assertEquals("stop-thread:1", driver.actions.last())
-    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadStopped))
-    assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
-  }
-
-  @Test
-  fun skipThreadPlaybackOutsidePlayingIsDuplicateAndNonThreadIsRejected() {
-    val driver = FakeDriver()
-    val controller = T3VoiceRuntimeController(driver)
-    assertEquals(
-      T3VoiceCommandOutcome.REJECTED,
-      controller.dispatch(T3VoiceRuntimeCommand.SkipThreadPlayback).outcome,
-    )
-
-    controller.dispatch(
-      T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session),
-    )
-    controller.activateInitialStart(1)
-    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
-    val actionCount = driver.actions.size
-    assertEquals(
-      T3VoiceCommandOutcome.DUPLICATE,
-      controller.dispatch(T3VoiceRuntimeCommand.SkipThreadPlayback).outcome,
-    )
-    assertEquals(actionCount, driver.actions.size)
-  }
-
-  @Test
-  fun skipThenNaturalFinishProducesExactlyOneCycleCompletion() {
-    val driver = FakeDriver()
-    val controller = T3VoiceRuntimeController(driver)
-    controller.dispatch(
-      T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session),
-    )
-    controller.activateInitialStart(1)
-    advanceThreadToPlaying(controller)
-
-    controller.dispatch(T3VoiceRuntimeCommand.SkipThreadPlayback)
-    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadPlaybackFinished))
-    assertThreadStage(controller, T3VoiceThreadStage.REARMING)
-    val rearmCount = driver.actions.count { it.startsWith("rearm-thread") }
-    assertEquals(1, rearmCount)
-    assertFalse(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadPlaybackFinished))
-    assertEquals(rearmCount, driver.actions.count { it.startsWith("rearm-thread") })
-  }
-
-  @Test
-  fun skipThenStopDropsLatePlaybackFinished() {
-    val driver = FakeDriver()
-    val controller = T3VoiceRuntimeController(driver)
-    controller.dispatch(
-      T3VoiceRuntimeCommand.StartThread(threadTarget, continuousSettings, session),
-    )
-    controller.activateInitialStart(1)
-    advanceThreadToPlaying(controller)
-
-    controller.dispatch(T3VoiceRuntimeCommand.SkipThreadPlayback)
-    assertEquals(
-      T3VoiceCommandOutcome.APPLIED,
-      controller.dispatch(T3VoiceRuntimeCommand.Stop).outcome,
-    )
-    assertThreadStage(controller, T3VoiceThreadStage.STOPPING)
-    assertFalse(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadPlaybackFinished))
-    assertTrue(controller.onCallback(1, T3VoiceRuntimeCallback.ThreadStopped))
-    assertEquals(T3VoiceControllerState.Idle, controller.snapshot().state)
-    assertFalse(driver.actions.any { it.startsWith("rearm-thread") })
-  }
-
-  private fun advanceThreadToPlaying(controller: T3VoiceRuntimeController) {
-    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
-    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadEndpointDetected)
-    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingFinalized)
-    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadTranscriptReady("spoken request"))
-    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadSubmitted)
-    assertTrue(
-      controller.onCallback(1, T3VoiceRuntimeCallback.ThreadResponseReady(hasPlayback = true)),
-    )
-    assertThreadStage(controller, T3VoiceThreadStage.PLAYING)
-  }
-
-  @Test
   fun driverFailureReleasesResourcesAndExposesAStableFailure() {
     val driver = FakeDriver(failAction = "start-realtime:1:environment-a")
     val controller = T3VoiceRuntimeController(driver)
@@ -1650,10 +1528,6 @@ internal class FakeDriver(
 
   override fun startThreadPlayback(generation: Long) {
     record("play-thread:$generation")
-  }
-
-  override fun cancelThreadPlayback(generation: Long) {
-    record("cancel-thread-playback:$generation")
   }
 
   override fun scheduleThreadRearm(generation: Long, delayMs: Long) {

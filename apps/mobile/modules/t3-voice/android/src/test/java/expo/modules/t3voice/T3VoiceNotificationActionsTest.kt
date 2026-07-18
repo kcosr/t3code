@@ -232,50 +232,6 @@ class T3VoiceNotificationActionsTest {
   }
 
   @Test
-  fun playingThreadAdvertisesSkipThenStop() {
-    val controller = T3VoiceRuntimeController(NotificationFakeDriver())
-    controller.dispatch(
-      T3VoiceRuntimeCommand.StartThread(
-        threadTarget,
-        settings.copy(
-          submissionPolicy = T3VoiceThreadSubmissionPolicy.AUTO_SUBMIT,
-          autoRearm = true,
-          playResponses = true,
-        ),
-        session,
-      ),
-    )
-    controller.activateInitialStart(1)
-    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingStarted)
-    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadEndpointDetected)
-    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadRecordingFinalized)
-    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadTranscriptReady("spoken"))
-    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadSubmitted)
-    controller.onCallback(1, T3VoiceRuntimeCallback.ThreadResponseReady(hasPlayback = true))
-
-    val state = controller.snapshot().state as T3VoiceControllerState.Thread
-    assertEquals(T3VoiceThreadStage.PLAYING, state.stage)
-    val actions = T3VoiceNotificationActions.forSnapshot(controller.snapshot())
-    assertEquals(
-      listOf(T3VoiceNotificationActionId.SKIP, T3VoiceNotificationActionId.STOP),
-      actions.map { it.id },
-    )
-    assertEquals(T3VoiceRuntimeCommand.SkipThreadPlayback, actions.first().command)
-    assertEquals(T3VoiceRuntimeCommand.Stop, actions.last().command)
-
-    val presentation =
-      controller.snapshot().androidControlsPresentation()
-        as T3VoiceAndroidControlsPresentation.Active
-    assertEquals(
-      listOf(T3VoiceAndroidControlAction.SKIP, T3VoiceAndroidControlAction.STOP),
-      presentation.actions,
-    )
-    assertTrue(
-      (transportActionsFor(presentation.actions) and PlaybackState.ACTION_SKIP_TO_NEXT) != 0L,
-    )
-  }
-
-  @Test
   fun recoverableCycleFailureShowsItsSafeStatusOnlyUntilRearmStarts() {
     val controller = T3VoiceRuntimeController(NotificationFakeDriver())
     controller.dispatch(
@@ -464,8 +420,6 @@ private class NotificationFakeDriver : T3VoiceRuntimeDriver {
   override fun waitForThreadResponse(generation: Long) = Unit
 
   override fun startThreadPlayback(generation: Long) = Unit
-
-  override fun cancelThreadPlayback(generation: Long) = Unit
 
   override fun scheduleThreadRearm(generation: Long, delayMs: Long) = Unit
 
