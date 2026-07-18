@@ -292,11 +292,17 @@ export function makePiSessionRuntime(
     const nextIdRef = yield* Ref.make(1);
     const writeMutex = yield* Semaphore.make(1);
     const jsonl = new JsonlDecoder();
+    // Long-lived stdin writer. Stream.run(handle.stdin) ends the Node writable when
+    // the stream completes (endOnDone defaults true), so per-command Stream.succeed
+    // writes close stdin after the first RPC request and Pi exits before follow-ups
+    // (e.g. get_available_models after get_state). Pipe a single queue stream instead.
+    const stdinQueue = yield* Queue.unbounded<Uint8Array>();
 
     let handle: ChildProcessSpawner.ChildProcessHandle | undefined;
     let stdoutFiber: Fiber.Fiber<void, never> | undefined;
     let stderrFiber: Fiber.Fiber<void, never> | undefined;
     let exitFiber: Fiber.Fiber<void, never> | undefined;
+    let stdinFiber: Fiber.Fiber<void, never> | undefined;
 
     const failAllPending = (error: PiSessionRuntimeError) =>
       Effect.gen(function* () {
@@ -321,7 +327,7 @@ export function makePiSessionRuntime(
     const writeLine = (value: unknown) =>
       writeMutex.withPermits(1)(
         Effect.gen(function* () {
-          if (!handle) {
+          if (!handle || !stdinFiber) {
             return yield* new PiSessionRuntimeClosedError({
               detail: "Pi RPC process is not running.",
             });
@@ -333,8 +339,7 @@ export function makePiSessionRuntime(
             });
           }
           const payload = textEncoder.encode(serializeJsonLine(value));
-          yield* Stream.succeed(payload).pipe(
-            Stream.run(handle.stdin),
+          yield* Queue.offer(stdinQueue, payload).pipe(
             Effect.mapError(
               (cause) =>
                 new PiSessionRuntimeProtocolError({
@@ -504,6 +509,12 @@ export function makePiSessionRuntime(
           );
         handle = child;
 
+        stdinFiber = yield* Stream.fromQueue(stdinQueue).pipe(
+          Stream.run(child.stdin),
+          Effect.catchCause(() => Effect.void),
+          Effect.forkIn(runtimeScope),
+        );
+
         stdoutFiber = yield* Stream.runForEach(child.stdout, (chunk) =>
           Effect.gen(function* () {
             const linesResult = Effect.try({
@@ -654,8 +665,13 @@ export function makePiSessionRuntime(
       if (!handle) {
         return;
       }
-      // Best-effort graceful: close stdin, SIGTERM the process group, then SIGKILL.
-      yield* Stream.empty.pipe(Stream.run(handle.stdin), Effect.ignore);
+      // Best-effort graceful: end stdin (queue shutdown completes the write stream),
+      // SIGTERM the process group, then SIGKILL.
+      yield* Queue.shutdown(stdinQueue).pipe(Effect.ignore);
+      if (stdinFiber) {
+        yield* Fiber.join(stdinFiber).pipe(Effect.timeoutOption("500 millis"), Effect.ignore);
+        stdinFiber = undefined;
+      }
       yield* killProcessTree("SIGTERM");
       const exited = yield* handle.exitCode.pipe(
         Effect.timeoutOption(GRACEFUL_EXIT_WAIT),

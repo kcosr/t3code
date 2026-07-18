@@ -44,8 +44,11 @@ const PI_PRESENTATION = {
   requiresNewThreadForModelChange: false,
 } as const;
 
-const VERSION_PROBE_TIMEOUT_MS = 4_000;
-const MODEL_DISCOVERY_TIMEOUT_MS = 20_000;
+// Stock Pi cold-starts the full CLI graph for `--version` (observed ~12s on this host).
+// Keep the probe generous so health checks do not report a false "unavailable".
+const VERSION_PROBE_TIMEOUT_MS = 20_000;
+// Model discovery spawns `pi --mode rpc --no-session --no-tools` and issues get_available_models.
+const MODEL_DISCOVERY_TIMEOUT_MS = 30_000;
 
 const THINKING_LEVEL_LABELS: Record<PiThinkingLevel, string> = {
   off: "Off",
