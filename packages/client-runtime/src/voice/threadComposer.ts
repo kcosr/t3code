@@ -9,11 +9,8 @@ export interface ThreadVoiceComposerTarget {
 export interface ThreadVoiceControlState {
   readonly active: boolean;
   readonly blockedByAnotherTarget: boolean;
-  readonly command: "start" | "finish-recording" | "stop";
-  readonly accessibilityLabel:
-    | "Start Auto Listen"
-    | "Finish Thread voice recording"
-    | "Stop Thread voice";
+  readonly command: "start" | "stop";
+  readonly accessibilityLabel: "Start Auto Listen" | "Stop Auto Listen";
 }
 
 export type ThreadVoiceControlCommand = ThreadVoiceControlState["command"];
@@ -121,19 +118,11 @@ export function threadVoiceControlState(
       accessibilityLabel: "Start Auto Listen",
     };
   }
-  if (snapshot.mode === "thread" && snapshot.phase === "recording") {
-    return {
-      active: true,
-      blockedByAnotherTarget: false,
-      command: "finish-recording",
-      accessibilityLabel: "Finish Thread voice recording",
-    };
-  }
   return {
     active: true,
     blockedByAnotherTarget: false,
     command: "stop",
-    accessibilityLabel: "Stop Thread voice",
+    accessibilityLabel: "Stop Auto Listen",
   };
 }
 

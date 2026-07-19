@@ -348,6 +348,26 @@ class T3VoiceModule : Module() {
         }
       }
 
+      AsyncFunction("getVoiceCueStartupPreRollMsAsync") { promise: Promise ->
+        withBinder(promise, "voice-cue-pre-roll-read-failed") { voice, result ->
+          result.resolve(mapOf("startupPreRollMs" to voice.voiceCueStartupPreRollMs()))
+        }
+      }
+
+      AsyncFunction("setVoiceCueStartupPreRollMsAsync") {
+        input: Map<String, Any?>, promise: Promise ->
+        input.requireExactBridgeKeys("voice cue pre-roll input", setOf("startupPreRollMs"))
+        val raw = input["startupPreRollMs"]
+        val startupPreRollMs =
+          when (raw) {
+            is Number -> raw.toInt()
+            else -> error("startupPreRollMs must be a number.")
+          }
+        withBinder(promise, "voice-cue-pre-roll-write-failed") { voice, result ->
+          result.resolve(voice.setVoiceCueStartupPreRollMs(startupPreRollMs))
+        }
+      }
+
       AsyncFunction("updateRealtimeContextAsync") {
         input: ReadableMap, promise: Promise ->
         dispatchRuntime(
@@ -409,6 +429,18 @@ class T3VoiceModule : Module() {
 
       AsyncFunction("finishThreadRecordingAsync") { promise: Promise ->
         dispatchRuntime(promise, T3VoiceRuntimeCommand.FinishThreadUtterance)
+      }
+
+      AsyncFunction("skipThreadPlaybackAsync") { promise: Promise ->
+        dispatchRuntime(promise, T3VoiceRuntimeCommand.SkipThreadPlayback)
+      }
+
+      AsyncFunction("updateThreadPlayResponsesAsync") {
+        input: Map<String, Any?>, promise: Promise ->
+        dispatchRuntime(
+          promise,
+          T3VoiceRuntimeBridgeInput.updateThreadPlayResponses(input),
+        )
       }
 
       AsyncFunction("updateThreadReviewTranscriptAsync") {

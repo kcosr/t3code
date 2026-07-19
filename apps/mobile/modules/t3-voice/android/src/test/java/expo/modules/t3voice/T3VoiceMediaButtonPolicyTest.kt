@@ -68,6 +68,36 @@ class T3VoiceMediaButtonPolicyTest {
   }
 
   @Test
+  fun playingKeysPreferSkipAndNeverMapHeadsetToStop() {
+    val available =
+      listOf(T3VoiceAndroidControlAction.SKIP, T3VoiceAndroidControlAction.STOP)
+    assertEquals(
+      T3VoiceAndroidControlAction.SKIP,
+      decide(KeyEvent.KEYCODE_HEADSETHOOK, available).action,
+    )
+    assertEquals(
+      T3VoiceAndroidControlAction.SKIP,
+      decide(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, available).action,
+    )
+    assertEquals(
+      T3VoiceAndroidControlAction.SKIP,
+      decide(KeyEvent.KEYCODE_MEDIA_NEXT, available).action,
+    )
+    assertEquals(
+      T3VoiceAndroidControlAction.SKIP,
+      decide(KeyEvent.KEYCODE_MEDIA_PAUSE, available).action,
+    )
+    assertEquals(
+      T3VoiceAndroidControlAction.SKIP,
+      decide(KeyEvent.KEYCODE_MEDIA_STOP, available).action,
+    )
+    assertEquals(
+      T3VoiceAndroidControlAction.SKIP,
+      decide(KeyEvent.KEYCODE_MEDIA_PLAY, available).action,
+    )
+  }
+
+  @Test
   fun unknownKeysFallThrough() {
     val decision = decide(KeyEvent.KEYCODE_VOLUME_UP, emptyList())
     assertFalse(decision.consume)

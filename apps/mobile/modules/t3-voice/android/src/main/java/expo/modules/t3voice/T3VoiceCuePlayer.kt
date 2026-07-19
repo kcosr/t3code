@@ -70,6 +70,10 @@ internal class T3VoiceCuePlayer(
   private val coldStartCheckMs: Long = COLD_START_CHECK_MS,
   private val drainPollMs: Long = DRAIN_POLL_MS,
   private val timeoutMs: Long = TIMEOUT_MS,
+  /** Resolved at each play so settings changes apply without recreating the player. */
+  private val startupPreRollMs: () -> Int = {
+    T3VoiceCueSettings.DEFAULT_STARTUP_PRE_ROLL_MS
+  },
   private val recordDiagnostic:
     (Long, T3VoiceDiagnosticCategory, T3VoiceDiagnosticCode, Int, Int) -> Unit =
     { generation, category, code, primaryCount, secondaryCount ->
@@ -119,7 +123,11 @@ internal class T3VoiceCuePlayer(
           T3VoiceCuePcm.withStartupPreRoll(
             sampleRate,
             T3VoiceCuePcm.synthesize(sampleRate, cue),
-            STARTUP_PRE_ROLL_MS,
+            startupPreRollMs()
+              .coerceIn(
+                T3VoiceCueSettings.STARTUP_PRE_ROLL_MIN_MS,
+                T3VoiceCueSettings.STARTUP_PRE_ROLL_MAX_MS,
+              ),
           ),
           clock.elapsedRealtime() + timeoutMs,
           completion,
@@ -287,7 +295,6 @@ internal class T3VoiceCuePlayer(
 
   private companion object {
     const val SAMPLE_RATE = 48_000
-    const val STARTUP_PRE_ROLL_MS = 512
     const val COLD_START_CHECK_MS = 220L
     const val DRAIN_POLL_MS = 10L
     const val TIMEOUT_MS = 2_500L

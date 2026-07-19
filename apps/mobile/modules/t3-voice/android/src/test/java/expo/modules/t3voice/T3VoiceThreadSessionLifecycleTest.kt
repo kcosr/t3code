@@ -578,7 +578,12 @@ internal class T3VoiceThreadSessionLifecycleTest {
     private val activeRecording = AtomicReference<String?>()
     private val activePlayback = AtomicReference<String?>()
 
-    override fun acquireAudio(): Boolean {
+    override fun acquireCaptureAudio(): Boolean {
+      audioAcquired.set(true)
+      return true
+    }
+
+    override fun acquirePlaybackAudio(): Boolean {
       audioAcquired.set(true)
       return true
     }

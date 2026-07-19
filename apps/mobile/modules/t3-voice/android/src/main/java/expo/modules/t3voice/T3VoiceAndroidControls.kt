@@ -25,6 +25,7 @@ internal enum class T3VoiceAndroidControlAction {
   FINISH_UTTERANCE,
   SUBMIT_TRANSCRIPT,
   SWITCH_TO_THREAD,
+  SKIP,
   STOP,
 }
 
@@ -87,6 +88,12 @@ internal fun transportActionsFor(actions: List<T3VoiceAndroidControlAction>): Lo
         T3VoiceAndroidControlAction.FINISH_UTTERANCE,
         -> PlaybackState.ACTION_PAUSE
         T3VoiceAndroidControlAction.SWITCH_TO_THREAD -> PlaybackState.ACTION_SKIP_TO_NEXT
+        T3VoiceAndroidControlAction.SKIP ->
+          PlaybackState.ACTION_SKIP_TO_NEXT or
+            PlaybackState.ACTION_PLAY or
+            PlaybackState.ACTION_PAUSE or
+            PlaybackState.ACTION_PLAY_PAUSE or
+            PlaybackState.ACTION_STOP
         T3VoiceAndroidControlAction.STOP -> PlaybackState.ACTION_STOP
         T3VoiceAndroidControlAction.DISABLE -> 0L
       }
@@ -123,6 +130,7 @@ internal class T3VoiceAndroidControls(
         object : MediaSession.Callback() {
           override fun onPlay() {
             dispatchFirst(
+              T3VoiceAndroidControlAction.SKIP,
               T3VoiceAndroidControlAction.START,
               T3VoiceAndroidControlAction.UNMUTE,
               T3VoiceAndroidControlAction.SUBMIT_TRANSCRIPT,
@@ -130,18 +138,27 @@ internal class T3VoiceAndroidControls(
           }
 
           override fun onPause() {
+            // While PLAYING, transport pause must skip speech (not pause/resume product).
             dispatchFirst(
+              T3VoiceAndroidControlAction.SKIP,
               T3VoiceAndroidControlAction.MUTE,
               T3VoiceAndroidControlAction.FINISH_UTTERANCE,
             )
           }
 
           override fun onStop() {
-            dispatchFirst(T3VoiceAndroidControlAction.STOP)
+            dispatchFirst(
+              T3VoiceAndroidControlAction.SKIP,
+              T3VoiceAndroidControlAction.STOP,
+            )
           }
 
           override fun onSkipToNext() {
-            dispatchFirst(T3VoiceAndroidControlAction.SWITCH_TO_THREAD)
+            // Match MEDIA_NEXT policy preference: SKIP first when available, else SWITCH.
+            dispatchFirst(
+              T3VoiceAndroidControlAction.SKIP,
+              T3VoiceAndroidControlAction.SWITCH_TO_THREAD,
+            )
           }
 
           override fun onCustomAction(action: String, extras: Bundle?) {
@@ -164,6 +181,15 @@ internal class T3VoiceAndroidControls(
                 repeatCount = event.repeatCount,
                 available = activeActions(),
               )
+            val presentation =
+              currentPresentation as? T3VoiceAndroidControlsPresentation.Active
+            T3VoiceDiagnostics.record(
+              generation = presentation?.generation ?: 0,
+              category = T3VoiceDiagnosticCategory.STATE,
+              code = T3VoiceDiagnosticCode.MEDIA_BUTTON_RECEIVED,
+              primaryCount = event.keyCode,
+              secondaryCount = decision.action?.ordinal?.plus(1) ?: 0,
+            )
             decision.action?.let { dispatchFirst(it) }
             return decision.consume || super.onMediaButtonEvent(mediaButtonIntent)
           }
@@ -277,7 +303,15 @@ internal class T3VoiceAndroidControls(
   private fun dispatchFirst(vararg ids: T3VoiceAndroidControlAction) {
     val presentation = currentPresentation as? T3VoiceAndroidControlsPresentation.Active ?: return
     ids.firstOrNull(presentation.actions::contains)
-      ?.let { dispatch(it, presentation.owner, presentation.generation) }
+      ?.let {
+        T3VoiceDiagnostics.record(
+          generation = presentation.generation,
+          category = T3VoiceDiagnosticCategory.STATE,
+          code = T3VoiceDiagnosticCode.MEDIA_ACTION_DISPATCHED,
+          primaryCount = it.ordinal + 1,
+        )
+        dispatch(it, presentation.owner, presentation.generation)
+      }
   }
 
   private fun parseActionId(value: String): T3VoiceAndroidControlAction? =
@@ -317,6 +351,7 @@ internal class T3VoiceAndroidControls(
       T3VoiceAndroidControlAction.FINISH_UTTERANCE -> "Finish"
       T3VoiceAndroidControlAction.SUBMIT_TRANSCRIPT -> "Submit"
       T3VoiceAndroidControlAction.SWITCH_TO_THREAD -> "Thread"
+      T3VoiceAndroidControlAction.SKIP -> "Skip"
       T3VoiceAndroidControlAction.STOP -> "Stop"
     }
 
@@ -329,7 +364,9 @@ internal class T3VoiceAndroidControls(
       T3VoiceAndroidControlAction.MUTE,
       T3VoiceAndroidControlAction.FINISH_UTTERANCE,
       -> android.R.drawable.ic_media_pause
-      T3VoiceAndroidControlAction.SWITCH_TO_THREAD -> android.R.drawable.ic_media_next
+      T3VoiceAndroidControlAction.SWITCH_TO_THREAD,
+      T3VoiceAndroidControlAction.SKIP,
+      -> android.R.drawable.ic_media_next
       T3VoiceAndroidControlAction.STOP,
       T3VoiceAndroidControlAction.DISABLE,
       -> android.R.drawable.ic_menu_close_clear_cancel
@@ -381,6 +418,7 @@ private fun T3VoiceNotificationActionId.toAndroidAction(): T3VoiceAndroidControl
     T3VoiceNotificationActionId.UNMUTE -> T3VoiceAndroidControlAction.UNMUTE
     T3VoiceNotificationActionId.FINISH_UTTERANCE -> T3VoiceAndroidControlAction.FINISH_UTTERANCE
     T3VoiceNotificationActionId.SUBMIT_TRANSCRIPT -> T3VoiceAndroidControlAction.SUBMIT_TRANSCRIPT
+    T3VoiceNotificationActionId.SKIP -> T3VoiceAndroidControlAction.SKIP
     T3VoiceNotificationActionId.STOP -> T3VoiceAndroidControlAction.STOP
   }
 

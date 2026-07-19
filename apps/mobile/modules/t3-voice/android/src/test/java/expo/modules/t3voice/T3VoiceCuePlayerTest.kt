@@ -21,10 +21,10 @@ class T3VoiceCuePlayerTest {
   }
 
   @Test
-  fun `prepends 512 milliseconds of startup silence without changing cue samples`() {
+  fun `prepends 768 milliseconds of startup silence without changing cue samples`() {
     val cue = T3VoiceCuePcm.synthesize(48_000, T3VoiceCue.ENDED)
-    val withPreRoll = T3VoiceCuePcm.withStartupPreRoll(48_000, cue, 512)
-    val silenceSamples = 48_000 * 512 / 1_000
+    val withPreRoll = T3VoiceCuePcm.withStartupPreRoll(48_000, cue, 768)
+    val silenceSamples = 48_000 * 768 / 1_000
 
     assertEquals((silenceSamples * 2) + cue.size, withPreRoll.size)
     assertEquals(0, sample(withPreRoll, silenceSamples - 1))

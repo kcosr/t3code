@@ -99,9 +99,8 @@ export const COMPOSER_EXPANDED_CHROME = 174;
 
 const THREAD_VOICE_CONTROL_ICONS = {
   start: "waveform",
-  "finish-recording": "checkmark",
   stop: "stop.fill",
-} as const satisfies Record<ThreadVoiceControlCommand, "waveform" | "checkmark" | "stop.fill">;
+} as const satisfies Record<ThreadVoiceControlCommand, "waveform" | "stop.fill">;
 
 export interface ThreadComposerProps {
   readonly draftMessage: string;
@@ -479,9 +478,6 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     await audioTransitionRef.current
       .run(async () => {
         switch (threadVoiceControl.command) {
-          case "finish-recording":
-            await voiceRuntime.finishThreadRecording();
-            return;
           case "stop":
             await voiceRuntime.stop();
             return;
@@ -490,12 +486,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
         }
       })
       .catch((cause) => Alert.alert("Thread voice unavailable", String(cause)));
-  }, [
-    threadVoiceControl.command,
-    voiceRuntime.finishThreadRecording,
-    voiceRuntime.startThread,
-    voiceRuntime.stop,
-  ]);
+  }, [threadVoiceControl.command, voiceRuntime.startThread, voiceRuntime.stop]);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
   const canSend = hasContent;
@@ -1125,9 +1116,10 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                   }
                   icon={THREAD_VOICE_CONTROL_ICONS[threadVoiceControl.command]}
                   onPress={() => void toggleAutoListenOperation()}
+                  variant={threadVoiceControl.active ? "danger" : "circle"}
                 />
               ) : null}
-              {realtimeInUse && dictation.available ? (
+              {realtimeInUse && dictation.available && !threadVoiceControl.active ? (
                 <ControlPill
                   icon="microphone.fill"
                   accessibilityLabel="Switch from realtime voice to dictation"
@@ -1137,7 +1129,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
               ) : null}
               {showStopAction ? (
                 <ControlPill icon="stop.fill" variant="danger" onPress={props.onStopThread} />
-              ) : dictation.phase === "recording" ? (
+              ) : threadVoiceControl.active ? null : dictation.phase === "recording" ? (
                 <ControlPill
                   icon="stop.fill"
                   variant="danger"
@@ -1176,7 +1168,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                   onPress={() => void props.onPickDraftImages()}
                   showChevron={false}
                 />
-                {dictation.available ? (
+                {dictation.available && !threadVoiceControl.active ? (
                   <ComposerToolbarButton
                     accessibilityLabel={
                       dictation.phase === "recording" ? "Stop dictation" : "Start dictation"
@@ -1200,6 +1192,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                     }
                     onPress={() => void toggleAutoListenOperation()}
                     showChevron={false}
+                    variant={threadVoiceControl.active ? "danger" : "default"}
                   />
                 ) : null}
                 {props.speechPlayback.available &&

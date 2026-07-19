@@ -3,6 +3,7 @@ package expo.modules.t3voice
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ThreadPoolExecutor
@@ -64,7 +65,14 @@ internal class T3VoiceThreadSession(
   private var playbackId: String? = null
   private var pcmSink: T3VoicePcmStreamSink? = null
   private var playbackFocusSuspended = false
+  /** Permanent playback focus loss requires a successful focus claim before rearming capture. */
+  private var rearmRequiresFocusAdmission = false
+  private var focusAdmissionRetryDelayMs = T3VoiceFocusAdmissionRetryPolicy.INITIAL_DELAY_MILLIS
   private var inFlightMediaCallbacks = 0
+  /** Set when Skip arrives before [playbackId] is assigned (WAITING→PLAYING handoff). */
+  private var skipPending = false
+  /** Playback id that has been asked to skip; cleared at the next recording cycle. */
+  private var skipRequestedPlaybackId: String? = null
 
   fun start() = startRecording()
 
@@ -121,7 +129,8 @@ internal class T3VoiceThreadSession(
               deleteRecording(finish)
               return@execute
             }
-            media.releaseAudio()
+            // Capture done with speech: play Ended before upload/submit (hands-free cycle).
+            playEndedAfterCaptureThenReleaseAudio()
             emitIfActive(T3VoiceRuntimeCallback.ThreadRecordingFinalized)
           }
         }
@@ -285,7 +294,15 @@ internal class T3VoiceThreadSession(
           playbackFocusSuspended = false
           mediaOwner = MediaOwner.STARTING_PLAYBACK
         }
-        check(media.acquireAudio()) {
+        val playbackAudioAcquired = media.acquirePlaybackAudio()
+        recordDiagnostic(
+          if (playbackAudioAcquired) {
+            T3VoiceDiagnosticCode.AUDIO_CLAIM_ACQUIRED
+          } else {
+            T3VoiceDiagnosticCode.AUDIO_CLAIM_REJECTED
+          },
+        )
+        check(playbackAudioAcquired) {
           "Android denied playback audio focus."
         }
         media.startPlayback(id, SPEECH_SAMPLE_RATE, SPEECH_CHANNEL_COUNT)
@@ -305,47 +322,221 @@ internal class T3VoiceThreadSession(
         if (focusSuspended == null) {
           sink.cancel()
           runCatching { media.cancelPlayback(id) }
-          media.releaseAudio()
+          // Interrupt or stop may already own release; only release if we still claim the id.
+          if (claimPlaybackOwnership(id)) {
+            media.releaseAudio()
+          }
+          return@execute
+        }
+        // Consume Skip that arrived during WAITING→PLAYING / STARTING_PLAYBACK.
+        val skipAfterEstablish =
+          synchronized(lock) {
+            if (skipPending || skipRequestedPlaybackId == id) {
+              skipPending = false
+              skipRequestedPlaybackId = id
+              true
+            } else {
+              false
+            }
+          }
+        if (skipAfterEstablish) {
+          sink.cancel()
+          runCatching { media.cancelPlayback(id) }
+          if (claimPlaybackOwnership(id)) {
+            media.releaseAudio()
+            emitIfActive(T3VoiceRuntimeCallback.ThreadPlaybackFinished)
+          }
           return@execute
         }
         if (focusSuspended) media.pausePlayback(id)
-        withBoundedCalls(MAXIMUM_PLAYBACK_MILLIS, "playback-timeout") { calls ->
+        withBoundedCalls(
+          MAXIMUM_PLAYBACK_MILLIS,
+          "playback-timeout",
+          admission = { playbackId == id && mediaOwner == MediaOwner.PLAYBACK },
+        ) { calls ->
           segments.forEach { segment ->
-            check(active.get()) { "Playback stopped." }
+            check(playbackIsOwned(id)) { "Playback stopped." }
             val requestId = UUID.randomUUID().toString()
             val ticket = api.createMediaTicket(calls, T3VoiceMediaOperation.SPEECH, requestId)
             api.synthesize(calls, ticket, requestId, id, segment, sink::accept)
           }
         }
-        check(active.get()) { "Playback stopped." }
+        check(playbackIsOwned(id)) { "Playback stopped." }
         media.finishPlayback(id, sink.finish())
       } catch (cause: Throwable) {
         sink.cancel()
         runCatching { media.cancelPlayback(id) }
-        synchronized(lock) {
-          if (playbackId == id) {
-            playbackId = null
-            pcmSink = null
-            playbackFocusSuspended = false
-            mediaOwner = MediaOwner.NONE
+        // Intentional skip must not surface as a terminal playback failure.
+        val skipped =
+          synchronized(lock) {
+            (skipPending || skipRequestedPlaybackId == id).also { intentional ->
+              if (intentional) {
+                skipPending = false
+                skipRequestedPlaybackId = id
+              }
+            }
+          }
+        if (claimPlaybackOwnership(id)) {
+          media.releaseAudio()
+          if (skipped) {
+            recordDiagnostic(T3VoiceDiagnosticCode.PLAYBACK_INTERRUPT_COMPLETED)
+            emitIfActive(T3VoiceRuntimeCallback.ThreadPlaybackFinished)
+          } else {
+            fail(cause, "playback-failed", "Assistant response playback failed.")
           }
         }
-        media.releaseAudio()
-        fail(cause, "playback-failed", "Assistant response playback failed.")
       }
     }
   }
 
+  /**
+   * Cancels the current response playback without tearing down the Thread session.
+   * Completes via [T3VoiceRuntimeCallback.ThreadPlaybackFinished] so the controller can rearm
+   * or stop according to autoRearm. Idempotent for double headset presses.
+   */
+  fun interruptPlayback() {
+    interruptPlayback(requireFocusAdmission = false)
+  }
+
+  private fun interruptPlayback(requireFocusAdmission: Boolean) {
+    data class Interrupt(
+      val id: String,
+      val sink: T3VoicePcmStreamSink?,
+      val calls: T3VoiceHttpCallRegistry?,
+    )
+
+    recordDiagnostic(T3VoiceDiagnosticCode.PLAYBACK_INTERRUPT_REQUESTED)
+    val interrupt =
+      synchronized(lock) {
+        if (!active.get()) return
+        if (requireFocusAdmission && !rearmRequiresFocusAdmission) {
+          rearmRequiresFocusAdmission = true
+          focusAdmissionRetryDelayMs = T3VoiceFocusAdmissionRetryPolicy.INITIAL_DELAY_MILLIS
+        }
+        val current = playbackId
+        if (current == null) {
+          skipPending = true
+          return
+        }
+        // While STARTING_PLAYBACK, only latch — startPlayback owns acquire/release/emit after
+        // establish so we do not releaseAudio before acquireAudio races.
+        if (mediaOwner == MediaOwner.STARTING_PLAYBACK) {
+          skipRequestedPlaybackId = current
+          skipPending = true
+          return
+        }
+        if (mediaOwner != MediaOwner.PLAYBACK) return
+        if (skipRequestedPlaybackId == current) return
+        skipRequestedPlaybackId = current
+        val sink = pcmSink
+        playbackId = null
+        pcmSink = null
+        playbackFocusSuspended = false
+        mediaOwner = MediaOwner.NONE
+        val calls = currentCalls.getAndSet(null)
+        inFlightMediaCallbacks += 1
+        Interrupt(current, sink, calls)
+      }
+    cleanupExecutor.execute {
+      try {
+        runCatching { interrupt.calls?.cancelAll() }
+        interrupt.sink?.cancel()
+        // Player cancel deliberately fires no onFinished callback — we synthesize completion.
+        runCatching { media.cancelPlayback(interrupt.id) }
+        runCatching { media.releaseAudio() }
+        recordDiagnostic(T3VoiceDiagnosticCode.PLAYBACK_INTERRUPT_COMPLETED)
+        emitIfActive(T3VoiceRuntimeCallback.ThreadPlaybackFinished)
+      } finally {
+        mediaCallbackFinished()
+      }
+    }
+  }
+
+  /** Sole gate that nulls playback ownership so exactly one path emits finish/fail. */
+  private fun claimPlaybackOwnership(id: String): Boolean =
+    synchronized(lock) {
+      if (playbackId != id) return false
+      playbackId = null
+      pcmSink = null
+      playbackFocusSuspended = false
+      mediaOwner = MediaOwner.NONE
+      true
+    }
+
+  private fun playbackIsOwned(id: String): Boolean =
+    synchronized(lock) {
+      active.get() && playbackId == id && mediaOwner == MediaOwner.PLAYBACK
+    }
+
   fun scheduleRearm(delayMs: Long) {
     if (!active.get()) return
+    recordDiagnostic(T3VoiceDiagnosticCode.THREAD_REARM_SCHEDULED)
     synchronized(lock) {
+      if (!active.get()) return
       scheduledRearm?.cancel(false)
-      scheduledRearm =
-        scheduler.schedule(
-          { emitIfActive(T3VoiceRuntimeCallback.ThreadRearmReady) },
-          delayMs,
-          TimeUnit.MILLISECONDS,
+      scheduledRearm = scheduleRearmTask(delayMs)
+    }
+  }
+
+  private fun scheduleRearmTask(delayMs: Long): ScheduledFuture<*>? =
+    try {
+      scheduler.schedule(
+        ::admitScheduledRearm,
+        delayMs,
+        TimeUnit.MILLISECONDS,
+      )
+    } catch (_: RejectedExecutionException) {
+      null
+    }
+
+  private fun admitScheduledRearm() {
+    runCatching {
+      controlExecutor.execute {
+        if (!active.get()) return@execute
+        val needsFocus = synchronized(lock) { rearmRequiresFocusAdmission }
+        if (!needsFocus) {
+          recordDiagnostic(T3VoiceDiagnosticCode.THREAD_REARM_ADMITTED)
+          emitIfActive(T3VoiceRuntimeCallback.ThreadRearmReady)
+          return@execute
+        }
+        val focusAcquired = runCatching { media.acquireCaptureAudio() }.getOrDefault(false)
+        recordDiagnostic(
+          if (focusAcquired) {
+            T3VoiceDiagnosticCode.AUDIO_CLAIM_ACQUIRED
+          } else {
+            T3VoiceDiagnosticCode.AUDIO_CLAIM_REJECTED
+          },
         )
+        val admitted =
+          synchronized(lock) {
+            if (active.get() && rearmRequiresFocusAdmission && focusAcquired) {
+              rearmRequiresFocusAdmission = false
+              focusAdmissionRetryDelayMs = T3VoiceFocusAdmissionRetryPolicy.INITIAL_DELAY_MILLIS
+              true
+            } else {
+              false
+            }
+          }
+        if (admitted) {
+          recordDiagnostic(T3VoiceDiagnosticCode.THREAD_REARM_ADMITTED)
+          emitIfActive(T3VoiceRuntimeCallback.ThreadRearmReady)
+        } else {
+          if (focusAcquired) media.releaseAudio()
+          recordDiagnostic(T3VoiceDiagnosticCode.THREAD_REARM_REJECTED)
+          scheduleFocusAdmissionRetry()
+        }
+      }
+    }
+  }
+
+  private fun scheduleFocusAdmissionRetry() {
+    if (!active.get()) return
+    synchronized(lock) {
+      if (!active.get() || !rearmRequiresFocusAdmission) return
+      val retryDelayMs = focusAdmissionRetryDelayMs
+      focusAdmissionRetryDelayMs = T3VoiceFocusAdmissionRetryPolicy.nextDelay(retryDelayMs)
+      scheduledRearm?.cancel(false)
+      scheduledRearm = scheduleRearmTask(retryDelayMs)
     }
   }
 
@@ -368,23 +559,48 @@ internal class T3VoiceThreadSession(
       inFlightMediaCallbacks += 1
     }
     try {
-      media.releaseAudio()
       when (termination) {
-        is T3VoiceRecordingTermination.Completed ->
+        is T3VoiceRecordingTermination.Completed -> {
+          // Auto-endpoint with usable speech: single Ended beep before cycle continues.
+          playEndedAfterCaptureThenReleaseAudio()
           emitIfActive(T3VoiceRuntimeCallback.ThreadEndpointDetected)
-        is T3VoiceRecordingTermination.Cancelled ->
+        }
+        is T3VoiceRecordingTermination.Cancelled -> {
+          media.releaseAudio()
           emitIfActive(T3VoiceRuntimeCallback.ThreadNoSpeechDetected)
-        is T3VoiceRecordingTermination.Failed ->
+        }
+        is T3VoiceRecordingTermination.Failed -> {
+          media.releaseAudio()
           failCycle(
             IllegalStateException("Recorder finalization failed."),
             "recording-finalization-failed",
             "Voice recording could not be finalized.",
           )
+        }
       }
     } finally {
       mediaCallbackFinished()
     }
     return true
+  }
+
+  /**
+   * After capture ownership is cleared, optionally play the Ended (done) cue on the
+   * communication route, then release audio so upload/submit can proceed.
+   *
+   * Uses [T3VoiceCueTiming.awaitEnded] (existing capture→Ended settle + pre-roll). No separate
+   * product delay control: cue lead silence and rearm guard already cover timing knobs.
+   * Fail-open if cues are off or the player rejects so the Thread cycle never stalls.
+   */
+  private fun playEndedAfterCaptureThenReleaseAudio() {
+    if (cueArming.isEnabled()) {
+      // Recording already held the route; re-acquire is idempotent if still active.
+      val routeHeld = runCatching { media.acquireCaptureAudio() }.getOrDefault(false)
+      if (routeHeld) {
+        T3VoiceCueTiming.awaitEnded(cueArming, generation)
+      }
+    }
+    media.releaseAudio()
   }
 
   fun onPlaybackChunkConsumed(id: String, chunkIndex: Int): Boolean {
@@ -395,7 +611,10 @@ internal class T3VoiceThreadSession(
 
   fun onPlaybackFinished(id: String): Boolean {
     synchronized(lock) {
-      if (!active.get() || playbackId != id) return false
+      if (!active.get() || playbackId != id) {
+        recordDiagnostic(T3VoiceDiagnosticCode.PLAYBACK_COMPLETION_STALE)
+        return false
+      }
       playbackId = null
       pcmSink = null
       playbackFocusSuspended = false
@@ -412,8 +631,30 @@ internal class T3VoiceThreadSession(
   }
 
   fun onPlaybackError(id: String, cause: Throwable): Boolean {
-    val owned = synchronized(lock) { playbackId == id }
-    if (!owned) return false
+    val skipped =
+      synchronized(lock) {
+        if (playbackId != id) {
+          recordDiagnostic(T3VoiceDiagnosticCode.PLAYBACK_COMPLETION_STALE)
+          return false
+        }
+        skipRequestedPlaybackId == id
+      }
+    if (skipped) {
+      // Same single-emit gate as interrupt/finish; fence terminal quiescence like onPlaybackFinished.
+      synchronized(lock) {
+        if (playbackId != id) return true
+        inFlightMediaCallbacks += 1
+      }
+      try {
+        if (claimPlaybackOwnership(id)) {
+          media.releaseAudio()
+          emitIfActive(T3VoiceRuntimeCallback.ThreadPlaybackFinished)
+        }
+      } finally {
+        mediaCallbackFinished()
+      }
+      return true
+    }
     fail(cause, "pcm-playback-failed", "Assistant response playback failed.")
     return true
   }
@@ -437,11 +678,7 @@ internal class T3VoiceThreadSession(
       MediaOwner.STARTING_PLAYBACK,
       MediaOwner.PLAYBACK -> {
         if (T3VoiceAudioFocusAction.TERMINATE_SESSION in actions) {
-          fail(
-            T3VoiceNativeApiException("thread-audio-focus-lost", retryable = true),
-            "thread-audio-focus-lost",
-            "Thread playback lost audio focus.",
-          )
+          interruptPlayback(requireFocusAdmission = true)
           return
         }
         val id =
@@ -497,13 +734,27 @@ internal class T3VoiceThreadSession(
         synchronized(lock) {
           check(active.get()) { "Thread voice session stopped." }
           check(mediaOwner == MediaOwner.NONE) { "Thread media is already active." }
+          // Never let a prior cycle's Skip latch affect the next rearm cycle.
+          skipPending = false
+          skipRequestedPlaybackId = null
           recordingId = id
           noInputRecordingId = null
           mediaOwner = MediaOwner.STARTING_RECORDING
         }
         // Establish MODE_IN_COMMUNICATION, focus, and the selected route before Ready. Without a
         // live communication output Android can accept the cue PCM while advancing zero frames.
-        check(media.acquireAudio()) {
+        val captureAudioAcquired = media.acquireCaptureAudio()
+        recordDiagnostic(
+          if (captureAudioAcquired) {
+            T3VoiceDiagnosticCode.AUDIO_CLAIM_ACQUIRED
+          } else {
+            T3VoiceDiagnosticCode.AUDIO_CLAIM_REJECTED
+          },
+        )
+        if (!captureAudioAcquired) {
+          synchronized(lock) { rearmRequiresFocusAdmission = true }
+        }
+        check(captureAudioAcquired) {
           "Android denied recording audio focus."
         }
         val settleMs =
@@ -600,11 +851,17 @@ internal class T3VoiceThreadSession(
   private fun <T> withBoundedCalls(
     timeoutMs: Long,
     timeoutCode: String,
+    admission: () -> Boolean = { true },
     block: (T3VoiceHttpCallRegistry) -> T,
   ): T {
-    check(active.get()) { "Thread voice session stopped." }
     val calls = T3VoiceHttpCallRegistry()
-    check(currentCalls.compareAndSet(null, calls)) { "A Thread network operation is already active." }
+    synchronized(lock) {
+      check(active.get()) { "Thread voice session stopped." }
+      check(admission()) { "Thread network operation is no longer admitted." }
+      check(currentCalls.compareAndSet(null, calls)) {
+        "A Thread network operation is already active."
+      }
+    }
     val timedOut = AtomicBoolean(false)
     val timeout =
       scheduler.schedule(
@@ -704,7 +961,7 @@ internal class T3VoiceThreadSession(
       // through the bounded Ended drain. This mirrors the Ready fence in the opposite direction.
       cancelOwnedMedia(releaseAudio = !playEnded)
       if (playEnded) {
-        val routeAcquired = runCatching { media.acquireAudio() }.getOrDefault(false)
+        val routeAcquired = runCatching { media.acquireCaptureAudio() }.getOrDefault(false)
         if (routeAcquired) {
           T3VoiceCueTiming.awaitEnded(cueArming, generation)
         }
@@ -781,6 +1038,10 @@ internal class T3VoiceThreadSession(
     if (active.get()) emit(callback)
   }
 
+  private fun recordDiagnostic(code: T3VoiceDiagnosticCode) {
+    T3VoiceDiagnostics.record(generation, T3VoiceDiagnosticCategory.STATE, code)
+  }
+
   private companion object {
     const val SPEECH_SAMPLE_RATE = 24_000
     const val SPEECH_CHANNEL_COUNT = 1
@@ -789,6 +1050,15 @@ internal class T3VoiceThreadSession(
     const val MAXIMUM_PLAYBACK_MILLIS = 15L * 60L * 1_000L
     const val MEDIA_EXECUTOR_COUNT = 2
   }
+}
+
+internal object T3VoiceFocusAdmissionRetryPolicy {
+  const val INITIAL_DELAY_MILLIS = 500L
+  private const val MAXIMUM_DELAY_MILLIS = 30_000L
+
+  fun nextDelay(currentDelayMs: Long): Long =
+    (currentDelayMs.coerceAtMost(MAXIMUM_DELAY_MILLIS / 2) * 2)
+      .coerceAtMost(MAXIMUM_DELAY_MILLIS)
 }
 
 /** A single worker whose termination hook runs only after its last task has fully returned. */

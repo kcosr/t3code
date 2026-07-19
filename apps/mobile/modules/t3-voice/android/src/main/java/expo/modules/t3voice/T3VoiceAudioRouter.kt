@@ -25,6 +25,11 @@ internal data class T3VoiceAudioRouterStartResult(
   val ownerGeneration: Long,
 )
 
+private enum class T3VoiceAudioRole {
+  COMMUNICATION,
+  PLAYBACK,
+}
+
 /** The narrow Realtime-session view of the process-owned Android audio router. */
 internal interface T3VoiceRealtimeAudioRouting {
   fun stop()
@@ -47,6 +52,9 @@ internal class T3VoiceAudioRouter(
   private var lastPublishedPreference: T3VoiceAudioRoutePreference? = null
   private var deviceCallbackRegistered = false
   private var active = false
+  private var activeRole: T3VoiceAudioRole? = null
+  /** True only after this owner has changed Android's process-wide audio mode or route. */
+  private var audioRoleEstablished = false
   private var generation = 0L
   private var activeGeneration: Long? = null
   private var focusChangeListener: AudioManager.OnAudioFocusChangeListener? = null
@@ -68,8 +76,15 @@ internal class T3VoiceAudioRouter(
   }
 
   @Synchronized
-  fun start(): T3VoiceAudioRouterStartResult {
+  fun startCommunication(): T3VoiceAudioRouterStartResult = start(T3VoiceAudioRole.COMMUNICATION)
+
+  @Synchronized
+  fun startPlayback(): T3VoiceAudioRouterStartResult = start(T3VoiceAudioRole.PLAYBACK)
+
+  @Synchronized
+  private fun start(role: T3VoiceAudioRole): T3VoiceAudioRouterStartResult {
     if (active) {
+      check(activeRole == role) { "Android audio is already owned by a different voice role." }
       return T3VoiceAudioRouterStartResult(
         transition = T3VoiceAudioFocusTransition(focusState, emptyList()),
         ownerGeneration = checkNotNull(activeGeneration),
@@ -82,13 +97,22 @@ internal class T3VoiceAudioRouter(
     focusChangeListener =
       AudioManager.OnAudioFocusChangeListener { change ->
         onAudioFocusChanged(ownerGeneration, change)
-      }
+    }
     active = true
+    activeRole = role
     focusState = T3VoiceAudioFocusState.ACTIVE
-    audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-    if (requestFocus()) {
+    if (
+      T3VoiceAudioRoleAdmissionPolicy.admit(
+        requestFocus = { requestFocus(role) },
+        establishAudioRole = { establishAudioRole(role) },
+      )
+    ) {
       recordDiagnostic(T3VoiceDiagnosticCategory.FOCUS, T3VoiceDiagnosticCode.REQUEST_GRANTED)
-      applyPreferredRoute(ownerGeneration)
+      if (role == T3VoiceAudioRole.COMMUNICATION) {
+        applyPreferredRoute(ownerGeneration)
+      } else {
+        updatePlaybackRoute()
+      }
       return T3VoiceAudioRouterStartResult(
         transition = T3VoiceAudioFocusTransition(focusState, emptyList()),
         ownerGeneration = ownerGeneration,
@@ -105,12 +129,14 @@ internal class T3VoiceAudioRouter(
     if (!active) return
     recordDiagnostic(T3VoiceDiagnosticCategory.LIFECYCLE, T3VoiceDiagnosticCode.STOPPED)
     active = false
+    activeRole = null
     activeGeneration = null
     focusState = T3VoiceAudioFocusState.TERMINATED
     activeRoute = null
-    runCatching(::clearSelectedRoute)
+    if (audioRoleEstablished) runCatching(::clearSelectedRoute)
     runCatching(::abandonFocus)
-    runCatching { audioManager.mode = AudioManager.MODE_NORMAL }
+    if (audioRoleEstablished) runCatching { audioManager.mode = AudioManager.MODE_NORMAL }
+    audioRoleEstablished = false
     publishPreference()
   }
 
@@ -128,14 +154,35 @@ internal class T3VoiceAudioRouter(
     if (preferredRoute == route) {
       val ownerGeneration = activeGeneration
       if (ownerGeneration != null && activeRoute != preferredRoute) {
-        applyPreferredRoute(ownerGeneration)
+        if (activeRole == T3VoiceAudioRole.COMMUNICATION) {
+          applyPreferredRoute(ownerGeneration)
+        } else {
+          updatePlaybackRoute()
+        }
       }
       return preference()
     }
     preferenceStore.set(route)
     preferredRoute = route
-    activeGeneration?.let(::applyPreferredRoute) ?: publishPreference()
+    val ownerGeneration = activeGeneration
+    when {
+      ownerGeneration == null -> publishPreference()
+      activeRole == T3VoiceAudioRole.COMMUNICATION -> applyPreferredRoute(ownerGeneration)
+      else -> updatePlaybackRoute()
+    }
     return preference()
+  }
+
+  @Synchronized
+  fun preferredPlaybackDevice(): AudioDeviceInfo? = resolvePlaybackRoute().second
+
+  @Synchronized
+  fun reportPlaybackRouteFallback() {
+    if (!active || activeRole != T3VoiceAudioRole.PLAYBACK) return
+    if (activeRoute == T3VoiceAudioRouteKind.SYSTEM) return
+    activeRoute = T3VoiceAudioRouteKind.SYSTEM
+    recordDiagnostic(T3VoiceDiagnosticCategory.ROUTE, T3VoiceDiagnosticCode.ROUTE_FALLBACK)
+    publishPreference()
   }
 
   @Synchronized
@@ -227,15 +274,21 @@ internal class T3VoiceAudioRouter(
       T3VoiceAudioRouteKind.SYSTEM -> "System default"
     }
 
-  private fun requestFocus(): Boolean {
+  private fun requestFocus(role: T3VoiceAudioRole): Boolean {
     val listener = checkNotNull(focusChangeListener)
+    val usage =
+      if (role == T3VoiceAudioRole.PLAYBACK) {
+        AudioAttributes.USAGE_MEDIA
+      } else {
+        AudioAttributes.USAGE_VOICE_COMMUNICATION
+      }
     val result =
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         val request =
           AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
             .setAudioAttributes(
               AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .setUsage(usage)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build(),
             )
@@ -247,7 +300,11 @@ internal class T3VoiceAudioRouter(
         @Suppress("DEPRECATION")
         audioManager.requestAudioFocus(
           listener,
-          AudioManager.STREAM_VOICE_CALL,
+          if (role == T3VoiceAudioRole.PLAYBACK) {
+            AudioManager.STREAM_MUSIC
+          } else {
+            AudioManager.STREAM_VOICE_CALL
+          },
           AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
         )
       }
@@ -264,6 +321,20 @@ internal class T3VoiceAudioRouter(
       audioManager.abandonAudioFocus(listener)
     }
     focusChangeListener = null
+  }
+
+  /**
+   * Establish process-wide audio state only after Android grants focus. In particular, a denied
+   * capture retry must not switch an ongoing phone call into or out of communication mode.
+   */
+  private fun establishAudioRole(role: T3VoiceAudioRole) {
+    audioRoleEstablished = true
+    if (role == T3VoiceAudioRole.COMMUNICATION) {
+      audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+    } else {
+      runCatching(::clearSelectedRoute)
+      audioManager.mode = AudioManager.MODE_NORMAL
+    }
   }
 
   @Synchronized
@@ -303,11 +374,13 @@ internal class T3VoiceAudioRouter(
   private fun releaseAudioOwnership() {
     if (!active) return
     active = false
+    activeRole = null
     activeGeneration = null
     activeRoute = null
-    runCatching(::clearSelectedRoute)
+    if (audioRoleEstablished) runCatching(::clearSelectedRoute)
     runCatching(::abandonFocus)
-    runCatching { audioManager.mode = AudioManager.MODE_NORMAL }
+    if (audioRoleEstablished) runCatching { audioManager.mode = AudioManager.MODE_NORMAL }
+    audioRoleEstablished = false
     publishPreference()
   }
 
@@ -341,8 +414,11 @@ internal class T3VoiceAudioRouter(
   @Synchronized
   private fun onAvailableDevicesChanged() {
     val ownerGeneration = activeGeneration
-    if (ownerGeneration != null) {
+    if (ownerGeneration != null && activeRole == T3VoiceAudioRole.COMMUNICATION) {
       applyPreferredRoute(ownerGeneration)
+    } else if (ownerGeneration != null) {
+      refreshAvailableRoutes(availableOutputDevicesOrNull())
+      updatePlaybackRoute()
     } else {
       refreshAvailableRoutes(availableOutputDevicesOrNull())
       publishPreference()
@@ -452,4 +528,56 @@ internal class T3VoiceAudioRouter(
       secondaryCount,
     )
   }
+
+  private fun updatePlaybackRoute() {
+    val (route, _) = resolvePlaybackRoute()
+    activeRoute = route
+    publishPreference()
+  }
+
+  private fun resolvePlaybackRoute(): Pair<T3VoiceAudioRouteKind, AudioDeviceInfo?> {
+    if (preferredRoute == T3VoiceAudioRouteKind.SYSTEM) {
+      return T3VoiceAudioRouteKind.SYSTEM to null
+    }
+    val outputs =
+      runCatching { audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList() }
+        .getOrNull()
+        ?: return T3VoiceAudioRouteKind.SYSTEM to null
+    val selected =
+      outputs
+        .filter { playbackRouteKind(it) == preferredRoute }
+        .minByOrNull(::playbackDevicePriority)
+    return if (selected == null) {
+      T3VoiceAudioRouteKind.SYSTEM to null
+    } else {
+      preferredRoute to selected
+    }
+  }
+
+  private fun playbackRouteKind(device: AudioDeviceInfo): T3VoiceAudioRouteKind? =
+    when (device.type) {
+      AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> T3VoiceAudioRouteKind.SPEAKER
+      AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> T3VoiceAudioRouteKind.EARPIECE
+      AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+      AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+      AudioDeviceInfo.TYPE_BLE_HEADSET,
+      AudioDeviceInfo.TYPE_BLE_SPEAKER,
+      -> T3VoiceAudioRouteKind.BLUETOOTH
+      AudioDeviceInfo.TYPE_WIRED_HEADSET,
+      AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+      AudioDeviceInfo.TYPE_USB_HEADSET,
+      AudioDeviceInfo.TYPE_USB_DEVICE,
+      -> T3VoiceAudioRouteKind.WIRED
+      else -> null
+    }
+
+  private fun playbackDevicePriority(device: AudioDeviceInfo): Int =
+    when (device.type) {
+      AudioDeviceInfo.TYPE_BLE_HEADSET,
+      AudioDeviceInfo.TYPE_BLE_SPEAKER,
+      AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+      -> 0
+      AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> 1
+      else -> 0
+    }
 }

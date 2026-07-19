@@ -1,7 +1,9 @@
 package expo.modules.t3voice
 
 import android.content.Context
+import android.media.AudioDeviceInfo
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -22,6 +24,8 @@ internal class T3VoiceNativeRuntimeDriver(
   private var threadSession: T3VoiceThreadSession? = null
   private var shutdownStarted = false
   private val sharedMediaReleased = AtomicBoolean(false)
+  private val preferredPlaybackOutput = AtomicReference<AudioDeviceInfo?>(null)
+  @Volatile private var sharedMediaReady = false
   private lateinit var audioRoutePreferenceState: MutableStateFlow<T3VoiceAudioRoutePreference>
   private lateinit var webRtc: T3VoiceWebRtcSession
   private val audioRouter =
@@ -43,12 +47,16 @@ internal class T3VoiceNativeRuntimeDriver(
       onError = { playbackId, cause ->
         synchronized(lock) { threadSession }?.onPlaybackError(playbackId, cause)
       },
+      onPreferredOutputRejected = audioRouter::reportPlaybackRouteFallback,
+      preferredOutputDevice = preferredPlaybackOutput::get,
     )
   private val threadMedia = T3VoiceAndroidThreadMedia(recorder, player, audioRouter)
   private val cueArming: T3VoiceCueArming =
     T3VoiceCueArmingLive(T3VoiceCueSettingsStore(applicationContext))
 
   init {
+    sharedMediaReady = true
+    preferredPlaybackOutput.set(audioRouter.preferredPlaybackDevice())
     audioRoutePreferenceState = MutableStateFlow(audioRouter.preference())
     webRtc =
       T3VoiceWebRtcSession(
@@ -75,6 +83,18 @@ internal class T3VoiceNativeRuntimeDriver(
     val next = cueArming.setEnabled(enabled)
     return mapOf(
       "enabled" to next.enabled,
+      "generation" to next.generation,
+    )
+  }
+
+  fun voiceCueStartupPreRollMs(): Int = cueArming.settings().startupPreRollMs
+
+  fun setVoiceCueStartupPreRollMs(startupPreRollMs: Int): Map<String, Any?> {
+    val live = cueArming as? T3VoiceCueArmingLive
+    val next =
+      live?.setStartupPreRollMs(startupPreRollMs) ?: cueArming.settings()
+    return mapOf(
+      "startupPreRollMs" to next.startupPreRollMs,
       "generation" to next.generation,
     )
   }
@@ -145,7 +165,7 @@ internal class T3VoiceNativeRuntimeDriver(
     audioRouter.setPreference(route)
 
   fun acquireLegacyAudio(): Boolean =
-    audioRouter.start().transition.state != T3VoiceAudioFocusState.TERMINATED
+    audioRouter.startCommunication().transition.state != T3VoiceAudioFocusState.TERMINATED
 
   fun releaseLegacyAudio() = audioRouter.stop()
 
@@ -206,6 +226,10 @@ internal class T3VoiceNativeRuntimeDriver(
 
   override fun startThreadPlayback(generation: Long) {
     requireThread(generation).startPlayback()
+  }
+
+  override fun cancelThreadPlayback(generation: Long) {
+    requireThread(generation).interruptPlayback()
   }
 
   override fun scheduleThreadRearm(generation: Long, delayMs: Long) {
@@ -372,6 +396,11 @@ internal class T3VoiceNativeRuntimeDriver(
   private fun handleAudioRoutePreferenceChanged(preference: T3VoiceAudioRoutePreference) {
     if (this::audioRoutePreferenceState.isInitialized) {
       audioRoutePreferenceState.value = preference
+    }
+    if (sharedMediaReady) {
+      val output = audioRouter.preferredPlaybackDevice()
+      preferredPlaybackOutput.set(output)
+      player.setPreferredOutputDevice(output)
     }
   }
 

@@ -95,6 +95,7 @@ import {
 import { VoiceConversationBrowser } from "./VoiceConversationBrowser";
 import { loadResumeSelection } from "./voiceConversationResume";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
+import { NativeThreadResponsePreferenceSync } from "./nativeThreadResponsePreference";
 import { useVoiceCapabilityAvailability } from "./useVoiceCapabilityAvailability";
 import { resolveVoicePreferences } from "./voicePreferences";
 import { voiceErrorMessage as errorMessage } from "./voiceError";
@@ -239,6 +240,29 @@ export function VoiceRuntimeProvider(props: {
     if (next.mode === "idle") setRuntimeEnvironmentId(null);
     setSnapshot(next);
   }, []);
+
+  const threadResponsePreferenceSync = useMemo(
+    () =>
+      native === null
+        ? null
+        : new NativeThreadResponsePreferenceSync({
+            native,
+            getSnapshot: () => snapshotRef.current,
+          }),
+    [native],
+  );
+  useEffect(
+    () => () => {
+      threadResponsePreferenceSync?.cancel();
+    },
+    [threadResponsePreferenceSync],
+  );
+  useEffect(() => {
+    if (!preferencesReady || threadResponsePreferenceSync === null) return;
+    void threadResponsePreferenceSync.synchronize(playThreadResponses).catch((cause) => {
+      Alert.alert("Spoken responses setting unavailable", errorMessage(cause));
+    });
+  }, [playThreadResponses, preferencesReady, snapshot, threadResponsePreferenceSync]);
 
   useEffect(() => {
     if (native === null) return;

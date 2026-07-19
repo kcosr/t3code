@@ -76,7 +76,7 @@ describe("Thread voice composer state", () => {
       active: true,
       blockedByAnotherTarget: false,
       command: "stop",
-      accessibilityLabel: "Stop Thread voice",
+      accessibilityLabel: "Stop Auto Listen",
     });
     expect(threadVoiceControlState(snapshot, otherTarget)).toEqual({
       active: false,
@@ -93,8 +93,8 @@ describe("Thread voice composer state", () => {
     ).toEqual({
       active: true,
       blockedByAnotherTarget: false,
-      command: "finish-recording",
-      accessibilityLabel: "Finish Thread voice recording",
+      command: "stop",
+      accessibilityLabel: "Stop Auto Listen",
     });
   });
 
@@ -142,7 +142,7 @@ describe("Thread voice composer state", () => {
     expect(threadVoiceControlState(switching, target)).toMatchObject({
       active: true,
       command: "stop",
-      accessibilityLabel: "Stop Thread voice",
+      accessibilityLabel: "Stop Auto Listen",
     });
 
     const switchingToRealtime: VoiceRuntimeSnapshot = {
@@ -160,7 +160,7 @@ describe("Thread voice composer state", () => {
     expect(threadVoiceControlState(switchingToRealtime, target)).toMatchObject({
       active: true,
       command: "stop",
-      accessibilityLabel: "Stop Thread voice",
+      accessibilityLabel: "Stop Auto Listen",
     });
     expect(threadVoiceControlState(switchingToRealtime, otherTarget)).toMatchObject({
       active: false,

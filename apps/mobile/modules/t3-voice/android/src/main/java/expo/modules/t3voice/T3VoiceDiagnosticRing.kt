@@ -1,6 +1,7 @@
 package expo.modules.t3voice
 
 import android.os.SystemClock
+import java.util.concurrent.TimeUnit
 
 internal enum class T3VoiceDiagnosticCategory {
   LIFECYCLE,
@@ -39,6 +40,16 @@ internal enum class T3VoiceDiagnosticCode {
   CUE_CANCELLED,
   CUE_FAILED,
   CUE_TIMED_OUT,
+  MEDIA_BUTTON_RECEIVED,
+  MEDIA_ACTION_DISPATCHED,
+  PLAYBACK_INTERRUPT_REQUESTED,
+  PLAYBACK_INTERRUPT_COMPLETED,
+  PLAYBACK_COMPLETION_STALE,
+  THREAD_REARM_SCHEDULED,
+  THREAD_REARM_ADMITTED,
+  THREAD_REARM_REJECTED,
+  AUDIO_CLAIM_ACQUIRED,
+  AUDIO_CLAIM_REJECTED,
 }
 
 internal data class T3VoiceDiagnosticEntry(
@@ -76,7 +87,7 @@ internal data class T3VoiceDiagnosticEntry(
 
 internal class T3VoiceDiagnosticRing(
   private val capacity: Int = DEFAULT_CAPACITY,
-  private val clock: () -> Long = SystemClock::elapsedRealtime,
+  private val clock: () -> Long = defaultDiagnosticClock,
   initialGeneration: Long = 0,
 ) {
   private val entries = ArrayDeque<T3VoiceDiagnosticEntry>(capacity)
@@ -151,6 +162,20 @@ internal class T3VoiceDiagnosticRing(
     internal const val DEFAULT_CAPACITY = 128
     internal const val MAX_CAPACITY = 256
     internal const val MAX_COUNTER = 1_000_000
+  }
+}
+
+/**
+ * Android's local-JVM stub throws when [SystemClock.elapsedRealtime] is called outside a device.
+ * Diagnostics are best-effort and must never stop the voice state machine. Probe once so local-JVM
+ * tests do not pay for and swallow the Android stub exception on every diagnostic event.
+ */
+private val defaultDiagnosticClock: () -> Long by lazy {
+  try {
+    SystemClock.elapsedRealtime()
+    SystemClock::elapsedRealtime
+  } catch (_: RuntimeException) {
+    { TimeUnit.NANOSECONDS.toMillis(System.nanoTime()) }
   }
 }
 

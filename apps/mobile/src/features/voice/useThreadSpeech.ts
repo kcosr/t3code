@@ -5,13 +5,14 @@ import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { useCallback, useEffect, useRef, useState } from "react";
-
 import { getT3VoiceNativeModule } from "@t3tools/mobile-voice-native";
 import { uuidv4 } from "../../lib/uuid";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import { usePreparedConnection } from "../../state/session";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
 import { releasePlaybackForRecording } from "./traditionalAudioHandoff";
+import { startReactThreadPlayback } from "./threadSpeechAdapterPolicy";
+import type { ThreadSpeechInput } from "./threadSpeechTypes";
 import {
   initialThreadSpeechPlannerState,
   interruptThreadSpeech,
@@ -20,7 +21,6 @@ import {
   restoreThreadSpeechPreference,
   setThreadSpeechEnabled,
   updateThreadSpeech,
-  type AssistantSpeechSnapshot,
   type ThreadSpeechAction,
   type ThreadSpeechPlannerState,
 } from "./threadSpeechPlanner";
@@ -45,12 +45,7 @@ export interface ThreadSpeechLifecycleEvent {
   readonly outcome: "started" | "drained" | "cancelled" | "failed";
 }
 
-export function useThreadSpeech(input: {
-  readonly environmentId: Parameters<typeof usePreparedConnection>[0];
-  readonly scopeKey: string;
-  readonly historyReady: boolean;
-  readonly latestAssistant: AssistantSpeechSnapshot | null;
-}) {
+export function useThreadSpeech(input: ThreadSpeechInput) {
   const prepared = Option.getOrNull(usePreparedConnection(input.environmentId));
   const native = getT3VoiceNativeModule();
   const capabilityAvailable = useVoiceCapabilityAvailability(prepared, "speech.streaming");
@@ -198,7 +193,7 @@ export function useThreadSpeech(input: {
             }
             playbackMessageIdsRef.current.set(action.playbackId, action.messageId);
             const startPromise = (async () => {
-              await native.startPlaybackAsync({
+              await startReactThreadPlayback(native, {
                 playbackId: action.playbackId,
                 sampleRate: 24_000,
                 channelCount: 1,

@@ -495,6 +495,23 @@ internal sealed interface T3VoiceRuntimeCommand {
 
   data object FinishThreadUtterance : T3VoiceRuntimeCommand
 
+  /**
+   * Cancels in-flight Thread response playback and completes the cycle via the normal
+   * [T3VoiceRuntimeCallback.ThreadPlaybackFinished] path (rearm or stop according to autoRearm).
+   * Distinct from [Stop], which always tears down the Thread session. Not pause/resume.
+   */
+  data object SkipThreadPlayback : T3VoiceRuntimeCommand
+
+  /** Updates playResponses on the active Thread cycle (mid-session toggle). */
+  data class UpdateThreadPlayResponses(
+    val expectedGeneration: Long,
+    val playResponses: Boolean,
+  ) : T3VoiceRuntimeCommand {
+    init {
+      require(expectedGeneration > 0) { "expectedGeneration must be positive." }
+    }
+  }
+
   data class UpdateThreadReviewTranscript(
     val expectedGeneration: Long,
     val expectedReviewId: Long,

@@ -97,6 +97,20 @@ internal object T3VoiceRuntimeBridgeInput {
     )
   }
 
+  fun updateThreadPlayResponses(
+    input: Map<String, Any?>,
+  ): T3VoiceRuntimeCommand.UpdateThreadPlayResponses {
+    input.requireExactBridgeKeys(
+      "Thread play responses update",
+      setOf("expectedGeneration", "playResponses"),
+    )
+    return T3VoiceRuntimeCommand.UpdateThreadPlayResponses(
+      expectedGeneration = input.requireBridgeLong("expectedGeneration"),
+      playResponses =
+        input["playResponses"] as? Boolean ?: error("playResponses must be a boolean."),
+    )
+  }
+
   fun updateThreadReviewTranscript(
     input: Map<String, Any?>,
   ): T3VoiceRuntimeCommand.UpdateThreadReviewTranscript {

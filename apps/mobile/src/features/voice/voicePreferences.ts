@@ -28,6 +28,9 @@ export const VOICE_MAXIMUM_UTTERANCE_DEFAULT_MS = VOICE_MAXIMUM_UTTERANCE_MAX_MS
 
 export const VOICE_REARM_GUARD_DEFAULT_MS = 750;
 
+/** Default leading silence before Ready/Ended cue tones (also native default). */
+export const VOICE_CUE_STARTUP_PRE_ROLL_DEFAULT_MS = 768;
+
 export const VOICE_TRANSCRIPTION_TIMEOUT_DEFAULT_MS = 10 * 60_000;
 export const VOICE_SUBMISSION_TIMEOUT_DEFAULT_MS = 30_000;
 export const VOICE_RESPONSE_TIMEOUT_DEFAULT_MS = 10 * 60_000;

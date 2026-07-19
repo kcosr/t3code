@@ -83,3 +83,15 @@ internal object T3VoiceAudioFocusPolicy {
     vararg actions: T3VoiceAudioFocusAction,
   ) = T3VoiceAudioFocusTransition(state = state, actions = actions.toList())
 }
+
+/** Keeps process-wide Android audio mutations behind a successful focus admission. */
+internal object T3VoiceAudioRoleAdmissionPolicy {
+  fun admit(
+    requestFocus: () -> Boolean,
+    establishAudioRole: () -> Unit,
+  ): Boolean {
+    if (!requestFocus()) return false
+    establishAudioRole()
+    return true
+  }
+}

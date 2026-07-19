@@ -5,7 +5,9 @@ package expo.modules.t3voice
  * the session lifecycle testable without constructing Android media framework objects.
  */
 internal interface T3VoiceThreadMedia {
-  fun acquireAudio(): Boolean
+  fun acquireCaptureAudio(): Boolean
+
+  fun acquirePlaybackAudio(): Boolean
 
   fun releaseAudio()
 
@@ -38,8 +40,11 @@ internal class T3VoiceAndroidThreadMedia(
   private val player: T3VoicePcmPlayer,
   private val audioRouter: T3VoiceAudioRouter,
 ) : T3VoiceThreadMedia {
-  override fun acquireAudio(): Boolean =
-    audioRouter.start().transition.state != T3VoiceAudioFocusState.TERMINATED
+  override fun acquireCaptureAudio(): Boolean =
+    audioRouter.startCommunication().transition.state != T3VoiceAudioFocusState.TERMINATED
+
+  override fun acquirePlaybackAudio(): Boolean =
+    audioRouter.startPlayback().transition.state != T3VoiceAudioFocusState.TERMINATED
 
   override fun releaseAudio() = audioRouter.stop()
 

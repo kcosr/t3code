@@ -255,7 +255,17 @@ export type T3VoiceDiagnosticCode =
   | "cue-drained"
   | "cue-cancelled"
   | "cue-failed"
-  | "cue-timed-out";
+  | "cue-timed-out"
+  | "media-button-received"
+  | "media-action-dispatched"
+  | "playback-interrupt-requested"
+  | "playback-interrupt-completed"
+  | "playback-completion-stale"
+  | "thread-rearm-scheduled"
+  | "thread-rearm-admitted"
+  | "thread-rearm-rejected"
+  | "audio-claim-acquired"
+  | "audio-claim-rejected";
 
 export interface T3VoiceDiagnosticEntry {
   readonly elapsedRealtimeMillis: number;
@@ -335,6 +345,12 @@ export interface T3VoiceNativeModule {
   readonly setVoiceCuesEnabledAsync: (input: {
     readonly enabled: boolean;
   }) => Promise<{ readonly enabled: boolean; readonly generation: number }>;
+  readonly getVoiceCueStartupPreRollMsAsync: () => Promise<{
+    readonly startupPreRollMs: number;
+  }>;
+  readonly setVoiceCueStartupPreRollMsAsync: (input: {
+    readonly startupPreRollMs: number;
+  }) => Promise<{ readonly startupPreRollMs: number; readonly generation: number }>;
   readonly getAudioRoutePreferenceAsync: () => Promise<T3VoiceAudioRoutePreferenceState>;
   readonly setAudioRoutePreferenceAsync: (
     input: T3VoiceSetAudioRoutePreferenceInput,
@@ -347,6 +363,13 @@ export interface T3VoiceNativeModule {
     input: T3VoiceCompleteRealtimeClientActionInput,
   ) => Promise<void>;
   readonly finishThreadRecordingAsync: () => Promise<void>;
+  /** Cancels Thread response TTS and completes the cycle (rearm or stop). Not pause. */
+  readonly skipThreadPlaybackAsync: () => Promise<void>;
+  /** Updates playResponses on the active Thread cycle (mid-session toggle). */
+  readonly updateThreadPlayResponsesAsync: (input: {
+    readonly expectedGeneration: number;
+    readonly playResponses: boolean;
+  }) => Promise<void>;
   readonly updateThreadReviewTranscriptAsync: (
     input: T3VoiceUpdateThreadReviewTranscriptInput,
   ) => Promise<void>;

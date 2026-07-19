@@ -25,8 +25,12 @@ internal object T3VoiceMediaButtonPolicy {
   private fun select(
     keyCode: Int,
     available: List<T3VoiceAndroidControlAction>,
-  ): T3VoiceAndroidControlAction? =
-    when (keyCode) {
+  ): T3VoiceAndroidControlAction? {
+    // Headsets and Android may describe the same physical toggle as Play, Pause, Stop,
+    // Play/Pause, Headset Hook, or Next. Native state is authoritative: during Thread TTS every
+    // recognized one-shot transport control skips playback rather than applying key-specific UI.
+    if (T3VoiceAndroidControlAction.SKIP in available) return T3VoiceAndroidControlAction.SKIP
+    return when (keyCode) {
       KeyEvent.KEYCODE_HEADSETHOOK,
       KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
       ->
@@ -57,6 +61,7 @@ internal object T3VoiceMediaButtonPolicy {
         firstAvailable(available, T3VoiceAndroidControlAction.SWITCH_TO_THREAD)
       else -> null
     }
+  }
 
   private fun firstAvailable(
     available: List<T3VoiceAndroidControlAction>,

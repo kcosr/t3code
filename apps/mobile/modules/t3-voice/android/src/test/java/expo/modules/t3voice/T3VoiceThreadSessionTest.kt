@@ -2,6 +2,11 @@ package expo.modules.t3voice
 
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -222,67 +227,547 @@ internal class T3VoiceThreadSessionTest {
   }
 
   @Test
-  fun `permanent playback focus loss cancels blocked synthesis without queued continuation`() {
+  fun `permanent playback focus loss completes and rearms only after capture focus is safe`() {
+    val captureFocusAvailable = AtomicBoolean(false)
+    val media = BlockingSynthesisMedia(captureFocusAvailable = captureFocusAvailable)
+    val api = BlockingSynthesisApi()
+    val playbackFinished = CountDownLatch(1)
+    val rearmReady = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    lateinit var session: T3VoiceThreadSession
+    session =
+      readyForPlaybackSession(
+        media = media,
+        api = api,
+        emit = { callback ->
+          callbacks += callback
+          when (callback) {
+            T3VoiceRuntimeCallback.ThreadPlaybackFinished -> {
+              playbackFinished.countDown()
+              session.scheduleRearm(0)
+            }
+            T3VoiceRuntimeCallback.ThreadRearmReady -> {
+              rearmReady.countDown()
+              session.rearmRecording()
+            }
+            else -> Unit
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    session.startPlayback()
+    assertTrue(api.synthesisEntered.await(1, TimeUnit.SECONDS))
+
+    session.onAudioFocusActions(listOf(T3VoiceAudioFocusAction.TERMINATE_SESSION))
+    assertTrue(playbackFinished.await(1, TimeUnit.SECONDS))
+    assertTrue(media.playbackCancelled.await(1, TimeUnit.SECONDS))
+    assertTrue(media.captureFocusRejected.await(1, TimeUnit.SECONDS))
+    assertFalse(rearmReady.await(100, TimeUnit.MILLISECONDS))
+    assertEquals(1L, media.recordingStarted.count)
+    assertNull(media.activePlayback.get())
+    assertEquals(0, media.finishCount.get())
+
+    captureFocusAvailable.set(true)
+    assertTrue(rearmReady.await(2, TimeUnit.SECONDS))
+    assertTrue(media.recordingStarted.await(1, TimeUnit.SECONDS))
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.Failed })
+
+    api.allowSynthesisToReturn.countDown()
+    session.stop(reportStopped = true)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `focus admission retries back off and cap during a long competing call`() {
+    val delays = mutableListOf(T3VoiceFocusAdmissionRetryPolicy.INITIAL_DELAY_MILLIS)
+    repeat(10) { delays += T3VoiceFocusAdmissionRetryPolicy.nextDelay(delays.last()) }
+
+    assertEquals(
+      listOf(
+        500L,
+        1_000L,
+        2_000L,
+        4_000L,
+        8_000L,
+        16_000L,
+        30_000L,
+        30_000L,
+        30_000L,
+        30_000L,
+        30_000L,
+      ),
+      delays,
+    )
+  }
+
+  @Test
+  fun `initial rearm scheduling tolerates scheduler shutdown race`() {
+    val scheduler = Executors.newSingleThreadScheduledExecutor()
+    scheduler.shutdownNow()
+    val quiesced = CountDownLatch(1)
+    val voice =
+      session(
+        generation = 1,
+        media = GenerationAwareMedia(),
+        emit = {},
+        onQuiesced = { quiesced.countDown() },
+        scheduler = scheduler,
+      )
+
+    voice.scheduleRearm(0)
+    voice.stop(reportStopped = false)
+
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `focus admission retry tolerates scheduler shutdown race`() {
+    val scheduler = RejectingRetryScheduler()
+    val captureFocusAvailable = AtomicBoolean(false)
+    val captureAttempted = CountDownLatch(1)
+    val media =
+      BlockingSynthesisMedia(
+        captureFocusAvailable = captureFocusAvailable,
+        onCaptureFocusAttempt = {
+          scheduler.rejectSchedules.set(true)
+          captureAttempted.countDown()
+        },
+      )
+    val api = BlockingSynthesisApi()
+    val playbackFinished = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    lateinit var voice: T3VoiceThreadSession
+    voice =
+      readyForPlaybackSession(
+        media = media,
+        api = api,
+        emit = { callback ->
+          if (callback == T3VoiceRuntimeCallback.ThreadPlaybackFinished) {
+            playbackFinished.countDown()
+            voice.scheduleRearm(0)
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+        scheduler = scheduler,
+      )
+
+    voice.startPlayback()
+    assertTrue(api.synthesisEntered.await(1, TimeUnit.SECONDS))
+    voice.onAudioFocusActions(listOf(T3VoiceAudioFocusAction.TERMINATE_SESSION))
+
+    assertTrue(playbackFinished.await(1, TimeUnit.SECONDS))
+    assertTrue(captureAttempted.await(1, TimeUnit.SECONDS))
+    assertTrue(scheduler.rejectedSchedule.await(1, TimeUnit.SECONDS))
+    api.allowSynthesisToReturn.countDown()
+    voice.stop(reportStopped = false)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `transient playback focus loss pauses and resumes without completing the cycle`() {
     val media = BlockingSynthesisMedia()
     val api = BlockingSynthesisApi()
-    val recordingStarted = CountDownLatch(1)
-    val submitted = CountDownLatch(1)
-    val responseReady = CountDownLatch(1)
+    val playbackFinished = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    val session =
+      readyForPlaybackSession(
+        media = media,
+        api = api,
+        emit = { callback ->
+          if (callback == T3VoiceRuntimeCallback.ThreadPlaybackFinished) {
+            playbackFinished.countDown()
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    session.startPlayback()
+    assertTrue(api.synthesisEntered.await(1, TimeUnit.SECONDS))
+    session.onAudioFocusActions(listOf(T3VoiceAudioFocusAction.PAUSE_PLAYBACK))
+    assertEquals(1, media.pauseCount.get())
+    assertFalse(playbackFinished.await(100, TimeUnit.MILLISECONDS))
+
+    session.onAudioFocusActions(listOf(T3VoiceAudioFocusAction.RESUME_PLAYBACK))
+    assertEquals(1, media.resumeCount.get())
+    assertFalse(playbackFinished.await(100, TimeUnit.MILLISECONDS))
+
+    session.interruptPlayback()
+    assertTrue(playbackFinished.await(1, TimeUnit.SECONDS))
+    api.allowSynthesisToReturn.countDown()
+    session.stop(reportStopped = true)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `skip detaches blocked synthesis before the rearmed recording starts`() {
+    val media = BlockingSynthesisMedia()
+    val api = BlockingSynthesisApi()
+    val playbackFinished = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    lateinit var session: T3VoiceThreadSession
+    session =
+      readyForPlaybackSession(
+        media = media,
+        api = api,
+        emit = { callback ->
+          if (callback == T3VoiceRuntimeCallback.ThreadPlaybackFinished) {
+            playbackFinished.countDown()
+            session.rearmRecording()
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    session.startPlayback()
+    assertTrue(api.synthesisEntered.await(1, TimeUnit.SECONDS))
+    session.interruptPlayback()
+
+    assertTrue(playbackFinished.await(1, TimeUnit.SECONDS))
+    assertTrue(media.recordingStarted.await(1, TimeUnit.SECONDS))
+    assertEquals(1L, api.allowSynthesisToReturn.count)
+
+    api.allowSynthesisToReturn.countDown()
+    session.stop(reportStopped = true)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `skip returns before player cancel and release then completes exactly once`() {
+    val media = BlockingSynthesisMedia(blockCancel = true, blockRelease = true)
+    val api = BlockingSynthesisApi()
+    val playbackFinished = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val session =
+      readyForPlaybackSession(
+        media = media,
+        api = api,
+        emit = { callback ->
+          callbacks += callback
+          if (callback == T3VoiceRuntimeCallback.ThreadPlaybackFinished) {
+            playbackFinished.countDown()
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    session.startPlayback()
+    assertTrue(api.synthesisEntered.await(1, TimeUnit.SECONDS))
+    session.interruptPlayback()
+
+    assertTrue(media.cancelEntered.await(1, TimeUnit.SECONDS))
+    assertFalse(playbackFinished.await(100, TimeUnit.MILLISECONDS))
+    media.allowCancel.countDown()
+    assertTrue(media.releaseEntered.await(1, TimeUnit.SECONDS))
+    assertFalse(playbackFinished.await(100, TimeUnit.MILLISECONDS))
+    media.allowRelease.countDown()
+    assertTrue(playbackFinished.await(1, TimeUnit.SECONDS))
+    assertEquals(1, callbacks.count { it == T3VoiceRuntimeCallback.ThreadPlaybackFinished })
+
+    api.allowSynthesisToReturn.countDown()
+    session.stop(reportStopped = true)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `skip mid-synthesis emits playback finished without terminal failure`() {
+    val media = BlockingSynthesisMedia()
+    val api = BlockingSynthesisApi()
+    val playbackFinished = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val session =
+      readyForPlaybackSession(
+        media = media,
+        api = api,
+        emit = { callback ->
+          callbacks += callback
+          if (callback == T3VoiceRuntimeCallback.ThreadPlaybackFinished) {
+            playbackFinished.countDown()
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    session.startPlayback()
+    assertTrue(api.synthesisEntered.await(1, TimeUnit.SECONDS))
+
+    session.interruptPlayback()
+    assertTrue(media.playbackCancelled.await(1, TimeUnit.SECONDS))
+    assertTrue(playbackFinished.await(1, TimeUnit.SECONDS))
+    assertEquals(1, callbacks.count { it == T3VoiceRuntimeCallback.ThreadPlaybackFinished })
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.Failed })
+    assertEquals(1L, quiesced.count)
+
+    api.allowSynthesisToReturn.countDown()
+    // Speech executor may still unwind; skip must not terminal-fail the session.
+    Thread.sleep(100)
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.Failed })
+    assertEquals(1, callbacks.count { it == T3VoiceRuntimeCallback.ThreadPlaybackFinished })
+
+    session.stop(reportStopped = true)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `double skip mid-synthesis emits playback finished once`() {
+    val media = BlockingSynthesisMedia()
+    val api = BlockingSynthesisApi()
+    val playbackFinished = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val session =
+      readyForPlaybackSession(
+        media = media,
+        api = api,
+        emit = { callback ->
+          callbacks += callback
+          if (callback == T3VoiceRuntimeCallback.ThreadPlaybackFinished) {
+            playbackFinished.countDown()
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    session.startPlayback()
+    assertTrue(api.synthesisEntered.await(1, TimeUnit.SECONDS))
+    session.interruptPlayback()
+    session.interruptPlayback()
+    assertTrue(playbackFinished.await(1, TimeUnit.SECONDS))
+    assertEquals(1, callbacks.count { it == T3VoiceRuntimeCallback.ThreadPlaybackFinished })
+    api.allowSynthesisToReturn.countDown()
+    Thread.sleep(50)
+    assertEquals(1, callbacks.count { it == T3VoiceRuntimeCallback.ThreadPlaybackFinished })
+    session.stop(reportStopped = true)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `skip before playback id is assigned latches and finishes once playback starts`() {
+    val media = DelayedPlaybackMedia()
+    val api = CompletedResponseApi(providePcm = true)
+    val playbackFinished = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val session =
+      readyForPlaybackSession(
+        media = media,
+        api = api,
+        emit = { callback ->
+          callbacks += callback
+          if (callback == T3VoiceRuntimeCallback.ThreadPlaybackFinished) {
+            playbackFinished.countDown()
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    // Skip during the WAITING→PLAYING handoff before startPlayback runs.
+    session.interruptPlayback()
+    session.startPlayback()
+    assertTrue(media.startEntered.await(1, TimeUnit.SECONDS))
+    media.allowStartToReturn.countDown()
+
+    assertTrue(playbackFinished.await(1, TimeUnit.SECONDS))
+    assertEquals(1, callbacks.count { it == T3VoiceRuntimeCallback.ThreadPlaybackFinished })
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.Failed })
+    assertEquals(0, api.synthesisCount.get())
+
+    session.stop(reportStopped = true)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `skip during blocked playback start finishes without terminal failure`() {
+    val media = DelayedPlaybackMedia()
+    val api = CompletedResponseApi(providePcm = true)
+    val playbackFinished = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val session =
+      readyForPlaybackSession(
+        media = media,
+        api = api,
+        emit = { callback ->
+          callbacks += callback
+          if (callback == T3VoiceRuntimeCallback.ThreadPlaybackFinished) {
+            playbackFinished.countDown()
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    session.startPlayback()
+    assertTrue(media.startEntered.await(1, TimeUnit.SECONDS))
+    session.interruptPlayback()
+    media.allowStartToReturn.countDown()
+
+    assertTrue(playbackFinished.await(1, TimeUnit.SECONDS))
+    assertEquals(1, callbacks.count { it == T3VoiceRuntimeCallback.ThreadPlaybackFinished })
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.Failed })
+    assertEquals(0, api.synthesisCount.get())
+
+    session.stop(reportStopped = true)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `skip pending converts playback focus acquisition failure into normal completion`() {
+    assertSkipPendingStartupFailure(FailingPlaybackStartupMedia(failAcquire = true))
+  }
+
+  @Test
+  fun `skip pending converts player startup failure into normal completion`() {
+    assertSkipPendingStartupFailure(FailingPlaybackStartupMedia(failAcquire = false))
+  }
+
+  @Test
+  fun `skip then stop reports clean stopped terminal without double failure`() {
+    val media = BlockingSynthesisMedia()
+    val api = BlockingSynthesisApi()
+    val playbackFinished = CountDownLatch(1)
     val quiesced = CountDownLatch(1)
     val terminal = AtomicReference<T3VoiceRuntimeCallback?>()
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
     val session =
-      T3VoiceThreadSession(
-        generation = 1,
-        start = START,
-        config = SESSION,
+      readyForPlaybackSession(
         media = media,
+        api = api,
         emit = { callback ->
-          when (callback) {
-            T3VoiceRuntimeCallback.ThreadRecordingStarted -> recordingStarted.countDown()
-            T3VoiceRuntimeCallback.ThreadSubmitted -> submitted.countDown()
-            is T3VoiceRuntimeCallback.ThreadResponseReady -> responseReady.countDown()
-            else -> Unit
+          callbacks += callback
+          if (callback == T3VoiceRuntimeCallback.ThreadPlaybackFinished) {
+            playbackFinished.countDown()
           }
         },
         onQuiesced = { callback ->
           terminal.set(callback)
           quiesced.countDown()
         },
-        api = api,
       )
 
-    session.start()
-    assertTrue(recordingStarted.await(1, TimeUnit.SECONDS))
-    val recordingId = media.finishEndpointCancellation()
-    assertTrue(
-      session.onRecorderTerminated(
-        T3VoiceRecordingTermination.Cancelled(recordingId, "test-endpoint"),
-      ),
-    )
-    session.submitTranscript("read the response")
-    assertTrue(submitted.await(1, TimeUnit.SECONDS))
-    session.waitForResponse()
-    assertTrue(responseReady.await(1, TimeUnit.SECONDS))
     session.startPlayback()
     assertTrue(api.synthesisEntered.await(1, TimeUnit.SECONDS))
-
-    val startedAt = System.nanoTime()
-    session.onAudioFocusActions(listOf(T3VoiceAudioFocusAction.TERMINATE_SESSION))
-    assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt) < 250)
-    assertTrue(media.playbackCancelled.await(1, TimeUnit.SECONDS))
-    assertNull(media.activePlayback.get())
-    assertEquals(1L, quiesced.count)
-    assertEquals(0, media.finishCount.get())
-
+    session.interruptPlayback()
+    assertTrue(playbackFinished.await(1, TimeUnit.SECONDS))
+    session.stop(reportStopped = true)
     api.allowSynthesisToReturn.countDown()
 
     assertTrue(quiesced.await(1, TimeUnit.SECONDS))
-    val failed = terminal.get() as T3VoiceRuntimeCallback.Failed
-    assertEquals("thread-audio-focus-lost", failed.failure.code)
-    assertEquals(0, media.finishCount.get())
-    assertEquals(0, media.resumeCount.get())
-    assertNull(media.activePlayback.get())
+    assertEquals(T3VoiceRuntimeCallback.ThreadStopped, terminal.get())
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.Failed })
   }
+
+  @Test
+  fun `skipPending after natural finish is cleared by rearm so next playback runs`() {
+    val media = GenerationAwareMedia()
+    val api = CompletedResponseApi(providePcm = true)
+    val firstFinished = CountDownLatch(1)
+    val secondFinished = CountDownLatch(1)
+    val recordingStarted = CountDownLatch(1)
+    val playbackFinishedCount = AtomicInteger(0)
+    val quiesced = CountDownLatch(1)
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val session =
+      readyForPlaybackSession(
+        media = media,
+        api = api,
+        emit = { callback ->
+          callbacks += callback
+          when (callback) {
+            T3VoiceRuntimeCallback.ThreadRecordingStarted -> recordingStarted.countDown()
+            T3VoiceRuntimeCallback.ThreadPlaybackFinished -> {
+              val n = playbackFinishedCount.incrementAndGet()
+              if (n == 1) firstFinished.countDown() else secondFinished.countDown()
+            }
+            else -> Unit
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    session.startPlayback()
+    assertTrue(media.playbackPrepared.await(2, TimeUnit.SECONDS))
+    val firstId = media.completeActivePlayback()
+    assertTrue(session.onPlaybackFinished(firstId))
+    assertTrue(firstFinished.await(1, TimeUnit.SECONDS))
+    assertEquals(1, media.playbackIds.size)
+
+    // Spurious skip after ownership is gone latches skipPending.
+    session.interruptPlayback()
+
+    // Rearm clears latches at startRecording. End the rearm recording so media is free.
+    session.rearmRecording()
+    assertTrue(recordingStarted.await(2, TimeUnit.SECONDS))
+    val rearmRecordingId = media.cancelActiveRecordingForEndpoint()
+    assertTrue(
+      session.onRecorderTerminated(
+        T3VoiceRecordingTermination.Cancelled(rearmRecordingId, "test-endpoint"),
+      ),
+    )
+
+    session.submitTranscript("second turn")
+    Thread.sleep(50)
+    session.waitForResponse()
+    Thread.sleep(50)
+    session.startPlayback()
+    // Wait until a second playback id is established.
+    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+    while (media.playbackIds.size < 2 && System.nanoTime() < deadline) {
+      Thread.sleep(10)
+    }
+    assertEquals(2, media.playbackIds.size)
+    // Still only one finish — second cycle is actively playing, not auto-skipped.
+    assertEquals(1, playbackFinishedCount.get())
+    val secondId = media.completeActivePlayback()
+    assertTrue(session.onPlaybackFinished(secondId))
+    assertTrue(secondFinished.await(1, TimeUnit.SECONDS))
+    assertEquals(2, playbackFinishedCount.get())
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.Failed })
+
+    session.stop(reportStopped = true)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
+  @Test
+  fun `onPlaybackError during skip emits finished not failed`() {
+    val media = BlockingSynthesisMedia()
+    val api = BlockingSynthesisApi()
+    val playbackFinished = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val session =
+      readyForPlaybackSession(
+        media = media,
+        api = api,
+        emit = { callback ->
+          callbacks += callback
+          if (callback == T3VoiceRuntimeCallback.ThreadPlaybackFinished) {
+            playbackFinished.countDown()
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    session.startPlayback()
+    assertTrue(api.synthesisEntered.await(1, TimeUnit.SECONDS))
+    val playbackId = checkNotNull(media.activePlayback.get())
+    // Race: player error while skip is in flight. interruptPlayback claims first.
+    session.interruptPlayback()
+    // After claim, a late error must not convert the skip into a terminal failure.
+    assertFalse(
+      session.onPlaybackError(playbackId, IllegalStateException("stale player error")),
+    )
+    assertTrue(playbackFinished.await(1, TimeUnit.SECONDS))
+    assertEquals(1, callbacks.count { it == T3VoiceRuntimeCallback.ThreadPlaybackFinished })
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.Failed })
+
+    api.allowSynthesisToReturn.countDown()
+    session.stop(reportStopped = true)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
+
 
   @Test
   fun `manual finish accepts the exact automatic finalization already in progress`() {
@@ -452,6 +937,7 @@ internal class T3VoiceThreadSessionTest {
     val api = CompletedResponseApi()
     val submitted = CountDownLatch(1)
     val responseReady = CountDownLatch(1)
+    val playbackFinished = CountDownLatch(1)
     val quiesced = CountDownLatch(1)
     val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
     val voice =
@@ -463,13 +949,11 @@ internal class T3VoiceThreadSessionTest {
           when (callback) {
             T3VoiceRuntimeCallback.ThreadSubmitted -> submitted.countDown()
             is T3VoiceRuntimeCallback.ThreadResponseReady -> responseReady.countDown()
+            T3VoiceRuntimeCallback.ThreadPlaybackFinished -> playbackFinished.countDown()
             else -> Unit
           }
         },
-        onQuiesced = { callback ->
-          if (callback != null) callbacks += callback
-          quiesced.countDown()
-        },
+        onQuiesced = { quiesced.countDown() },
         api = api,
       )
     voice.submitTranscript("hello")
@@ -485,12 +969,14 @@ internal class T3VoiceThreadSessionTest {
     assertNull(media.activePlaybackId())
     media.allowStartToReturn.countDown()
 
-    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+    assertTrue(playbackFinished.await(1, TimeUnit.SECONDS))
     assertNull(media.activePlaybackId())
     assertEquals(1, media.cancelledPlaybackIds.size)
     assertEquals(0, api.synthesisCount.get())
-    val failure = callbacks.filterIsInstance<T3VoiceRuntimeCallback.Failed>().single().failure
-    assertEquals("thread-audio-focus-lost", failure.code)
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.Failed })
+
+    voice.stop(reportStopped = false)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
   }
 
   @Test
@@ -623,6 +1109,7 @@ internal class T3VoiceThreadSessionTest {
     emit: (T3VoiceRuntimeCallback) -> Unit,
     onQuiesced: (T3VoiceRuntimeCallback?) -> Unit,
     api: T3VoiceThreadSessionApi? = null,
+    scheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor(),
   ): T3VoiceThreadSession =
     T3VoiceThreadSession(
       generation = generation,
@@ -632,7 +1119,71 @@ internal class T3VoiceThreadSessionTest {
       emit = emit,
       onQuiesced = onQuiesced,
       api = api ?: CompletedResponseApi(),
+      scheduler = scheduler,
     )
+
+  /** Submits a turn and waits until the response is ready so tests can exercise playback. */
+  private fun readyForPlaybackSession(
+    media: T3VoiceThreadMedia,
+    api: T3VoiceThreadSessionApi,
+    emit: (T3VoiceRuntimeCallback) -> Unit,
+    onQuiesced: (T3VoiceRuntimeCallback?) -> Unit,
+    scheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor(),
+  ): T3VoiceThreadSession {
+    val submitted = CountDownLatch(1)
+    val responseReady = CountDownLatch(1)
+    val session =
+      session(
+        generation = 1,
+        media = media,
+        emit = { callback ->
+          when (callback) {
+            T3VoiceRuntimeCallback.ThreadSubmitted -> submitted.countDown()
+            is T3VoiceRuntimeCallback.ThreadResponseReady -> responseReady.countDown()
+            else -> Unit
+          }
+          emit(callback)
+        },
+        onQuiesced = onQuiesced,
+        api = api,
+        scheduler = scheduler,
+      )
+    session.submitTranscript("read the response")
+    check(submitted.await(2, TimeUnit.SECONDS)) { "Thread submit timed out." }
+    session.waitForResponse()
+    check(responseReady.await(2, TimeUnit.SECONDS)) { "Thread response timed out." }
+    return session
+  }
+
+  private fun assertSkipPendingStartupFailure(media: FailingPlaybackStartupMedia) {
+    val api = CompletedResponseApi(providePcm = true)
+    val playbackFinished = CountDownLatch(1)
+    val quiesced = CountDownLatch(1)
+    val callbacks = CopyOnWriteArrayList<T3VoiceRuntimeCallback>()
+    val session =
+      readyForPlaybackSession(
+        media = media,
+        api = api,
+        emit = { callback ->
+          callbacks += callback
+          if (callback == T3VoiceRuntimeCallback.ThreadPlaybackFinished) {
+            playbackFinished.countDown()
+          }
+        },
+        onQuiesced = { quiesced.countDown() },
+      )
+
+    session.interruptPlayback()
+    session.startPlayback()
+
+    assertTrue(playbackFinished.await(1, TimeUnit.SECONDS))
+    assertEquals(1, callbacks.count { it == T3VoiceRuntimeCallback.ThreadPlaybackFinished })
+    assertTrue(callbacks.none { it is T3VoiceRuntimeCallback.Failed })
+    assertEquals(0, api.synthesisCount.get())
+
+    session.stop(reportStopped = true)
+    assertTrue(quiesced.await(1, TimeUnit.SECONDS))
+  }
 
   private class GenerationAwareMedia(
     private val blockFirstRelease: Boolean = false,
@@ -652,7 +1203,9 @@ internal class T3VoiceThreadSessionTest {
     private var activePlayback: String? = null
     private var audioOwner: String? = null
 
-    override fun acquireAudio(): Boolean = true
+    override fun acquireCaptureAudio(): Boolean = true
+
+    override fun acquirePlaybackAudio(): Boolean = true
 
     override fun releaseAudio() {
       val release = releaseCount.incrementAndGet()
@@ -793,7 +1346,9 @@ internal class T3VoiceThreadSessionTest {
       @Synchronized get() =
         baseCompletedRecording.copy(recordingId = checkNotNull(finalizingRecordingId))
 
-    override fun acquireAudio(): Boolean = true
+    override fun acquireCaptureAudio(): Boolean = true
+
+    override fun acquirePlaybackAudio(): Boolean = true
 
     override fun releaseAudio() = Unit
 
@@ -866,7 +1421,10 @@ internal class T3VoiceThreadSessionTest {
     private val lock = Any()
     private var activePlayback: String? = null
 
-    override fun acquireAudio(): Boolean = true
+    override fun acquireCaptureAudio(): Boolean =
+      error("Playback-only test media must not acquire communication audio")
+
+    override fun acquirePlaybackAudio(): Boolean = true
 
     override fun releaseAudio() = Unit
 
@@ -923,6 +1481,44 @@ internal class T3VoiceThreadSessionTest {
       }
       if (interrupted) Thread.currentThread().interrupt()
     }
+  }
+
+  private class FailingPlaybackStartupMedia(
+    private val failAcquire: Boolean,
+  ) : T3VoiceThreadMedia {
+    override fun acquireCaptureAudio(): Boolean =
+      error("Playback-only test media must not acquire communication audio")
+
+    override fun acquirePlaybackAudio(): Boolean = !failAcquire
+
+    override fun releaseAudio() = Unit
+
+    override fun startRecording(
+      recordingId: String,
+      endpointConfig: T3VoiceEndpointDetectionConfig,
+    ) = error("Recording is not used by this test.")
+
+    override fun finishRecording(recordingId: String): T3VoiceRecordingResult =
+      error("Recording is not used by this test.")
+
+    override fun cancelRecording(recordingId: String) =
+      error("Recording is not used by this test.")
+
+    override fun deleteRecording(recording: T3VoiceRecordingResult) = Unit
+
+    override fun startPlayback(playbackId: String, sampleRate: Int, channelCount: Int) {
+      error("Player startup failed.")
+    }
+
+    override fun enqueueOwnedPlaybackPcm(playbackId: String, chunkIndex: Int, pcm: ByteArray) = Unit
+
+    override fun finishPlayback(playbackId: String, finalChunkIndex: Int) = Unit
+
+    override fun cancelPlayback(playbackId: String) = Unit
+
+    override fun pausePlayback(playbackId: String) = Unit
+
+    override fun resumePlayback(playbackId: String) = Unit
   }
 
   private class CompletedResponseApi(
@@ -993,7 +1589,9 @@ internal class T3VoiceThreadSessionTest {
     private val lock = Any()
     private var activeRecording: String? = null
 
-    override fun acquireAudio(): Boolean = true
+    override fun acquireCaptureAudio(): Boolean = true
+
+    override fun acquirePlaybackAudio(): Boolean = true
 
     override fun releaseAudio() = Unit
 
@@ -1057,22 +1655,44 @@ internal class T3VoiceThreadSessionTest {
     }
   }
 
-  private class BlockingSynthesisMedia : T3VoiceThreadMedia {
+  private class BlockingSynthesisMedia(
+    private val captureFocusAvailable: AtomicBoolean = AtomicBoolean(true),
+    private val blockCancel: Boolean = false,
+    private val blockRelease: Boolean = false,
+    private val onCaptureFocusAttempt: () -> Unit = {},
+  ) : T3VoiceThreadMedia {
     val activePlayback = AtomicReference<String?>()
     val playbackCancelled = CountDownLatch(1)
+    val recordingStarted = CountDownLatch(1)
+    val captureFocusRejected = CountDownLatch(1)
+    val cancelEntered = CountDownLatch(1)
+    val allowCancel = CountDownLatch(1)
+    val releaseEntered = CountDownLatch(1)
+    val allowRelease = CountDownLatch(1)
     val finishCount = AtomicInteger(0)
+    val pauseCount = AtomicInteger(0)
     val resumeCount = AtomicInteger(0)
     private val activeRecording = AtomicReference<String?>()
 
-    override fun acquireAudio(): Boolean = true
+    override fun acquireCaptureAudio(): Boolean =
+      captureFocusAvailable.get().also { granted ->
+        onCaptureFocusAttempt()
+        if (!granted) captureFocusRejected.countDown()
+      }
 
-    override fun releaseAudio() = Unit
+    override fun acquirePlaybackAudio(): Boolean = true
+
+    override fun releaseAudio() {
+      releaseEntered.countDown()
+      if (blockRelease) awaitIgnoringInterrupt(allowRelease)
+    }
 
     override fun startRecording(
       recordingId: String,
       endpointConfig: T3VoiceEndpointDetectionConfig,
     ) {
       check(activeRecording.compareAndSet(null, recordingId))
+      recordingStarted.countDown()
     }
 
     override fun finishRecording(recordingId: String): T3VoiceRecordingResult =
@@ -1096,11 +1716,15 @@ internal class T3VoiceThreadSessionTest {
     }
 
     override fun cancelPlayback(playbackId: String) {
+      cancelEntered.countDown()
+      if (blockCancel) awaitIgnoringInterrupt(allowCancel)
       activePlayback.compareAndSet(playbackId, null)
       playbackCancelled.countDown()
     }
 
-    override fun pausePlayback(playbackId: String) = Unit
+    override fun pausePlayback(playbackId: String) {
+      pauseCount.incrementAndGet()
+    }
 
     override fun resumePlayback(playbackId: String) {
       resumeCount.incrementAndGet()
@@ -1108,6 +1732,36 @@ internal class T3VoiceThreadSessionTest {
 
     fun finishEndpointCancellation(): String =
       checkNotNull(activeRecording.getAndSet(null))
+
+    private fun awaitIgnoringInterrupt(latch: CountDownLatch) {
+      var interrupted = false
+      while (true) {
+        try {
+          latch.await()
+          break
+        } catch (_: InterruptedException) {
+          interrupted = true
+        }
+      }
+      if (interrupted) Thread.currentThread().interrupt()
+    }
+  }
+
+  private class RejectingRetryScheduler : ScheduledThreadPoolExecutor(1) {
+    val rejectSchedules = AtomicBoolean(false)
+    val rejectedSchedule = CountDownLatch(1)
+
+    override fun schedule(
+      command: Runnable,
+      delay: Long,
+      unit: TimeUnit,
+    ): ScheduledFuture<*> {
+      if (rejectSchedules.get()) {
+        rejectedSchedule.countDown()
+        throw RejectedExecutionException("Scheduler stopped during focus admission.")
+      }
+      return super.schedule(command, delay, unit)
+    }
   }
 
   private class BlockingSynthesisApi : T3VoiceThreadSessionApi {

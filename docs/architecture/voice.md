@@ -26,7 +26,10 @@ The mobile app exposes five related voice surfaces:
    conversation and always exposes the shared native audio-route selector. While Realtime is active,
    it also exposes transcript, mute, and stop controls. While Thread voice is active, the bar remains
    a Realtime Resume surface.
-4. Eligible assistant messages can use bounded streaming speech playback.
+4. Android Thread Auto Listen can speak the response produced by its own native cycle. Arbitrary
+   message read-aloud and tap-to-hear are not implemented on Android. The generic React speech
+   implementation remains in source for future non-Android use, but no current web, desktop, or iOS
+   adapter exposes that feature.
 5. On Android, opt-in Background Voice Controls keep a native Ready notification and MediaSession
    available after an operation ends. The user chooses Realtime or the latest valid Active Thread as
    the default next interaction and can start it without React remaining attached.
@@ -105,7 +108,9 @@ The control API also provides:
 deltas followed by one final result. `POST /api/voice/speech` validates upstream status and PCM
 format before committing success, then returns cancellable, backpressured 24 kHz mono signed 16-bit
 PCM. Android Thread voice requests one-use tickets for these routes while React is detached;
-React-owned dictation and message playback request their own tickets.
+React-owned composer dictation requests its own transcription tickets. The server speech route and
+generic React playback implementation remain available to code, but arbitrary message read-aloud is
+not exposed by a current platform adapter.
 
 Server settings select non-Realtime providers and configure the optional OpenAI-compatible speech
 server:
@@ -222,6 +227,16 @@ React subscribes to complete snapshots and does not maintain a second Android vo
 The native bridge does not expose credentials, provider identifiers, SDP, raw provider events, or
 temporary recording paths.
 
+On Android, Thread Auto Listen response speech is owned by the semantic native runtime only
+(`playResponses`). The Thread screen mounts a small native snapshot/settings adapter rather than
+React's assistant-message observer and generic PCM state machine. The always-mounted runtime
+provider synchronizes preference changes into an active native cycle even when that screen is
+unmounted. Headset input during response playback **skips** speech (cancel + complete cycle)—not
+pause/resume. Thread-to-Realtime handoff is a single native transition; React does not dispatch a
+competing Skip first. After permanent playback focus loss, Auto Listen reacquires capture focus
+before rearming, with bounded exponential retry backoff. A denied retry does not change Android's
+process-wide communication mode or route.
+
 ### Realtime-to-Thread
 
 A user-initiated switch from the composer supplies the visible Thread target. An agent-initiated
@@ -326,7 +341,8 @@ the service, the readiness snapshot:
 - Realtime exposes mute or unmute and stop. When React has explicitly provisioned a complete latest
   Thread target, it also exposes a fenced Thread switch; it never resolves a destination inside the
   background service.
-- Thread exposes finish utterance while recording, submit while reviewing, and stop.
+- Thread exposes finish utterance while recording, submit while reviewing, skip while playing a
+  response, and stop.
 - Transitions expose stop.
 - A failed owner retains a Stop-only foreground notification only while native release remains
   unresolved. Exact cleanup returns the operation controller to Idle, so enabled readiness becomes
@@ -334,9 +350,13 @@ the service, the readiness snapshot:
 
 MediaSession transport controls map to the same native commands. Recognized media-button key-up and
 repeat events are consumed without dispatch; only the initial key-down can act. In Ready, headset
-hook, play, and play/pause start, while pause and stop never start. Background Voice Controls require
-notification permission when enabled; notification permission denial for an already active visible
-operation still reduces drawer visibility without creating a second control path.
+hook, play, and play/pause start, while pause and stop never start. During Thread response playback,
+every recognized headset transport key maps to Skip (cancel remaining TTS and complete the cycle:
+rearm when auto-rearm is on, otherwise stop and release). The notification's explicit Stop action
+remains a full session teardown.
+Background Voice Controls require notification permission when enabled; notification permission
+denial for an already active visible operation still reduces drawer visibility without creating a
+second control path.
 
 Android owns and persists one global preferred audio route. The always-visible selector in the
 Realtime call bar and the selector in Voice Settings read and write that same native preference.
