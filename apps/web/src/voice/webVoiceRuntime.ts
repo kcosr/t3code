@@ -1211,8 +1211,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         void runThreadCycle(input).catch(async (cause) => {
           if (
             (cause instanceof DOMException && cause.name === "AbortError") ||
-            threadAbort?.signal.aborted === true ||
-            (cause instanceof Error && /aborted/i.test(cause.message))
+            threadAbort?.signal.aborted === true
           ) {
             // stopInternal may already have published idle; avoid failed chrome.
             if (snapshot.mode !== "idle" && snapshot.mode !== "realtime") {
