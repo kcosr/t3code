@@ -6,6 +6,7 @@ import { TrimmedNonEmptyString, TrimmedString } from "./baseSchemas.ts";
 import { DEFAULT_GIT_TEXT_GENERATION_MODEL, ProviderOptionSelections } from "./model.ts";
 import { ModelSelection } from "./orchestration.ts";
 import { ProviderInstanceConfig, ProviderInstanceId } from "./providerInstance.ts";
+import { VoiceToolName } from "./voice.ts";
 
 // ── Client Settings (local-only) ───────────────────────────────
 
@@ -470,11 +471,12 @@ export const OpenAiSpeechServerSettings = Schema.Struct({
 export type OpenAiSpeechServerSettings = typeof OpenAiSpeechServerSettings.Type;
 
 /**
- * Migrated voice business tools that may be exposed only through the command
- * wrapper meta-tools (`command_list` / `command_describe` / `command_execute`)
- * instead of as directly named Realtime function tools.
+ * Migrated voice tools that may be exposed only through the command wrapper
+ * meta-tools (`command_list` / `command_describe` / `command_execute`) instead
+ * of as directly named Realtime function tools. Every public voice tool is
+ * command-capable; membership is opt-in via `voice.commandTools`.
  */
-export const VoiceCommandToolName = Schema.Literals(["list_threads", "create_thread"]);
+export const VoiceCommandToolName = VoiceToolName;
 export type VoiceCommandToolName = typeof VoiceCommandToolName.Type;
 
 export const VoiceCommandTools = Schema.Array(VoiceCommandToolName).check(Schema.isUnique());
@@ -507,8 +509,8 @@ export const VoiceSettings = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(16_000)),
   ),
   /**
-   * Opt-in list of migrated business tools exposed only through the command
-   * wrapper. Empty (default) keeps both tools as direct Realtime declarations.
+   * Opt-in list of voice tools exposed only through the command wrapper.
+   * Empty (default) keeps every migrated tool as a direct Realtime declaration.
    */
   commandTools: VoiceCommandTools.pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   providers: VoiceProviderSelections.pipe(Schema.withDecodingDefault(Effect.succeed({}))),

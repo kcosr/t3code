@@ -185,14 +185,14 @@ The Realtime voice-agent allowlist is:
 - `interrupt_thread`
 - `archive_thread`
 
-`list_threads` and `create_thread` are defined once as typed model-tool definitions in
+Every Realtime voice-agent tool is defined once as a typed model-tool definition in
 `apps/server/src/voice/modelTools/`. Each definition owns the Effect input schema, generated JSON
-Schema, description, and business operation. Direct Realtime declarations and command-wrapper
-exposure are adapters over those definitions.
+Schema, and description (with full execute bodies for tools that have been extracted). Direct
+Realtime declarations and command-wrapper exposure are adapters over those definitions.
 
-Optional server setting `voice.commandTools` (default `[]`) is an allowlist of those migrated tools.
-When a name is listed, the server omits its direct function declaration for the session and exposes
-it only through the session-internal command meta-tools:
+Optional server setting `voice.commandTools` (default `[]`) is an allowlist of any public
+`VoiceToolName`. When a name is listed, the server omits its direct function declaration for the
+session and exposes it only through the session-internal command meta-tools:
 
 - `command_list` — compact catalog of command-exposed tools
 - `command_describe` — description plus generated input schema for one catalog entry

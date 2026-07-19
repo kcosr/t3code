@@ -6,17 +6,11 @@ import {
   ClientOrchestrationCommand,
   CommandId,
   MessageId,
-  HISTORY_READ_CONTEXT_MAX_RECORDS,
-  HistorySearchInput,
-  HistoryThreadMessageRef,
-  HistoryVoiceEntryRef,
-  HistoryVoiceScope,
   type HistoryReadInput as HistoryReadInputType,
   type HistorySearchInput as HistorySearchInputType,
   type HistoryVoiceScope as HistoryVoiceScopeType,
   type OrchestrationMessageTurnResult,
   ThreadId,
-  TrimmedNonEmptyString,
   VoiceConfirmationId,
   VoiceClientActionId,
   VoiceConversationEntryId,
@@ -56,7 +50,16 @@ import {
 import { VoiceError } from "../Errors.ts";
 import {
   CreateThreadTool,
+  GetThreadMessagesArguments,
+  ListProjectsArguments,
   ListThreadsTool,
+  ReadHistoryArguments,
+  SearchHistoryArguments,
+  SendThreadMessageArguments,
+  StopRealtimeArguments,
+  ThreadArguments,
+  VoiceToolHistoryVoiceScope,
+  WaitForThreadTurnArguments,
   voiceThreadProjection as threadOutput,
 } from "../modelTools/definitions.ts";
 import { VoiceConversationService } from "../Services/VoiceConversationService.ts";
@@ -81,53 +84,17 @@ const MAX_WAIT_MESSAGE_CHARS = 8_000;
 const MAX_HISTORY_TOOL_OUTPUT_BYTES = 32_000;
 const TURN_WAIT_POLL_INTERVAL = "250 millis";
 
-const ListProjectsArguments = Schema.Struct({
-  limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
-});
-const ThreadArguments = Schema.Struct({ threadId: ThreadId });
-const GetThreadMessagesArguments = Schema.Struct({
-  threadId: ThreadId,
-  limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
-  cursor: Schema.optionalKey(TrimmedNonEmptyString),
-});
-const WaitForThreadTurnArguments = Schema.Struct({
-  threadId: ThreadId,
-  messageId: MessageId,
-  waitMilliseconds: Schema.Int.check(Schema.isBetween({ minimum: 250, maximum: 25_000 })),
-});
-const SendThreadMessageArguments = Schema.Struct({
-  threadId: ThreadId,
-  message: TrimmedNonEmptyString,
-});
-const CurrentConversationVoiceScope = Schema.Struct({
-  type: Schema.Literal("current-conversation"),
-});
-const VoiceToolHistoryVoiceScope = Schema.Union([CurrentConversationVoiceScope, HistoryVoiceScope]);
-const SearchHistoryArguments = Schema.Struct({
-  ...HistorySearchInput.fields,
-  voiceScope: Schema.optionalKey(VoiceToolHistoryVoiceScope),
-});
-const HistoryContextRadius = Schema.Int.check(
-  Schema.isBetween({ minimum: 0, maximum: HISTORY_READ_CONTEXT_MAX_RECORDS }),
-);
-const ReadHistoryArguments = Schema.Struct({
-  ref: Schema.Union([HistoryThreadMessageRef, HistoryVoiceEntryRef]),
-  voiceScope: Schema.optionalKey(VoiceToolHistoryVoiceScope),
-  before: HistoryContextRadius,
-  after: HistoryContextRadius,
-});
-const StopRealtimeArguments = Schema.Record(Schema.String, Schema.Unknown);
-type SearchHistoryArguments = typeof SearchHistoryArguments.Type;
-type ReadHistoryArguments = typeof ReadHistoryArguments.Type;
+type SearchHistoryArgumentsType = typeof SearchHistoryArguments.Type;
+type ReadHistoryArgumentsType = typeof ReadHistoryArguments.Type;
 
 const resolveHistoryVoiceScope = (
-  scope: typeof VoiceToolHistoryVoiceScope.Type,
+  scope: VoiceToolHistoryVoiceScope,
   conversationId: VoiceConversationId,
 ): HistoryVoiceScopeType =>
   scope.type === "current-conversation" ? { type: "conversation", conversationId } : scope;
 
 const resolveSearchHistoryArguments = (
-  args: SearchHistoryArguments,
+  args: SearchHistoryArgumentsType,
   conversationId: VoiceConversationId,
 ): HistorySearchInputType => {
   const { voiceScope: requestedVoiceScope, ...rest } = args;
@@ -141,7 +108,7 @@ const resolveSearchHistoryArguments = (
 };
 
 const resolveReadHistoryArguments = (
-  args: ReadHistoryArguments,
+  args: ReadHistoryArgumentsType,
   conversationId: VoiceConversationId,
 ): HistoryReadInputType =>
   args.ref.type === "thread-message"

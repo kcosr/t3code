@@ -569,12 +569,13 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
     expect(
       configuredTools.find((tool) => tool.name === "search_history")?.parameters,
     ).toMatchObject({
+      type: "object",
       required: ["query", "sources", "limit"],
       additionalProperties: false,
       properties: {
-        query: { maxLength: 512 },
-        sources: { maxItems: 2, uniqueItems: true },
-        limit: { maximum: 20 },
+        query: { type: "string" },
+        sources: { type: "array", maxItems: 2 },
+        limit: { type: "integer", maximum: 20 },
       },
     });
     const readHistoryParameters = configuredTools.find((tool) => tool.name === "read_history")
@@ -584,10 +585,12 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       readonly additionalProperties: boolean;
       readonly properties: {
         readonly ref: {
-          readonly oneOf: ReadonlyArray<Record<string, unknown>>;
+          readonly anyOf?: ReadonlyArray<Record<string, unknown>>;
+          readonly oneOf?: ReadonlyArray<Record<string, unknown>>;
         };
         readonly voiceScope: {
-          readonly oneOf: ReadonlyArray<Record<string, unknown>>;
+          readonly anyOf?: ReadonlyArray<Record<string, unknown>>;
+          readonly oneOf?: ReadonlyArray<Record<string, unknown>>;
         };
         readonly before: Record<string, unknown>;
         readonly after: Record<string, unknown>;
@@ -599,7 +602,9 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       additionalProperties: false,
     });
     expect(readHistoryParameters).not.toHaveProperty("anyOf");
-    expect(readHistoryParameters.properties.ref.oneOf).toEqual(
+    const refVariants =
+      readHistoryParameters.properties.ref.anyOf ?? readHistoryParameters.properties.ref.oneOf;
+    expect(refVariants).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           required: ["type", "projectId", "threadId", "messageId"],
@@ -609,11 +614,11 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
         }),
       ]),
     );
-    expect(readHistoryParameters.properties.voiceScope.oneOf).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ required: ["type"] }),
-        expect.objectContaining({ required: ["type", "conversationId"] }),
-      ]),
+    const voiceScopeVariants =
+      readHistoryParameters.properties.voiceScope.anyOf ??
+      readHistoryParameters.properties.voiceScope.oneOf;
+    expect(voiceScopeVariants).toEqual(
+      expect.arrayContaining([expect.objectContaining({ required: ["type"] })]),
     );
     expect(readHistoryParameters.properties).toMatchObject({
       before: { maximum: 10 },

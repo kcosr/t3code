@@ -115,17 +115,17 @@ describe("ServerSettings.voice", () => {
     });
   });
 
-  it("accepts commandTools allowlist and rejects unknown or duplicate names", () => {
+  it("accepts commandTools allowlist for any public voice tool and rejects unknown or duplicates", () => {
     expect(
       decodeServerSettings({
-        voice: { commandTools: ["list_threads", "create_thread"] },
+        voice: { commandTools: ["list_threads", "create_thread", "send_thread_message"] },
       }).voice.commandTools,
-    ).toEqual(["list_threads", "create_thread"]);
+    ).toEqual(["list_threads", "create_thread", "send_thread_message"]);
     expect(
       decodeServerSettings({
-        voice: { commandTools: ["create_thread"] },
+        voice: { commandTools: ["stop_realtime_voice"] },
       }).voice.commandTools,
-    ).toEqual(["create_thread"]);
+    ).toEqual(["stop_realtime_voice"]);
     expect(() =>
       Schema.decodeUnknownSync(ServerSettings)({
         voice: { commandTools: ["list_threads", "list_threads"] },
@@ -133,7 +133,7 @@ describe("ServerSettings.voice", () => {
     ).toThrow();
     expect(() =>
       Schema.decodeUnknownSync(ServerSettings)({
-        voice: { commandTools: ["send_thread_message"] },
+        voice: { commandTools: ["not_a_voice_tool"] },
       }),
     ).toThrow();
   });

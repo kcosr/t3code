@@ -19,8 +19,23 @@ import { CreateThreadTool, ListThreadsTool, VoiceModelTools } from "./definition
 import { resolveVoiceToolExposure } from "./exposure.ts";
 
 describe("voice model tool definitions", () => {
-  it("registers migrated tools with object-root generated schemas", () => {
-    expect(VoiceModelTools.names()).toEqual(["list_threads", "create_thread"]);
+  it("registers every public voice tool with object-root generated schemas", () => {
+    expect(VoiceModelTools.names()).toEqual([
+      "list_projects",
+      "list_threads",
+      "get_thread_status",
+      "interrupt_thread",
+      "archive_thread",
+      "get_thread_messages",
+      "wait_for_thread_turn",
+      "search_history",
+      "read_history",
+      "activate_thread",
+      "create_thread",
+      "send_thread_message",
+      "stop_realtime_voice",
+      "switch_to_thread_voice",
+    ]);
     expect(ListThreadsTool.inputJsonSchema.type).toBe("object");
     expect(ListThreadsTool.inputJsonSchema.additionalProperties).toBe(false);
     expect(ListThreadsTool.inputJsonSchema.required).toEqual(["projectId", "limit"]);
@@ -30,25 +45,26 @@ describe("voice model tool definitions", () => {
 });
 
 describe("voice tool exposure", () => {
-  it("keeps both tools direct when commandTools is empty", () => {
+  it("keeps all tools direct when commandTools is empty", () => {
     const exposure = resolveVoiceToolExposure([]);
     expect(exposure.commandMetaToolsEnabled).toBe(false);
-    expect(exposure.directMigratedTools.map((tool) => tool.name)).toEqual([
-      "list_threads",
-      "create_thread",
-    ]);
+    expect(exposure.directMigratedTools.map((tool) => tool.name)).toEqual(VoiceModelTools.names());
     expect(exposure.commandCatalog).toEqual([]);
   });
 
   it("suppresses direct declaration for each configured command tool", () => {
     const listOnly = resolveVoiceToolExposure(["list_threads"]);
-    expect(listOnly.directMigratedTools.map((tool) => tool.name)).toEqual(["create_thread"]);
     expect(listOnly.commandCatalog.map((tool) => tool.name)).toEqual(["list_threads"]);
+    expect(listOnly.directMigratedTools.map((tool) => tool.name)).not.toContain("list_threads");
     expect(listOnly.commandMetaToolsEnabled).toBe(true);
 
-    const both = resolveVoiceToolExposure(["create_thread", "list_threads"]);
-    expect(both.directMigratedTools).toEqual([]);
-    expect(both.commandCatalog.map((tool) => tool.name)).toEqual(["create_thread", "list_threads"]);
+    const many = resolveVoiceToolExposure(["create_thread", "list_threads", "send_thread_message"]);
+    expect(many.commandCatalog.map((tool) => tool.name)).toEqual([
+      "create_thread",
+      "list_threads",
+      "send_thread_message",
+    ]);
+    expect(many.directMigratedTools.map((tool) => tool.name)).not.toContain("send_thread_message");
   });
 });
 
