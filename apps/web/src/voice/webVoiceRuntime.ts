@@ -765,31 +765,50 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         const stream = await requestMicrophoneStream();
         const capture = await startAudioCapture(stream);
         let endpoint: "silence" | "no-speech" | "max-utterance" | "manual" = "manual";
+        const endpointAbort = new AbortController();
+        const onParentAbort = () => endpointAbort.abort();
+        abort.signal.addEventListener("abort", onParentAbort, { once: true });
         try {
           endpoint = await new Promise<"silence" | "no-speech" | "max-utterance" | "manual">(
             (resolve, reject) => {
-              resolveManualFinish = resolve;
+              let settled = false;
+              const finish = (
+                next: "silence" | "no-speech" | "max-utterance" | "manual" | Error,
+              ) => {
+                if (settled) return;
+                settled = true;
+                if (resolveManualFinish === settleManual) {
+                  resolveManualFinish = null;
+                }
+                if (next instanceof Error) reject(next);
+                else resolve(next);
+              };
+              const settleManual = (reason: "manual") => {
+                endpointAbort.abort();
+                finish(reason);
+              };
+              resolveManualFinish = settleManual;
               void waitForEndpoint({
                 capture,
                 config: input.settings.endpointDetection,
-                signal: abort.signal,
+                signal: endpointAbort.signal,
               }).then(
-                (reason) => {
-                  resolveManualFinish = null;
-                  resolve(reason);
-                },
-                (cause) => {
-                  resolveManualFinish = null;
-                  reject(cause);
-                },
+                (reason) => finish(reason),
+                (cause) => finish(cause instanceof Error ? cause : new Error(String(cause))),
               );
             },
           );
         } catch (cause) {
           capture.stop();
-          if (abort.signal.aborted) break;
-          throw cause;
+          if (endpoint === "manual") {
+            // Manual finish aborted the waiter after resolving — continue with PCM.
+          } else if (abort.signal.aborted) {
+            break;
+          } else {
+            throw cause;
+          }
         } finally {
+          abort.signal.removeEventListener("abort", onParentAbort);
           resolveManualFinish = null;
         }
 
@@ -920,6 +939,9 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
               : transcriptText;
         }
 
+        // Never dispatch a turn after stop/handoff during encode/transcribe.
+        if (abort.signal.aborted) break;
+
         await submitTranscriptAndWait({
           input,
           client,
@@ -1008,6 +1030,14 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
       signal: abort.signal,
     });
 
+    if (abort.signal.aborted) {
+      throw new DOMException("Thread voice aborted", "AbortError");
+    }
+
+    if (outcome.status === "failed" && outcome.message === "Thread wait aborted") {
+      throw new DOMException("Thread voice aborted", "AbortError");
+    }
+
     if (outcome.status === "attention") {
       publishNext({
         mode: "thread",
@@ -1080,8 +1110,14 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     });
     // Detach cycle so callers (terminal-action / startThread) do not hold the transition.
     void runThreadCycle(input).catch(async (cause) => {
-      if (cause instanceof DOMException && cause.name === "AbortError") {
-        await stopInternal("aborted");
+      if (
+        (cause instanceof DOMException && cause.name === "AbortError") ||
+        threadAbort?.signal.aborted === true ||
+        (cause instanceof Error && /aborted/i.test(cause.message))
+      ) {
+        if (snapshot.mode !== "idle" && snapshot.mode !== "realtime") {
+          await stopInternal("aborted");
+        }
         return;
       }
       await failAndRelease(
@@ -1173,8 +1209,15 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         }
         // Detach the long-running cycle so stop()/startRealtime stay available.
         void runThreadCycle(input).catch(async (cause) => {
-          if (cause instanceof DOMException && cause.name === "AbortError") {
-            await stopInternal("aborted");
+          if (
+            (cause instanceof DOMException && cause.name === "AbortError") ||
+            threadAbort?.signal.aborted === true ||
+            (cause instanceof Error && /aborted/i.test(cause.message))
+          ) {
+            // stopInternal may already have published idle; avoid failed chrome.
+            if (snapshot.mode !== "idle" && snapshot.mode !== "realtime") {
+              await stopInternal("aborted");
+            }
             return;
           }
           await failAndRelease(
