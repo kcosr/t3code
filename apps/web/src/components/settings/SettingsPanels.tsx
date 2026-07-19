@@ -25,6 +25,7 @@ import * as Duration from "effect/Duration";
 import * as Equal from "effect/Equal";
 import * as Result from "effect/Result";
 import { APP_VERSION, HOSTED_APP_CHANNEL, HOSTED_APP_CHANNEL_LABEL } from "../../branding";
+import { VoiceSettingsSection } from "../../voice/VoiceSettingsSection";
 import {
   canCheckForUpdate,
   getDesktopUpdateButtonTooltip,
@@ -525,6 +526,9 @@ export function GeneralSettingsPanel() {
 
   return (
     <SettingsPageContainer>
+      <SettingsSection title="Voice">
+        <VoiceSettingsSection />
+      </SettingsSection>
       <SettingsSection title="General">
         <SettingsRow
           title="Theme"

@@ -275,6 +275,32 @@ export const make = Effect.gen(function* () {
       window.setAutoHideCursor(false);
     }
 
+    // Allow microphone / media permissions for Realtime and Thread voice in the
+    // main renderer (custom-scheme secure context). Preview partitions keep a
+    // separate, tighter permission policy.
+    window.webContents.session.setPermissionRequestHandler((_webContents, permission, callback) => {
+      if (
+        permission === "media" ||
+        permission === "mediaKeySystem" ||
+        permission === "clipboard-read" ||
+        permission === "clipboard-sanitized-write" ||
+        permission === "notifications"
+      ) {
+        callback(true);
+        return;
+      }
+      callback(false);
+    });
+    window.webContents.session.setPermissionCheckHandler((_webContents, permission) => {
+      return (
+        permission === "media" ||
+        permission === "mediaKeySystem" ||
+        permission === "clipboard-read" ||
+        permission === "clipboard-sanitized-write" ||
+        permission === "notifications"
+      );
+    });
+
     yield* previewManager.setMainWindow(window);
     window.webContents.on("will-attach-webview", (event, webPreferences, params) => {
       if (

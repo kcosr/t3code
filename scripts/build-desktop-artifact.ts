@@ -1426,6 +1426,11 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       target: target === "dmg" ? [target, "zip"] : [target],
       icon: "icon.icns",
       category: "public.app-category.developer-tools",
+      // Required for Realtime / Thread voice microphone access on macOS.
+      extendInfo: {
+        NSMicrophoneUsageDescription:
+          "T3 Code needs microphone access for Realtime voice and Thread Auto Listen.",
+      },
       protocols: [
         {
           name: "T3 Code",

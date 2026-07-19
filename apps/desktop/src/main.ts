@@ -19,6 +19,7 @@ import * as ElectronApp from "./electron/ElectronApp.ts";
 import * as ElectronDialog from "./electron/ElectronDialog.ts";
 import * as ElectronMenu from "./electron/ElectronMenu.ts";
 import * as ElectronProtocol from "./electron/ElectronProtocol.ts";
+import { registerDesktopSchemesAsPrivileged } from "./electron/ElectronProtocol.ts";
 import * as ElectronSafeStorage from "./electron/ElectronSafeStorage.ts";
 import * as ElectronShell from "./electron/ElectronShell.ts";
 import * as ElectronTheme from "./electron/ElectronTheme.ts";
@@ -52,6 +53,10 @@ import * as PreviewManager from "./preview/Manager.ts";
 import * as DesktopWindow from "./window/DesktopWindow.ts";
 import * as DesktopWslBackend from "./wsl/DesktopWslBackend.ts";
 import * as DesktopWslEnvironment from "./wsl/DesktopWslEnvironment.ts";
+
+// Privileged custom schemes must be registered before app ready so the
+// renderer is a secure context for mic/WebRTC voice.
+registerDesktopSchemesAsPrivileged();
 
 const desktopEnvironmentLayer = Layer.unwrap(
   Effect.gen(function* () {

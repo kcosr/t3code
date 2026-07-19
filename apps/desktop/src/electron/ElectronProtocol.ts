@@ -24,6 +24,25 @@ export function getDesktopUrl(isDevelopment: boolean): string {
   return `${getDesktopOrigin(isDevelopment)}/`;
 }
 
+/**
+ * Must run before Electron app ready so custom-scheme renderers are treated as
+ * secure contexts (required for getUserMedia / WebRTC / AudioWorklet).
+ */
+export function registerDesktopSchemesAsPrivileged(): void {
+  const privileges: Electron.Privileges = {
+    standard: true,
+    secure: true,
+    supportFetchAPI: true,
+    corsEnabled: true,
+    stream: true,
+    bypassCSP: false,
+  };
+  Electron.protocol.registerSchemesAsPrivileged([
+    { scheme: DESKTOP_PRODUCTION_SCHEME, privileges },
+    { scheme: DESKTOP_DEVELOPMENT_SCHEME, privileges },
+  ]);
+}
+
 export class ElectronProtocolRegistrationError extends Schema.TaggedErrorClass<ElectronProtocolRegistrationError>()(
   "ElectronProtocolRegistrationError",
   {

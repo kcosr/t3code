@@ -202,6 +202,8 @@ import {
 } from "../state/entities";
 import { environmentShell } from "../state/shell";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
+import { RealtimeVoiceCallBar } from "../voice/RealtimeVoiceCallBar";
+import { ThreadVoiceControls } from "../voice/ThreadVoiceControls";
 import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
@@ -5375,6 +5377,31 @@ function ChatViewContent(props: ChatViewProps) {
                       ref={attachDraftHeroComposerAnchorRef}
                       className="relative z-10 mx-auto w-full max-w-3xl"
                     >
+                      <div className="mb-2 flex justify-end px-1">
+                        <ThreadVoiceControls
+                          environmentId={environmentId}
+                          projectId={activeProject?.id ?? activeThread?.projectId ?? null}
+                          threadId={activeThreadId}
+                          modelSelection={
+                            activeThread?.modelSelection ??
+                            activeProject?.defaultModelSelection ??
+                            null
+                          }
+                          runtimeMode={runtimeMode}
+                          interactionMode={interactionMode}
+                          composerEmpty={promptRef.current.trim().length === 0}
+                          hasAttachments={composerImagesRef.current.length > 0}
+                          interactionRequired={
+                            pendingApprovals.length > 0 || pendingUserInputs.length > 0
+                          }
+                          activeThreadBusy={phase === "running" || isSendBusy}
+                          onDictationInsert={(text) => {
+                            composerRef.current?.insertTextAtEnd(
+                              promptRef.current.trim().length > 0 ? ` ${text}` : text,
+                            );
+                          }}
+                        />
+                      </div>
                       <ChatComposer
                         composerRef={composerRef}
                         composerDraftTarget={composerDraftTarget}
@@ -5463,6 +5490,12 @@ function ChatViewContent(props: ChatViewProps) {
                             : "pb-[calc(env(safe-area-inset-bottom)+0.75rem)] sm:pb-[calc(env(safe-area-inset-bottom)+1rem)]",
                         )}
                       >
+                        <RealtimeVoiceCallBar
+                          environmentId={environmentId}
+                          projectId={activeProject?.id ?? activeThread?.projectId ?? null}
+                          threadId={activeThreadId}
+                          className="mx-auto w-full max-w-3xl"
+                        />
                         {isGitRepo && (
                           <div className="pointer-events-auto">
                             <BranchToolbar
