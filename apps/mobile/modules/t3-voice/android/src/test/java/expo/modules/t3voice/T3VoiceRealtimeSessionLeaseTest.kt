@@ -104,6 +104,8 @@ class T3VoiceRealtimeSessionLeaseTest {
     val second = T3VoiceRealtimeSessionLease("session-a")
     first.install()
     val stale = requireNotNull(first.armTimeout(T3VoiceRealtimeSessionLease.TimeoutKind.DISCONNECTED))
+    // Production releases the prior lease before installing a replacement.
+    first.release()
     second.install()
     val current =
       requireNotNull(second.armTimeout(T3VoiceRealtimeSessionLease.TimeoutKind.DISCONNECTED))
