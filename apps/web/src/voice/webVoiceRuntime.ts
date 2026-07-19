@@ -677,6 +677,9 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     resolveManualFinish = null;
     threadAbort?.abort();
     threadAbort = null;
+    // Keep lastThreadAbortSignal for in-flight Effect interruption mapping, but
+    // clear activeCycleAbortSignal so a later start's early guards aren't masked.
+    activeCycleAbortSignal = null;
     pcmPlayer?.cancel();
     if (realtime !== null) {
       const gen = bumpGeneration();
@@ -743,6 +746,9 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
       throw new Error("Thread voice cycle is already running");
     }
     threadCycleRunning = true;
+    // Clear prior-cycle abort signal before any early guards so a previous stop
+    // cannot misclassify a fresh start failure as an abort.
+    activeCycleAbortSignal = null;
     const prepared = hooks.getPrepared(input.target.environmentId);
     if (prepared === null) {
       threadCycleRunning = false;
@@ -755,7 +761,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
 
     try {
       const abort = new AbortController();
-      // Assign early so start failures after a prior stop aren't misclassified.
+      // Assign early so mid-cycle stop classification stays accurate.
       activeCycleAbortSignal = abort.signal;
       lastThreadAbortSignal = abort.signal;
       threadAbort?.abort();

@@ -184,7 +184,9 @@ export function ThreadVoiceControls(props: {
   const reviewing =
     voice.snapshot.mode === "thread" &&
     voice.snapshot.phase === "reviewing" &&
-    voice.snapshot.reviewId != null;
+    voice.snapshot.reviewId != null &&
+    props.threadId != null &&
+    voice.snapshot.target.threadId === props.threadId;
 
   return (
     <div className="flex flex-col gap-2">
