@@ -2,7 +2,6 @@ import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { useNavigation } from "@react-navigation/native";
 import type { PreparedConnection } from "@t3tools/client-runtime/connection";
 import {
-  admittedClientActionFocusState,
   bindVoiceConversationBrowser,
   canStartThreadVoiceFromComposer,
   continueVoiceConversationSelection,
@@ -16,12 +15,9 @@ import {
   threadTranscriptSubmissionDisposition,
   threadVoiceStartForFocus,
   threadVoiceSettings,
-  voiceRealtimeContextsEqual,
   voiceRuntimeCommandEnvironmentMatches,
   voiceRuntimeSnapshotEnvironmentId,
-  voiceThreadNavigationRequest,
   type ActiveVoiceRuntimeAttachment,
-  type AdmittedClientActionFocus,
   type VoiceRuntimeFocus,
   type ThreadReviewIdentity,
   type ThreadTranscriptSubmissionDisposition,
@@ -31,16 +27,10 @@ import {
   type VoiceRealtimeTranscriptTurn,
   type VoiceRuntimeSnapshot,
 } from "@t3tools/client-runtime/voice";
-import {
-  EnvironmentId,
-  type ThreadId,
-  type VoiceConversationId,
-  type VoiceConversationSelection,
-} from "@t3tools/contracts";
+import { EnvironmentId, type ThreadId, type VoiceConversationId } from "@t3tools/contracts";
 import {
   getT3VoiceNativeModule,
   type T3VoiceReadinessSnapshot,
-  type T3VoiceTerminalRuntimeFailureEvent,
 } from "@t3tools/mobile-voice-native";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
@@ -69,10 +59,7 @@ import {
   useComposerDraftContentEmpty,
   useComposerDraftsReady,
 } from "../../state/use-composer-drafts";
-import {
-  makeAndroidVoiceRuntimeAdapter,
-  type AndroidVoiceRuntimeAdapter,
-} from "./androidVoiceRuntimeAdapter";
+import { makeAndroidVoiceRuntimeAdapter } from "./androidVoiceRuntimeAdapter";
 import {
   acceptEnabledAndroidVoiceReadiness,
   androidVoiceReadinessIdentity,
@@ -97,14 +84,16 @@ import { loadResumeSelection } from "./voiceConversationResume";
 import { makeMobileVoiceClient } from "./mobileVoiceClient";
 import { NativeThreadResponsePreferenceSync } from "./nativeThreadResponsePreference";
 import { useVoiceCapabilityAvailability } from "./useVoiceCapabilityAvailability";
+import { useVoiceRuntimeClientActionNavigation } from "./useVoiceRuntimeClientActionNavigation";
+import { useVoiceRuntimeConfirmationPrompting } from "./useVoiceRuntimeConfirmationPrompting";
+import {
+  useVoiceRuntimeFailurePresentation,
+  type VoiceRuntimeConnection,
+} from "./useVoiceRuntimeFailurePresentation";
 import { resolveVoicePreferences } from "./voicePreferences";
 import { voiceErrorMessage as errorMessage } from "./voiceError";
-import { RuntimeTerminalFailurePresentationRegistry } from "./runtimeTerminalFailurePresentations";
 
-interface NativeRuntimeConnection {
-  readonly environmentId: EnvironmentId;
-  readonly adapter: AndroidVoiceRuntimeAdapter;
-}
+type NativeRuntimeConnection = VoiceRuntimeConnection;
 
 interface VoiceConversationConnection {
   readonly environmentId: EnvironmentId;
@@ -201,11 +190,6 @@ export function VoiceRuntimeProvider(props: {
   const voiceStartTransitionRef = useRef(new ExclusiveTransition());
   const threadReviewHydrationTracker = useMemo(() => new ThreadReviewHydrationTracker(), []);
   const resumeAbortRef = useRef<AbortController | null>(null);
-  const failurePresentationsRef = useRef(new RuntimeTerminalFailurePresentationRegistry());
-  const handledClientActionsRef = useRef(new Set<string>());
-  const admittedClientActionFocusRef = useRef<AdmittedClientActionFocus | null>(null);
-  const promptedConfirmationsRef = useRef(new Set<string>());
-  const handledThreadNavigationRef = useRef<string | null>(null);
   const traditionalAudioInterruptionsRef = useRef(
     new Set<() => void | (() => void) | Promise<void | (() => void)>>(),
   );
@@ -766,57 +750,6 @@ export function VoiceRuntimeProvider(props: {
   ]);
   const threadStartAvailable =
     threadStart !== null && isThreadVoiceStartAvailable(snapshot, prepared !== null);
-  const acknowledgeAdmittedClientAction = useCallback(
-    (admittedFocus: AdmittedClientActionFocus): boolean => {
-      const runtime = runtimeRef.current;
-      const current = snapshotRef.current;
-      if (
-        runtime === null ||
-        current.mode !== "realtime" ||
-        runtime.environmentId !== current.target.environmentId
-      ) {
-        return false;
-      }
-      admittedClientActionFocusRef.current = null;
-      void runtime.adapter
-        .completeRealtimeClientAction(admittedFocus.actionId, "succeeded")
-        .catch((cause) =>
-          Alert.alert("Voice navigation acknowledgement failed", errorMessage(cause)),
-        );
-      return true;
-    },
-    [],
-  );
-
-  useEffect(() => {
-    const runtime = runtimeRef.current;
-    let admittedFocus = admittedClientActionFocusRef.current;
-    if (
-      admittedFocus !== null &&
-      snapshot.mode === "realtime" &&
-      !snapshot.pendingClientActions.some((action) => action.actionId === admittedFocus?.actionId)
-    ) {
-      admittedClientActionFocusRef.current = null;
-      admittedFocus = null;
-    }
-    const admission = admittedClientActionFocusState(admittedFocus, visibleFocus);
-    if (admission === "waiting") return;
-    if (admission === "admitted" && admittedFocus !== null) {
-      acknowledgeAdmittedClientAction(admittedFocus);
-      return;
-    }
-    if (
-      runtime === null ||
-      snapshot.mode !== "realtime" ||
-      runtime.environmentId !== snapshot.target.environmentId ||
-      voiceRealtimeContextsEqual(snapshot.target, realtimeContext)
-    ) {
-      return;
-    }
-    void runtime.adapter
-      .updateRealtimeContext(realtimeContext)
-      .catch((cause) => Alert.alert("Voice focus unavailable", errorMessage(cause)));
-  }, [acknowledgeAdmittedClientAction, realtimeContext, snapshot, visibleFocus]);
 
   const interruptTraditionalAudio = useCallback(async () => {
     const releases: Array<void | (() => void)> = [];
@@ -900,242 +833,39 @@ export function VoiceRuntimeProvider(props: {
     [performRealtimeStart],
   );
 
-  const presentRuntimeFailure = useCallback(
-    (failed: T3VoiceTerminalRuntimeFailureEvent, acknowledge: () => Promise<void>) => {
-      const presentation = failurePresentationsRef.current.register(failed.failureId, acknowledge);
-      if (!presentation.shouldPresent) return;
-      const complete = presentation.complete;
-      const target = lastRealtimeTargetRef.current;
-      if (
-        failed.operation === "realtime" &&
-        failed.failure.code === "takeover-required" &&
-        target?.conversation.type === "continue" &&
-        !target.conversation.takeover
-      ) {
-        const takeoverConversation: VoiceConversationSelection = {
-          ...target.conversation,
-          takeover: true,
-        };
-        const takeoverTarget: VoiceRealtimeTarget = {
-          ...target,
-          conversation: takeoverConversation,
-        };
-        const expectedEnvironmentId = target.environmentId;
-        Alert.alert(
-          "Take over active voice session?",
-          "An existing voice session is already active for this conversation. Taking over stops it and starts a new session here.",
-          [
-            {
-              text: "Cancel",
-              style: "cancel",
-              onPress: () => {
-                complete();
-                const runtime = runtimeRef.current;
-                if (
-                  runtime === null ||
-                  !voiceRuntimeCommandEnvironmentMatches(
-                    expectedEnvironmentId,
-                    runtime.environmentId,
-                    controllerEnvironmentIdRef.current,
-                  )
-                ) {
-                  return;
-                }
-                void runtime.adapter
-                  .stop()
-                  .catch((cause) => Alert.alert("Could not stop voice", errorMessage(cause)));
-              },
-            },
-            {
-              text: "Take Over",
-              onPress: () => {
-                complete();
-                void (async () => {
-                  const runtime = runtimeRef.current;
-                  if (
-                    runtime === null ||
-                    !voiceRuntimeCommandEnvironmentMatches(
-                      expectedEnvironmentId,
-                      runtime.environmentId,
-                      controllerEnvironmentIdRef.current,
-                    )
-                  ) {
-                    return;
-                  }
-                  await runtime.adapter.stop();
-                  await startRealtime(takeoverTarget);
-                })().catch((cause) => Alert.alert("Voice takeover failed", errorMessage(cause)));
-              },
-            },
-          ],
-          { cancelable: false },
-        );
-        return;
-      }
-      if (
-        failed.operation === "realtime" &&
-        failed.failure.code === "voice_conversation_not_found"
-      ) {
-        void runtimeRef.current?.adapter
-          .stop()
-          .catch((cause) => Alert.alert("Could not stop voice", errorMessage(cause)));
-        Alert.alert(
-          "Conversation no longer available",
-          "It may have been deleted on another device. The conversation list has been refreshed.",
-          [{ text: "OK", onPress: complete }],
-          { cancelable: false },
-        );
-        setBrowserVisible(true);
-        return;
-      }
-      Alert.alert(
-        "Voice session failed",
-        failed.failure.message,
-        [{ text: "OK", onPress: complete }],
-        { cancelable: false },
-      );
-    },
-    [startRealtime],
-  );
-
-  useEffect(() => {
-    if (applicationState !== "active" || subscribedEnvironmentId === null) return;
-    const runtime = runtimeRef.current;
-    if (runtime === null || runtime.environmentId !== subscribedEnvironmentId) return;
-    let disposed = false;
-    let detach: (() => void) | null = null;
-
-    void runtime.adapter
-      .subscribeTerminalFailures((failure: T3VoiceTerminalRuntimeFailureEvent) => {
-        if (disposed) return;
-        presentRuntimeFailure(failure, () =>
-          runtime.adapter.acknowledgeTerminalFailure(failure.failureId),
-        );
-      })
-      .then((release) => {
-        if (disposed) release();
-        else detach = release;
-      })
-      .catch((cause) => {
-        if (!disposed) Alert.alert("Voice failure reporting unavailable", errorMessage(cause));
-      });
-
-    return () => {
-      disposed = true;
-      detach?.();
-    };
-  }, [applicationState, presentRuntimeFailure, subscribedEnvironmentId]);
-
-  useEffect(() => {
-    const request = voiceThreadNavigationRequest(snapshot);
-    if (request === null) {
-      handledThreadNavigationRef.current = null;
-      return;
-    }
-    if (handledThreadNavigationRef.current === request.key) return;
-    handledThreadNavigationRef.current = request.key;
+  const dismissVoiceOverlays = useCallback(() => {
     setBrowserVisible(false);
     setTranscriptVisible(false);
-    try {
-      navigation.navigate("Thread", {
-        environmentId: String(request.environmentId),
-        threadId: String(request.threadId),
-      });
-    } catch (cause) {
-      handledThreadNavigationRef.current = null;
-      Alert.alert("Voice navigation failed", errorMessage(cause));
-    }
-  }, [navigation, snapshot]);
+  }, []);
 
-  useEffect(() => {
-    if (snapshot.mode !== "realtime") {
-      handledClientActionsRef.current.clear();
-      admittedClientActionFocusRef.current = null;
-      return;
-    }
-    const pendingIds = new Set<string>(
-      snapshot.pendingClientActions.map((action) => action.actionId),
-    );
-    const admittedFocus = admittedClientActionFocusRef.current;
-    if (admittedFocus !== null && !pendingIds.has(admittedFocus.actionId)) {
-      admittedClientActionFocusRef.current = null;
-    }
-    for (const actionId of handledClientActionsRef.current) {
-      if (!pendingIds.has(actionId)) handledClientActionsRef.current.delete(actionId);
-    }
-    for (const action of snapshot.pendingClientActions) {
-      if (handledClientActionsRef.current.has(action.actionId)) continue;
-      handledClientActionsRef.current.add(action.actionId);
-      try {
-        setBrowserVisible(false);
-        setTranscriptVisible(false);
-        admittedClientActionFocusRef.current = {
-          actionId: action.actionId,
-          environmentId: snapshot.target.environmentId,
-          projectId: action.projectId,
-          threadId: action.threadId,
-        };
-        navigation.navigate("Thread", {
-          environmentId: String(snapshot.target.environmentId),
-          threadId: String(action.threadId),
-        });
-        const admittedFocus = admittedClientActionFocusRef.current;
-        if (
-          admittedFocus !== null &&
-          admittedClientActionFocusState(admittedFocus, visibleFocus) === "admitted"
-        ) {
-          acknowledgeAdmittedClientAction(admittedFocus);
-        }
-      } catch (cause) {
-        admittedClientActionFocusRef.current = null;
-        void runtimeRef.current?.adapter
-          .completeRealtimeClientAction(action.actionId, "failed", errorMessage(cause))
-          .catch((acknowledgementCause) =>
-            Alert.alert(
-              "Voice navigation acknowledgement failed",
-              errorMessage(acknowledgementCause),
-            ),
-          );
-      }
-    }
-  }, [acknowledgeAdmittedClientAction, navigation, snapshot, visibleFocus]);
+  const openConversationBrowser = useCallback(() => {
+    setBrowserVisible(true);
+  }, []);
 
-  useEffect(() => {
-    if (snapshot.mode !== "realtime") return;
-    const pendingIds = new Set<string>(
-      snapshot.pendingConfirmations.map((item) => item.confirmationId),
-    );
-    for (const confirmationId of promptedConfirmationsRef.current) {
-      if (!pendingIds.has(confirmationId)) {
-        promptedConfirmationsRef.current.delete(confirmationId);
-      }
-    }
-    const confirmation = snapshot.pendingConfirmations[0];
-    if (
-      confirmation === undefined ||
-      promptedConfirmationsRef.current.has(confirmation.confirmationId)
-    ) {
-      return;
-    }
-    promptedConfirmationsRef.current.add(confirmation.confirmationId);
-    const decide = (decision: "approve" | "reject") => {
-      void runtimeRef.current?.adapter
-        .decideRealtimeConfirmation(confirmation.confirmationId, decision)
-        .catch((cause) => {
-          promptedConfirmationsRef.current.delete(confirmation.confirmationId);
-          Alert.alert("Voice confirmation failed", errorMessage(cause));
-        });
-    };
-    Alert.alert(
-      "Confirm voice action",
-      confirmation.summary,
-      [
-        { text: "Reject", style: "cancel", onPress: () => decide("reject") },
-        { text: "Approve", onPress: () => decide("approve") },
-      ],
-      { cancelable: false },
-    );
-  }, [snapshot]);
+  useVoiceRuntimeFailurePresentation({
+    applicationState,
+    subscribedEnvironmentId,
+    runtimeRef,
+    controllerEnvironmentIdRef,
+    lastRealtimeTargetRef,
+    startRealtime,
+    onConversationNotFound: openConversationBrowser,
+  });
+
+  useVoiceRuntimeClientActionNavigation({
+    snapshot,
+    visibleFocus,
+    realtimeContext,
+    navigation,
+    runtimeRef,
+    snapshotRef,
+    dismissOverlays: dismissVoiceOverlays,
+  });
+
+  useVoiceRuntimeConfirmationPrompting({
+    snapshot,
+    runtimeRef,
+  });
 
   const resume = useCallback(() => {
     const runtime = runtimeRef.current;
