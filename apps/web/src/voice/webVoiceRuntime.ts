@@ -765,6 +765,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         const stream = await requestMicrophoneStream();
         const capture = await startAudioCapture(stream);
         let endpoint: "silence" | "no-speech" | "max-utterance" | "manual" = "manual";
+        let manualFinished = false;
         const endpointAbort = new AbortController();
         const onParentAbort = () => endpointAbort.abort();
         abort.signal.addEventListener("abort", onParentAbort, { once: true });
@@ -784,6 +785,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
                 else resolve(next);
               };
               const settleManual = (reason: "manual") => {
+                manualFinished = true;
                 endpointAbort.abort();
                 finish(reason);
               };
@@ -800,7 +802,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
           );
         } catch (cause) {
           capture.stop();
-          if (endpoint === "manual") {
+          if (manualFinished) {
             // Manual finish aborted the waiter after resolving — continue with PCM.
           } else if (abort.signal.aborted) {
             break;
@@ -811,6 +813,9 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
           abort.signal.removeEventListener("abort", onParentAbort);
           resolveManualFinish = null;
         }
+
+        // Never finalize/transcribe after stop/handoff during recording.
+        if (abort.signal.aborted) break;
 
         publishNext({
           mode: "thread",
@@ -1112,8 +1117,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     void runThreadCycle(input).catch(async (cause) => {
       if (
         (cause instanceof DOMException && cause.name === "AbortError") ||
-        threadAbort?.signal.aborted === true ||
-        (cause instanceof Error && /aborted/i.test(cause.message))
+        threadAbort?.signal.aborted === true
       ) {
         if (snapshot.mode !== "idle" && snapshot.mode !== "realtime") {
           await stopInternal("aborted");
