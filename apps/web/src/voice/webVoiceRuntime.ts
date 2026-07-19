@@ -156,6 +156,8 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
   let disposed = false;
   let activeRealtime: ActiveRealtime | null = null;
   let threadAbort: AbortController | null = null;
+  /** Survives stopInternal nulling threadAbort so Effect interruptions still look like aborts. */
+  let lastThreadAbortSignal: AbortSignal | null = null;
   let reviewTranscript: string | null = null;
   let reviewId = 0;
   let pcmPlayer: PcmPlayer | null = null;
@@ -165,6 +167,25 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     | { readonly action: "submit"; readonly transcript: string }
     | { readonly action: "discard" };
   let resolveReview: ((resolution: ReviewResolution) => void) | null = null;
+
+  const isCycleAbortCause = (cause: unknown): boolean =>
+    (cause instanceof DOMException && cause.name === "AbortError") ||
+    lastThreadAbortSignal?.aborted === true ||
+    threadAbort?.signal.aborted === true;
+
+  const runAbortableEffect = async <A>(
+    effect: Effect.Effect<A, unknown>,
+    signal: AbortSignal,
+  ): Promise<A> => {
+    try {
+      return await Effect.runPromise(effect, { signal });
+    } catch (cause) {
+      if (signal.aborted) {
+        throw new DOMException("Thread voice aborted", "AbortError");
+      }
+      throw cause;
+    }
+  };
 
   const multiTab = makeVoiceMultiTabLock({
     onTakeoverRequest: async () => {
@@ -738,7 +759,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
       }));
 
       const client = await makeClient(prepared);
-      const capabilities = await Effect.runPromise(client.capabilities(), { signal: abort.signal });
+      const capabilities = await runAbortableEffect(client.capabilities(), abort.signal);
       const sttCap = capabilities.capabilities.find(
         (item) => item.capability === "transcription.request",
       );
@@ -1067,7 +1088,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
 
     if (input.settings.playResponses && outcome.assistantText && outcome.assistantText.length > 0) {
       const speechCap = (
-        await Effect.runPromise(client.capabilities(), { signal: abort.signal })
+        await runAbortableEffect(client.capabilities(), abort.signal)
       ).capabilities.find((item) => item.capability === "speech.streaming");
       if (speechCap?.state === "ready") {
         publishNext({
@@ -1115,10 +1136,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     });
     // Detach cycle so callers (terminal-action / startThread) do not hold the transition.
     void runThreadCycle(input).catch(async (cause) => {
-      if (
-        (cause instanceof DOMException && cause.name === "AbortError") ||
-        threadAbort?.signal.aborted === true
-      ) {
+      if (isCycleAbortCause(cause)) {
         if (snapshot.mode !== "idle" && snapshot.mode !== "realtime") {
           await stopInternal("aborted");
         }
@@ -1213,10 +1231,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         }
         // Detach the long-running cycle so stop()/startRealtime stay available.
         void runThreadCycle(input).catch(async (cause) => {
-          if (
-            (cause instanceof DOMException && cause.name === "AbortError") ||
-            threadAbort?.signal.aborted === true
-          ) {
+          if (isCycleAbortCause(cause)) {
             // stopInternal may already have published idle; avoid failed chrome.
             if (snapshot.mode !== "idle" && snapshot.mode !== "realtime") {
               await stopInternal("aborted");
