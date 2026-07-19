@@ -167,3 +167,29 @@ it("reports media counters and timings without text, audio, or provider payloads
   expect(encodeUnknownJson(diagnostic)).not.toContain(privateRequestId);
   expect(encodeUnknownJson(diagnostic)).not.toContain("PRIVATE transcript");
 });
+
+it("reports realtime response usage counters including cache hit percent", () => {
+  const diagnostic = voiceDiagnostic({
+    type: "realtime-response-usage",
+    sessionId: VoiceSessionId.make("session-1"),
+    leaseGeneration: 2,
+    inputTokens: 200,
+    outputTokens: 50,
+    totalTokens: 250,
+    cachedInputTokens: 128,
+    inputTextTokens: 150,
+    inputAudioTokens: 50,
+    inputImageTokens: 0,
+    cachedInputTextTokens: 128,
+    cachedInputAudioTokens: 0,
+    cachedInputImageTokens: 0,
+    outputTextTokens: 20,
+    outputAudioTokens: 30,
+    functionCallCount: 1,
+  });
+  expect(diagnostic.message).toBe("voice.realtime.response_usage");
+  expect(diagnostic.annotations.cachedInputTokens).toBe(128);
+  expect(diagnostic.annotations.cachedInputPercent).toBe(64);
+  expect(Object.keys(diagnostic.annotations)).not.toContain("transcript");
+  expect(Object.keys(diagnostic.annotations)).not.toContain("arguments");
+});

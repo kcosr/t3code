@@ -181,6 +181,89 @@ const completedFunctionCall = (
     : undefined;
 };
 
+/** Non-negative integer from provider usage objects; rejects non-finite values. */
+const usageCount = (value: unknown): number =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+
+const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+  typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
+
+/**
+ * Extract privacy-safe token counts from `response.done` usage.
+ * Never includes transcripts, tool args, or provider item content.
+ */
+const parseResponseUsage = (
+  response: unknown,
+): {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly totalTokens: number;
+  readonly cachedInputTokens: number;
+  readonly inputTextTokens: number;
+  readonly inputAudioTokens: number;
+  readonly inputImageTokens: number;
+  readonly cachedInputTextTokens: number;
+  readonly cachedInputAudioTokens: number;
+  readonly cachedInputImageTokens: number;
+  readonly outputTextTokens: number;
+  readonly outputAudioTokens: number;
+  readonly functionCallCount: number;
+} | null => {
+  const responseRecord = asRecord(response);
+  if (responseRecord === undefined) return null;
+  const usage = asRecord(responseRecord.usage);
+  if (usage === undefined) return null;
+
+  const inputDetails = asRecord(usage.input_token_details) ?? asRecord(usage.input_tokens_details);
+  const cachedDetails = asRecord(inputDetails?.cached_tokens_details);
+  const outputDetails =
+    asRecord(usage.output_token_details) ?? asRecord(usage.output_tokens_details);
+
+  let functionCallCount = 0;
+  if (Array.isArray(responseRecord.output)) {
+    for (const item of responseRecord.output) {
+      if (completedFunctionCall(item) !== undefined) functionCallCount += 1;
+    }
+  }
+
+  return {
+    inputTokens: usageCount(usage.input_tokens),
+    outputTokens: usageCount(usage.output_tokens),
+    totalTokens: usageCount(usage.total_tokens),
+    cachedInputTokens: usageCount(inputDetails?.cached_tokens),
+    inputTextTokens: usageCount(inputDetails?.text_tokens),
+    inputAudioTokens: usageCount(inputDetails?.audio_tokens),
+    inputImageTokens: usageCount(inputDetails?.image_tokens),
+    cachedInputTextTokens: usageCount(cachedDetails?.text_tokens),
+    cachedInputAudioTokens: usageCount(cachedDetails?.audio_tokens),
+    cachedInputImageTokens: usageCount(cachedDetails?.image_tokens),
+    outputTextTokens: usageCount(outputDetails?.text_tokens),
+    outputAudioTokens: usageCount(outputDetails?.audio_tokens),
+    functionCallCount,
+  };
+};
+
+const parseInputTranscriptionUsage = (
+  record: Record<string, unknown>,
+): {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly totalTokens: number;
+  readonly inputTextTokens: number;
+  readonly inputAudioTokens: number;
+} | null => {
+  const usage = asRecord(record.usage);
+  if (usage === undefined) return null;
+  const inputDetails = asRecord(usage.input_token_details) ?? asRecord(usage.input_tokens_details);
+  return {
+    inputTokens: usageCount(usage.input_tokens),
+    outputTokens: usageCount(usage.output_tokens),
+    totalTokens: usageCount(usage.total_tokens),
+    inputTextTokens: usageCount(inputDetails?.text_tokens),
+    inputAudioTokens: usageCount(inputDetails?.audio_tokens),
+  };
+};
+
 const isBenignRealtimeClose = (event: OpenAiRealtimeSocketEvent): boolean =>
   event.type === "closed" && (event.code === 1000 || event.code === 1001 || event.code === 1005);
 
@@ -808,8 +891,29 @@ const make = Effect.gen(function* () {
             );
             return;
           }
+          if (record.type === "conversation.item.input_audio_transcription.completed") {
+            const transcriptionUsage = parseInputTranscriptionUsage(record);
+            if (transcriptionUsage !== null) {
+              yield* logVoiceDiagnostic({
+                type: "realtime-input-transcription-usage",
+                sessionId: input.sessionId,
+                leaseGeneration: input.leaseGeneration,
+                ...transcriptionUsage,
+              });
+            }
+            return;
+          }
           if (record.type !== "response.done") return;
           const response = record.response;
+          const responseUsage = parseResponseUsage(response);
+          if (responseUsage !== null) {
+            yield* logVoiceDiagnostic({
+              type: "realtime-response-usage",
+              sessionId: input.sessionId,
+              leaseGeneration: input.leaseGeneration,
+              ...responseUsage,
+            });
+          }
           const functionCallIds =
             typeof response === "object" && response !== null
               ? ((response as Record<string, unknown>).output as unknown)

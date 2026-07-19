@@ -70,6 +70,36 @@ export type VoiceDiagnosticEvent =
       readonly firstByteMs?: number;
       readonly inputBytes?: number;
       readonly inputDurationMs?: number;
+    }
+  | {
+      /** Privacy-safe Realtime Response token usage (prompt-cache metrics). */
+      readonly type: "realtime-response-usage";
+      readonly sessionId: VoiceSessionId;
+      readonly leaseGeneration: number;
+      readonly inputTokens: number;
+      readonly outputTokens: number;
+      readonly totalTokens: number;
+      readonly cachedInputTokens: number;
+      readonly inputTextTokens: number;
+      readonly inputAudioTokens: number;
+      readonly inputImageTokens: number;
+      readonly cachedInputTextTokens: number;
+      readonly cachedInputAudioTokens: number;
+      readonly cachedInputImageTokens: number;
+      readonly outputTextTokens: number;
+      readonly outputAudioTokens: number;
+      readonly functionCallCount: number;
+    }
+  | {
+      /** Privacy-safe input transcription token usage (ASR; not prompt cache). */
+      readonly type: "realtime-input-transcription-usage";
+      readonly sessionId: VoiceSessionId;
+      readonly leaseGeneration: number;
+      readonly inputTokens: number;
+      readonly outputTokens: number;
+      readonly totalTokens: number;
+      readonly inputTextTokens: number;
+      readonly inputAudioTokens: number;
     };
 
 export type VoiceSessionEndReason =
@@ -192,6 +222,47 @@ export const voiceDiagnostic = (event: VoiceDiagnosticEvent): VoiceDiagnostic =>
           ...(event.inputDurationMs === undefined
             ? {}
             : { inputDurationMs: event.inputDurationMs }),
+        },
+      };
+    case "realtime-response-usage":
+      return {
+        level: "info",
+        message: "voice.realtime.response_usage",
+        annotations: {
+          sessionId: event.sessionId,
+          leaseGeneration: event.leaseGeneration,
+          inputTokens: event.inputTokens,
+          outputTokens: event.outputTokens,
+          totalTokens: event.totalTokens,
+          cachedInputTokens: event.cachedInputTokens,
+          inputTextTokens: event.inputTextTokens,
+          inputAudioTokens: event.inputAudioTokens,
+          inputImageTokens: event.inputImageTokens,
+          cachedInputTextTokens: event.cachedInputTextTokens,
+          cachedInputAudioTokens: event.cachedInputAudioTokens,
+          cachedInputImageTokens: event.cachedInputImageTokens,
+          outputTextTokens: event.outputTextTokens,
+          outputAudioTokens: event.outputAudioTokens,
+          functionCallCount: event.functionCallCount,
+          // Integer percent 0–100 for easy journal grepping (0 when no input).
+          cachedInputPercent:
+            event.inputTokens > 0
+              ? Math.min(100, Math.round((event.cachedInputTokens * 100) / event.inputTokens))
+              : 0,
+        },
+      };
+    case "realtime-input-transcription-usage":
+      return {
+        level: "info",
+        message: "voice.realtime.input_transcription_usage",
+        annotations: {
+          sessionId: event.sessionId,
+          leaseGeneration: event.leaseGeneration,
+          inputTokens: event.inputTokens,
+          outputTokens: event.outputTokens,
+          totalTokens: event.totalTokens,
+          inputTextTokens: event.inputTextTokens,
+          inputAudioTokens: event.inputAudioTokens,
         },
       };
   }
