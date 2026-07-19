@@ -96,7 +96,7 @@ const buildRealtimeInstructions = (commandTools: ReadonlyArray<VoiceCommandToolN
     );
   }
   parts.push(
-    "create_thread (directly or via command_execute) dispatches immediately and returns accepted command metadata. Do not claim the thread is fully initialized or that downstream work completed from that receipt.",
+    "create_thread (directly or via command_execute) dispatches immediately and returns accepted command metadata. Optional instanceId, model, and options select a non-default model; call list_provider_models first when choosing them. Do not claim the thread is fully initialized or that downstream work completed from that receipt.",
     "send_thread_message (directly or via command_execute) dispatches immediately and returns a messageId. Never claim the coding turn completed from that receipt. When the user needs the result, call wait_for_thread_turn with that exact messageId; a pending or running timeout is not completion and may be waited on again.",
     "Any supplied terminal voice tool must be the final output action. You may speak one brief completion or transition sentence immediately before calling it, but you must not speak after it or claim a transition already completed.",
     "switch_to_thread_voice requires the exact target threadId and starts Thread voice for that thread; it never uses the focused or last active thread.",

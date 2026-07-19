@@ -11,12 +11,15 @@ import {
   MessageId,
   ProjectId,
   ProviderInstanceId,
+  ProviderOptionSelection,
   ThreadId,
   TrimmedNonEmptyString,
   type ClientOrchestrationCommand,
+  type ModelSelection,
   type OrchestrationProjectShell,
   type OrchestrationShellSnapshot,
   type OrchestrationThreadShell,
+  type ServerProvider,
   type VoiceCommandToolName,
   type VoiceToolName,
 } from "@t3tools/contracts";
@@ -37,6 +40,7 @@ import { VoiceError } from "../Errors.ts";
 export const VOICE_TOOL_DECLARATION_ORDER = [
   "list_projects",
   "list_threads",
+  "list_provider_models",
   "get_thread_status",
   "interrupt_thread",
   "archive_thread",
@@ -89,9 +93,29 @@ export const WaitForThreadTurnArguments = Schema.Struct({
 });
 export type WaitForThreadTurnArguments = typeof WaitForThreadTurnArguments.Type;
 
+export const ListProviderModelsArguments = Schema.Struct({
+  instanceId: Schema.optionalKey(ProviderInstanceId),
+  limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })).pipe(
+    Schema.withDecodingDefault(Effect.succeed(20)),
+  ),
+});
+export type ListProviderModelsArguments = typeof ListProviderModelsArguments.Type;
+
 export const CreateThreadArguments = Schema.Struct({
   projectId: ProjectId,
   title: Schema.optionalKey(TrimmedNonEmptyString),
+  /**
+   * Provider instance id from `list_provider_models`. When set, `model` is required.
+   */
+  instanceId: Schema.optionalKey(ProviderInstanceId),
+  /**
+   * Model slug from `list_provider_models`. When set, `instanceId` is required.
+   */
+  model: Schema.optionalKey(TrimmedNonEmptyString),
+  /**
+   * Per-model option selections (e.g. reasoning effort). Requires instanceId+model.
+   */
+  options: Schema.optionalKey(Schema.Array(ProviderOptionSelection)),
 });
 export type CreateThreadArguments = typeof CreateThreadArguments.Type;
 
@@ -142,8 +166,29 @@ export interface CreateThreadPrepared {
   readonly command: Extract<ClientOrchestrationCommand, { readonly type: "thread.create" }>;
 }
 
+export interface ListProviderModelsResult {
+  readonly providers: ReadonlyArray<{
+    readonly instanceId: string;
+    readonly driver: string;
+    readonly displayName: string | null;
+    readonly enabled: boolean;
+    readonly status: string;
+    readonly models: ReadonlyArray<{
+      readonly slug: string;
+      readonly name: string;
+      readonly options: ReadonlyArray<{
+        readonly id: string;
+        readonly type: string;
+        readonly label: string;
+        readonly choices?: ReadonlyArray<{ readonly id: string; readonly label: string }>;
+      }>;
+    }>;
+  }>;
+}
+
 export type ListThreadsToolFailure = ProjectionRepositoryError;
 export type CreateThreadToolFailure = ProjectionRepositoryError | VoiceError;
+export type ListProviderModelsToolFailure = never;
 
 export interface ListThreadsToolContext {
   readonly getShellSnapshot: () => Effect.Effect<
@@ -152,14 +197,20 @@ export interface ListThreadsToolContext {
   >;
 }
 
+export interface ListProviderModelsToolContext {
+  readonly getProviders: Effect.Effect<ReadonlyArray<ServerProvider>>;
+}
+
 export interface CreateThreadToolContext {
   readonly getProjectShellById: (
     projectId: ProjectId,
   ) => Effect.Effect<Option.Option<OrchestrationProjectShell>, ProjectionRepositoryError>;
+  readonly getProviders: Effect.Effect<ReadonlyArray<ServerProvider>>;
   readonly makeCommandId: Effect.Effect<CommandId>;
   readonly makeThreadId: Effect.Effect<ThreadId>;
   readonly nowIso: Effect.Effect<string>;
   readonly projectNotFound: (projectId: ProjectId) => VoiceError;
+  readonly invalidModelSelection: (detail: string) => VoiceError;
 }
 
 const threadProjection = (thread: OrchestrationThreadShell) => ({
@@ -202,6 +253,67 @@ export const ListThreadsTool: ModelToolDefinition<
           .slice(0, input.limit)
           .map(threadProjection),
       } satisfies ListThreadsResult;
+    }),
+});
+
+const MAX_MODELS_PER_PROVIDER = 40;
+const MAX_OPTION_DESCRIPTORS_PER_MODEL = 16;
+
+const providerModelCatalogEntry = (provider: ServerProvider) => ({
+  instanceId: provider.instanceId,
+  driver: provider.driver,
+  displayName: provider.displayName ?? null,
+  enabled: provider.enabled,
+  status: provider.status,
+  models: provider.models.slice(0, MAX_MODELS_PER_PROVIDER).map((model) => ({
+    slug: model.slug,
+    name: model.name,
+    options: (model.capabilities?.optionDescriptors ?? [])
+      .slice(0, MAX_OPTION_DESCRIPTORS_PER_MODEL)
+      .map((descriptor) =>
+        descriptor.type === "select"
+          ? {
+              id: descriptor.id,
+              type: descriptor.type,
+              label: descriptor.label,
+              choices: descriptor.options.map((choice) => ({
+                id: choice.id,
+                label: choice.label,
+              })),
+            }
+          : {
+              id: descriptor.id,
+              type: descriptor.type,
+              label: descriptor.label,
+            },
+      ),
+  })),
+});
+
+export const ListProviderModelsTool: ModelToolDefinition<
+  "list_provider_models",
+  ListProviderModelsArguments,
+  ListProviderModelsResult,
+  ListProviderModelsToolContext,
+  ListProviderModelsToolFailure
+> = defineModelTool({
+  name: "list_provider_models",
+  description:
+    "List configured provider instances and their available models (including reasoning/option descriptors). Use before create_thread when selecting a non-default model.",
+  inputSchema: ListProviderModelsArguments,
+  execute: (context, input) =>
+    Effect.gen(function* () {
+      const providers = yield* context.getProviders;
+      const filtered =
+        input.instanceId === undefined
+          ? providers
+          : providers.filter((provider) => provider.instanceId === input.instanceId);
+      return {
+        providers: filtered
+          .filter((provider) => provider.availability !== "unavailable")
+          .slice(0, input.limit)
+          .map(providerModelCatalogEntry),
+      } satisfies ListProviderModelsResult;
     }),
 });
 
@@ -265,6 +377,96 @@ export const ActivateThreadTool = defineModelTool({
   execute: schemaOnlyExecute<ThreadArguments>(),
 });
 
+const resolveCreateThreadModelSelection = Effect.fn("CreateThreadTool.resolveModelSelection")(
+  function* (context: CreateThreadToolContext, input: CreateThreadArguments) {
+    const hasInstance = input.instanceId !== undefined;
+    const hasModel = input.model !== undefined;
+    const hasOptions = input.options !== undefined && input.options.length > 0;
+    if (hasInstance !== hasModel) {
+      return yield* Effect.fail(
+        context.invalidModelSelection(
+          "create_thread requires both instanceId and model when selecting a non-default model",
+        ),
+      );
+    }
+    if (hasOptions && !hasInstance) {
+      return yield* Effect.fail(
+        context.invalidModelSelection(
+          "create_thread options require instanceId and model from list_provider_models",
+        ),
+      );
+    }
+    if (!hasInstance || input.instanceId === undefined || input.model === undefined) {
+      return undefined;
+    }
+
+    const providers = yield* context.getProviders;
+    const provider = providers.find((entry) => entry.instanceId === input.instanceId);
+    if (provider === undefined || provider.availability === "unavailable") {
+      return yield* Effect.fail(
+        context.invalidModelSelection(`Provider instance ${input.instanceId} is not available`),
+      );
+    }
+    if (!provider.enabled) {
+      return yield* Effect.fail(
+        context.invalidModelSelection(`Provider instance ${input.instanceId} is disabled`),
+      );
+    }
+    const model = provider.models.find((entry) => entry.slug === input.model);
+    if (model === undefined) {
+      return yield* Effect.fail(
+        context.invalidModelSelection(
+          `Model ${input.model} is not listed for provider instance ${input.instanceId}`,
+        ),
+      );
+    }
+
+    if (input.options !== undefined && input.options.length > 0) {
+      const descriptors = model.capabilities?.optionDescriptors ?? [];
+      for (const option of input.options) {
+        const descriptor = descriptors.find((entry) => entry.id === option.id);
+        if (descriptor === undefined) {
+          return yield* Effect.fail(
+            context.invalidModelSelection(
+              `Option ${option.id} is not available for model ${input.model}`,
+            ),
+          );
+        }
+        if (descriptor.type === "boolean") {
+          if (typeof option.value !== "boolean") {
+            return yield* Effect.fail(
+              context.invalidModelSelection(`Option ${option.id} requires a boolean value`),
+            );
+          }
+        } else if (descriptor.type === "select") {
+          if (typeof option.value !== "string") {
+            return yield* Effect.fail(
+              context.invalidModelSelection(`Option ${option.id} requires a string choice id`),
+            );
+          }
+          const allowed = descriptor.options.some((choice) => choice.id === option.value);
+          if (!allowed) {
+            return yield* Effect.fail(
+              context.invalidModelSelection(
+                `Option ${option.id} value is not a valid choice for model ${input.model}`,
+              ),
+            );
+          }
+        }
+      }
+    }
+
+    const selection: ModelSelection = {
+      instanceId: input.instanceId,
+      model: input.model,
+      ...(input.options !== undefined && input.options.length > 0
+        ? { options: [...input.options] }
+        : {}),
+    };
+    return selection;
+  },
+);
+
 export const CreateThreadTool: ModelToolDefinition<
   "create_thread",
   CreateThreadArguments,
@@ -274,7 +476,7 @@ export const CreateThreadTool: ModelToolDefinition<
 > = defineModelTool({
   name: "create_thread",
   description:
-    "Dispatch creation of a T3 thread immediately and return accepted command metadata. The receipt does not mean downstream initialization is complete.",
+    "Dispatch creation of a T3 thread immediately and return accepted command metadata. Optional instanceId, model, and options (e.g. reasoning effort) select a non-default model from list_provider_models. The receipt does not mean downstream initialization is complete.",
   inputSchema: CreateThreadArguments,
   execute: (context, input) =>
     Effect.gen(function* () {
@@ -290,18 +492,22 @@ export const CreateThreadTool: ModelToolDefinition<
       const threadId = yield* context.makeThreadId;
       const createdAt = yield* context.nowIso;
       const title = input.title ?? "Voice thread";
+      const explicitSelection = yield* resolveCreateThreadModelSelection(context, input);
+      const modelSelection = explicitSelection ??
+        project.defaultModelSelection ?? {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: DEFAULT_MODEL,
+        };
+      const modelLabel = `${modelSelection.instanceId}/${modelSelection.model}`;
       return {
-        summary: `Create thread "${title}" in project "${project.title}"`,
+        summary: `Create thread "${title}" in project "${project.title}" (${modelLabel})`,
         command: {
           type: "thread.create",
           commandId,
           threadId,
           projectId: project.id,
           title,
-          modelSelection: project.defaultModelSelection ?? {
-            instanceId: ProviderInstanceId.make("codex"),
-            model: DEFAULT_MODEL,
-          },
+          modelSelection,
           runtimeMode: DEFAULT_RUNTIME_MODE,
           interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
           branch: null,
@@ -339,6 +545,7 @@ export const VoiceModelTools = defineModelToolRegistry(
   [
     ListProjectsTool,
     ListThreadsTool,
+    ListProviderModelsTool,
     GetThreadStatusTool,
     InterruptThreadTool,
     ArchiveThreadTool,

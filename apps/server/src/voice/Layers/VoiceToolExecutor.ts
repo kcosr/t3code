@@ -52,6 +52,7 @@ import {
   CreateThreadTool,
   GetThreadMessagesArguments,
   ListProjectsArguments,
+  ListProviderModelsTool,
   ListThreadsTool,
   ReadHistoryArguments,
   SearchHistoryArguments,
@@ -62,6 +63,7 @@ import {
   WaitForThreadTurnArguments,
   voiceThreadProjection as threadOutput,
 } from "../modelTools/definitions.ts";
+import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
 import { VoiceConversationService } from "../Services/VoiceConversationService.ts";
 import {
   VoiceToolExecutor,
@@ -148,6 +150,7 @@ type ReadVoiceTool = Extract<
   VoiceToolName,
   | "list_projects"
   | "list_threads"
+  | "list_provider_models"
   | "get_thread_status"
   | "get_thread_messages"
   | "wait_for_thread_turn"
@@ -163,6 +166,7 @@ type HistoryVoiceTool = Extract<VoiceToolName, "search_history" | "read_history"
 const VOICE_TOOL_ACCESS = {
   list_projects: "orchestration-read",
   list_threads: "orchestration-read",
+  list_provider_models: "orchestration-read",
   get_thread_status: "orchestration-read",
   get_thread_messages: "orchestration-read",
   wait_for_thread_turn: "orchestration-read",
@@ -433,6 +437,7 @@ const make = Effect.gen(function* () {
   const history = yield* HistorySearchService;
   const conversations = yield* VoiceConversationService;
   const toolCalls = yield* VoiceToolCallRepository;
+  const providers = yield* ProviderRegistry;
   const state = yield* SynchronizedRef.make<ExecutorState>({
     calls: new Map(),
     confirmations: new Map(),
@@ -645,11 +650,13 @@ const make = Effect.gen(function* () {
         const prepared = yield* CreateThreadTool.execute(
           {
             getProjectShellById: (projectId) => query.getProjectShellById(projectId),
+            getProviders: providers.getProviders,
             makeCommandId: Effect.succeed(commandId),
             makeThreadId: Effect.succeed(ThreadId.make(deterministicId("voice-thread", input))),
             nowIso: Effect.succeed(createdAt),
             projectNotFound: (projectId) =>
               voiceError("invalid-phase", "tool.project", `Project ${projectId} was not found`),
+            invalidModelSelection: (detail) => voiceError("invalid-phase", "tool.model", detail),
           },
           args,
         );
@@ -724,6 +731,14 @@ const make = Effect.gen(function* () {
         return jsonOutput({
           projects: snapshot.projects.slice(0, args.limit).map(projectOutput),
         });
+      }
+      case "list_provider_models": {
+        const args = yield* parseArguments(ListProviderModelsTool.inputSchema, input);
+        const result = yield* ListProviderModelsTool.execute(
+          { getProviders: providers.getProviders },
+          args,
+        );
+        return jsonOutput(result);
       }
       case "list_threads": {
         const args = yield* parseArguments(ListThreadsTool.inputSchema, input);
@@ -1351,7 +1366,11 @@ const make = Effect.gen(function* () {
               },
             ] as const;
           }
-          if (tool === "create_thread" || tool === "send_thread_message") {
+          if (
+            tool === "create_thread" ||
+            tool === "send_thread_message" ||
+            tool === "interrupt_thread"
+          ) {
             const result = yield* dispatcher.dispatch(prepared.value.command).pipe(
               Effect.match({
                 onFailure: (cause) =>

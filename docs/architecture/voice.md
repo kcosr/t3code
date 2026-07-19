@@ -172,6 +172,7 @@ The Realtime voice-agent allowlist is:
 
 - `list_projects`
 - `list_threads`
+- `list_provider_models`
 - `get_thread_status`
 - `get_thread_messages`
 - `wait_for_thread_turn`
@@ -205,11 +206,14 @@ Meta-tool names are not public `VoiceToolName` values and never appear in client
 and outputs as direct calls. The resolved `commandTools` set is snapshotted when a Realtime session
 is created and reused for every tool-declaration rebuild (including terminal `session.update`).
 
-Read tools execute on the server against bounded projections. `create_thread` and
+Read tools execute on the server against bounded projections. `list_provider_models` returns
+configured provider instances and model catalogs (including reasoning/option descriptors).
+`create_thread` accepts optional `instanceId`, `model`, and `options` (for example reasoning
+effort) from that catalog; omitted selection uses the project default. `create_thread` and
 `send_thread_message` dispatch immediately with deterministic identifiers; a successful receipt is
 not a claim that downstream work completed. `wait_for_thread_turn` polls the exact dispatched
-message and never redispatches it. `interrupt_thread` and `archive_thread` require explicit client
-confirmation.
+message and never redispatches it. `interrupt_thread` dispatches immediately. `archive_thread`
+requires explicit client confirmation.
 
 `activate_thread` changes visible focus while Realtime continues. `switch_to_thread_voice` requires
 one explicit `threadId`; it never infers a destination from the currently visible or last-used

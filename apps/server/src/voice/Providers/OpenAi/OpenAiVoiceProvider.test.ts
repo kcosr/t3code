@@ -552,6 +552,7 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
     expect(configuredTools.map((tool) => tool.name)).toEqual([
       "list_projects",
       "list_threads",
+      "list_provider_models",
       "get_thread_status",
       "interrupt_thread",
       "archive_thread",

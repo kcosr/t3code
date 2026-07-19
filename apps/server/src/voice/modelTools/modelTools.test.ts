@@ -23,6 +23,7 @@ describe("voice model tool definitions", () => {
     expect(VoiceModelTools.names()).toEqual([
       "list_projects",
       "list_threads",
+      "list_provider_models",
       "get_thread_status",
       "interrupt_thread",
       "archive_thread",
