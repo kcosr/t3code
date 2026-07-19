@@ -5,9 +5,6 @@ import {
   type AuthEnvironmentScope,
   ClientOrchestrationCommand,
   CommandId,
-  DEFAULT_MODEL,
-  DEFAULT_PROVIDER_INTERACTION_MODE,
-  DEFAULT_RUNTIME_MODE,
   MessageId,
   HISTORY_READ_CONTEXT_MAX_RECORDS,
   HistorySearchInput,
@@ -18,8 +15,6 @@ import {
   type HistorySearchInput as HistorySearchInputType,
   type HistoryVoiceScope as HistoryVoiceScopeType,
   type OrchestrationMessageTurnResult,
-  ProjectId,
-  ProviderInstanceId,
   ThreadId,
   TrimmedNonEmptyString,
   VoiceConfirmationId,
@@ -29,7 +24,6 @@ import {
   VoiceToolName,
   VoiceTerminalActionRequest,
   type OrchestrationProjectShell,
-  type OrchestrationThreadShell,
   type VoiceConversationId,
   type VoiceSessionId,
 } from "@t3tools/contracts";
@@ -60,6 +54,11 @@ import {
   VoiceToolCallRepository,
 } from "../../persistence/Services/VoiceToolCalls.ts";
 import { VoiceError } from "../Errors.ts";
+import {
+  CreateThreadTool,
+  ListThreadsTool,
+  voiceThreadProjection as threadOutput,
+} from "../modelTools/definitions.ts";
 import { VoiceConversationService } from "../Services/VoiceConversationService.ts";
 import {
   VoiceToolExecutor,
@@ -85,10 +84,6 @@ const TURN_WAIT_POLL_INTERVAL = "250 millis";
 const ListProjectsArguments = Schema.Struct({
   limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
 });
-const ListThreadsArguments = Schema.Struct({
-  projectId: ProjectId,
-  limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
-});
 const ThreadArguments = Schema.Struct({ threadId: ThreadId });
 const GetThreadMessagesArguments = Schema.Struct({
   threadId: ThreadId,
@@ -99,10 +94,6 @@ const WaitForThreadTurnArguments = Schema.Struct({
   threadId: ThreadId,
   messageId: MessageId,
   waitMilliseconds: Schema.Int.check(Schema.isBetween({ minimum: 250, maximum: 25_000 })),
-});
-const CreateThreadArguments = Schema.Struct({
-  projectId: ProjectId,
-  title: Schema.optionalKey(TrimmedNonEmptyString),
 });
 const SendThreadMessageArguments = Schema.Struct({
   threadId: ThreadId,
@@ -445,20 +436,6 @@ const projectOutput = (project: OrchestrationProjectShell) => ({
   workspaceRoot: project.workspaceRoot,
 });
 
-const threadOutput = (thread: OrchestrationThreadShell) => ({
-  threadId: thread.id,
-  projectId: thread.projectId,
-  title: thread.title,
-  runtimeMode: thread.runtimeMode,
-  branch: thread.branch,
-  worktreePath: thread.worktreePath,
-  turnState: thread.latestTurn?.state ?? null,
-  sessionStatus: thread.session?.status ?? "stopped",
-  hasPendingApprovals: thread.hasPendingApprovals,
-  hasPendingUserInput: thread.hasPendingUserInput,
-  updatedAt: thread.updatedAt,
-});
-
 const mutationOutput = (command: ClientOrchestrationCommand, sequence: number) => {
   switch (command.type) {
     case "thread.turn.start":
@@ -697,43 +674,22 @@ const make = Effect.gen(function* () {
     const commandId = CommandId.make(deterministicId("voice", input));
     switch (tool) {
       case "create_thread": {
-        const args = yield* parseArguments(CreateThreadArguments, input);
-        const project = yield* query.getProjectShellById(args.projectId).pipe(
-          Effect.flatMap(
-            Option.match({
-              onNone: () =>
-                Effect.fail(
-                  voiceError(
-                    "invalid-phase",
-                    "tool.project",
-                    `Project ${args.projectId} was not found`,
-                  ),
-                ),
-              onSome: Effect.succeed,
-            }),
-          ),
+        const args = yield* parseArguments(CreateThreadTool.inputSchema, input);
+        const prepared = yield* CreateThreadTool.execute(
+          {
+            getProjectShellById: (projectId) => query.getProjectShellById(projectId),
+            makeCommandId: Effect.succeed(commandId),
+            makeThreadId: Effect.succeed(ThreadId.make(deterministicId("voice-thread", input))),
+            nowIso: Effect.succeed(createdAt),
+            projectNotFound: (projectId) =>
+              voiceError("invalid-phase", "tool.project", `Project ${projectId} was not found`),
+          },
+          args,
         );
-        const threadId = ThreadId.make(deterministicId("voice-thread", input));
-        const title = args.title ?? "Voice thread";
         return {
           tool,
-          summary: `Create thread "${title}" in project "${project.title}"`,
-          command: {
-            type: "thread.create",
-            commandId,
-            threadId,
-            projectId: project.id,
-            title,
-            modelSelection: project.defaultModelSelection ?? {
-              instanceId: ProviderInstanceId.make("codex"),
-              model: DEFAULT_MODEL,
-            },
-            runtimeMode: DEFAULT_RUNTIME_MODE,
-            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-            branch: null,
-            worktreePath: null,
-            createdAt,
-          },
+          summary: prepared.summary,
+          command: prepared.command,
         } satisfies PreparedMutation;
       }
       case "send_thread_message": {
@@ -803,14 +759,14 @@ const make = Effect.gen(function* () {
         });
       }
       case "list_threads": {
-        const args = yield* parseArguments(ListThreadsArguments, input);
-        const snapshot = yield* query.getShellSnapshot();
-        return jsonOutput({
-          threads: snapshot.threads
-            .filter((thread) => thread.projectId === args.projectId)
-            .slice(0, args.limit)
-            .map(threadOutput),
-        });
+        const args = yield* parseArguments(ListThreadsTool.inputSchema, input);
+        const result = yield* ListThreadsTool.execute(
+          {
+            getShellSnapshot: () => query.getShellSnapshot(),
+          },
+          args,
+        );
+        return jsonOutput(result);
       }
       case "get_thread_status": {
         const args = yield* parseArguments(ThreadArguments, input);

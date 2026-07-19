@@ -122,6 +122,7 @@ server:
       "transcription": "openai",
       "speech": "openai"
     },
+    "commandTools": [],
     "openaiSpeechServer": {
       "baseUrl": "http://192.168.50.72:6624",
       "connectTimeoutSeconds": 15,
@@ -135,7 +136,8 @@ server:
 ```
 
 Selection is observed on each new media request. Changing settings does not require a process
-restart and does not alter an already in-flight request.
+restart and does not alter an already in-flight request. `commandTools` is snapshotted when a
+Realtime session is created; later settings edits affect only new sessions.
 
 ## Conversations, sessions, and calls
 
@@ -182,6 +184,26 @@ The Realtime voice-agent allowlist is:
 - `send_thread_message`
 - `interrupt_thread`
 - `archive_thread`
+
+`list_threads` and `create_thread` are defined once as typed model-tool definitions in
+`apps/server/src/voice/modelTools/`. Each definition owns the Effect input schema, generated JSON
+Schema, description, and business operation. Direct Realtime declarations and command-wrapper
+exposure are adapters over those definitions.
+
+Optional server setting `voice.commandTools` (default `[]`) is an allowlist of those migrated tools.
+When a name is listed, the server omits its direct function declaration for the session and exposes
+it only through the session-internal command meta-tools:
+
+- `command_list` — compact catalog of command-exposed tools
+- `command_describe` — description plus generated input schema for one catalog entry
+- `command_execute` — normalizes `{ command, payload }` into the effective business-tool invocation
+  before the existing voice executor runs
+
+Meta-tool names are not public `VoiceToolName` values and never appear in client/native tool events.
+`command_execute` reuses the outer tool-call IDs and the existing executor path, so wrapped
+`list_threads` / `create_thread` calls keep the same authorization, journaling, durable identity,
+and outputs as direct calls. The resolved `commandTools` set is snapshotted when a Realtime session
+is created and reused for every tool-declaration rebuild (including terminal `session.update`).
 
 Read tools execute on the server against bounded projections. `create_thread` and
 `send_thread_message` dispatch immediately with deterministic identifiers; a successful receipt is

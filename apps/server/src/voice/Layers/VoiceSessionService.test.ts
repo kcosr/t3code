@@ -50,6 +50,7 @@ import { VoiceContextCompilerLive } from "./VoiceContextCompiler.ts";
 import { VoiceSessionServiceLive } from "./VoiceSessionService.ts";
 
 const encodeUnknownJson = Schema.encodeEffect(Schema.UnknownFromJsonString);
+const encodeUnknownJsonSync = Schema.encodeSync(Schema.UnknownFromJsonString);
 const conversationId = VoiceConversationId.make("conversation-test");
 const summary: VoiceConversationSummary = {
   conversationId,
@@ -93,6 +94,7 @@ interface MakeLayerOptions {
   readonly voiceSettings?: {
     readonly enabled: boolean;
     readonly maxConcurrentSessions: number;
+    readonly commandTools?: ReadonlyArray<"list_threads" | "create_thread">;
   };
   readonly projection?: Partial<ProjectionSnapshotQuery["Service"]>;
   readonly appendContext?: VoiceConversationService["Service"]["appendContext"];
@@ -2673,6 +2675,226 @@ it.effect("fences approval while deleting an active conversation", () =>
       const approval = yield* Fiber.join(approving);
       expect(Result.isFailure(approval)).toBe(true);
       expect(yield* Ref.get(decisions)).toBe(0);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect(
+  "normalizes command_execute to business tools and never emits meta-tool public events",
+  () =>
+    Effect.gen(function* () {
+      const invoked = yield* Ref.make<
+        ReadonlyArray<{ readonly name: string; readonly argumentsJson: string }>
+      >([]);
+      const outputs = yield* Ref.make<ReadonlyArray<string>>([]);
+      const allOutputsSubmitted = yield* Deferred.make<void>();
+      const provider: VoiceProviderAdapter = {
+        id: "command-wrapper-provider",
+        capabilities: new Set(["agent.realtime"]),
+        realtime: {
+          negotiate: (request) =>
+            Effect.succeed({
+              answer: {
+                sessionId: request.sessionId,
+                leaseGeneration: request.leaseGeneration,
+                sdp: "command-wrapper-answer",
+              },
+              events: Stream.fromIterable([
+                {
+                  type: "function-call" as const,
+                  providerFunctionCallId: "call-command-list",
+                  name: "command_list",
+                  argumentsJson: "{}",
+                },
+                {
+                  type: "function-call" as const,
+                  providerFunctionCallId: "call-command-execute",
+                  name: "command_execute",
+                  argumentsJson: encodeUnknownJsonSync({
+                    command: "create_thread",
+                    payload: { projectId: "project-cmd", title: "Via command" },
+                  }),
+                },
+                {
+                  type: "function-call" as const,
+                  providerFunctionCallId: "call-direct-create",
+                  name: "create_thread",
+                  argumentsJson: encodeUnknownJsonSync({ projectId: "project-cmd" }),
+                },
+              ]),
+              ...noOpRealtimeTerminalControls,
+              updateContext: () => Effect.void,
+              submitToolOutput: ({ output }: { readonly output: string }) =>
+                Ref.modify(outputs, (current) => {
+                  const next = [...current, output];
+                  return [next.length >= 3, next] as const;
+                }).pipe(
+                  Effect.flatMap((done) =>
+                    done
+                      ? Deferred.succeed(allOutputsSubmitted, undefined).pipe(Effect.asVoid)
+                      : Effect.void,
+                  ),
+                ),
+              terminate: Effect.void,
+            }),
+        },
+      };
+      const executor = VoiceToolExecutor.of({
+        invoke: (toolCall) =>
+          Ref.update(invoked, (current) => [
+            ...current,
+            { name: toolCall.name, argumentsJson: toolCall.argumentsJson },
+          ]).pipe(
+            Effect.as({
+              type: "completed" as const,
+              toolCallId: toolCall.toolCallId,
+              providerFunctionCallId: toolCall.providerFunctionCallId,
+              tool: "create_thread" as const,
+              outcome: "succeeded" as const,
+              output: encodeUnknownJsonSync({
+                sequence: 1,
+                threadId: "thread-cmd",
+                commandId: "command-cmd",
+              }),
+              submitOutput: true,
+            }),
+          ),
+        decide: () => Effect.die("unused"),
+        expire: () => Effect.succeed(undefined),
+        discardSession: () => Effect.void,
+      });
+      const test = yield* makeLayer(provider, {
+        toolExecutor: executor,
+        voiceSettings: {
+          enabled: true,
+          maxConcurrentSessions: 16,
+          commandTools: ["create_thread", "list_threads"],
+        },
+      });
+
+      yield* Effect.gen(function* () {
+        const sessions = yield* VoiceSessionService;
+        const owner = AuthSessionId.make("command-wrapper-owner");
+        const created = yield* sessions.create(principal(owner), input(false, "command-wrapper"));
+        yield* sessions.offer(owner, created.state.sessionId, {
+          sessionId: created.state.sessionId,
+          leaseGeneration: created.state.leaseGeneration,
+          sdp: "command-wrapper-offer",
+        });
+        yield* Deferred.await(allOutputsSubmitted);
+
+        const snapshot = yield* sessions.events(owner, created.state.sessionId, 0, 0);
+        const toolEvents = snapshot.events.filter((event) => event.type === "tool");
+        expect(toolEvents.map((event) => (event.type === "tool" ? event.tool : null))).toEqual([
+          "create_thread",
+        ]);
+        // Meta-tool names are not assignable to VoiceToolName; public tool events only
+        // carry business names from the VoiceToolName contract.
+        expect(toolEvents).toHaveLength(1);
+
+        const invocations = yield* Ref.get(invoked);
+        expect(invocations).toEqual([
+          {
+            name: "create_thread",
+            argumentsJson: encodeUnknownJsonSync({
+              projectId: "project-cmd",
+              title: "Via command",
+            }),
+          },
+        ]);
+
+        const submitted = yield* Ref.get(outputs);
+        expect(
+          submitted.some(
+            (output) => output.includes("create_thread —") || output.includes("list_threads —"),
+          ),
+        ).toBe(true);
+        expect(submitted.some((output) => output.includes("command_only_tool"))).toBe(true);
+
+        yield* sessions.close(owner, created.state.sessionId, created.state.leaseGeneration);
+      }).pipe(Effect.provide(test.layer));
+    }),
+);
+
+it.effect("emits public list_threads for command-wrapped list_threads invocations", () =>
+  Effect.gen(function* () {
+    const invoked = yield* Ref.make<ReadonlyArray<string>>([]);
+    const done = yield* Deferred.make<void>();
+    const provider: VoiceProviderAdapter = {
+      id: "command-list-threads-provider",
+      capabilities: new Set(["agent.realtime"]),
+      realtime: {
+        negotiate: (request) =>
+          Effect.succeed({
+            answer: {
+              sessionId: request.sessionId,
+              leaseGeneration: request.leaseGeneration,
+              sdp: "answer",
+            },
+            events: Stream.fromIterable([
+              {
+                type: "function-call" as const,
+                providerFunctionCallId: "call-list-via-command",
+                name: "command_execute",
+                argumentsJson: encodeUnknownJsonSync({
+                  command: "list_threads",
+                  payload: { projectId: "project-list", limit: 5 },
+                }),
+              },
+            ]),
+            ...noOpRealtimeTerminalControls,
+            updateContext: () => Effect.void,
+            submitToolOutput: () => Deferred.succeed(done, undefined).pipe(Effect.asVoid),
+            terminate: Effect.void,
+          }),
+      },
+    };
+    const executor = VoiceToolExecutor.of({
+      invoke: (toolCall) =>
+        Ref.update(invoked, (current) => [...current, toolCall.name]).pipe(
+          Effect.as({
+            type: "completed" as const,
+            toolCallId: toolCall.toolCallId,
+            providerFunctionCallId: toolCall.providerFunctionCallId,
+            tool: "list_threads" as const,
+            outcome: "succeeded" as const,
+            output: encodeUnknownJsonSync({ threads: [] }),
+            submitOutput: true,
+          }),
+        ),
+      decide: () => Effect.die("unused"),
+      expire: () => Effect.succeed(undefined),
+      discardSession: () => Effect.void,
+    });
+    const test = yield* makeLayer(provider, {
+      toolExecutor: executor,
+      voiceSettings: {
+        enabled: true,
+        maxConcurrentSessions: 16,
+        commandTools: ["list_threads"],
+      },
+    });
+    yield* Effect.gen(function* () {
+      const sessions = yield* VoiceSessionService;
+      const owner = AuthSessionId.make("list-cmd-owner");
+      const created = yield* sessions.create(principal(owner), input(false, "list-cmd"));
+      yield* sessions.offer(owner, created.state.sessionId, {
+        sessionId: created.state.sessionId,
+        leaseGeneration: created.state.leaseGeneration,
+        sdp: "offer",
+      });
+      yield* Deferred.await(done);
+      const toolEvents = (yield* sessions.events(
+        owner,
+        created.state.sessionId,
+        0,
+        0,
+      )).events.filter((event) => event.type === "tool");
+      expect(toolEvents).toEqual([
+        expect.objectContaining({ type: "tool", tool: "list_threads", outcome: "succeeded" }),
+      ]);
+      expect(yield* Ref.get(invoked)).toEqual(["list_threads"]);
+      yield* sessions.close(owner, created.state.sessionId, created.state.leaseGeneration);
     }).pipe(Effect.provide(test.layer));
   }),
 );

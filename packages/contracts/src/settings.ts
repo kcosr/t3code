@@ -469,6 +469,17 @@ export const OpenAiSpeechServerSettings = Schema.Struct({
 });
 export type OpenAiSpeechServerSettings = typeof OpenAiSpeechServerSettings.Type;
 
+/**
+ * Migrated voice business tools that may be exposed only through the command
+ * wrapper meta-tools (`command_list` / `command_describe` / `command_execute`)
+ * instead of as directly named Realtime function tools.
+ */
+export const VoiceCommandToolName = Schema.Literals(["list_threads", "create_thread"]);
+export type VoiceCommandToolName = typeof VoiceCommandToolName.Type;
+
+export const VoiceCommandTools = Schema.Array(VoiceCommandToolName).check(Schema.isUnique());
+export type VoiceCommandTools = typeof VoiceCommandTools.Type;
+
 export const VoiceSettings = Schema.Struct({
   enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   maxUploadBytes: Schema.Int.check(
@@ -495,6 +506,11 @@ export const VoiceSettings = Schema.Struct({
   contextTokenBudget: Schema.Int.check(Schema.isBetween({ minimum: 1024, maximum: 100_000 })).pipe(
     Schema.withDecodingDefault(Effect.succeed(16_000)),
   ),
+  /**
+   * Opt-in list of migrated business tools exposed only through the command
+   * wrapper. Empty (default) keeps both tools as direct Realtime declarations.
+   */
+  commandTools: VoiceCommandTools.pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   providers: VoiceProviderSelections.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   openaiSpeechServer: OpenAiSpeechServerSettings.pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
@@ -679,6 +695,7 @@ export const ServerSettingsPatch = Schema.Struct({
       maxConcurrentMediaRequests: Schema.optionalKey(Schema.Int),
       maxConcurrentSessions: Schema.optionalKey(Schema.Int),
       contextTokenBudget: Schema.optionalKey(Schema.Int),
+      commandTools: Schema.optionalKey(VoiceCommandTools),
       providers: Schema.optionalKey(
         Schema.Struct({
           transcription: Schema.optionalKey(VoiceNonRealtimeProviderId),
