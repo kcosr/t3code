@@ -26,7 +26,9 @@ import {
   type VoiceSessionEvent,
   type VoiceSessionId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Stream from "effect/Stream";
 
 import { requestMicrophoneStream, startAudioCapture, waitForEndpoint } from "./audioCapture";
@@ -179,14 +181,14 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     effect: Effect.Effect<A, E>,
     signal: AbortSignal,
   ): Promise<A> => {
-    try {
-      return await Effect.runPromise(effect as Effect.Effect<A, never>, { signal });
-    } catch (cause) {
-      if (signal.aborted) {
-        throw new DOMException("Thread voice aborted", "AbortError");
-      }
-      throw cause;
+    const exit = await Effect.runPromiseExit(effect, { signal });
+    if (Exit.isSuccess(exit)) {
+      return exit.value;
     }
+    if (signal.aborted) {
+      throw new DOMException("Thread voice aborted", "AbortError");
+    }
+    throw Cause.squash(exit.cause);
   };
 
   const multiTab = makeVoiceMultiTabLock({
