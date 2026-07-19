@@ -168,17 +168,19 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     | { readonly action: "discard" };
   let resolveReview: ((resolution: ReviewResolution) => void) | null = null;
 
-  const isCycleAbortCause = (cause: unknown): boolean =>
-    (cause instanceof DOMException && cause.name === "AbortError") ||
-    lastThreadAbortSignal?.aborted === true ||
-    threadAbort?.signal.aborted === true;
+  const isCycleAbortCause = (cause: unknown): boolean => {
+    if (cause instanceof DOMException && cause.name === "AbortError") return true;
+    if (lastThreadAbortSignal !== null && lastThreadAbortSignal.aborted) return true;
+    if (threadAbort !== null && threadAbort.signal.aborted) return true;
+    return false;
+  };
 
-  const runAbortableEffect = async <A>(
-    effect: Effect.Effect<A, unknown>,
+  const runAbortableEffect = async <A, E>(
+    effect: Effect.Effect<A, E>,
     signal: AbortSignal,
   ): Promise<A> => {
     try {
-      return await Effect.runPromise(effect, { signal });
+      return await Effect.runPromise(effect as Effect.Effect<A, never>, { signal });
     } catch (cause) {
       if (signal.aborted) {
         throw new DOMException("Thread voice aborted", "AbortError");
@@ -682,9 +684,9 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
   ): Promise<Uint8Array> => {
     const requestId = createRequestId() as VoiceRequestId;
     const playbackId = VoicePlaybackId.make(randomId());
-    const ticket = await Effect.runPromise(
+    const ticket = await runAbortableEffect(
       client.createMediaTicket({ operation: "speech-stream", requestId }),
-      { signal },
+      signal,
     );
     const chunks: Uint8Array[] = [];
     await Stream.runForEach(
@@ -736,6 +738,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
       threadAbort?.abort();
       const abort = new AbortController();
       threadAbort = abort;
+      lastThreadAbortSignal = abort.signal;
 
       publishNext({
         mode: "thread",
@@ -888,9 +891,9 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         });
 
         const requestId = createRequestId() as VoiceRequestId;
-        const ticket = await Effect.runPromise(
+        const ticket = await runAbortableEffect(
           client.createMediaTicket({ operation: "transcription-upload", requestId }),
-          { signal: abort.signal },
+          abort.signal,
         );
 
         let transcriptText = "";
