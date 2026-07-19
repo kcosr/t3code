@@ -99,6 +99,7 @@ describe("ServerSettings.voice", () => {
       maxConcurrentMediaRequests: 4,
       maxConcurrentSessions: 1,
       contextTokenBudget: 16_000,
+      commandTools: [],
       providers: {
         transcription: "openai",
         speech: "openai",
@@ -112,6 +113,29 @@ describe("ServerSettings.voice", () => {
         },
       },
     });
+  });
+
+  it("accepts commandTools allowlist for any public voice tool and rejects unknown or duplicates", () => {
+    expect(
+      decodeServerSettings({
+        voice: { commandTools: ["list_threads", "create_thread", "send_thread_message"] },
+      }).voice.commandTools,
+    ).toEqual(["list_threads", "create_thread", "send_thread_message"]);
+    expect(
+      decodeServerSettings({
+        voice: { commandTools: ["stop_realtime_voice"] },
+      }).voice.commandTools,
+    ).toEqual(["stop_realtime_voice"]);
+    expect(() =>
+      Schema.decodeUnknownSync(ServerSettings)({
+        voice: { commandTools: ["list_threads", "list_threads"] },
+      }),
+    ).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(ServerSettings)({
+        voice: { commandTools: ["not_a_voice_tool"] },
+      }),
+    ).toThrow();
   });
 
   it("accepts independent non-Realtime provider selection and speech-server config", () => {

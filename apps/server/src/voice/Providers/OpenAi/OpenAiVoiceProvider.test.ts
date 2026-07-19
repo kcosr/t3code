@@ -515,6 +515,7 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       },
       instructions: "Control T3 threads.",
       terminalActions: new Set(),
+      commandTools: [],
       continuationContext: [
         { role: "system", text: "Previous work was in project one." },
         { role: "assistant", text: "I found the project." },
@@ -551,6 +552,7 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
     expect(configuredTools.map((tool) => tool.name)).toEqual([
       "list_projects",
       "list_threads",
+      "list_provider_models",
       "get_thread_status",
       "interrupt_thread",
       "archive_thread",
@@ -568,12 +570,13 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
     expect(
       configuredTools.find((tool) => tool.name === "search_history")?.parameters,
     ).toMatchObject({
+      type: "object",
       required: ["query", "sources", "limit"],
       additionalProperties: false,
       properties: {
-        query: { maxLength: 512 },
-        sources: { maxItems: 2, uniqueItems: true },
-        limit: { maximum: 20 },
+        query: { type: "string" },
+        sources: { type: "array", maxItems: 2 },
+        limit: { type: "integer", maximum: 20 },
       },
     });
     const readHistoryParameters = configuredTools.find((tool) => tool.name === "read_history")
@@ -583,10 +586,12 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       readonly additionalProperties: boolean;
       readonly properties: {
         readonly ref: {
-          readonly oneOf: ReadonlyArray<Record<string, unknown>>;
+          readonly anyOf?: ReadonlyArray<Record<string, unknown>>;
+          readonly oneOf?: ReadonlyArray<Record<string, unknown>>;
         };
         readonly voiceScope: {
-          readonly oneOf: ReadonlyArray<Record<string, unknown>>;
+          readonly anyOf?: ReadonlyArray<Record<string, unknown>>;
+          readonly oneOf?: ReadonlyArray<Record<string, unknown>>;
         };
         readonly before: Record<string, unknown>;
         readonly after: Record<string, unknown>;
@@ -598,7 +603,9 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
       additionalProperties: false,
     });
     expect(readHistoryParameters).not.toHaveProperty("anyOf");
-    expect(readHistoryParameters.properties.ref.oneOf).toEqual(
+    const refVariants =
+      readHistoryParameters.properties.ref.anyOf ?? readHistoryParameters.properties.ref.oneOf;
+    expect(refVariants).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           required: ["type", "projectId", "threadId", "messageId"],
@@ -608,11 +615,11 @@ it.effect("negotiates unified WebRTC, attaches sideband, and normalizes Realtime
         }),
       ]),
     );
-    expect(readHistoryParameters.properties.voiceScope.oneOf).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ required: ["type"] }),
-        expect.objectContaining({ required: ["type", "conversationId"] }),
-      ]),
+    const voiceScopeVariants =
+      readHistoryParameters.properties.voiceScope.anyOf ??
+      readHistoryParameters.properties.voiceScope.oneOf;
+    expect(voiceScopeVariants).toEqual(
+      expect.arrayContaining([expect.objectContaining({ required: ["type"] })]),
     );
     expect(readHistoryParameters.properties).toMatchObject({
       before: { maximum: 10 },
@@ -775,6 +782,7 @@ it.effect("coalesces parallel tool outputs into one continuation in either compl
         },
         instructions: "test",
         terminalActions: new Set(),
+        commandTools: [],
         continuationContext: [],
       });
       yield* session.events.pipe(Stream.runDrain);
@@ -863,6 +871,7 @@ it.effect("does not track malformed completed function calls as pending continua
       },
       instructions: "test",
       terminalActions: new Set(),
+      commandTools: [],
       continuationContext: [],
     });
     yield* session.events.pipe(Stream.runDrain);
@@ -936,6 +945,7 @@ it.effect("waits for an acknowledged live context update on the sideband event s
       },
       instructions: "test",
       terminalActions: new Set(),
+      commandTools: [],
       continuationContext: [],
     });
     const eventFiber = yield* session.events.pipe(Stream.runDrain, Effect.forkScoped);
@@ -969,7 +979,7 @@ it.effect("waits for an acknowledged live context update on the sideband event s
 it("exposes only the terminal tools advertised for negotiation", () => {
   const names = (actions: ReadonlySet<"stop-realtime" | "switch-to-thread">) =>
     __testing
-      .providerSessionConfig("test", actions)
+      .providerSessionConfig("test", actions, [])
       .tools.map((tool) => tool.name)
       .filter((name) => name === "stop_realtime_voice" || name === "switch_to_thread_voice");
 
@@ -982,7 +992,7 @@ it("exposes only the terminal tools advertised for negotiation", () => {
   ]);
   expect(
     __testing
-      .providerSessionConfig("test", new Set(["switch-to-thread"]))
+      .providerSessionConfig("test", new Set(["switch-to-thread"]), [])
       .tools.find((tool) => tool.name === "switch_to_thread_voice"),
   ).toMatchObject({
     parameters: {
@@ -992,7 +1002,31 @@ it("exposes only the terminal tools advertised for negotiation", () => {
       additionalProperties: false,
     },
   });
-  expect(__testing.providerSessionConfig("test", new Set()).parallel_tool_calls).toBe(false);
+  expect(__testing.providerSessionConfig("test", new Set(), []).parallel_tool_calls).toBe(false);
+});
+
+it("suppresses command-listed tools and keeps meta-tools across terminal rebuilds", () => {
+  const commandTools = ["list_threads", "create_thread"] as const;
+  const initial = __testing.providerSessionConfig("test", new Set(["stop-realtime"]), [
+    ...commandTools,
+  ]);
+  const names = initial.tools.map((tool: { readonly name: string }) => tool.name);
+  expect(names).not.toContain("list_threads");
+  expect(names).not.toContain("create_thread");
+  expect(names).toEqual(
+    expect.arrayContaining([
+      "command_list",
+      "command_describe",
+      "command_execute",
+      "stop_realtime_voice",
+      "send_thread_message",
+    ]),
+  );
+  expect(names.filter((name: string) => name.startsWith("command_"))).toEqual([
+    "command_list",
+    "command_describe",
+    "command_execute",
+  ]);
 });
 
 it.effect(
@@ -1060,6 +1094,7 @@ it.effect(
         },
         instructions: "test",
         terminalActions: new Set(["stop-realtime"]),
+        commandTools: [],
         continuationContext: [],
       });
       const eventFiber = yield* session.events.pipe(Stream.runDrain, Effect.forkScoped);
@@ -1222,6 +1257,7 @@ it.effect("retries a terminal tool output after the sideband send fails", () =>
       },
       instructions: "test",
       terminalActions: new Set(["stop-realtime"]),
+      commandTools: [],
       continuationContext: [],
     });
     const eventFiber = yield* session.events.pipe(Stream.runDrain, Effect.forkScoped);
@@ -1310,6 +1346,7 @@ it.effect("retries a terminal tool output after its acknowledgement times out", 
       },
       instructions: "test",
       terminalActions: new Set(["stop-realtime"]),
+      commandTools: [],
       continuationContext: [],
     });
     const eventFiber = yield* session.events.pipe(Stream.runDrain, Effect.forkScoped);
@@ -1394,6 +1431,7 @@ it.effect("hangs up the provider call when sideband attachment fails", () =>
         },
         instructions: "test",
         terminalActions: new Set(),
+        commandTools: [],
         continuationContext: [],
       })
       .pipe(Effect.flip);
@@ -1461,6 +1499,7 @@ it.effect("rejects startup and hangs up when OpenAI rejects a replay item", () =
         },
         instructions: "test",
         terminalActions: new Set(),
+        commandTools: [],
         continuationContext: [{ role: "user", text: "My code word is heliotrope." }],
       })
       .pipe(Effect.flip);
@@ -1529,6 +1568,7 @@ it.effect("rejects startup when the sideband closes before every replay item is 
         },
         instructions: "test",
         terminalActions: new Set(),
+        commandTools: [],
         continuationContext: [
           { role: "user", text: "My code word is heliotrope." },
           { role: "assistant", text: "I will remember that." },

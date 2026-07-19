@@ -314,6 +314,7 @@ internal data class T3VoiceRealtimeTranscriptTurn(
 internal enum class T3VoiceToolName {
   LIST_PROJECTS,
   LIST_THREADS,
+  LIST_PROVIDER_MODELS,
   GET_THREAD_STATUS,
   GET_THREAD_MESSAGES,
   WAIT_FOR_THREAD_TURN,

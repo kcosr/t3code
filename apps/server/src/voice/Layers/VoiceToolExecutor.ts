@@ -5,23 +5,12 @@ import {
   type AuthEnvironmentScope,
   ClientOrchestrationCommand,
   CommandId,
-  DEFAULT_MODEL,
-  DEFAULT_PROVIDER_INTERACTION_MODE,
-  DEFAULT_RUNTIME_MODE,
   MessageId,
-  HISTORY_READ_CONTEXT_MAX_RECORDS,
-  HistorySearchInput,
-  HistoryThreadMessageRef,
-  HistoryVoiceEntryRef,
-  HistoryVoiceScope,
   type HistoryReadInput as HistoryReadInputType,
   type HistorySearchInput as HistorySearchInputType,
   type HistoryVoiceScope as HistoryVoiceScopeType,
   type OrchestrationMessageTurnResult,
-  ProjectId,
-  ProviderInstanceId,
   ThreadId,
-  TrimmedNonEmptyString,
   VoiceConfirmationId,
   VoiceClientActionId,
   VoiceConversationEntryId,
@@ -29,7 +18,6 @@ import {
   VoiceToolName,
   VoiceTerminalActionRequest,
   type OrchestrationProjectShell,
-  type OrchestrationThreadShell,
   type VoiceConversationId,
   type VoiceSessionId,
 } from "@t3tools/contracts";
@@ -60,6 +48,22 @@ import {
   VoiceToolCallRepository,
 } from "../../persistence/Services/VoiceToolCalls.ts";
 import { VoiceError } from "../Errors.ts";
+import {
+  CreateThreadTool,
+  GetThreadMessagesArguments,
+  ListProjectsArguments,
+  ListProviderModelsTool,
+  ListThreadsTool,
+  ReadHistoryArguments,
+  SearchHistoryArguments,
+  SendThreadMessageArguments,
+  StopRealtimeArguments,
+  ThreadArguments,
+  VoiceToolHistoryVoiceScope,
+  WaitForThreadTurnArguments,
+  voiceThreadProjection as threadOutput,
+} from "../modelTools/definitions.ts";
+import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
 import { VoiceConversationService } from "../Services/VoiceConversationService.ts";
 import {
   VoiceToolExecutor,
@@ -82,61 +86,17 @@ const MAX_WAIT_MESSAGE_CHARS = 8_000;
 const MAX_HISTORY_TOOL_OUTPUT_BYTES = 32_000;
 const TURN_WAIT_POLL_INTERVAL = "250 millis";
 
-const ListProjectsArguments = Schema.Struct({
-  limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
-});
-const ListThreadsArguments = Schema.Struct({
-  projectId: ProjectId,
-  limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
-});
-const ThreadArguments = Schema.Struct({ threadId: ThreadId });
-const GetThreadMessagesArguments = Schema.Struct({
-  threadId: ThreadId,
-  limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
-  cursor: Schema.optionalKey(TrimmedNonEmptyString),
-});
-const WaitForThreadTurnArguments = Schema.Struct({
-  threadId: ThreadId,
-  messageId: MessageId,
-  waitMilliseconds: Schema.Int.check(Schema.isBetween({ minimum: 250, maximum: 25_000 })),
-});
-const CreateThreadArguments = Schema.Struct({
-  projectId: ProjectId,
-  title: Schema.optionalKey(TrimmedNonEmptyString),
-});
-const SendThreadMessageArguments = Schema.Struct({
-  threadId: ThreadId,
-  message: TrimmedNonEmptyString,
-});
-const CurrentConversationVoiceScope = Schema.Struct({
-  type: Schema.Literal("current-conversation"),
-});
-const VoiceToolHistoryVoiceScope = Schema.Union([CurrentConversationVoiceScope, HistoryVoiceScope]);
-const SearchHistoryArguments = Schema.Struct({
-  ...HistorySearchInput.fields,
-  voiceScope: Schema.optionalKey(VoiceToolHistoryVoiceScope),
-});
-const HistoryContextRadius = Schema.Int.check(
-  Schema.isBetween({ minimum: 0, maximum: HISTORY_READ_CONTEXT_MAX_RECORDS }),
-);
-const ReadHistoryArguments = Schema.Struct({
-  ref: Schema.Union([HistoryThreadMessageRef, HistoryVoiceEntryRef]),
-  voiceScope: Schema.optionalKey(VoiceToolHistoryVoiceScope),
-  before: HistoryContextRadius,
-  after: HistoryContextRadius,
-});
-const StopRealtimeArguments = Schema.Record(Schema.String, Schema.Unknown);
-type SearchHistoryArguments = typeof SearchHistoryArguments.Type;
-type ReadHistoryArguments = typeof ReadHistoryArguments.Type;
+type SearchHistoryArgumentsType = typeof SearchHistoryArguments.Type;
+type ReadHistoryArgumentsType = typeof ReadHistoryArguments.Type;
 
 const resolveHistoryVoiceScope = (
-  scope: typeof VoiceToolHistoryVoiceScope.Type,
+  scope: VoiceToolHistoryVoiceScope,
   conversationId: VoiceConversationId,
 ): HistoryVoiceScopeType =>
   scope.type === "current-conversation" ? { type: "conversation", conversationId } : scope;
 
 const resolveSearchHistoryArguments = (
-  args: SearchHistoryArguments,
+  args: SearchHistoryArgumentsType,
   conversationId: VoiceConversationId,
 ): HistorySearchInputType => {
   const { voiceScope: requestedVoiceScope, ...rest } = args;
@@ -150,7 +110,7 @@ const resolveSearchHistoryArguments = (
 };
 
 const resolveReadHistoryArguments = (
-  args: ReadHistoryArguments,
+  args: ReadHistoryArgumentsType,
   conversationId: VoiceConversationId,
 ): HistoryReadInputType =>
   args.ref.type === "thread-message"
@@ -190,6 +150,7 @@ type ReadVoiceTool = Extract<
   VoiceToolName,
   | "list_projects"
   | "list_threads"
+  | "list_provider_models"
   | "get_thread_status"
   | "get_thread_messages"
   | "wait_for_thread_turn"
@@ -205,6 +166,7 @@ type HistoryVoiceTool = Extract<VoiceToolName, "search_history" | "read_history"
 const VOICE_TOOL_ACCESS = {
   list_projects: "orchestration-read",
   list_threads: "orchestration-read",
+  list_provider_models: "orchestration-read",
   get_thread_status: "orchestration-read",
   get_thread_messages: "orchestration-read",
   wait_for_thread_turn: "orchestration-read",
@@ -294,8 +256,14 @@ const canonicalizeJsonValue = (value: unknown): unknown => {
 const canonicalizeArguments = (argumentsJson: string) =>
   Effect.try({
     try: () => jsonOutput(canonicalizeJsonValue(decodeJson(argumentsJson))),
-    catch: () =>
-      voiceError("invalid-phase", "tool.arguments", "Voice tool arguments were not valid JSON"),
+    catch: (cause) =>
+      voiceError(
+        "invalid-phase",
+        "tool.arguments",
+        cause instanceof Error && cause.message.length > 0
+          ? cause.message
+          : "Voice tool arguments were not valid JSON",
+      ),
   });
 
 const decodeCursor = (cursor: string | undefined) => {
@@ -427,6 +395,27 @@ const decodePersistedTerminalResult = Schema.decodeUnknownOption(
   Schema.fromJsonString(PersistedTerminalResult),
 );
 
+const schemaErrorDetail = (error: unknown): string => {
+  if (Schema.isSchemaError(error)) {
+    return error.message;
+  }
+  if (error instanceof Error && error.message.length > 0) {
+    return error.message;
+  }
+  return "Voice tool arguments were invalid";
+};
+
+/** Prefer VoiceError.detail so tool outputs expose the schema issue, not the tagged wrapper. */
+const toolFailureDetail = (cause: unknown): string => {
+  if (cause instanceof VoiceError) {
+    return cause.detail;
+  }
+  if (cause instanceof Error && cause.message.length > 0) {
+    return cause.message;
+  }
+  return "Invalid tool arguments";
+};
+
 const parseArguments = <A>(
   schema: Schema.Codec<A, unknown, never, never>,
   input: VoiceToolCallInput,
@@ -434,8 +423,8 @@ const parseArguments = <A>(
   Schema.decodeUnknownEffect(Schema.fromJsonString(schema), {
     onExcessProperty: "error",
   })(input.argumentsJson).pipe(
-    Effect.mapError(() =>
-      voiceError("invalid-phase", "tool.arguments", "Voice tool arguments were invalid"),
+    Effect.mapError((error) =>
+      voiceError("invalid-phase", "tool.arguments", schemaErrorDetail(error)),
     ),
   );
 
@@ -443,20 +432,6 @@ const projectOutput = (project: OrchestrationProjectShell) => ({
   projectId: project.id,
   title: project.title,
   workspaceRoot: project.workspaceRoot,
-});
-
-const threadOutput = (thread: OrchestrationThreadShell) => ({
-  threadId: thread.id,
-  projectId: thread.projectId,
-  title: thread.title,
-  runtimeMode: thread.runtimeMode,
-  branch: thread.branch,
-  worktreePath: thread.worktreePath,
-  turnState: thread.latestTurn?.state ?? null,
-  sessionStatus: thread.session?.status ?? "stopped",
-  hasPendingApprovals: thread.hasPendingApprovals,
-  hasPendingUserInput: thread.hasPendingUserInput,
-  updatedAt: thread.updatedAt,
 });
 
 const mutationOutput = (command: ClientOrchestrationCommand, sequence: number) => {
@@ -489,6 +464,7 @@ const make = Effect.gen(function* () {
   const history = yield* HistorySearchService;
   const conversations = yield* VoiceConversationService;
   const toolCalls = yield* VoiceToolCallRepository;
+  const providers = yield* ProviderRegistry;
   const state = yield* SynchronizedRef.make<ExecutorState>({
     calls: new Map(),
     confirmations: new Map(),
@@ -697,43 +673,24 @@ const make = Effect.gen(function* () {
     const commandId = CommandId.make(deterministicId("voice", input));
     switch (tool) {
       case "create_thread": {
-        const args = yield* parseArguments(CreateThreadArguments, input);
-        const project = yield* query.getProjectShellById(args.projectId).pipe(
-          Effect.flatMap(
-            Option.match({
-              onNone: () =>
-                Effect.fail(
-                  voiceError(
-                    "invalid-phase",
-                    "tool.project",
-                    `Project ${args.projectId} was not found`,
-                  ),
-                ),
-              onSome: Effect.succeed,
-            }),
-          ),
+        const args = yield* parseArguments(CreateThreadTool.inputSchema, input);
+        const prepared = yield* CreateThreadTool.execute(
+          {
+            getProjectShellById: (projectId) => query.getProjectShellById(projectId),
+            getProviders: providers.getProviders,
+            makeCommandId: Effect.succeed(commandId),
+            makeThreadId: Effect.succeed(ThreadId.make(deterministicId("voice-thread", input))),
+            nowIso: Effect.succeed(createdAt),
+            projectNotFound: (projectId) =>
+              voiceError("invalid-phase", "tool.project", `Project ${projectId} was not found`),
+            invalidModelSelection: (detail) => voiceError("invalid-phase", "tool.model", detail),
+          },
+          args,
         );
-        const threadId = ThreadId.make(deterministicId("voice-thread", input));
-        const title = args.title ?? "Voice thread";
         return {
           tool,
-          summary: `Create thread "${title}" in project "${project.title}"`,
-          command: {
-            type: "thread.create",
-            commandId,
-            threadId,
-            projectId: project.id,
-            title,
-            modelSelection: project.defaultModelSelection ?? {
-              instanceId: ProviderInstanceId.make("codex"),
-              model: DEFAULT_MODEL,
-            },
-            runtimeMode: DEFAULT_RUNTIME_MODE,
-            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-            branch: null,
-            worktreePath: null,
-            createdAt,
-          },
+          summary: prepared.summary,
+          command: prepared.command,
         } satisfies PreparedMutation;
       }
       case "send_thread_message": {
@@ -802,15 +759,23 @@ const make = Effect.gen(function* () {
           projects: snapshot.projects.slice(0, args.limit).map(projectOutput),
         });
       }
+      case "list_provider_models": {
+        const args = yield* parseArguments(ListProviderModelsTool.inputSchema, input);
+        const result = yield* ListProviderModelsTool.execute(
+          { getProviders: providers.getProviders },
+          args,
+        );
+        return jsonOutput(result);
+      }
       case "list_threads": {
-        const args = yield* parseArguments(ListThreadsArguments, input);
-        const snapshot = yield* query.getShellSnapshot();
-        return jsonOutput({
-          threads: snapshot.threads
-            .filter((thread) => thread.projectId === args.projectId)
-            .slice(0, args.limit)
-            .map(threadOutput),
-        });
+        const args = yield* parseArguments(ListThreadsTool.inputSchema, input);
+        const result = yield* ListThreadsTool.execute(
+          {
+            getShellSnapshot: () => query.getShellSnapshot(),
+          },
+          args,
+        );
+        return jsonOutput(result);
       }
       case "get_thread_status": {
         const args = yield* parseArguments(ThreadArguments, input);
@@ -1406,7 +1371,7 @@ const make = Effect.gen(function* () {
             Effect.match({
               onFailure: (cause) =>
                 ({
-                  error: cause instanceof Error ? cause.message : "Invalid tool arguments",
+                  error: toolFailureDetail(cause),
                 }) as const,
               onSuccess: (value) => ({ value }) as const,
             }),
@@ -1428,7 +1393,11 @@ const make = Effect.gen(function* () {
               },
             ] as const;
           }
-          if (tool === "create_thread" || tool === "send_thread_message") {
+          if (
+            tool === "create_thread" ||
+            tool === "send_thread_message" ||
+            tool === "interrupt_thread"
+          ) {
             const result = yield* dispatcher.dispatch(prepared.value.command).pipe(
               Effect.match({
                 onFailure: (cause) =>
@@ -1556,7 +1525,7 @@ const make = Effect.gen(function* () {
           Effect.match({
             onFailure: (cause) =>
               jsonOutput({
-                error: cause instanceof Error ? cause.message : "Invalid tool arguments",
+                error: toolFailureDetail(cause),
               }),
             onSuccess: (value) => value,
           }),

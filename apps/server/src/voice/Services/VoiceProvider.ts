@@ -1,5 +1,6 @@
 import type {
   VoiceCapability,
+  VoiceCommandToolName,
   VoiceRequestId,
   VoiceSessionId,
   VoiceTerminalAction,
@@ -52,6 +53,12 @@ export interface RealtimeNegotiationRequest {
   readonly offer: VoiceWebRtcOffer;
   readonly instructions: string;
   readonly terminalActions: ReadonlySet<VoiceTerminalAction>;
+  /**
+   * Session-stable set of migrated business tools exposed only through the
+   * command wrapper. Reused for every declaration rebuild, including terminal
+   * `session.update`.
+   */
+  readonly commandTools: ReadonlyArray<VoiceCommandToolName>;
   readonly continuationContext: ReadonlyArray<RealtimeContextItem>;
 }
 

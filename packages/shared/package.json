@@ -11,6 +11,10 @@
       "types": "./src/model.ts",
       "import": "./src/model.ts"
     },
+    "./model-tool": {
+      "types": "./src/modelTool.ts",
+      "import": "./src/modelTool.ts"
+    },
     "./advertisedEndpoint": {
       "types": "./src/advertisedEndpoint.ts",
       "import": "./src/advertisedEndpoint.ts"

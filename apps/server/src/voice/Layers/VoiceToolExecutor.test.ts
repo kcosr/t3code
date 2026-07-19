@@ -51,6 +51,7 @@ import {
   VoiceToolCallRepository,
 } from "../../persistence/Services/VoiceToolCalls.ts";
 import { VoiceConversationService } from "../Services/VoiceConversationService.ts";
+import { makeProviderRegistryLayer } from "../../provider/testUtils/providerRegistryMock.ts";
 import { VoiceToolExecutor } from "../Services/VoiceToolExecutor.ts";
 import { VoiceToolExecutorLive } from "./VoiceToolExecutor.ts";
 
@@ -528,6 +529,40 @@ const makeTest = Effect.fn("test.makeVoiceToolExecutor")(function* (
     Layer.succeed(HistorySearchService, history),
     Layer.succeed(VoiceConversationService, conversations),
     Layer.succeed(VoiceToolCallRepository, toolCallRepository),
+    makeProviderRegistryLayer([
+      {
+        instanceId: "codex" as never,
+        driver: "codex" as never,
+        enabled: true,
+        installed: true,
+        version: "1.0.0",
+        status: "ready",
+        auth: { status: "authenticated" },
+        checkedAt: now,
+        models: [
+          {
+            slug: "gpt-5.4",
+            name: "GPT-5.4",
+            isCustom: false,
+            capabilities: {
+              optionDescriptors: [
+                {
+                  id: "effort",
+                  type: "select",
+                  label: "Reasoning effort",
+                  options: [
+                    { id: "low", label: "Low" },
+                    { id: "high", label: "High" },
+                  ],
+                },
+              ],
+            },
+          },
+        ],
+        slashCommands: [],
+        skills: [],
+      },
+    ]),
     NodeServices.layer,
   );
   const dependencies = Layer.mergeAll(
@@ -1334,8 +1369,7 @@ it.effect("rejects a wait for a message owned by another thread", () =>
       );
       expect(result.type === "completed" ? result.outcome : undefined).toBe("failed");
       expect(result.type === "completed" ? decodeJson(result.output) : undefined).toEqual({
-        error:
-          "Voice tool.wait-for-thread-turn failed (invalid-phase): The dispatched thread message was not found",
+        error: "The dispatched thread message was not found",
       });
     }).pipe(Effect.provide(test.layer));
   }),
@@ -1369,8 +1403,7 @@ it.effect("rejects a wait for a non-user message in the requested thread", () =>
       );
       expect(result.type === "completed" ? result.outcome : undefined).toBe("failed");
       expect(result.type === "completed" ? decodeJson(result.output) : undefined).toEqual({
-        error:
-          "Voice tool.wait-for-thread-turn failed (invalid-phase): The dispatched thread message was not found",
+        error: "The dispatched thread message was not found",
       });
     }).pipe(Effect.provide(test.layer));
   }),
@@ -2035,42 +2068,60 @@ it.effect("enforces the orchestration scope required by each tool class", () =>
   }),
 );
 
-it.effect("requires confirmation for gated mutations and dispatches them canonically", () =>
+it.effect("dispatches interrupt_thread immediately without confirmation", () =>
   Effect.gen(function* () {
     const test = yield* makeTest();
     yield* Effect.gen(function* () {
       const tools = yield* VoiceToolExecutor;
-      const mutations = [
-        call("interrupt_thread", encodeJson({ threadId })),
-        call("archive_thread", encodeJson({ threadId })),
-      ];
-      const expectedTypes = ["thread.turn.interrupt", "thread.archive"];
-      for (const mutation of mutations) {
-        const pending = yield* tools.invoke(mutation);
-        expect(pending.type).toBe("confirmation-required");
-        if (pending.type !== "confirmation-required") continue;
-        const duplicate = yield* tools.invoke(mutation);
-        expect(duplicate.type === "confirmation-required" && duplicate.newlyCreated).toBe(false);
-        const completed = yield* tools.decide({
+      const mutation = call("interrupt_thread", encodeJson({ threadId }), "immediate-interrupt");
+      const result = yield* tools.invoke(mutation);
+      expect(result.type).toBe("completed");
+      expect(result.type === "completed" ? result.outcome : undefined).toBe("succeeded");
+      expect(result.type === "completed" ? decodeJson(result.output) : undefined).toMatchObject({
+        sequence: 42,
+        threadId,
+      });
+      const duplicate = yield* tools.invoke(mutation);
+      expect(duplicate.type === "completed" ? duplicate.submitOutput : undefined).toBe(false);
+      expect((yield* Ref.get(test.commands)).map((command) => command.type)).toEqual([
+        "thread.turn.interrupt",
+      ]);
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("requires confirmation for archive_thread and dispatches it canonically", () =>
+  Effect.gen(function* () {
+    const test = yield* makeTest();
+    yield* Effect.gen(function* () {
+      const tools = yield* VoiceToolExecutor;
+      const mutation = call("archive_thread", encodeJson({ threadId }));
+      const pending = yield* tools.invoke(mutation);
+      expect(pending.type).toBe("confirmation-required");
+      if (pending.type !== "confirmation-required") return;
+      const duplicate = yield* tools.invoke(mutation);
+      expect(duplicate.type === "confirmation-required" && duplicate.newlyCreated).toBe(false);
+      const completed = yield* tools.decide({
+        authSessionId,
+        sessionId,
+        confirmationId: pending.confirmationId,
+        decision: "approve",
+      });
+      expect(completed.outcome).toBe("succeeded");
+      expect(decodeJson(completed.output)).toMatchObject({ sequence: 42 });
+      expect(decodeJson(completed.output).threadId).toBeTruthy();
+      const repeated = yield* tools
+        .decide({
           authSessionId,
           sessionId,
           confirmationId: pending.confirmationId,
           decision: "approve",
-        });
-        expect(completed.outcome).toBe("succeeded");
-        expect(decodeJson(completed.output)).toMatchObject({ sequence: 42 });
-        expect(decodeJson(completed.output).threadId).toBeTruthy();
-        const repeated = yield* tools
-          .decide({
-            authSessionId,
-            sessionId,
-            confirmationId: pending.confirmationId,
-            decision: "approve",
-          })
-          .pipe(Effect.flip);
-        expect(repeated.reason).toBe("confirmation-expired");
-      }
-      expect((yield* Ref.get(test.commands)).map((command) => command.type)).toEqual(expectedTypes);
+        })
+        .pipe(Effect.flip);
+      expect(repeated.reason).toBe("confirmation-expired");
+      expect((yield* Ref.get(test.commands)).map((command) => command.type)).toEqual([
+        "thread.archive",
+      ]);
     }).pipe(Effect.provide(test.layer));
   }),
 );
@@ -2100,6 +2151,61 @@ it.effect("dispatches create_thread immediately and durably deduplicates it", ()
       expect(
         (yield* Ref.get(test.durableCalls)).get(`${conversationId}:immediate-create`),
       ).toMatchObject({ status: "succeeded" });
+    }).pipe(Effect.provide(test.layer));
+  }),
+);
+
+it.effect("lists provider models and creates threads with explicit model selection", () =>
+  Effect.gen(function* () {
+    const test = yield* makeTest();
+    yield* Effect.gen(function* () {
+      const tools = yield* VoiceToolExecutor;
+      const listed = yield* tools.invoke(
+        call("list_provider_models", encodeJson({ limit: 10 }), "list-models"),
+      );
+      expect(listed.type === "completed" ? listed.outcome : undefined).toBe("succeeded");
+      expect(listed.type === "completed" ? decodeJson(listed.output) : undefined).toMatchObject({
+        providers: [
+          {
+            instanceId: "codex",
+            models: [{ slug: "gpt-5.4", options: [{ id: "effort", type: "select" }] }],
+          },
+        ],
+      });
+
+      const created = yield* tools.invoke(
+        call(
+          "create_thread",
+          encodeJson({
+            projectId,
+            title: "Model pick",
+            instanceId: "codex",
+            model: "gpt-5.4",
+            options: [{ id: "effort", value: "high" }],
+          }),
+          "create-with-model",
+        ),
+      );
+      expect(created.type === "completed" ? created.outcome : undefined).toBe("succeeded");
+      const commands = yield* Ref.get(test.commands);
+      expect(commands).toHaveLength(1);
+      expect(commands[0]).toMatchObject({
+        type: "thread.create",
+        modelSelection: {
+          instanceId: "codex",
+          model: "gpt-5.4",
+          options: [{ id: "effort", value: "high" }],
+        },
+      });
+
+      const invalid = yield* tools.invoke(
+        call(
+          "create_thread",
+          encodeJson({ projectId, instanceId: "codex" }),
+          "create-missing-model",
+        ),
+      );
+      expect(invalid.type === "completed" ? invalid.outcome : undefined).toBe("failed");
     }).pipe(Effect.provide(test.layer));
   }),
 );
@@ -2153,7 +2259,7 @@ it.effect("rejects without dispatch and expires pending calls exactly once", () 
       expect(yield* Ref.get(test.commands)).toHaveLength(0);
 
       const expiring = yield* tools.invoke(
-        call("interrupt_thread", encodeJson({ threadId }), "expire-call"),
+        call("archive_thread", encodeJson({ threadId }), "expire-call"),
       );
       if (expiring.type !== "confirmation-required") return;
       yield* TestClock.adjust("31 seconds");

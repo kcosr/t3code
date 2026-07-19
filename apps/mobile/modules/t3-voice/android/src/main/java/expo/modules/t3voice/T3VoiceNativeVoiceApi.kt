@@ -764,6 +764,7 @@ private fun toolName(value: String): T3VoiceToolName =
   when (value) {
     "list_projects" -> T3VoiceToolName.LIST_PROJECTS
     "list_threads" -> T3VoiceToolName.LIST_THREADS
+    "list_provider_models" -> T3VoiceToolName.LIST_PROVIDER_MODELS
     "get_thread_status" -> T3VoiceToolName.GET_THREAD_STATUS
     "get_thread_messages" -> T3VoiceToolName.GET_THREAD_MESSAGES
     "wait_for_thread_turn" -> T3VoiceToolName.WAIT_FOR_THREAD_TURN

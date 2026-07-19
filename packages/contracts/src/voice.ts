@@ -392,6 +392,7 @@ export type VoiceTranscriptRole = typeof VoiceTranscriptRole.Type;
 export const VoiceToolName = Schema.Literals([
   "list_projects",
   "list_threads",
+  "list_provider_models",
   "get_thread_status",
   "get_thread_messages",
   "wait_for_thread_turn",
