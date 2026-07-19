@@ -18,10 +18,18 @@ interface ActiveSpeechPlan {
   readonly chunker: SpeechChunkerState;
 }
 
+export interface ThreadSpeechHydrationState {
+  readonly preferenceHydrated: boolean;
+  readonly toggledBeforePreferenceHydration: boolean;
+  readonly earlyToggleNeedsBaseline: boolean;
+  readonly lastObservedPreference: boolean | null;
+}
+
 export interface ThreadSpeechPlannerState {
   readonly enabled: boolean;
   readonly baselineMessageId: string | null;
   readonly active: ActiveSpeechPlan | null;
+  readonly hydration: ThreadSpeechHydrationState;
 }
 
 export type ThreadSpeechAction =
@@ -34,14 +42,27 @@ export type ThreadSpeechAction =
   | { readonly type: "finish"; readonly playbackId: string }
   | { readonly type: "cancel"; readonly playbackId: string };
 
+const initialHydrationState = (): ThreadSpeechHydrationState => ({
+  preferenceHydrated: false,
+  toggledBeforePreferenceHydration: false,
+  earlyToggleNeedsBaseline: false,
+  lastObservedPreference: null,
+});
+
 export const initialThreadSpeechPlannerState = (): ThreadSpeechPlannerState => ({
   enabled: false,
   baselineMessageId: null,
   active: null,
+  hydration: initialHydrationState(),
 });
 
 export const isThreadSpeechSuspended = (dictation: boolean, realtime: boolean): boolean =>
   dictation || realtime;
+
+const withHydration = (
+  state: ThreadSpeechPlannerState,
+  hydration: ThreadSpeechHydrationState = state.hydration,
+): Pick<ThreadSpeechPlannerState, "hydration"> => ({ hydration });
 
 export const restoreThreadSpeechPreference = (
   state: ThreadSpeechPlannerState,
@@ -55,6 +76,7 @@ export const restoreThreadSpeechPreference = (
     enabled,
     baselineMessageId: latest?.id ?? null,
     active: null,
+    ...withHydration(state),
   },
   actions: state.active ? [{ type: "cancel", playbackId: state.active.playbackId }] : [],
 });
@@ -74,6 +96,7 @@ export const setThreadSpeechEnabled = (
         enabled: false,
         baselineMessageId: latest?.id ?? null,
         active: null,
+        ...withHydration(state),
       },
       actions: state.active ? [{ type: "cancel", playbackId: state.active.playbackId }] : [],
     };
@@ -83,6 +106,7 @@ export const setThreadSpeechEnabled = (
       enabled: true,
       baselineMessageId: latest?.streaming ? null : (latest?.id ?? null),
       active: null,
+      ...withHydration(state),
     },
     actions: [],
   };
@@ -95,7 +119,114 @@ export const interruptThreadSpeech = (
   enabled: state.enabled,
   baselineMessageId: latest?.id ?? state.baselineMessageId,
   active: null,
+  ...withHydration(state),
 });
+
+export const noteThreadSpeechEarlyToggle = (
+  state: ThreadSpeechPlannerState,
+  historyReady: boolean,
+): ThreadSpeechPlannerState => {
+  if (state.hydration.preferenceHydrated) return state;
+  return {
+    ...state,
+    hydration: {
+      ...state.hydration,
+      toggledBeforePreferenceHydration: true,
+      earlyToggleNeedsBaseline: state.hydration.earlyToggleNeedsBaseline || !historyReady,
+    },
+  };
+};
+
+export const hydrateThreadSpeechPreference = (
+  state: ThreadSpeechPlannerState,
+  input: {
+    readonly historyReady: boolean;
+    readonly preferencesReady: boolean;
+    readonly persistedEnabled: boolean;
+    readonly latest: AssistantSpeechSnapshot | null;
+  },
+): {
+  readonly state: ThreadSpeechPlannerState;
+  readonly actions: ReadonlyArray<ThreadSpeechAction>;
+  readonly didHydrate: boolean;
+} => {
+  if (state.hydration.preferenceHydrated || !input.historyReady || !input.preferencesReady) {
+    return { state, actions: [], didHydrate: false };
+  }
+
+  const nextHydration: ThreadSpeechHydrationState = {
+    ...state.hydration,
+    preferenceHydrated: true,
+  };
+
+  // User toggled after history was ready: keep planner as-is (including baseline from toggle).
+  // Preserve prior behavior of not seeding lastObservedPreference on this path.
+  if (
+    state.hydration.toggledBeforePreferenceHydration &&
+    !state.hydration.earlyToggleNeedsBaseline
+  ) {
+    return {
+      state: { ...state, hydration: nextHydration },
+      actions: [],
+      didHydrate: true,
+    };
+  }
+
+  const enabled = state.hydration.toggledBeforePreferenceHydration
+    ? state.enabled
+    : input.persistedEnabled;
+  const restored = restoreThreadSpeechPreference(state, enabled, input.latest);
+  return {
+    state: {
+      ...restored.state,
+      hydration: {
+        ...nextHydration,
+        lastObservedPreference: input.persistedEnabled,
+      },
+    },
+    actions: restored.actions,
+    didHydrate: true,
+  };
+};
+
+export const syncExternalThreadSpeechPreference = (
+  state: ThreadSpeechPlannerState,
+  input: {
+    readonly preferencesReady: boolean;
+    readonly persistedEnabled: boolean;
+    readonly latest: AssistantSpeechSnapshot | null;
+  },
+): {
+  readonly state: ThreadSpeechPlannerState;
+  readonly actions: ReadonlyArray<ThreadSpeechAction>;
+  readonly kind: "none" | "enable" | "disable_no_persist";
+} => {
+  if (!state.hydration.preferenceHydrated || !input.preferencesReady) {
+    return { state, actions: [], kind: "none" };
+  }
+
+  const previouslyRequested = state.hydration.lastObservedPreference;
+  const nextState: ThreadSpeechPlannerState = {
+    ...state,
+    hydration: {
+      ...state.hydration,
+      lastObservedPreference: input.persistedEnabled,
+    },
+  };
+
+  if (previouslyRequested === null || previouslyRequested === input.persistedEnabled) {
+    return { state: nextState, actions: [], kind: "none" };
+  }
+  if (input.persistedEnabled === nextState.enabled) {
+    return { state: nextState, actions: [], kind: "none" };
+  }
+  if (!input.persistedEnabled) {
+    return { state: nextState, actions: [], kind: "disable_no_persist" };
+  }
+
+  const enabled = setThreadSpeechEnabled(nextState, true, input.latest);
+  return { state: enabled.state, actions: enabled.actions, kind: "enable" };
+};
 
 export const planThreadSpeechToggle = (
   state: ThreadSpeechPlannerState,

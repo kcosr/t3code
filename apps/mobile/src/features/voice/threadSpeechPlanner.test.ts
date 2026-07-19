@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  hydrateThreadSpeechPreference,
   initialThreadSpeechPlannerState,
   interruptThreadSpeech,
   isThreadSpeechSuspended,
+  noteThreadSpeechEarlyToggle,
   planThreadSpeechToggle,
   restoreThreadSpeechPreference,
   setThreadSpeechEnabled,
+  syncExternalThreadSpeechPreference,
   updateThreadSpeech,
 } from "./threadSpeechPlanner";
 
@@ -30,7 +33,7 @@ describe("threadSpeechPlanner", () => {
     };
     const restored = restoreThreadSpeechPreference(initialThreadSpeechPlannerState(), true, latest);
 
-    expect(restored.state).toEqual({
+    expect(restored.state).toMatchObject({
       enabled: true,
       baselineMessageId: "existing",
       active: null,
@@ -175,7 +178,7 @@ describe("threadSpeechPlanner", () => {
 
     const interrupted = interruptThreadSpeech(active, latest);
 
-    expect(interrupted).toEqual({
+    expect(interrupted).toMatchObject({
       enabled: true,
       baselineMessageId: "current",
       active: null,
@@ -242,5 +245,179 @@ describe("threadSpeechPlanner", () => {
       },
       { type: "finish", playbackId: "playback-2" },
     ]);
+  });
+
+  describe("preference hydration", () => {
+    const completed = {
+      id: "visible",
+      text: "Already on screen.",
+      streaming: false,
+    } as const;
+
+    it("waits until both preferences and history are ready", () => {
+      const state = initialThreadSpeechPlannerState();
+      expect(
+        hydrateThreadSpeechPreference(state, {
+          historyReady: false,
+          preferencesReady: true,
+          persistedEnabled: true,
+          latest: completed,
+        }),
+      ).toEqual({ state, actions: [], didHydrate: false });
+      expect(
+        hydrateThreadSpeechPreference(state, {
+          historyReady: true,
+          preferencesReady: false,
+          persistedEnabled: true,
+          latest: completed,
+        }),
+      ).toEqual({ state, actions: [], didHydrate: false });
+    });
+
+    it("applies a persisted preference once both gates open", () => {
+      const hydrated = hydrateThreadSpeechPreference(initialThreadSpeechPlannerState(), {
+        historyReady: true,
+        preferencesReady: true,
+        persistedEnabled: true,
+        latest: completed,
+      });
+      expect(hydrated.didHydrate).toBe(true);
+      expect(hydrated.state).toMatchObject({
+        enabled: true,
+        baselineMessageId: "visible",
+        active: null,
+        hydration: {
+          preferenceHydrated: true,
+          toggledBeforePreferenceHydration: false,
+          earlyToggleNeedsBaseline: false,
+          lastObservedPreference: true,
+        },
+      });
+      expect(updateThreadSpeech(hydrated.state, completed, () => "playback-1").actions).toEqual([]);
+
+      const again = hydrateThreadSpeechPreference(hydrated.state, {
+        historyReady: true,
+        preferencesReady: true,
+        persistedEnabled: false,
+        latest: completed,
+      });
+      expect(again).toEqual({ state: hydrated.state, actions: [], didHydrate: false });
+    });
+
+    it("lets an early toggle after history is ready win over the persisted value", () => {
+      let state = noteThreadSpeechEarlyToggle(initialThreadSpeechPlannerState(), true);
+      state = planThreadSpeechToggle(state, completed, () => "playback-1").state;
+      expect(state.enabled).toBe(true);
+
+      const hydrated = hydrateThreadSpeechPreference(state, {
+        historyReady: true,
+        preferencesReady: true,
+        persistedEnabled: false,
+        latest: completed,
+      });
+      expect(hydrated.didHydrate).toBe(true);
+      expect(hydrated.actions).toEqual([]);
+      expect(hydrated.state.enabled).toBe(true);
+      expect(hydrated.state.hydration).toMatchObject({
+        preferenceHydrated: true,
+        toggledBeforePreferenceHydration: true,
+        earlyToggleNeedsBaseline: false,
+        lastObservedPreference: null,
+      });
+    });
+
+    it("baselines the visible message when the user toggles before history is ready", () => {
+      let state = noteThreadSpeechEarlyToggle(initialThreadSpeechPlannerState(), false);
+      state = planThreadSpeechToggle(state, null, () => "playback-1").state;
+      expect(state.enabled).toBe(true);
+      expect(state.hydration.earlyToggleNeedsBaseline).toBe(true);
+
+      const hydrated = hydrateThreadSpeechPreference(state, {
+        historyReady: true,
+        preferencesReady: true,
+        persistedEnabled: false,
+        latest: completed,
+      });
+      expect(hydrated.state).toMatchObject({
+        enabled: true,
+        baselineMessageId: "visible",
+        active: null,
+        hydration: {
+          preferenceHydrated: true,
+          lastObservedPreference: false,
+        },
+      });
+      expect(updateThreadSpeech(hydrated.state, completed, () => "playback-1").actions).toEqual([]);
+    });
+
+    it("keeps the final early-toggle intent when the user toggles twice", () => {
+      let state = noteThreadSpeechEarlyToggle(initialThreadSpeechPlannerState(), true);
+      state = planThreadSpeechToggle(state, completed, () => "playback-1").state;
+      state = noteThreadSpeechEarlyToggle(state, true);
+      state = planThreadSpeechToggle(state, completed, () => "playback-2").state;
+      expect(state.enabled).toBe(false);
+
+      const hydrated = hydrateThreadSpeechPreference(state, {
+        historyReady: true,
+        preferencesReady: true,
+        persistedEnabled: true,
+        latest: completed,
+      });
+      expect(hydrated.state.enabled).toBe(false);
+    });
+
+    it("synchronizes external preference changes after hydration", () => {
+      const hydrated = hydrateThreadSpeechPreference(initialThreadSpeechPlannerState(), {
+        historyReady: true,
+        preferencesReady: true,
+        persistedEnabled: false,
+        latest: completed,
+      }).state;
+
+      const same = syncExternalThreadSpeechPreference(hydrated, {
+        preferencesReady: true,
+        persistedEnabled: false,
+        latest: completed,
+      });
+      expect(same.kind).toBe("none");
+
+      const enable = syncExternalThreadSpeechPreference(same.state, {
+        preferencesReady: true,
+        persistedEnabled: true,
+        latest: completed,
+      });
+      expect(enable.kind).toBe("enable");
+      expect(enable.state.enabled).toBe(true);
+
+      const disable = syncExternalThreadSpeechPreference(enable.state, {
+        preferencesReady: true,
+        persistedEnabled: false,
+        latest: completed,
+      });
+      expect(disable.kind).toBe("disable_no_persist");
+      expect(disable.state.enabled).toBe(true);
+      expect(disable.state.hydration.lastObservedPreference).toBe(false);
+    });
+
+    it("seeds lastObserved without applying when early-toggle skipped restore", () => {
+      let state = noteThreadSpeechEarlyToggle(initialThreadSpeechPlannerState(), true);
+      state = planThreadSpeechToggle(state, completed, () => "playback-1").state;
+      state = hydrateThreadSpeechPreference(state, {
+        historyReady: true,
+        preferencesReady: true,
+        persistedEnabled: false,
+        latest: completed,
+      }).state;
+      expect(state.hydration.lastObservedPreference).toBeNull();
+
+      const seeded = syncExternalThreadSpeechPreference(state, {
+        preferencesReady: true,
+        persistedEnabled: false,
+        latest: completed,
+      });
+      expect(seeded.kind).toBe("none");
+      expect(seeded.state.hydration.lastObservedPreference).toBe(false);
+      expect(seeded.state.enabled).toBe(true);
+    });
   });
 });

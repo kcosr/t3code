@@ -14,12 +14,14 @@ import { releasePlaybackForRecording } from "./traditionalAudioHandoff";
 import { startReactThreadPlayback } from "./threadSpeechAdapterPolicy";
 import type { ThreadSpeechInput } from "./threadSpeechTypes";
 import {
+  hydrateThreadSpeechPreference,
   initialThreadSpeechPlannerState,
   interruptThreadSpeech,
   isThreadSpeechSuspended,
+  noteThreadSpeechEarlyToggle,
   planThreadSpeechToggle,
-  restoreThreadSpeechPreference,
   setThreadSpeechEnabled,
+  syncExternalThreadSpeechPreference,
   updateThreadSpeech,
   type ThreadSpeechAction,
   type ThreadSpeechPlannerState,
@@ -52,10 +54,6 @@ export function useThreadSpeech(input: ThreadSpeechInput) {
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
   const plannerRef = useRef<ThreadSpeechPlannerState>(initialThreadSpeechPlannerState());
-  const preferenceHydratedRef = useRef(false);
-  const lastObservedPreferenceRef = useRef<boolean | null>(null);
-  const toggledBeforePreferenceHydrationRef = useRef(false);
-  const earlyToggleNeedsBaselineRef = useRef(false);
   const latestRef = useRef(input.latestAssistant);
   latestRef.current = input.latestAssistant;
   const actionChainRef = useRef(Promise.resolve());
@@ -385,6 +383,7 @@ export function useThreadSpeech(input: ThreadSpeechInput) {
       enabled: plannerRef.current.enabled,
       baselineMessageId: input.latestAssistant?.id ?? null,
       active: null,
+      hydration: plannerRef.current.hydration,
     };
     setPlaying(false);
   }, [input.scopeKey, native, prepared]);
@@ -474,62 +473,58 @@ export function useThreadSpeech(input: ThreadSpeechInput) {
   );
 
   useEffect(() => {
+    const result = hydrateThreadSpeechPreference(plannerRef.current, {
+      historyReady: input.historyReady,
+      preferencesReady: AsyncResult.isSuccess(preferencesResult),
+      persistedEnabled:
+        AsyncResult.isSuccess(preferencesResult) &&
+        preferencesResult.value.threadSpeechEnabled === true,
+      latest: latestRef.current,
+    });
+    if (!result.didHydrate) return;
+    plannerRef.current = result.state;
+    // Skip-restore: user already toggled after history was ready; UI already matches.
     if (
-      preferenceHydratedRef.current ||
-      !input.historyReady ||
-      !AsyncResult.isSuccess(preferencesResult)
+      result.state.hydration.toggledBeforePreferenceHydration &&
+      !result.state.hydration.earlyToggleNeedsBaseline
     ) {
       return;
     }
-    preferenceHydratedRef.current = true;
-    if (toggledBeforePreferenceHydrationRef.current && !earlyToggleNeedsBaselineRef.current) {
-      return;
-    }
-
-    const restored = restoreThreadSpeechPreference(
-      plannerRef.current,
-      toggledBeforePreferenceHydrationRef.current
-        ? plannerRef.current.enabled
-        : preferencesResult.value.threadSpeechEnabled === true,
-      latestRef.current,
-    );
-    lastObservedPreferenceRef.current = preferencesResult.value.threadSpeechEnabled === true;
-    plannerRef.current = restored.state;
-    setEnabled(restored.state.enabled);
-    enqueueActions(restored.actions);
+    setEnabled(result.state.enabled);
+    enqueueActions(result.actions);
   }, [enqueueActions, input.historyReady, preferencesResult]);
 
   useEffect(() => {
-    if (!preferenceHydratedRef.current || !AsyncResult.isSuccess(preferencesResult)) return;
-    const requestedEnabled = preferencesResult.value.threadSpeechEnabled === true;
-    const previouslyRequested = lastObservedPreferenceRef.current;
-    lastObservedPreferenceRef.current = requestedEnabled;
-    if (previouslyRequested === null || previouslyRequested === requestedEnabled) return;
-    if (requestedEnabled === plannerRef.current.enabled) return;
-    if (!requestedEnabled) {
+    const result = syncExternalThreadSpeechPreference(plannerRef.current, {
+      preferencesReady: AsyncResult.isSuccess(preferencesResult),
+      persistedEnabled:
+        AsyncResult.isSuccess(preferencesResult) &&
+        preferencesResult.value.threadSpeechEnabled === true,
+      latest: latestRef.current,
+    });
+    plannerRef.current = result.state;
+    if (result.kind === "disable_no_persist") {
       void disableImmediately(false).catch(() => undefined);
       return;
     }
-    const result = setThreadSpeechEnabled(plannerRef.current, requestedEnabled, latestRef.current);
-    plannerRef.current = result.state;
-    setEnabled(requestedEnabled);
-    setError(null);
-    enqueueActions(result.actions);
+    if (result.kind === "enable") {
+      setEnabled(true);
+      setError(null);
+      enqueueActions(result.actions);
+    }
   }, [disableImmediately, enqueueActions, preferencesResult]);
 
   const toggle = useCallback(() => {
     if (!capabilityAvailable) return;
-    if (!preferenceHydratedRef.current) {
-      toggledBeforePreferenceHydrationRef.current = true;
-      earlyToggleNeedsBaselineRef.current ||= !input.historyReady;
-    }
+    const noted = noteThreadSpeechEarlyToggle(plannerRef.current, input.historyReady);
     const result = planThreadSpeechToggle(
-      plannerRef.current,
+      noted,
       latestRef.current,
       uuidv4,
       isThreadSpeechSuspended(suspendedForDictationRef.current, suspendedForRealtimeRef.current),
     );
     if (!result.enabled) {
+      plannerRef.current = result.state;
       void disableImmediately(true).catch(() => undefined);
       return;
     }
