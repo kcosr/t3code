@@ -256,8 +256,14 @@ const canonicalizeJsonValue = (value: unknown): unknown => {
 const canonicalizeArguments = (argumentsJson: string) =>
   Effect.try({
     try: () => jsonOutput(canonicalizeJsonValue(decodeJson(argumentsJson))),
-    catch: () =>
-      voiceError("invalid-phase", "tool.arguments", "Voice tool arguments were not valid JSON"),
+    catch: (cause) =>
+      voiceError(
+        "invalid-phase",
+        "tool.arguments",
+        cause instanceof Error && cause.message.length > 0
+          ? cause.message
+          : "Voice tool arguments were not valid JSON",
+      ),
   });
 
 const decodeCursor = (cursor: string | undefined) => {
@@ -389,6 +395,27 @@ const decodePersistedTerminalResult = Schema.decodeUnknownOption(
   Schema.fromJsonString(PersistedTerminalResult),
 );
 
+const schemaErrorDetail = (error: unknown): string => {
+  if (Schema.isSchemaError(error)) {
+    return error.message;
+  }
+  if (error instanceof Error && error.message.length > 0) {
+    return error.message;
+  }
+  return "Voice tool arguments were invalid";
+};
+
+/** Prefer VoiceError.detail so tool outputs expose the schema issue, not the tagged wrapper. */
+const toolFailureDetail = (cause: unknown): string => {
+  if (cause instanceof VoiceError) {
+    return cause.detail;
+  }
+  if (cause instanceof Error && cause.message.length > 0) {
+    return cause.message;
+  }
+  return "Invalid tool arguments";
+};
+
 const parseArguments = <A>(
   schema: Schema.Codec<A, unknown, never, never>,
   input: VoiceToolCallInput,
@@ -396,8 +423,8 @@ const parseArguments = <A>(
   Schema.decodeUnknownEffect(Schema.fromJsonString(schema), {
     onExcessProperty: "error",
   })(input.argumentsJson).pipe(
-    Effect.mapError(() =>
-      voiceError("invalid-phase", "tool.arguments", "Voice tool arguments were invalid"),
+    Effect.mapError((error) =>
+      voiceError("invalid-phase", "tool.arguments", schemaErrorDetail(error)),
     ),
   );
 
@@ -1344,7 +1371,7 @@ const make = Effect.gen(function* () {
             Effect.match({
               onFailure: (cause) =>
                 ({
-                  error: cause instanceof Error ? cause.message : "Invalid tool arguments",
+                  error: toolFailureDetail(cause),
                 }) as const,
               onSuccess: (value) => ({ value }) as const,
             }),
@@ -1498,7 +1525,7 @@ const make = Effect.gen(function* () {
           Effect.match({
             onFailure: (cause) =>
               jsonOutput({
-                error: cause instanceof Error ? cause.message : "Invalid tool arguments",
+                error: toolFailureDetail(cause),
               }),
             onSuccess: (value) => value,
           }),

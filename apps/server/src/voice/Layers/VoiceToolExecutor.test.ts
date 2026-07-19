@@ -1369,8 +1369,7 @@ it.effect("rejects a wait for a message owned by another thread", () =>
       );
       expect(result.type === "completed" ? result.outcome : undefined).toBe("failed");
       expect(result.type === "completed" ? decodeJson(result.output) : undefined).toEqual({
-        error:
-          "Voice tool.wait-for-thread-turn failed (invalid-phase): The dispatched thread message was not found",
+        error: "The dispatched thread message was not found",
       });
     }).pipe(Effect.provide(test.layer));
   }),
@@ -1404,8 +1403,7 @@ it.effect("rejects a wait for a non-user message in the requested thread", () =>
       );
       expect(result.type === "completed" ? result.outcome : undefined).toBe("failed");
       expect(result.type === "completed" ? decodeJson(result.output) : undefined).toEqual({
-        error:
-          "Voice tool.wait-for-thread-turn failed (invalid-phase): The dispatched thread message was not found",
+        error: "The dispatched thread message was not found",
       });
     }).pipe(Effect.provide(test.layer));
   }),
