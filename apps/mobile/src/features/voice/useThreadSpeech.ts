@@ -360,6 +360,9 @@ export function useThreadSpeech(input: ThreadSpeechInput) {
   );
 
   useEffect(() => {
+    // Wait until preference hydration has baselined (or skipped restore) so an early
+    // pre-history enable cannot start playback of the already-visible message.
+    if (!plannerRef.current.hydration.preferenceHydrated) return;
     const result = updateThreadSpeech(
       plannerRef.current,
       input.latestAssistant,
@@ -368,7 +371,7 @@ export function useThreadSpeech(input: ThreadSpeechInput) {
     );
     plannerRef.current = result.state;
     enqueueActions(result.actions);
-  }, [enqueueActions, input.latestAssistant]);
+  }, [enqueueActions, input.latestAssistant, input.historyReady, preferencesResult]);
 
   useEffect(() => {
     ++operationGenerationRef.current;

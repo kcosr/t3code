@@ -399,6 +399,25 @@ describe("threadSpeechPlanner", () => {
       expect(disable.state.hydration.lastObservedPreference).toBe(false);
     });
 
+    it("baselines before later planning so pre-history enable does not replay", () => {
+      let state = noteThreadSpeechEarlyToggle(initialThreadSpeechPlannerState(), false);
+      state = planThreadSpeechToggle(state, null, () => "playback-early").state;
+      expect(state.enabled).toBe(true);
+      expect(state.baselineMessageId).toBeNull();
+
+      // History arrives: planning before hydrate would start the visible message.
+      const unguarded = updateThreadSpeech(state, completed, () => "playback-race");
+      expect(unguarded.actions.some((action) => action.type === "start")).toBe(true);
+
+      const hydrated = hydrateThreadSpeechPreference(state, {
+        historyReady: true,
+        preferencesReady: true,
+        persistedEnabled: false,
+        latest: completed,
+      });
+      expect(updateThreadSpeech(hydrated.state, completed, () => "playback-1").actions).toEqual([]);
+    });
+
     it("seeds lastObserved without applying when early-toggle skipped restore", () => {
       let state = noteThreadSpeechEarlyToggle(initialThreadSpeechPlannerState(), true);
       state = planThreadSpeechToggle(state, completed, () => "playback-1").state;
