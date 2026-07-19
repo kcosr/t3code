@@ -79,8 +79,6 @@ const entryToItem = (entry: VoiceConversationJournalEntry): RealtimeContextItem 
       if (decoded._tag === "Failure") return undefined;
       return voiceFocusContextItem(decoded.value);
     }
-    case "call-boundary":
-    case "device-handoff":
     case "context-cleared":
     case "tool-request":
       return undefined;

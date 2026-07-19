@@ -32,8 +32,6 @@ export const VoiceConversationJournalEntryKind = Schema.Literals([
   "tool-request",
   "tool-result",
   "context-change",
-  "call-boundary",
-  "device-handoff",
   "context-cleared",
 ]);
 export type VoiceConversationJournalEntryKind = typeof VoiceConversationJournalEntryKind.Type;

@@ -32,7 +32,7 @@ it.effect("compiles normalized journal entries without provider state", () =>
         entry(1, "summary", { version: 1, text: "The user is working in T3." }),
         entry(2, "transcript.user", { text: "Open my active thread." }),
         entry(3, "tool-result", { tool: "get_thread_status", outcome: "succeeded" }),
-        entry(4, "call-boundary", { reason: "handoff" }),
+        entry(4, "tool-request", { tool: "get_thread_status" }),
       ],
     });
 
