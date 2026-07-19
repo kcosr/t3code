@@ -64,10 +64,13 @@ export function useOptionalVoiceRuntime(): VoiceRuntimeContextValue | null {
 function waitForThreadTurnIdle(input: {
   readonly environmentId: EnvironmentId;
   readonly threadId: import("@t3tools/contracts").ThreadId;
+  readonly messageId: import("@t3tools/contracts").MessageId;
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
 }): Promise<WebThreadTurnWaitResult> {
   const started = Date.now();
+  let sawRunning = false;
+  let baselineMessageCount: number | null = null;
   return new Promise((resolve) => {
     const tick = () => {
       if (input.signal?.aborted) {
@@ -90,8 +93,12 @@ function waitForThreadTurnIdle(input: {
         if (thread == null) {
           return;
         }
+        const messages = thread.messages ?? [];
+        baselineMessageCount ??= messages.length;
         const session = thread.session;
-        if (session?.status === "running" && session.activeTurnId != null) {
+        const running = session?.status === "running" && session.activeTurnId != null;
+        if (running) {
+          sawRunning = true;
           const attentionActivity = thread.activities.find(
             (activity) =>
               activity.tone === "approval" ||
@@ -113,13 +120,40 @@ function waitForThreadTurnIdle(input: {
           }
           return;
         }
-        const messages = thread.messages ?? [];
+        // Do not complete on pre-start idle — wait until we have observed running
+        // (or a new assistant message after our user message appears).
+        const userMessageIndex = messages.findIndex((message) => message.id === input.messageId);
+        if (!sawRunning && userMessageIndex < 0) {
+          return;
+        }
+        if (!sawRunning && userMessageIndex >= 0) {
+          // Turn may complete very quickly; also accept a newer assistant message after ours.
+          const laterAssistant = messages
+            .slice(userMessageIndex + 1)
+            .find((message) => message.role === "assistant" && message.text.trim().length > 0);
+          if (laterAssistant == null) {
+            return;
+          }
+          cleanup();
+          resolve({ status: "completed", assistantText: laterAssistant.text });
+          return;
+        }
         let assistantText: string | null = null;
-        for (let i = messages.length - 1; i >= 0; i -= 1) {
-          const message = messages[i]!;
-          if (message.role === "assistant" && message.text.trim().length > 0) {
-            assistantText = message.text;
-            break;
+        if (userMessageIndex >= 0) {
+          for (let i = userMessageIndex + 1; i < messages.length; i += 1) {
+            const message = messages[i]!;
+            if (message.role === "assistant" && message.text.trim().length > 0) {
+              assistantText = message.text;
+              break;
+            }
+          }
+        } else {
+          for (let i = messages.length - 1; i >= Math.max(0, baselineMessageCount); i -= 1) {
+            const message = messages[i]!;
+            if (message.role === "assistant" && message.text.trim().length > 0) {
+              assistantText = message.text;
+              break;
+            }
           }
         }
         cleanup();
@@ -197,6 +231,7 @@ export function VoiceRuntimeProvider(props: { readonly children: ReactNode }) {
         waitForThreadTurnIdle({
           environmentId: input.environmentId,
           threadId: input.threadId,
+          messageId: input.messageId,
           timeoutMs: input.timeoutMs,
           ...(input.signal !== undefined ? { signal: input.signal } : {}),
         }),

@@ -321,11 +321,40 @@ export function makeVoiceMultiTabLock(input: MakeVoiceMultiTabLockInput = {}): V
         return true;
       }
       if (leaderTabId !== null && leaderTabId !== tabId) {
-        return false;
-      }
-      // Stale storage leader with no live announce: claim after short probe.
-      if (leaderTabId !== null && leaderTabId !== tabId) {
-        return false;
+        // Probe for a live leader; reclaim if they do not answer (crashed tab).
+        if (channel === null) {
+          becomeLeader(environmentId);
+          return true;
+        }
+        let heardLiveLeader = false;
+        const previousOnMessage = channel.onmessage;
+        channel.onmessage = (event: MessageEvent<LockMessage>) => {
+          previousOnMessage?.call(channel, event);
+          const data = event.data;
+          if (
+            data &&
+            typeof data === "object" &&
+            data.type === "announce" &&
+            data.tabId !== tabId
+          ) {
+            heardLiveLeader = true;
+          }
+        };
+        channel.postMessage({ type: "probe", fromTabId: tabId } satisfies LockMessage);
+        await new Promise<void>((resolve) => setTimeout(resolve, 350));
+        channel.onmessage = previousOnMessage;
+        if (disposed) return false;
+        if (leaderTabId === tabId) {
+          ownerEnvironmentId = environmentId;
+          publish();
+          return true;
+        }
+        if (heardLiveLeader) {
+          return false;
+        }
+        // Silence → reclaim stale lock left by a crashed leader.
+        becomeLeader(environmentId);
+        return true;
       }
       becomeLeader(environmentId);
       return true;

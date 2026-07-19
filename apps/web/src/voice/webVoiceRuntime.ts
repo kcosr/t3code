@@ -159,6 +159,12 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
   let reviewTranscript: string | null = null;
   let reviewId = 0;
   let pcmPlayer: PcmPlayer | null = null;
+  let threadCycleRunning = false;
+  let resolveManualFinish: ((reason: "manual") => void) | null = null;
+  type ReviewResolution =
+    | { readonly action: "submit"; readonly transcript: string }
+    | { readonly action: "discard" };
+  let resolveReview: ((resolution: ReviewResolution) => void) | null = null;
 
   const multiTab = makeVoiceMultiTabLock({
     onTakeoverRequest: async () => {
@@ -444,129 +450,154 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
       ? ["stop-realtime", "switch-to-thread"]
       : ["stop-realtime"];
 
+    // Acquire mic early (user-gesture window) before longer network round-trips.
     const localStream = await requestMicrophoneStream();
     if (options?.signal?.aborted) {
       for (const track of localStream.getTracks()) track.stop();
       throw new Error("Voice start was cancelled");
     }
 
-    await mediaGate.admit("realtime", async () => ({
-      release: async () => {
-        // Release is driven by stopPeer / stopInternal.
-      },
-    }));
-
-    const session = await Effect.runPromise(
-      client.createSession({
-        mode: "realtime-agent",
-        conversation: target.conversation,
-        ...(target.focus
-          ? { projectId: target.focus.projectId, threadId: target.focus.threadId }
-          : {}),
-        terminalActions: [...terminalActions],
-        media: {
-          transports: [...WEB_MEDIA_CAPABILITIES.transports],
-          audioFormats: [...WEB_MEDIA_CAPABILITIES.audioFormats],
-          supportsInputRouteSelection: false,
-          supportsOutputRouteSelection: false,
+    let peer: RTCPeerConnection | null = null;
+    let remoteAudio: HTMLAudioElement | null = null;
+    try {
+      await mediaGate.admit("realtime", async () => ({
+        release: async () => {
+          // Release is driven by stopPeer / stopInternal once active.
         },
-        idempotencyKey: randomId(),
-      }),
-      { signal: options?.signal },
-    );
+      }));
 
-    const peer = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-    });
-    for (const track of localStream.getAudioTracks()) {
-      peer.addTrack(track, localStream);
-    }
+      const session = await Effect.runPromise(
+        client.createSession({
+          mode: "realtime-agent",
+          conversation: target.conversation,
+          ...(target.focus
+            ? { projectId: target.focus.projectId, threadId: target.focus.threadId }
+            : {}),
+          terminalActions: [...terminalActions],
+          media: {
+            transports: [...WEB_MEDIA_CAPABILITIES.transports],
+            audioFormats: [...WEB_MEDIA_CAPABILITIES.audioFormats],
+            supportsInputRouteSelection: false,
+            supportsOutputRouteSelection: false,
+          },
+          idempotencyKey: randomId(),
+        }),
+        { signal: options?.signal },
+      );
 
-    const remoteAudio = document.createElement("audio");
-    remoteAudio.autoplay = true;
-    peer.ontrack = (event) => {
-      if (event.streams[0]) {
-        remoteAudio.srcObject = event.streams[0];
-        void remoteAudio.play().catch(() => undefined);
-      }
-    };
-
-    const offer = await peer.createOffer({ offerToReceiveAudio: true });
-    await peer.setLocalDescription(offer);
-    // Wait briefly for ICE gathering in environments without trickle support.
-    if (peer.iceGatheringState !== "complete") {
-      await new Promise<void>((resolve) => {
-        const timeout = setTimeout(() => resolve(), 2_000);
-        peer.onicegatheringstatechange = () => {
-          if (peer.iceGatheringState === "complete") {
-            clearTimeout(timeout);
-            resolve();
-          }
-        };
+      peer = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
       });
-    }
-    const localSdp = peer.localDescription?.sdp;
-    if (localSdp == null || localSdp.trim() === "") {
-      throw new Error("Failed to create a WebRTC offer for Realtime voice");
-    }
+      for (const track of localStream.getAudioTracks()) {
+        peer.addTrack(track, localStream);
+      }
 
-    const answer = await Effect.runPromise(
-      client.offerSession({
-        sessionId: session.state.sessionId,
-        leaseGeneration: session.state.leaseGeneration,
-        sdp: localSdp,
-      }),
-      { signal: options?.signal },
-    );
-    await peer.setRemoteDescription({ type: "answer", sdp: answer.sdp });
+      remoteAudio = document.createElement("audio");
+      remoteAudio.autoplay = true;
+      peer.ontrack = (event) => {
+        if (event.streams[0] && remoteAudio !== null) {
+          remoteAudio.srcObject = event.streams[0];
+          void remoteAudio.play().catch(() => undefined);
+        }
+      };
 
-    const timers = makeVoiceLeaseTimers();
-    const eventLoop = new AbortController();
-    const realtime: ActiveRealtime = {
-      sessionId: session.state.sessionId,
-      conversationId: session.state.conversationId,
-      leaseGeneration: session.state.leaseGeneration,
-      heartbeatIntervalSeconds: session.heartbeatIntervalSeconds,
-      peer,
-      localStream,
-      remoteAudio,
-      client,
-      target,
-      muted: false,
-      transcript: [],
-      pendingConfirmations: [],
-      pendingClientActions: [],
-      afterSequence: session.state.sequence,
-      eventLoop,
-      timers,
-      heartbeatHandle: null,
-    };
-    activeRealtime = realtime;
-
-    realtime.heartbeatHandle = timers.interval(
-      Math.max(1, session.heartbeatIntervalSeconds) * 1_000,
-      () => {
-        if (activeRealtime !== realtime) return;
-        void Effect.runPromise(
-          client.heartbeatSession(realtime.sessionId, realtime.leaseGeneration),
-        ).catch(async (cause) => {
-          if (activeRealtime !== realtime) return;
-          await failAndRelease(
-            target.environmentId,
-            "realtime",
-            failureOf(
-              "heartbeat-failed",
-              cause instanceof Error ? cause.message : "Voice heartbeat failed",
-              true,
-            ),
-          );
+      const offer = await peer.createOffer({ offerToReceiveAudio: true });
+      await peer.setLocalDescription(offer);
+      // Wait briefly for ICE gathering in environments without trickle support.
+      if (peer.iceGatheringState !== "complete") {
+        await new Promise<void>((resolve) => {
+          const timeout = setTimeout(() => resolve(), 2_000);
+          peer!.onicegatheringstatechange = () => {
+            if (peer!.iceGatheringState === "complete") {
+              clearTimeout(timeout);
+              resolve();
+            }
+          };
         });
-      },
-    );
+      }
+      const localSdp = peer.localDescription?.sdp;
+      if (localSdp == null || localSdp.trim() === "") {
+        throw new Error("Failed to create a WebRTC offer for Realtime voice");
+      }
 
-    runEventLoop(realtime);
-    multiTab.setOwnerEnvironment(target.environmentId);
-    publishRealtime(realtime, "connected");
+      const answer = await Effect.runPromise(
+        client.offerSession({
+          sessionId: session.state.sessionId,
+          leaseGeneration: session.state.leaseGeneration,
+          sdp: localSdp,
+        }),
+        { signal: options?.signal },
+      );
+      await peer.setRemoteDescription({ type: "answer", sdp: answer.sdp });
+
+      const timers = makeVoiceLeaseTimers();
+      const eventLoop = new AbortController();
+      const realtime: ActiveRealtime = {
+        sessionId: session.state.sessionId,
+        conversationId: session.state.conversationId,
+        leaseGeneration: session.state.leaseGeneration,
+        heartbeatIntervalSeconds: session.heartbeatIntervalSeconds,
+        peer,
+        localStream,
+        remoteAudio,
+        client,
+        target,
+        muted: false,
+        transcript: [],
+        pendingConfirmations: [],
+        pendingClientActions: [],
+        afterSequence: session.state.sequence,
+        eventLoop,
+        timers,
+        heartbeatHandle: null,
+      };
+      activeRealtime = realtime;
+
+      realtime.heartbeatHandle = timers.interval(
+        Math.max(1, session.heartbeatIntervalSeconds) * 1_000,
+        () => {
+          if (activeRealtime !== realtime) return;
+          void Effect.runPromise(
+            client.heartbeatSession(realtime.sessionId, realtime.leaseGeneration),
+          ).catch(async (cause) => {
+            if (activeRealtime !== realtime) return;
+            await failAndRelease(
+              target.environmentId,
+              "realtime",
+              failureOf(
+                "heartbeat-failed",
+                cause instanceof Error ? cause.message : "Voice heartbeat failed",
+                true,
+              ),
+            );
+          });
+        },
+      );
+
+      runEventLoop(realtime);
+      multiTab.setOwnerEnvironment(target.environmentId);
+      publishRealtime(realtime, "connected");
+    } catch (cause) {
+      // Mic/peer may leak if we fail before activeRealtime is assigned.
+      try {
+        peer?.close();
+      } catch {
+        // ignore
+      }
+      for (const track of localStream.getTracks()) {
+        track.stop();
+      }
+      if (remoteAudio !== null) {
+        try {
+          remoteAudio.pause();
+          remoteAudio.srcObject = null;
+        } catch {
+          // ignore
+        }
+      }
+      await mediaGate.releaseExact().catch(() => undefined);
+      throw cause;
+    }
   };
 
   const failAndRelease = async (
@@ -597,6 +628,9 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
   const stopInternal = async (_reason: string) => {
     const realtime = activeRealtime;
     activeRealtime = null;
+    resolveReview?.({ action: "discard" });
+    resolveReview = null;
+    resolveManualFinish = null;
     threadAbort?.abort();
     threadAbort = null;
     pcmPlayer?.cancel();
@@ -661,56 +695,31 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
   };
 
   const runThreadCycle = async (input: VoiceThreadStartInput) => {
+    if (threadCycleRunning) {
+      throw new Error("Thread voice cycle is already running");
+    }
+    threadCycleRunning = true;
     const prepared = hooks.getPrepared(input.target.environmentId);
     if (prepared === null) {
+      threadCycleRunning = false;
       throw new Error("A prepared environment connection is required for Thread voice");
     }
     if (hooks.dispatchThreadTurn == null || hooks.waitForThreadTurn == null) {
+      threadCycleRunning = false;
       throw new Error("Thread voice orchestration hooks are not configured");
     }
 
-    await ensureLeader(input.target.environmentId);
-    const gen = bumpGeneration();
-    threadAbort?.abort();
-    const abort = new AbortController();
-    threadAbort = abort;
-
-    publishNext({
-      mode: "thread",
-      phase: "starting",
-      generation: gen,
-      target: input.target,
-      settings: input.settings,
-      transcript: null,
-      reviewId: null,
-      attention: null,
-    });
-
-    await mediaGate.admit("thread-auto-listen", async () => ({
-      release: async () => {
-        abort.abort();
-        pcmPlayer?.cancel();
-      },
-    }));
-
-    const client = await makeClient(prepared);
-    const capabilities = await Effect.runPromise(client.capabilities(), { signal: abort.signal });
-    const sttCap = capabilities.capabilities.find(
-      (item) => item.capability === "transcription.request",
-    );
-    if (sttCap?.state !== "ready") {
-      throw new Error("Voice transcription is not ready on this environment");
-    }
-
-    // Continuous loop for autoRearm; single pass otherwise.
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      if (abort.signal.aborted) break;
+    try {
+      await ensureLeader(input.target.environmentId);
+      const gen = bumpGeneration();
+      threadAbort?.abort();
+      const abort = new AbortController();
+      threadAbort = abort;
 
       publishNext({
         mode: "thread",
-        phase: "recording",
-        generation,
+        phase: "starting",
+        generation: gen,
         target: input.target,
         settings: input.settings,
         transcript: null,
@@ -718,37 +727,209 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         attention: null,
       });
 
-      const stream = await requestMicrophoneStream();
-      const capture = await startAudioCapture(stream);
-      let endpoint: "silence" | "no-speech" | "max-utterance" | "manual" = "manual";
-      try {
-        endpoint = await waitForEndpoint({
-          capture,
-          config: input.settings.endpointDetection,
-          signal: abort.signal,
-        });
-      } catch (cause) {
-        capture.stop();
-        if (abort.signal.aborted) break;
-        throw cause;
+      await mediaGate.admit("thread-auto-listen", async () => ({
+        release: async () => {
+          resolveReview?.({ action: "discard" });
+          resolveReview = null;
+          resolveManualFinish = null;
+          abort.abort();
+          pcmPlayer?.cancel();
+        },
+      }));
+
+      const client = await makeClient(prepared);
+      const capabilities = await Effect.runPromise(client.capabilities(), { signal: abort.signal });
+      const sttCap = capabilities.capabilities.find(
+        (item) => item.capability === "transcription.request",
+      );
+      if (sttCap?.state !== "ready") {
+        throw new Error("Voice transcription is not ready on this environment");
       }
 
-      publishNext({
-        mode: "thread",
-        phase: "finalizing",
-        generation,
-        target: input.target,
-        settings: input.settings,
-        transcript: null,
-        reviewId: null,
-        attention: null,
-      });
+      // Continuous loop for autoRearm; single pass otherwise.
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        if (abort.signal.aborted) break;
 
-      const pcm = capture.getPcmMono();
-      capture.stop();
+        publishNext({
+          mode: "thread",
+          phase: "recording",
+          generation,
+          target: input.target,
+          settings: input.settings,
+          transcript: null,
+          reviewId: null,
+          attention: null,
+        });
 
-      if (endpoint === "no-speech" || pcm.length < 1600) {
+        const stream = await requestMicrophoneStream();
+        const capture = await startAudioCapture(stream);
+        let endpoint: "silence" | "no-speech" | "max-utterance" | "manual" = "manual";
+        try {
+          endpoint = await new Promise<"silence" | "no-speech" | "max-utterance" | "manual">(
+            (resolve, reject) => {
+              resolveManualFinish = resolve;
+              void waitForEndpoint({
+                capture,
+                config: input.settings.endpointDetection,
+                signal: abort.signal,
+              }).then(
+                (reason) => {
+                  resolveManualFinish = null;
+                  resolve(reason);
+                },
+                (cause) => {
+                  resolveManualFinish = null;
+                  reject(cause);
+                },
+              );
+            },
+          );
+        } catch (cause) {
+          capture.stop();
+          if (abort.signal.aborted) break;
+          throw cause;
+        } finally {
+          resolveManualFinish = null;
+        }
+
+        publishNext({
+          mode: "thread",
+          phase: "finalizing",
+          generation,
+          target: input.target,
+          settings: input.settings,
+          transcript: null,
+          reviewId: null,
+          attention: null,
+        });
+
+        const pcm = capture.getPcmMono();
+        capture.stop();
+
+        if (endpoint === "no-speech" || pcm.length < 1600) {
+          if (!input.settings.autoRearm) break;
+          publishNext({
+            mode: "thread",
+            phase: "rearming",
+            generation,
+            target: input.target,
+            settings: input.settings,
+            transcript: null,
+            reviewId: null,
+            attention: null,
+          });
+          await delay(input.settings.rearmDelayMs, abort.signal);
+          continue;
+        }
+
+        publishNext({
+          mode: "thread",
+          phase: "transcribing",
+          generation,
+          target: input.target,
+          settings: input.settings,
+          transcript: null,
+          reviewId: null,
+          attention: null,
+        });
+
+        const encoded = await encodeMonoPcmToAacMp4({
+          pcm,
+          sampleRate: Math.round(
+            // Prefer 24 kHz when the capture rate is high enough; encoder uses native rate.
+            capture.sampleRate,
+          ),
+        });
+
+        const requestId = createRequestId() as VoiceRequestId;
+        const ticket = await Effect.runPromise(
+          client.createMediaTicket({ operation: "transcription-upload", requestId }),
+          { signal: abort.signal },
+        );
+
+        let transcriptText = "";
+        await Stream.runForEach(
+          client.transcribe({
+            audio: {
+              kind: "blob",
+              value: encoded.blob,
+              filename: "utterance.mp4",
+            },
+            metadata: {
+              requestId,
+              format: "audio/mp4",
+            },
+            ticket,
+          }),
+          (event) =>
+            Effect.sync(() => {
+              if (event.type === "delta") {
+                transcriptText += event.text;
+              } else if (event.type === "final") {
+                transcriptText = event.result.text;
+              }
+            }),
+        ).pipe(Effect.runPromise);
+
+        transcriptText = transcriptText.trim();
+        if (transcriptText.length === 0) {
+          if (!input.settings.autoRearm) break;
+          await delay(input.settings.rearmDelayMs, abort.signal);
+          continue;
+        }
+
+        let transcriptToSubmit = transcriptText;
+        if (input.settings.submission === "review") {
+          reviewId += 1;
+          reviewTranscript = transcriptText;
+          publishNext({
+            mode: "thread",
+            phase: "reviewing",
+            generation,
+            target: input.target,
+            settings: input.settings,
+            transcript: transcriptText,
+            reviewId,
+            attention: null,
+          });
+          // Cycle owns submit + teardown; submitThreadTranscript only resolves this.
+          const reviewOutcome = await new Promise<ReviewResolution>((resolve) => {
+            const onAbort = () => {
+              resolveReview = null;
+              resolve({ action: "discard" });
+            };
+            if (abort.signal.aborted) {
+              onAbort();
+              return;
+            }
+            abort.signal.addEventListener("abort", onAbort, { once: true });
+            resolveReview = (resolution) => {
+              abort.signal.removeEventListener("abort", onAbort);
+              resolveReview = null;
+              resolve(resolution);
+            };
+          });
+
+          if (reviewOutcome.action === "discard" || abort.signal.aborted) {
+            break;
+          }
+          transcriptToSubmit =
+            reviewOutcome.transcript.trim().length > 0
+              ? reviewOutcome.transcript.trim()
+              : transcriptText;
+        }
+
+        await submitTranscriptAndWait({
+          input,
+          client,
+          transcript: transcriptToSubmit,
+          abort,
+        });
+
+        if (abort.signal.aborted) break;
         if (!input.settings.autoRearm) break;
+
         publishNext({
           mode: "thread",
           phase: "rearming",
@@ -760,125 +941,18 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
           attention: null,
         });
         await delay(input.settings.rearmDelayMs, abort.signal);
-        continue;
       }
 
-      publishNext({
-        mode: "thread",
-        phase: "transcribing",
-        generation,
-        target: input.target,
-        settings: input.settings,
-        transcript: null,
-        reviewId: null,
-        attention: null,
-      });
-
-      const encoded = await encodeMonoPcmToAacMp4({
-        pcm,
-        sampleRate: Math.round(
-          // Prefer 24 kHz when the capture rate is high enough; encoder uses native rate.
-          capture.sampleRate,
-        ),
-      });
-
-      const requestId = createRequestId() as VoiceRequestId;
-      const ticket = await Effect.runPromise(
-        client.createMediaTicket({ operation: "transcription-upload", requestId }),
-        { signal: abort.signal },
-      );
-
-      let transcriptText = "";
-      await Stream.runForEach(
-        client.transcribe({
-          audio: {
-            kind: "blob",
-            value: encoded.blob,
-            filename: "utterance.mp4",
-          },
-          metadata: {
-            requestId,
-            format: "audio/mp4",
-          },
-          ticket,
-        }),
-        (event) =>
-          Effect.sync(() => {
-            if (event.type === "delta") {
-              transcriptText += event.text;
-            } else if (event.type === "final") {
-              transcriptText = event.result.text;
-            }
-          }),
-      ).pipe(Effect.runPromise);
-
-      transcriptText = transcriptText.trim();
-      if (transcriptText.length === 0) {
-        if (!input.settings.autoRearm) break;
-        await delay(input.settings.rearmDelayMs, abort.signal);
-        continue;
+      if (!abort.signal.aborted) {
+        await mediaGate.releaseExact();
+        multiTab.release();
+        const doneGen = bumpGeneration();
+        publish(idleSnapshot(doneGen, sequence + 1));
       }
-
-      if (input.settings.submission === "review") {
-        reviewId += 1;
-        reviewTranscript = transcriptText;
-        publishNext({
-          mode: "thread",
-          phase: "reviewing",
-          generation,
-          target: input.target,
-          settings: input.settings,
-          transcript: transcriptText,
-          reviewId,
-          attention: null,
-        });
-        // Wait until submitThreadTranscript or stop.
-        await waitUntil(
-          () =>
-            abort.signal.aborted || snapshot.mode !== "thread" || snapshot.phase !== "reviewing",
-          abort.signal,
-        );
-        if (abort.signal.aborted || snapshot.mode !== "thread") break;
-        if (snapshot.phase === "stopping") break;
-        // After submit, snapshot moves to submitting/waiting inside submit handler.
-        // Continue loop only after a full cycle completes back to rearming/idle path.
-        if (snapshot.mode === "thread" && snapshot.phase === "rearming") {
-          await delay(input.settings.rearmDelayMs, abort.signal);
-          if (!input.settings.autoRearm) break;
-          continue;
-        }
-        if (!input.settings.autoRearm) break;
-        continue;
-      }
-
-      await submitTranscriptAndWait({
-        input,
-        client,
-        transcript: transcriptText,
-        abort,
-      });
-
-      if (abort.signal.aborted) break;
-      if (!input.settings.autoRearm) break;
-
-      publishNext({
-        mode: "thread",
-        phase: "rearming",
-        generation,
-        target: input.target,
-        settings: input.settings,
-        transcript: null,
-        reviewId: null,
-        attention: null,
-      });
-      await delay(input.settings.rearmDelayMs, abort.signal);
-    }
-
-    if (!abort.signal.aborted) {
-      await mediaGate.releaseExact();
-      multiTab.release();
-      const doneGen = bumpGeneration();
-      publish(idleSnapshot(doneGen, sequence + 1));
+    } finally {
+      threadCycleRunning = false;
+      resolveReview = null;
+      resolveManualFinish = null;
     }
   };
 
@@ -1004,7 +1078,22 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
       target: input.target,
       settings: input.settings,
     });
-    await runThreadCycle(input);
+    // Detach cycle so callers (terminal-action / startThread) do not hold the transition.
+    void runThreadCycle(input).catch(async (cause) => {
+      if (cause instanceof DOMException && cause.name === "AbortError") {
+        await stopInternal("aborted");
+        return;
+      }
+      await failAndRelease(
+        input.target.environmentId,
+        "switching-to-thread",
+        failureOf(
+          "switch-to-thread-failed",
+          cause instanceof Error ? cause.message : "Failed to switch to Thread voice",
+          true,
+        ),
+      );
+    });
   };
 
   const command = async (operation: () => Promise<void>): Promise<void> => {
@@ -1057,13 +1146,33 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     startThread: (input) =>
       command(async () => {
         if (snapshot.mode === "realtime") {
-          await switchRealtimeToThreadInternal(input);
+          // Handoff admission under the transition; cycle itself is detached.
+          const realtime = activeRealtime;
+          activeRealtime = null;
+          const gen = bumpGeneration();
+          publishNext({
+            mode: "switching-to-thread",
+            phase: "closing-realtime",
+            generation: gen,
+            target: input.target,
+            settings: input.settings,
+          });
+          if (realtime !== null) {
+            await stopPeer(realtime);
+          }
+          await mediaGate.releaseExact();
+          publishNext({
+            mode: "switching-to-thread",
+            phase: "starting-recorder",
+            generation: gen,
+            target: input.target,
+            settings: input.settings,
+          });
+        } else if (snapshot.mode === "thread" || threadCycleRunning) {
           return;
         }
-        if (snapshot.mode === "thread") return;
-        try {
-          await runThreadCycle(input);
-        } catch (cause) {
+        // Detach the long-running cycle so stop()/startRealtime stay available.
+        void runThreadCycle(input).catch(async (cause) => {
           if (cause instanceof DOMException && cause.name === "AbortError") {
             await stopInternal("aborted");
             return;
@@ -1077,27 +1186,9 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
               true,
             ),
           );
-        }
+        });
       }),
-    switchRealtimeToThread: (input) =>
-      command(async () => {
-        if (snapshot.mode !== "realtime") {
-          throw new Error("Realtime voice is not active");
-        }
-        try {
-          await switchRealtimeToThreadInternal(input);
-        } catch (cause) {
-          await failAndRelease(
-            input.target.environmentId,
-            "switching-to-thread",
-            failureOf(
-              "switch-to-thread-failed",
-              cause instanceof Error ? cause.message : "Failed to switch to Thread voice",
-              true,
-            ),
-          );
-        }
-      }),
+    switchRealtimeToThread: (input) => adapter.startThread(input),
     stop: () => command(async () => stopInternal("user-stop")),
     setRealtimeMuted: async (muted) => {
       if (activeRealtime === null) return;
@@ -1114,7 +1205,8 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         focus: context.focus,
         threadSettings: context.threadSettings,
       };
-      activeRealtime = { ...activeRealtime, target: nextTarget };
+      // Mutate in place — heartbeat/event-loop fence on object identity.
+      (activeRealtime as { target: VoiceRealtimeTarget }).target = nextTarget;
       const terminalActions: WebVoiceTerminalActions = advertiseSwitchToThread
         ? ["stop-realtime", "switch-to-thread"]
         : ["stop-realtime"];
@@ -1179,13 +1271,9 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
       publishRealtime(activeRealtime, "connected");
     },
     finishThreadRecording: async () => {
-      // Endpoint loop treats abort of wait as stop; manual finish is modeled by
-      // aborting the current endpoint wait via a dedicated signal path.
-      // For v1, stop the cycle after current utterance by flipping settings.
       if (snapshot.mode === "thread" && snapshot.phase === "recording") {
-        // Force silence endpoint by aborting and letting the cycle finalize
-        // with whatever PCM has been captured — simplified: stop entirely.
-        threadAbort?.abort();
+        resolveManualFinish?.("manual");
+        resolveManualFinish = null;
       }
     },
     updateThreadReviewTranscript: async (token, transcript) => {
@@ -1212,46 +1300,12 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
       ) {
         return;
       }
-      const input: VoiceThreadStartInput = {
-        target: snapshot.target,
-        settings: snapshot.settings,
-      };
-      const prepared = hooks.getPrepared(input.target.environmentId);
-      if (prepared === null) throw new Error("Missing prepared connection");
-      const client = await makeClient(prepared);
-      const abort = threadAbort ?? new AbortController();
-      try {
-        await submitTranscriptAndWait({
-          input,
-          client,
-          transcript: transcript.trim().length > 0 ? transcript.trim() : (reviewTranscript ?? ""),
-          abort,
-        });
-        if (input.settings.autoRearm) {
-          publishNext({
-            mode: "thread",
-            phase: "rearming",
-            generation,
-            target: input.target,
-            settings: input.settings,
-            transcript: null,
-            reviewId: null,
-            attention: null,
-          });
-        } else {
-          await stopInternal("review-submitted");
-        }
-      } catch (cause) {
-        await failAndRelease(
-          input.target.environmentId,
-          "thread",
-          failureOf(
-            "thread-submit-failed",
-            cause instanceof Error ? cause.message : "Failed to submit Thread voice transcript",
-            true,
-          ),
-        );
-      }
+      // Hand the transcript back to the cycle owner — do not submit/teardown here.
+      resolveReview?.({
+        action: "submit",
+        transcript: transcript.trim().length > 0 ? transcript.trim() : (reviewTranscript ?? ""),
+      });
+      resolveReview = null;
     },
     getMultiTabSnapshot: () => multiTab.getSnapshot(),
     subscribeMultiTab: (listener) => multiTab.subscribe(listener),

@@ -244,6 +244,30 @@ const startup = Effect.gen(function* () {
     Effect.withSpan("desktop.electron.whenReady"),
     Effect.catchCause((cause) => fatalStartupCause("whenReady", cause)),
   );
+  // macOS TCC: present the system microphone prompt when status is not yet determined
+  // so getUserMedia succeeds after the Chromium permission handler grants "media".
+  if (environment.platform === "darwin") {
+    yield* Effect.tryPromise({
+      try: async () => {
+        const { systemPreferences } = await import("electron");
+        const status = systemPreferences.getMediaAccessStatus("microphone");
+        if (status !== "granted") {
+          await systemPreferences.askForMediaAccess("microphone");
+        }
+      },
+      catch: (cause) =>
+        new Error(
+          cause instanceof Error ? cause.message : "Failed to request macOS microphone access",
+          { cause },
+        ),
+    }).pipe(
+      Effect.catch((error) =>
+        logStartupInfo("microphone access prompt failed", {
+          error: error.message,
+        }),
+      ),
+    );
+  }
   yield* logStartupInfo("app ready");
   yield* appIdentity.configure;
   yield* applicationMenu.configure;
