@@ -174,26 +174,38 @@ export function makeVoiceMultiTabLock(input: MakeVoiceMultiTabLockInput = {}): V
     publish();
   };
 
+  /** True when the remote claim should win over this tab's current claim. */
+  const remoteClaimWins = (theirGeneration: number, theirTabId: string): boolean => {
+    if (theirGeneration > generation) return true;
+    if (theirGeneration < generation) return false;
+    // Equal generation: deterministic lexicographic tabId tie-break (lower wins).
+    return theirTabId < tabId;
+  };
+
+  const reannounceIfLeader = () => {
+    if (leaderTabId !== tabId || disposed) return;
+    channel?.postMessage({
+      type: "announce",
+      tabId,
+      ownerEnvironmentId,
+      generation,
+    } satisfies LockMessage);
+  };
+
   const handleMessage = (message: LockMessage) => {
     if (disposed) return;
     switch (message.type) {
       case "announce": {
         if (message.tabId === tabId) return;
-        if (leaderTabId === tabId && message.generation <= generation) {
-          // Another tab claimed leadership while we thought we owned it — yield if
-          // their generation is higher (takeover completed elsewhere).
-          if (message.generation > generation) {
-            leaderTabId = message.tabId;
-            ownerEnvironmentId = message.ownerEnvironmentId;
-            generation = message.generation;
-            publish();
-          }
+        if (remoteClaimWins(message.generation, message.tabId)) {
+          leaderTabId = message.tabId;
+          ownerEnvironmentId = message.ownerEnvironmentId;
+          generation = message.generation;
+          publish();
           return;
         }
-        leaderTabId = message.tabId;
-        ownerEnvironmentId = message.ownerEnvironmentId;
-        generation = Math.max(generation, message.generation);
-        publish();
+        // Stale or losing claim — reassert if we still own leadership.
+        reannounceIfLeader();
         return;
       }
       case "release": {
@@ -275,11 +287,25 @@ export function makeVoiceMultiTabLock(input: MakeVoiceMultiTabLockInput = {}): V
     }
     try {
       const next = JSON.parse(event.newValue) as StoredLeader;
-      if (next.tabId !== tabId) {
+      if (next.tabId === tabId) return;
+      // Same generation+tabId tie-break as BroadcastChannel announce, so a
+      // concurrent first-acquire cannot flip both tabs into follower deadlock.
+      if (remoteClaimWins(next.generation, next.tabId)) {
         leaderTabId = next.tabId;
         ownerEnvironmentId = next.ownerEnvironmentId;
         generation = next.generation;
         publish();
+        return;
+      }
+      // We win: reassert so the persisted record matches the broadcast winner.
+      reannounceIfLeader();
+      if (leaderTabId === tabId) {
+        writeStoredLeader({
+          tabId,
+          ownerEnvironmentId,
+          generation,
+          updatedAt: now(),
+        });
       }
     } catch {
       // ignore

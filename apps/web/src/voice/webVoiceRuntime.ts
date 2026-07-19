@@ -61,6 +61,11 @@ export interface WebThreadTurnWaitInput {
   readonly messageId: MessageId;
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
+  /**
+   * When true, keep waiting through approval/user-input attention instead of
+   * returning early — used after the cycle has already surfaced attention once.
+   */
+  readonly ignoreAttention?: boolean;
 }
 
 export type WebThreadTurnWaitResult =
@@ -92,6 +97,11 @@ export interface WebVoiceRuntime extends VoiceRuntimeAdapter {
     listener: (snapshot: VoiceMultiTabLockSnapshot) => void,
   ) => () => void;
   readonly requestMultiTabTakeover: () => Promise<boolean>;
+  /**
+   * One-shot composer dictation under exclusive media ownership.
+   * Returns the final transcript, or null if empty/cancelled.
+   */
+  readonly dictate: (environmentId: EnvironmentId) => Promise<string | null>;
   readonly dispose: () => Promise<void>;
 }
 
@@ -158,14 +168,24 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
   let disposed = false;
   let activeRealtime: ActiveRealtime | null = null;
   let threadAbort: AbortController | null = null;
-  /** Survives stopInternal nulling threadAbort so Effect interruptions still look like aborts. */
+  /**
+   * Survives stopInternal nulling threadAbort so late Effect interruptions of the
+   * *current* cycle still look like aborts. Reset at the start of each new operation
+   * so a prior abort cannot mask early failures on a fresh start.
+   */
   let lastThreadAbortSignal: AbortSignal | null = null;
   /** Abort signal for the cycle currently (or about to be) running. */
   let activeCycleAbortSignal: AbortSignal | null = null;
+  /**
+   * Bumped by stopInternal / dispose so in-flight startRealtimeInternal can detect
+   * supersession even when activeRealtime is still null (connect window).
+   */
+  let startEpoch = 0;
   let reviewTranscript: string | null = null;
   let reviewId = 0;
   let pcmPlayer: PcmPlayer | null = null;
   let threadCycleRunning = false;
+  let activeThreadCapture: { stop: () => void } | null = null;
   let resolveManualFinish: ((reason: "manual") => void) | null = null;
   type ReviewResolution =
     | { readonly action: "submit"; readonly transcript: string }
@@ -188,9 +208,21 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
 
   const isCycleAbortCause = (cause: unknown, cycleSignal?: AbortSignal | null): boolean => {
     if (cause instanceof DOMException && cause.name === "AbortError") return true;
+    // Prefer the signal for the operation that was in flight; only fall back to
+    // lastThreadAbortSignal when that operation's signal is the one retained.
     const signal = cycleSignal ?? activeCycleAbortSignal;
     if (signal !== null && signal.aborted) return true;
     if (threadAbort !== null && threadAbort.signal.aborted) return true;
+    // Late stream rejection after stopInternal nulled threadAbort/activeCycleAbortSignal:
+    // only count when we still have a retained signal from that same cycle.
+    if (
+      cycleSignal == null &&
+      activeCycleAbortSignal == null &&
+      lastThreadAbortSignal !== null &&
+      lastThreadAbortSignal.aborted
+    ) {
+      return true;
+    }
     return false;
   };
 
@@ -456,9 +488,18 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     target: VoiceRealtimeTarget,
     options?: VoiceRuntimeAdmissionOptions,
   ) => {
-    if (options?.signal?.aborted) throw new Error("Voice start was cancelled");
+    // Capture epoch so a concurrent stopInternal (which bumps startEpoch) can
+    // supersede this connect even while activeRealtime is still null.
+    const epoch = startEpoch;
+    lastThreadAbortSignal = null;
+    const assertStillStarting = () => {
+      if (epoch !== startEpoch || options?.signal?.aborted) {
+        throw new DOMException("Voice start was cancelled", "AbortError");
+      }
+    };
+    assertStillStarting();
     await ensureLeader(target.environmentId);
-    if (options?.signal?.aborted) throw new Error("Voice start was cancelled");
+    assertStillStarting();
 
     const prepared = hooks.getPrepared(target.environmentId);
     if (prepared === null) {
@@ -478,11 +519,12 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     });
 
     const client = await makeClient(prepared);
-    if (options?.signal?.aborted) throw new Error("Voice start was cancelled");
+    assertStillStarting();
 
     const capabilities = await Effect.runPromise(client.capabilities(), {
       signal: options?.signal,
     });
+    assertStillStarting();
     const realtimeCap = capabilities.capabilities.find(
       (item) => item.capability === "agent.realtime",
     );
@@ -496,19 +538,25 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
 
     // Acquire mic early (user-gesture window) before longer network round-trips.
     const localStream = await requestMicrophoneStream();
-    if (options?.signal?.aborted) {
+    if (epoch !== startEpoch || options?.signal?.aborted) {
       for (const track of localStream.getTracks()) track.stop();
-      throw new Error("Voice start was cancelled");
+      throw new DOMException("Voice start was cancelled", "AbortError");
     }
 
     let peer: RTCPeerConnection | null = null;
     let remoteAudio: HTMLAudioElement | null = null;
+    let mediaAdmissionGeneration: number | null = null;
     try {
-      await mediaGate.admit("realtime", async () => ({
+      const admission = await mediaGate.admit("realtime", async () => ({
         release: async () => {
           // Release is driven by stopPeer / stopInternal once active.
         },
       }));
+      mediaAdmissionGeneration = admission.generation;
+      assertStillStarting();
+      if (!mediaGate.isCurrent(admission.generation)) {
+        throw new DOMException("Voice start was cancelled", "AbortError");
+      }
 
       const session = await Effect.runPromise(
         client.createSession({
@@ -528,6 +576,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         }),
         { signal: options?.signal },
       );
+      assertStillStarting();
 
       peer = new RTCPeerConnection({
         iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
@@ -559,6 +608,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
           };
         });
       }
+      assertStillStarting();
       const localSdp = peer.localDescription?.sdp;
       if (localSdp == null || localSdp.trim() === "") {
         throw new Error("Failed to create a WebRTC offer for Realtime voice");
@@ -572,7 +622,17 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         }),
         { signal: options?.signal },
       );
+      assertStillStarting();
       await peer.setRemoteDescription({ type: "answer", sdp: answer.sdp });
+      assertStillStarting();
+      // Final fence before go-live: stop may have released our admission mid-connect.
+      if (
+        epoch !== startEpoch ||
+        mediaAdmissionGeneration === null ||
+        !mediaGate.isCurrent(mediaAdmissionGeneration)
+      ) {
+        throw new DOMException("Voice start was cancelled", "AbortError");
+      }
 
       const timers = makeVoiceLeaseTimers();
       const eventLoop = new AbortController();
@@ -639,7 +699,10 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
           // ignore
         }
       }
-      await mediaGate.releaseExact().catch(() => undefined);
+      // Only release the gate if we still own the admission we installed.
+      if (mediaAdmissionGeneration !== null && mediaGate.isCurrent(mediaAdmissionGeneration)) {
+        await mediaGate.releaseExact().catch(() => undefined);
+      }
       throw cause;
     }
   };
@@ -670,6 +733,8 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
   };
 
   const stopInternal = async (_reason: string) => {
+    // Supersede any in-flight startRealtimeInternal before tearing down.
+    startEpoch += 1;
     const realtime = activeRealtime;
     activeRealtime = null;
     resolveReview?.({ action: "discard" });
@@ -680,6 +745,13 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     // Keep lastThreadAbortSignal for in-flight Effect interruption mapping, but
     // clear activeCycleAbortSignal so a later start's early guards aren't masked.
     activeCycleAbortSignal = null;
+    // Best-effort capture stop in case media-gate release races the capture install.
+    try {
+      activeThreadCapture?.stop();
+    } catch {
+      // ignore
+    }
+    activeThreadCapture = null;
     pcmPlayer?.cancel();
     if (realtime !== null) {
       const gen = bumpGeneration();
@@ -713,23 +785,26 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
       signal,
     );
     const chunks: Uint8Array[] = [];
-    await Stream.runForEach(
-      client.synthesize({
-        request: {
-          requestId,
-          playbackId,
-          segmentIndex: 0,
-          finalSegment: true,
-          text,
-          preset: "default",
-        },
-        ticket,
-      }),
-      (chunk) =>
-        Effect.sync(() => {
-          chunks.push(chunk);
+    await Effect.runPromise(
+      Stream.runForEach(
+        client.synthesize({
+          request: {
+            requestId,
+            playbackId,
+            segmentIndex: 0,
+            finalSegment: true,
+            text,
+            preset: "default",
+          },
+          ticket,
         }),
-    ).pipe(Effect.runPromise);
+        (chunk) =>
+          Effect.sync(() => {
+            chunks.push(chunk);
+          }),
+      ),
+      { signal },
+    );
     let total = 0;
     for (const chunk of chunks) total += chunk.byteLength;
     const out = new Uint8Array(total);
@@ -746,9 +821,10 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
       throw new Error("Thread voice cycle is already running");
     }
     threadCycleRunning = true;
-    // Clear prior-cycle abort signal before any early guards so a previous stop
-    // cannot misclassify a fresh start failure as an abort.
+    // Clear prior-cycle abort signals before any early guards so a previous stop
+    // or finished dictation cannot misclassify a fresh start failure as an abort.
     activeCycleAbortSignal = null;
+    lastThreadAbortSignal = null;
     const prepared = hooks.getPrepared(input.target.environmentId);
     if (prepared === null) {
       threadCycleRunning = false;
@@ -787,6 +863,12 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
           resolveManualFinish = null;
           abort.abort();
           pcmPlayer?.cancel();
+          try {
+            activeThreadCapture?.stop();
+          } catch {
+            // ignore
+          }
+          activeThreadCapture = null;
         },
       }));
 
@@ -817,6 +899,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
 
         const stream = await requestMicrophoneStream();
         const capture = await startAudioCapture(stream);
+        activeThreadCapture = capture;
         let endpoint: "silence" | "no-speech" | "max-utterance" | "manual" = "manual";
         let manualFinished = false;
         const endpointAbort = new AbortController();
@@ -855,6 +938,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
           );
         } catch (cause) {
           capture.stop();
+          activeThreadCapture = null;
           if (manualFinished) {
             // Manual finish aborted the waiter after resolving — continue with PCM.
           } else if (abort.signal.aborted) {
@@ -868,7 +952,15 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         }
 
         // Never finalize/transcribe after stop/handoff during recording.
-        if (abort.signal.aborted) break;
+        if (abort.signal.aborted) {
+          try {
+            capture.stop();
+          } catch {
+            // ignore
+          }
+          activeThreadCapture = null;
+          break;
+        }
 
         publishNext({
           mode: "thread",
@@ -882,7 +974,9 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         });
 
         const pcm = capture.getPcmMono();
+        const captureSampleRate = capture.sampleRate;
         capture.stop();
+        activeThreadCapture = null;
 
         if (endpoint === "no-speech" || pcm.length < 1600) {
           if (!input.settings.autoRearm) break;
@@ -913,10 +1007,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
 
         const encoded = await encodeMonoPcmToAacMp4({
           pcm,
-          sampleRate: Math.round(
-            // Prefer 24 kHz when the capture rate is high enough; encoder uses native rate.
-            capture.sampleRate,
-          ),
+          sampleRate: Math.round(captureSampleRate),
         });
 
         const requestId = createRequestId() as VoiceRequestId;
@@ -926,28 +1017,31 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         );
 
         let transcriptText = "";
-        await Stream.runForEach(
-          client.transcribe({
-            audio: {
-              kind: "blob",
-              value: encoded.blob,
-              filename: "utterance.mp4",
-            },
-            metadata: {
-              requestId,
-              format: "audio/mp4",
-            },
-            ticket,
-          }),
-          (event) =>
-            Effect.sync(() => {
-              if (event.type === "delta") {
-                transcriptText += event.text;
-              } else if (event.type === "final") {
-                transcriptText = event.result.text;
-              }
+        await Effect.runPromise(
+          Stream.runForEach(
+            client.transcribe({
+              audio: {
+                kind: "blob",
+                value: encoded.blob,
+                filename: "utterance.mp4",
+              },
+              metadata: {
+                requestId,
+                format: "audio/mp4",
+              },
+              ticket,
             }),
-        ).pipe(Effect.runPromise);
+            (event) =>
+              Effect.sync(() => {
+                if (event.type === "delta") {
+                  transcriptText += event.text;
+                } else if (event.type === "final") {
+                  transcriptText = event.result.text;
+                }
+              }),
+          ),
+          { signal: abort.signal },
+        );
 
         transcriptText = transcriptText.trim();
         if (transcriptText.length === 0) {
@@ -1099,7 +1193,9 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
       throw new DOMException("Thread voice aborted", "AbortError");
     }
 
-    if (outcome.status === "attention") {
+    // Attention is temporary: surface it, then keep waiting for completion.
+    let finalOutcome = outcome;
+    while (finalOutcome.status === "attention" && !abort.signal.aborted) {
       publishNext({
         mode: "thread",
         phase: "waiting",
@@ -1108,20 +1204,40 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         settings: input.settings,
         transcript,
         reviewId: null,
-        attention: outcome.kind,
+        attention: finalOutcome.kind,
       });
-      // Stay waiting until user resolves or stops.
-      await waitUntil(() => abort.signal.aborted, abort.signal).catch(() => undefined);
-      return;
+      finalOutcome = await hooks.waitForThreadTurn!({
+        environmentId: input.target.environmentId,
+        threadId: input.target.threadId,
+        messageId,
+        timeoutMs: input.settings.responseTimeoutMs,
+        signal: abort.signal,
+        ignoreAttention: true,
+      });
     }
 
-    if (outcome.status === "failed" || outcome.status === "timeout") {
+    if (abort.signal.aborted) {
+      throw new DOMException("Thread voice aborted", "AbortError");
+    }
+
+    if (finalOutcome.status === "failed" && finalOutcome.message === "Thread wait aborted") {
+      throw new DOMException("Thread voice aborted", "AbortError");
+    }
+
+    if (finalOutcome.status === "failed" || finalOutcome.status === "timeout") {
       throw new Error(
-        outcome.status === "timeout" ? "Timed out waiting for the Thread turn" : outcome.message,
+        finalOutcome.status === "timeout"
+          ? "Timed out waiting for the Thread turn"
+          : finalOutcome.message,
       );
     }
 
-    if (input.settings.playResponses && outcome.assistantText && outcome.assistantText.length > 0) {
+    if (
+      finalOutcome.status === "completed" &&
+      input.settings.playResponses &&
+      finalOutcome.assistantText &&
+      finalOutcome.assistantText.length > 0
+    ) {
       const speechCap = (
         await runAbortableEffect(client.capabilities(), abort.signal)
       ).capabilities.find((item) => item.capability === "speech.streaming");
@@ -1139,10 +1255,114 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         pcmPlayer ??= makePcmPlayer(24_000);
         const pcm = await collectAssistantTextFromSpeechStream(
           client,
-          outcome.assistantText,
+          finalOutcome.assistantText,
           abort.signal,
         );
         await pcmPlayer.play(pcm);
+      }
+    }
+  };
+
+  const dictateInternal = async (environmentId: EnvironmentId): Promise<string | null> => {
+    lastThreadAbortSignal = null;
+    await ensureLeader(environmentId);
+    const prepared = hooks.getPrepared(environmentId);
+    if (prepared === null) {
+      throw new Error("A prepared environment connection is required for dictation");
+    }
+    const abort = new AbortController();
+    threadAbort?.abort();
+    threadAbort = abort;
+    lastThreadAbortSignal = abort.signal;
+    activeCycleAbortSignal = abort.signal;
+
+    let capture: Awaited<ReturnType<typeof startAudioCapture>> | null = null;
+    const admission = await mediaGate.admit("dictation", async () => ({
+      release: async () => {
+        abort.abort();
+        try {
+          capture?.stop();
+        } catch {
+          // ignore
+        }
+        capture = null;
+      },
+    }));
+    const admissionGeneration = admission.generation;
+
+    try {
+      const client = await makeClient(prepared);
+      const capabilities = await runAbortableEffect(client.capabilities(), abort.signal);
+      const sttCap = capabilities.capabilities.find(
+        (item) => item.capability === "transcription.request",
+      );
+      if (sttCap?.state !== "ready") {
+        throw new Error("Voice transcription is not ready on this environment");
+      }
+
+      const stream = await requestMicrophoneStream();
+      capture = await startAudioCapture(stream);
+      try {
+        await waitForEndpoint({
+          capture,
+          config: {
+            endSilenceMs: 900,
+            noSpeechTimeoutMs: 8_000,
+            maximumUtteranceMs: 60_000,
+          },
+          signal: abort.signal,
+        });
+      } catch (cause) {
+        if (abort.signal.aborted) return null;
+        throw cause;
+      }
+      const pcm = capture.getPcmMono();
+      const sampleRate = capture.sampleRate;
+      capture.stop();
+      capture = null;
+      if (abort.signal.aborted || pcm.length < 1600) return null;
+
+      const encoded = await encodeMonoPcmToAacMp4({ pcm, sampleRate });
+      const requestId = createRequestId();
+      const ticket = await runAbortableEffect(
+        client.createMediaTicket({ operation: "transcription-upload", requestId }),
+        abort.signal,
+      );
+      let text = "";
+      await Effect.runPromise(
+        Stream.runForEach(
+          client.transcribe({
+            audio: { kind: "blob", value: encoded.blob, filename: "dictation.mp4" },
+            metadata: { requestId, format: "audio/mp4" },
+            ticket,
+          }),
+          (event) =>
+            Effect.sync(() => {
+              if (event.type === "delta") text += event.text;
+              else if (event.type === "final") text = event.result.text;
+            }),
+        ),
+        { signal: abort.signal },
+      );
+      const trimmed = text.trim();
+      return trimmed.length > 0 ? trimmed : null;
+    } finally {
+      try {
+        capture?.stop();
+      } catch {
+        // ignore
+      }
+      // Only release gate/lock if we still own the admission — a newer owner
+      // (Realtime/Thread) may have fenced us out via mediaGate.admit.
+      if (mediaGate.isCurrent(admissionGeneration)) {
+        await mediaGate.releaseExact();
+        multiTab.release();
+      }
+      if (threadAbort === abort) {
+        threadAbort = null;
+      }
+      if (activeCycleAbortSignal === abort.signal) {
+        activeCycleAbortSignal = null;
       }
     }
   };
@@ -1225,6 +1445,11 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         try {
           await startRealtimeInternal(target, options);
         } catch (cause) {
+          // Supersession from stop/takeover/dictation throws AbortError after
+          // carefully not releasing a newer owner's gate — do not failAndRelease.
+          if (cause instanceof DOMException && cause.name === "AbortError") {
+            return;
+          }
           await failAndRelease(
             target.environmentId,
             "realtime",
@@ -1285,7 +1510,22 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         });
       }),
     switchRealtimeToThread: (input) => adapter.startThread(input),
-    stop: () => command(async () => stopInternal("user-stop")),
+    // Stop must interrupt in-flight transitions (spec: always available).
+    stop: () => stopInternal("user-stop"),
+    dictate: async (environmentId) => {
+      if (disposed) throw new Error("Voice runtime is disposed");
+      // Stop any active voice path so dictation can claim exclusive media.
+      // stop is intentionally outside ExclusiveTransition so it can interrupt cycles.
+      if (snapshot.mode !== "idle" || threadCycleRunning || activeRealtime !== null) {
+        await stopInternal("dictation-replace");
+      }
+      try {
+        return await dictateInternal(environmentId);
+      } catch (cause) {
+        if (isCycleAbortCause(cause)) return null;
+        throw cause;
+      }
+    },
     setRealtimeMuted: async (muted) => {
       if (activeRealtime === null) return;
       activeRealtime.muted = muted;

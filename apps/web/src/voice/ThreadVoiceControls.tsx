@@ -15,13 +15,6 @@ import { useCallback, useEffect, useState } from "react";
 
 import { Button } from "../components/ui/button";
 import { useOptionalVoiceRuntime } from "./VoiceRuntimeContext";
-import { encodeMonoPcmToAacMp4 } from "./mp4Encode";
-import { requestMicrophoneStream, startAudioCapture, waitForEndpoint } from "./audioCapture";
-import { makeWebVoiceHttpClient } from "./webVoiceHttpClient";
-import { readPreparedConnection } from "../state/session";
-import * as Effect from "effect/Effect";
-import * as Stream from "effect/Stream";
-import { VoiceRequestId } from "@t3tools/contracts";
 
 export function ThreadVoiceControls(props: {
   readonly environmentId: EnvironmentId | null;
@@ -120,52 +113,19 @@ export function ThreadVoiceControls(props: {
   }, [voice, props, control, canStartAutoListen]);
 
   const runDictation = useCallback(async () => {
-    if (voice == null || props.environmentId == null || dictating) return;
-    const prepared = readPreparedConnection(props.environmentId);
-    if (prepared === null || !sttReady) return;
+    if (voice == null || props.environmentId == null || dictating || !sttReady) return;
     setDictating(true);
     try {
-      if (voice.snapshot.mode !== "idle") {
-        await voice.runtime.stop();
+      if (voice.multiTab.role !== "leader" && voice.multiTab.leaderTabId != null) {
+        await voice.runtime.requestMultiTabTakeover();
       }
-      const stream = await requestMicrophoneStream();
-      const capture = await startAudioCapture(stream);
-      try {
-        await waitForEndpoint({
-          capture,
-          config: voice.threadSettings.endpointDetection,
-        });
-      } catch {
-        capture.stop();
-        return;
+      // Runtime owns exclusive media gate + multi-tab lock for one-shot STT.
+      const text = await voice.runtime.dictate(props.environmentId);
+      if (text != null && text.length > 0) {
+        props.onDictationInsert(text);
       }
-      const pcm = capture.getPcmMono();
-      const sampleRate = capture.sampleRate;
-      capture.stop();
-      if (pcm.length < 1600) return;
-      const encoded = await encodeMonoPcmToAacMp4({ pcm, sampleRate });
-      const client = await makeWebVoiceHttpClient(prepared);
-      const requestId = VoiceRequestId.make(
-        `req-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-      );
-      const ticket = await Effect.runPromise(
-        client.createMediaTicket({ operation: "transcription-upload", requestId }),
-      );
-      let text = "";
-      await Stream.runForEach(
-        client.transcribe({
-          audio: { kind: "blob", value: encoded.blob, filename: "dictation.mp4" },
-          metadata: { requestId, format: "audio/mp4" },
-          ticket,
-        }),
-        (event) =>
-          Effect.sync(() => {
-            if (event.type === "delta") text += event.text;
-            else if (event.type === "final") text = event.result.text;
-          }),
-      ).pipe(Effect.runPromise);
-      const trimmed = text.trim();
-      if (trimmed.length > 0) props.onDictationInsert(trimmed);
+    } catch {
+      // Dictation failures are non-fatal for the composer; leave draft unchanged.
     } finally {
       setDictating(false);
     }

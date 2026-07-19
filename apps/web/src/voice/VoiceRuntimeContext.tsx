@@ -67,6 +67,11 @@ function waitForThreadTurnIdle(input: {
   readonly messageId: import("@t3tools/contracts").MessageId;
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
+  /**
+   * When true, keep polling through approval/user-input attention instead of
+   * returning early — used after the cycle has already surfaced attention once.
+   */
+  readonly ignoreAttention?: boolean;
 }): Promise<WebThreadTurnWaitResult> {
   const started = Date.now();
   let sawRunning = false;
@@ -99,24 +104,26 @@ function waitForThreadTurnIdle(input: {
         const running = session?.status === "running" && session.activeTurnId != null;
         if (running) {
           sawRunning = true;
-          const attentionActivity = thread.activities.find(
-            (activity) =>
-              activity.tone === "approval" ||
-              activity.kind.includes("approval") ||
-              activity.kind.includes("user-input") ||
-              activity.kind.includes("user_input"),
-          );
-          if (attentionActivity != null) {
-            cleanup();
-            resolve({
-              status: "attention",
-              kind:
-                attentionActivity.kind.includes("user-input") ||
-                attentionActivity.kind.includes("user_input")
-                  ? "user-input-required"
-                  : "approval-required",
-            });
-            return;
+          if (!input.ignoreAttention) {
+            const attentionActivity = thread.activities.find(
+              (activity) =>
+                activity.tone === "approval" ||
+                activity.kind.includes("approval") ||
+                activity.kind.includes("user-input") ||
+                activity.kind.includes("user_input"),
+            );
+            if (attentionActivity != null) {
+              cleanup();
+              resolve({
+                status: "attention",
+                kind:
+                  attentionActivity.kind.includes("user-input") ||
+                  attentionActivity.kind.includes("user_input")
+                    ? "user-input-required"
+                    : "approval-required",
+              });
+              return;
+            }
           }
           return;
         }
@@ -202,6 +209,7 @@ export function VoiceRuntimeProvider(props: { readonly children: ReactNode }) {
   navigateRef.current = navigate;
 
   const runtimeRef = useRef<WebVoiceRuntime | null>(null);
+  const mountGenerationRef = useRef(0);
   if (runtimeRef.current === null) {
     runtimeRef.current = makeWebVoiceRuntime({
       getPrepared: (environmentId) => readPreparedConnection(environmentId),
@@ -234,6 +242,9 @@ export function VoiceRuntimeProvider(props: { readonly children: ReactNode }) {
           messageId: input.messageId,
           timeoutMs: input.timeoutMs,
           ...(input.signal !== undefined ? { signal: input.signal } : {}),
+          ...(input.ignoreAttention !== undefined
+            ? { ignoreAttention: input.ignoreAttention }
+            : {}),
         }),
       onActivateThread: async ({ environmentId, threadId }) => {
         await navigateRef.current({
@@ -263,12 +274,23 @@ export function VoiceRuntimeProvider(props: { readonly children: ReactNode }) {
   }, [runtime]);
 
   useEffect(() => {
+    const mountId = ++mountGenerationRef.current;
+    // Full dispose on page hide (tab close / hard navigation).
     const onPageHide = () => {
-      void runtime.stop();
+      void runtime.dispose();
     };
     window.addEventListener("pagehide", onPageHide);
     return () => {
       window.removeEventListener("pagehide", onPageHide);
+      void runtime.stop();
+      // Defer dispose past Strict Mode's sync cleanup→setup so a remount
+      // (mountGeneration bumps) cancels the dispose of the still-live runtime.
+      const expected = mountId;
+      setTimeout(() => {
+        if (mountGenerationRef.current === expected) {
+          void runtime.dispose();
+        }
+      }, 0);
     };
   }, [runtime]);
 
