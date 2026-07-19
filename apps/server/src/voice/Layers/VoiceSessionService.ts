@@ -915,9 +915,11 @@ const make = Effect.gen(function* () {
         return;
       case "function-call":
         if (!(yield* isSessionLive(lease))) return;
+        const sessionExposure = resolveVoiceToolExposure(runtimeSession.commandTools);
+        let effectiveToolName = event.name;
+        let effectiveArgumentsJson = event.argumentsJson;
         if (isCommandMetaToolName(event.name)) {
-          const exposure = resolveVoiceToolExposure(runtimeSession.commandTools);
-          if (!exposure.commandMetaToolsEnabled) {
+          if (!sessionExposure.commandMetaToolsEnabled) {
             yield* submitCompletedTool(lease, providerSession, {
               type: "completed",
               toolCallId: VoiceToolCallId.make(event.providerFunctionCallId),
@@ -934,100 +936,45 @@ const make = Effect.gen(function* () {
             });
             return;
           }
-          if (event.name === COMMAND_EXECUTE_TOOL_NAME) {
-            const normalized = normalizeCommandExecute(event.argumentsJson, exposure);
-            if (normalized.type === "wrapper-error") {
-              // Wrapper errors never enter the business executor or public tool events.
-              yield* submitCompletedTool(lease, providerSession, {
-                type: "completed",
-                toolCallId: VoiceToolCallId.make(event.providerFunctionCallId),
-                providerFunctionCallId: event.providerFunctionCallId,
-                tool: "unknown",
-                outcome: "failed",
-                output: normalized.output,
-                submitOutput: true,
-              });
-              return;
-            }
-            // Reuse outer tool-call IDs; executor sees the effective business tool only.
-            const commandInvocation = tools.invoke({
-              authSessionId: lease.ownerAuthSessionId,
-              sessionId: lease.sessionId,
-              conversationId: lease.conversationId,
-              contextEpoch: lease.contextEpoch,
+          if (event.name !== COMMAND_EXECUTE_TOOL_NAME) {
+            const presentationOutput = yield* handleCommandPresentation(
+              event.name,
+              event.argumentsJson,
+              sessionExposure,
+            );
+            // Meta list/describe answers are internal; never emit public tool events.
+            const presentationFailed = presentationOutput.startsWith('{"error"');
+            yield* submitCompletedTool(lease, providerSession, {
+              type: "completed",
               toolCallId: VoiceToolCallId.make(event.providerFunctionCallId),
               providerFunctionCallId: event.providerFunctionCallId,
-              name: normalized.name,
-              argumentsJson: normalized.argumentsJson,
-              grantedScopes,
-              requestClientAction: (request) => requestClientAction(lease, request),
+              tool: "unknown",
+              outcome: presentationFailed ? "failed" : "succeeded",
+              output: presentationOutput,
+              submitOutput: true,
             });
-            const commandResult = yield* commandInvocation;
-            if (commandResult.type === "completed") {
-              yield* submitCompletedTool(lease, providerSession, commandResult);
-              return;
-            }
-            if (commandResult.type === "terminal-completed") {
-              yield* runtimeSession.operationMutex.withPermits(1)(
-                submitTerminalTool(lease, providerSession, commandResult),
-              );
-              return;
-            }
-            if (commandResult.newlyCreated) {
-              if (!(yield* isSessionLive(lease))) return;
-              // Match the direct-path confirmation flow: addPendingConfirmation
-              // already sets phase "confirming"; schedule expiry with the same
-              // error surface as direct tools.
-              yield* addPendingConfirmation(lease, commandResult.confirmationId);
-              yield* emit(lease, {
-                type: "tool",
-                toolCallId: commandResult.toolCallId,
-                tool: commandResult.tool,
-                outcome: "pending-confirmation",
-              });
-              yield* emit(lease, {
-                type: "confirmation-required",
-                confirmationId: commandResult.confirmationId,
-                toolCallId: commandResult.toolCallId,
-                tool: commandResult.tool,
-                summary: commandResult.summary,
-                expiresAt: commandResult.expiresAt,
-              });
-              yield* scheduleConfirmationExpiry(lease, providerSession, commandResult).pipe(
-                Effect.catch((error) =>
-                  emit(lease, {
-                    type: "error",
-                    reason: error.detail,
-                    recoverable: error.retryable,
-                  }),
-                ),
-                Effect.forkIn(runtimeSession.sessionScope),
-              );
-            }
             return;
           }
-
-          const presentationOutput = yield* handleCommandPresentation(
-            event.name,
-            event.argumentsJson,
-            exposure,
-          );
-          // Meta list/describe answers are internal; never emit public tool events.
-          const presentationFailed = presentationOutput.startsWith('{"error"');
-          yield* submitCompletedTool(lease, providerSession, {
-            type: "completed",
-            toolCallId: VoiceToolCallId.make(event.providerFunctionCallId),
-            providerFunctionCallId: event.providerFunctionCallId,
-            tool: "unknown",
-            outcome: presentationFailed ? "failed" : "succeeded",
-            output: presentationOutput,
-            submitOutput: true,
-          });
-          return;
-        }
-        // Command-only migrated tools must not be invoked by a direct name.
-        // The model should use command_execute; dual routes are never advertised.
-        if (isCommandOnlyTool(resolveVoiceToolExposure(runtimeSession.commandTools), event.name)) {
+          const normalized = normalizeCommandExecute(event.argumentsJson, sessionExposure);
+          if (normalized.type === "wrapper-error") {
+            // Wrapper errors never enter the business executor or public tool events.
+            yield* submitCompletedTool(lease, providerSession, {
+              type: "completed",
+              toolCallId: VoiceToolCallId.make(event.providerFunctionCallId),
+              providerFunctionCallId: event.providerFunctionCallId,
+              tool: "unknown",
+              outcome: "failed",
+              output: normalized.output,
+              submitOutput: true,
+            });
+            return;
+          }
+          // Reuse outer tool-call IDs; continue through the shared direct-path
+          // executor flow so background forking and terminal gating apply equally.
+          effectiveToolName = normalized.name;
+          effectiveArgumentsJson = normalized.argumentsJson;
+        } else if (isCommandOnlyTool(sessionExposure, event.name)) {
+          // Command-only tools must not be invoked by a direct name.
           yield* submitCompletedTool(lease, providerSession, {
             type: "completed",
             toolCallId: VoiceToolCallId.make(event.providerFunctionCallId),
@@ -1044,7 +991,7 @@ const make = Effect.gen(function* () {
           });
           return;
         }
-        const requestedTerminalAction = terminalActionForVoiceTool(event.name);
+        const requestedTerminalAction = terminalActionForVoiceTool(effectiveToolName);
         const invocation = tools.invoke({
           authSessionId: lease.ownerAuthSessionId,
           sessionId: lease.sessionId,
@@ -1052,12 +999,12 @@ const make = Effect.gen(function* () {
           contextEpoch: lease.contextEpoch,
           toolCallId: VoiceToolCallId.make(event.providerFunctionCallId),
           providerFunctionCallId: event.providerFunctionCallId,
-          name: event.name,
-          argumentsJson: event.argumentsJson,
+          name: effectiveToolName,
+          argumentsJson: effectiveArgumentsJson,
           grantedScopes,
           requestClientAction: (request) => requestClientAction(lease, request),
         });
-        if (BACKGROUND_VOICE_TOOLS.has(event.name)) {
+        if (BACKGROUND_VOICE_TOOLS.has(effectiveToolName)) {
           const executeBackgroundTool = invocation.pipe(
             Effect.flatMap((result) =>
               result.type === "completed"
