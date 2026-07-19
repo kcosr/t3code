@@ -24,6 +24,42 @@ export interface EncodeMonoPcmToAacMp4Result {
   readonly codec: "mp4a.40.2";
 }
 
+/** Prefer a rate the AAC encoder and server both accept cleanly. */
+export function pickAacEncodeSampleRate(captureSampleRate: number): number {
+  const preferred: ReadonlyArray<number> = [
+    24_000, 16_000, 48_000, 44_100, 32_000, 22_050, 12_000, 8_000,
+  ];
+  if (preferred.includes(captureSampleRate)) {
+    return captureSampleRate;
+  }
+  // Nearest preferred rate.
+  let best = preferred[0]!;
+  let bestDelta = Math.abs(captureSampleRate - best);
+  for (const rate of preferred) {
+    const delta = Math.abs(captureSampleRate - rate);
+    if (delta < bestDelta) {
+      best = rate;
+      bestDelta = delta;
+    }
+  }
+  return best;
+}
+
+export function resampleMonoPcm(pcm: Float32Array, fromRate: number, toRate: number): Float32Array {
+  if (fromRate === toRate || pcm.length === 0) return pcm;
+  const ratio = fromRate / toRate;
+  const outLength = Math.max(1, Math.round(pcm.length / ratio));
+  const out = new Float32Array(outLength);
+  for (let i = 0; i < outLength; i += 1) {
+    const src = i * ratio;
+    const left = Math.floor(src);
+    const right = Math.min(pcm.length - 1, left + 1);
+    const frac = src - left;
+    out[i] = pcm[left]! * (1 - frac) + pcm[right]! * frac;
+  }
+  return out;
+}
+
 export function isWebAacEncoderAvailable(): boolean {
   return (
     typeof globalThis.AudioEncoder !== "undefined" &&
@@ -57,23 +93,43 @@ async function assertAacSupported(sampleRate: number): Promise<void> {
 export async function encodeMonoPcmToAacMp4(
   input: EncodeMonoPcmToAacMp4Input,
 ): Promise<EncodeMonoPcmToAacMp4Result> {
-  const { pcm, sampleRate } = input;
+  const encodeRate = pickAacEncodeSampleRate(input.sampleRate);
+  const pcm = resampleMonoPcm(input.pcm, input.sampleRate, encodeRate);
   if (pcm.length === 0) {
     throw new Error("Cannot encode empty PCM for voice transcription");
   }
-  await assertAacSupported(sampleRate);
+  await assertAacSupported(encodeRate);
 
   const frames: AacFrame[] = [];
   let encoderError: unknown = null;
+  let audioSpecificConfig: Uint8Array | null = null;
 
   const encoder = new AudioEncoder({
-    output: (chunk) => {
+    output: (chunk, meta) => {
+      const description = meta?.decoderConfig?.description;
+      if (description != null && audioSpecificConfig === null) {
+        if (description instanceof ArrayBuffer) {
+          audioSpecificConfig = new Uint8Array(description.slice(0));
+        } else if (ArrayBuffer.isView(description)) {
+          audioSpecificConfig = new Uint8Array(
+            description.buffer.slice(
+              description.byteOffset,
+              description.byteOffset + description.byteLength,
+            ),
+          );
+        }
+      }
       const buffer = new Uint8Array(chunk.byteLength);
       chunk.copyTo(buffer);
       const stripped = stripAdtsIfPresent(buffer);
+      // Prefer encoder duration when present (microseconds → samples).
+      const samplesFromChunk =
+        chunk.duration != null && chunk.duration > 0
+          ? Math.max(1, Math.round((chunk.duration / 1_000_000) * encodeRate))
+          : stripped.samples;
       frames.push({
         data: stripped.data,
-        samples: stripped.samples > 0 ? stripped.samples : 1024,
+        samples: samplesFromChunk > 0 ? samplesFromChunk : 1024,
       });
     },
     error: (error) => {
@@ -84,7 +140,7 @@ export async function encodeMonoPcmToAacMp4(
   encoder.configure({
     codec: "mp4a.40.2",
     numberOfChannels: 1,
-    sampleRate,
+    sampleRate: encodeRate,
     bitrate: 64_000,
   });
 
@@ -99,7 +155,7 @@ export async function encodeMonoPcmToAacMp4(
     samples.set(slice);
     const audioData = new AudioData({
       format: "f32",
-      sampleRate,
+      sampleRate: encodeRate,
       numberOfFrames: frameSize,
       numberOfChannels: 1,
       timestamp: timestampUs,
@@ -107,7 +163,7 @@ export async function encodeMonoPcmToAacMp4(
     });
     encoder.encode(audioData);
     audioData.close();
-    timestampUs += Math.round((frameSize / sampleRate) * 1_000_000);
+    timestampUs += Math.round((frameSize / encodeRate) * 1_000_000);
   }
 
   await encoder.flush();
@@ -123,16 +179,17 @@ export async function encodeMonoPcmToAacMp4(
   }
 
   const mp4 = muxProgressiveAacMp4({
-    sampleRate,
+    sampleRate: encodeRate,
     frames,
-    audioSpecificConfig: aacLcMonoAudioSpecificConfig(sampleRate),
+    audioSpecificConfig: audioSpecificConfig ?? aacLcMonoAudioSpecificConfig(encodeRate),
   });
+  // Copy into a standalone ArrayBuffer so Blob gets exact bytes.
   const copy = mp4.slice();
-  const blob = new Blob([copy.buffer as ArrayBuffer], { type: "audio/mp4" });
+  const blob = new Blob([copy.buffer], { type: "audio/mp4" });
   return {
     blob,
     byteLength: mp4.byteLength,
-    sampleRate,
+    sampleRate: encodeRate,
     codec: "mp4a.40.2",
   };
 }

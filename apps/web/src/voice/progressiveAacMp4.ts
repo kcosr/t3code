@@ -221,16 +221,23 @@ export function muxProgressiveAacMp4(input: ProgressiveAacMp4Input): Uint8Array 
     const smhd = fullBox("smhd", 0, 0, concatBytes([u16(0), u16(0)]));
 
     const esdsDecoderConfig = (() => {
-      // DecoderSpecificInfo
+      // MPEG-4 descriptor lengths use a short form when size < 128.
+      // DecoderSpecificInfo = tag(0x05) + length + AudioSpecificConfig
       const decSpecific = concatBytes([
         new Uint8Array([0x05, audioSpecificConfig.byteLength]),
         audioSpecificConfig,
       ]);
-      // DecoderConfigDescriptor
+      // DecoderConfigDescriptor body after tag+length:
+      // objectTypeIndication(1) + streamType(1) + bufferSizeDB(3) + maxBitrate(4)
+      // + avgBitrate(4) + DecoderSpecificInfo = 13 + decSpecific
+      const decConfigBodyLength = 13 + decSpecific.byteLength;
+      if (decConfigBodyLength >= 128 || decSpecific.byteLength >= 128) {
+        throw new Error("AAC decoder config is unexpectedly large for short-form descriptors");
+      }
       const decConfig = concatBytes([
         new Uint8Array([
           0x04, // tag
-          23 + decSpecific.byteLength, // length (short form, enough for our ASC)
+          decConfigBodyLength,
           0x40, // MPEG-4 AAC
           0x15, // stream type AudioStream, upstream=0, reserved=1
           0x00,
@@ -243,9 +250,13 @@ export function muxProgressiveAacMp4(input: ProgressiveAacMp4Input): Uint8Array 
       ]);
       // SLConfigDescriptor
       const slConfig = new Uint8Array([0x06, 0x01, 0x02]);
-      // ES_Descriptor
+      // ES_Descriptor body: ES_ID(2) + flags(1) + decConfig + slConfig
+      const esBodyLength = 3 + decConfig.byteLength + slConfig.byteLength;
+      if (esBodyLength >= 128) {
+        throw new Error("AAC ES descriptor is unexpectedly large for short-form descriptors");
+      }
       const es = concatBytes([
-        new Uint8Array([0x03, 3 + decConfig.byteLength + slConfig.byteLength, 0x00, 0x00, 0x00]),
+        new Uint8Array([0x03, esBodyLength, 0x00, 0x00, 0x00]),
         decConfig,
         slConfig,
       ]);

@@ -5,7 +5,10 @@ import { useCallback, useEffect, useState } from "react";
 
 import { Button } from "../components/ui/button";
 import { cn } from "../lib/utils";
+import { readPreparedConnection } from "../state/session";
 import { useOptionalVoiceRuntime } from "./VoiceRuntimeContext";
+import { makeWebVoiceHttpClient } from "./webVoiceHttpClient";
+import { loadResumeSelection, selectionForResumeStart } from "./voiceConversationResume";
 
 export function RealtimeVoiceCallBar(props: {
   readonly environmentId: EnvironmentId | null;
@@ -35,17 +38,39 @@ export function RealtimeVoiceCallBar(props: {
         const taken = await voice.runtime.requestMultiTabTakeover();
         if (!taken) return;
       }
-      // Only advertise focus when we have a coherent server project+thread pair.
-      // Drafts and mismatched project shells must not be sent (server validates ownership).
-      await voice.runtime.startRealtime({
-        environmentId: props.environmentId,
-        conversation: { type: "new", retention: "durable" },
-        focus:
-          props.projectId != null && props.threadId != null
-            ? { projectId: props.projectId, threadId: props.threadId }
-            : null,
-        threadSettings: voice.threadSettings,
-      });
+      const prepared = readPreparedConnection(props.environmentId);
+      if (prepared === null) {
+        throw new Error("A prepared environment connection is required to start voice");
+      }
+      // Prefer continuing the newest durable conversation (Android parity).
+      const client = await makeWebVoiceHttpClient(prepared);
+      let conversation = selectionForResumeStart(await loadResumeSelection(client));
+      const focus =
+        props.projectId != null && props.threadId != null
+          ? { projectId: props.projectId, threadId: props.threadId }
+          : null;
+      try {
+        await voice.runtime.startRealtime({
+          environmentId: props.environmentId,
+          conversation,
+          focus,
+          threadSettings: voice.threadSettings,
+        });
+      } catch (cause) {
+        // Lease held elsewhere: force takeover once, then fail through.
+        const message = cause instanceof Error ? cause.message : String(cause);
+        if (conversation.type === "continue" && /takeover/i.test(message)) {
+          conversation = { ...conversation, takeover: true };
+          await voice.runtime.startRealtime({
+            environmentId: props.environmentId,
+            conversation,
+            focus,
+            threadSettings: voice.threadSettings,
+          });
+          return;
+        }
+        throw cause;
+      }
     } finally {
       setBusy(false);
     }
