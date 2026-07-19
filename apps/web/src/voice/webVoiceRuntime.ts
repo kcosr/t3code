@@ -170,6 +170,20 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     | { readonly action: "discard" };
   let resolveReview: ((resolution: ReviewResolution) => void) | null = null;
 
+  const formatVoiceHttpError = (cause: unknown): string => {
+    if (cause instanceof Error) {
+      const anyCause = cause as Error & { readonly detail?: string; readonly reason?: string };
+      if (typeof anyCause.detail === "string" && anyCause.detail.trim().length > 0) {
+        return anyCause.detail;
+      }
+      // Nested EnvironmentVoiceOperationError often appears in message after colon.
+      const match = /EnvironmentVoiceOperationError:\s*(.+?)\)?$/.exec(cause.message);
+      if (match?.[1]) return match[1].trim();
+      return cause.message;
+    }
+    return String(cause);
+  };
+
   const isCycleAbortCause = (cause: unknown): boolean => {
     if (cause instanceof DOMException && cause.name === "AbortError") return true;
     if (lastThreadAbortSignal !== null && lastThreadAbortSignal.aborted) return true;
@@ -1200,7 +1214,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
             "realtime",
             failureOf(
               "start-realtime-failed",
-              cause instanceof Error ? cause.message : "Failed to start Realtime voice",
+              formatVoiceHttpError(cause) || "Failed to start Realtime voice",
               true,
             ),
           );

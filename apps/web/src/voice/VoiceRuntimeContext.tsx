@@ -277,30 +277,51 @@ export function VoiceRuntimeProvider(props: { readonly children: ReactNode }) {
     saveWebVoiceThreadSettings(settings);
   }, []);
 
+  const capabilitiesInflightRef = useRef(new Map<EnvironmentId, Promise<void>>());
   const refreshCapabilities = useCallback(async (environmentId: EnvironmentId) => {
-    const prepared = readPreparedConnection(environmentId);
-    if (prepared === null) {
-      setCapabilitiesByEnvironment((prev) => {
-        const next = new Map(prev);
-        next.set(environmentId, null);
-        return next;
-      });
+    const existing = capabilitiesInflightRef.current.get(environmentId);
+    if (existing !== undefined) {
+      await existing;
       return;
     }
+    const work = (async () => {
+      const prepared = readPreparedConnection(environmentId);
+      if (prepared === null) {
+        setCapabilitiesByEnvironment((prev) => {
+          if (prev.get(environmentId) === null) return prev;
+          const next = new Map(prev);
+          next.set(environmentId, null);
+          return next;
+        });
+        return;
+      }
+      try {
+        const client = await makeWebVoiceHttpClient(prepared);
+        const capabilities = await Effect.runPromise(client.capabilities());
+        setCapabilitiesByEnvironment((prev) => {
+          const prior = prev.get(environmentId);
+          // Avoid re-render storms when capabilities are unchanged.
+          if (prior != null && JSON.stringify(prior) === JSON.stringify(capabilities)) {
+            return prev;
+          }
+          const next = new Map(prev);
+          next.set(environmentId, capabilities);
+          return next;
+        });
+      } catch {
+        setCapabilitiesByEnvironment((prev) => {
+          if (prev.get(environmentId) === null) return prev;
+          const next = new Map(prev);
+          next.set(environmentId, null);
+          return next;
+        });
+      }
+    })();
+    capabilitiesInflightRef.current.set(environmentId, work);
     try {
-      const client = await makeWebVoiceHttpClient(prepared);
-      const capabilities = await Effect.runPromise(client.capabilities());
-      setCapabilitiesByEnvironment((prev) => {
-        const next = new Map(prev);
-        next.set(environmentId, capabilities);
-        return next;
-      });
-    } catch {
-      setCapabilitiesByEnvironment((prev) => {
-        const next = new Map(prev);
-        next.set(environmentId, null);
-        return next;
-      });
+      await work;
+    } finally {
+      capabilitiesInflightRef.current.delete(environmentId);
     }
   }, []);
 

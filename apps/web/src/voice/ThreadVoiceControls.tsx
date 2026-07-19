@@ -40,10 +40,11 @@ export function ThreadVoiceControls(props: {
   const [dictating, setDictating] = useState(false);
   const [reviewDraft, setReviewDraft] = useState("");
 
+  const refreshCapabilities = voice?.refreshCapabilities;
   useEffect(() => {
-    if (props.environmentId == null || voice == null) return;
-    void voice.refreshCapabilities(props.environmentId);
-  }, [props.environmentId, voice]);
+    if (props.environmentId == null || refreshCapabilities == null) return;
+    void refreshCapabilities(props.environmentId);
+  }, [props.environmentId, refreshCapabilities]);
 
   useEffect(() => {
     if (voice?.snapshot.mode === "thread" && voice.snapshot.phase === "reviewing") {

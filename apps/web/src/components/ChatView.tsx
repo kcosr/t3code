@@ -5380,8 +5380,12 @@ function ChatViewContent(props: ChatViewProps) {
                       <div className="mb-2 flex justify-end px-1">
                         <ThreadVoiceControls
                           environmentId={environmentId}
-                          projectId={activeProject?.id ?? activeThread?.projectId ?? null}
-                          threadId={activeThreadId}
+                          projectId={
+                            // Prefer the thread's owning project so voice focus never
+                            // pairs a logical/selected project shell with a foreign thread.
+                            activeThread?.projectId ?? activeProject?.id ?? null
+                          }
+                          threadId={isServerThread ? activeThreadId : null}
                           modelSelection={
                             activeThread?.modelSelection ??
                             activeProject?.defaultModelSelection ??
@@ -5492,8 +5496,8 @@ function ChatViewContent(props: ChatViewProps) {
                       >
                         <RealtimeVoiceCallBar
                           environmentId={environmentId}
-                          projectId={activeProject?.id ?? activeThread?.projectId ?? null}
-                          threadId={activeThreadId}
+                          projectId={activeThread?.projectId ?? activeProject?.id ?? null}
+                          threadId={isServerThread ? activeThreadId : null}
                           className="mx-auto w-full max-w-3xl"
                         />
                         {isGitRepo && (

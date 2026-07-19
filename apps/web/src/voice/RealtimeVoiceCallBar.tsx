@@ -21,10 +21,11 @@ export function RealtimeVoiceCallBar(props: {
   >([]);
   const [busy, setBusy] = useState(false);
 
+  const refreshCapabilities = voice?.refreshCapabilities;
   useEffect(() => {
-    if (props.environmentId == null || voice == null) return;
-    void voice.refreshCapabilities(props.environmentId);
-  }, [props.environmentId, voice]);
+    if (props.environmentId == null || refreshCapabilities == null) return;
+    void refreshCapabilities(props.environmentId);
+  }, [props.environmentId, refreshCapabilities]);
 
   const startOrResume = useCallback(async () => {
     if (voice == null || props.environmentId == null) return;
@@ -34,6 +35,8 @@ export function RealtimeVoiceCallBar(props: {
         const taken = await voice.runtime.requestMultiTabTakeover();
         if (!taken) return;
       }
+      // Only advertise focus when we have a coherent server project+thread pair.
+      // Drafts and mismatched project shells must not be sent (server validates ownership).
       await voice.runtime.startRealtime({
         environmentId: props.environmentId,
         conversation: { type: "new", retention: "durable" },
