@@ -487,14 +487,23 @@ export function useThreadSpeech(input: ThreadSpeechInput) {
     if (!result.didHydrate) return;
     plannerRef.current = result.state;
     // Skip-restore: user already toggled after history was ready; UI already matches.
-    if (
+    const skipRestore =
       result.state.hydration.toggledBeforePreferenceHydration &&
-      !result.state.hydration.earlyToggleNeedsBaseline
-    ) {
-      return;
+      !result.state.hydration.earlyToggleNeedsBaseline;
+    if (!skipRestore) {
+      setEnabled(result.state.enabled);
+      enqueueActions(result.actions);
     }
-    setEnabled(result.state.enabled);
-    enqueueActions(result.actions);
+    // Catch up streaming segments/finish that were gated while prefs loaded, and
+    // avoid replaying a baselined visible message after early pre-history enable.
+    const catchUp = updateThreadSpeech(
+      plannerRef.current,
+      latestRef.current,
+      uuidv4,
+      isThreadSpeechSuspended(suspendedForDictationRef.current, suspendedForRealtimeRef.current),
+    );
+    plannerRef.current = catchUp.state;
+    enqueueActions(catchUp.actions);
   }, [enqueueActions, input.historyReady, preferencesResult]);
 
   useEffect(() => {
