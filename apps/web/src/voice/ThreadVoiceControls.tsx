@@ -35,6 +35,10 @@ export function ThreadVoiceControls(props: {
   readonly interactionRequired: boolean;
   readonly activeThreadBusy: boolean;
   readonly onDictationInsert: (text: string) => void;
+  /** When true, show the one-shot dictation mic even if threadId is null (drafts). */
+  readonly allowDictationWithoutThread?: boolean;
+  /** When false, hide Auto Listen (e.g. drafts). Defaults to true when threadId is set. */
+  readonly autoListenEnabled?: boolean;
 }) {
   const voice = useOptionalVoiceRuntime();
   const [dictating, setDictating] = useState(false);
@@ -167,7 +171,13 @@ export function ThreadVoiceControls(props: {
     }
   }, [voice, props, dictating, sttReady]);
 
-  if (voice == null || props.environmentId == null || props.threadId == null) {
+  const allowDictation = props.allowDictationWithoutThread === true || props.threadId != null;
+  const showAutoListen = props.autoListenEnabled !== false && props.threadId != null;
+
+  if (voice == null || props.environmentId == null) {
+    return null;
+  }
+  if (!allowDictation && !showAutoListen) {
     return null;
   }
 
@@ -215,30 +225,34 @@ export function ThreadVoiceControls(props: {
       ) : null}
 
       <div className="flex items-center gap-1.5">
-        <Button
-          size="icon-sm"
-          variant="outline"
-          aria-label="Dictate into composer"
-          disabled={!sttReady || dictating || props.interactionRequired}
-          onClick={() => void runDictation()}
-          title={sttReady ? "Dictate into draft" : "Transcription not ready"}
-        >
-          <Mic className="size-4" />
-        </Button>
-        <Button
-          size="icon-sm"
-          variant={control?.active ? "default" : "outline"}
-          aria-label={control?.accessibilityLabel ?? "Start Auto Listen"}
-          disabled={
-            control?.command === "start"
-              ? !canStartAutoListen || control.blockedByAnotherTarget
-              : false
-          }
-          onClick={() => void toggleAutoListen()}
-          title={control?.accessibilityLabel ?? "Auto Listen"}
-        >
-          {control?.active ? <Square className="size-3.5" /> : <AudioLines className="size-4" />}
-        </Button>
+        {allowDictation ? (
+          <Button
+            size="icon-sm"
+            variant="outline"
+            aria-label="Dictate into composer"
+            disabled={!sttReady || dictating || props.interactionRequired}
+            onClick={() => void runDictation()}
+            title={sttReady ? "Dictate into draft" : "Transcription not ready"}
+          >
+            <Mic className="size-4" />
+          </Button>
+        ) : null}
+        {showAutoListen ? (
+          <Button
+            size="icon-sm"
+            variant={control?.active ? "default" : "outline"}
+            aria-label={control?.accessibilityLabel ?? "Start Auto Listen"}
+            disabled={
+              control?.command === "start"
+                ? !canStartAutoListen || control.blockedByAnotherTarget
+                : false
+            }
+            onClick={() => void toggleAutoListen()}
+            title={control?.accessibilityLabel ?? "Auto Listen"}
+          >
+            {control?.active ? <Square className="size-3.5" /> : <AudioLines className="size-4" />}
+          </Button>
+        ) : null}
         {voice.snapshot.mode === "thread" ? (
           <span className="text-xs text-muted-foreground capitalize">{voice.snapshot.phase}</span>
         ) : null}

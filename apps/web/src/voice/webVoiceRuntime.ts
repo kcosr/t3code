@@ -160,6 +160,8 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
   let threadAbort: AbortController | null = null;
   /** Survives stopInternal nulling threadAbort so Effect interruptions still look like aborts. */
   let lastThreadAbortSignal: AbortSignal | null = null;
+  /** Abort signal for the cycle currently (or about to be) running. */
+  let activeCycleAbortSignal: AbortSignal | null = null;
   let reviewTranscript: string | null = null;
   let reviewId = 0;
   let pcmPlayer: PcmPlayer | null = null;
@@ -184,9 +186,10 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     return String(cause);
   };
 
-  const isCycleAbortCause = (cause: unknown): boolean => {
+  const isCycleAbortCause = (cause: unknown, cycleSignal?: AbortSignal | null): boolean => {
     if (cause instanceof DOMException && cause.name === "AbortError") return true;
-    if (lastThreadAbortSignal !== null && lastThreadAbortSignal.aborted) return true;
+    const signal = cycleSignal ?? activeCycleAbortSignal;
+    if (signal !== null && signal.aborted) return true;
     if (threadAbort !== null && threadAbort.signal.aborted) return true;
     return false;
   };
@@ -242,7 +245,9 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
 
   const ensureLeader = async (environmentId: EnvironmentId): Promise<void> => {
     const tab = multiTab.getSnapshot();
-    if (tab.role === "leader") {
+    // role "leader" can mean "free to acquire" when no elected owner exists.
+    // Only skip acquire when this tab actually holds the lock (leaderTabId === us).
+    if (tab.leaderTabId === multiTab.tabId) {
       multiTab.setOwnerEnvironment(environmentId);
       return;
     }
@@ -749,12 +754,14 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     }
 
     try {
+      const abort = new AbortController();
+      // Assign early so start failures after a prior stop aren't misclassified.
+      activeCycleAbortSignal = abort.signal;
+      lastThreadAbortSignal = abort.signal;
+      threadAbort?.abort();
+      threadAbort = abort;
       await ensureLeader(input.target.environmentId);
       const gen = bumpGeneration();
-      threadAbort?.abort();
-      const abort = new AbortController();
-      threadAbort = abort;
-      lastThreadAbortSignal = abort.signal;
 
       publishNext({
         mode: "thread",
@@ -1020,6 +1027,9 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
       threadCycleRunning = false;
       resolveReview = null;
       resolveManualFinish = null;
+      if (activeCycleAbortSignal === threadAbort?.signal) {
+        activeCycleAbortSignal = null;
+      }
     }
   };
 
@@ -1155,7 +1165,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
     });
     // Detach cycle so callers (terminal-action / startThread) do not hold the transition.
     void runThreadCycle(input).catch(async (cause) => {
-      if (isCycleAbortCause(cause)) {
+      if (isCycleAbortCause(cause, activeCycleAbortSignal)) {
         if (snapshot.mode !== "idle" && snapshot.mode !== "realtime") {
           await stopInternal("aborted");
         }
@@ -1250,7 +1260,7 @@ export function makeWebVoiceRuntime(hooks: WebVoiceRuntimeHooks): WebVoiceRuntim
         }
         // Detach the long-running cycle so stop()/startRealtime stay available.
         void runThreadCycle(input).catch(async (cause) => {
-          if (isCycleAbortCause(cause)) {
+          if (isCycleAbortCause(cause, activeCycleAbortSignal)) {
             // stopInternal may already have published idle; avoid failed chrome.
             if (snapshot.mode !== "idle" && snapshot.mode !== "realtime") {
               await stopInternal("aborted");

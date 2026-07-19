@@ -49,28 +49,14 @@ export function RealtimeVoiceCallBar(props: {
         props.projectId != null && props.threadId != null
           ? { projectId: props.projectId, threadId: props.threadId }
           : null;
-      try {
-        await voice.runtime.startRealtime({
-          environmentId: props.environmentId,
-          conversation,
-          focus,
-          threadSettings: voice.threadSettings,
-        });
-      } catch (cause) {
-        // Lease held elsewhere: force takeover once, then fail through.
-        const message = cause instanceof Error ? cause.message : String(cause);
-        if (conversation.type === "continue" && /takeover/i.test(message)) {
-          conversation = { ...conversation, takeover: true };
-          await voice.runtime.startRealtime({
-            environmentId: props.environmentId,
-            conversation,
-            focus,
-            threadSettings: voice.threadSettings,
-          });
-          return;
-        }
-        throw cause;
-      }
+      // selectionForResumeStart already sets takeover: true for continue selections.
+      // startRealtime surfaces failures via failed snapshots rather than rethrowing.
+      await voice.runtime.startRealtime({
+        environmentId: props.environmentId,
+        conversation,
+        focus,
+        threadSettings: voice.threadSettings,
+      });
     } finally {
       setBusy(false);
     }

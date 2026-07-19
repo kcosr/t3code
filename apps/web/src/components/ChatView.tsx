@@ -5385,7 +5385,10 @@ function ChatViewContent(props: ChatViewProps) {
                             // pairs a logical/selected project shell with a foreign thread.
                             activeThread?.projectId ?? activeProject?.id ?? null
                           }
+                          // Auto Listen needs a server thread; dictation still works with null.
                           threadId={isServerThread ? activeThreadId : null}
+                          allowDictationWithoutThread
+                          autoListenEnabled={isServerThread}
                           modelSelection={
                             activeThread?.modelSelection ??
                             activeProject?.defaultModelSelection ??
