@@ -126,11 +126,17 @@ export function makeVoiceMultiTabLock(input: MakeVoiceMultiTabLockInput = {}): V
   const channel =
     typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(channelName) : null;
 
+  const roleOf = (): VoiceMultiTabRole => {
+    // No elected leader → this tab is free to acquire (not a follower of anyone).
+    if (leaderTabId === null || leaderTabId === tabId) return "leader";
+    return "follower";
+  };
+
   const publish = () => {
     const snapshot: VoiceMultiTabLockSnapshot = {
-      role: leaderTabId === tabId ? "leader" : "follower",
+      role: roleOf(),
       leaderTabId,
-      ownerEnvironmentId: leaderTabId === tabId ? ownerEnvironmentId : ownerEnvironmentId,
+      ownerEnvironmentId,
     };
     for (const listener of listeners) listener(snapshot);
   };
@@ -286,14 +292,14 @@ export function makeVoiceMultiTabLock(input: MakeVoiceMultiTabLockInput = {}): V
   return {
     tabId,
     getSnapshot: () => ({
-      role: leaderTabId === tabId ? "leader" : "follower",
+      role: roleOf(),
       leaderTabId,
       ownerEnvironmentId,
     }),
     subscribe: (listener) => {
       listeners.add(listener);
       listener({
-        role: leaderTabId === tabId ? "leader" : "follower",
+        role: roleOf(),
         leaderTabId,
         ownerEnvironmentId,
       });

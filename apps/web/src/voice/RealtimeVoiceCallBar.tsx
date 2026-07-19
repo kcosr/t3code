@@ -66,15 +66,33 @@ export function RealtimeVoiceCallBar(props: {
 
   if (voice == null) return null;
 
+  const hasCapabilityEntry =
+    props.environmentId != null && voice.capabilitiesByEnvironment.has(props.environmentId);
   const capabilities =
     props.environmentId != null
       ? voice.capabilitiesByEnvironment.get(props.environmentId)
       : undefined;
-  const realtimeReady =
-    capabilities?.capabilities.some(
-      (item: { capability: string; state: string }) =>
-        item.capability === "agent.realtime" && item.state === "ready",
-    ) === true;
+  const realtimeDescriptor = capabilities?.capabilities.find(
+    (item: { capability: string; state: string }) => item.capability === "agent.realtime",
+  );
+  const realtimeState = realtimeDescriptor?.state;
+  const realtimeReady = realtimeState === "ready";
+  const realtimeStatusLabel =
+    props.environmentId == null
+      ? "Connect an environment to use Realtime voice"
+      : !hasCapabilityEntry
+        ? "Checking Realtime voice…"
+        : capabilities == null
+          ? "Could not load voice capabilities"
+          : realtimeState === "ready"
+            ? "Start or resume a Realtime voice call"
+            : realtimeState === "not-configured"
+              ? "Realtime needs an OpenAI API key on this environment"
+              : realtimeState === "disabled"
+                ? "Realtime voice is disabled in environment settings"
+                : realtimeState === "unavailable"
+                  ? "Realtime voice is unavailable on this environment"
+                  : "Realtime voice is not ready on this environment";
 
   const barPhase = realtimeVoiceBarPhase(voice.snapshot);
   const transcript = voice.snapshot.mode === "realtime" ? voice.snapshot.transcript : [];
@@ -84,7 +102,11 @@ export function RealtimeVoiceCallBar(props: {
   const clientAction =
     voice.snapshot.mode === "realtime" ? (voice.snapshot.pendingClientActions[0] ?? null) : null;
 
-  if (barPhase === "idle" && !realtimeReady && voice.multiTab.role === "leader") {
+  // Idle with no Realtime capability: hide chrome (don't leave a dead Start button).
+  // Still show the bar while checking, when failed, or when another tab holds voice.
+  const blockedByOtherTab =
+    voice.multiTab.role === "follower" && voice.multiTab.leaderTabId != null;
+  if (barPhase === "idle" && !realtimeReady && !blockedByOtherTab && hasCapabilityEntry) {
     return null;
   }
 
@@ -180,9 +202,9 @@ export function RealtimeVoiceCallBar(props: {
           <div className="truncate text-xs text-muted-foreground">
             {barPhase === "active"
               ? (transcript.at(-1)?.text ?? "Listening…")
-              : realtimeReady
-                ? "Start or resume a Realtime voice call"
-                : "Realtime voice is not ready on this environment"}
+              : barPhase === "error"
+                ? realtimeStatusLabel
+                : realtimeStatusLabel}
           </div>
         </div>
 
@@ -199,7 +221,9 @@ export function RealtimeVoiceCallBar(props: {
             </Button>
             <Button
               size="sm"
+              variant={realtimeReady ? "default" : "outline"}
               disabled={!realtimeReady || busy || props.environmentId == null}
+              title={realtimeReady ? "Start Realtime voice" : realtimeStatusLabel}
               onClick={() => void startOrResume()}
             >
               <Play className="size-3.5" />
