@@ -11,15 +11,13 @@ import { usePreparedConnection } from "../../state/session";
 import {
   applyTranscriptionEvent,
   beginTranscriptionDraft,
-  renderTranscriptionDraft,
-} from "./transcriptionDraft";
-import { useVoiceCapabilityDescriptor } from "./useVoiceCapabilityAvailability";
-import { validateRecordingAgainstCapability } from "./dictationPolicy";
-import {
+  canStartComposerDictation,
   cleanupOrphanedRecordingTermination,
   dictationTerminationOwnership,
-} from "./dictationTermination";
-import { canStartComposerDictation } from "./dictationAdmission";
+  renderTranscriptionDraft,
+  validateRecordingAgainstCapability,
+} from "./composerDictationPolicy";
+import { useVoiceCapabilityDescriptor } from "./useVoiceCapabilityAvailability";
 import { ensureMicrophonePermission } from "./microphonePermission";
 import { releaseRecordingForRealtime } from "./traditionalAudioHandoff";
 import type { ResolvedVoicePreferences } from "./voicePreferences";

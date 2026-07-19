@@ -1,14 +1,19 @@
+import { VoiceRequestId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
-
 import type {
   T3VoiceNativeModule,
   T3VoiceRecordingTerminatedEvent,
 } from "@t3tools/mobile-voice-native";
-import { validateRecordingAgainstCapability } from "./dictationPolicy";
+
 import {
+  applyTranscriptionEvent,
+  beginTranscriptionDraft,
+  canStartComposerDictation,
   cleanupOrphanedRecordingTermination,
   dictationTerminationOwnership,
-} from "./dictationTermination";
+  renderTranscriptionDraft,
+  validateRecordingAgainstCapability,
+} from "./composerDictationPolicy";
 
 const capability = {
   capability: "transcription.request" as const,
@@ -18,6 +23,43 @@ const capability = {
   maxInputBytes: 32 * 1024 * 1024,
   maxInputDurationSeconds: 30 * 60,
 };
+
+const REQUEST_ID = VoiceRequestId.make("request-1");
+
+describe("canStartComposerDictation", () => {
+  it("rejects a stale idle render after native recording ownership was acquired", () => {
+    expect(
+      canStartComposerDictation({
+        phase: "idle",
+        startPending: false,
+        activeRecordingId: "recording-1",
+        stoppingRecordingId: null,
+        transcribingRecordingId: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("admits only a fully idle dictation lifecycle", () => {
+    expect(
+      canStartComposerDictation({
+        phase: "idle",
+        startPending: false,
+        activeRecordingId: null,
+        stoppingRecordingId: null,
+        transcribingRecordingId: null,
+      }),
+    ).toBe(true);
+    expect(
+      canStartComposerDictation({
+        phase: "idle",
+        startPending: false,
+        activeRecordingId: null,
+        stoppingRecordingId: "recording-1",
+        transcribingRecordingId: null,
+      }),
+    ).toBe(false);
+  });
+});
 
 describe("dictation capability preflight", () => {
   it("accepts recordings at the advertised limits", () => {
@@ -115,5 +157,37 @@ describe("orphaned dictation termination cleanup", () => {
     await cleanupOrphanedRecordingTermination(native, event);
 
     expect(calls).toEqual([["acknowledge", { recordingId: "recording-a" }]]);
+  });
+});
+
+describe("transcriptionDraft", () => {
+  it("preserves the existing composer text while deltas stream", () => {
+    const started = beginTranscriptionDraft("Review this change.");
+    const first = applyTranscriptionEvent(started, {
+      type: "delta",
+      requestId: REQUEST_ID,
+      text: "Then ",
+    });
+    const second = applyTranscriptionEvent(first, {
+      type: "delta",
+      requestId: REQUEST_ID,
+      text: "run tests",
+    });
+
+    expect(renderTranscriptionDraft(second)).toBe("Review this change. Then run tests");
+  });
+
+  it("uses the authoritative final transcript without duplicating deltas", () => {
+    const partial = applyTranscriptionEvent(beginTranscriptionDraft(""), {
+      type: "delta",
+      requestId: REQUEST_ID,
+      text: "helo",
+    });
+    const final = applyTranscriptionEvent(partial, {
+      type: "final",
+      result: { requestId: REQUEST_ID, text: "hello" },
+    });
+
+    expect(renderTranscriptionDraft(final)).toBe("hello");
   });
 });
