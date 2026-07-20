@@ -1,3 +1,5 @@
+import type { Socket } from "node:net";
+
 import { NodeWS } from "@effect/platform-node/NodeSocket";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -7,6 +9,11 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import { VoiceError } from "../../Errors.ts";
+
+/** WebSocket ping interval for the OpenAI sideband (keeps NAT/middleboxes awake). */
+export const SIDEBAND_WS_PING_INTERVAL_MS = 60_000;
+/** TCP keepalive probe idle delay once the sideband socket is open. */
+export const SIDEBAND_TCP_KEEPALIVE_INITIAL_DELAY_MS = 60_000;
 
 export type OpenAiRealtimeSocketEvent =
   | { readonly type: "message"; readonly data: string }
@@ -41,9 +48,41 @@ const socketError = (operation: string, cause: unknown) =>
     cause,
   });
 
+const enableTcpKeepAlive = (socket: NodeWS.WebSocket): void => {
+  const tcp = (socket as NodeWS.WebSocket & { _socket?: Socket | null })._socket;
+  if (!tcp || typeof tcp.setKeepAlive !== "function") {
+    return;
+  }
+  try {
+    tcp.setKeepAlive(true, SIDEBAND_TCP_KEEPALIVE_INITIAL_DELAY_MS);
+  } catch {
+    // Best-effort; WS pings remain the primary keepalive.
+  }
+};
+
+const startPingLoop = (socket: NodeWS.WebSocket): (() => void) => {
+  const timer = setInterval(() => {
+    if (socket.readyState !== NodeWS.WebSocket.OPEN) {
+      return;
+    }
+    try {
+      socket.ping();
+    } catch {
+      // Ignore transient send failures; close/error handlers own session fate.
+    }
+  }, SIDEBAND_WS_PING_INTERVAL_MS);
+  if (typeof timer.unref === "function") {
+    timer.unref();
+  }
+  return () => {
+    clearInterval(timer);
+  };
+};
+
 const connect: OpenAiRealtimeSocketShape["connect"] = Effect.fn("OpenAiRealtimeSocket.connect")(
   function* (input) {
     const events = yield* Queue.unbounded<OpenAiRealtimeSocketEvent>();
+    let stopPingLoop: (() => void) | null = null;
     const socket = yield* Effect.acquireRelease(
       Effect.callback<NodeWS.WebSocket, VoiceError>((resume) => {
         const ws = new NodeWS.WebSocket(input.url, {
@@ -67,6 +106,8 @@ const connect: OpenAiRealtimeSocketShape["connect"] = Effect.fn("OpenAiRealtimeS
       }),
       (ws) =>
         Effect.sync(() => {
+          stopPingLoop?.();
+          stopPingLoop = null;
           if (
             ws.readyState === NodeWS.WebSocket.OPEN ||
             ws.readyState === NodeWS.WebSocket.CONNECTING
@@ -76,16 +117,27 @@ const connect: OpenAiRealtimeSocketShape["connect"] = Effect.fn("OpenAiRealtimeS
         }),
     );
 
+    enableTcpKeepAlive(socket);
+    stopPingLoop = startPingLoop(socket);
+
     const publish = (event: OpenAiRealtimeSocketEvent) => void Queue.offerUnsafe(events, event);
     socket.on("message", (data) => publish({ type: "message", data: data.toString() }));
-    socket.on("error", (cause) => publish({ type: "error", cause }));
-    socket.on("close", (code, reason) =>
-      publish({ type: "closed", code, reason: reason.toString() }),
-    );
+    socket.on("error", (cause) => {
+      stopPingLoop?.();
+      stopPingLoop = null;
+      publish({ type: "error", cause });
+    });
+    socket.on("close", (code, reason) => {
+      stopPingLoop?.();
+      stopPingLoop = null;
+      publish({ type: "closed", code, reason: reason.toString() });
+    });
 
     yield* Scope.addFinalizer(
       yield* Effect.scope,
       Effect.sync(() => {
+        stopPingLoop?.();
+        stopPingLoop = null;
         socket.removeAllListeners();
       }),
     );
@@ -99,6 +151,8 @@ const connect: OpenAiRealtimeSocketShape["connect"] = Effect.fn("OpenAiRealtimeS
           catch: (cause) => socketError("openai.realtime.sideband.send", cause),
         }),
       close: Effect.sync(() => {
+        stopPingLoop?.();
+        stopPingLoop = null;
         if (socket.readyState === NodeWS.WebSocket.OPEN) {
           socket.close(1000, "T3 voice session closed");
         }
