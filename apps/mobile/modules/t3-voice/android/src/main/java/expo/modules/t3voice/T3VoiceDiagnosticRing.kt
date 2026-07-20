@@ -41,6 +41,10 @@ internal enum class T3VoiceDiagnosticCode {
   CUE_FAILED,
   CUE_TIMED_OUT,
   MEDIA_BUTTON_RECEIVED,
+  /** Recognized media key but no semantic action matched available controls. */
+  MEDIA_BUTTON_NO_ACTION,
+  /** MediaSession transport callback (play/pause/stop/next) without a raw KeyEvent. */
+  MEDIA_TRANSPORT_CALLBACK,
   MEDIA_ACTION_DISPATCHED,
   PLAYBACK_INTERRUPT_REQUESTED,
   PLAYBACK_INTERRUPT_COMPLETED,

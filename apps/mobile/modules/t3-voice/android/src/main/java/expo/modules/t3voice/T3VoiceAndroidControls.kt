@@ -10,6 +10,7 @@ import android.media.session.PlaybackState
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.KeyEvent
 
 internal enum class T3VoiceAndroidControlOwner {
@@ -129,6 +130,7 @@ internal class T3VoiceAndroidControls(
       setCallback(
         object : MediaSession.Callback() {
           override fun onPlay() {
+            recordTransportCallback("onPlay")
             dispatchFirst(
               T3VoiceAndroidControlAction.SKIP,
               T3VoiceAndroidControlAction.START,
@@ -139,6 +141,7 @@ internal class T3VoiceAndroidControls(
 
           override fun onPause() {
             // While PLAYING, transport pause must skip speech (not pause/resume product).
+            recordTransportCallback("onPause")
             dispatchFirst(
               T3VoiceAndroidControlAction.SKIP,
               T3VoiceAndroidControlAction.MUTE,
@@ -147,6 +150,7 @@ internal class T3VoiceAndroidControls(
           }
 
           override fun onStop() {
+            recordTransportCallback("onStop")
             dispatchFirst(
               T3VoiceAndroidControlAction.SKIP,
               T3VoiceAndroidControlAction.STOP,
@@ -155,6 +159,7 @@ internal class T3VoiceAndroidControls(
 
           override fun onSkipToNext() {
             // Match MEDIA_NEXT policy preference: SKIP first when available, else SWITCH.
+            recordTransportCallback("onSkipToNext")
             dispatchFirst(
               T3VoiceAndroidControlAction.SKIP,
               T3VoiceAndroidControlAction.SWITCH_TO_THREAD,
@@ -163,6 +168,10 @@ internal class T3VoiceAndroidControls(
 
           override fun onCustomAction(action: String, extras: Bundle?) {
             val id = action.removePrefix(MEDIA_CUSTOM_ACTION_PREFIX).let(::parseActionId) ?: return
+            Log.i(
+              MEDIA_BUTTON_LOG_TAG,
+              "customAction raw=$action action=$id available=${activeActions().joinToString(",")}",
+            )
             dispatchFirst(id)
           }
 
@@ -173,24 +182,67 @@ internal class T3VoiceAndroidControls(
               } else {
                 @Suppress("DEPRECATION")
                 mediaButtonIntent.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
-              } ?: return super.onMediaButtonEvent(mediaButtonIntent)
+              }
+            if (event == null) {
+              Log.i(MEDIA_BUTTON_LOG_TAG, "onMediaButtonEvent missing KeyEvent")
+              return super.onMediaButtonEvent(mediaButtonIntent)
+            }
+            val available = activeActions()
             val decision =
               T3VoiceMediaButtonPolicy.decide(
                 keyCode = event.keyCode,
                 keyAction = event.action,
                 repeatCount = event.repeatCount,
-                available = activeActions(),
+                available = available,
               )
             val presentation =
               currentPresentation as? T3VoiceAndroidControlsPresentation.Active
+            val keyName = KeyEvent.keyCodeToString(event.keyCode)
+            val actionName =
+              when (event.action) {
+                KeyEvent.ACTION_DOWN -> "DOWN"
+                KeyEvent.ACTION_UP -> "UP"
+                KeyEvent.ACTION_MULTIPLE -> "MULTIPLE"
+                else -> "action=${event.action}"
+              }
+            // Privacy-safe: enums/ids only. Filter: adb logcat -s T3VoiceMediaButton
+            Log.i(
+              MEDIA_BUTTON_LOG_TAG,
+              "onMediaButtonEvent key=$keyName(${event.keyCode}) $actionName " +
+                "repeat=${event.repeatCount} consume=${decision.consume} " +
+                "decided=${decision.action?.name ?: "none"} " +
+                "owner=${presentation?.owner?.name ?: "none"} " +
+                "generation=${presentation?.generation ?: 0} " +
+                "playbackState=${presentation?.playbackState ?: -1} " +
+                "available=${available.joinToString(",") { it.name }.ifEmpty { "none" }}",
+            )
             T3VoiceDiagnostics.record(
               generation = presentation?.generation ?: 0,
               category = T3VoiceDiagnosticCategory.STATE,
               code = T3VoiceDiagnosticCode.MEDIA_BUTTON_RECEIVED,
               primaryCount = event.keyCode,
-              secondaryCount = decision.action?.ordinal?.plus(1) ?: 0,
+              secondaryCount =
+                (event.action and 0xFF) or
+                  ((event.repeatCount.coerceIn(0, 255) and 0xFF) shl 8) or
+                  (((decision.action?.ordinal?.plus(1) ?: 0).coerceIn(0, 255) and 0xFF) shl 16),
             )
-            decision.action?.let { dispatchFirst(it) }
+            if (decision.action != null) {
+              dispatchFirst(decision.action)
+            } else if (decision.consume && event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+              // Recognized one-shot key with no matching semantic control (e.g. OS delivered
+              // the event but available actions don't include mute/start/skip).
+              T3VoiceDiagnostics.record(
+                generation = presentation?.generation ?: 0,
+                category = T3VoiceDiagnosticCategory.STATE,
+                code = T3VoiceDiagnosticCode.MEDIA_BUTTON_NO_ACTION,
+                primaryCount = event.keyCode,
+                secondaryCount = available.size,
+              )
+              Log.i(
+                MEDIA_BUTTON_LOG_TAG,
+                "noAction key=$keyName available=${available.joinToString(",") { it.name }.ifEmpty { "none" }}",
+              )
+            }
             return decision.consume || super.onMediaButtonEvent(mediaButtonIntent)
           }
         },
@@ -300,18 +352,63 @@ internal class T3VoiceAndroidControls(
   private fun activeActions(): List<T3VoiceAndroidControlAction> =
     (currentPresentation as? T3VoiceAndroidControlsPresentation.Active)?.actions.orEmpty()
 
+  private fun recordTransportCallback(callback: String) {
+    val presentation = currentPresentation as? T3VoiceAndroidControlsPresentation.Active
+    val available = presentation?.actions.orEmpty()
+    Log.i(
+      MEDIA_BUTTON_LOG_TAG,
+      "transportCallback=$callback owner=${presentation?.owner?.name ?: "none"} " +
+        "generation=${presentation?.generation ?: 0} " +
+        "playbackState=${presentation?.playbackState ?: -1} " +
+        "available=${available.joinToString(",") { it.name }.ifEmpty { "none" }}",
+    )
+    T3VoiceDiagnostics.record(
+      generation = presentation?.generation ?: 0,
+      category = T3VoiceDiagnosticCategory.STATE,
+      code = T3VoiceDiagnosticCode.MEDIA_TRANSPORT_CALLBACK,
+      primaryCount = callback.hashCode().and(0x7fff_ffff),
+      secondaryCount = available.size,
+    )
+  }
+
   private fun dispatchFirst(vararg ids: T3VoiceAndroidControlAction) {
-    val presentation = currentPresentation as? T3VoiceAndroidControlsPresentation.Active ?: return
-    ids.firstOrNull(presentation.actions::contains)
-      ?.let {
-        T3VoiceDiagnostics.record(
-          generation = presentation.generation,
-          category = T3VoiceDiagnosticCategory.STATE,
-          code = T3VoiceDiagnosticCode.MEDIA_ACTION_DISPATCHED,
-          primaryCount = it.ordinal + 1,
-        )
-        dispatch(it, presentation.owner, presentation.generation)
-      }
+    val presentation = currentPresentation as? T3VoiceAndroidControlsPresentation.Active
+    if (presentation == null) {
+      Log.i(
+        MEDIA_BUTTON_LOG_TAG,
+        "dispatchFirst skipped: no active presentation preferred=${ids.joinToString(",") { it.name }}",
+      )
+      return
+    }
+    val matched = ids.firstOrNull(presentation.actions::contains)
+    if (matched == null) {
+      Log.i(
+        MEDIA_BUTTON_LOG_TAG,
+        "dispatchFirst noMatch preferred=${ids.joinToString(",") { it.name }} " +
+          "available=${presentation.actions.joinToString(",") { it.name }} " +
+          "owner=${presentation.owner.name} generation=${presentation.generation}",
+      )
+      T3VoiceDiagnostics.record(
+        generation = presentation.generation,
+        category = T3VoiceDiagnosticCategory.STATE,
+        code = T3VoiceDiagnosticCode.MEDIA_BUTTON_NO_ACTION,
+        primaryCount = ids.firstOrNull()?.ordinal?.plus(1) ?: 0,
+        secondaryCount = presentation.actions.size,
+      )
+      return
+    }
+    Log.i(
+      MEDIA_BUTTON_LOG_TAG,
+      "dispatch action=${matched.name} owner=${presentation.owner.name} " +
+        "generation=${presentation.generation}",
+    )
+    T3VoiceDiagnostics.record(
+      generation = presentation.generation,
+      category = T3VoiceDiagnosticCategory.STATE,
+      code = T3VoiceDiagnosticCode.MEDIA_ACTION_DISPATCHED,
+      primaryCount = matched.ordinal + 1,
+    )
+    dispatch(matched, presentation.owner, presentation.generation)
   }
 
   private fun parseActionId(value: String): T3VoiceAndroidControlAction? =
@@ -385,6 +482,8 @@ internal class T3VoiceAndroidControls(
 
 private const val ACTION_REQUEST_CODE_BASE = 3150
 private const val SEMANTIC_CONTROL_URI_PREFIX = "t3voice-runtime://semantic-control"
+/** Filter with: adb logcat -s T3VoiceMediaButton:I */
+private const val MEDIA_BUTTON_LOG_TAG = "T3VoiceMediaButton"
 
 internal fun T3VoiceControllerSnapshot.androidControlsPresentation(
   readiness: T3VoiceReadinessSnapshot = T3VoiceReadinessSnapshot.Disabled(0),
